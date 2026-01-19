@@ -231,6 +231,7 @@ export class ContextManager {
 
   /**
    * Create a branch from a specific message.
+   * The new branch will have state as of that message's sequence (time-travel branching).
    */
   branchAt(messageId: MessageId, name?: string): string {
     const message = this.messageStore.get(messageId);
@@ -240,7 +241,12 @@ export class ContextManager {
 
     // Create branch name if not provided
     const branchName = name ?? `branch-${Date.now()}`;
-    const branch = this.store.createBranch(branchName, null);
+    
+    // Get current branch name to branch from
+    const currentBranch = this.store.currentBranch();
+    
+    // Use createBranchAt to branch at the message's sequence (time-travel)
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
 
     return branch.id;
   }
