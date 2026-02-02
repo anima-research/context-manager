@@ -86,3 +86,55 @@ export interface StoredMessageInternal {
   timestamp: number; // Unix timestamp for storage
   causedBy?: MessageId[];
 }
+
+/**
+ * Query filter for message lookup.
+ * All fields are optional - omitted fields match everything.
+ */
+export interface MessageQuery {
+  /**
+   * Filter by external source (e.g., 'discord', 'slack').
+   * Matches messages where metadata.external.source === source.
+   */
+  source?: string;
+
+  /**
+   * Filter by specific external IDs.
+   * Matches messages where metadata.external.id is in this list.
+   */
+  externalIds?: string[];
+
+  /**
+   * Filter by participant name.
+   */
+  participant?: string;
+
+  /**
+   * Filter by metadata fields.
+   * Supports dot notation for nested fields (e.g., 'external.channelId').
+   * Values are compared with strict equality.
+   */
+  metadata?: Record<string, unknown>;
+
+  /**
+   * Maximum number of messages to return.
+   * If not specified, returns all matching messages.
+   */
+  limit?: number;
+
+  /**
+   * Return messages in reverse order (newest first).
+   * Default: false (oldest first).
+   */
+  reverse?: boolean;
+}
+
+/**
+ * Result of a message query.
+ */
+export interface MessageQueryResult {
+  /** Matching messages */
+  messages: StoredMessage[];
+  /** Total count of matching messages (may be more than returned if limited) */
+  totalCount: number;
+}

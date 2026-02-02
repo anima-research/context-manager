@@ -7,6 +7,8 @@ import type {
   StoredMessage,
   StoredMessageInternal,
   MessageStoreView,
+  MessageQuery,
+  MessageQueryResult,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 
@@ -318,6 +320,110 @@ export class MessageStore {
       length: () => this.length(),
       estimateTokens: (msg) => this.estimateTokens(msg),
     };
+  }
+
+  /**
+   * Query messages by filter criteria.
+   * Useful for finding messages from external sources, by participant, etc.
+   */
+  query(filter: MessageQuery): MessageQueryResult {
+    let messages = this.getAll();
+    let totalCount = 0;
+
+    // Apply filters
+    const filtered: StoredMessage[] = [];
+    for (const msg of messages) {
+      if (this.matchesFilter(msg, filter)) {
+        filtered.push(msg);
+      }
+    }
+
+    totalCount = filtered.length;
+
+    // Apply reverse if requested
+    let result = filter.reverse ? filtered.reverse() : filtered;
+
+    // Apply limit if specified
+    if (filter.limit !== undefined && filter.limit < result.length) {
+      result = result.slice(0, filter.limit);
+    }
+
+    return { messages: result, totalCount };
+  }
+
+  /**
+   * Find a message by external source and ID.
+   * Convenience method for common lookup pattern.
+   */
+  findByExternalId(source: string, externalId: string): StoredMessage | null {
+    const result = this.query({
+      source,
+      externalIds: [externalId],
+      limit: 1,
+    });
+    return result.messages[0] ?? null;
+  }
+
+  /**
+   * Check if a message matches the query filter.
+   */
+  private matchesFilter(msg: StoredMessage, filter: MessageQuery): boolean {
+    // Filter by source
+    if (filter.source !== undefined) {
+      const external = msg.metadata?.external as { source?: string } | undefined;
+      if (external?.source !== filter.source) {
+        return false;
+      }
+    }
+
+    // Filter by external IDs
+    if (filter.externalIds !== undefined && filter.externalIds.length > 0) {
+      const external = msg.metadata?.external as { id?: string } | undefined;
+      if (!external?.id || !filter.externalIds.includes(external.id)) {
+        return false;
+      }
+    }
+
+    // Filter by participant
+    if (filter.participant !== undefined) {
+      if (msg.participant !== filter.participant) {
+        return false;
+      }
+    }
+
+    // Filter by metadata fields
+    if (filter.metadata !== undefined) {
+      for (const [key, value] of Object.entries(filter.metadata)) {
+        const actual = this.getNestedValue(msg.metadata, key);
+        if (actual !== value) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Get a nested value from an object using dot notation.
+   * e.g., getNestedValue(obj, 'external.channelId')
+   */
+  private getNestedValue(obj: unknown, path: string): unknown {
+    if (obj === undefined || obj === null) {
+      return undefined;
+    }
+
+    const parts = path.split('.');
+    let current: unknown = obj;
+
+    for (const part of parts) {
+      if (current === undefined || current === null || typeof current !== 'object') {
+        return undefined;
+      }
+      current = (current as Record<string, unknown>)[part];
+    }
+
+    return current;
   }
 
   private getAllInternal(): StoredMessageInternal[] {

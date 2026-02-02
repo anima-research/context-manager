@@ -22,6 +22,8 @@ export type {
   StoredMessage,
   BlobReference,
   StoredContentBlock,
+  MessageQuery,
+  MessageQueryResult,
   // Context types
   SourceRelation,
   ContextEntry,
