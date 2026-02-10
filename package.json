@@ -33,7 +33,7 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "chronicle": "file:../record-store",
+    "chronicle": "file:../chronicle",
     "membrane": "file:../membrane"
   },
   "devDependencies": {

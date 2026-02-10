@@ -8,6 +8,8 @@ export type {
   BlobReference,
   StoredContentBlock,
   StoredMessageInternal,
+  MessageQuery,
+  MessageQueryResult,
 } from './message.js';
 
 // Context types

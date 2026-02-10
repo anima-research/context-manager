@@ -11,6 +11,8 @@ import type {
   BranchInfo,
   ContextStrategy,
   StrategyContext,
+  MessageQuery,
+  MessageQueryResult,
 } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -225,12 +227,48 @@ export class ContextManager {
     return this.messageStore.getAll();
   }
 
+  /**
+   * Query messages by filter criteria.
+   * Useful for finding messages from external sources, by participant, etc.
+   *
+   * @example
+   * // Find all messages from Discord
+   * const { messages } = manager.queryMessages({ source: 'discord' });
+   *
+   * @example
+   * // Find messages from a specific channel
+   * const { messages } = manager.queryMessages({
+   *   source: 'discord',
+   *   metadata: { 'external.channelId': '123456' }
+   * });
+   *
+   * @example
+   * // Find specific messages by external ID
+   * const { messages } = manager.queryMessages({
+   *   source: 'discord',
+   *   externalIds: ['msg1', 'msg2', 'msg3']
+   * });
+   */
+  queryMessages(filter: MessageQuery): MessageQueryResult {
+    return this.messageStore.query(filter);
+  }
+
+  /**
+   * Find a message by its external source and ID.
+   * Returns the internal message ID, or null if not found.
+   */
+  findMessageByExternalId(source: string, externalId: string): MessageId | null {
+    const msg = this.messageStore.findByExternalId(source, externalId);
+    return msg?.id ?? null;
+  }
+
   // ==========================================================================
   // Branching
   // ==========================================================================
 
   /**
    * Create a branch from a specific message.
+   * The new branch will have state as of that message's sequence (time-travel branching).
    */
   branchAt(messageId: MessageId, name?: string): string {
     const message = this.messageStore.get(messageId);
@@ -240,7 +278,12 @@ export class ContextManager {
 
     // Create branch name if not provided
     const branchName = name ?? `branch-${Date.now()}`;
-    const branch = this.store.createBranch(branchName, null);
+    
+    // Get current branch name to branch from
+    const currentBranch = this.store.currentBranch();
+    
+    // Use createBranchAt to branch at the message's sequence (time-travel)
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
 
     return branch.id;
   }

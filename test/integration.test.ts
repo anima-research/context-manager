@@ -189,6 +189,34 @@ describe('ContextManager', () => {
       assert.ok(branch.name);
       assert.ok(branch.id);
     });
+
+    it('should branch at specific message sequence (time-travel)', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+      });
+
+      // Add several messages to create history
+      const id1 = manager.addMessage('Alice', [{ type: 'text', text: 'Message 1' }]);
+      const id2 = manager.addMessage('Alice', [{ type: 'text', text: 'Message 2' }]);
+      const id3 = manager.addMessage('Bot', [{ type: 'text', text: 'Message 3' }]);
+      const id4 = manager.addMessage('Alice', [{ type: 'text', text: 'Message 4' }]);
+      const id5 = manager.addMessage('Bot', [{ type: 'text', text: 'Message 5' }]);
+
+      // Get the sequence of message 2 (we'll branch at this point)
+      const msg2 = manager.getMessage(id2);
+      assert.ok(msg2, 'Message 2 should exist');
+      const msg2Sequence = msg2!.sequence;
+
+      // Branch at message 2
+      const branchId = manager.branchAt(id2, 'time-travel-test');
+
+      // Verify the branch was created with correct branch point
+      const branches = manager.listBranches();
+      const newBranch = branches.find(b => b.name === 'time-travel-test');
+      assert.ok(newBranch, 'Time-travel branch should exist');
+      assert.strictEqual(newBranch!.branchPoint, msg2Sequence, 'Branch point should equal message 2 sequence');
+    });
   });
 
   describe('AutobiographicalStrategy', () => {
