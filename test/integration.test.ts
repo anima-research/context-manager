@@ -4,7 +4,7 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, PassthroughStrategy, AutobiographicalStrategy, ContextLog, MessageStore } from '../src/index.js';
 import { JsStore } from 'chronicle';
 import type { ContentBlock } from 'membrane';
-import type { ContextStrategy, StrategyContext, ReadinessState, MessageStoreView, ContextLogView, TokenBudget, ContextEntry, StoredMessage, SourceRelation } from '../src/types/index.js';
+import type { ContextStrategy, StrategyContext, ReadinessState, MessageStoreView, ContextLogView, TokenBudget, ContextEntry, StoredMessage, SourceRelation, ContextInjection } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-context-store';
 
@@ -125,7 +125,7 @@ describe('ContextManager', () => {
       manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
       manager.addMessage('Claude', [{ type: 'text', text: 'Hi!' }]);
 
-      const messages = await manager.compile();
+      const { messages } = await manager.compile();
 
       assert.strictEqual(messages.length, 2);
       assert.strictEqual(messages[0].participant, 'User');
@@ -145,7 +145,7 @@ describe('ContextManager', () => {
       }
 
       // Compile with a small budget
-      const messages = await manager.compile({
+      const { messages } = await manager.compile({
         maxTokens: 1000,
         reserveForResponse: 200,
       });
@@ -251,7 +251,7 @@ describe('ContextManager', () => {
       manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
       manager.addMessage('Claude', [{ type: 'text', text: 'Hi!' }]);
 
-      const messages = await manager.compile();
+      const { messages } = await manager.compile();
 
       // Should include our messages
       assert.ok(messages.length >= 2);
@@ -739,7 +739,7 @@ describe('ContextManager', () => {
 
       // Compile to see initial state (this triggers rebuildChunks)
       const initialCompiled = await manager.compile();
-      const initialCompiledCount = initialCompiled.length;
+      const initialCompiledCount = initialCompiled.messages.length;
 
       // Add more messages
       for (let i = 20; i < 30; i++) {
@@ -835,7 +835,7 @@ describe('ContextManager', () => {
 
       // Context manager works
       manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
-      const compiled = await manager.compile();
+      const { messages: compiled } = await manager.compile();
       assert.strictEqual(compiled.length, 1);
 
       // App can use its own state via the store
@@ -923,8 +923,8 @@ describe('ContextManager', () => {
       const betaCompiled = await agentBeta.compile();
 
       // Both see the same messages in their compiled context
-      assert.strictEqual(alphaCompiled.length, 2);
-      assert.strictEqual(betaCompiled.length, 2);
+      assert.strictEqual(alphaCompiled.messages.length, 2);
+      assert.strictEqual(betaCompiled.messages.length, 2);
 
       // Context logs are separate - verified by the fact that both work independently
 
@@ -977,8 +977,8 @@ describe('ContextManager', () => {
       const betaCompiled = await agentBeta.compile();
 
       // Both should compile successfully
-      assert.ok(alphaCompiled.length > 0);
-      assert.ok(betaCompiled.length > 0);
+      assert.ok(alphaCompiled.messages.length > 0);
+      assert.ok(betaCompiled.messages.length > 0);
 
       agentAlpha.close();
       agentBeta.close();
@@ -1048,7 +1048,7 @@ describe('ContextManager', () => {
 
       // Can still compile (uses uncompressed chunks + recent window)
       const compiled = await manager.compile();
-      assert.ok(compiled.length > 0);
+      assert.ok(compiled.messages.length > 0);
 
       // Now allow success
       shouldFail = false;
@@ -1060,7 +1060,7 @@ describe('ContextManager', () => {
 
       // Should still work
       const recompiled = await manager.compile();
-      assert.ok(recompiled.length > 0);
+      assert.ok(recompiled.messages.length > 0);
 
       manager.close();
       rmSync(storePath, { recursive: true, force: true });
@@ -1116,10 +1116,367 @@ describe('ContextManager', () => {
 
       // Compile should still work (falls back to uncompressed)
       const compiled = await manager.compile();
-      assert.ok(compiled.length > 0);
+      assert.ok(compiled.messages.length > 0);
 
       manager.close();
       rmSync(storePath, { recursive: true, force: true });
+    });
+  });
+  describe('Context Injection Merging', () => {
+    it('should return empty systemInjections when no injections provided', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'Hi!' }]);
+
+      const result = await manager.compile();
+
+      assert.strictEqual(result.messages.length, 2);
+      assert.strictEqual(result.systemInjections.length, 0);
+    });
+
+    it('should return empty systemInjections when injections array is empty', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
+
+      const result = await manager.compile(undefined, []);
+
+      assert.strictEqual(result.messages.length, 1);
+      assert.strictEqual(result.systemInjections.length, 0);
+    });
+
+    it('should separate system-position injections into systemInjections', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'Hi!' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'memory',
+          position: 'system',
+          content: [{ type: 'text', text: '<memories>User likes cats</memories>' }],
+          metadata: { memoryIds: ['mem_1'] },
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // System injections should be separated out
+      assert.strictEqual(result.systemInjections.length, 1);
+      assert.strictEqual(result.systemInjections[0].type, 'text');
+      if (result.systemInjections[0].type === 'text') {
+        assert.ok(result.systemInjections[0].text.includes('User likes cats'));
+      }
+
+      // Messages should be unchanged (no system injection in messages array)
+      assert.strictEqual(result.messages.length, 2);
+      assert.strictEqual(result.messages[0].participant, 'User');
+      assert.strictEqual(result.messages[1].participant, 'Claude');
+    });
+
+    it('should insert beforeUser injections before last user message', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'First question' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'First answer' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Second question' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'rag',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'Relevant document excerpt...' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Should be: User, Claude, injection:rag, User
+      assert.strictEqual(result.messages.length, 4);
+      assert.strictEqual(result.messages[0].participant, 'User');
+      assert.strictEqual(result.messages[1].participant, 'Claude');
+      assert.strictEqual(result.messages[2].participant, 'injection:rag');
+      assert.strictEqual(result.messages[3].participant, 'User');
+
+      // Verify injection content
+      if (result.messages[2].content[0].type === 'text') {
+        assert.strictEqual(result.messages[2].content[0].text, 'Relevant document excerpt...');
+      }
+    });
+
+    it('should insert afterUser injections after last user message', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'First question' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'First answer' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Second question' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'context',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'Additional context after user input' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Should be: User, Claude, User, injection:context
+      assert.strictEqual(result.messages.length, 4);
+      assert.strictEqual(result.messages[0].participant, 'User');
+      assert.strictEqual(result.messages[1].participant, 'Claude');
+      assert.strictEqual(result.messages[2].participant, 'User');
+      assert.strictEqual(result.messages[3].participant, 'injection:context');
+    });
+
+    it('should handle all three injection positions together', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Hello' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'Hi!' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'How are you?' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'memory',
+          position: 'system',
+          content: [{ type: 'text', text: 'System memory' }],
+        },
+        {
+          namespace: 'rag',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'Before user context' }],
+        },
+        {
+          namespace: 'tools',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'After user context' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // System injections separated out
+      assert.strictEqual(result.systemInjections.length, 1);
+      if (result.systemInjections[0].type === 'text') {
+        assert.strictEqual(result.systemInjections[0].text, 'System memory');
+      }
+
+      // Messages: User, Claude, injection:rag, User, injection:tools
+      assert.strictEqual(result.messages.length, 5);
+      assert.strictEqual(result.messages[0].participant, 'User');
+      assert.strictEqual(result.messages[1].participant, 'Claude');
+      assert.strictEqual(result.messages[2].participant, 'injection:rag');
+      assert.strictEqual(result.messages[3].participant, 'User');
+      assert.strictEqual(result.messages[4].participant, 'injection:tools');
+    });
+
+    it('should handle multiple injections at the same position', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Question' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'memory',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'Memory injection' }],
+        },
+        {
+          namespace: 'rag',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'RAG injection' }],
+        },
+        {
+          namespace: 'persona',
+          position: 'system',
+          content: [{ type: 'text', text: 'Persona context' }],
+        },
+        {
+          namespace: 'compliance',
+          position: 'system',
+          content: [{ type: 'text', text: 'Compliance rules' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Two system injections (flattened into content blocks)
+      assert.strictEqual(result.systemInjections.length, 2);
+
+      // Messages: injection:memory, injection:rag, User (both beforeUser injections before user)
+      assert.strictEqual(result.messages.length, 3);
+      assert.strictEqual(result.messages[0].participant, 'injection:memory');
+      assert.strictEqual(result.messages[1].participant, 'injection:rag');
+      assert.strictEqual(result.messages[2].participant, 'User');
+    });
+
+    it('should handle injections when there is no user message', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      // Only assistant messages, no user message
+      manager.addMessage('Claude', [{ type: 'text', text: 'Thinking aloud...' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'memory',
+          position: 'system',
+          content: [{ type: 'text', text: 'System context' }],
+        },
+        {
+          namespace: 'rag',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'Before user (no user to anchor)' }],
+        },
+        {
+          namespace: 'tools',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'After user (no user to anchor)' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // System injection works regardless
+      assert.strictEqual(result.systemInjections.length, 1);
+
+      // beforeUser has no user message to anchor to — should be skipped
+      // afterUser has no user message — should append at end
+      assert.strictEqual(result.messages.length, 2);
+      assert.strictEqual(result.messages[0].participant, 'Claude');
+      assert.strictEqual(result.messages[1].participant, 'injection:tools');
+    });
+
+    it('should handle injections with multimodal content', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Look at this' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'vision',
+          position: 'beforeUser',
+          content: [
+            { type: 'text', text: 'Here is relevant visual context:' },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                data: 'iVBORw0KGgo=',
+                mediaType: 'image/png',
+              },
+            },
+          ],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      assert.strictEqual(result.messages.length, 2);
+      assert.strictEqual(result.messages[0].participant, 'injection:vision');
+      assert.strictEqual(result.messages[0].content.length, 2);
+      assert.strictEqual(result.messages[0].content[0].type, 'text');
+      assert.strictEqual(result.messages[0].content[1].type, 'image');
+    });
+
+    it('should preserve injection order within same position', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Question' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'first',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'First after' }],
+        },
+        {
+          namespace: 'second',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'Second after' }],
+        },
+        {
+          namespace: 'third',
+          position: 'afterUser',
+          content: [{ type: 'text', text: 'Third after' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Order should be preserved: User, first, second, third
+      assert.strictEqual(result.messages.length, 4);
+      assert.strictEqual(result.messages[1].participant, 'injection:first');
+      assert.strictEqual(result.messages[2].participant, 'injection:second');
+      assert.strictEqual(result.messages[3].participant, 'injection:third');
+    });
+
+    it('should handle case-insensitive user participant matching', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      // Different casing of "user"
+      manager.addMessage('user', [{ type: 'text', text: 'lowercase user' }]);
+
+      const injections: ContextInjection[] = [
+        {
+          namespace: 'test',
+          position: 'beforeUser',
+          content: [{ type: 'text', text: 'Injected before' }],
+        },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Should still find the user message despite lowercase
+      assert.strictEqual(result.messages.length, 2);
+      assert.strictEqual(result.messages[0].participant, 'injection:test');
+      assert.strictEqual(result.messages[1].participant, 'user');
     });
   });
 });

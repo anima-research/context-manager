@@ -30,6 +30,8 @@ export type {
   TokenBudget,
   PendingWork,
   BranchInfo,
+  ContextInjection,
+  CompileResult,
   // Strategy types
   MessageStoreView,
   ContextLogView,

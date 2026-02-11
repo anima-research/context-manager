@@ -20,6 +20,8 @@ export type {
   TokenBudget,
   PendingWork,
   BranchInfo,
+  ContextInjection,
+  CompileResult,
 } from './context.js';
 
 // Strategy types

@@ -1,4 +1,4 @@
-import type { ContentBlock } from 'membrane';
+import type { ContentBlock, NormalizedMessage } from 'membrane';
 import type { MessageId, StoredContentBlock } from './message.js';
 
 /**
@@ -64,6 +64,40 @@ export interface PendingWork {
   estimatedMs?: number;
   /** When the work started */
   started: Date;
+}
+
+/**
+ * An injection into the compiled context.
+ * Source-agnostic: may come from MCPL servers, local strategies, or application code.
+ */
+export interface ContextInjection {
+  /** Server-defined namespace (e.g., "memory", "compliance") */
+  namespace: string;
+
+  /** Where to inject in the message array */
+  position: 'system' | 'beforeUser' | 'afterUser';
+
+  /** Content blocks to inject (multimodal) */
+  content: ContentBlock[];
+
+  /** Arbitrary metadata (passed through, not interpreted) */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Result of context compilation.
+ * Separates system-position injections from message-level content.
+ */
+export interface CompileResult {
+  /** Compiled messages (includes beforeUser/afterUser injections merged in) */
+  messages: NormalizedMessage[];
+
+  /**
+   * System-position injections, grouped by namespace.
+   * Caller should append these to the system prompt.
+   * Separated because the system prompt is outside context-manager's scope.
+   */
+  systemInjections: ContentBlock[];
 }
 
 /**

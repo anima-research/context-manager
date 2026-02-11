@@ -48,9 +48,9 @@ describe('AutobiographicalStrategy - Compression', () => {
     }
 
     const compiled = await manager.compile();
-    assert.ok(compiled.length > 0, 'Should compile context');
+    assert.ok(compiled.messages.length > 0, 'Should compile context');
 
-    console.log('Compiled', compiled.length, 'entries');
+    console.log('Compiled', compiled.messages.length, 'entries');
     manager.close();
   });
 });

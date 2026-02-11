@@ -13,6 +13,8 @@ import type {
   StrategyContext,
   MessageQuery,
   MessageQueryResult,
+  ContextInjection,
+  CompileResult,
 } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -351,10 +353,20 @@ export class ContextManager {
   }
 
   /**
-   * Compile context to NormalizedMessage[] for Membrane.
+   * Compile context for Membrane.
+   *
+   * Accepts optional context injections (e.g., from MCPL servers) and merges
+   * them into the compiled output by position:
+   * - "system": returned separately in `systemInjections` (caller appends to system prompt)
+   * - "beforeUser": inserted before the last user message
+   * - "afterUser": inserted after the last user message
+   *
    * May block if strategy has pending work.
    */
-  async compile(budget?: TokenBudget): Promise<NormalizedMessage[]> {
+  async compile(
+    budget?: TokenBudget,
+    injections?: ContextInjection[]
+  ): Promise<CompileResult> {
     // Check readiness and wait if needed
     const readiness = this.strategy.checkReadiness();
     if (!readiness.ready && readiness.pendingWork) {
@@ -375,10 +387,66 @@ export class ContextManager {
     );
 
     // Convert to NormalizedMessage[]
-    return entries.map((entry) => ({
+    const messages: NormalizedMessage[] = entries.map((entry) => ({
       participant: entry.participant,
       content: entry.content,
     }));
+
+    // If no injections, return early
+    if (!injections || injections.length === 0) {
+      return { messages, systemInjections: [] };
+    }
+
+    // Separate injections by position
+    const systemInjections: ContentBlock[] = [];
+    const beforeUser: ContextInjection[] = [];
+    const afterUser: ContextInjection[] = [];
+
+    for (const injection of injections) {
+      switch (injection.position) {
+        case 'system':
+          systemInjections.push(...injection.content);
+          break;
+        case 'beforeUser':
+          beforeUser.push(injection);
+          break;
+        case 'afterUser':
+          afterUser.push(injection);
+          break;
+      }
+    }
+
+    // Find last user message index (participant is typically 'user' or 'User')
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].participant.toLowerCase() === 'user') {
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    // Insert beforeUser injections before last user message
+    if (beforeUser.length > 0 && lastUserIdx >= 0) {
+      const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
+        participant: `injection:${inj.namespace}`,
+        content: inj.content,
+      }));
+      messages.splice(lastUserIdx, 0, ...injectedMessages);
+      // Adjust lastUserIdx to account for inserted messages
+      lastUserIdx += injectedMessages.length;
+    }
+
+    // Insert afterUser injections after last user message
+    if (afterUser.length > 0) {
+      const insertIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : messages.length;
+      const injectedMessages: NormalizedMessage[] = afterUser.map((inj) => ({
+        participant: `injection:${inj.namespace}`,
+        content: inj.content,
+      }));
+      messages.splice(insertIdx, 0, ...injectedMessages);
+    }
+
+    return { messages, systemInjections };
   }
 
   // ==========================================================================
