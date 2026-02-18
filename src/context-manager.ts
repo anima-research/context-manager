@@ -89,6 +89,7 @@ export class ContextManager {
   private initialized = false;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
+  private debugLogContext: boolean;
 
   private constructor(
     store: JsStore,
@@ -96,7 +97,8 @@ export class ContextManager {
     contextLog: ContextLog,
     strategy: ContextStrategy,
     ownsStore: boolean,
-    membrane?: Membrane
+    membrane?: Membrane,
+    debugLogContext = false,
   ) {
     this.store = store;
     this.messageStore = messageStore;
@@ -104,6 +106,7 @@ export class ContextManager {
     this.strategy = strategy;
     this.ownsStore = ownsStore;
     this.membrane = membrane;
+    this.debugLogContext = debugLogContext;
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
@@ -166,7 +169,8 @@ export class ContextManager {
       contextLog,
       strategy,
       ownsStore,
-      config.membrane
+      config.membrane,
+      config.debugLogContext ?? false,
     );
 
     // Initialize strategy
@@ -401,9 +405,11 @@ export class ContextManager {
       content: entry.content,
     }));
 
-    // If no injections, return early
+    // If no injections, log and return early
     if (!injections || injections.length === 0) {
-      return { messages, systemInjections: [] };
+      const result = { messages, systemInjections: [] };
+      if (this.debugLogContext) this.logCompiledContext(result);
+      return result;
     }
 
     // Separate injections by position
@@ -455,7 +461,45 @@ export class ContextManager {
       messages.splice(insertIdx, 0, ...injectedMessages);
     }
 
-    return { messages, systemInjections };
+    const result = { messages, systemInjections };
+    if (this.debugLogContext) this.logCompiledContext(result);
+    return result;
+  }
+
+  /**
+   * Append a snapshot of the compiled context to the context log.
+   * Each entry captures the full rendered messages (including injections)
+   * as sent to the LLM, for post-hoc debugging.
+   */
+  private logCompiledContext(result: CompileResult): void {
+    const renderedMessages = result.messages.map((m) => {
+      // Flatten content blocks into a single text for readability
+      const text = m.content
+        .map((b) => {
+          switch (b.type) {
+            case 'text': return b.text;
+            case 'thinking': return `[thinking] ${b.thinking}`;
+            case 'tool_use': return `[tool_use:${b.name}] ${JSON.stringify(b.input)}`;
+            case 'tool_result': return `[tool_result:${b.toolUseId}] ${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}`;
+            default: return `[${b.type}]`;
+          }
+        })
+        .join('\n');
+      return { participant: m.participant, text };
+    });
+
+    const entry = {
+      timestamp: Date.now(),
+      type: 'compiled_context',
+      messageCount: result.messages.length,
+      systemInjectionCount: result.systemInjections.length,
+      messages: renderedMessages,
+    };
+
+    this.contextLog.append(
+      'debug',
+      [{ type: 'text', text: JSON.stringify(entry) }],
+    );
   }
 
   // ==========================================================================
