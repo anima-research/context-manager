@@ -297,7 +297,10 @@ export class MessageStore {
         if (typeof block.content === 'string') {
           return this.tokenEstimator(block.content);
         }
-        return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
+        if (Array.isArray(block.content)) {
+          return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
+        }
+        return 0;
       case 'image':
         return block.tokenEstimate ?? 1000; // Default estimate for images
       case 'document':
