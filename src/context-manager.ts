@@ -33,12 +33,14 @@ interface ContextManagerBaseConfig {
   /**
    * Namespace for multi-agent support.
    * When set, the context log uses state ID `{namespace}/context`.
-   * Messages remain shared (no namespace) for Option B multi-agent scenarios.
+   * Messages remain shared (no namespace) unless `isolate` is true.
    */
   namespace?: string;
   /**
-   * When true, this context manager uses an isolated message store.
-   * Used by ephemeral/subagent context managers that should not share messages.
+   * When true, the namespace applies to messages as well as the context log,
+   * giving fully isolated state: `{namespace}/messages` + `{namespace}/context`.
+   * Use for subagents that should not share message state with the parent.
+   * Requires `namespace` to be set.
    */
   isolate?: boolean;
   /**
@@ -141,9 +143,12 @@ export class ContextManager {
       throw new Error('ContextManagerConfig must have either "path" or "store"');
     }
 
+    // Namespace for messages: only when `isolate` is true
+    const messageNamespace = config.isolate ? config.namespace : undefined;
+
     // Register states if needed (idempotent)
     try {
-      MessageStore.register(store);
+      MessageStore.register(store, messageNamespace);
     } catch {
       // State already registered
     }
@@ -156,6 +161,7 @@ export class ContextManager {
 
     const messageStore = new MessageStore(store, {
       estimator: config.tokenEstimator,
+      namespace: messageNamespace,
     });
     const contextLog = new ContextLog(store, {
       estimator: config.tokenEstimator,
