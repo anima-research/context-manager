@@ -140,6 +140,9 @@ export interface AutobiographicalConfig {
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
+  /** Maximum tokens per individual message in compiled output. Messages exceeding
+   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+  maxMessageTokens: number;
 
   // Legacy aliases (deprecated, use summary* instead)
   /** @deprecated Use summarySystemPrompt */
@@ -218,4 +221,5 @@ Capture what matters:
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   summaryParticipant: 'Claude',
+  maxMessageTokens: 0,
 };

@@ -53,6 +53,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
   private chunks: Chunk[] = [];
   private pendingCompression: Promise<void> | null = null;
   private compressionQueue: number[] = [];
+  private _compressionCount = 0;
 
   // Hierarchical state
   private summaries: SummaryEntry[] = [];
@@ -71,6 +72,15 @@ export class AutobiographicalStrategy implements ContextStrategy {
       this.config.l2BudgetTokens ??= 30000;
       this.config.l1BudgetTokens ??= 30000;
     }
+  }
+
+  /** Compression statistics for observability (e.g., TUI display). */
+  getStats(): { chunksTotal: number; chunksCompressed: number; compressionCount: number } {
+    return {
+      chunksTotal: this.chunks.length,
+      chunksCompressed: this.chunks.filter(c => c.compressed).length,
+      compressionCount: this._compressionCount,
+    };
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
@@ -198,9 +208,11 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
     // 1. Head window: preserved verbatim as raw copies
     const headEnd = this.getHeadWindowEnd(store);
+    const msgCap = this.config.maxMessageTokens;
     for (let i = 0; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = store.estimateTokens(msg);
+      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
       if (totalTokens + tokens > maxTokens) break;
 
       entries.push({
@@ -208,52 +220,91 @@ export class AutobiographicalStrategy implements ContextStrategy {
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
-        content: msg.content,
+        content,
       });
       totalTokens += tokens;
     }
 
-    // 2. Compressed chunks as diary pairs
+    // 2. Middle zone: compressed chunks as diary pairs, uncompressed as raw messages.
+    //    Uncompressed chunks arise when compression hasn't run yet (e.g. fresh forks).
+    //    Without this fallback, messages in the gap between head and recent windows
+    //    would be silently dropped.
+    const rawRecentStart = this.getRecentWindowStart(store);
+    let middleCoveredUpTo = headEnd; // tracks which gap messages have been emitted
+
     for (const chunk of this.chunks) {
-      if (!chunk.compressed || !chunk.diary) {
-        continue;
+      if (chunk.compressed && chunk.diary) {
+        // Emit as diary pair
+        const contextLabel = this.config.summaryContextLabel ?? 'Here is a summary of earlier conversation context:';
+        const summaryParticipant = this.config.summaryParticipant ?? 'Summary';
+
+        const questionEntry: ContextEntry = {
+          index: entries.length,
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: contextLabel }],
+          sourceRelation: 'derived',
+        };
+
+        const answerEntry: ContextEntry = {
+          index: entries.length + 1,
+          participant: summaryParticipant,
+          content: [{ type: 'text', text: chunk.diary }],
+          sourceRelation: 'derived',
+        };
+
+        const pairTokens = this.estimateTokens(questionEntry.content) +
+                           this.estimateTokens(answerEntry.content);
+
+        if (totalTokens + pairTokens > maxTokens) break;
+
+        entries.push(questionEntry);
+        entries.push(answerEntry);
+        totalTokens += pairTokens;
+      } else {
+        // Uncompressed: emit raw messages so they aren't lost
+        for (const msg of chunk.messages) {
+          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+          const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+          if (totalTokens + tokens > maxTokens) break;
+
+          entries.push({
+            index: entries.length,
+            sourceMessageId: msg.id,
+            sourceRelation: 'copy',
+            participant: msg.participant,
+            content,
+          });
+          totalTokens += tokens;
+        }
       }
+      middleCoveredUpTo = chunk.endIndex;
+    }
 
-      const contextLabel = this.config.summaryContextLabel ?? 'Here is a summary of earlier conversation context:';
-      const summaryParticipant = this.config.summaryParticipant ?? 'Summary';
+    // Emit any gap messages not covered by chunks (remainder < 4 messages)
+    for (let i = middleCoveredUpTo; i < rawRecentStart && i < messages.length; i++) {
+      const msg = messages[i];
+      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      if (totalTokens + tokens > maxTokens) break;
 
-      const questionEntry: ContextEntry = {
+      entries.push({
         index: entries.length,
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: contextLabel }],
-        sourceRelation: 'derived',
-      };
-
-      const answerEntry: ContextEntry = {
-        index: entries.length + 1,
-        participant: summaryParticipant,
-        content: [{ type: 'text', text: chunk.diary }],
-        sourceRelation: 'derived',
-      };
-
-      const pairTokens = this.estimateTokens(questionEntry.content) +
-                         this.estimateTokens(answerEntry.content);
-
-      if (totalTokens + pairTokens > maxTokens) {
-        break;
-      }
-
-      entries.push(questionEntry);
-      entries.push(answerEntry);
-      totalTokens += pairTokens;
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content,
+      });
+      totalTokens += tokens;
     }
 
     // 3. Recent uncompressed messages
-    const recentStart = this.getRecentWindowStart(store);
+    // Guard: skip messages already emitted in the head window
+    const recentStart = Math.max(this.getRecentWindowStart(store), headEnd);
 
     for (let i = recentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = store.estimateTokens(msg);
+      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
 
       if (totalTokens + tokens > maxTokens) {
         break;
@@ -264,7 +315,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
-        content: msg.content,
+        content,
       });
 
       totalTokens += tokens;
@@ -314,6 +365,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
       chunk.compressed = true;
       chunk.diary = diaryText;
+      this._compressionCount++;
     } catch (error) {
       console.error('Failed to compress chunk:', error);
       throw error;
@@ -943,5 +995,61 @@ export class AutobiographicalStrategy implements ContextStrategy {
       }
     }
     return tokens;
+  }
+
+  /**
+   * Truncate a message's content blocks to fit within maxMessageTokens.
+   * Returns the original content if no truncation is needed, or a new array
+   * with text/tool_result blocks trimmed.
+   */
+  private truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+    if (maxTokens <= 0) return content;
+    const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
+    if (est <= maxTokens) return content;
+
+    const maxChars = maxTokens * 4; // inverse of chars/4 estimate
+    const result: ContentBlock[] = [];
+    let remaining = maxChars;
+
+    for (const block of content) {
+      if (block.type === 'text') {
+        if (remaining <= 0) {
+          continue;
+        }
+        if (block.text.length <= remaining) {
+          result.push(block);
+          remaining -= block.text.length;
+        } else {
+          result.push({
+            type: 'text',
+            text: block.text.slice(0, remaining) + '\n\n[truncated — original was ' +
+              Math.ceil(block.text.length / 4) + ' tokens]',
+          });
+          remaining = 0;
+        }
+      } else if (block.type === 'tool_result') {
+        if (typeof (block as any).content === 'string') {
+          const content = (block as any).content as string;
+          if (content.length > remaining && remaining > 0) {
+            result.push({
+              ...block,
+              content: content.slice(0, remaining) + '\n\n[truncated — original was ' +
+                Math.ceil(content.length / 4) + ' tokens]',
+            } as ContentBlock);
+            remaining = 0;
+          } else if (remaining > 0) {
+            result.push(block);
+            remaining -= content.length;
+          }
+        } else {
+          result.push(block);
+        }
+      } else {
+        // tool_use, image, etc — pass through
+        result.push(block);
+      }
+    }
+
+    return result;
   }
 }
