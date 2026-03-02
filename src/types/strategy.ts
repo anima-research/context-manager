@@ -70,6 +70,11 @@ export interface ContextStrategy {
   /** Strategy name for identification */
   readonly name: string;
 
+  /** Maximum tokens per individual message. Used by the framework to truncate
+   *  tool results in-flight (yielding stream) and at storage time.
+   *  0 or undefined = no limit. */
+  readonly maxMessageTokens?: number;
+
   /**
    * Initialize the strategy with context.
    * Called when strategy is set on ContextManager.

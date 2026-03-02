@@ -40,6 +40,8 @@ interface Chunk {
 export class AutobiographicalStrategy implements ContextStrategy {
   readonly name = 'autobiographical';
 
+  get maxMessageTokens(): number { return this.config.maxMessageTokens; }
+
   private config: AutobiographicalConfig;
   private chunks: Chunk[] = [];
   private pendingCompression: Promise<void> | null = null;
