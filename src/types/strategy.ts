@@ -71,6 +71,12 @@ export interface ContextStrategy {
   readonly name: string;
 
   /**
+   * Maximum tokens per individual message (used by framework to truncate
+   * large tool results before they enter the context window).
+   */
+  maxMessageTokens?: number;
+
+  /**
    * Initialize the strategy with context.
    * Called when strategy is set on ContextManager.
    */

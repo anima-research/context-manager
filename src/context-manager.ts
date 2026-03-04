@@ -36,6 +36,15 @@ interface ContextManagerBaseConfig {
    * Messages remain shared (no namespace) for Option B multi-agent scenarios.
    */
   namespace?: string;
+  /**
+   * When true, this context manager uses an isolated message store.
+   * Used by ephemeral/subagent context managers that should not share messages.
+   */
+  isolate?: boolean;
+  /**
+   * When true, log the compiled context to stderr for debugging.
+   */
+  debugLogContext?: boolean;
 }
 
 /**
