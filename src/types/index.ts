@@ -32,6 +32,8 @@ export type {
   ReadinessState,
   ContextStrategy,
   AutobiographicalConfig,
+  SummaryLevel,
+  SummaryEntry,
 } from './strategy.js';
 
 export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from './strategy.js';

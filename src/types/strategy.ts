@@ -139,6 +139,53 @@ export interface AutobiographicalConfig {
   diarySystemPrompt?: string;
   /** @deprecated Use summaryUserPrompt */
   diaryUserPrompt?: string;
+
+  // --- Hierarchical compression (L1/L2/L3 pyramid) ---
+
+  /** Enable hierarchical 3-level compression. Set to false for single-level legacy compression. */
+  hierarchical?: boolean;
+  /** Number of unmerged summaries before merging to the next level (default: 6) */
+  mergeThreshold?: number;
+  /** Token target for each summary at any level (default: 2000) */
+  summaryTargetTokens?: number;
+  /** Token budget for L3 summaries in select() (default: 30000) */
+  l3BudgetTokens?: number;
+  /** Token budget for L2 summaries in select() (default: 30000) */
+  l2BudgetTokens?: number;
+  /** Token budget for L1 summaries in select() (default: 30000) */
+  l1BudgetTokens?: number;
+}
+
+/**
+ * Compression level in the hierarchical pyramid.
+ */
+export type SummaryLevel = 1 | 2 | 3;
+
+/**
+ * A summary entry in the hierarchical memory pyramid.
+ * L1: compressed from raw message chunks.
+ * L2: merged from mergeThreshold L1s.
+ * L3: merged from mergeThreshold L2s.
+ */
+export interface SummaryEntry {
+  /** Unique ID (e.g., "L1-0", "L2-3") */
+  id: string;
+  /** Compression level */
+  level: SummaryLevel;
+  /** The summary text */
+  content: string;
+  /** Estimated token count (content.length / 4) */
+  tokens: number;
+  /** Level of the sources: 0 = raw messages, 1 = L1s, 2 = L2s */
+  sourceLevel: 0 | 1 | 2;
+  /** IDs of source items (message IDs for L1, summary IDs for L2/L3) */
+  sourceIds: string[];
+  /** Range of original message IDs covered */
+  sourceRange: { first: string; last: string };
+  /** If merged into a higher-level summary, that summary's ID */
+  mergedInto?: string;
+  /** Creation timestamp */
+  created: number;
 }
 
 /**

@@ -39,6 +39,8 @@ export type {
   ReadinessState,
   ContextStrategy,
   AutobiographicalConfig,
+  SummaryLevel,
+  SummaryEntry,
 } from './types/index.js';
 
 export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from './types/index.js';
