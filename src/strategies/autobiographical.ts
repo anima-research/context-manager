@@ -326,6 +326,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
       totalTokens += tokens;
     }
 
+    this.trimOrphanedToolUse(entries);
     return entries;
   }
 
@@ -804,6 +805,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
       totalTokens += tokens;
     }
 
+    this.trimOrphanedToolUse(entries);
     return entries;
   }
 
@@ -988,8 +990,9 @@ export class AutobiographicalStrategy implements ContextStrategy {
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.recentWindowTokens) {
         let boundary = i + 1;
-        // Don't split tool_use/tool_result pairs
-        while (boundary > 0 && boundary < messages.length && this.hasToolResult(messages[boundary])) {
+        // Don't split a tool_use/tool_result pair: if the message at the boundary
+        // is a tool_result, include the preceding tool_use with it (retreat by 1).
+        if (boundary > 0 && boundary < messages.length && this.hasToolResult(messages[boundary])) {
           boundary--;
         }
         return boundary;
@@ -1013,8 +1016,10 @@ export class AutobiographicalStrategy implements ContextStrategy {
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
         let boundary = i;
-        // Don't split tool_use/tool_result pairs
-        while (boundary > 0 && this.hasToolUse(messages[boundary - 1])) {
+        // Don't split a tool_use/tool_result pair: if the last message in the
+        // head window has tool_use, pull boundary back by 1 so the tool_use
+        // and its tool_result stay together outside the head window.
+        if (boundary > 0 && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
         return boundary;
@@ -1030,6 +1035,24 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
   protected hasToolResult(message: StoredMessage): boolean {
     return message.content.some(block => block.type === 'tool_result');
+  }
+
+  /**
+   * Remove trailing entries that contain tool_use without a following tool_result.
+   * This prevents orphaned tool_use blocks when a budget break cuts between
+   * a tool_use message and its tool_result response.
+   */
+  private trimOrphanedToolUse(entries: ContextEntry[]): void {
+    while (entries.length > 0) {
+      const last = entries[entries.length - 1];
+      const hasUse = last.content.some(b => b.type === 'tool_use');
+      const hasResult = last.content.some(b => b.type === 'tool_result');
+      if (hasUse && !hasResult) {
+        entries.pop();
+      } else {
+        break;
+      }
+    }
   }
 
   protected isChunkOldEnough(chunk: Chunk): boolean {

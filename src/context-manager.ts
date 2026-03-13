@@ -144,6 +144,9 @@ export class ContextManager {
     }
 
     // Namespace for messages: only when `isolate` is true
+    if (config.isolate && !config.namespace) {
+      throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
+    }
     const messageNamespace = config.isolate ? config.namespace : undefined;
 
     // Register states if needed (idempotent)
