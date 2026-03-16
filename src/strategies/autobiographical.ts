@@ -1166,20 +1166,20 @@ export class AutobiographicalStrategy implements ContextStrategy {
       } else if (block.type === 'tool_result') {
         // tool_result blocks MUST always be included — the Anthropic API requires
         // every tool_use to have a matching tool_result.  Dropping one causes a 400.
-        if (typeof (block as any).content === 'string') {
-          const text = (block as any).content as string;
+        if (typeof block.content === 'string') {
+          const text = block.content;
           if (remaining <= 0) {
             // Budget exhausted — include with minimal content to preserve pairing
             result.push({
               ...block,
               content: '[content omitted — context budget exceeded]',
-            } as ContentBlock);
+            });
           } else if (text.length > remaining) {
             result.push({
               ...block,
               content: safeSlice(text, 0, remaining) + '\n\n[truncated — original was ' +
                 Math.ceil(text.length / 4) + ' tokens]',
-            } as ContentBlock);
+            });
             remaining = 0;
           } else {
             result.push(block);
