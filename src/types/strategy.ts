@@ -70,11 +70,10 @@ export interface ContextStrategy {
   /** Strategy name for identification */
   readonly name: string;
 
-  /**
-   * Maximum tokens per individual message (used by framework to truncate
-   * large tool results before they enter the context window).
-   */
-  maxMessageTokens?: number;
+  /** Maximum tokens per individual message. Used by the framework to truncate
+   *  tool results in-flight (yielding stream) and at storage time.
+   *  0 or undefined = no limit. */
+  readonly maxMessageTokens?: number;
 
   /**
    * Initialize the strategy with context.
@@ -119,10 +118,17 @@ export interface AutobiographicalConfig {
   targetChunkTokens: number;
   /** Recent tokens to keep uncompressed (~30000) */
   recentWindowTokens: number;
+  /** Tokens at the head of the conversation to preserve verbatim (default: 0).
+   *  Messages within this window are never chunked or compressed — they survive
+   *  as raw copies so initial instructions retain full granularity. */
+  headWindowTokens: number;
   /** Always break at message boundaries */
   chunkOnMessageBoundary: boolean;
   /** Don't count attachment tokens toward chunk size */
   attachmentsIgnoreSize: boolean;
+  /** When true, onNewMessage() fires tick() as a background promise so compression
+   *  runs automatically without the framework calling tick() explicitly. */
+  autoTickOnNewMessage: boolean;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
@@ -133,6 +139,9 @@ export interface AutobiographicalConfig {
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
+  /** Maximum tokens per individual message in compiled output. Messages exceeding
+   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+  maxMessageTokens: number;
 
   // Legacy aliases (deprecated, use summary* instead)
   /** @deprecated Use summarySystemPrompt */
@@ -186,6 +195,43 @@ export interface SummaryEntry {
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
+  /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
+  phaseType?: string;
+}
+
+/**
+ * Phase type for knowledge extraction workflows.
+ */
+export type PhaseType = 'research' | 'synthesis' | 'lesson' | 'subagent';
+
+/**
+ * Configuration for the Knowledge strategy.
+ * Extends AutobiographicalConfig with phase-aware compression settings.
+ */
+export interface KnowledgeConfig extends AutobiographicalConfig {
+  /** Tool name prefixes that indicate research/retrieval activity.
+   *  Default: ['mcpl:', 'zulip:'] */
+  researchToolPrefixes?: string[];
+  /** Tool name prefixes that indicate subagent coordination.
+   *  Default: ['subagent:'] */
+  subagentToolPrefixes?: string[];
+  /** Exact tool names that indicate lesson capture.
+   *  Default: ['lessons:create', 'lessons:update'] */
+  lessonToolNames?: string[];
+
+  /** Max chunk tokens for research phases (default: 2x targetChunkTokens) */
+  maxResearchChunkTokens?: number;
+  /** Max chunk tokens for synthesis phases (default: 1.5x targetChunkTokens) */
+  maxSynthesisChunkTokens?: number;
+  /** Max chunk tokens for subagent phases (default: 2x targetChunkTokens) */
+  maxSubagentChunkTokens?: number;
+  /** Max chunk tokens for lesson phases (default: targetChunkTokens) */
+  maxLessonChunkTokens?: number;
+
+  /** Maximum fraction of L1 budget for research summaries (default: 0.3) */
+  researchL1BudgetCap?: number;
+  /** Minimum fraction of L1 budget for synthesis summaries (default: 0.4) */
+  synthesisL1BudgetFloor?: number;
 }
 
 /**
@@ -194,8 +240,10 @@ export interface SummaryEntry {
 export const DEFAULT_AUTOBIOGRAPHICAL_CONFIG: AutobiographicalConfig = {
   targetChunkTokens: 3000,
   recentWindowTokens: 30000,
+  headWindowTokens: 0,
   chunkOnMessageBoundary: true,
   attachmentsIgnoreSize: true,
+  autoTickOnNewMessage: false,
   summarySystemPrompt: 'You are forming a memory of an earlier part of this conversation. The context you see is continuous with your experience - what you read is what happened. Write authentically about what occurred.',
   summaryUserPrompt: `What do you recall from this part of the conversation?
 
@@ -209,4 +257,5 @@ Capture what matters:
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   summaryParticipant: 'Claude',
+  maxMessageTokens: 0,
 };

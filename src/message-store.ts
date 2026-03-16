@@ -12,7 +12,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 
-const MESSAGE_STATE_ID = 'messages';
+const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
 /**
  * Event emitted when the message store changes.
@@ -45,11 +45,18 @@ export class MessageStore {
   private listeners: Set<MessageStoreListener> = new Set();
   private idToIndex: Map<MessageId, number> = new Map();
   private tokenEstimator: (text: string) => number;
+  private stateId: string;
 
   constructor(
     private store: JsStore,
-    options: TokenEstimatorOptions = {}
+    options: TokenEstimatorOptions & {
+      /** Namespace for multi-agent support. Creates state ID: `{namespace}/messages` */
+      namespace?: string;
+    } = {}
   ) {
+    this.stateId = options.namespace
+      ? `${options.namespace}/messages`
+      : DEFAULT_MESSAGE_STATE_ID;
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildIndex();
@@ -58,10 +65,14 @@ export class MessageStore {
   /**
    * Register the message store state in Chronicle.
    * Should be called once when setting up the store.
+   *
+   * @param store The Chronicle store
+   * @param namespace Optional namespace for multi-agent support
    */
-  static register(store: JsStore): void {
+  static register(store: JsStore, namespace?: string): void {
+    const stateId = namespace ? `${namespace}/messages` : DEFAULT_MESSAGE_STATE_ID;
     store.registerState({
-      id: MESSAGE_STATE_ID,
+      id: stateId,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
@@ -111,7 +122,7 @@ export class MessageStore {
       causedBy,
     };
 
-    const record = this.store.appendToStateJson(MESSAGE_STATE_ID, partialInternal);
+    const record = this.store.appendToStateJson(this.stateId, partialInternal);
     const index = this.length() - 1;
 
     // Now update the stored item to include the id (for rebuildIndex)
@@ -120,7 +131,7 @@ export class MessageStore {
       sequence: record.sequence,
       ...partialInternal,
     };
-    this.store.editStateItem(MESSAGE_STATE_ID, index, Buffer.from(JSON.stringify(fullInternal)));
+    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(fullInternal)));
 
     // Build full message with ID and sequence from record
     const message: StoredMessage = {
@@ -163,7 +174,7 @@ export class MessageStore {
       content: storedContent,
     };
 
-    this.store.editStateItem(MESSAGE_STATE_ID, index, Buffer.from(JSON.stringify(updated)));
+    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
     this.emit({ type: 'edit', messageId, oldContent, newContent });
   }
@@ -177,7 +188,7 @@ export class MessageStore {
       throw new Error(`Message not found: ${messageId}`);
     }
 
-    this.store.redactStateItems(MESSAGE_STATE_ID, index, index + 1);
+    this.store.redactStateItems(this.stateId, index, index + 1);
     this.rebuildIndex();
 
     this.emit({ type: 'remove', messageId });
@@ -197,7 +208,7 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    this.store.redactStateItems(MESSAGE_STATE_ID, fromIndex, toIndex + 1);
+    this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.rebuildIndex();
 
     this.emit({ type: 'removeRange', fromId, toId });
@@ -225,7 +236,7 @@ export class MessageStore {
    */
   getAt(messageId: MessageId, atSequence: Sequence): StoredMessage | null {
     // Get historical state
-    const historicalState = this.store.getStateJsonAt(MESSAGE_STATE_ID, atSequence);
+    const historicalState = this.store.getStateJsonAt(this.stateId, atSequence);
     if (!historicalState || !Array.isArray(historicalState)) {
       return null;
     }
@@ -270,7 +281,7 @@ export class MessageStore {
    * Get the total number of messages.
    */
   length(): number {
-    return this.store.getStateLen(MESSAGE_STATE_ID) ?? 0;
+    return this.store.getStateLen(this.stateId) ?? 0;
   }
 
   /**
@@ -297,7 +308,10 @@ export class MessageStore {
         if (typeof block.content === 'string') {
           return this.tokenEstimator(block.content);
         }
-        return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
+        if (Array.isArray(block.content)) {
+          return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
+        }
+        return 0;
       case 'image':
         return block.tokenEstimate ?? 1000; // Default estimate for images
       case 'document':
@@ -428,7 +442,7 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const state = this.store.getStateJson(MESSAGE_STATE_ID);
+    const state = this.store.getStateJson(this.stateId);
     if (!state || !Array.isArray(state)) {
       return [];
     }

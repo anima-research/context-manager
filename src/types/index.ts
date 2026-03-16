@@ -34,6 +34,8 @@ export type {
   AutobiographicalConfig,
   SummaryLevel,
   SummaryEntry,
+  PhaseType,
+  KnowledgeConfig,
 } from './strategy.js';
 
 export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from './strategy.js';

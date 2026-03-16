@@ -11,6 +11,7 @@ export { BlobManager } from './blob-manager.js';
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
 export { AutobiographicalStrategy } from './strategies/autobiographical.js';
+export { KnowledgeStrategy } from './strategies/knowledge.js';
 
 // Types
 export type {
@@ -41,6 +42,8 @@ export type {
   AutobiographicalConfig,
   SummaryLevel,
   SummaryEntry,
+  PhaseType,
+  KnowledgeConfig,
 } from './types/index.js';
 
 export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from './types/index.js';

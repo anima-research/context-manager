@@ -1479,6 +1479,143 @@ describe('ContextManager', () => {
       assert.strictEqual(result.messages[1].participant, 'user');
     });
   });
+
+  describe('Tool Pair Integrity', () => {
+    it('should not split tool_use/tool_result across head window boundary', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new AutobiographicalStrategy({
+          headWindowTokens: 200,
+          recentWindowTokens: 50,
+        }),
+      });
+
+      // Small messages that fit in the head window
+      manager.addMessage('user', [{ type: 'text', text: 'Hello' }]);
+      manager.addMessage('assistant', [{ type: 'text', text: 'Hi there' }]);
+      manager.addMessage('user', [{ type: 'text', text: 'Do a search' }]);
+      // Assistant with tool_use — fits in head window
+      manager.addMessage('assistant', [
+        { type: 'text', text: 'Sure' },
+        { type: 'tool_use', id: 'call_1', name: 'search', input: { q: 'test' } },
+      ]);
+      // Huge tool_result — does NOT fit in head window, pushes over budget
+      manager.addMessage('user', [
+        { type: 'tool_result', toolUseId: 'call_1', content: 'x'.repeat(5000) },
+      ]);
+
+      const { messages } = await manager.compile();
+
+      // The head window must NOT include the tool_use without the tool_result.
+      // Check that no message in the output has a tool_use block without a
+      // subsequent tool_result message.
+      for (let i = 0; i < messages.length; i++) {
+        const hasToolUse = messages[i].content.some(b => b.type === 'tool_use');
+        if (hasToolUse) {
+          // Next message must have tool_result
+          assert.ok(i + 1 < messages.length, 'tool_use message is not the last message');
+          const nextHasToolResult = messages[i + 1].content.some(b => b.type === 'tool_result');
+          assert.ok(nextHasToolResult, 'tool_use must be followed by tool_result');
+        }
+      }
+    });
+
+    it('should not split tool_use/tool_result across recent window boundary', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new AutobiographicalStrategy({
+          headWindowTokens: 50,
+          recentWindowTokens: 300,
+        }),
+      });
+
+      // Enough messages to push the tool pair out of the head window
+      for (let i = 0; i < 6; i++) {
+        manager.addMessage(i % 2 === 0 ? 'user' : 'assistant', [
+          { type: 'text', text: `Msg ${i}: ${'y'.repeat(100)}` },
+        ]);
+      }
+      // Assistant with tool_use
+      manager.addMessage('assistant', [
+        { type: 'text', text: 'Let me check' },
+        { type: 'tool_use', id: 'call_2', name: 'lookup', input: {} },
+      ]);
+      // tool_result
+      manager.addMessage('user', [
+        { type: 'tool_result', toolUseId: 'call_2', content: 'Result data here' },
+      ]);
+      // A follow-up
+      manager.addMessage('assistant', [{ type: 'text', text: 'Based on that...' }]);
+      manager.addMessage('user', [{ type: 'text', text: 'Thanks' }]);
+
+      const { messages } = await manager.compile();
+
+      // Validate no orphaned tool_use or tool_result in the output
+      for (let i = 0; i < messages.length; i++) {
+        const hasToolUse = messages[i].content.some(b => b.type === 'tool_use');
+        if (hasToolUse) {
+          assert.ok(i + 1 < messages.length, 'tool_use message is not the last message');
+          const nextHasToolResult = messages[i + 1].content.some(b => b.type === 'tool_result');
+          assert.ok(nextHasToolResult, 'tool_use must be followed by tool_result');
+        }
+        const hasToolResult = messages[i].content.some(b => b.type === 'tool_result');
+        if (hasToolResult) {
+          assert.ok(i > 0, 'tool_result is not the first message');
+          const prevHasToolUse = messages[i - 1].content.some(b => b.type === 'tool_use');
+          assert.ok(prevHasToolUse, 'tool_result must be preceded by tool_use');
+        }
+      }
+    });
+
+    it('should drop oversized tool_result along with its tool_use', async () => {
+      // This reproduces the exact zulip-app bug: a massive tool_result
+      // that exceeds both head and recent window budgets.
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new AutobiographicalStrategy({
+          headWindowTokens: 200,
+          recentWindowTokens: 200,
+        }),
+      });
+
+      manager.addMessage('user', [{ type: 'text', text: 'Hi' }]);
+      manager.addMessage('assistant', [{ type: 'text', text: 'Hello' }]);
+      manager.addMessage('user', [{ type: 'text', text: 'List streams' }]);
+      manager.addMessage('assistant', [
+        { type: 'text', text: 'Sure' },
+        { type: 'tool_use', id: 'call_big', name: 'list_streams', input: {} },
+      ]);
+      // Oversized tool_result: exceeds both windows
+      manager.addMessage('user', [
+        { type: 'tool_result', toolUseId: 'call_big', content: 'x'.repeat(10000) },
+      ]);
+
+      const { messages } = await manager.compile();
+
+      // The compiled output must be valid: no orphaned tool_use or tool_result
+      for (let i = 0; i < messages.length; i++) {
+        const hasToolUse = messages[i].content.some(b => b.type === 'tool_use');
+        if (hasToolUse) {
+          assert.ok(
+            i + 1 < messages.length &&
+            messages[i + 1].content.some(b => b.type === 'tool_result'),
+            `Orphaned tool_use at index ${i}`
+          );
+        }
+        const hasToolResult = messages[i].content.some(b => b.type === 'tool_result');
+        if (hasToolResult) {
+          assert.ok(
+            i > 0 &&
+            messages[i - 1].content.some(b => b.type === 'tool_use'),
+            `Orphaned tool_result at index ${i}`
+          );
+        }
+      }
+    });
+  });
 });
 
 // Run with: node --test dist/test/integration.test.js
