@@ -32,7 +32,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   constructor(config: Partial<KnowledgeConfig> = {}) {
     // Force hierarchical mode
     super({ ...config, hierarchical: true });
-    this.knowledgeConfig = this.config as KnowledgeConfig;
+    // Merge knowledge-specific fields onto the base config so all KnowledgeConfig
+    // fields are actually present (super() only stores AutobiographicalConfig fields).
+    this.knowledgeConfig = { ...this.config, ...config } as KnowledgeConfig;
   }
 
   // ============================================================================
@@ -77,7 +79,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
         msgTokens = this.estimateTextOnlyTokens(msg);
       }
 
-      // Check if we should close before adding this message
+      // Semantic chunking uses a minimum of 2 messages (vs parent's 4) because
+      // phase transitions are the primary chunk boundary signal. A tool_use + tool_result
+      // pair is already a meaningful unit of work worth compressing independently.
       const phaseChanged = currentPhase !== null && phase !== currentPhase;
       const maxTokens = this.getMaxChunkTokens(currentPhase ?? phase);
       const sizeExceeded = currentTokens >= maxTokens;
@@ -168,8 +172,21 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     sources: SummaryEntry[],
     targetTokens: number
   ): string {
+    // Describe the phase composition of the sources
+    const phaseCounts = new Map<string, number>();
+    for (const s of sources) {
+      const phase = s.phaseType ?? 'unknown';
+      phaseCounts.set(phase, (phaseCounts.get(phase) ?? 0) + 1);
+    }
+    const phaseDesc = [...phaseCounts.entries()]
+      .map(([phase, count]) => `${count} ${phase}`)
+      .join(', ');
+
+    const levelLabel = targetLevel === 2 ? 'L1 summaries' : 'L2 summaries';
+
     return (
-      `Please consolidate the memories since my last message into a single cohesive memory. ` +
+      `Please consolidate these ${sources.length} ${levelLabel} (${phaseDesc}) ` +
+      `into a single cohesive memory. ` +
       `Aim for about ${targetTokens} tokens. Write as you would to yourself — this is your ` +
       `autobiography, capturing the arc of what happened. ` +
       `IMPORTANT: Preserve any items marked with [LEAD] — these are unresolved questions ` +
@@ -214,8 +231,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     // Priority 1: Synthesis — guaranteed floor, can go higher if budget allows
     for (const s of synthesis) {
       if (used + s.tokens > effectiveBudget) break;
-      // Keep going past the floor if there's room
-      if (used >= synthesisFloor && used + s.tokens > effectiveBudget * 0.7) break;
+      // Keep going past the floor, but cap synthesis to avoid starving other phases
+      const synthesisCap = effectiveBudget * (this.knowledgeConfig.synthesisL1BudgetCap ?? 0.7);
+      if (used >= synthesisFloor && used + s.tokens > synthesisCap) break;
       selected.push(s);
       used += s.tokens;
     }

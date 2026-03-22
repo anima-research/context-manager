@@ -232,6 +232,9 @@ export interface KnowledgeConfig extends AutobiographicalConfig {
   researchL1BudgetCap?: number;
   /** Minimum fraction of L1 budget for synthesis summaries (default: 0.4) */
   synthesisL1BudgetFloor?: number;
+  /** Maximum fraction of L1 budget for synthesis summaries (default: 0.7).
+   *  Prevents synthesis from starving lessons/subagent/research phases. */
+  synthesisL1BudgetCap?: number;
 }
 
 /**

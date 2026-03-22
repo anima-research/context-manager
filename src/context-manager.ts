@@ -476,13 +476,11 @@ export class ContextManager {
   }
 
   /**
-   * Append a snapshot of the compiled context to the context log.
-   * Each entry captures the full rendered messages (including injections)
-   * as sent to the LLM, for post-hoc debugging.
+   * Log the compiled context to stderr for debugging.
+   * Uses stderr so it doesn't pollute the context log (which strategies read).
    */
   private logCompiledContext(result: CompileResult): void {
     const renderedMessages = result.messages.map((m) => {
-      // Flatten content blocks into a single text for readability
       const text = m.content
         .map((b) => {
           switch (b.type) {
@@ -505,10 +503,7 @@ export class ContextManager {
       messages: renderedMessages,
     };
 
-    this.contextLog.append(
-      'debug',
-      [{ type: 'text', text: JSON.stringify(entry) }],
-    );
+    console.error('[debugLogContext]', JSON.stringify(entry));
   }
 
   // ==========================================================================
