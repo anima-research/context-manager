@@ -15,11 +15,7 @@
     "sourceMap": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "composite": true,
-    "paths": {
-      "@animalabs/chronicle": ["../chronicle/index.d.ts"],
-      "@animalabs/membrane": ["../membrane/dist/index.d.ts"]
-    }
+    "composite": true
   },
   "include": ["src/**/*", "test/**/*"],
   "exclude": ["node_modules", "dist"]
