@@ -24,7 +24,7 @@ import {
   PassthroughStrategy,
   isResettableStrategy,
 } from '../src/index.js';
-import type { ContentBlock } from 'membrane';
+import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-head-window-reset';
 

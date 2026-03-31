@@ -1,4 +1,4 @@
-import type { Membrane } from 'membrane';
+import type { Membrane } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
 

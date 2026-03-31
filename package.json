@@ -1,5 +1,5 @@
 {
-  "name": "@connectome/context-manager",
+  "name": "@animalabs/context-manager",
   "version": "0.1.0",
   "description": "Context management layer for LLM-based agents using Chronicle and Membrane",
   "type": "module",
@@ -21,7 +21,8 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/test/*.test.js"
+    "test": "node --test dist/test/*.test.js",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "connectome",
@@ -34,8 +35,8 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "chronicle": "file:../chronicle",
-    "membrane": "file:../membrane"
+    "@animalabs/chronicle": "^0.1.0",
+    "@animalabs/membrane": "^0.5.40"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

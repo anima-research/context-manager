@@ -1,4 +1,4 @@
-import type { ContentBlock, NormalizedMessage } from 'membrane';
+import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import type { MessageId, StoredContentBlock } from './message.js';
 
 /**

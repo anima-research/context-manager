@@ -1,5 +1,5 @@
-import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from 'membrane';
-import { NativeFormatter } from 'membrane';
+import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from '@animalabs/membrane';
+import { NativeFormatter } from '@animalabs/membrane';
 import type {
   ContextStrategy,
   ResettableStrategy,

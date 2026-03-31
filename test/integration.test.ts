@@ -2,8 +2,8 @@ import { describe, it, before, after, skip } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, PassthroughStrategy, AutobiographicalStrategy, ContextLog, MessageStore } from '../src/index.js';
-import { JsStore } from 'chronicle';
-import type { ContentBlock } from 'membrane';
+import { JsStore } from '@animalabs/chronicle';
+import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextStrategy, StrategyContext, ReadinessState, MessageStoreView, ContextLogView, TokenBudget, ContextEntry, StoredMessage, SourceRelation, ContextInjection } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-context-store';

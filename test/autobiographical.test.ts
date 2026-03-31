@@ -2,7 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
-import { Membrane, AnthropicAdapter } from 'membrane';
+import { Membrane, AnthropicAdapter } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-autobio-store';
 const API_KEY = process.env.ANTHROPIC_API_KEY || '';
