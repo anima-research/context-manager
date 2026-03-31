@@ -257,9 +257,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // 2. Middle zone: compressed chunks as diary pairs, uncompressed as raw messages.
     const rawRecentStart = this.getRecentWindowStart(store);
-    let middleCoveredUpTo = headEnd;
+    // Track which message IDs are covered by chunks
+    const coveredByChunks = new Set<string>();
 
     for (const chunk of this.chunks) {
+      for (const m of chunk.messages) coveredByChunks.add(m.id);
+
       if (chunk.compressed && chunk.diary) {
         const contextLabel = this.config.summaryContextLabel ?? 'Here is a summary of earlier conversation context:';
         const summaryParticipant = this.config.summaryParticipant ?? 'Summary';
@@ -303,11 +306,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           totalTokens += tokens;
         }
       }
-      middleCoveredUpTo = chunk.endIndex;
     }
 
-    // Emit any gap messages not covered by chunks (remainder < 4 messages)
-    for (let i = middleCoveredUpTo; i < rawRecentStart && i < messages.length; i++) {
+    // Emit gap messages in the compressible zone not covered by any chunk.
+    // Compressible zone: [0, headStart) ∪ [headEnd, rawRecentStart)
+    for (let i = 0; i < rawRecentStart && i < messages.length; i++) {
+      // Skip head window messages (already emitted verbatim above)
+      if (i >= headStart && i < headEnd) continue;
+      if (coveredByChunks.has(messages[i].id)) continue;
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
@@ -415,19 +421,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
+    // Find the actual position of this chunk's first message in the full array
     const messages = ctx.messageStore.getAll();
-    const precedingStart = Math.max(0, chunk.startIndex - 50);
-    let tokens = 0;
+    const firstMsgId = chunk.messages[0]?.id;
+    const chunkAbsStart = firstMsgId
+      ? messages.findIndex(m => m.id === firstMsgId)
+      : -1;
 
-    for (let i = chunk.startIndex - 1; i >= precedingStart && tokens < 15000; i--) {
-      const msg = messages[i];
-      if (!msg) break;
+    if (chunkAbsStart > 0) {
+      const precedingStart = Math.max(0, chunkAbsStart - 50);
+      let tokens = 0;
 
-      tokens += ctx.messageStore.estimateTokens(msg);
-      context.unshift({
-        participant: msg.participant,
-        content: msg.content,
-      });
+      for (let i = chunkAbsStart - 1; i >= precedingStart && tokens < 15000; i--) {
+        const msg = messages[i];
+        if (!msg) break;
+
+        tokens += ctx.messageStore.estimateTokens(msg);
+        context.unshift({
+          participant: msg.participant,
+          content: msg.content,
+        });
+      }
     }
 
     return context;
