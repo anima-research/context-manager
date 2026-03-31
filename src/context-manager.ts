@@ -16,6 +16,7 @@ import type {
   ContextInjection,
   CompileResult,
 } from './types/index.js';
+import { isResettableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -523,6 +524,36 @@ export class ContextManager {
    */
   getStrategy(): ContextStrategy {
     return this.strategy;
+  }
+
+  /**
+   * Reset the head window to start from a new position.
+   * Old head window messages become compressible.
+   *
+   * If transitionText is provided, it's used as the transition summary.
+   * If omitted, an LLM call auto-generates a transition summary.
+   *
+   * Returns the transition summary text used.
+   */
+  async resetHeadWindow(transitionText?: string): Promise<string> {
+    if (!isResettableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support head window reset');
+    }
+
+    const ctx = this.createStrategyContext();
+
+    // Generate transition summary if not provided
+    const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
+
+    // Inject transition message
+    const msgId = this.addMessage('Context Manager', [
+      { type: 'text', text: `[Topic Transition]\n\n${summary}` },
+    ]);
+
+    // Reset head window to start from this message
+    this.strategy.resetHeadWindow(msgId);
+
+    return summary;
   }
 
   /**

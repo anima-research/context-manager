@@ -42,11 +42,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   // ============================================================================
 
   protected rebuildChunks(store: MessageStoreView): void {
-    const messages = store.getAll();
-    const headEnd = this.getHeadWindowEnd(store);
-    const recentStart = this.getRecentWindowStart(store);
-    const chunkStart = Math.min(headEnd, recentStart);
-    const messagesToChunk = messages.slice(chunkStart, recentStart);
+    const messagesToChunk = this.getCompressibleMessages(store);
 
     // Preserve existing compressed chunks
     const existingCompressed = new Map<string, Chunk>();
@@ -63,7 +59,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     let currentTokens = 0;
     let currentPhase: PhaseType | null = null;
     let lastToolPhase: PhaseType = 'synthesis';
-    let chunkStartAbsolute = chunkStart;
+    let chunkFilteredStart = 0;
 
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
@@ -90,8 +86,8 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       if (shouldClose) {
         const chunk = this.createChunk(
           this.chunks.length,
-          chunkStartAbsolute,
-          chunkStart + i,
+          chunkFilteredStart,
+          i,
           currentChunk,
           currentTokens,
           existingCompressed
@@ -102,7 +98,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
 
         currentChunk = [];
         currentTokens = 0;
-        chunkStartAbsolute = chunkStart + i;
+        chunkFilteredStart = i;
       }
 
       currentChunk.push(msg);
@@ -114,8 +110,8 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     if (currentChunk.length >= 1 && currentPhase) {
       const chunk = this.createChunk(
         this.chunks.length,
-        chunkStartAbsolute,
-        chunkStart + messagesToChunk.length,
+        chunkFilteredStart,
+        messagesToChunk.length,
         currentChunk,
         currentTokens,
         existingCompressed
