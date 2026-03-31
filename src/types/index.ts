@@ -36,6 +36,7 @@ export type {
   SummaryEntry,
   PhaseType,
   KnowledgeConfig,
+  ResettableStrategy,
 } from './strategy.js';
 
-export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from './strategy.js';
+export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG, isResettableStrategy } from './strategy.js';

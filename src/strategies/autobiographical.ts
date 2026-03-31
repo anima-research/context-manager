@@ -2,6 +2,7 @@ import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from 
 import { NativeFormatter } from 'membrane';
 import type {
   ContextStrategy,
+  ResettableStrategy,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
@@ -34,9 +35,11 @@ function safeSlice(str: string, start: number, end: number): string {
 export interface Chunk {
   /** Index in the chunk list */
   index: number;
-  /** Starting message index (inclusive) */
+  /** Starting index in the compressible message array (inclusive).
+   *  Note: this is an index into getCompressibleMessages(), not store.getAll(). */
   startIndex: number;
-  /** Ending message index (exclusive) */
+  /** Ending index in the compressible message array (exclusive).
+   *  Note: this is an index into getCompressibleMessages(), not store.getAll(). */
   endIndex: number;
   /** Messages in this chunk */
   messages: StoredMessage[];
@@ -61,7 +64,7 @@ export interface Chunk {
  * L1 (raw→summary) → L2 (merge N L1s) → L3 (merge N L2s)
  * with anti-redundancy filtering and budget carryover.
  */
-export class AutobiographicalStrategy implements ContextStrategy {
+export class AutobiographicalStrategy implements ResettableStrategy {
   readonly name: string = 'autobiographical';
 
   get maxMessageTokens(): number { return this.config.maxMessageTokens; }
@@ -80,6 +83,8 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
   /** Message ID from which the head window starts. null = start from message 0. */
   protected headWindowStartId: string | null = null;
+  /** Cached result of getHeadWindowStartIndex to avoid repeated linear scans. */
+  private _cachedHeadStartIndex: { id: string | null; msgCount: number; result: number } | null = null;
 
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
@@ -876,6 +881,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
    */
   resetHeadWindow(newStartId: string | null): void {
     this.headWindowStartId = newStartId;
+    this._cachedHeadStartIndex = null;
   }
 
   /**
@@ -892,10 +898,17 @@ export class AutobiographicalStrategy implements ContextStrategy {
     const headEnd = this.getHeadWindowEnd(ctx.messageStore);
     const headMessages = messages.slice(headStart, headEnd);
 
-    // Format head content
-    const headContent = headMessages.map(m =>
-      `${m.participant}: ${this.extractText(m.content)}`
-    ).join('\n\n');
+    // Format head content, truncated to ~2000 tokens (~8000 chars)
+    const MAX_HEAD_CHARS = 8000;
+    let headContent = '';
+    for (const m of headMessages) {
+      const entry = `${m.participant}: ${this.extractText(m.content)}`;
+      if (headContent.length + entry.length > MAX_HEAD_CHARS) {
+        headContent += '\n\n[...truncated...]';
+        break;
+      }
+      headContent += (headContent ? '\n\n' : '') + entry;
+    }
 
     // Gather top summaries for broader context
     const topSummaries = this.summaries
@@ -960,17 +973,23 @@ export class AutobiographicalStrategy implements ContextStrategy {
   // ============================================================================
 
   /**
-   * Rebuild chunk boundaries based on current messages.
+   * Get messages in the compressible zone: outside both head window and recent window.
+   * Returns messages from [0, headStart) ∪ [headEnd, recentStart).
    */
-  protected rebuildChunks(store: MessageStoreView): void {
+  protected getCompressibleMessages(store: MessageStoreView): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    // Chunk messages outside head window and recent window:
-    // [0, headStart) ∪ [headEnd, recentStart)
-    const messagesToChunk = messages.slice(0, recentStart)
+    return messages.slice(0, recentStart)
       .filter((_, i) => i < headStart || i >= headEnd);
+  }
+
+  /**
+   * Rebuild chunk boundaries based on current messages.
+   */
+  protected rebuildChunks(store: MessageStoreView): void {
+    const messagesToChunk = this.getCompressibleMessages(store);
 
     // Preserve existing compressed chunks (legacy) and summary linkage (hierarchical)
     const existingCompressed = new Map<string, Chunk>();
@@ -1114,8 +1133,16 @@ export class AutobiographicalStrategy implements ContextStrategy {
   protected getHeadWindowStartIndex(store: MessageStoreView): number {
     if (!this.headWindowStartId) return 0;
     const messages = store.getAll();
+    // Cache to avoid repeated O(n) scans within the same select/rebuild pass
+    if (this._cachedHeadStartIndex
+      && this._cachedHeadStartIndex.id === this.headWindowStartId
+      && this._cachedHeadStartIndex.msgCount === messages.length) {
+      return this._cachedHeadStartIndex.result;
+    }
     const idx = messages.findIndex(m => m.id === this.headWindowStartId);
-    return idx >= 0 ? idx : 0; // fall back to 0 if message not found
+    const result = idx >= 0 ? idx : 0;
+    this._cachedHeadStartIndex = { id: this.headWindowStartId, msgCount: messages.length, result };
+    return result;
   }
 
   /**
@@ -1133,10 +1160,9 @@ export class AutobiographicalStrategy implements ContextStrategy {
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
         let boundary = i;
-        // Don't split a tool_use/tool_result pair: if the last message in the
-        // head window has tool_use, pull boundary back so the tool_use
-        // and its tool_result stay together outside the head window.
-        while (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
+        // Don't split a tool_use/tool_result pair: if the boundary message's
+        // predecessor has tool_use, pull back by one so the pair stays together.
+        if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
         return boundary;

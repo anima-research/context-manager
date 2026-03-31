@@ -16,6 +16,7 @@ import type {
   ContextInjection,
   CompileResult,
 } from './types/index.js';
+import { isResettableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -540,19 +541,14 @@ export class ContextManager {
    * Returns the transition summary text used.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
-    const strategy = this.strategy as { resetHeadWindow?: (id: string | null) => void; generateTransitionSummary?: (ctx: unknown) => Promise<string> };
-    if (!strategy.resetHeadWindow) {
+    if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
     }
 
     const ctx = this.createStrategyContext();
 
     // Generate transition summary if not provided
-    const summary = transitionText ?? (
-      strategy.generateTransitionSummary
-        ? await strategy.generateTransitionSummary(ctx)
-        : 'Topic transition.'
-    );
+    const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
 
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
@@ -560,7 +556,7 @@ export class ContextManager {
     ]);
 
     // Reset head window to start from this message
-    strategy.resetHeadWindow(msgId);
+    this.strategy.resetHeadWindow(msgId);
 
     return summary;
   }

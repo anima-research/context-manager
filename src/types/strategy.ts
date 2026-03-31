@@ -111,6 +111,24 @@ export interface ContextStrategy {
 }
 
 /**
+ * Strategy that supports resetting the head window for topic transitions.
+ * Implemented by AutobiographicalStrategy and its subclasses.
+ */
+export interface ResettableStrategy extends ContextStrategy {
+  /** Reset the head window to start from a new message ID. */
+  resetHeadWindow(newStartId: string | null): void;
+  /** Generate a transition summary from the current head window + summaries. */
+  generateTransitionSummary(ctx: StrategyContext): Promise<string>;
+}
+
+/**
+ * Type guard for strategies that support head window reset.
+ */
+export function isResettableStrategy(s: ContextStrategy): s is ResettableStrategy {
+  return 'resetHeadWindow' in s && typeof (s as ResettableStrategy).resetHeadWindow === 'function';
+}
+
+/**
  * Configuration for the Autobiographical strategy.
  */
 export interface AutobiographicalConfig {

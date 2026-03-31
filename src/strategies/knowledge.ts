@@ -40,14 +40,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   // ============================================================================
 
   protected rebuildChunks(store: MessageStoreView): void {
-    const messages = store.getAll();
-    const headStart = this.getHeadWindowStartIndex(store);
-    const headEnd = this.getHeadWindowEnd(store);
-    const recentStart = this.getRecentWindowStart(store);
-    // Chunk messages outside head window and recent window:
-    // [0, headStart) ∪ [headEnd, recentStart)
-    const messagesToChunk = messages.slice(0, recentStart)
-      .filter((_, i) => i < headStart || i >= headEnd);
+    const messagesToChunk = this.getCompressibleMessages(store);
 
     // Preserve existing compressed chunks
     const existingCompressed = new Map<string, Chunk>();
