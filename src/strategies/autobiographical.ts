@@ -78,6 +78,9 @@ export class AutobiographicalStrategy implements ContextStrategy {
   protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[] }> = [];
   protected nativeFormatter = new NativeFormatter();
 
+  /** Message ID from which the head window starts. null = start from message 0. */
+  protected headWindowStartId: string | null = null;
+
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
     // Hierarchical is on by default; set hierarchical: false to use legacy single-level
@@ -92,6 +95,14 @@ export class AutobiographicalStrategy implements ContextStrategy {
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
+    // Restore headWindowStartId from last topic transition message
+    const messages = ctx.messageStore.getAll();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (this.isTopicTransitionMessage(messages[i])) {
+        this.headWindowStartId = messages[i].id;
+        break;
+      }
+    }
     this.rebuildChunks(ctx.messageStore);
   }
 
@@ -221,8 +232,9 @@ export class AutobiographicalStrategy implements ContextStrategy {
     const msgCap = this.config.maxMessageTokens;
 
     // 1. Head window: preserved verbatim as raw copies
+    const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
-    for (let i = 0; i < headEnd && i < messages.length; i++) {
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
@@ -693,9 +705,10 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
     let totalTokens = 0;
 
-    // Phase 0: Head window — preserved verbatim
+    // Phase 0: Head window — preserved verbatim (from headStart, not necessarily 0)
+    const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
-    for (let i = 0; i < headEnd && i < messages.length; i++) {
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
@@ -714,7 +727,7 @@ export class AutobiographicalStrategy implements ContextStrategy {
     // Compute recent window exclusion set (also exclude head window messages)
     const recentStart = this.getRecentWindowStart(store);
     const excludeIds = new Set<string>();
-    for (let i = 0; i < headEnd; i++) excludeIds.add(messages[i].id);
+    for (let i = headStart; i < headEnd; i++) excludeIds.add(messages[i].id);
     for (let i = recentStart; i < messages.length; i++) excludeIds.add(messages[i].id);
 
     // Get anti-redundant summaries
@@ -854,6 +867,95 @@ export class AutobiographicalStrategy implements ContextStrategy {
   }
 
   // ============================================================================
+  // Head window reset / topic transition
+  // ============================================================================
+
+  /**
+   * Reset the head window to start from a new message ID.
+   * Old head window messages become compressible on the next chunk rebuild.
+   */
+  resetHeadWindow(newStartId: string | null): void {
+    this.headWindowStartId = newStartId;
+  }
+
+  /**
+   * Generate a transition summary from the current head window + top summaries.
+   * Used when `/newtopic` is called without explicit context.
+   */
+  async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
+    if (!ctx.membrane) {
+      throw new Error('No membrane instance for transition summary generation');
+    }
+
+    const messages = ctx.messageStore.getAll();
+    const headStart = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEnd = this.getHeadWindowEnd(ctx.messageStore);
+    const headMessages = messages.slice(headStart, headEnd);
+
+    // Format head content
+    const headContent = headMessages.map(m =>
+      `${m.participant}: ${this.extractText(m.content)}`
+    ).join('\n\n');
+
+    // Gather top summaries for broader context
+    const topSummaries = this.summaries
+      .filter(s => s.level >= 2)
+      .slice(-3)
+      .map(s => s.content)
+      .join('\n\n---\n\n');
+
+    const instruction = [
+      'Summarize the prior conversation context in 2-3 paragraphs, focusing on:',
+      '- What was the original objective and what was accomplished',
+      '- Key findings, decisions, and unresolved questions',
+      '- Any cross-references or context that may be relevant going forward',
+      '',
+      'Prior context:',
+      '',
+      headContent,
+      topSummaries ? `\nHigher-level summaries:\n${topSummaries}` : '',
+      '',
+      'Write a concise transition summary.',
+    ].join('\n');
+
+    const request: NormalizedRequest = {
+      messages: [{ participant: 'Context Manager', content: [{ type: 'text', text: instruction }] }],
+      system: 'You are forming a transition summary between conversation topics. Write concisely.',
+      config: {
+        model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+        maxTokens: 1500,
+        temperature: 0,
+      },
+    };
+
+    const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    return response.content
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+  }
+
+  /**
+   * Check if a message is a topic transition marker.
+   */
+  protected isTopicTransitionMessage(message: StoredMessage): boolean {
+    return message.participant === 'Context Manager' &&
+      message.content.some(b =>
+        b.type === 'text' && (b as { type: 'text'; text: string }).text.startsWith('[Topic Transition]')
+      );
+  }
+
+  /**
+   * Extract plain text from content blocks.
+   */
+  protected extractText(content: ContentBlock[]): string {
+    return content
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+  }
+
+  // ============================================================================
   // Shared utilities
   // ============================================================================
 
@@ -862,11 +964,13 @@ export class AutobiographicalStrategy implements ContextStrategy {
    */
   protected rebuildChunks(store: MessageStoreView): void {
     const messages = store.getAll();
+    const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    // Only chunk messages between head window and recent window
-    const chunkStart = Math.min(headEnd, recentStart);
-    const messagesToChunk = messages.slice(chunkStart, recentStart);
+    // Chunk messages outside head window and recent window:
+    // [0, headStart) ∪ [headEnd, recentStart)
+    const messagesToChunk = messages.slice(0, recentStart)
+      .filter((_, i) => i < headStart || i >= headEnd);
 
     // Preserve existing compressed chunks (legacy) and summary linkage (hierarchical)
     const existingCompressed = new Map<string, Chunk>();
@@ -883,8 +987,8 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
-    // Absolute index into the full messages array
-    let chunkStartAbsolute = chunkStart;
+    // Track start position in the filtered array for chunk boundary metadata
+    let chunkFilteredStart = 0;
 
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
@@ -904,8 +1008,8 @@ export class AutobiographicalStrategy implements ContextStrategy {
       if (shouldClose) {
         const chunk = this.createChunk(
           this.chunks.length,
-          chunkStartAbsolute,
-          chunkStart + i + 1,
+          chunkFilteredStart,
+          i + 1,
           currentChunk,
           currentTokens,
           existingCompressed
@@ -918,15 +1022,15 @@ export class AutobiographicalStrategy implements ContextStrategy {
 
         currentChunk = [];
         currentTokens = 0;
-        chunkStartAbsolute = chunkStart + i + 1;
+        chunkFilteredStart = i + 1;
       }
     }
 
     if (currentChunk.length >= 4) {
       const chunk = this.createChunk(
         this.chunks.length,
-        chunkStartAbsolute,
-        chunkStart + messagesToChunk.length,
+        chunkFilteredStart,
+        messagesToChunk.length,
         currentChunk,
         currentTokens,
         existingCompressed
@@ -1003,23 +1107,36 @@ export class AutobiographicalStrategy implements ContextStrategy {
   }
 
   /**
+   * Index of the first message in the head window.
+   * When headWindowStartId is set, the head window starts from that message
+   * instead of message 0 — old messages before it become compressible.
+   */
+  protected getHeadWindowStartIndex(store: MessageStoreView): number {
+    if (!this.headWindowStartId) return 0;
+    const messages = store.getAll();
+    const idx = messages.findIndex(m => m.id === this.headWindowStartId);
+    return idx >= 0 ? idx : 0; // fall back to 0 if message not found
+  }
+
+  /**
    * Index of the first message AFTER the head window.
-   * Messages [0, headEnd) are preserved verbatim.
+   * Messages [headStart, headEnd) are preserved verbatim.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
     if (this.config.headWindowTokens <= 0) return 0;
 
     const messages = store.getAll();
+    const startIdx = this.getHeadWindowStartIndex(store);
     let tokens = 0;
 
-    for (let i = 0; i < messages.length; i++) {
+    for (let i = startIdx; i < messages.length; i++) {
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
         let boundary = i;
         // Don't split a tool_use/tool_result pair: if the last message in the
-        // head window has tool_use, pull boundary back by 1 so the tool_use
+        // head window has tool_use, pull boundary back so the tool_use
         // and its tool_result stay together outside the head window.
-        if (boundary > 0 && this.hasToolUse(messages[boundary - 1])) {
+        while (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
         return boundary;

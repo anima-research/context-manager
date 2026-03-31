@@ -531,6 +531,41 @@ export class ContextManager {
   }
 
   /**
+   * Reset the head window to start from a new position.
+   * Old head window messages become compressible.
+   *
+   * If transitionText is provided, it's used as the transition summary.
+   * If omitted, an LLM call auto-generates a transition summary.
+   *
+   * Returns the transition summary text used.
+   */
+  async resetHeadWindow(transitionText?: string): Promise<string> {
+    const strategy = this.strategy as { resetHeadWindow?: (id: string | null) => void; generateTransitionSummary?: (ctx: unknown) => Promise<string> };
+    if (!strategy.resetHeadWindow) {
+      throw new Error('Active strategy does not support head window reset');
+    }
+
+    const ctx = this.createStrategyContext();
+
+    // Generate transition summary if not provided
+    const summary = transitionText ?? (
+      strategy.generateTransitionSummary
+        ? await strategy.generateTransitionSummary(ctx)
+        : 'Topic transition.'
+    );
+
+    // Inject transition message
+    const msgId = this.addMessage('Context Manager', [
+      { type: 'text', text: `[Topic Transition]\n\n${summary}` },
+    ]);
+
+    // Reset head window to start from this message
+    strategy.resetHeadWindow(msgId);
+
+    return summary;
+  }
+
+  /**
    * Trigger background maintenance work.
    * Call this periodically to allow strategies to do compression, etc.
    */
