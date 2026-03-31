@@ -2,7 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, KnowledgeStrategy } from '../src/index.js';
-import type { ContentBlock } from 'membrane';
+import type { ContentBlock } from '@animalabs/membrane';
 import type { KnowledgeConfig, SummaryEntry } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-knowledge-store';

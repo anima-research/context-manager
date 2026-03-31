@@ -1,5 +1,5 @@
-import { JsStore } from 'chronicle';
-import type { Membrane, NormalizedMessage, ContentBlock } from 'membrane';
+import { JsStore } from '@animalabs/chronicle';
+import type { Membrane, NormalizedMessage, ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,

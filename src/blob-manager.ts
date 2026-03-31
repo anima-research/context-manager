@@ -1,4 +1,4 @@
-import type { JsStore } from 'chronicle';
+import type { JsStore } from '@animalabs/chronicle';
 import type {
   ContentBlock,
   ImageContent,
@@ -6,7 +6,7 @@ import type {
   AudioContent,
   VideoContent,
   Base64Source,
-} from 'membrane';
+} from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
 
 /**
