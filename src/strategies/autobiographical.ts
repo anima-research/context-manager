@@ -245,12 +245,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
       if (totalTokens + tokens > maxTokens) break;
 
+      const isLastHeadMsg = i === headEnd - 1 || i === messages.length - 1;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
         content,
+        cacheMarker: isLastHeadMsg,
       });
       totalTokens += tokens;
     }
@@ -733,12 +735,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
       if (totalTokens + tokens > maxTokens) break;
 
+      const isLastHeadMsg = i === headEnd - 1 || i === messages.length - 1;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
         content,
+        cacheMarker: isLastHeadMsg,
       });
       totalTokens += tokens;
     }
