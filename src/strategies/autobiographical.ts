@@ -245,16 +245,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
       if (totalTokens + tokens > maxTokens) break;
 
-      const isLastHeadMsg = i === headEnd - 1 || i === messages.length - 1;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
         content,
-        cacheMarker: isLastHeadMsg,
       });
       totalTokens += tokens;
+    }
+    // Mark the last head entry as a cache boundary (even if budget truncated the window)
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
     }
 
     // 2. Middle zone: compressed chunks as diary pairs, uncompressed as raw messages.
@@ -735,16 +737,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
       if (totalTokens + tokens > maxTokens) break;
 
-      const isLastHeadMsg = i === headEnd - 1 || i === messages.length - 1;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
         participant: msg.participant,
         content,
-        cacheMarker: isLastHeadMsg,
       });
       totalTokens += tokens;
+    }
+    // Mark the last head entry as a cache boundary (even if budget truncated the window)
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
     }
 
     // Compute recent window exclusion set (also exclude head window messages)
