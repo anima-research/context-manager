@@ -254,6 +254,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       totalTokens += tokens;
     }
+    // Mark the last head entry as a cache boundary (even if budget truncated the window)
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
+    }
 
     // 2. Middle zone: compressed chunks as diary pairs, uncompressed as raw messages.
     const rawRecentStart = this.getRecentWindowStart(store);
@@ -741,6 +745,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content,
       });
       totalTokens += tokens;
+    }
+    // Mark the last head entry as a cache boundary (even if budget truncated the window)
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
     }
 
     // Compute recent window exclusion set (also exclude head window messages)

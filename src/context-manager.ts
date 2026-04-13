@@ -413,6 +413,7 @@ export class ContextManager {
     const messages: NormalizedMessage[] = entries.map((entry) => ({
       participant: entry.participant,
       content: entry.content,
+      ...(entry.cacheMarker ? { cacheBreakpoint: true } : {}),
     }));
 
     // If no injections, log and return early

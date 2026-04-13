@@ -1616,6 +1616,44 @@ describe('ContextManager', () => {
       }
     });
   });
+  describe('Cache Marker Placement', () => {
+    it('should place cacheBreakpoint on the last head window message', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new AutobiographicalStrategy({ headWindowTokens: 4000, recentWindowTokens: 30000 }),
+      });
+
+      // Add enough messages to have a head window
+      manager.addMessage('user', [{ type: 'text', text: 'First message in the conversation' }]);
+      manager.addMessage('assistant', [{ type: 'text', text: 'Reply to first message' }]);
+      manager.addMessage('user', [{ type: 'text', text: 'Second user message' }]);
+      manager.addMessage('assistant', [{ type: 'text', text: 'Reply to second message' }]);
+
+      const { messages } = await manager.compile();
+
+      // At least one message should have cacheBreakpoint
+      const markedMessages = messages.filter(m => m.cacheBreakpoint);
+      assert.ok(markedMessages.length > 0, 'At least one message should have cacheBreakpoint');
+
+      // Exactly one cache breakpoint should be placed (at the head window boundary)
+      assert.strictEqual(markedMessages.length, 1, 'Exactly one cacheBreakpoint should be placed');
+    });
+
+    it('should place cacheBreakpoint even when all messages fit in head window', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new AutobiographicalStrategy({ headWindowTokens: 100000, recentWindowTokens: 30000 }),
+      });
+
+      manager.addMessage('user', [{ type: 'text', text: 'Only message' }]);
+
+      const { messages } = await manager.compile();
+      const marked = messages.filter(m => m.cacheBreakpoint);
+      assert.strictEqual(marked.length, 1, 'Should have cacheBreakpoint even with single message');
+    });
+  });
 });
 
 // Run with: node --test dist/test/integration.test.js
