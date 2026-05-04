@@ -278,10 +278,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceRelation: 'derived',
         };
 
+        // Synthesised summary turns must respect maxMessageTokens just like raw
+        // copies do — otherwise a runaway diary can starve recent messages.
+        const answerContent: ContentBlock[] = [{ type: 'text', text: chunk.diary }];
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
           participant: summaryParticipant,
-          content: [{ type: 'text', text: chunk.diary }],
+          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
           sourceRelation: 'derived',
         };
 
@@ -335,14 +338,59 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // 3. Recent uncompressed messages (skip those already in head window)
     const recentStart = Math.max(this.getRecentWindowStart(store), headEnd);
+    this.emitRecentNewestFirst(entries, store, messages, recentStart, msgCap, maxTokens, totalTokens);
 
-    for (let i = recentStart; i < messages.length; i++) {
+    this.trimOrphanedToolUse(entries);
+    return entries;
+  }
+
+  /**
+   * Emit recent-window messages, evicting OLDEST-first when the budget is tight.
+   *
+   * The previous loop iterated `recentStart → messages.length` forward and broke
+   * on `totalTokens + tokens > maxTokens`. When the head/summary section eats most
+   * of the budget, the loop emits the oldest messages of the window and aborts
+   * before reaching the newest — exactly the messages an agent needs to act on.
+   * This helper picks newest-first within the budget, then emits the kept set in
+   * chronological order, dropping a leading orphan tool_result if its tool_use
+   * fell into the evicted older portion.
+   */
+  protected emitRecentNewestFirst(
+    entries: ContextEntry[],
+    store: MessageStoreView,
+    messages: StoredMessage[],
+    recentStart: number,
+    msgCap: number,
+    maxTokens: number,
+    totalTokensBefore: number,
+  ): void {
+    if (recentStart >= messages.length) return;
+
+    const accepted: number[] = [];
+    let acceptedTokens = 0;
+    for (let i = messages.length - 1; i >= recentStart; i--) {
+      const msg = messages[i];
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      if (totalTokensBefore + acceptedTokens + tokens > maxTokens) break;
+      accepted.push(i);
+      acceptedTokens += tokens;
+    }
+    accepted.reverse();
+
+    // Drop leading orphan tool_result(s): their matching tool_use was evicted.
+    while (
+      accepted.length > 0 &&
+      this.hasToolResult(messages[accepted[0]]) &&
+      !this.hasToolUse(messages[accepted[0]])
+    ) {
+      accepted.shift();
+    }
+
+    for (const i of accepted) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-
-      if (totalTokens + tokens > maxTokens) break;
-
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -350,11 +398,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: msg.participant,
         content,
       });
-      totalTokens += tokens;
     }
-
-    this.trimOrphanedToolUse(entries);
-    return entries;
   }
 
   protected async compressChunkLegacy(chunk: Chunk, ctx: StrategyContext): Promise<void> {
@@ -811,10 +855,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: [{ type: 'text', text: contextLabel }],
         sourceRelation: 'derived',
       };
+      // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
+      // budgets defaulting to 30k each, an unconstrained concatenation can push
+      // a single assistant turn past 90k tokens, eating the inference budget
+      // and starving recent messages (postmortem 2026-05-04, bug B).
+      const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
       const answerEntry: ContextEntry = {
         index: entries.length + 1,
         participant: this.config.summaryParticipant ?? 'Claude',
-        content: [{ type: 'text', text: combinedText }],
+        content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
         sourceRelation: 'derived',
       };
 
@@ -826,24 +875,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       totalTokens += pairTokens;
     }
 
-    // Phase 4: Recent uncompressed messages (skip head window overlap)
+    // Phase 4: Recent uncompressed messages (skip head window overlap).
+    // Newest-first eviction so that when summaries/head consume most of the
+    // budget, the latest messages (the ones the agent actually needs to act
+    // on) are preserved and the oldest recent-window messages are dropped.
     const effectiveRecentStart = Math.max(recentStart, headEnd);
-    for (let i = effectiveRecentStart; i < messages.length; i++) {
-      const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-
-      if (totalTokens + tokens > maxTokens) break;
-
-      entries.push({
-        index: entries.length,
-        sourceMessageId: msg.id,
-        sourceRelation: 'copy',
-        participant: msg.participant,
-        content,
-      });
-      totalTokens += tokens;
-    }
+    this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
 
     this.trimOrphanedToolUse(entries);
     return entries;
