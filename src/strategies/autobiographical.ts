@@ -598,6 +598,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.emitRecentNewestFirst(entries, store, messages, recentStart, msgCap, maxTokens, totalTokens);
 
     this.trimOrphanedToolUse(entries);
+    this.pruneToolEntries(entries);
     return entries;
   }
 
@@ -1248,6 +1249,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
 
     this.trimOrphanedToolUse(entries);
+    this.pruneToolEntries(entries);
     return entries;
   }
 
@@ -1661,6 +1663,91 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.pop();
       } else {
         break;
+      }
+    }
+  }
+
+  /**
+   * Prune tool_use / tool_result blocks in-place:
+   *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
+   *     `toolUseInputMaxTokens`.
+   *  2. For each tool name, keep only the last N `tool_result` blocks
+   *     per `toolResultMaxLastN`; older ones get their `content` replaced
+   *     with a brief marker referencing the tool name and how many newer
+   *     results exist below.
+   *
+   * Both passes are no-ops when the corresponding config is unset/0.
+   * Pruning runs AFTER selection and orphan-trimming, so it doesn't
+   * affect chunk formation or the recall/pin layout.
+   */
+  protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Pass 1: build toolUseId → toolName map and apply input truncation
+    const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
+    const toolUseIdToName = new Map<string, string>();
+
+    for (const entry of entries) {
+      for (let i = 0; i < entry.content.length; i++) {
+        const block = entry.content[i];
+        if (block.type !== 'tool_use') continue;
+        toolUseIdToName.set(block.id, block.name);
+
+        if (toolUseInputCap > 0) {
+          const inputJson = JSON.stringify(block.input);
+          const inputTokens = Math.ceil(inputJson.length / 4);
+          if (inputTokens > toolUseInputCap) {
+            const keys = Object.keys(block.input).slice(0, 5);
+            entry.content[i] = {
+              ...block,
+              input: {
+                _truncated: true,
+                _originalTokens: inputTokens,
+                _keys: keys,
+              },
+            };
+          }
+        }
+      }
+    }
+
+    // Pass 2: collect tool_result occurrences per tool name, in order
+    const occurrencesByTool = new Map<string, Array<{ entry: ContextEntry; blockIndex: number }>>();
+    for (const entry of entries) {
+      for (let i = 0; i < entry.content.length; i++) {
+        const block = entry.content[i];
+        if (block.type !== 'tool_result') continue;
+        const toolName = toolUseIdToName.get(block.toolUseId);
+        if (!toolName) continue;
+        let arr = occurrencesByTool.get(toolName);
+        if (!arr) {
+          arr = [];
+          occurrencesByTool.set(toolName, arr);
+        }
+        arr.push({ entry, blockIndex: i });
+      }
+    }
+
+    // Pass 3: apply per-tool max-last-N
+    const cfg = this.config.toolResultMaxLastN;
+    if (cfg === undefined) return;
+
+    for (const [toolName, occs] of occurrencesByTool) {
+      let limit: number | undefined;
+      if (typeof cfg === 'number') limit = cfg;
+      else if (typeof cfg === 'object') limit = cfg[toolName];
+      if (limit === undefined || limit < 0) continue;
+
+      const excessCount = occs.length - limit;
+      if (excessCount <= 0) continue;
+
+      for (let i = 0; i < excessCount; i++) {
+        const { entry, blockIndex } = occs[i];
+        const orig = entry.content[blockIndex];
+        if (orig.type !== 'tool_result') continue;
+        const fresherCount = occs.length - i - 1;
+        entry.content[blockIndex] = {
+          ...orig,
+          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+        };
       }
     }
   }

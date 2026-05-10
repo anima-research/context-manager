@@ -246,6 +246,30 @@ export interface AutobiographicalConfig {
    * Only used when `positionedRecallPairs` is true.
    */
   recallHeaderTemplate?: string;
+
+  /**
+   * Per-tool retention limit: keep at most the last N `tool_result` blocks
+   * for each tool name. Older results get their content replaced with a
+   * brief marker referencing the tool name and how many newer results exist.
+   *
+   * Two shapes accepted:
+   *  - `number`: applies as a global default across all tools.
+   *  - `Record<toolName, number>`: per-tool limit; tools not listed are
+   *    unlimited.
+   *
+   * Default: undefined (no pruning). Use a small number (1–5) for tools
+   * that produce verbose, mostly-stale output (e.g. file listings, http
+   * fetches, log queries).
+   */
+  toolResultMaxLastN?: number | Record<string, number>;
+
+  /**
+   * Truncate `tool_use` block inputs whose serialized JSON exceeds this
+   * many tokens. The truncated input becomes `{ "_truncated": true,
+   * "_originalTokens": N }` plus a head slice of the original input
+   * keys for context. Default: 0 (no truncation).
+   */
+  toolUseInputMaxTokens?: number;
 }
 
 /**
