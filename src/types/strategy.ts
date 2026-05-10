@@ -328,6 +328,22 @@ export interface AutobiographicalConfig {
    * new message when `autoTickOnNewMessage` is true).
    */
   maxSpeculativeL1s?: number;
+
+  /**
+   * When false, the rendering pipeline emits the full ideal context (head
+   * window + all selected summaries + all recent messages) without
+   * truncating to fit `budget.maxTokens`. The caller's API will reject if
+   * the result exceeds the model's context window — the philosophy is
+   * "surface the overage rather than silently lose content."
+   *
+   * Default: true (legacy budget-aware truncation: stops emitting recall
+   * pairs and recent messages when the running total exceeds maxTokens).
+   *
+   * Recommended setting for long-lived agents on large-context models
+   * (e.g. opus-4-7 with 1M context): false. The window is generous enough
+   * that overflow is rare, and when it does happen you want to know.
+   */
+  enforceBudget?: boolean;
 }
 
 /**

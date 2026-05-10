@@ -437,11 +437,15 @@ export class ContextManager {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    // Check readiness and wait if needed
-    const readiness = this.strategy.checkReadiness();
-    if (!readiness.ready && readiness.pendingWork) {
-      await readiness.pendingWork;
-    }
+    // Don't block the agent's turn on speculative compression — let it
+    // run in the background. The strategy renders whatever's available
+    // now; the next compile picks up the freshly-formed L1.
+    //
+    // Old behavior (await pendingWork to fold the latest chunk before
+    // the agent responds) added 30+ seconds of latency per turn whenever
+    // a chunk was forming, which is unacceptable UX for an agent that
+    // streams its responses. We accept "this turn doesn't have the very
+    // latest L1" in exchange for non-blocking compile.
 
     // Default budget
     const effectiveBudget: TokenBudget = budget ?? {
@@ -637,6 +641,29 @@ export class ContextManager {
   getSummary(id: string): SummaryEntry | null {
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
+  }
+
+  /**
+   * Per-render stats from the active strategy: head/tail message + token
+   * counts, plus per-level summary counts and total tokens. Returns null
+   * if the strategy doesn't implement `getRenderStats`.
+   *
+   * Designed for TUIs / dashboards that want to display "how much of the
+   * agent's context is folded vs raw" at a glance.
+   */
+  getRenderStats(): {
+    head: { messages: number; tokens: number };
+    tail: { messages: number; tokens: number };
+    summaries: {
+      l1: { count: number; tokens: number };
+      l2: { count: number; tokens: number };
+      l3: { count: number; tokens: number };
+    };
+    pending: { chunks: number; merges: number };
+  } | null {
+    const fn = (this.strategy as { getRenderStats?: (s: unknown) => unknown }).getRenderStats;
+    if (typeof fn !== 'function') return null;
+    return fn.call(this.strategy, this.messageStore.createView()) as ReturnType<NonNullable<typeof this.getRenderStats>>;
   }
 
   /**

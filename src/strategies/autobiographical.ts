@@ -456,22 +456,52 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
     this.rebuildChunks(ctx.messageStore);
 
-    // Auto-tick: fire compression in the background so it runs without
-    // the framework explicitly calling tick(). compile() will await
-    // pendingCompression via checkReadiness().
-    if (this.config.autoTickOnNewMessage && this.compressionQueue.length > 0 && !this.pendingCompression) {
-      // Speculation cap: defer if we already have more pending+pending-merge
-      // L1s than the configured ceiling. Chunks still queue; the next
-      // explicit tick() or compile() will drain them.
-      if (this.isAtSpeculativeCap()) return;
-
-      // Preflight hook (subclass override for predictive scheduling).
-      if (!this.shouldCompressPreflight()) return;
-
-      this.tick(ctx).catch((err) =>
-        console.error('AutobiographicalStrategy: auto-tick error:', err)
-      );
+    // Auto-tick: fire speculative compression in the background. After
+    // each tick completes, if the queue still has work AND we're under
+    // the speculation cap AND preflight allows, schedule another tick.
+    // This drains the queue ahead of need rather than one-chunk-per-
+    // user-turn (reactive). Combined with ContextManager.compile not
+    // awaiting pendingCompression, the agent's response and background
+    // compression run truly in parallel.
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
     }
+  }
+
+  /**
+   * Background-drain loop: keeps calling tick() while there's queued work,
+   * subject to the speculation cap and preflight hook. Recurses via
+   * `queueMicrotask` so one chunk's compression doesn't block the
+   * scheduling of the next.
+   *
+   * Stops if a tick fails to make progress (queue size unchanged) — guards
+   * against runaway recursion when tick is a no-op (e.g. no membrane
+   * configured, or a subclass override that doesn't process the queue).
+   */
+  protected driveSpeculativeDrain(ctx: StrategyContext): void {
+    if (this.pendingCompression) return;
+    if (this.compressionQueue.length === 0 && this.mergeQueue.length === 0) return;
+    if (this.isAtSpeculativeCap()) return;
+    if (!this.shouldCompressPreflight()) return;
+
+    const beforeChunks = this.compressionQueue.length;
+    const beforeMerges = this.mergeQueue.length;
+
+    this.tick(ctx)
+      .then(() => {
+        const afterChunks = this.compressionQueue.length;
+        const afterMerges = this.mergeQueue.length;
+        // Made progress if either queue shrank.
+        const progressed = afterChunks < beforeChunks || afterMerges < beforeMerges;
+        if (!progressed) return;
+        // Recurse to drain more. queueMicrotask defers until the current
+        // task is done, letting other code (the agent's stream consumer)
+        // interleave.
+        queueMicrotask(() => this.driveSpeculativeDrain(ctx));
+      })
+      .catch((err) => {
+        console.error('AutobiographicalStrategy: speculative-drain error:', err);
+      });
   }
 
   /**
@@ -580,6 +610,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
+  /**
+   * Richer per-render stats: requires a message store view to compute the
+   * head + tail (recent window) sizes. Returns counts AND token sums per
+   * summary level, so observers can see "how much of the agent's context
+   * is in raw tail vs folded into L1/L2/L3."
+   *
+   * Useful for TUI / dashboards. The token sums use the strategy's own
+   * token estimates (which match what `select()` uses for budget math).
+   */
+  getRenderStats(store: MessageStoreView): {
+    head: { messages: number; tokens: number };
+    tail: { messages: number; tokens: number };
+    summaries: {
+      l1: { count: number; tokens: number };
+      l2: { count: number; tokens: number };
+      l3: { count: number; tokens: number };
+    };
+    pending: { chunks: number; merges: number };
+  } {
+    const messages = store.getAll();
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = this.getRecentWindowStart(store);
+
+    const sumTokens = (slice: StoredMessage[]): number =>
+      slice.reduce((acc, m) => acc + store.estimateTokens(m), 0);
+
+    const headMsgs = messages.slice(headStart, headEnd);
+    const tailMsgs = messages.slice(recentStart);
+
+    const live = (level: SummaryLevel) =>
+      this.summaries.filter(s => s.level === level && !s.mergedInto);
+    const sumLevelTokens = (level: SummaryLevel): number =>
+      live(level).reduce((acc, s) => acc + s.tokens, 0);
+
+    return {
+      head: { messages: headMsgs.length, tokens: sumTokens(headMsgs) },
+      tail: { messages: tailMsgs.length, tokens: sumTokens(tailMsgs) },
+      summaries: {
+        l1: { count: live(1).length, tokens: sumLevelTokens(1) },
+        l2: { count: live(2).length, tokens: sumLevelTokens(2) },
+        l3: { count: live(3).length, tokens: sumLevelTokens(3) },
+      },
+      pending: {
+        chunks: this.chunks.filter(c => !c.compressed).length,
+        merges: this.mergeQueue.length,
+      },
+    };
+  }
+
   // ============================================================================
   // Legacy (single-level) path
   // ============================================================================
@@ -602,7 +682,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -650,7 +730,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const pairTokens = this.estimateTokens(questionEntry.content) +
                            this.estimateTokens(answerEntry.content);
 
-        if (totalTokens + pairTokens > maxTokens) break;
+        if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
 
         entries.push(questionEntry);
         entries.push(answerEntry);
@@ -660,7 +740,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const msg of chunk.messages) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-          if (totalTokens + tokens > maxTokens) break;
+          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
           entries.push({
             index: entries.length,
@@ -683,7 +763,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -733,7 +813,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0
         ? Math.min(store.estimateTokens(msg), msgCap + 50)
         : store.estimateTokens(msg);
-      if (totalTokensBefore + acceptedTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) break;
       accepted.push(i);
       acceptedTokens += tokens;
     }
@@ -1169,7 +1249,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -1206,7 +1286,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let l3Used = 0;
     for (const s of shownL3) {
       if (l3Used + s.tokens > l3Budget) break;
-      if (totalTokens + totalSummaryTokens + s.tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) break;
       selectedSummaries.push(s);
       l3Used += s.tokens;
       totalSummaryTokens += s.tokens;
@@ -1218,7 +1298,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const l2Effective = l2Budget + l3Carryover;
     for (const s of shownL2) {
       if (l2Used + s.tokens > l2Effective) break;
-      if (totalTokens + totalSummaryTokens + s.tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) break;
       selectedSummaries.push(s);
       l2Used += s.tokens;
       totalSummaryTokens += s.tokens;
@@ -1297,7 +1377,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const pairTokens =
               this.estimateTokens(questionEntry.content) +
               this.estimateTokens(answerEntry.content);
-            if (totalTokens + pairTokens > maxTokens) break;
+            if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
             entries.push(questionEntry);
             entries.push(answerEntry);
             totalTokens += pairTokens;
@@ -1307,7 +1387,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const tokens = msgCap > 0
               ? Math.min(store.estimateTokens(msg), msgCap + 50)
               : store.estimateTokens(msg);
-            if (totalTokens + tokens > maxTokens) break;
+            if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
             entries.push({
               index: entries.length,
               sourceMessageId: msg.id,
@@ -1356,7 +1436,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const tokens = msgCap > 0
             ? Math.min(store.estimateTokens(msg), msgCap + 50)
             : store.estimateTokens(msg);
-          if (totalTokens + tokens > maxTokens) break;
+          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
           entries.push({
             index: entries.length,
             sourceMessageId: msg.id,
@@ -1418,11 +1498,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let used = 0;
     for (const s of shownL1) {
       if (used + s.tokens > budget) break;
-      if (used + s.tokens > maxTokens) break;
+      if (this.isOverBudget(used + s.tokens, maxTokens)) break;
       selected.push(s);
       used += s.tokens;
     }
     return { selected, tokensUsed: used };
+  }
+
+  /**
+   * True if `projectedTotal` exceeds `max` AND the strategy is configured
+   * to enforce budget. When `enforceBudget: false`, always returns false
+   * — the rendering pipeline emits the full ideal context regardless of
+   * budget overage. Caller's API will reject if it exceeds the model's
+   * context window; the philosophy is "surface overage, don't hide it."
+   */
+  protected isOverBudget(projectedTotal: number, max: number): boolean {
+    if (this.config.enforceBudget === false) return false;
+    return projectedTotal > max;
   }
 
   /**
