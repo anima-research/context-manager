@@ -38,6 +38,15 @@ export type {
   KnowledgeConfig,
   ResettableStrategy,
   ProtectedRange,
+  SearchQuery,
+  SearchResult,
+  SearchableStrategy,
+  PinnableStrategy,
 } from './strategy.js';
 
-export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG, isResettableStrategy, isPinnableStrategy } from './strategy.js';
+export {
+  DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
+  isResettableStrategy,
+  isPinnableStrategy,
+  isSearchableStrategy,
+} from './strategy.js';

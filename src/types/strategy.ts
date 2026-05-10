@@ -168,6 +168,52 @@ export function isPinnableStrategy(s: ContextStrategy): s is PinnableStrategy {
 }
 
 /**
+ * Query for `searchSummaries`. At least one of `text` or `regex` should be
+ * provided to constrain results; otherwise all summaries pass.
+ */
+export interface SearchQuery {
+  /** Case-insensitive substring match against summary content. */
+  text?: string;
+  /** Regex match against summary content (overrides `text` if both set). */
+  regex?: RegExp;
+  /** Filter by summary level(s). Default: all levels. */
+  levels?: SummaryLevel[];
+  /** Maximum number of results to return. Default: 50. */
+  limit?: number;
+  /**
+   * Include summaries that have been merged into a higher-level summary.
+   * Default: false (only "live" unmerged summaries are returned).
+   */
+  includeMerged?: boolean;
+}
+
+/** Result of a single search match. */
+export interface SearchResult {
+  summary: SummaryEntry;
+  /** Number of times the query pattern matched in the summary content. */
+  matches: number;
+}
+
+/**
+ * Strategy that supports searching its summary archive. Implemented by
+ * AutobiographicalStrategy.
+ */
+export interface SearchableStrategy extends ContextStrategy {
+  searchSummaries(query: SearchQuery): SearchResult[];
+  getSummary(id: string): SummaryEntry | null;
+}
+
+/** Type guard for strategies that support search. */
+export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrategy {
+  return (
+    'searchSummaries' in s &&
+    typeof (s as SearchableStrategy).searchSummaries === 'function' &&
+    'getSummary' in s &&
+    typeof (s as SearchableStrategy).getSummary === 'function'
+  );
+}
+
+/**
  * Configuration for the Autobiographical strategy.
  */
 export interface AutobiographicalConfig {

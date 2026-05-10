@@ -16,8 +16,11 @@ import type {
   ContextInjection,
   CompileResult,
   ProtectedRange,
+  SearchQuery,
+  SearchResult,
+  SummaryEntry,
 } from './types/index.js';
-import { isResettableStrategy, isPinnableStrategy } from './types/index.js';
+import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -612,6 +615,28 @@ export class ContextManager {
   listPins(): ReadonlyArray<ProtectedRange> {
     if (!isPinnableStrategy(this.strategy)) return [];
     return this.strategy.listPins();
+  }
+
+  // ==========================================================================
+  // Search (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Search the strategy's summary archive (substring or regex over content).
+   * Returns empty array if the strategy doesn't support search.
+   *
+   * Suitable for building memory-search agent tools at the framework layer
+   * — see e.g. agent-framework's MCPL host integration.
+   */
+  searchSummaries(query: SearchQuery): SearchResult[] {
+    if (!isSearchableStrategy(this.strategy)) return [];
+    return this.strategy.searchSummaries(query);
+  }
+
+  /** Look up a single summary by id. Returns null if not found / unsupported. */
+  getSummary(id: string): SummaryEntry | null {
+    if (!isSearchableStrategy(this.strategy)) return null;
+    return this.strategy.getSummary(id);
   }
 
   /**

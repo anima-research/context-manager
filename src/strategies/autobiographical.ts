@@ -15,6 +15,8 @@ import type {
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
+  SearchQuery,
+  SearchResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 
@@ -268,6 +270,77 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Read-only list of all current pins. */
   listPins(): ReadonlyArray<ProtectedRange> {
     return this.pins;
+  }
+
+  // ============================================================================
+  // Search (gap #7)
+  // ============================================================================
+
+  /**
+   * Look up a single summary by id. Returns null if not found.
+   */
+  getSummary(id: string): SummaryEntry | null {
+    return this.summaries.find(s => s.id === id) ?? null;
+  }
+
+  /**
+   * Search summaries by substring or regex over their content.
+   *
+   * Result ordering: matches by descending hit count, then by descending
+   * `created` timestamp (newest first within the same hit count).
+   *
+   * Default behavior: only "live" (unmerged) summaries are searched. Set
+   * `includeMerged: true` to also include summaries that have been folded
+   * into a higher level.
+   */
+  searchSummaries(query: SearchQuery): SearchResult[] {
+    const limit = query.limit ?? 50;
+    const includeMerged = query.includeMerged ?? false;
+
+    // Build the matcher
+    let matcher: ((content: string) => number) | null = null;
+    if (query.regex) {
+      const flags = query.regex.flags.includes('g') ? query.regex.flags : query.regex.flags + 'g';
+      const re = new RegExp(query.regex.source, flags);
+      matcher = (content: string) => {
+        const matches = content.match(re);
+        return matches ? matches.length : 0;
+      };
+    } else if (query.text) {
+      const needle = query.text.toLowerCase();
+      matcher = (content: string) => {
+        const hay = content.toLowerCase();
+        let count = 0;
+        let idx = 0;
+        while ((idx = hay.indexOf(needle, idx)) !== -1) {
+          count++;
+          idx += needle.length || 1;
+        }
+        return count;
+      };
+    } else {
+      // No pattern: every summary "matches" once
+      matcher = () => 1;
+    }
+
+    const levelsFilter = query.levels && query.levels.length > 0 ? new Set(query.levels) : null;
+
+    const results: SearchResult[] = [];
+    for (const s of this.summaries) {
+      if (!includeMerged && s.mergedInto) continue;
+      if (levelsFilter && !levelsFilter.has(s.level)) continue;
+      const matches = matcher(s.content);
+      if (matches > 0) {
+        results.push({ summary: s, matches });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (b.matches !== a.matches) return b.matches - a.matches;
+      return b.summary.created - a.summary.created;
+    });
+
+    return results.slice(0, limit);
   }
 
   /**
