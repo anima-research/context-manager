@@ -93,6 +93,8 @@ export class ContextManager {
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
   private debugLogContext: boolean;
+  /** Namespace passed to strategies for scoping their persistent state slots. */
+  private strategyNamespace: string;
 
   private constructor(
     store: JsStore,
@@ -100,6 +102,7 @@ export class ContextManager {
     contextLog: ContextLog,
     strategy: ContextStrategy,
     ownsStore: boolean,
+    strategyNamespace: string,
     membrane?: Membrane,
     debugLogContext = false,
   ) {
@@ -108,6 +111,7 @@ export class ContextManager {
     this.contextLog = contextLog;
     this.strategy = strategy;
     this.ownsStore = ownsStore;
+    this.strategyNamespace = strategyNamespace;
     this.membrane = membrane;
     this.debugLogContext = debugLogContext;
 
@@ -173,12 +177,18 @@ export class ContextManager {
     });
     const strategy = config.strategy ?? new PassthroughStrategy();
 
+    // Namespace passed to strategies. Falls back to a stable per-store value
+    // so strategies always have something to scope state IDs by, even when
+    // the caller didn't supply a namespace.
+    const strategyNamespace = config.namespace ?? 'default';
+
     const manager = new ContextManager(
       store,
       messageStore,
       contextLog,
       strategy,
       ownsStore,
+      strategyNamespace,
       config.membrane,
       config.debugLogContext ?? false,
     );
@@ -294,6 +304,10 @@ export class ContextManager {
   /**
    * Create a branch from a specific message.
    * The new branch will have state as of that message's sequence (time-travel branching).
+   *
+   * Returns the new branch *name*, which is what `switchBranch` and `forkAt`
+   * expect. (Chronicle's branch APIs are name-keyed; the numeric `id` field
+   * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
     const message = this.messageStore.get(messageId);
@@ -303,21 +317,50 @@ export class ContextManager {
 
     // Create branch name if not provided
     const branchName = name ?? `branch-${Date.now()}`;
-    
+
     // Get current branch name to branch from
     const currentBranch = this.store.currentBranch();
-    
+
     // Use createBranchAt to branch at the message's sequence (time-travel)
     const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
 
-    return branch.id;
+    return branch.name;
   }
 
   /**
    * Switch to a different branch.
+   *
+   * Re-initializes the strategy after switching so any branch-scoped state
+   * stored on Chronicle is reloaded. Strategies that hold derived in-memory
+   * caches (e.g. AutobiographicalStrategy.summaries) need this to avoid
+   * showing the previous branch's state on the new branch.
    */
-  switchBranch(branchId: string): void {
+  async switchBranch(branchId: string): Promise<void> {
     this.store.switchBranch(branchId);
+    await this.initializeStrategy();
+  }
+
+  /**
+   * Fork from the current head: create a new branch at the current sequence
+   * and switch to it. The new branch starts with all current state (messages,
+   * context log, and strategy state) and diverges from there.
+   *
+   * Use this when an agent wants to explore an alternate timeline from
+   * "now" — e.g. trying a different response without committing.
+   *
+   * For time-travel branching at a specific historical message, use
+   * `branchAt(messageId, name?)` instead, then `switchBranch(name)`.
+   *
+   * Returns the new branch's name. The strategy is re-initialized on the
+   * new branch so it picks up the forked state.
+   */
+  async fork(name?: string): Promise<string> {
+    const branchName = name ?? `fork-${Date.now()}`;
+    const currentBranch = this.store.currentBranch();
+    const currentSeq = this.store.currentSequence();
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
+    await this.switchBranch(branch.name);
+    return branch.name;
   }
 
   /**
@@ -583,6 +626,8 @@ export class ContextManager {
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
       currentSequence: this.store.currentSequence(),
+      store: this.store,
+      namespace: this.strategyNamespace,
     };
   }
 

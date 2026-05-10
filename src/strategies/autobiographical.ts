@@ -1,3 +1,4 @@
+import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
 import type {
@@ -86,6 +87,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Cached result of getHeadWindowStartIndex to avoid repeated linear scans. */
   private _cachedHeadStartIndex: { id: string | null; msgCount: number; result: number } | null = null;
 
+  /** Chronicle store for persistent state. Set in `initialize()`. */
+  protected store: JsStore | null = null;
+  /** Namespace for state-id scoping. Set in `initialize()`. */
+  protected ns: string = '';
+  protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
+  protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
+  protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
+
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
     // Hierarchical is on by default; set hierarchical: false to use legacy single-level
@@ -100,8 +109,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
+    // Bind to the chronicle store + namespace for persistent strategy state.
+    this.store = ctx.store;
+    this.ns = ctx.namespace;
+    this.registerStates();
+    this.loadPersistedState();
+
     // Restore headWindowStartId from last topic transition message
     const messages = ctx.messageStore.getAll();
+    this.headWindowStartId = null;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (this.isTopicTransitionMessage(messages[i])) {
         this.headWindowStartId = messages[i].id;
@@ -109,6 +125,110 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     this.rebuildChunks(ctx.messageStore);
+  }
+
+  /**
+   * Register the three Chronicle state slots this strategy uses.
+   * Idempotent — chronicle throws if a state is already registered, which we
+   * swallow (the existing slot is what we want).
+   */
+  protected registerStates(): void {
+    if (!this.store) return;
+    try {
+      this.store.registerState({
+        id: this.summariesStateId,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 50,
+        fullSnapshotEvery: 10,
+      });
+    } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.counterStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.mergeQueueStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
+  }
+
+  /**
+   * Load summaries, counter, and pending merges from chronicle into the
+   * in-memory mirrors. Called on every (re)initialize so branch switches
+   * pick up the new branch's state.
+   */
+  protected loadPersistedState(): void {
+    if (!this.store) {
+      this.summaries = [];
+      this.summaryIdCounter = 0;
+      this.mergeQueue = [];
+      return;
+    }
+    const summaries = this.store.getStateJson(this.summariesStateId);
+    this.summaries = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
+
+    const counter = this.store.getStateJson(this.counterStateId);
+    this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
+
+    const queue = this.store.getStateJson(this.mergeQueueStateId);
+    this.mergeQueue = Array.isArray(queue)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[] }>)
+      : [];
+  }
+
+  /**
+   * Append a summary to the in-memory list and to the chronicle AppendLog.
+   * Single point so subclasses inherit persistence.
+   */
+  protected pushSummary(entry: SummaryEntry): void {
+    this.summaries.push(entry);
+    this.store?.appendToStateJson(this.summariesStateId, entry);
+  }
+
+  /**
+   * Mark a summary as merged into a higher-level summary, updating the
+   * chronicle copy at the same index. Index is the position in `this.summaries`.
+   */
+  protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
+    entry.mergedInto = mergedIntoId;
+    if (!this.store) return;
+    const index = this.summaries.indexOf(entry);
+    if (index < 0) return;
+    this.store.editStateItem(
+      this.summariesStateId,
+      index,
+      Buffer.from(JSON.stringify(entry)),
+    );
+  }
+
+  /**
+   * Allocate the next summary-id counter value and persist the new counter.
+   */
+  protected nextSummaryIdCounter(): number {
+    const value = this.summaryIdCounter++;
+    this.store?.setStateJson(this.counterStateId, this.summaryIdCounter);
+    return value;
+  }
+
+  /**
+   * Push to the merge queue and persist the new queue snapshot.
+   */
+  protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[] }): void {
+    this.mergeQueue.push(merge);
+    this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+  }
+
+  /**
+   * Pop from the merge queue and persist the new queue snapshot.
+   */
+  protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[] } | undefined {
+    const merge = this.mergeQueue.shift();
+    this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    return merge;
   }
 
   checkReadiness(): ReadinessState {
@@ -180,7 +300,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Priority 2: Execute pending merges (hierarchical only)
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
-      const merge = this.mergeQueue.shift()!;
+      const merge = this.dequeueMerge()!;
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
@@ -595,7 +715,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
-        id: `L1-${this.summaryIdCounter++}`,
+        id: `L1-${this.nextSummaryIdCounter()}`,
         level: 1,
         content: summaryText,
         tokens: Math.ceil(summaryText.length / 4),
@@ -609,7 +729,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         phaseType: chunk.phaseType,
       };
 
-      this.summaries.push(entry);
+      this.pushSummary(entry);
       chunk.compressed = true;
       chunk.summaryId = entry.id;
       this._compressionCount++;
@@ -632,7 +752,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unmergedL1 = this.summaries.filter(s => s.level === 1 && !s.mergedInto);
     if (unmergedL1.length >= threshold) {
       const toMerge = unmergedL1.slice(0, threshold);
-      this.mergeQueue.push({
+      this.enqueueMerge({
         level: 2,
         sourceIds: toMerge.map(s => s.id),
       });
@@ -642,7 +762,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unmergedL2 = this.summaries.filter(s => s.level === 2 && !s.mergedInto);
     if (unmergedL2.length >= threshold) {
       const toMerge = unmergedL2.slice(0, threshold);
-      this.mergeQueue.push({
+      this.enqueueMerge({
         level: 3,
         sourceIds: toMerge.map(s => s.id),
       });
@@ -735,7 +855,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const sourceLevel = (targetLevel - 1) as 0 | 1 | 2;
       const newEntry: SummaryEntry = {
-        id: `L${targetLevel}-${this.summaryIdCounter++}`,
+        id: `L${targetLevel}-${this.nextSummaryIdCounter()}`,
         level: targetLevel,
         content: mergedText,
         tokens: Math.ceil(mergedText.length / 4),
@@ -745,11 +865,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         created: Date.now(),
       };
 
-      this.summaries.push(newEntry);
+      // Append the new merged entry first, then mark sources. Persist each
+      // mergedInto edit individually so chronicle reflects the same shape as
+      // the in-memory mirror. (If the process crashes mid-loop, restart sees
+      // the new entry plus a partial set of marked sources; un-marked sources
+      // would re-trigger a merge — accept the rare duplicate over data loss.)
+      this.pushSummary(newEntry);
 
-      // Mark sources as merged
       for (const source of sources) {
-        source.mergedInto = newEntry.id;
+        this.setMergedInto(source, newEntry.id);
       }
 
       // Check if this merge triggers a further merge

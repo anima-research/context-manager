@@ -1,3 +1,4 @@
+import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
@@ -48,6 +49,22 @@ export interface StrategyContext {
   membrane?: Membrane;
   /** Current sequence number */
   currentSequence: Sequence;
+  /**
+   * Underlying Chronicle store. Strategies may register their own state slots
+   * (via `store.registerState`) for durable strategy state that needs to
+   * survive process restart and follow Chronicle branches.
+   *
+   * State IDs should be scoped under `namespace` to avoid collisions with
+   * other strategies or with the message/context-log states.
+   */
+  store: JsStore;
+  /**
+   * Namespace under which this strategy should scope its state IDs.
+   * Use as a prefix: e.g. `${namespace}/autobio:summaries`. Always defined;
+   * defaults to a stable per-manager value when no caller-supplied namespace
+   * exists, so strategies never need to handle the unscoped case.
+   */
+  namespace: string;
 }
 
 /**
