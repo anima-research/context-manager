@@ -146,6 +146,28 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
 }
 
 /**
+ * Strategy that supports protected ranges (pins + documents).
+ * Pinned ranges are excluded from compression and render raw at their
+ * original chronological position. Implemented by AutobiographicalStrategy.
+ */
+export interface PinnableStrategy extends ContextStrategy {
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string;
+  markDocument(messageId: string, opts?: { name?: string }): string;
+  unpin(pinId: string): boolean;
+  listPins(): ReadonlyArray<ProtectedRange>;
+}
+
+/** Type guard for strategies that support pins / documents. */
+export function isPinnableStrategy(s: ContextStrategy): s is PinnableStrategy {
+  return (
+    'pinRange' in s &&
+    typeof (s as PinnableStrategy).pinRange === 'function' &&
+    'unpin' in s &&
+    typeof (s as PinnableStrategy).unpin === 'function'
+  );
+}
+
+/**
  * Configuration for the Autobiographical strategy.
  */
 export interface AutobiographicalConfig {
@@ -258,6 +280,29 @@ export interface SummaryEntry {
   created: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
+}
+
+/**
+ * A range of messages protected from compression. Pins keep a span of raw
+ * messages visible at their original position in the rendered context.
+ *
+ * - `kind: 'pin'` — generic protected range (any first/last span).
+ * - `kind: 'document'` — typically a single message containing a body of
+ *   information the agent wants to retain in full; semantically identical
+ *   to a single-message pin, distinguished by metadata for tooling.
+ */
+export interface ProtectedRange {
+  /** Stable id assigned at pin time. */
+  id: string;
+  /** First message id of the protected range (inclusive). */
+  firstMessageId: string;
+  /** Last message id of the protected range (inclusive). */
+  lastMessageId: string;
+  kind: 'pin' | 'document';
+  /** Optional human-readable label. */
+  name?: string;
+  /** Creation timestamp (ms since epoch). */
+  created: number;
 }
 
 /**

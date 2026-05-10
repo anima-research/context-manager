@@ -15,8 +15,9 @@ import type {
   MessageQueryResult,
   ContextInjection,
   CompileResult,
+  ProtectedRange,
 } from './types/index.js';
-import { isResettableStrategy } from './types/index.js';
+import { isResettableStrategy, isPinnableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -568,6 +569,49 @@ export class ContextManager {
    */
   getStrategy(): ContextStrategy {
     return this.strategy;
+  }
+
+  // ==========================================================================
+  // Pins / documents (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Pin a range of messages so they aren't compressed and render raw at
+   * their original chronological position. Returns the new pin id.
+   *
+   * Throws if the active strategy doesn't support pins.
+   */
+  pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.pinRange(firstMessageId, lastMessageId, opts);
+  }
+
+  /**
+   * Mark a single message as a "document" (semantically a body of
+   * information to retain in full). Same effect as a single-message pin
+   * with `kind: 'document'`. Returns the new pin id.
+   */
+  markDocument(messageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support documents');
+    }
+    return this.strategy.markDocument(messageId, opts);
+  }
+
+  /** Remove a pin or document mark. Returns true if removed. */
+  unpin(pinId: string): boolean {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.unpin(pinId);
+  }
+
+  /** List all current pins. Returns empty array if strategy is not pinnable. */
+  listPins(): ReadonlyArray<ProtectedRange> {
+    if (!isPinnableStrategy(this.strategy)) return [];
+    return this.strategy.listPins();
   }
 
   /**
