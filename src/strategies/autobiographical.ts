@@ -982,12 +982,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Check if unmerged summary counts exceed the merge threshold.
    * Enqueues merge operations if so.
+   *
+   * Skips L1s/L2s that are already in a pending merge — without this guard,
+   * each new summary above threshold re-enqueues a merge for the same
+   * already-eligible siblings, producing N near-identical higher-level
+   * summaries when the queue eventually drains.
    */
   protected checkMergeThreshold(): void {
     const threshold = this.config.mergeThreshold ?? 6;
 
+    // IDs that are already part of a queued merge — exclude them from
+    // eligibility so we don't re-enqueue.
+    const queuedL1 = new Set<string>();
+    const queuedL2 = new Set<string>();
+    for (const m of this.mergeQueue) {
+      const set = m.level === 2 ? queuedL1 : queuedL2;
+      for (const id of m.sourceIds) set.add(id);
+    }
+
     // Check L1 → L2
-    const unmergedL1 = this.summaries.filter(s => s.level === 1 && !s.mergedInto);
+    const unmergedL1 = this.summaries.filter(
+      s => s.level === 1 && !s.mergedInto && !queuedL1.has(s.id),
+    );
     if (unmergedL1.length >= threshold) {
       const toMerge = unmergedL1.slice(0, threshold);
       this.enqueueMerge({
@@ -997,7 +1013,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Check L2 → L3
-    const unmergedL2 = this.summaries.filter(s => s.level === 2 && !s.mergedInto);
+    const unmergedL2 = this.summaries.filter(
+      s => s.level === 2 && !s.mergedInto && !queuedL2.has(s.id),
+    );
     if (unmergedL2.length >= threshold) {
       const toMerge = unmergedL2.slice(0, threshold);
       this.enqueueMerge({
@@ -1026,6 +1044,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (sources.length !== sourceIds.length) {
       console.warn('executeMerge: some source summaries not found, skipping');
+      return;
+    }
+
+    // Defensive: if every source is already mergedInto something, this is a
+    // stale queue entry (could happen if multiple merges for the same
+    // sourceIds were enqueued before the dedup fix in checkMergeThreshold).
+    // Skip rather than produce a redundant near-identical higher-level entry.
+    if (sources.every(s => s.mergedInto)) {
+      console.warn(
+        `executeMerge: all sources already merged into ${sources[0].mergedInto}, skipping (stale queue entry)`,
+      );
       return;
     }
 
