@@ -387,10 +387,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the framework explicitly calling tick(). compile() will await
     // pendingCompression via checkReadiness().
     if (this.config.autoTickOnNewMessage && this.compressionQueue.length > 0 && !this.pendingCompression) {
+      // Speculation cap: defer if we already have more pending+pending-merge
+      // L1s than the configured ceiling. Chunks still queue; the next
+      // explicit tick() or compile() will drain them.
+      if (this.isAtSpeculativeCap()) return;
+
+      // Preflight hook (subclass override for predictive scheduling).
+      if (!this.shouldCompressPreflight()) return;
+
       this.tick(ctx).catch((err) =>
         console.error('AutobiographicalStrategy: auto-tick error:', err)
       );
     }
+  }
+
+  /**
+   * Whether the strategy's pending+queued L1 budget has reached the cap
+   * configured by `maxSpeculativeL1s`. If no cap is set, always false.
+   */
+  protected isAtSpeculativeCap(): boolean {
+    const cap = this.config.maxSpeculativeL1s;
+    if (cap === undefined || cap < 0) return false;
+    const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto).length;
+    return unmergedL1s + this.compressionQueue.length > cap;
+  }
+
+  /**
+   * Preflight hook for whether speculative compression should fire on
+   * `onNewMessage`. Returns true by default (current eager behavior).
+   * Subclasses can override for predictive scheduling — e.g. only fire
+   * when the live tail token count is approaching some threshold.
+   */
+  protected shouldCompressPreflight(): boolean {
+    return true;
   }
 
   async tick(ctx: StrategyContext): Promise<void> {

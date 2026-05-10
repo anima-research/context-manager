@@ -270,6 +270,18 @@ export interface AutobiographicalConfig {
    * keys for context. Default: 0 (no truncation).
    */
   toolUseInputMaxTokens?: number;
+
+  /**
+   * Cap on the number of speculative L1 summaries the strategy will hold
+   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
+   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
+   * still form and queue, but compression is deferred until a manual
+   * `tick()` or `compile()` triggers it.
+   *
+   * Default: undefined (no cap; compression fires eagerly on every
+   * new message when `autoTickOnNewMessage` is true).
+   */
+  maxSpeculativeL1s?: number;
 }
 
 /**
