@@ -789,7 +789,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: 2000,
-        temperature: 0,
       },
     };
 
@@ -942,7 +941,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
-        temperature: 0,
       },
     };
 
@@ -1076,7 +1074,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
-        temperature: 0,
       },
     };
 
@@ -1500,7 +1497,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: 1500,
-        temperature: 0,
       },
     };
 
