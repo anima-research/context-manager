@@ -983,35 +983,75 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     selectedSummaries.push(...l1Selected);
     totalSummaryTokens += l1Used;
 
-    // Emit summaries as a single Q&A pair
+    // Emit summaries as Q/A recall pairs.
+    // Default (positionedRecallPairs=true): one Q/A pair per summary, sorted
+    // chronologically by source-range position. This is the spec-faithful
+    // shape — each memory appears in its temporal place rather than as a
+    // wall of unrelated recollections from another speaker.
+    // Legacy (positionedRecallPairs=false): all summaries concatenated into
+    // a single Q/A pair between head and tail.
     if (selectedSummaries.length > 0) {
-      const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-      const combinedText = selectedSummaries.map(s => s.content).join('\n\n---\n\n');
+      if (this.config.positionedRecallPairs !== false) {
+        const sorted = this.sortSummariesChronologically(selectedSummaries, messages);
+        const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
-      const questionEntry: ContextEntry = {
-        index: entries.length,
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: contextLabel }],
-        sourceRelation: 'derived',
-      };
-      // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
-      // budgets defaulting to 30k each, an unconstrained concatenation can push
-      // a single assistant turn past 90k tokens, eating the inference budget
-      // and starving recent messages (postmortem 2026-05-04, bug B).
-      const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
-      const answerEntry: ContextEntry = {
-        index: entries.length + 1,
-        participant: this.config.summaryParticipant ?? 'Claude',
-        content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
-        sourceRelation: 'derived',
-      };
+        for (const summary of sorted) {
+          const headerText = this.buildRecallHeader(summary);
+          const questionEntry: ContextEntry = {
+            index: entries.length,
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: headerText }],
+            sourceRelation: 'derived',
+          };
+          const answerContent: ContentBlock[] = [{ type: 'text', text: summary.content }];
+          const answerEntry: ContextEntry = {
+            index: entries.length + 1,
+            participant: summaryParticipant,
+            content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+            sourceRelation: 'derived',
+          };
 
-      const pairTokens = this.estimateTokens(questionEntry.content) +
-                         this.estimateTokens(answerEntry.content);
+          const pairTokens =
+            this.estimateTokens(questionEntry.content) +
+            this.estimateTokens(answerEntry.content);
 
-      entries.push(questionEntry);
-      entries.push(answerEntry);
-      totalTokens += pairTokens;
+          // Stop emitting recall pairs if we'd blow the overall budget.
+          if (totalTokens + pairTokens > maxTokens) break;
+
+          entries.push(questionEntry);
+          entries.push(answerEntry);
+          totalTokens += pairTokens;
+        }
+      } else {
+        // Legacy combined-pair mode
+        const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+        const combinedText = selectedSummaries.map(s => s.content).join('\n\n---\n\n');
+
+        const questionEntry: ContextEntry = {
+          index: entries.length,
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: contextLabel }],
+          sourceRelation: 'derived',
+        };
+        // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
+        // budgets defaulting to 30k each, an unconstrained concatenation can push
+        // a single assistant turn past 90k tokens, eating the inference budget
+        // and starving recent messages (postmortem 2026-05-04, bug B).
+        const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
+        const answerEntry: ContextEntry = {
+          index: entries.length + 1,
+          participant: this.config.summaryParticipant ?? 'Claude',
+          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+          sourceRelation: 'derived',
+        };
+
+        const pairTokens = this.estimateTokens(questionEntry.content) +
+                           this.estimateTokens(answerEntry.content);
+
+        entries.push(questionEntry);
+        entries.push(answerEntry);
+        totalTokens += pairTokens;
+      }
     }
 
     // Phase 4: Recent uncompressed messages (skip head window overlap).
@@ -1067,6 +1107,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       used += s.tokens;
     }
     return { selected, tokensUsed: used };
+  }
+
+  /**
+   * Sort selected summaries by source-range start position, so per-pair
+   * recall emission appears in chronological order. Falls back to the
+   * created timestamp for summaries whose source-range first message is
+   * no longer in the store.
+   */
+  protected sortSummariesChronologically(
+    summaries: SummaryEntry[],
+    messages: StoredMessage[],
+  ): SummaryEntry[] {
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      positionOf.set(messages[i].id, i);
+    }
+    return [...summaries].sort((a, b) => {
+      const posA = positionOf.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+      const posB = positionOf.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+      if (posA !== posB) return posA - posB;
+      return a.created - b.created;
+    });
+  }
+
+  /**
+   * Render the per-pair recall header from the configured template.
+   * Substitutions: {id} {level} {first} {last}.
+   */
+  protected buildRecallHeader(summary: SummaryEntry): string {
+    const template = this.config.recallHeaderTemplate ?? '[Recall {id}]';
+    return template
+      .replace(/\{id\}/g, summary.id)
+      .replace(/\{level\}/g, String(summary.level))
+      .replace(/\{first\}/g, summary.sourceRange.first)
+      .replace(/\{last\}/g, summary.sourceRange.last);
   }
 
   // ============================================================================

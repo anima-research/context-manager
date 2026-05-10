@@ -198,6 +198,32 @@ export interface AutobiographicalConfig {
   l2BudgetTokens?: number;
   /** Token budget for L1 summaries in select() (default: 30000) */
   l1BudgetTokens?: number;
+
+  /**
+   * When true (default), each selected summary emits as its own positioned
+   * Q/A recall pair, sorted chronologically by source range. When false,
+   * all selected summaries are concatenated into one Q/A pair between head
+   * and tail (legacy behavior pre-2026-05-10).
+   *
+   * Per-region positioning is the spec-faithful behavior: it lets the agent
+   * see each memory in its temporal place rather than as a wall of unrelated
+   * recollections from another speaker. Without it, hierarchical compression
+   * is structurally similar to the dual-recall corruption pattern that
+   * caused Lena's context degradation on Hermes.
+   */
+  positionedRecallPairs?: boolean;
+
+  /**
+   * Template for the per-pair recall question header. Substitutions:
+   *   {id}    — summary id (e.g. "L1-3")
+   *   {level} — summary level (1, 2, or 3)
+   *   {first} — first source message id
+   *   {last}  — last source message id
+   * Default: '[Recall {id}]'.
+   *
+   * Only used when `positionedRecallPairs` is true.
+   */
+  recallHeaderTemplate?: string;
 }
 
 /**
@@ -296,4 +322,6 @@ Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
+  positionedRecallPairs: true,
+  recallHeaderTemplate: '[Recall {id}]',
 };
