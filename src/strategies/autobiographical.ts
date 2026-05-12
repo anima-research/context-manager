@@ -1332,13 +1332,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
+    const pinnedIdsInMiddle = new Set<string>();
     for (let i = headEnd; i < recentStart; i++) {
       if (pinnedPositionsSet.has(i)) {
         pinnedInMiddle.push({ msg: messages[i], position: i });
+        pinnedIdsInMiddle.add(messages[i].id);
       }
     }
 
-    if (selectedSummaries.length > 0 || pinnedInMiddle.length > 0) {
+    // Uncompressed-chunk fallback: messages in the middle region whose
+    // chunk hasn't been summarized yet. Without this, a message that
+    // rolled out of the recent window into a queued-but-not-yet-compressed
+    // chunk would vanish from rendered context — there'd be no summary to
+    // emit (compression hasn't run) and Phase 4 only walks recentStart
+    // onwards. Mirrors selectLegacy's "Uncompressed: emit raw" behavior
+    // around line 738, but here we interleave chronologically with
+    // summaries and pins via the unified items list below.
+    //
+    // This matters because compile() was made non-blocking in commit
+    // `3e42e98` (drops the prior `await readiness.pendingWork`); without
+    // this fallback, the trade was silent data-loss for messages caught
+    // in the queued-but-not-yet-compressed window. Now compile()'s
+    // freshness contract is: summaries may lag the very latest L1, but
+    // no message ever disappears.
+    const uncompressedInMiddle: { msg: StoredMessage; position: number }[] = [];
+    for (const chunk of this.chunks) {
+      if (chunk.compressed) continue;
+      for (const msg of chunk.messages) {
+        const pos = positionOf.get(msg.id);
+        if (pos === undefined) continue;
+        if (pos < headEnd || pos >= recentStart) continue;
+        if (pinnedIdsInMiddle.has(msg.id)) continue;
+        uncompressedInMiddle.push({ msg, position: pos });
+      }
+    }
+
+    // Merged list of raw messages to emit in the middle region —
+    // either a pin or a message whose chunk hasn't compressed yet.
+    // Both render identically (raw, at their chronological position).
+    const middleRaw: { msg: StoredMessage; position: number }[] = [
+      ...pinnedInMiddle,
+      ...uncompressedInMiddle,
+    ];
+
+    if (selectedSummaries.length > 0 || middleRaw.length > 0) {
       const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
       if (this.config.positionedRecallPairs !== false) {
@@ -1352,7 +1389,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const pos = positionOf.get(s.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
           items.push({ kind: 'summary', position: pos, summary: s });
         }
-        for (const p of pinnedInMiddle) {
+        for (const p of middleRaw) {
           items.push({ kind: 'pin', position: p.position, msg: p.msg });
         }
         items.sort((a, b) => a.position - b.position);
@@ -1431,7 +1468,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           totalTokens += pairTokens;
         }
 
-        for (const { msg } of pinnedInMiddle) {
+        // Sort by position so uncompressed-middle messages and pins both
+        // appear in their chronological place after the combined recall pair.
+        const middleRawSorted = [...middleRaw].sort((a, b) => a.position - b.position);
+        for (const { msg } of middleRawSorted) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0
             ? Math.min(store.estimateTokens(msg), msgCap + 50)
