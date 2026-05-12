@@ -457,11 +457,22 @@ export class MessageStore {
   private internalToStored(
     internal: StoredMessageInternal,
     id: MessageId,
-    index: number
+    _index: number,
   ): StoredMessage {
     return {
       id,
-      sequence: index, // Use index as sequence for now
+      // chronicle record sequence captured when the message was appended
+      // (see `add()` line 131: `sequence: record.sequence`). The previous
+      // implementation returned the slot index ("// Use index as sequence
+      // for now"), which silently corrupted any downstream code that
+      // forwarded this number to chronicle APIs expecting a real sequence
+      // — most notably `ContextManager.branchAt`, which would fork the
+      // chronicle at the index-mistaken-for-sequence and lose every
+      // record between the intended fork point and the actual one. For
+      // typical autobio sessions the index-vs-sequence ratio is ~1:2
+      // (each message append is accompanied by ~1 autobio state update),
+      // so /undo of a 800-message conversation forked ~400 messages back.
+      sequence: internal.sequence,
       participant: internal.participant,
       content: this.blobManager.resolveBlobs(internal.content),
       metadata: internal.metadata,
