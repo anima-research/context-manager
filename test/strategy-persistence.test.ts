@@ -231,4 +231,78 @@ describe('AutobiographicalStrategy — persistence', () => {
 
     manager.close();
   });
+
+  it('keeps merge queue intact when executeMerge throws (no eager dequeue)', async () => {
+    // Regression test for the eager-dequeue footgun: dequeueMerge() used to
+    // run *before* the LLM call, so a transient failure (429, network drop,
+    // timeout) would silently drop the merge from the persisted queue
+    // forever. The fix is peek + shift-on-success — these assertions lock
+    // that contract in.
+    class FailingMergeStrategy extends TestableStrategy {
+      executeMergeError = new Error('simulated LLM failure');
+
+      protected override async executeMerge(
+        _level: SummaryLevel,
+        _sourceIds: string[],
+        _ctx: import('../src/types/index.js').StrategyContext,
+      ): Promise<void> {
+        throw this.executeMergeError;
+      }
+    }
+
+    const stubMembrane = {} as unknown as import('@animalabs/membrane').Membrane;
+
+    // Phase 1: enqueue a merge, force tick to fail, verify queue intact
+    {
+      const strategy = new FailingMergeStrategy({
+        targetChunkTokens: 300,
+        hierarchical: true,
+      });
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy,
+        membrane: stubMembrane,
+      });
+
+      strategy.seedMerge(2, ['L1-0', 'L1-1']);
+      assert.equal(strategy.getMergeQueueView().length, 1, 'merge enqueued');
+
+      // tick() will pick up the merge, invoke (our failing) executeMerge,
+      // and surface the error. The queue must still be intact afterward.
+      await assert.rejects(
+        () => manager.tick(),
+        /simulated LLM failure/,
+        'tick should propagate the LLM failure',
+      );
+
+      const queue = strategy.getMergeQueueView();
+      assert.equal(queue.length, 1, 'merge MUST remain in queue after failure');
+      assert.equal(queue[0].level, 2);
+      assert.deepEqual(queue[0].sourceIds, ['L1-0', 'L1-1']);
+
+      manager.sync();
+      manager.close();
+    }
+
+    // Phase 2: reopen the store; the un-merged entry must still be there.
+    // This is the part that mattered most pre-fix — the failure was *durable*
+    // because dequeueMerge persisted the shorter queue before the LLM call.
+    {
+      const strategy = new TestableStrategy({
+        targetChunkTokens: 300,
+        hierarchical: true,
+      });
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy,
+      });
+
+      const queue = strategy.getMergeQueueView();
+      assert.equal(queue.length, 1, 'merge MUST survive close/reopen');
+      assert.equal(queue[0].level, 2);
+      assert.deepEqual(queue[0].sourceIds, ['L1-0', 'L1-1']);
+
+      manager.close();
+    }
+  });
 });

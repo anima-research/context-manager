@@ -299,12 +299,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Priority 2: Execute pending merges (hierarchical only)
+    //
+    // Peek at the head rather than dequeueing eagerly: dequeueMerge persists
+    // the shorter queue *before* the LLM call leaves the building, so a
+    // transient failure (429, network drop, timeout, executeMerge throw)
+    // would silently lose the merge from disk and the sources would sit at
+    // level N-1 with no mergedInto pointers forever. Commit the removal
+    // only after the merge succeeds; on failure, the queue keeps its entry
+    // and the next tick() retries it.
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
-      const merge = this.dequeueMerge()!;
+      const merge = this.mergeQueue[0]!;
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
         await this.pendingCompression;
+        // Success: drop from head and persist the shorter queue. We
+        // re-check that head is still our merge in case some future code
+        // path mutates the queue mid-await (today no other site does,
+        // but the assertion makes that invariant explicit).
+        if (this.mergeQueue[0] === merge) {
+          this.dequeueMerge();
+        }
       } finally {
         this.pendingCompression = null;
       }
