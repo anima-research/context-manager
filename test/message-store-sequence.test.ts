@@ -130,20 +130,90 @@ describe('MessageStore — sequence semantics', () => {
       `forked branch must see exactly 5 messages, got ${onBranch.length}. ` +
         'A smaller count means branchAt forked at the slot index instead of the chronicle sequence.',
     );
-    // Verify the contents are the first 5 messages, in order. (We don't
-    // assert `onBranch[N-1].id === ids[4]` because of a separate bug:
-    // MessageStore.add() appends a partial record then patches in id/seq
-    // via a follow-up editStateItem, so the fork-point message's id/seq
-    // are inherited pre-patch on the new branch. Tracked as a follow-up;
-    // doesn't affect this test's invariant — the count is the part that
-    // matters for the original /undo regression.)
+    // Verify the contents AND that fork-point message has full id/sequence
+    // (not undefined). Pre-fix #2, the fork-point message was visible only
+    // in its pre-patch form on the new branch — id and sequence undefined —
+    // because MessageStore.add() does append-then-editStateItem, and
+    // forking at the original append's sequence captured the pre-patch
+    // state. Fix #2 stores the EDIT's sequence as the canonical
+    // commit-sequence, so a fork at messageId.sequence now lands at the
+    // edit record and the patched payload is inherited intact.
     for (let i = 0; i < 5; i++) {
       const text = onBranch[i]?.content?.[0];
       assert.ok(
         text && text.type === 'text' && text.text === `m${i}`,
         `forked branch message[${i}] should be "m${i}", got ${JSON.stringify(text)}`,
       );
+      assert.ok(
+        onBranch[i].id !== undefined && onBranch[i].id !== null,
+        `forked branch message[${i}].id must be defined (was the chained-branching bug), got ${onBranch[i].id}`,
+      );
+      assert.ok(
+        typeof onBranch[i].sequence === 'number' && Number.isFinite(onBranch[i].sequence),
+        `forked branch message[${i}].sequence must be a finite number, got ${onBranch[i].sequence}`,
+      );
     }
+    // The most specific check: the fork-point message on the new branch
+    // must equal the fork-point message on main (same id).
+    assert.equal(
+      onBranch[onBranch.length - 1].id,
+      ids[4],
+      'fork-point message on the new branch must have the same id as on main',
+    );
+
+    manager.close();
+  });
+
+  it('chained branching at the fork-point message preserves full message state', async () => {
+    // The bonus chained-branching bug: pre-fix, the FORK-POINT message
+    // on a new branch had id and sequence = undefined, because the
+    // append-then-patch dance left its patched payload at a chronicle
+    // sequence one PAST the fork-point. Anyone trying to branchAt the
+    // fork-point message on a forked branch would hit
+    // `idToIndex.get(undefined)` returning nothing → "Message not found".
+    // This test catches that by chaining two forks where the second
+    // forks AT the prior fork's fork-point message.
+    const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = manager.addMessage('user', textBlock(`m${i}`));
+      ids.push(id);
+    }
+
+    // Fork 1: at message index 4 (sees first 5 messages)
+    const fork1 = manager.branchAt(ids[4], 'chained-fork-1');
+    await manager.switchBranch(fork1);
+    const { messages: onFork1 } = manager.queryMessages({});
+    assert.equal(onFork1.length, 5);
+
+    // The fork-point message on fork1 must have full id/sequence — that's
+    // the precondition for branchAt to work from it.
+    const forkPointMsg = onFork1[onFork1.length - 1];
+    assert.ok(
+      forkPointMsg.id !== undefined && forkPointMsg.id !== null,
+      'fork-point message on a forked branch must have a defined id (was the chained-branching bug)',
+    );
+    assert.ok(
+      typeof forkPointMsg.sequence === 'number' && Number.isFinite(forkPointMsg.sequence),
+      'fork-point message on a forked branch must have a finite sequence',
+    );
+
+    // Fork 2: from fork1, AT the fork-point message of fork1.
+    // Pre-fix this throws "Message not found: undefined" because
+    // forkPointMsg.id is undefined on fork1.
+    const fork2 = manager.branchAt(forkPointMsg.id, 'chained-fork-2');
+    await manager.switchBranch(fork2);
+    const { messages: onFork2 } = manager.queryMessages({});
+    assert.equal(
+      onFork2.length,
+      5,
+      'fork2 forked at fork1.fork-point should see the same 5 messages as fork1',
+    );
 
     manager.close();
   });
