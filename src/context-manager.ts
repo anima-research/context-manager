@@ -15,8 +15,12 @@ import type {
   MessageQueryResult,
   ContextInjection,
   CompileResult,
+  ProtectedRange,
+  SearchQuery,
+  SearchResult,
+  SummaryEntry,
 } from './types/index.js';
-import { isResettableStrategy } from './types/index.js';
+import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -93,6 +97,8 @@ export class ContextManager {
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
   private debugLogContext: boolean;
+  /** Namespace passed to strategies for scoping their persistent state slots. */
+  private strategyNamespace: string;
 
   private constructor(
     store: JsStore,
@@ -100,6 +106,7 @@ export class ContextManager {
     contextLog: ContextLog,
     strategy: ContextStrategy,
     ownsStore: boolean,
+    strategyNamespace: string,
     membrane?: Membrane,
     debugLogContext = false,
   ) {
@@ -108,6 +115,7 @@ export class ContextManager {
     this.contextLog = contextLog;
     this.strategy = strategy;
     this.ownsStore = ownsStore;
+    this.strategyNamespace = strategyNamespace;
     this.membrane = membrane;
     this.debugLogContext = debugLogContext;
 
@@ -173,12 +181,18 @@ export class ContextManager {
     });
     const strategy = config.strategy ?? new PassthroughStrategy();
 
+    // Namespace passed to strategies. Falls back to a stable per-store value
+    // so strategies always have something to scope state IDs by, even when
+    // the caller didn't supply a namespace.
+    const strategyNamespace = config.namespace ?? 'default';
+
     const manager = new ContextManager(
       store,
       messageStore,
       contextLog,
       strategy,
       ownsStore,
+      strategyNamespace,
       config.membrane,
       config.debugLogContext ?? false,
     );
@@ -294,6 +308,10 @@ export class ContextManager {
   /**
    * Create a branch from a specific message.
    * The new branch will have state as of that message's sequence (time-travel branching).
+   *
+   * Returns the new branch *name*, which is what `switchBranch` and `forkAt`
+   * expect. (Chronicle's branch APIs are name-keyed; the numeric `id` field
+   * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
     const message = this.messageStore.get(messageId);
@@ -303,21 +321,50 @@ export class ContextManager {
 
     // Create branch name if not provided
     const branchName = name ?? `branch-${Date.now()}`;
-    
+
     // Get current branch name to branch from
     const currentBranch = this.store.currentBranch();
-    
+
     // Use createBranchAt to branch at the message's sequence (time-travel)
     const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
 
-    return branch.id;
+    return branch.name;
   }
 
   /**
    * Switch to a different branch.
+   *
+   * Re-initializes the strategy after switching so any branch-scoped state
+   * stored on Chronicle is reloaded. Strategies that hold derived in-memory
+   * caches (e.g. AutobiographicalStrategy.summaries) need this to avoid
+   * showing the previous branch's state on the new branch.
    */
-  switchBranch(branchId: string): void {
+  async switchBranch(branchId: string): Promise<void> {
     this.store.switchBranch(branchId);
+    await this.initializeStrategy();
+  }
+
+  /**
+   * Fork from the current head: create a new branch at the current sequence
+   * and switch to it. The new branch starts with all current state (messages,
+   * context log, and strategy state) and diverges from there.
+   *
+   * Use this when an agent wants to explore an alternate timeline from
+   * "now" — e.g. trying a different response without committing.
+   *
+   * For time-travel branching at a specific historical message, use
+   * `branchAt(messageId, name?)` instead, then `switchBranch(name)`.
+   *
+   * Returns the new branch's name. The strategy is re-initialized on the
+   * new branch so it picks up the forked state.
+   */
+  async fork(name?: string): Promise<string> {
+    const branchName = name ?? `fork-${Date.now()}`;
+    const currentBranch = this.store.currentBranch();
+    const currentSeq = this.store.currentSequence();
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
+    await this.switchBranch(branch.name);
+    return branch.name;
   }
 
   /**
@@ -390,11 +437,15 @@ export class ContextManager {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    // Check readiness and wait if needed
-    const readiness = this.strategy.checkReadiness();
-    if (!readiness.ready && readiness.pendingWork) {
-      await readiness.pendingWork;
-    }
+    // Don't block the agent's turn on speculative compression — let it
+    // run in the background. The strategy renders whatever's available
+    // now; the next compile picks up the freshly-formed L1.
+    //
+    // Old behavior (await pendingWork to fold the latest chunk before
+    // the agent responds) added 30+ seconds of latency per turn whenever
+    // a chunk was forming, which is unacceptable UX for an agent that
+    // streams its responses. We accept "this turn doesn't have the very
+    // latest L1" in exchange for non-blocking compile.
 
     // Default budget
     const effectiveBudget: TokenBudget = budget ?? {
@@ -527,6 +578,94 @@ export class ContextManager {
     return this.strategy;
   }
 
+  // ==========================================================================
+  // Pins / documents (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Pin a range of messages so they aren't compressed and render raw at
+   * their original chronological position. Returns the new pin id.
+   *
+   * Throws if the active strategy doesn't support pins.
+   */
+  pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.pinRange(firstMessageId, lastMessageId, opts);
+  }
+
+  /**
+   * Mark a single message as a "document" (semantically a body of
+   * information to retain in full). Same effect as a single-message pin
+   * with `kind: 'document'`. Returns the new pin id.
+   */
+  markDocument(messageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support documents');
+    }
+    return this.strategy.markDocument(messageId, opts);
+  }
+
+  /** Remove a pin or document mark. Returns true if removed. */
+  unpin(pinId: string): boolean {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.unpin(pinId);
+  }
+
+  /** List all current pins. Returns empty array if strategy is not pinnable. */
+  listPins(): ReadonlyArray<ProtectedRange> {
+    if (!isPinnableStrategy(this.strategy)) return [];
+    return this.strategy.listPins();
+  }
+
+  // ==========================================================================
+  // Search (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Search the strategy's summary archive (substring or regex over content).
+   * Returns empty array if the strategy doesn't support search.
+   *
+   * Suitable for building memory-search agent tools at the framework layer
+   * — see e.g. agent-framework's MCPL host integration.
+   */
+  searchSummaries(query: SearchQuery): SearchResult[] {
+    if (!isSearchableStrategy(this.strategy)) return [];
+    return this.strategy.searchSummaries(query);
+  }
+
+  /** Look up a single summary by id. Returns null if not found / unsupported. */
+  getSummary(id: string): SummaryEntry | null {
+    if (!isSearchableStrategy(this.strategy)) return null;
+    return this.strategy.getSummary(id);
+  }
+
+  /**
+   * Per-render stats from the active strategy: head/tail message + token
+   * counts, plus per-level summary counts and total tokens. Returns null
+   * if the strategy doesn't implement `getRenderStats`.
+   *
+   * Designed for TUIs / dashboards that want to display "how much of the
+   * agent's context is folded vs raw" at a glance.
+   */
+  getRenderStats(): {
+    head: { messages: number; tokens: number };
+    tail: { messages: number; tokens: number };
+    summaries: {
+      l1: { count: number; tokens: number };
+      l2: { count: number; tokens: number };
+      l3: { count: number; tokens: number };
+    };
+    pending: { chunks: number; merges: number };
+  } | null {
+    const fn = (this.strategy as { getRenderStats?: (s: unknown) => unknown }).getRenderStats;
+    if (typeof fn !== 'function') return null;
+    return fn.call(this.strategy, this.messageStore.createView()) as ReturnType<NonNullable<typeof this.getRenderStats>>;
+  }
+
   /**
    * Reset the head window to start from a new position.
    * Old head window messages become compressible.
@@ -583,6 +722,8 @@ export class ContextManager {
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
       currentSequence: this.store.currentSequence(),
+      store: this.store,
+      namespace: this.strategyNamespace,
     };
   }
 
