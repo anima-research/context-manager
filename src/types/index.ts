@@ -42,6 +42,8 @@ export type {
   SearchResult,
   SearchableStrategy,
   PinnableStrategy,
+  RenderStats,
+  RenderStatsCapableStrategy,
 } from './strategy.js';
 
 export {
@@ -49,4 +51,5 @@ export {
   isResettableStrategy,
   isPinnableStrategy,
   isSearchableStrategy,
+  isRenderStatsCapable,
 } from './strategy.js';

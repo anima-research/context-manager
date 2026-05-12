@@ -214,6 +214,41 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 }
 
 /**
+ * Per-render observability stats from a strategy. Counts and token sums for
+ * head / tail / summaries / pending work, suitable for TUIs and dashboards
+ * that want to display "how much of the context is folded vs raw" at a
+ * glance. Token sums use the strategy's own estimates so they line up with
+ * the numbers `select()` uses for budget math.
+ */
+export interface RenderStats {
+  head: { messages: number; tokens: number };
+  tail: { messages: number; tokens: number };
+  summaries: {
+    l1: { count: number; tokens: number };
+    l2: { count: number; tokens: number };
+    l3: { count: number; tokens: number };
+  };
+  pending: { chunks: number; merges: number };
+}
+
+/**
+ * Strategy that can produce render-time observability stats. Implemented by
+ * AutobiographicalStrategy. Optional capability — strategies that don't
+ * implement it simply have `ContextManager.getRenderStats()` return `null`.
+ */
+export interface RenderStatsCapableStrategy extends ContextStrategy {
+  getRenderStats(store: MessageStoreView): RenderStats;
+}
+
+/** Type guard for strategies that produce render stats. */
+export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapableStrategy {
+  return (
+    'getRenderStats' in s &&
+    typeof (s as RenderStatsCapableStrategy).getRenderStats === 'function'
+  );
+}
+
+/**
  * Configuration for the Autobiographical strategy.
  */
 export interface AutobiographicalConfig {

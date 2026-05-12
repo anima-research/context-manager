@@ -20,7 +20,8 @@ import type {
   SearchResult,
   SummaryEntry,
 } from './types/index.js';
-import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy } from './types/index.js';
+import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy, isRenderStatsCapable } from './types/index.js';
+import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -651,19 +652,9 @@ export class ContextManager {
    * Designed for TUIs / dashboards that want to display "how much of the
    * agent's context is folded vs raw" at a glance.
    */
-  getRenderStats(): {
-    head: { messages: number; tokens: number };
-    tail: { messages: number; tokens: number };
-    summaries: {
-      l1: { count: number; tokens: number };
-      l2: { count: number; tokens: number };
-      l3: { count: number; tokens: number };
-    };
-    pending: { chunks: number; merges: number };
-  } | null {
-    const fn = (this.strategy as { getRenderStats?: (s: unknown) => unknown }).getRenderStats;
-    if (typeof fn !== 'function') return null;
-    return fn.call(this.strategy, this.messageStore.createView()) as ReturnType<NonNullable<typeof this.getRenderStats>>;
+  getRenderStats(): RenderStats | null {
+    if (!isRenderStatsCapable(this.strategy)) return null;
+    return this.strategy.getRenderStats(this.messageStore.createView());
   }
 
   /**
