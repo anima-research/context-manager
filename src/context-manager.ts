@@ -15,8 +15,12 @@ import type {
   MessageQueryResult,
   ContextInjection,
   CompileResult,
+  ProtectedRange,
+  SearchQuery,
+  SearchResult,
+  SummaryEntry,
 } from './types/index.js';
-import { isResettableStrategy } from './types/index.js';
+import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
@@ -433,11 +437,15 @@ export class ContextManager {
     budget?: TokenBudget,
     injections?: ContextInjection[]
   ): Promise<CompileResult> {
-    // Check readiness and wait if needed
-    const readiness = this.strategy.checkReadiness();
-    if (!readiness.ready && readiness.pendingWork) {
-      await readiness.pendingWork;
-    }
+    // Don't block the agent's turn on speculative compression — let it
+    // run in the background. The strategy renders whatever's available
+    // now; the next compile picks up the freshly-formed L1.
+    //
+    // Old behavior (await pendingWork to fold the latest chunk before
+    // the agent responds) added 30+ seconds of latency per turn whenever
+    // a chunk was forming, which is unacceptable UX for an agent that
+    // streams its responses. We accept "this turn doesn't have the very
+    // latest L1" in exchange for non-blocking compile.
 
     // Default budget
     const effectiveBudget: TokenBudget = budget ?? {
@@ -568,6 +576,94 @@ export class ContextManager {
    */
   getStrategy(): ContextStrategy {
     return this.strategy;
+  }
+
+  // ==========================================================================
+  // Pins / documents (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Pin a range of messages so they aren't compressed and render raw at
+   * their original chronological position. Returns the new pin id.
+   *
+   * Throws if the active strategy doesn't support pins.
+   */
+  pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.pinRange(firstMessageId, lastMessageId, opts);
+  }
+
+  /**
+   * Mark a single message as a "document" (semantically a body of
+   * information to retain in full). Same effect as a single-message pin
+   * with `kind: 'document'`. Returns the new pin id.
+   */
+  markDocument(messageId: MessageId, opts?: { name?: string }): string {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support documents');
+    }
+    return this.strategy.markDocument(messageId, opts);
+  }
+
+  /** Remove a pin or document mark. Returns true if removed. */
+  unpin(pinId: string): boolean {
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.unpin(pinId);
+  }
+
+  /** List all current pins. Returns empty array if strategy is not pinnable. */
+  listPins(): ReadonlyArray<ProtectedRange> {
+    if (!isPinnableStrategy(this.strategy)) return [];
+    return this.strategy.listPins();
+  }
+
+  // ==========================================================================
+  // Search (passthrough to the active strategy)
+  // ==========================================================================
+
+  /**
+   * Search the strategy's summary archive (substring or regex over content).
+   * Returns empty array if the strategy doesn't support search.
+   *
+   * Suitable for building memory-search agent tools at the framework layer
+   * — see e.g. agent-framework's MCPL host integration.
+   */
+  searchSummaries(query: SearchQuery): SearchResult[] {
+    if (!isSearchableStrategy(this.strategy)) return [];
+    return this.strategy.searchSummaries(query);
+  }
+
+  /** Look up a single summary by id. Returns null if not found / unsupported. */
+  getSummary(id: string): SummaryEntry | null {
+    if (!isSearchableStrategy(this.strategy)) return null;
+    return this.strategy.getSummary(id);
+  }
+
+  /**
+   * Per-render stats from the active strategy: head/tail message + token
+   * counts, plus per-level summary counts and total tokens. Returns null
+   * if the strategy doesn't implement `getRenderStats`.
+   *
+   * Designed for TUIs / dashboards that want to display "how much of the
+   * agent's context is folded vs raw" at a glance.
+   */
+  getRenderStats(): {
+    head: { messages: number; tokens: number };
+    tail: { messages: number; tokens: number };
+    summaries: {
+      l1: { count: number; tokens: number };
+      l2: { count: number; tokens: number };
+      l3: { count: number; tokens: number };
+    };
+    pending: { chunks: number; merges: number };
+  } | null {
+    const fn = (this.strategy as { getRenderStats?: (s: unknown) => unknown }).getRenderStats;
+    if (typeof fn !== 'function') return null;
+    return fn.call(this.strategy, this.messageStore.createView()) as ReturnType<NonNullable<typeof this.getRenderStats>>;
   }
 
   /**

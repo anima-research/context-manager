@@ -37,6 +37,16 @@ export type {
   PhaseType,
   KnowledgeConfig,
   ResettableStrategy,
+  ProtectedRange,
+  SearchQuery,
+  SearchResult,
+  SearchableStrategy,
+  PinnableStrategy,
 } from './strategy.js';
 
-export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG, isResettableStrategy } from './strategy.js';
+export {
+  DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
+  isResettableStrategy,
+  isPinnableStrategy,
+  isSearchableStrategy,
+} from './strategy.js';

@@ -14,6 +14,9 @@ import type {
   AutobiographicalConfig,
   SummaryLevel,
   SummaryEntry,
+  ProtectedRange,
+  SearchQuery,
+  SearchResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 
@@ -94,6 +97,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
+  protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
+
+  /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
+  protected pins: ProtectedRange[] = [];
+  /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
+  protected pinIdCounter = 0;
 
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
@@ -154,6 +163,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strategy: 'snapshot',
       });
     } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.pinsStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
   }
 
   /**
@@ -166,6 +181,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.summaries = [];
       this.summaryIdCounter = 0;
       this.mergeQueue = [];
+      this.pins = [];
+      this.pinIdCounter = 0;
       return;
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
@@ -178,6 +195,184 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQueue = Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[] }>)
       : [];
+
+    const pinsState = this.store.getStateJson(this.pinsStateId);
+    if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
+      const ps = pinsState as { pins: ProtectedRange[]; counter?: number };
+      this.pins = ps.pins;
+      this.pinIdCounter = typeof ps.counter === 'number' ? ps.counter : ps.pins.length;
+    } else {
+      this.pins = [];
+      this.pinIdCounter = 0;
+    }
+  }
+
+  /** Persist the current pins + counter as a single snapshot. */
+  protected persistPins(): void {
+    this.store?.setStateJson(this.pinsStateId, {
+      pins: this.pins,
+      counter: this.pinIdCounter,
+    });
+  }
+
+  // ============================================================================
+  // Pins / documents (protected ranges)
+  // ============================================================================
+
+  /**
+   * Pin a range of messages so they aren't compressed and render raw at
+   * their original position. Returns the pin id.
+   */
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string {
+    const id = `pin-${this.pinIdCounter++}`;
+    this.pins.push({
+      id,
+      firstMessageId,
+      lastMessageId,
+      kind: 'pin',
+      name: opts?.name,
+      created: Date.now(),
+    });
+    this.persistPins();
+    return id;
+  }
+
+  /**
+   * Mark a single message as a "document" — semantically a body of
+   * information the agent wants to retain in full. Functionally a
+   * single-message pin with `kind: 'document'`.
+   */
+  markDocument(messageId: string, opts?: { name?: string }): string {
+    const id = `pin-${this.pinIdCounter++}`;
+    this.pins.push({
+      id,
+      firstMessageId: messageId,
+      lastMessageId: messageId,
+      kind: 'document',
+      name: opts?.name,
+      created: Date.now(),
+    });
+    this.persistPins();
+    return id;
+  }
+
+  /** Remove a pin or document mark by id. Returns true if removed. */
+  unpin(pinId: string): boolean {
+    const before = this.pins.length;
+    this.pins = this.pins.filter(p => p.id !== pinId);
+    if (this.pins.length < before) {
+      this.persistPins();
+      return true;
+    }
+    return false;
+  }
+
+  /** Read-only list of all current pins. */
+  listPins(): ReadonlyArray<ProtectedRange> {
+    return this.pins;
+  }
+
+  // ============================================================================
+  // Search (gap #7)
+  // ============================================================================
+
+  /**
+   * Look up a single summary by id. Returns null if not found.
+   */
+  getSummary(id: string): SummaryEntry | null {
+    return this.summaries.find(s => s.id === id) ?? null;
+  }
+
+  /**
+   * Search summaries by substring or regex over their content.
+   *
+   * Result ordering: matches by descending hit count, then by descending
+   * `created` timestamp (newest first within the same hit count).
+   *
+   * Default behavior: only "live" (unmerged) summaries are searched. Set
+   * `includeMerged: true` to also include summaries that have been folded
+   * into a higher level.
+   */
+  searchSummaries(query: SearchQuery): SearchResult[] {
+    const limit = query.limit ?? 50;
+    const includeMerged = query.includeMerged ?? false;
+
+    // Build the matcher
+    let matcher: ((content: string) => number) | null = null;
+    if (query.regex) {
+      const flags = query.regex.flags.includes('g') ? query.regex.flags : query.regex.flags + 'g';
+      const re = new RegExp(query.regex.source, flags);
+      matcher = (content: string) => {
+        const matches = content.match(re);
+        return matches ? matches.length : 0;
+      };
+    } else if (query.text) {
+      const needle = query.text.toLowerCase();
+      matcher = (content: string) => {
+        const hay = content.toLowerCase();
+        let count = 0;
+        let idx = 0;
+        while ((idx = hay.indexOf(needle, idx)) !== -1) {
+          count++;
+          idx += needle.length || 1;
+        }
+        return count;
+      };
+    } else {
+      // No pattern: every summary "matches" once
+      matcher = () => 1;
+    }
+
+    const levelsFilter = query.levels && query.levels.length > 0 ? new Set(query.levels) : null;
+
+    const results: SearchResult[] = [];
+    for (const s of this.summaries) {
+      if (!includeMerged && s.mergedInto) continue;
+      if (levelsFilter && !levelsFilter.has(s.level)) continue;
+      const matches = matcher(s.content);
+      if (matches > 0) {
+        results.push({ summary: s, matches });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (b.matches !== a.matches) return b.matches - a.matches;
+      return b.summary.created - a.summary.created;
+    });
+
+    return results.slice(0, limit);
+  }
+
+  /**
+   * Whether a given message position is inside any protected range.
+   * Uses a position map (computed by caller) so callers can avoid
+   * repeated per-message lookups in tight loops.
+   */
+  protected isPositionPinned(position: number, pinPositions: Set<number>): boolean {
+    return pinPositions.has(position);
+  }
+
+  /**
+   * Build a set of message-store positions covered by any pin. O(N pins · K range).
+   * Returns positions for which the message exists; orphan pins (deleted
+   * messages) are silently skipped.
+   */
+  protected pinnedPositions(messages: StoredMessage[]): Set<number> {
+    if (this.pins.length === 0) return new Set();
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      positionOf.set(messages[i].id, i);
+    }
+    const out = new Set<number>();
+    for (const pin of this.pins) {
+      const first = positionOf.get(pin.firstMessageId);
+      const last = positionOf.get(pin.lastMessageId);
+      if (first === undefined || last === undefined) continue;
+      const lo = Math.min(first, last);
+      const hi = Math.max(first, last);
+      for (let i = lo; i <= hi; i++) out.add(i);
+    }
+    return out;
   }
 
   /**
@@ -261,14 +456,73 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
     this.rebuildChunks(ctx.messageStore);
 
-    // Auto-tick: fire compression in the background so it runs without
-    // the framework explicitly calling tick(). compile() will await
-    // pendingCompression via checkReadiness().
-    if (this.config.autoTickOnNewMessage && this.compressionQueue.length > 0 && !this.pendingCompression) {
-      this.tick(ctx).catch((err) =>
-        console.error('AutobiographicalStrategy: auto-tick error:', err)
-      );
+    // Auto-tick: fire speculative compression in the background. After
+    // each tick completes, if the queue still has work AND we're under
+    // the speculation cap AND preflight allows, schedule another tick.
+    // This drains the queue ahead of need rather than one-chunk-per-
+    // user-turn (reactive). Combined with ContextManager.compile not
+    // awaiting pendingCompression, the agent's response and background
+    // compression run truly in parallel.
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
     }
+  }
+
+  /**
+   * Background-drain loop: keeps calling tick() while there's queued work,
+   * subject to the speculation cap and preflight hook. Recurses via
+   * `queueMicrotask` so one chunk's compression doesn't block the
+   * scheduling of the next.
+   *
+   * Stops if a tick fails to make progress (queue size unchanged) — guards
+   * against runaway recursion when tick is a no-op (e.g. no membrane
+   * configured, or a subclass override that doesn't process the queue).
+   */
+  protected driveSpeculativeDrain(ctx: StrategyContext): void {
+    if (this.pendingCompression) return;
+    if (this.compressionQueue.length === 0 && this.mergeQueue.length === 0) return;
+    if (this.isAtSpeculativeCap()) return;
+    if (!this.shouldCompressPreflight()) return;
+
+    const beforeChunks = this.compressionQueue.length;
+    const beforeMerges = this.mergeQueue.length;
+
+    this.tick(ctx)
+      .then(() => {
+        const afterChunks = this.compressionQueue.length;
+        const afterMerges = this.mergeQueue.length;
+        // Made progress if either queue shrank.
+        const progressed = afterChunks < beforeChunks || afterMerges < beforeMerges;
+        if (!progressed) return;
+        // Recurse to drain more. queueMicrotask defers until the current
+        // task is done, letting other code (the agent's stream consumer)
+        // interleave.
+        queueMicrotask(() => this.driveSpeculativeDrain(ctx));
+      })
+      .catch((err) => {
+        console.error('AutobiographicalStrategy: speculative-drain error:', err);
+      });
+  }
+
+  /**
+   * Whether the strategy's pending+queued L1 budget has reached the cap
+   * configured by `maxSpeculativeL1s`. If no cap is set, always false.
+   */
+  protected isAtSpeculativeCap(): boolean {
+    const cap = this.config.maxSpeculativeL1s;
+    if (cap === undefined || cap < 0) return false;
+    const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto).length;
+    return unmergedL1s + this.compressionQueue.length > cap;
+  }
+
+  /**
+   * Preflight hook for whether speculative compression should fire on
+   * `onNewMessage`. Returns true by default (current eager behavior).
+   * Subclasses can override for predictive scheduling — e.g. only fire
+   * when the live tail token count is approaching some threshold.
+   */
+  protected shouldCompressPreflight(): boolean {
+    return true;
   }
 
   async tick(ctx: StrategyContext): Promise<void> {
@@ -356,6 +610,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
+  /**
+   * Richer per-render stats: requires a message store view to compute the
+   * head + tail (recent window) sizes. Returns counts AND token sums per
+   * summary level, so observers can see "how much of the agent's context
+   * is in raw tail vs folded into L1/L2/L3."
+   *
+   * Useful for TUI / dashboards. The token sums use the strategy's own
+   * token estimates (which match what `select()` uses for budget math).
+   */
+  getRenderStats(store: MessageStoreView): {
+    head: { messages: number; tokens: number };
+    tail: { messages: number; tokens: number };
+    summaries: {
+      l1: { count: number; tokens: number };
+      l2: { count: number; tokens: number };
+      l3: { count: number; tokens: number };
+    };
+    pending: { chunks: number; merges: number };
+  } {
+    const messages = store.getAll();
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = this.getRecentWindowStart(store);
+
+    const sumTokens = (slice: StoredMessage[]): number =>
+      slice.reduce((acc, m) => acc + store.estimateTokens(m), 0);
+
+    const headMsgs = messages.slice(headStart, headEnd);
+    const tailMsgs = messages.slice(recentStart);
+
+    const live = (level: SummaryLevel) =>
+      this.summaries.filter(s => s.level === level && !s.mergedInto);
+    const sumLevelTokens = (level: SummaryLevel): number =>
+      live(level).reduce((acc, s) => acc + s.tokens, 0);
+
+    return {
+      head: { messages: headMsgs.length, tokens: sumTokens(headMsgs) },
+      tail: { messages: tailMsgs.length, tokens: sumTokens(tailMsgs) },
+      summaries: {
+        l1: { count: live(1).length, tokens: sumLevelTokens(1) },
+        l2: { count: live(2).length, tokens: sumLevelTokens(2) },
+        l3: { count: live(3).length, tokens: sumLevelTokens(3) },
+      },
+      pending: {
+        chunks: this.chunks.filter(c => !c.compressed).length,
+        merges: this.mergeQueue.length,
+      },
+    };
+  }
+
   // ============================================================================
   // Legacy (single-level) path
   // ============================================================================
@@ -378,7 +682,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -426,7 +730,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const pairTokens = this.estimateTokens(questionEntry.content) +
                            this.estimateTokens(answerEntry.content);
 
-        if (totalTokens + pairTokens > maxTokens) break;
+        if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
 
         entries.push(questionEntry);
         entries.push(answerEntry);
@@ -436,7 +740,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const msg of chunk.messages) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-          if (totalTokens + tokens > maxTokens) break;
+          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
           entries.push({
             index: entries.length,
@@ -459,7 +763,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -476,6 +780,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.emitRecentNewestFirst(entries, store, messages, recentStart, msgCap, maxTokens, totalTokens);
 
     this.trimOrphanedToolUse(entries);
+    this.pruneToolEntries(entries);
     return entries;
   }
 
@@ -508,7 +813,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0
         ? Math.min(store.estimateTokens(msg), msgCap + 50)
         : store.estimateTokens(msg);
-      if (totalTokensBefore + acceptedTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) break;
       accepted.push(i);
       acceptedTokens += tokens;
     }
@@ -564,7 +869,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: 2000,
-        temperature: 0,
       },
     };
 
@@ -717,7 +1021,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
-        temperature: 0,
       },
     };
 
@@ -759,12 +1062,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Check if unmerged summary counts exceed the merge threshold.
    * Enqueues merge operations if so.
+   *
+   * Skips L1s/L2s that are already in a pending merge — without this guard,
+   * each new summary above threshold re-enqueues a merge for the same
+   * already-eligible siblings, producing N near-identical higher-level
+   * summaries when the queue eventually drains.
    */
   protected checkMergeThreshold(): void {
     const threshold = this.config.mergeThreshold ?? 6;
 
+    // IDs that are already part of a queued merge — exclude them from
+    // eligibility so we don't re-enqueue.
+    const queuedL1 = new Set<string>();
+    const queuedL2 = new Set<string>();
+    for (const m of this.mergeQueue) {
+      const set = m.level === 2 ? queuedL1 : queuedL2;
+      for (const id of m.sourceIds) set.add(id);
+    }
+
     // Check L1 → L2
-    const unmergedL1 = this.summaries.filter(s => s.level === 1 && !s.mergedInto);
+    const unmergedL1 = this.summaries.filter(
+      s => s.level === 1 && !s.mergedInto && !queuedL1.has(s.id),
+    );
     if (unmergedL1.length >= threshold) {
       const toMerge = unmergedL1.slice(0, threshold);
       this.enqueueMerge({
@@ -774,7 +1093,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Check L2 → L3
-    const unmergedL2 = this.summaries.filter(s => s.level === 2 && !s.mergedInto);
+    const unmergedL2 = this.summaries.filter(
+      s => s.level === 2 && !s.mergedInto && !queuedL2.has(s.id),
+    );
     if (unmergedL2.length >= threshold) {
       const toMerge = unmergedL2.slice(0, threshold);
       this.enqueueMerge({
@@ -803,6 +1124,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (sources.length !== sourceIds.length) {
       console.warn('executeMerge: some source summaries not found, skipping');
+      return;
+    }
+
+    // Defensive: if every source is already mergedInto something, this is a
+    // stale queue entry (could happen if multiple merges for the same
+    // sourceIds were enqueued before the dedup fix in checkMergeThreshold).
+    // Skip rather than produce a redundant near-identical higher-level entry.
+    if (sources.every(s => s.mergedInto)) {
+      console.warn(
+        `executeMerge: all sources already merged into ${sources[0].mergedInto}, skipping (stale queue entry)`,
+      );
       return;
     }
 
@@ -851,7 +1183,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
-        temperature: 0,
       },
     };
 
@@ -918,7 +1249,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
 
       entries.push({
         index: entries.length,
@@ -955,7 +1286,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let l3Used = 0;
     for (const s of shownL3) {
       if (l3Used + s.tokens > l3Budget) break;
-      if (totalTokens + totalSummaryTokens + s.tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) break;
       selectedSummaries.push(s);
       l3Used += s.tokens;
       totalSummaryTokens += s.tokens;
@@ -967,7 +1298,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const l2Effective = l2Budget + l3Carryover;
     for (const s of shownL2) {
       if (l2Used + s.tokens > l2Effective) break;
-      if (totalTokens + totalSummaryTokens + s.tokens > maxTokens) break;
+      if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) break;
       selectedSummaries.push(s);
       l2Used += s.tokens;
       totalSummaryTokens += s.tokens;
@@ -983,35 +1314,139 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     selectedSummaries.push(...l1Selected);
     totalSummaryTokens += l1Used;
 
-    // Emit summaries as a single Q&A pair
-    if (selectedSummaries.length > 0) {
-      const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-      const combinedText = selectedSummaries.map(s => s.content).join('\n\n---\n\n');
+    // Emit summaries + pinned messages between head and recent windows.
+    //
+    // Default (positionedRecallPairs=true): one Q/A pair per summary,
+    // interleaved with raw pinned messages, all sorted chronologically by
+    // source-range / message position. Each memory appears in its temporal
+    // place rather than as a wall of unrelated recollections.
+    //
+    // Legacy (positionedRecallPairs=false): summaries concatenated into one
+    // Q/A pair between head and tail; pinned messages still emit raw, in
+    // their chronological positions, after the combined recall pair.
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      positionOf.set(messages[i].id, i);
+    }
+    const pinnedPositionsSet = this.pinnedPositions(messages);
+    // Pinned messages between head and recent (head/recent pinned ones
+    // already emit raw via Phase 0 / Phase 4).
+    const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
+    for (let i = headEnd; i < recentStart; i++) {
+      if (pinnedPositionsSet.has(i)) {
+        pinnedInMiddle.push({ msg: messages[i], position: i });
+      }
+    }
 
-      const questionEntry: ContextEntry = {
-        index: entries.length,
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: contextLabel }],
-        sourceRelation: 'derived',
-      };
-      // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
-      // budgets defaulting to 30k each, an unconstrained concatenation can push
-      // a single assistant turn past 90k tokens, eating the inference budget
-      // and starving recent messages (postmortem 2026-05-04, bug B).
-      const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
-      const answerEntry: ContextEntry = {
-        index: entries.length + 1,
-        participant: this.config.summaryParticipant ?? 'Claude',
-        content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
-        sourceRelation: 'derived',
-      };
+    if (selectedSummaries.length > 0 || pinnedInMiddle.length > 0) {
+      const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
-      const pairTokens = this.estimateTokens(questionEntry.content) +
-                         this.estimateTokens(answerEntry.content);
+      if (this.config.positionedRecallPairs !== false) {
+        // Build a unified, chronologically-sorted item list.
+        type Item =
+          | { kind: 'summary'; position: number; summary: SummaryEntry }
+          | { kind: 'pin'; position: number; msg: StoredMessage };
 
-      entries.push(questionEntry);
-      entries.push(answerEntry);
-      totalTokens += pairTokens;
+        const items: Item[] = [];
+        for (const s of selectedSummaries) {
+          const pos = positionOf.get(s.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+          items.push({ kind: 'summary', position: pos, summary: s });
+        }
+        for (const p of pinnedInMiddle) {
+          items.push({ kind: 'pin', position: p.position, msg: p.msg });
+        }
+        items.sort((a, b) => a.position - b.position);
+
+        for (const item of items) {
+          if (item.kind === 'summary') {
+            const summary = item.summary;
+            const headerText = this.buildRecallHeader(summary);
+            const questionEntry: ContextEntry = {
+              index: entries.length,
+              participant: 'Context Manager',
+              content: [{ type: 'text', text: headerText }],
+              sourceRelation: 'derived',
+            };
+            const answerContent: ContentBlock[] = [{ type: 'text', text: summary.content }];
+            const answerEntry: ContextEntry = {
+              index: entries.length + 1,
+              participant: summaryParticipant,
+              content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+              sourceRelation: 'derived',
+            };
+            const pairTokens =
+              this.estimateTokens(questionEntry.content) +
+              this.estimateTokens(answerEntry.content);
+            if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
+            entries.push(questionEntry);
+            entries.push(answerEntry);
+            totalTokens += pairTokens;
+          } else {
+            const msg = item.msg;
+            const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+            const tokens = msgCap > 0
+              ? Math.min(store.estimateTokens(msg), msgCap + 50)
+              : store.estimateTokens(msg);
+            if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
+            entries.push({
+              index: entries.length,
+              sourceMessageId: msg.id,
+              sourceRelation: 'copy',
+              participant: msg.participant,
+              content,
+            });
+            totalTokens += tokens;
+          }
+        }
+      } else {
+        // Legacy combined-pair mode for summaries; pins still emit raw at
+        // their positions after the combined pair.
+        if (selectedSummaries.length > 0) {
+          const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+          const combinedText = selectedSummaries.map(s => s.content).join('\n\n---\n\n');
+
+          const questionEntry: ContextEntry = {
+            index: entries.length,
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: contextLabel }],
+            sourceRelation: 'derived',
+          };
+          // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
+          // budgets defaulting to 30k each, an unconstrained concatenation can push
+          // a single assistant turn past 90k tokens, eating the inference budget
+          // and starving recent messages (postmortem 2026-05-04, bug B).
+          const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
+          const answerEntry: ContextEntry = {
+            index: entries.length + 1,
+            participant: summaryParticipant,
+            content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+            sourceRelation: 'derived',
+          };
+
+          const pairTokens = this.estimateTokens(questionEntry.content) +
+                             this.estimateTokens(answerEntry.content);
+
+          entries.push(questionEntry);
+          entries.push(answerEntry);
+          totalTokens += pairTokens;
+        }
+
+        for (const { msg } of pinnedInMiddle) {
+          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+          const tokens = msgCap > 0
+            ? Math.min(store.estimateTokens(msg), msgCap + 50)
+            : store.estimateTokens(msg);
+          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
+          entries.push({
+            index: entries.length,
+            sourceMessageId: msg.id,
+            sourceRelation: 'copy',
+            participant: msg.participant,
+            content,
+          });
+          totalTokens += tokens;
+        }
+      }
     }
 
     // Phase 4: Recent uncompressed messages (skip head window overlap).
@@ -1022,6 +1457,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
 
     this.trimOrphanedToolUse(entries);
+    this.pruneToolEntries(entries);
     return entries;
   }
 
@@ -1062,11 +1498,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let used = 0;
     for (const s of shownL1) {
       if (used + s.tokens > budget) break;
-      if (used + s.tokens > maxTokens) break;
+      if (this.isOverBudget(used + s.tokens, maxTokens)) break;
       selected.push(s);
       used += s.tokens;
     }
     return { selected, tokensUsed: used };
+  }
+
+  /**
+   * True if `projectedTotal` exceeds `max` AND the strategy is configured
+   * to enforce budget. When `enforceBudget: false`, always returns false
+   * — the rendering pipeline emits the full ideal context regardless of
+   * budget overage. Caller's API will reject if it exceeds the model's
+   * context window; the philosophy is "surface overage, don't hide it."
+   */
+  protected isOverBudget(projectedTotal: number, max: number): boolean {
+    if (this.config.enforceBudget === false) return false;
+    return projectedTotal > max;
+  }
+
+  /**
+   * Sort selected summaries by source-range start position, so per-pair
+   * recall emission appears in chronological order. Falls back to the
+   * created timestamp for summaries whose source-range first message is
+   * no longer in the store.
+   */
+  protected sortSummariesChronologically(
+    summaries: SummaryEntry[],
+    messages: StoredMessage[],
+  ): SummaryEntry[] {
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      positionOf.set(messages[i].id, i);
+    }
+    return [...summaries].sort((a, b) => {
+      const posA = positionOf.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+      const posB = positionOf.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+      if (posA !== posB) return posA - posB;
+      return a.created - b.created;
+    });
+  }
+
+  /**
+   * Render the per-pair recall header from the configured template.
+   * Substitutions: {id} {level} {first} {last}.
+   */
+  protected buildRecallHeader(summary: SummaryEntry): string {
+    const template = this.config.recallHeaderTemplate ?? '[Recall {id}]';
+    return template
+      .replace(/\{id\}/g, summary.id)
+      .replace(/\{level\}/g, String(summary.level))
+      .replace(/\{first\}/g, summary.sourceRange.first)
+      .replace(/\{last\}/g, summary.sourceRange.last);
   }
 
   // ============================================================================
@@ -1135,7 +1618,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: 1500,
-        temperature: 0,
       },
     };
 
@@ -1171,16 +1653,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Get messages in the compressible zone: outside both head window and recent window.
-   * Returns messages from [0, headStart) ∪ [headEnd, recentStart).
+   * Get messages in the compressible zone: outside both head window and
+   * recent window AND not inside any pinned range. Returns messages from
+   * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
+   * by a pin or document mark.
    */
   protected getCompressibleMessages(store: MessageStoreView): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    return messages.slice(0, recentStart)
-      .filter((_, i) => i < headStart || i >= headEnd);
+    const pinned = this.pinnedPositions(messages);
+    const out: StoredMessage[] = [];
+    for (let i = 0; i < recentStart; i++) {
+      if (i >= headStart && i < headEnd) continue;
+      if (pinned.has(i)) continue;
+      out.push(messages[i]);
+    }
+    return out;
   }
 
   /**
@@ -1392,6 +1882,91 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.pop();
       } else {
         break;
+      }
+    }
+  }
+
+  /**
+   * Prune tool_use / tool_result blocks in-place:
+   *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
+   *     `toolUseInputMaxTokens`.
+   *  2. For each tool name, keep only the last N `tool_result` blocks
+   *     per `toolResultMaxLastN`; older ones get their `content` replaced
+   *     with a brief marker referencing the tool name and how many newer
+   *     results exist below.
+   *
+   * Both passes are no-ops when the corresponding config is unset/0.
+   * Pruning runs AFTER selection and orphan-trimming, so it doesn't
+   * affect chunk formation or the recall/pin layout.
+   */
+  protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Pass 1: build toolUseId → toolName map and apply input truncation
+    const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
+    const toolUseIdToName = new Map<string, string>();
+
+    for (const entry of entries) {
+      for (let i = 0; i < entry.content.length; i++) {
+        const block = entry.content[i];
+        if (block.type !== 'tool_use') continue;
+        toolUseIdToName.set(block.id, block.name);
+
+        if (toolUseInputCap > 0) {
+          const inputJson = JSON.stringify(block.input);
+          const inputTokens = Math.ceil(inputJson.length / 4);
+          if (inputTokens > toolUseInputCap) {
+            const keys = Object.keys(block.input).slice(0, 5);
+            entry.content[i] = {
+              ...block,
+              input: {
+                _truncated: true,
+                _originalTokens: inputTokens,
+                _keys: keys,
+              },
+            };
+          }
+        }
+      }
+    }
+
+    // Pass 2: collect tool_result occurrences per tool name, in order
+    const occurrencesByTool = new Map<string, Array<{ entry: ContextEntry; blockIndex: number }>>();
+    for (const entry of entries) {
+      for (let i = 0; i < entry.content.length; i++) {
+        const block = entry.content[i];
+        if (block.type !== 'tool_result') continue;
+        const toolName = toolUseIdToName.get(block.toolUseId);
+        if (!toolName) continue;
+        let arr = occurrencesByTool.get(toolName);
+        if (!arr) {
+          arr = [];
+          occurrencesByTool.set(toolName, arr);
+        }
+        arr.push({ entry, blockIndex: i });
+      }
+    }
+
+    // Pass 3: apply per-tool max-last-N
+    const cfg = this.config.toolResultMaxLastN;
+    if (cfg === undefined) return;
+
+    for (const [toolName, occs] of occurrencesByTool) {
+      let limit: number | undefined;
+      if (typeof cfg === 'number') limit = cfg;
+      else if (typeof cfg === 'object') limit = cfg[toolName];
+      if (limit === undefined || limit < 0) continue;
+
+      const excessCount = occs.length - limit;
+      if (excessCount <= 0) continue;
+
+      for (let i = 0; i < excessCount; i++) {
+        const { entry, blockIndex } = occs[i];
+        const orig = entry.content[blockIndex];
+        if (orig.type !== 'tool_result') continue;
+        const fresherCount = occs.length - i - 1;
+        entry.content[blockIndex] = {
+          ...orig,
+          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+        };
       }
     }
   }

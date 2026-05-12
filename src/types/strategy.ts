@@ -146,6 +146,74 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
 }
 
 /**
+ * Strategy that supports protected ranges (pins + documents).
+ * Pinned ranges are excluded from compression and render raw at their
+ * original chronological position. Implemented by AutobiographicalStrategy.
+ */
+export interface PinnableStrategy extends ContextStrategy {
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string;
+  markDocument(messageId: string, opts?: { name?: string }): string;
+  unpin(pinId: string): boolean;
+  listPins(): ReadonlyArray<ProtectedRange>;
+}
+
+/** Type guard for strategies that support pins / documents. */
+export function isPinnableStrategy(s: ContextStrategy): s is PinnableStrategy {
+  return (
+    'pinRange' in s &&
+    typeof (s as PinnableStrategy).pinRange === 'function' &&
+    'unpin' in s &&
+    typeof (s as PinnableStrategy).unpin === 'function'
+  );
+}
+
+/**
+ * Query for `searchSummaries`. At least one of `text` or `regex` should be
+ * provided to constrain results; otherwise all summaries pass.
+ */
+export interface SearchQuery {
+  /** Case-insensitive substring match against summary content. */
+  text?: string;
+  /** Regex match against summary content (overrides `text` if both set). */
+  regex?: RegExp;
+  /** Filter by summary level(s). Default: all levels. */
+  levels?: SummaryLevel[];
+  /** Maximum number of results to return. Default: 50. */
+  limit?: number;
+  /**
+   * Include summaries that have been merged into a higher-level summary.
+   * Default: false (only "live" unmerged summaries are returned).
+   */
+  includeMerged?: boolean;
+}
+
+/** Result of a single search match. */
+export interface SearchResult {
+  summary: SummaryEntry;
+  /** Number of times the query pattern matched in the summary content. */
+  matches: number;
+}
+
+/**
+ * Strategy that supports searching its summary archive. Implemented by
+ * AutobiographicalStrategy.
+ */
+export interface SearchableStrategy extends ContextStrategy {
+  searchSummaries(query: SearchQuery): SearchResult[];
+  getSummary(id: string): SummaryEntry | null;
+}
+
+/** Type guard for strategies that support search. */
+export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrategy {
+  return (
+    'searchSummaries' in s &&
+    typeof (s as SearchableStrategy).searchSummaries === 'function' &&
+    'getSummary' in s &&
+    typeof (s as SearchableStrategy).getSummary === 'function'
+  );
+}
+
+/**
  * Configuration for the Autobiographical strategy.
  */
 export interface AutobiographicalConfig {
@@ -198,6 +266,84 @@ export interface AutobiographicalConfig {
   l2BudgetTokens?: number;
   /** Token budget for L1 summaries in select() (default: 30000) */
   l1BudgetTokens?: number;
+
+  /**
+   * When true (default), each selected summary emits as its own positioned
+   * Q/A recall pair, sorted chronologically by source range. When false,
+   * all selected summaries are concatenated into one Q/A pair between head
+   * and tail (legacy behavior pre-2026-05-10).
+   *
+   * Per-region positioning is the spec-faithful behavior: it lets the agent
+   * see each memory in its temporal place rather than as a wall of unrelated
+   * recollections from another speaker. Without it, hierarchical compression
+   * is structurally similar to the dual-recall corruption pattern that
+   * caused Lena's context degradation on Hermes.
+   */
+  positionedRecallPairs?: boolean;
+
+  /**
+   * Template for the per-pair recall question header. Substitutions:
+   *   {id}    — summary id (e.g. "L1-3")
+   *   {level} — summary level (1, 2, or 3)
+   *   {first} — first source message id
+   *   {last}  — last source message id
+   * Default: '[Recall {id}]'.
+   *
+   * Only used when `positionedRecallPairs` is true.
+   */
+  recallHeaderTemplate?: string;
+
+  /**
+   * Per-tool retention limit: keep at most the last N `tool_result` blocks
+   * for each tool name. Older results get their content replaced with a
+   * brief marker referencing the tool name and how many newer results exist.
+   *
+   * Two shapes accepted:
+   *  - `number`: applies as a global default across all tools.
+   *  - `Record<toolName, number>`: per-tool limit; tools not listed are
+   *    unlimited.
+   *
+   * Default: undefined (no pruning). Use a small number (1–5) for tools
+   * that produce verbose, mostly-stale output (e.g. file listings, http
+   * fetches, log queries).
+   */
+  toolResultMaxLastN?: number | Record<string, number>;
+
+  /**
+   * Truncate `tool_use` block inputs whose serialized JSON exceeds this
+   * many tokens. The truncated input becomes `{ "_truncated": true,
+   * "_originalTokens": N }` plus a head slice of the original input
+   * keys for context. Default: 0 (no truncation).
+   */
+  toolUseInputMaxTokens?: number;
+
+  /**
+   * Cap on the number of speculative L1 summaries the strategy will hold
+   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
+   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
+   * still form and queue, but compression is deferred until a manual
+   * `tick()` or `compile()` triggers it.
+   *
+   * Default: undefined (no cap; compression fires eagerly on every
+   * new message when `autoTickOnNewMessage` is true).
+   */
+  maxSpeculativeL1s?: number;
+
+  /**
+   * When false, the rendering pipeline emits the full ideal context (head
+   * window + all selected summaries + all recent messages) without
+   * truncating to fit `budget.maxTokens`. The caller's API will reject if
+   * the result exceeds the model's context window — the philosophy is
+   * "surface the overage rather than silently lose content."
+   *
+   * Default: true (legacy budget-aware truncation: stops emitting recall
+   * pairs and recent messages when the running total exceeds maxTokens).
+   *
+   * Recommended setting for long-lived agents on large-context models
+   * (e.g. opus-4-7 with 1M context): false. The window is generous enough
+   * that overflow is rare, and when it does happen you want to know.
+   */
+  enforceBudget?: boolean;
 }
 
 /**
@@ -232,6 +378,29 @@ export interface SummaryEntry {
   created: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
+}
+
+/**
+ * A range of messages protected from compression. Pins keep a span of raw
+ * messages visible at their original position in the rendered context.
+ *
+ * - `kind: 'pin'` — generic protected range (any first/last span).
+ * - `kind: 'document'` — typically a single message containing a body of
+ *   information the agent wants to retain in full; semantically identical
+ *   to a single-message pin, distinguished by metadata for tooling.
+ */
+export interface ProtectedRange {
+  /** Stable id assigned at pin time. */
+  id: string;
+  /** First message id of the protected range (inclusive). */
+  firstMessageId: string;
+  /** Last message id of the protected range (inclusive). */
+  lastMessageId: string;
+  kind: 'pin' | 'document';
+  /** Optional human-readable label. */
+  name?: string;
+  /** Creation timestamp (ms since epoch). */
+  created: number;
 }
 
 /**
@@ -296,4 +465,6 @@ Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
+  positionedRecallPairs: true,
+  recallHeaderTemplate: '[Recall {id}]',
 };
