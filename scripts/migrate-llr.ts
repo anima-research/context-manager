@@ -24,6 +24,15 @@ import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
+// Force synchronous stdout writes so progress logs appear immediately
+// when output is piped or redirected — otherwise Node block-buffers
+// stdout when it's not a TTY and we appear stuck during long-running
+// LLM calls.
+const stdoutHandle = (process.stdout as unknown as { _handle?: { setBlocking?: (b: boolean) => void } })._handle;
+if (stdoutHandle?.setBlocking) {
+  stdoutHandle.setBlocking(true);
+}
+
 interface InputMessage {
   role: 'user' | 'assistant';
   content: string | Array<{ type: string; text?: string; [k: string]: unknown }>;

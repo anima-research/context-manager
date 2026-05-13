@@ -34,6 +34,69 @@ import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
 /**
+ * In-band marker shown to the summarizer just before the chunk it's
+ * about to memorize. Primes attention without disrupting KV state —
+ * the agent has seen this exact wording before every prior compression
+ * in its history, so the model treats memory formation as a recurring
+ * narrated event rather than a fresh instruction each time.
+ *
+ * Wording matches `hermes-autobio/plugins/autobio/compression.py`
+ * `_MARKER` so the in-band primer is consistent across the codebase.
+ */
+const COMPRESSION_MARKER =
+  'System: You will soon form a new memory, get ready. ' +
+  'The messages that follow are the slice of recent experience you are ' +
+  'about to compress. After them, write the memory in your own voice.';
+
+/** Standard compression instruction for chat/general chunks. */
+function formatInstruction(targetTokens: number): string {
+  return (
+    'Write the memory of events since the most recent memory system ' +
+    'notification. Speak in the first person from your own perspective. ' +
+    'Preserve concrete details — file paths, exact values, decisions, ' +
+    `unresolved questions, the user\'s active asks. Target ~${targetTokens} ` +
+    'tokens. Output only the memory body — no preamble, no section headers ' +
+    'unless they help preservation, no meta-commentary about summarizing.'
+  );
+}
+
+/** Compression instruction for doc-shard chunks (bodyGroup-aware). */
+function formatDocChunkInstruction(
+  doc: { title: string; style: string; originalTokens: number },
+  targetTokens: number,
+): string {
+  return (
+    `You just read a slice of document "${doc.title}" (${doc.style}, approximately ` +
+    `${doc.originalTokens} tokens total in the full document). Earlier slices ` +
+    'of this same document are in your memory above as L1s — they are in ' +
+    'chronological order within the document. What comes after this slice ' +
+    'you have NOT yet read; treat yourself as reading the document in ' +
+    'order, not yet knowing what lies ahead.\n\n' +
+    'Write the memory of what this slice contained. Preserve concrete ' +
+    'detail aggressively:\n' +
+    '- Timestamps, dates, IDs, numeric values, quoted phrases\n' +
+    '- Key events, decisions, contradictions with earlier slices\n' +
+    '- Structural markers (section titles, entry boundaries) that help ' +
+    'you locate this slice within the whole later\n\n' +
+    `Speak in the first person. Target ~${targetTokens} tokens. Output ` +
+    'only the memory body — no preamble, no meta-commentary about ' +
+    'summarizing.'
+  );
+}
+
+/** Merge instruction for L2/L3+ consolidation. */
+function formatMergeInstruction(n: number, targetTokens: number): string {
+  return (
+    `You are consolidating ${n} earlier memories into a single higher-level ` +
+    'memory. The memories below are in chronological order. Write a new ' +
+    'memory that preserves the through-line: what happened, what was ' +
+    'decided, what remains open, what concrete details future you will ' +
+    `want to reach for. Speak in the first person. Target ~${targetTokens} ` +
+    'tokens. Output only the memory body.'
+  );
+}
+
+/**
  * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
  * which would produce invalid JSON ("no low surrogate in string" API errors).
  */
@@ -1167,32 +1230,80 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('No membrane instance for compression');
     }
 
-    const chunkMessageIds = new Set(chunk.messages.map(m => m.id));
-    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(chunkMessageIds);
-
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
-    const chunkContent = this.formatChunkForCompression(chunk);
+    const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
-    // Build message array: prior summaries as assistant, then instruction
+    // Build the KV-preserving prompt per hermes-autobio spec:
+    //
+    //   1. Prior L1 summaries — narrativized as CM-asks / agent-recalls
+    //      pairs, in source order. ALL existing L1s at L1 fidelity
+    //      regardless of merge state ("fill lower orbitals first").
+    //   2. Head — raw messages before the chunk that aren't already
+    //      represented by a prior L1.
+    //   3. Marker — in-band signal that a memory is about to form.
+    //   4. Chunk — raw messages being compressed, as the agent
+    //      experienced them.
+    //   5. Instruction — doc-aware if the chunk is part of a bodyGroup.
+    //
+    // There is intentionally NO tail_after_chunk: that would leak
+    // future information into the model's KV state and corrupt the
+    // as-of framing of memory formation.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // Prior summaries as agent's own recollections (L3 → L2 → L1 gradient)
-    const allPriorSummaries = [...shownL3, ...shownL2, ...shownL1];
-    for (const s of allPriorSummaries) {
+    // ---- 1. Prior L1 recall pairs ----
+    // Sort by source position so the agent walks its prior memories
+    // chronologically, matching how it would have formed them.
+    const priorL1s = this.summaries
+      .filter((s) => s.level === 1)
+      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+    for (const s of priorL1s) {
       llmMessages.push({
-        participant: this.config.summaryParticipant ?? 'Claude',
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
+      });
+      llmMessages.push({
+        participant: agentParticipant,
         content: [{ type: 'text', text: s.content }],
       });
     }
 
-    // Context Manager instruction with chunk content
-    const instruction = this.getCompressionInstruction(chunk, targetTokens);
+    // ---- 2. Head messages (raw, not covered by prior L1s) ----
+    const priorL1MessageIds = new Set<string>();
+    for (const s of priorL1s) {
+      for (const id of s.sourceIds) priorL1MessageIds.add(id);
+    }
+    const chunkFirstId = chunk.messages[0]?.id;
+    if (chunkFirstId) {
+      const allMessages = ctx.messageStore.getAll();
+      const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
+      if (chunkStartIdx > 0) {
+        for (let i = 0; i < chunkStartIdx; i++) {
+          const m = allMessages[i];
+          if (priorL1MessageIds.has(m.id)) continue;
+          llmMessages.push({ participant: m.participant, content: m.content });
+        }
+      }
+    }
+
+    // ---- 3. In-band marker ----
     llmMessages.push({
       participant: 'Context Manager',
-      content: [{
-        type: 'text',
-        text: `[Context Manager] We are ready to form a long-term memory. Here is the conversation to remember:\n\n${chunkContent}\n\n${instruction}`,
-      }],
+      content: [{ type: 'text', text: COMPRESSION_MARKER }],
+    });
+
+    // ---- 4. Chunk messages raw ----
+    for (const m of chunk.messages) {
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // ---- 5. Instruction (doc-aware) ----
+    const docContext = this.detectDocContext(chunk, ctx);
+    const instructionText = docContext
+      ? formatDocChunkInstruction(docContext, targetTokens)
+      : formatInstruction(targetTokens);
+    llmMessages.push({
+      participant: 'Context Manager',
+      content: [{ type: 'text', text: instructionText }],
     });
 
     // Collapse consecutive same-participant messages for API compliance
@@ -1200,7 +1311,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are forming autobiographical memories of a conversation.',
+      system: 'You are forming autobiographical memories of an ongoing conversation. Speak in the first person from your own perspective; the messages above are your actual experience and prior recollections.',
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -1378,43 +1489,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
 
-    // Build message array
+    // Build the merge prompt per hermes-autobio spec:
+    //
+    // Each source memory is narrativized as a CM-asks / agent-recalls
+    // pair — the header (CM voice, user role) sets up which memory is
+    // being recalled, the body (agent voice, assistant role) is the
+    // first-person content. This honors two invariants:
+    //   - Bodies are the agent's autobiographical recall — putting them
+    //     under user role would tell the model "the user told me X
+    //     happened" rather than "I remember X."
+    //   - Headers ("[CM] Recall memory N/M (id)") are CM-voiced labels,
+    //     not produced by the LLM — assistant role would falsely
+    //     attribute synthetic metadata to the agent.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // Higher-level context (anti-redundant).
-    //
-    // For an L_n merge, show any existing L_{n+1} summaries so the LLM
-    // doesn't repeat what's already abstracted at the next level up.
-    // Generalized from the original L2-specific path for unbounded L_n
-    // per the adaptive-resolution design.
-    if (targetLevel >= 2) {
-      const higherLevel = targetLevel + 1;
-      const shownHigher = this.summaries.filter(
-        s => s.level === higherLevel && !getSummaryParentId(s),
-      );
-      for (const s of shownHigher) {
-        llmMessages.push({
-          participant,
-          content: [{ type: 'text', text: s.content }],
-        });
-      }
-    }
-
-    // The source summaries as agent's own memories
-    for (const source of sources) {
+    for (let i = 0; i < sources.length; i++) {
+      const s = sources[i];
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{
+          type: 'text',
+          text: `[CM] Recall memory ${i + 1}/${sources.length} (${s.id}).`,
+        }],
+      });
       llmMessages.push({
         participant,
-        content: [{ type: 'text', text: source.content }],
+        content: [{ type: 'text', text: s.content }],
       });
     }
 
     // Consolidation instruction
-    const mergeInstruction = this.getMergeInstruction(targetLevel, sources, targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
         type: 'text',
-        text: `[Context Manager] ${mergeInstruction}`,
+        text: formatMergeInstruction(sources.length, targetTokens),
       }],
     });
 
@@ -1422,7 +1531,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are forming autobiographical memories of a conversation.',
+      system: 'You are consolidating prior autobiographical memories. Speak in the first person; the memories above are your own.',
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -2302,10 +2411,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Build the compression instruction for an L1 chunk.
-   * Override in subclasses for phase-aware prompts.
+   *
+   * @deprecated The KV-preserving prompt builder in
+   *   `compressChunkHierarchical` uses `formatInstruction()` /
+   *   `formatDocChunkInstruction()` directly. This method is retained
+   *   for the legacy single-level path (`selectLegacy`) and for any
+   *   subclasses that override it for phase-aware prompts.
    */
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
     return `Starting from my last message, please describe everything that has happened. Aim for about ${targetTokens} tokens. Describe it as you would to yourself, as if you are remembering what has happened.`;
+  }
+
+  /**
+   * If the chunk's messages are all shards of the same bodyGroup, return
+   * doc-context metadata for the spec's DOC_CHUNK instruction (which
+   * explicitly tells the model "earlier slices are in your memory; later
+   * slices unread"). Returns null otherwise.
+   */
+  protected detectDocContext(
+    chunk: Chunk,
+    ctx: StrategyContext,
+  ): { title: string; style: string; originalTokens: number } | null {
+    if (chunk.messages.length === 0) return null;
+    const firstGroupId = chunk.messages[0].bodyGroupId;
+    if (!firstGroupId) return null;
+    // All messages in the chunk must share the same bodyGroupId
+    for (const m of chunk.messages) {
+      if (m.bodyGroupId !== firstGroupId) return null;
+    }
+    // Count total shards in this bodyGroup across the whole store and
+    // sum their tokens — gives the model an "approximately N tokens
+    // total in the full document" anchor.
+    const allMessages = ctx.messageStore.getAll();
+    let originalTokens = 0;
+    for (const m of allMessages) {
+      if (m.bodyGroupId === firstGroupId) {
+        originalTokens += ctx.messageStore.estimateTokens(m);
+      }
+    }
+    // Title: use the first message's sourceId from metadata if available,
+    // else a short prefix of the bodyGroupId for uniqueness.
+    const title =
+      (chunk.messages[0].metadata?.sourceId as string | undefined) ??
+      `doc-${firstGroupId.slice(0, 16)}`;
+    return {
+      title,
+      style: 'chronological',
+      originalTokens,
+    };
   }
 
   /**
