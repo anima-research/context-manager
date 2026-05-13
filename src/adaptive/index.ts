@@ -37,6 +37,7 @@ export { OldestFirstStrategy } from './strategies/oldest-first.js';
 // Picker
 export {
   Picker,
+  OverBudgetError,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,

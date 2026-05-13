@@ -25,6 +25,49 @@ import type { SummaryEntry } from '../types/strategy.js';
 import { getSummaryParentId } from '../types/strategy.js';
 
 /**
+ * Error raised by the strategy when the picker has folded everything it can
+ * and the resulting context still exceeds the hard token budget.
+ *
+ * The strategy throws this rather than silently dropping entries. The host
+ * application decides how to respond — typical responses: raise the budget,
+ * switch to a larger-context model, drop the head/tail windows explicitly,
+ * or surface a "context too large" error to the user.
+ *
+ * See `docs/adaptive-resolution-design.md` §3.10.
+ */
+export class OverBudgetError extends Error {
+  readonly name = 'OverBudgetError';
+  /** The hard budget the strategy was trying to fit under. */
+  readonly budget: number;
+  /** The token count the strategy could not reduce below `budget`. */
+  readonly actual: number;
+  /** Diagnostic snapshot of the picker's final state. */
+  readonly diagnostics: {
+    headTokens: number;
+    tailTokens: number;
+    middleTokens: number;
+    middleChunkCount: number;
+    deepestLevel: number;
+  };
+
+  constructor(opts: {
+    budget: number;
+    actual: number;
+    diagnostics: OverBudgetError['diagnostics'];
+  }) {
+    super(
+      `Adaptive picker exhausted but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
+        ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
+        ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} chunks,` +
+        ` deepest fold level=L${opts.diagnostics.deepestLevel})`
+    );
+    this.budget = opts.budget;
+    this.actual = opts.actual;
+    this.diagnostics = opts.diagnostics;
+  }
+}
+
+/**
  * Minimal chunk representation used by the picker. Real callers will adapt
  * their `StoredMessage` instances to this shape.
  */

@@ -20,7 +20,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
-import { Picker, type PickerChunk } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
@@ -1578,6 +1578,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // unnecessary state-slot writes on no-op compiles (which is the common
     // case in steady state with slack).
     let resolutionsChanged = false;
+    let deepestLevel = 0;
     for (const [id, level] of result.finalResolutions) {
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
       if (this.locked.has(id)) continue;
@@ -1586,9 +1587,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.resolutions.set(id, level);
         resolutionsChanged = true;
       }
+      if (level > deepestLevel) deepestLevel = level;
     }
     if (resolutionsChanged) {
       this.persistResolutions();
+    }
+
+    // Hard-fail check: if the picker exhausted itself but the final render
+    // would still exceed the HARD budget (not just the soft target), surface
+    // an OverBudgetError to the host rather than silently dropping entries.
+    // The strategy has done all it can; the application has to decide what
+    // to do next (raise budget, switch model, drop windows, etc.).
+    if (result.exhausted && result.finalTokens > totalBudget) {
+      throw new OverBudgetError({
+        budget: totalBudget,
+        actual: result.finalTokens,
+        diagnostics: {
+          headTokens,
+          tailTokens,
+          middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
+          middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
+          deepestLevel,
+        },
+      });
     }
 
     // ----- 5. Emit middle entries in source order -----
