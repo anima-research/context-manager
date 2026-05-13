@@ -4,7 +4,8 @@
 
 ## Changelog
 
-- **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis. Added migration recovery mode for over-folded chronicles.
+- **rev 2.1 (2026-05-12)**: Settled outstanding decisions. Slack default = 10%. Speculative production = bottom-up background pre-producer, default-on. `lockedByAgent` programmatic API set-only in V1, no agent tool. Migration deferred to follow-up PR; V1 validates via re-ingest on fresh chronicles.
+- **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis.
 - **rev 1 (2026-05-12)**: Initial draft.
 
 ## 1. Problem
@@ -338,52 +339,68 @@ Token counting (§7 open question): each chunk has a cached `tokensL0` from inge
 
 ## 6. Migration
 
-### 6.1 Schema migration
+### 6.1 V1 strategy: re-ingest, don't migrate
 
-Existing chronicles have `SummaryEntry.mergedInto` populated and `MessageEntry.currentResolution` absent. On strategy `initialize()`:
+Migration of existing chronicles is **deferred to a follow-up PR**. The target deployment (Lena's chronicle) will be validated by re-ingesting its starting state into a fresh chronicle on a new instance, exercising the picker from scratch. This sidesteps the migration's hardest case (over-folded chronicles whose original raw chunks are still in the archive but whose `mergedInto` chains point at lossy summaries) and lets us validate the picker against a real workload before committing to a migration algorithm.
 
-1. **Default mode (conservative)** — preserves the chronicle's current rendered shape. For each `mergedInto` chain `L1 → L2 → L3`, walk down to leaf chunks and set their `currentResolution` to the level of the topmost ancestor that has `mergedInto == null` (i.e., the level actually rendered today).
-2. **Recovery mode (`config.migrationRecoveryMode: true`)** — recomputes resolution from current budget. Sets all chunks to `currentResolution: 0`, then runs the configured strategy until budget is met. For over-folded chronicles like Lena's, this produces the resolution the picker would have chosen if it had been running all along.
-3. **Rename `mergedInto` → `parentId`.** Field rename, automatic write on any read. Old reads of `mergedInto` for display purposes are now bugs that surface loudly.
+What V1 ships for compatibility:
 
-Recovery mode is opt-in because it costs LLM calls to produce missing L_k summaries (if not already in the archive) and changes the prefix the agent sees on its next compile — both worth a deliberate operator decision.
+1. **Field rename `mergedInto` → `parentId`.** Purely a schema change; `parentId` is archive metadata, not consulted by render.
+2. **Legacy chronicle reads.** When `adaptiveResolution: true` and a chronicle has chunks without `currentResolution`, default to 0. The picker treats the chronicle as if from-scratch: existing L_n summaries in the archive are reusable (idempotent on `sourceHash`), so the picker doesn't need to re-summarize. First compile after enabling the flag is effectively a re-fold from L0; one-time KV miss propagates from the head.
+3. **No automatic conversion of `mergedInto` chains to `currentResolution`.** Old pointers stay readable but unused by the render path.
 
-### 6.2 Rollout phases
+This means existing chronicles upgrading to the new strategy take a one-time KV miss on first compile, then converge to whatever the picker chooses for ongoing pressure. For chronicles where this is unacceptable (e.g., production deployments where the agent's working memory matters), don't enable the flag — keep them on the threshold-driven path until a proper migration ships.
 
-**Phase 1 — Default off behind feature flag.**
-- Add `bodyGroupId`, chunker, on-chunk state, picker, strategies, lazy production, hard-fail fallback, migration code.
+### 6.2 What a future migration PR needs to handle
+
+The deferred migration work splits into two paths, both keyed on the operator's intent for a given chronicle:
+
+- **Preserve current display** — synthesize `currentResolution` from the topmost-null ancestor in each `mergedInto` chain. No re-render. Most conservative; appropriate when the existing folded shape is what the agent has been remembering.
+- **Re-resolve to current budget** — set all chunks to L0, run the configured strategy. Recovers from over-folding (Lena's case) at the cost of changing the prefix the agent sees on its next compile.
+
+Postponing this lets the picker prove itself on workloads where the choice is easy (fresh chronicles, re-ingested chronicles) before tackling chronicles where it's loaded.
+
+### 6.3 Rollout phases
+
+**Phase 1 — Ship behind feature flag.**
+- Add `bodyGroupId`, chunker, on-chunk state, picker, strategies, lazy production, background pre-producer, hard-fail fallback.
 - Feature flag `config.adaptiveResolution: true` activates the new path.
-- Existing chronicles keep rendering as today (default migration mode). New chronicles can opt in.
-- `checkMergeThreshold` continues to run on non-`bodyGroupId` chunks for backward compat.
+- Existing chronicles continue rendering via the threshold-driven code until the flag is enabled.
+- `checkMergeThreshold` keeps running on chunks without `bodyGroupId` until Phase 2.
 
 **Phase 2 — Switch default; deprecate threshold path.**
 - Default `adaptiveResolution: true`.
 - `checkMergeThreshold` becomes a no-op (emits deprecation warning).
-- New merges go through the picker.
+- Ship the migration PR (§6.2) so existing chronicles can convert.
 
 **Phase 3 — Delete threshold path.**
 - Remove `checkMergeThreshold`, related tests.
-- One-time forward migration of any remaining unmigrated chronicles.
 
-## 7. Open questions
+## 7. Settled decisions
 
-1. **Slack default value.** 10% (rev 1's guess) vs 15% vs adaptive (based on observed turn-over-turn token delta variance). Probably 10% is fine but should be tuned against real workloads.
+These were debated during the rev-2 revision and are now locked unless implementation surprises force revisit:
 
-2. **Token counting fidelity.** Picker decisions hinge on token counts. Per-chunk and per-summary cached counts (from tokenizer at production time) vs estimate (4 chars ≈ 1 token) vs real-tokenize-on-every-compile. Cached counts are accurate and cheap as long as we always use the same tokenizer; recommend that.
+1. **Slack default = 10%.** `compressionSlackRatio: 0.1`. Configurable. Conservative enough to leave headroom for small turn-over-turn fluctuations. Re-tune from real workload data after a few weeks of running.
 
-3. **Speculative L_{k+1} production.** Whether V1 ships a background loop that produces higher-level summaries ahead of demand, or only produces them on strategy request. Background pre-production avoids picker latency at first fold but spends LLM tokens that might never be needed. Default V1: lazy only. Background opt-in via `config.speculativeProduction: true`.
+2. **Speculative production: background pre-producer, default-on.** When a new L_k summary lands, if N siblings exist that would share an L_{k+1} parent, the pre-producer enqueues the L_{k+1} summary immediately. Bottom-up, bounded, idempotent on `sourceHash`. Avoids first-fold latency at the cost of LLM tokens that may not be used. Disable via `config.speculativeProduction: false` for cost-sensitive deployments.
 
-4. **Recall pair format consistency across levels.** Under adaptive resolution, the same chunk might be rendered as an L_k recall on one turn and L_{k+1} on a later turn. Each summary is faithful to its own as-of moment, so this is *monotonic memory fading* by construction (more detail → less detail, never reverse) — promote to design property in §3.9 if reviewers agree.
+3. **`lockedByAgent` programmatic API in V1: set-only.** Strategy hosts expose `lockChunk(chunkId)` / `unlockChunk(chunkId)`. No agent-facing tool until V2, but the lock is observable and settable by module code so content-aware strategies can experiment now.
 
-5. **Pins interaction.** Spec says pins are display locks, not write locks. The picker must skip pinned chunks. If the only way to fit budget is folding a pinned chunk, the spec implies accept being over budget rather than violate a pin → fallback in §3.10 kicks in. Confirm.
+4. **Migration deferred (§6).** V1 ships compatibility for *reading* legacy chronicles without active migration. Re-ingest is the validation path.
 
-6. **Branching semantics for on-chunk state.** New chronicle branches inherit chunk state at the fork point via the existing branch-scoped slot model. An agent unfold on branch A does not leak into branch B. Believed to come for free from existing chronicle copy-on-write, but verify with an explicit test.
+## 8. Open questions
 
-7. **Telemetry.** `getRenderStats()` needs extension. Suggested: per-level chunk counts, picker iterations and fold ops this compile, lazy production queue depth, total raises since chronicle start. The `RenderStats` interface (PR #16) needs updating.
+1. **Token counting fidelity.** Picker decisions hinge on token counts. Per-chunk and per-summary cached counts (from tokenizer at production time) vs estimate (4 chars ≈ 1 token) vs real-tokenize-on-every-compile. Cached counts are accurate and cheap as long as we always use the same tokenizer; recommend that, but confirm tokenizer choice before implementation (Anthropic's tokenizer for accuracy, tiktoken for speed/portability, or a hybrid).
 
-8. **`lockedByAgent` programmatic API in V1.** V1 ships no agent tool, but should the field be settable via a programmatic strategy-host API so module developers can experiment? Lean: yes, set-only (no agent-facing tool until V2).
+2. **Recall pair format consistency across levels.** Under adaptive resolution, the same chunk might be rendered as an L_k recall on one turn and L_{k+1} on a later turn. Each summary is faithful to its own as-of moment, so this is *monotonic memory fading* by construction (more detail → less detail, never reverse) — promote to design property in §3.9 if reviewers agree.
 
-## 8. Implementation scope
+3. **Pins interaction.** Spec says pins are display locks, not write locks. The picker must skip pinned chunks. If the only way to fit budget is folding a pinned chunk, the spec implies accept being over budget rather than violate a pin → fallback in §3.10 kicks in. Confirm.
+
+4. **Branching semantics for on-chunk state.** New chronicle branches inherit chunk state at the fork point via the existing branch-scoped slot model. An agent unfold on branch A does not leak into branch B. Believed to come for free from existing chronicle copy-on-write, but verify with an explicit test.
+
+5. **Telemetry.** `getRenderStats()` needs extension. Suggested: per-level chunk counts, picker iterations and fold ops this compile, lazy production queue depth, background pre-producer queue depth, total raises since chronicle start. The `RenderStats` interface (PR #16) needs updating.
+
+## 9. Implementation scope
 
 Estimated breakdown:
 
@@ -395,18 +412,20 @@ Estimated breakdown:
 | `FoldingStrategy` interface + `FlatProfileStrategy` + `OldestFirstStrategy` | ~200 |
 | Picker orchestrator loop | ~30 |
 | Lazy summary production at arbitrary level | ~80 |
+| Background pre-producer (bottom-up speculative L_{k+1}) | ~80 |
+| `lockChunk` / `unlockChunk` programmatic API | ~20 |
 | Token-counting cache on chunks and summaries | ~40 |
 | Recent-window-slide handling in eligibility check | ~20 |
 | Hard-fail fallback (tail shrink, head truncate, error) | ~40 |
-| Migration code (default + recovery mode) | ~100 |
+| Legacy-chronicle read compatibility (`mergedInto` → `parentId` rename, default `currentResolution: 0`) | ~30 |
 | Deprecation glue for phase 1/2 | ~30 |
 | Tests | ~400 |
 
-**Total: ~1100 LOC new + ~80 LOC deleted.** Feature flag controls rollout.
+**Total: ~1100 LOC new + ~80 LOC deleted.** Feature flag controls rollout. Migration code deferred to a follow-up PR (§6.2).
 
-Realistic timeline: 2 weeks of focused implementation + 1 week of integration testing on real chronicles + migration day.
+Realistic timeline: 2 weeks of focused implementation + 1 week of integration testing + re-ingest validation against the target workload.
 
-## 9. Related work
+## 10. Related work
 
 - [`hermes-autobio/docs/hierarchical-autobiographical-memory.md`](../../hermes-autobio/docs/hierarchical-autobiographical-memory.md) — the canonical spec this design implements.
 - PR #14 — branch-scoped persistence model; on-chunk state is branched naturally via the same mechanism.
@@ -414,13 +433,6 @@ Realistic timeline: 2 weeks of focused implementation + 1 week of integration te
 - PR #16 — fixed silent-message-drop on `compile()` in hierarchical mode.
 - PR #17 — fixed `MessageStore.get` returning slot index as sequence; chained branching now works.
 
-## 10. Decisions still owed
+## 11. Status
 
-This design is concrete enough to either implement or critique. Specifically, please weigh in on:
-
-- **Recovery mode for over-folded chronicles.** §6.1 ships it as opt-in. Lena's chronicle is the obvious target. Confirm: opt-in only, or default-on for chronicles where the picker-recomputed resolution would meaningfully differ from the as-stored resolution?
-- **Slack default.** §7 #1 — 10%, 15%, or adaptive?
-- **Speculative production.** §7 #3 — lazy-only in V1, or also ship the background pre-producer?
-- **`lockedByAgent` programmatic API in V1.** §7 #8 — set-only programmatic API even without a tool?
-
-Once these are settled the design is implementation-ready.
+All architectural decisions are settled (§7). Remaining open items in §8 are implementation-level details that can be resolved during the work itself without changing the design. The design is **implementation-ready**.
