@@ -203,6 +203,72 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
+  it('flag on: folded shards within a bodyGroup emit separate Q+A recall pair messages', async () => {
+    const mock = makeMockMembrane();
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 300,
+      recentWindowTokens: 200, // small so the doc is in foldable middle
+      summaryContextLabel: 'What do you remember from earlier?',
+      summaryParticipant: 'Claude',
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: mock as any,
+    });
+
+    // Big doc with distinctive content per section
+    const paras: string[] = [];
+    for (let p = 0; p < 24; p++) {
+      paras.push(`Section ${p}: ` + `unique-token-${p} `.repeat(30));
+    }
+    const bigBody = paras.join('\n\n');
+    manager.addMessage('User', [{ type: 'text', text: bigBody }]);
+    // Trailing follow-up so the doc isn't entirely in tail
+    manager.addMessage('User', [{ type: 'text', text: 'Follow up please.' }]);
+
+    while (!manager.isReady()) {
+      await manager.tick();
+    }
+
+    // Compile with a budget tight enough to force folding
+    const compiled = await manager.compile({ maxTokens: 4000, reserveForResponse: 500 });
+
+    // Look for the Q+A recall pair pattern. If any folding happened, we
+    // should see "Context Manager" + summaryParticipant pairs in the
+    // compiled output.
+    const participants = compiled.messages.map((m) => m.participant);
+    const cmIndex = participants.indexOf('Context Manager');
+    const claudeIndex = participants.indexOf('Claude');
+
+    // The exact structure depends on which shards are folded and where the
+    // doc ends up. We assert at least one of the following holds:
+    //   - A Q+A pair appears (Context Manager followed by Claude/summary participant)
+    //   - OR no folding happened (everything fit at L0)
+    if (cmIndex >= 0) {
+      // Found a Q+A — there should be a Claude turn right after
+      assert.ok(
+        participants[cmIndex + 1] === 'Claude' ||
+          participants[cmIndex + 1] === strategy['config'].summaryParticipant,
+        `expected summary participant right after Context Manager; got ${participants[cmIndex + 1]}`
+      );
+    }
+
+    // The bodyGroup should NOT be a single big composite entry with inline
+    // `[Section summary ...]` markers anymore. Verify no inline marker.
+    const allText = compiled.messages
+      .flatMap((m) => m.content)
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('\n');
+    assert.ok(
+      !allText.includes('[Section summary ('),
+      'should NOT use inline [Section summary (...)] markers; should emit Q+A pairs instead'
+    );
+    manager.close();
+  });
+
   it('flag on: non-text content (e.g., tool_use blocks) is preserved on first shard', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({

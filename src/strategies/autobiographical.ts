@@ -1555,48 +1555,110 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
         );
 
-        // Build the combined body: walk shards in order, emit raw content or
-        // inline summary text, deduplicating ancestors within the group.
-        const groupEmittedAncestors = new Set<SummaryId>();
-        const parts: string[] = [];
+        // Walk shards in order, accumulating "runs":
+        //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
+        //    message with their text concatenated.
+        //  - a 'summary' run is consecutive shards under the same L_k
+        //    ancestor; flushed as a Q+A recall pair (Context Manager
+        //    question + summaryParticipant answer), emitted once per
+        //    distinct ancestor.
+        // The run breaks (and the previous run flushes) when:
+        //  - resolution transitions raw ↔ folded
+        //  - the L_k ancestor changes
+        type Run =
+          | { kind: 'raw'; parts: string[] }
+          | { kind: 'summary'; ancestor: SummaryEntry };
+        let currentRun: Run | null = null;
+        const participant = sortedShards[0].participant;
+
+        const flushRun = (): boolean => {
+          if (!currentRun) return true;
+          if (currentRun.kind === 'raw') {
+            const text = currentRun.parts.join('');
+            const content: ContentBlock[] = [{ type: 'text', text }];
+            const truncated = msgCap > 0 ? this.truncateContent(content, msgCap) : content;
+            const tokens = this.estimateTokens(truncated);
+            if (totalTokens + tokens > maxTokens) {
+              currentRun = null;
+              return false;
+            }
+            entries.push({
+              index: entries.length,
+              sourceMessageId: undefined,
+              sourceRelation: 'copy',
+              participant,
+              content: truncated,
+            });
+            totalTokens += tokens;
+          } else {
+            // summary run — emit Q+A pair, dedup at the strategy level
+            const ancestor = currentRun.ancestor;
+            if (!emittedAncestors.has(ancestor.id)) {
+              emittedAncestors.add(ancestor.id);
+              const questionEntry: ContextEntry = {
+                index: entries.length,
+                participant: 'Context Manager',
+                content: [{ type: 'text', text: summaryLabel }],
+                sourceRelation: 'derived',
+              };
+              const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+              const answerEntry: ContextEntry = {
+                index: entries.length + 1,
+                participant: summaryParticipant,
+                content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+                sourceRelation: 'derived',
+              };
+              const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+              if (totalTokens + pairTokens > maxTokens) {
+                currentRun = null;
+                return false;
+              }
+              entries.push(questionEntry);
+              entries.push(answerEntry);
+              totalTokens += pairTokens;
+            }
+          }
+          currentRun = null;
+          return true;
+        };
+
+        let budgetExhausted = false;
         for (const shard of sortedShards) {
           const resolution = result.finalResolutions.get(shard.id) ?? 0;
           if (resolution === 0) {
-            // Raw shard content
+            if (currentRun?.kind !== 'raw') {
+              if (!flushRun()) { budgetExhausted = true; break; }
+              currentRun = { kind: 'raw', parts: [] };
+            }
             for (const block of shard.content) {
-              if (block.type === 'text') parts.push(block.text);
+              if (block.type === 'text') (currentRun as { kind: 'raw'; parts: string[] }).parts.push(block.text);
             }
           } else {
             const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId);
             if (!ancestor) {
-              // Fall back to raw if summary missing
+              // Fall back to raw
+              if (currentRun?.kind !== 'raw') {
+                if (!flushRun()) { budgetExhausted = true; break; }
+                currentRun = { kind: 'raw', parts: [] };
+              }
               for (const block of shard.content) {
-                if (block.type === 'text') parts.push(block.text);
+                if (block.type === 'text') (currentRun as { kind: 'raw'; parts: string[] }).parts.push(block.text);
               }
               continue;
             }
-            if (groupEmittedAncestors.has(ancestor.id)) continue;
-            groupEmittedAncestors.add(ancestor.id);
-            emittedAncestors.add(ancestor.id);
-            // Inline summary marker — keeps the model aware that some content
-            // was elided here, with the summary inline.
-            parts.push(`\n\n[Section summary (${ancestor.id}, ~${ancestor.tokens} tokens compressed): ${ancestor.content}]\n\n`);
+            // If we're already in a summary run for the SAME ancestor, this
+            // shard is covered — skip silently.
+            if (currentRun?.kind === 'summary' && currentRun.ancestor.id === ancestor.id) {
+              continue;
+            }
+            if (!flushRun()) { budgetExhausted = true; break; }
+            currentRun = { kind: 'summary', ancestor };
           }
         }
-
-        const combinedText = parts.join('');
-        const combinedContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
-        const combinedEntry: ContextEntry = {
-          index: entries.length,
-          sourceMessageId: sortedShards[0].id,
-          sourceRelation: 'copy',
-          participant: sortedShards[0].participant,
-          content: msgCap > 0 ? this.truncateContent(combinedContent, msgCap) : combinedContent,
-        };
-        const combinedTokens = this.estimateTokens(combinedEntry.content);
-        if (totalTokens + combinedTokens > maxTokens) break;
-        entries.push(combinedEntry);
-        totalTokens += combinedTokens;
+        if (!budgetExhausted) {
+          if (!flushRun()) budgetExhausted = true;
+        }
+        if (budgetExhausted) break;
         continue;
       }
 
