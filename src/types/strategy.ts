@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane } from '@animalabs/membrane';
+import type { Membrane, ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
 
@@ -125,6 +125,41 @@ export interface ContextStrategy {
     log: ContextLogView,
     budget: TokenBudget
   ): ContextEntry[];
+
+  /**
+   * Optional: at ingestion time, decide whether to split this incoming
+   * message into multiple shards (because it's too large to be a single
+   * fold unit). If returned, the framework stores each shard as a separate
+   * StoredMessage with the shared `bodyGroupId` and per-shard `shardIndex`,
+   * and the render path will reassemble them into one API message at
+   * compile time.
+   *
+   * Return null or undefined to skip chunking (message stored as one record).
+   *
+   * See `docs/adaptive-resolution-design.md` §3.6.
+   */
+  chunkIngressMessage?(
+    participant: string,
+    content: ContentBlock[]
+  ): IngressChunkResult | null;
+}
+
+/**
+ * Result of a strategy's ingestion-time chunking decision.
+ */
+export interface IngressChunkResult {
+  /** Stable id shared by all shards of this message. */
+  bodyGroupId: string;
+  /**
+   * The shards in source order. Each becomes a separate StoredMessage.
+   * Concatenating the shards' text content must reproduce the original
+   * message body byte-for-byte.
+   */
+  shards: Array<{
+    content: ContentBlock[];
+    /** Order within the bodyGroup, starting at 0. */
+    shardIndex: number;
+  }>;
 }
 
 /**

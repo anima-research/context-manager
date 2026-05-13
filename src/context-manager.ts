@@ -211,6 +211,11 @@ export class ContextManager {
 
   /**
    * Add a message to the store.
+   *
+   * If the configured strategy implements `chunkIngressMessage` and returns
+   * a non-null sharding decision, the message is stored as multiple records
+   * sharing a `bodyGroupId` (per the adaptive-resolution design §3.6). The
+   * returned MessageId is the first shard's id.
    */
   addMessage(
     participant: string,
@@ -218,6 +223,33 @@ export class ContextManager {
     metadata?: MessageMetadata,
     causedBy?: MessageId[]
   ): MessageId {
+    // Optional strategy-driven ingestion-time chunking
+    const strategyAny = this.strategy as unknown as {
+      chunkIngressMessage?: (
+        participant: string,
+        content: ContentBlock[]
+      ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
+    };
+    if (typeof strategyAny.chunkIngressMessage === 'function') {
+      const decision = strategyAny.chunkIngressMessage(participant, content);
+      if (decision && decision.shards.length > 1) {
+        let firstId: MessageId | null = null;
+        for (const shard of decision.shards) {
+          const message = this.messageStore.append(
+            participant,
+            shard.content,
+            metadata,
+            causedBy,
+            {
+              bodyGroupId: decision.bodyGroupId,
+              shardIndex: shard.shardIndex,
+            }
+          );
+          if (firstId === null) firstId = message.id;
+        }
+        return firstId!;
+      }
+    }
     const message = this.messageStore.append(participant, content, metadata, causedBy);
     return message.id;
   }

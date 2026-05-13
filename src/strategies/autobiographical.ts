@@ -29,7 +29,9 @@ import type {
   ChunkId,
   SummaryId,
 } from '../adaptive/folding-strategy.js';
+import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import type { MessageId } from '../types/message.js';
+import type { IngressChunkResult } from '../types/strategy.js';
 
 /**
  * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
@@ -172,6 +174,70 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   unlockChunk(id: MessageId): void {
     this.locked.delete(id);
+  }
+
+  /**
+   * Ingestion-time chunking hook.
+   *
+   * Active only when `config.adaptiveResolution` is true. Inspects the
+   * incoming message's text content; if its approximate token count
+   * exceeds the chunker's threshold, splits it into shards with a stable
+   * shared `bodyGroupId`. The framework then stores each shard as its own
+   * StoredMessage, and the render path concatenates them back into one
+   * API message at compile time (preserving KV cache structure).
+   *
+   * Multi-block content: text blocks are concatenated for chunking, then
+   * the resulting shards are emitted as text blocks. Non-text blocks
+   * (images, tool results) are passed through unchanged on the first
+   * shard only — they don't get split.
+   *
+   * See `docs/adaptive-resolution-design.md` §3.6.
+   */
+  chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
+    if (!this.config.adaptiveResolution) return null;
+
+    // Separate text and non-text blocks.
+    const textParts: string[] = [];
+    const nonTextBlocks: ContentBlock[] = [];
+    for (const block of content) {
+      if (block.type === 'text') {
+        textParts.push(block.text);
+      } else {
+        nonTextBlocks.push(block);
+      }
+    }
+    if (textParts.length === 0) return null;
+    const combined = textParts.join('');
+
+    // Threshold and shard size derive from the strategy's existing
+    // targetChunkTokens setting: a message over 2x targetChunkTokens
+    // gets sharded into pieces of ~targetChunkTokens each. This keeps
+    // doc shards the same size as chat-message chunks for L1 production
+    // consistency.
+    const target = this.config.targetChunkTokens ?? DEFAULT_CHUNKER_OPTIONS.chunkSize;
+    const chunkerOpts = {
+      chunkThreshold: target * 2,
+      chunkSize: target,
+      charsPerToken: DEFAULT_CHUNKER_OPTIONS.charsPerToken,
+    };
+
+    const sharded = chunkMessage(combined, chunkerOpts);
+    if (!sharded.wasSharded) return null;
+
+    // Build IngressChunkResult. Non-text blocks (if any) go on shard 0
+    // so the agent doesn't lose attachments. They're outside the chunker's
+    // concern but should still be available on the first shard.
+    const shards = sharded.shards.map((s) => ({
+      content: ([{ type: 'text', text: s.content }] as ContentBlock[]).concat(
+        s.index === 0 ? nonTextBlocks : []
+      ),
+      shardIndex: s.index,
+    }));
+
+    return {
+      bodyGroupId: sharded.bodyGroupId,
+      shards,
+    };
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
@@ -1458,15 +1524,83 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 5. Emit middle entries in source order -----
-    // Walk middle messages. For each, look up its current resolution. If 0,
-    // emit raw. If k>0, emit the recall pair for its L_k ancestor (but only
-    // once per distinct ancestor).
+    // Walk middle messages. Handle two cases:
+    //  - bodyGroupId set: collect all consecutive shards from the same group,
+    //    emit ONE combined entry with concatenated content (raw shards + inline
+    //    summary text for folded shards). This preserves KV — the model sees
+    //    one continuous user message instead of N turns.
+    //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
     const emittedAncestors = new Set<SummaryId>();
     const summaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
-    for (let i = headEnd; i < effectiveRecentStart && i < messages.length; i++) {
+    let i = headEnd;
+    while (i < effectiveRecentStart && i < messages.length) {
       const msg = messages[i];
+
+      if (msg.bodyGroupId) {
+        // Collect the full run of consecutive shards sharing this bodyGroupId.
+        const groupId = msg.bodyGroupId;
+        const groupStart = i;
+        while (
+          i < effectiveRecentStart &&
+          i < messages.length &&
+          messages[i].bodyGroupId === groupId
+        ) {
+          i++;
+        }
+        const groupMessages = messages.slice(groupStart, i);
+        // Sort by shardIndex to ensure byte-faithful ordering.
+        const sortedShards = [...groupMessages].sort(
+          (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
+        );
+
+        // Build the combined body: walk shards in order, emit raw content or
+        // inline summary text, deduplicating ancestors within the group.
+        const groupEmittedAncestors = new Set<SummaryId>();
+        const parts: string[] = [];
+        for (const shard of sortedShards) {
+          const resolution = result.finalResolutions.get(shard.id) ?? 0;
+          if (resolution === 0) {
+            // Raw shard content
+            for (const block of shard.content) {
+              if (block.type === 'text') parts.push(block.text);
+            }
+          } else {
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId);
+            if (!ancestor) {
+              // Fall back to raw if summary missing
+              for (const block of shard.content) {
+                if (block.type === 'text') parts.push(block.text);
+              }
+              continue;
+            }
+            if (groupEmittedAncestors.has(ancestor.id)) continue;
+            groupEmittedAncestors.add(ancestor.id);
+            emittedAncestors.add(ancestor.id);
+            // Inline summary marker — keeps the model aware that some content
+            // was elided here, with the summary inline.
+            parts.push(`\n\n[Section summary (${ancestor.id}, ~${ancestor.tokens} tokens compressed): ${ancestor.content}]\n\n`);
+          }
+        }
+
+        const combinedText = parts.join('');
+        const combinedContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
+        const combinedEntry: ContextEntry = {
+          index: entries.length,
+          sourceMessageId: sortedShards[0].id,
+          sourceRelation: 'copy',
+          participant: sortedShards[0].participant,
+          content: msgCap > 0 ? this.truncateContent(combinedContent, msgCap) : combinedContent,
+        };
+        const combinedTokens = this.estimateTokens(combinedEntry.content);
+        if (totalTokens + combinedTokens > maxTokens) break;
+        entries.push(combinedEntry);
+        totalTokens += combinedTokens;
+        continue;
+      }
+
+      // Non-shard path: existing behavior.
       const resolution = result.finalResolutions.get(msg.id) ?? 0;
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
@@ -1480,11 +1614,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content,
         });
         totalTokens += tokens;
+        i++;
       } else {
-        // Find the L_resolution ancestor
         const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId);
         if (!ancestor) {
-          // Resolution set but summary missing — emit raw as a safety net.
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
           if (totalTokens + tokens > maxTokens) break;
@@ -1496,12 +1629,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             content,
           });
           totalTokens += tokens;
+          i++;
           continue;
         }
-        if (emittedAncestors.has(ancestor.id)) continue;
+        if (emittedAncestors.has(ancestor.id)) {
+          i++;
+          continue;
+        }
         emittedAncestors.add(ancestor.id);
-
-        // Emit the recall pair: Context Manager prompt + summary answer.
         const questionEntry: ContextEntry = {
           index: entries.length,
           participant: 'Context Manager',
@@ -1520,6 +1655,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
+        i++;
       }
     }
 

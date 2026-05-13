@@ -102,13 +102,30 @@ export class MessageStore {
   }
 
   /**
+   * Optional extra fields for `append`, used by callers that need to set
+   * adaptive-resolution metadata (bodyGroupId for shards, initial
+   * resolution state, etc.) at ingestion time.
+   */
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
+
+  /**
    * Append a new message to the store.
+   *
+   * `extra` is an optional bag of adaptive-resolution metadata
+   * (bodyGroupId / shardIndex / currentResolution / lockedByAgent) that
+   * callers may set at ingestion. Field semantics match StoredMessage.
    */
   append(
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
-    causedBy?: MessageId[]
+    causedBy?: MessageId[],
+    extra?: {
+      bodyGroupId?: string;
+      shardIndex?: number;
+      currentResolution?: number;
+      lockedByAgent?: boolean;
+    }
   ): StoredMessage {
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
@@ -120,6 +137,7 @@ export class MessageStore {
       metadata,
       timestamp: Date.now(),
       causedBy,
+      ...(extra ?? {}),
     };
 
     const record = this.store.appendToStateJson(this.stateId, partialInternal);
@@ -142,6 +160,7 @@ export class MessageStore {
       metadata,
       timestamp: new Date(partialInternal.timestamp),
       causedBy,
+      ...(extra ?? {}),
     };
 
     // Update index
@@ -459,7 +478,7 @@ export class MessageStore {
     id: MessageId,
     index: number
   ): StoredMessage {
-    return {
+    const stored: StoredMessage = {
       id,
       sequence: index, // Use index as sequence for now
       participant: internal.participant,
@@ -468,6 +487,12 @@ export class MessageStore {
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,
     };
+    // Carry adaptive-resolution fields through unchanged.
+    if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
+    if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
+    if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
+    if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
+    return stored;
   }
 }
 
