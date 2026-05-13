@@ -4,6 +4,7 @@
 
 ## Changelog
 
+- **rev 2.3 (2026-05-13)**: Replaced the three-step hard-fail escalation ladder (tail-shrink → head-truncate → throw) with throw-only. The strategy raises `OverBudgetError` when the picker is exhausted and the result still exceeds the hard budget; the host decides how to recover. See §3.10.
 - **rev 2.2 (2026-05-13)**: Revised bodyGroup rendering. Rev 2 proposed one composite message with inline `[Section summary]` markers for folded portions; rev 2.2 switches to standard Q+A recall pairs interleaved with raw runs. Matches the existing agent experience for summaries. See §3.6.
 - **rev 2.1 (2026-05-12)**: Settled outstanding decisions. Slack default = 10%. Speculative production = bottom-up background pre-producer, default-on. `lockedByAgent` programmatic API set-only in V1, no agent tool. Migration deferred to follow-up PR; V1 validates via re-ingest on fresh chronicles.
 - **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis.
@@ -272,15 +273,23 @@ Two design implications:
 
 V2's agent-driven `unfold` violates monotonicity intentionally — the agent decided detail was worth a cache miss. The architecture permits non-monotonic strategies; V1 does not ship one.
 
-### 3.10 Hard-fail fallback
+### 3.10 Hard-fail behavior
 
-If the strategy returns null while total still exceeds the model's hard context limit (not just the soft budget), the picker enters fallback:
+When the picker exhausts itself (no more groups it can raise, no more L_{k+1}s it can request) and the result still exceeds the **hard** budget (not just the soft target), the strategy throws `OverBudgetError`.
 
-1. **Shrink the tail from its left edge.** Truncate the oldest chunks of the recent window. Each truncated chunk's source content stays in the archive (L0 still exists in the chunk store), so this is reversible if conditions change later.
-2. **If the tail can't shrink further** (e.g., it's at minimum size, or the most recent message alone exceeds the limit): truncate the head from the right edge. Last resort because the head is usually pinned for instruction-following reasons.
-3. **If neither can give**: raise an `OverBudgetError` to the strategy host. Application-level handling at this point; we've done all we can.
+No silent degradation. No automatic tail-shrink or head-truncate. The host is in a better position than the strategy to decide what to do — raise the budget, switch to a larger-context model, drop the head/tail windows for this call, surface a "context too large" error to the user. The strategy's job is to fit when it can and report cleanly when it can't.
 
-This case should be unreachable in practice with unbounded L_n: only one chunk shouldn't fit on its own, and even then, lower-level shards via `bodyGroupId` chunking break it up.
+Earlier revisions of this section proposed a three-step escalation ladder (shrink tail → truncate head → throw). That was rejected in favor of the throw-only behavior because:
+- Tail-shrink and head-truncate are heuristic guesses about which content matters. The host has more context.
+- Silent content loss obscures the underlying problem.
+- The chronicle's existing `enforceBudget` config flag already establishes "surface the overage" as the project-level philosophy.
+
+This case should be rare in practice with unbounded L_n: the picker can almost always fold further. Real triggers are:
+- A `recentWindowTokens` larger than the hard budget (configuration error).
+- A single non-foldable chunk (head, pinned, or locked) bigger than the budget.
+- Hard budget set lower than the minimum-renderable head+tail size.
+
+`OverBudgetError` carries diagnostic info: `{ budget, actual, diagnostics: { headTokens, tailTokens, middleTokens, middleChunkCount, deepestLevel } }`.
 
 ### 3.11 Recent-window slide
 
@@ -351,7 +360,7 @@ The picker runs once per `compile()`. Given:
    - if op.kind == 'produce': enqueue background summarization; break
    - op = strategy.selectNextFold(state, totalBudget)
 4. If any chunk state changed, persist via delta records.
-5. If still over hard limit, invoke fallback (§3.10).
+5. If picker exhausted AND finalTokens > hard budget, throw OverBudgetError (§3.10).
 6. Render using updated state.
 ```
 
@@ -436,7 +445,7 @@ Estimated breakdown:
 | `lockChunk` / `unlockChunk` programmatic API | ~20 |
 | Token-counting cache on chunks and summaries | ~40 |
 | Recent-window-slide handling in eligibility check | ~20 |
-| Hard-fail fallback (tail shrink, head truncate, error) | ~40 |
+| Hard-fail check + OverBudgetError class | ~25 |
 | Legacy-chronicle read compatibility (`mergedInto` → `parentId` rename, default `currentResolution: 0`) | ~30 |
 | Deprecation glue for phase 1/2 | ~30 |
 | Tests | ~400 |
