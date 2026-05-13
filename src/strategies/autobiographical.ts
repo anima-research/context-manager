@@ -162,18 +162,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Lock a message so the adaptive picker won't change its resolution.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
-   * the design (no agent-facing tool in V1).
+   * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
   lockChunk(id: MessageId): void {
+    if (this.locked.has(id)) return;
     this.locked.add(id);
+    this.persistLocks();
   }
 
   /**
    * Unlock a message so the adaptive picker may again change its resolution.
-   * No-op when adaptiveResolution is false.
+   * No-op when adaptiveResolution is false. Persisted to chronicle.
    */
   unlockChunk(id: MessageId): void {
+    if (!this.locked.has(id)) return;
     this.locked.delete(id);
+    this.persistLocks();
   }
 
   /**
@@ -292,6 +296,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strategy: 'snapshot',
       });
     } catch { /* already registered */ }
+    // Adaptive-resolution state slots — only registered when the flag is on
+    // so chronicles without the flag don't accumulate unused slots.
+    if (this.config.adaptiveResolution) {
+      try {
+        this.store.registerState({
+          id: this.resolutionsStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+      try {
+        this.store.registerState({
+          id: this.locksStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+    }
   }
 
   /**
@@ -328,6 +348,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pins = [];
       this.pinIdCounter = 0;
     }
+
+    // Adaptive-resolution state — only present when flag was/is on
+    if (this.config.adaptiveResolution) {
+      const resState = this.store.getStateJson(this.resolutionsStateId);
+      this.resolutions = new Map();
+      if (resState && typeof resState === 'object') {
+        for (const [k, v] of Object.entries(resState as Record<string, unknown>)) {
+          if (typeof v === 'number' && v > 0) {
+            this.resolutions.set(k, v);
+          }
+        }
+      }
+      const lockState = this.store.getStateJson(this.locksStateId);
+      this.locked = new Set();
+      if (Array.isArray(lockState)) {
+        for (const id of lockState) {
+          if (typeof id === 'string') this.locked.add(id);
+        }
+      }
+    }
   }
 
   /** Persist the current pins + counter as a single snapshot. */
@@ -336,6 +376,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       pins: this.pins,
       counter: this.pinIdCounter,
     });
+  }
+
+  /** Persist the current resolutions snapshot. Only stores non-zero entries
+   *  to keep the slot compact. */
+  protected persistResolutions(): void {
+    if (!this.store) return;
+    const out: Record<string, number> = {};
+    for (const [id, level] of this.resolutions) {
+      if (level > 0) out[id] = level;
+    }
+    this.store.setStateJson(this.resolutionsStateId, out);
+  }
+
+  /** Persist the current locked-id snapshot. */
+  protected persistLocks(): void {
+    if (!this.store) return;
+    this.store.setStateJson(this.locksStateId, Array.from(this.locked));
   }
 
   // ============================================================================
@@ -1517,10 +1574,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
 
     // Commit the new resolutions back to strategy state for next compile.
+    // Persist to chronicle only if anything actually changed — avoids
+    // unnecessary state-slot writes on no-op compiles (which is the common
+    // case in steady state with slack).
+    let resolutionsChanged = false;
     for (const [id, level] of result.finalResolutions) {
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
       if (this.locked.has(id)) continue;
-      this.resolutions.set(id, level);
+      const prev = this.resolutions.get(id) ?? 0;
+      if (prev !== level) {
+        this.resolutions.set(id, level);
+        resolutionsChanged = true;
+      }
+    }
+    if (resolutionsChanged) {
+      this.persistResolutions();
     }
 
     // ----- 5. Emit middle entries in source order -----
