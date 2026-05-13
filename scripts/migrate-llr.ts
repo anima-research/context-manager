@@ -55,9 +55,12 @@ function makeMockMembrane() {
 }
 
 async function makeRealMembrane() {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  // Accept either env var. CONNECTOME_LLM_API_KEY is the project-standard
+  // name used elsewhere in connectome-local; ANTHROPIC_API_KEY is the
+  // upstream default.
+  const apiKey = process.env.CONNECTOME_LLM_API_KEY ?? process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    throw new Error('--real mode requires ANTHROPIC_API_KEY env var');
+    throw new Error('--real mode requires CONNECTOME_LLM_API_KEY or ANTHROPIC_API_KEY env var');
   }
   const { Membrane, AnthropicAdapter } = await import('@animalabs/membrane');
   return new Membrane(new AnthropicAdapter({ apiKey }));
@@ -92,14 +95,41 @@ function estimateTokens(content: ContentBlock[]): number {
   return total;
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  if (args.length < 2) {
-    console.error('Usage: migrate-llr <input.json> <store-path> [--mock|--real]');
-    process.exit(1);
+function parseArgs(argv: string[]): {
+  inputPath: string;
+  storePath: string;
+  real: boolean;
+  model?: string;
+  limit?: number;
+} {
+  const positionals: string[] = [];
+  let real = false;
+  let model: string | undefined;
+  let limit: number | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--real') real = true;
+    else if (a === '--mock') real = false;
+    else if (a === '--model') model = argv[++i];
+    else if (a === '--limit') limit = parseInt(argv[++i], 10);
+    else positionals.push(a);
   }
-  const [inputPath, storePath, modeArg] = args;
-  const real = modeArg === '--real';
+  if (positionals.length < 2) {
+    throw new Error(
+      'Usage: migrate-llr <input.json> <store-path> [--mock|--real] [--model <name>] [--limit N]'
+    );
+  }
+  return {
+    inputPath: positionals[0],
+    storePath: positionals[1],
+    real,
+    model,
+    limit,
+  };
+}
+
+async function main() {
+  const { inputPath, storePath, real, model: modelArg, limit } = parseArgs(process.argv.slice(2));
 
   if (!existsSync(inputPath)) {
     console.error(`Input file not found: ${inputPath}`);
@@ -115,6 +145,10 @@ async function main() {
   // Parse input
   console.log(`Loading ${inputPath}...`);
   const input: InputJSON = JSON.parse(readFileSync(inputPath, 'utf8'));
+  if (limit !== undefined && limit > 0 && limit < input.messages.length) {
+    console.log(`Limiting to first ${limit} of ${input.messages.length} messages`);
+    input.messages = input.messages.slice(0, limit);
+  }
   console.log(`Input: ${input.messages.length} messages, model=${input.model ?? '(unspecified)'}`);
 
   // Compute input token estimate
@@ -135,15 +169,24 @@ async function main() {
       `Biggest message: [${biggestMsg.idx}] ${biggestMsg.chars} chars (~${Math.ceil(biggestMsg.chars / 4)} tokens).`
   );
 
-  // Set up strategy
+  // Resolve compression model: CLI --model wins, else input.model, else
+  // strategy default. Note: input.model may use a project alias like
+  // 'claude-opus-4-7' that the Anthropic API won't accept — use --model
+  // to override with the API name (e.g. claude-opus-4-20250514).
+  const compressionModel = modelArg ?? input.model;
+
   const membrane = real ? await makeRealMembrane() : makeMockMembrane();
   const strategy = new AutobiographicalStrategy({
     adaptiveResolution: true,
-    targetChunkTokens: 3000, // → chunker threshold 6000, shard size ~3000
+    targetChunkTokens: 3000,
     recentWindowTokens: 30000,
     mergeThreshold: 6,
     compressionSlackRatio: 0.1,
+    ...(real && compressionModel ? { compressionModel } : {}),
   });
+  if (real) {
+    console.log(`Using compression model: ${compressionModel ?? '(strategy default)'}`);
+  }
   const manager = await ContextManager.open({
     path: storePath,
     strategy,
