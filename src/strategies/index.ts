@@ -1,2 +1,2 @@
 export { PassthroughStrategy } from './passthrough.js';
-export { AutobiographicalStrategy } from './autobiographical.js';
+export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot } from './autobiographical.js';

@@ -10,7 +10,7 @@ export { BlobManager } from './blob-manager.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
-export { AutobiographicalStrategy } from './strategies/autobiographical.js';
+export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot } from './strategies/autobiographical.js';
 export { KnowledgeStrategy } from './strategies/knowledge.js';
 
 // Types
