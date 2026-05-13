@@ -1546,6 +1546,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    // Pinned-position set so the picker doesn't fold messages the user
+    // explicitly marked as keep-raw. Built once and reused.
+    const pinnedSet = this.pinnedPositions(messages);
+
+    // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
+    // calls during emission.
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+
     const pickerChunks: PickerChunk[] = [];
     for (let i = headEnd; i < effectiveRecentStart && i < messages.length; i++) {
       const msg = messages[i];
@@ -1559,7 +1568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rawTokens: tokens,
         currentResolution: this.resolutions.get(msg.id) ?? 0,
         lockedByAgent: this.locked.has(msg.id),
-        pinned: false, // pins not yet integrated; future work
+        pinned: pinnedSet.has(i),
         l1Id: ch?.summaryId,
       });
     }
@@ -1725,8 +1734,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (currentRun.kind === 'raw') {
             const text = currentRun.parts.join('');
             const content: ContentBlock[] = [{ type: 'text', text }];
-            const truncated = msgCap > 0 ? this.truncateContent(content, msgCap) : content;
-            const tokens = this.estimateTokens(truncated);
+            // Deliberately do NOT apply maxMessageTokens here: the picker
+            // is the authority on how much of the doc renders raw vs.
+            // summarized. Truncating the composite would silently lose
+            // doc content that the picker explicitly chose to keep raw.
+            // (`maxMessageTokens` is for per-message caps on chat / tool
+            // results, not for sharded bodyGroup composites.)
+            const tokens = this.estimateTokens(content);
             if (totalTokens + tokens > maxTokens) {
               currentRun = null;
               return false;
@@ -1736,7 +1750,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sourceMessageId: undefined,
               sourceRelation: 'copy',
               participant,
-              content: truncated,
+              content,
             });
             totalTokens += tokens;
           } else {
@@ -1783,7 +1797,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (block.type === 'text') (currentRun as { kind: 'raw'; parts: string[] }).parts.push(block.text);
             }
           } else {
-            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId);
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById);
             if (!ancestor) {
               // Fall back to raw
               if (currentRun?.kind !== 'raw') {
@@ -1827,7 +1841,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         totalTokens += tokens;
         i++;
       } else {
-        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId);
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById);
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
@@ -1981,20 +1995,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Walk the summary tree to find the L_k ancestor of a message.
    * Returns null if no ancestor exists at that level (e.g., L_k not yet produced).
+   *
+   * Takes a pre-built summariesById map to avoid O(summaries) lookups per
+   * call — for a chronicle with thousands of summaries and hundreds of
+   * middle messages, the O(n) `find` would dominate compile latency.
    */
   protected findAncestorAt(
     messageId: MessageId,
     level: number,
-    chunksByMessageId: ReadonlyMap<MessageId, Chunk>
+    chunksByMessageId: ReadonlyMap<MessageId, Chunk>,
+    summariesById?: ReadonlyMap<string, SummaryEntry>,
   ): SummaryEntry | null {
     if (level <= 0) return null;
     const chunk = chunksByMessageId.get(messageId);
     if (!chunk?.summaryId) return null;
-    let current: SummaryEntry | undefined = this.summaries.find((s) => s.id === chunk.summaryId);
+    const lookup = (id: string): SummaryEntry | undefined =>
+      summariesById ? summariesById.get(id) : this.summaries.find((s) => s.id === id);
+    let current: SummaryEntry | undefined = lookup(chunk.summaryId);
     while (current && current.level < level) {
       const parentId = getSummaryParentId(current);
       if (!parentId) return null;
-      current = this.summaries.find((s) => s.id === parentId);
+      current = lookup(parentId);
     }
     if (!current || current.level !== level) return null;
     return current;
