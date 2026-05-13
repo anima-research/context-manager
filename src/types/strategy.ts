@@ -383,36 +383,67 @@ export interface AutobiographicalConfig {
 
 /**
  * Compression level in the hierarchical pyramid.
+ *
+ * Historically constrained to 1 | 2 | 3. As of the adaptive-resolution design
+ * (`docs/adaptive-resolution-design.md`), levels are unbounded: the picker
+ * can recursively produce L4, L5, ... as needed. The narrower literal type
+ * is kept as `LegacySummaryLevel` for code that still assumes the old shape.
  */
-export type SummaryLevel = 1 | 2 | 3;
+export type SummaryLevel = number;
+
+/**
+ * The narrow level type used by pre-adaptive-resolution code paths.
+ * Prefer `SummaryLevel` for new code.
+ */
+export type LegacySummaryLevel = 1 | 2 | 3;
 
 /**
  * A summary entry in the hierarchical memory pyramid.
  * L1: compressed from raw message chunks.
- * L2: merged from mergeThreshold L1s.
- * L3: merged from mergeThreshold L2s.
+ * L_{k>1}: merged from mergeThreshold L_{k-1}s.
  */
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
   id: string;
-  /** Compression level */
+  /** Compression level (1, 2, 3, ... — unbounded in the adaptive-resolution design) */
   level: SummaryLevel;
   /** The summary text */
   content: string;
-  /** Estimated token count (content.length / 4) */
+  /** Estimated token count (content.length / 4 or tokenizer-cached) */
   tokens: number;
-  /** Level of the sources: 0 = raw messages, 1 = L1s, 2 = L2s */
-  sourceLevel: 0 | 1 | 2;
-  /** IDs of source items (message IDs for L1, summary IDs for L2/L3) */
+  /**
+   * Level of the sources: 0 = raw messages, k = L_k summaries.
+   * Pre-adaptive code uses 0 | 1 | 2; new code may produce higher values.
+   */
+  sourceLevel: number;
+  /** IDs of source items (message IDs for L1, summary IDs for L_{k>1}) */
   sourceIds: string[];
   /** Range of original message IDs covered */
   sourceRange: { first: string; last: string };
-  /** If merged into a higher-level summary, that summary's ID */
+  /**
+   * The L_{level+1} summary this one is a source for, if produced.
+   * Pure archive metadata in the adaptive-resolution design — display
+   * decisions live on per-chunk `currentResolution`, not here.
+   */
+  parentId?: string;
+  /**
+   * @deprecated Renamed to `parentId` in the adaptive-resolution design.
+   * Kept for read compatibility with chronicles produced by the old
+   * threshold-driven path. New writes should set `parentId` only.
+   */
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
+}
+
+/**
+ * Helper: read the parent pointer from a summary, accepting either the
+ * new `parentId` field or the deprecated `mergedInto` alias.
+ */
+export function getSummaryParentId(s: SummaryEntry): string | undefined {
+  return s.parentId ?? s.mergedInto;
 }
 
 /**
