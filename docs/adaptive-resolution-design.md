@@ -1,6 +1,11 @@
 # Adaptive Resolution for AutobiographicalStrategy
 
-**Status:** Design draft · **Author(s):** antra-tess + Claude (Opus 4.7) · **Date:** 2026-05-12
+**Status:** Design draft (revision 2) · **Author(s):** antra-tess + Claude (Opus 4.7) · **Date:** 2026-05-12
+
+## Changelog
+
+- **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis. Added migration recovery mode for over-folded chronicles.
+- **rev 1 (2026-05-12)**: Initial draft.
 
 ## 1. Problem
 
@@ -34,21 +39,25 @@ L3: 1 live
 
 The entire conversation could comfortably fit at **L1 resolution** (36 × ~3K tokens = ~108K), but the strategy folded it all the way to a single L3 because count crossed threshold, not because the budget was tight. There is no path back to L1: `selectHierarchical` consults `mergedInto`, and once stamped the pointer is permanent.
 
+A second class of problem motivates the chunking work in §3.6: an instance receiving a single 500K-token document as its initial context cannot reasonably be compressed to a 2K L1 summary, nor can it be split into separate API messages without destroying KV cache. The design must accommodate sub-message resolution.
+
 ## 2. Goals
 
-This redesign must balance three forces:
+This redesign must balance four forces:
 
 1. **Adaptive resolution (per spec).** The live view picks a resolution per region. Folding happens *because* the tail is approaching budget, not because a counter crossed a literal. Regions that comfortably fit at a higher resolution stay there.
 
-2. **Cache stickiness.** Anthropic prompt caching keys on exact-prefix match. Every change in the rendered prefix is a cache miss starting at that point. Folding decisions therefore must be **monotonic in the common case** — once a region is folded, it stays folded even if hypothetical budget would permit unfolding. Speculative unfold = cache trash. Pressure-driven unfold = never (V1).
+2. **Cache stickiness.** Anthropic prompt caching keys on exact-prefix match. Every change in the rendered prefix is a cache miss starting at that point. The picker should be **stingy**: fire only when truly needed, raise the minimum required, then go silent for many turns.
 
-3. **V2 agent unfold/refold.** A future iteration gives the main agent explicit `unfold(summaryId)` / `refold(summaryId)` tools so it can pull a region back to higher resolution to look at something specific, then re-fold when done. V2 introduces *intentional* cache misses; V1's design must leave room for this without re-architecting.
+3. **Pluggable folding policy.** Different deployments have different priorities (oldest-first, flat-profile, content-importance, topic-coherence). The picker is a generic orchestrator; the policy is a separate object that any strategy can implement.
+
+4. **V2 agent unfold/refold.** A future iteration gives the main agent explicit `unfold(chunkId)` / `refold(chunkId)` tools so it can pull a region back to higher resolution to look at something specific, then re-fold when done. V2 introduces *intentional* cache misses; V1's design must leave room for this without re-architecting.
 
 Non-goals (V1):
 
-- **Speculative unfolding to use spare budget.** Even if the tail is small enough that folded regions could be unfolded back to L0, V1 leaves them folded. Cache stickiness wins. (V2's agent-driven unfold is the path for "I want to see this in detail.")
-- **Reordering folds.** Folds happen chronologically from oldest to newest, per the spec's "Compression is always chronological and never destructive" principle. The data model permits non-chronological folds but the picker doesn't issue them.
-- **Removing summaries from the archive.** Summaries are write-once. Even regions currently rendered at L0 keep their pre-computed L1/L2/L3 in the archive (or schedule them for background production) so future folds are free.
+- **Speculative unfolding to use spare budget.** Default V1 strategies are monotonic. Non-monotonic strategies are *permitted* by the architecture but not shipped.
+- **Reordering folds.** Folds happen chronologically per the spec's "Compression is always chronological and never destructive" principle. Specific strategies may reorder; the default does not.
+- **Removing summaries from the archive.** Summaries are write-once. Pre-computed L_n summaries are retained for future folds.
 
 ## 3. Model
 
@@ -56,303 +65,362 @@ Non-goals (V1):
 
 This is the principle the spec opens with, and it's load-bearing here. Concretely:
 
-- **Archive** = all summaries at all levels, indexed by `source_hash` (so re-summarizing the same chunk is idempotent). Append-only. Never deleted. Already implemented as the `summaries` state slot.
-- **Live view** = the output of `select()`, a sequence of `ContextEntry` objects rendered into the LLM request. Computed at compile time from message store + summaries + render state.
-- **Render state** = the new addition. A per-region resolution table that says "for region R, show level L." Persists across turns. Updated only by the fold/unfold algorithm below.
+- **Archive** = all summaries at all levels, indexed by `source_hash` (so re-summarizing the same chunk is idempotent). Append-only. Never deleted. Implemented as the `summaries` state slot.
+- **Live view** = the output of `select()`, a sequence of `ContextEntry` objects rendered into the LLM request. Computed at compile time from message store + summaries + per-chunk resolution state.
+- **Per-chunk resolution state** = the new addition. Each chunk carries its current display resolution as a small field on its `MessageEntry`. Persists across turns. Updated only by the picker (or, in V2, by an agent-driven strategy).
 
-### 3.2 Regions and resolutions
+### 3.2 Chunks, levels, and resolutions
 
-A **region** is a contiguous range of source messages identified by `(firstMessageId, lastMessageId)`. Regions partition the conversation: every message is in exactly one region.
+A **chunk** is the unit of fold operations. For chat messages under `chunkThreshold` (default 8K tokens), one chunk = the whole message. For larger messages — pasted documents, large tool-call results, dumped logs — a message is split into multiple chunks at ingestion (see §3.6).
 
-A **resolution** is one of `L0 | L1 | L2 | L3`:
+A **level** is a non-negative integer:
+- `L0` (level 0) = render the chunk's raw content.
+- `L1` (level 1) = render the L1 summary covering this chunk (and possibly N-1 sibling chunks).
+- `L_k` for `k > 1` = render the L_k summary covering this chunk's L_{k-1} ancestor (and that ancestor's siblings).
 
-- `L0` = render raw messages
-- `L1` = render the L1 summary's recall pair
-- `L2` = render the L2 summary's recall pair (covers what was multiple L1 regions)
-- `L3` = render the L3 summary's recall pair (covers what was multiple L2 regions)
+Levels are **unbounded**: there is no fixed `L3`-as-top. When the picker needs to fold further than existing summaries support, it produces L_{k+1} from N existing L_k summaries (default N = 6). This bounds the worst-case fold depth to `log_N(chunk_count)`, and means the picker can always make progress as long as there is more than one foldable group remaining.
 
-A region's resolution determines two things: what gets emitted in the live view (raw messages vs. a recall pair), and which other regions are subsumed (an `L2` region covers what was previously multiple `L1` regions; those `L1` regions collapse into the parent).
+A **region** at level k is not a stored object. It is the maximal contiguous run of chunks that share an L_k ancestor in the summary tree and all have `currentResolution = k`. Regions are derived at render time by scanning chunks left-to-right. Run-length encoding, not a table.
 
-Region boundaries can shift up the hierarchy (when folding deeper) but the boundaries themselves are derivable from the archive's summary tree: if `L2-15` was built from `L1-{6..11}`, an `L2` region for `L2-15` covers the union of source ranges of those L1s.
-
-### 3.3 Pressure-driven, chronologically-ordered fold
-
-When `compile()` is invoked:
-
-1. Walk the messages. Identify the **tail** (recent window) — keep everything in it at `L0`. Same as today.
-2. Identify the **head** (configurable preserve-verbatim region at the start) — also `L0`.
-3. **Compute current rendered tokens** at the current per-region resolution.
-4. **If total ≤ budget**: nothing to do. Emit.
-5. **If total > budget**: pick the oldest region whose resolution can be raised (L0 → L1 → L2 → L3), raise it by one step, recompute, loop. Stop when the budget fits or no more regions can be folded.
-
-The "raise by one step" rule preserves cache: an existing fold at L1 either stays at L1 (cache-hit) or moves to L2 (cache miss starts from that point, propagates forward). It never reverses (no spontaneous unfold).
-
-Pseudocode:
+### 3.3 Per-chunk state
 
 ```typescript
-function pickResolutions(state: RenderState, budget: number): RenderState {
-  let total = state.totalTokens();
-  while (total > budget) {
-    const target = state.oldestRegionAtResolution(['L0', 'L1', 'L2'])
-      ?.firstWhere(r => !r.lockedByAgent);
-    if (!target) break;                                // can't fold further
-    state.raiseResolution(target);                     // L0→L1 or L1→L2 or L2→L3
-    total = state.totalTokens();
-  }
-  return state;
-}
-```
+interface MessageEntry {
+  // ... existing fields (id, role, content, timestamps, etc.) ...
 
-### 3.4 Cache-stickiness
+  /** The chunk's current display resolution. 0 = render raw; k > 0 = render
+   *  the L_k ancestor's recall pair (collapsing this chunk and its
+   *  L_k-sharing siblings into one rendered item). Default 0. */
+  currentResolution: number;
 
-The pressure picker is monotonic by construction: it only raises resolutions, never lowers them. So the **prefix of folds at any compile is a superset of the prefix of folds at any earlier compile**. Cache hits across turns are preserved at every prefix length up to the most-recently-folded boundary.
-
-Counter-example to watch for: the head and tail windows themselves can shift (e.g., as new messages arrive, the recent-window's left edge advances). When the recent window slides past a message, that message becomes part of the compressible middle and gets a fresh resolution decision. If the picker assigns it `L0` initially (region still fits) and later raises to `L1` (region forced over budget), that's a cache miss at that message's position — but it's a *one-time* miss, propagated forward forever. Re-folds don't oscillate.
-
-### 3.5 Slack for stability
-
-To prevent the picker from sitting just below budget and folding on every minor token fluctuation, two knobs:
-
-- **Hysteresis target**: the picker folds until total tokens ≤ `budget * (1 - slack)`, e.g. 90% of budget. Once below, no further folds until the tail grows enough to cross the budget line again.
-- **Fold granularity**: the picker doesn't fold one message at a time; it folds whole regions (the source range of one summary at a level). So crossing the threshold by 1 token still triggers a region-sized fold — but that's the natural unit, not a problem.
-
-The slack value should be configurable (config: `compressionSlackRatio`, default `0.1`). Lower → more aggressive folding (more cache stability, less resolution). Higher → less aggressive (less stability, more resolution).
-
-## 4. Data model
-
-### 4.1 What `mergedInto` becomes
-
-`SummaryEntry.mergedInto` was carrying two meanings: "this summary has a parent in the archive" AND "this summary is hidden from the live view." Split these:
-
-- **Hierarchy** (archive metadata, immutable once written): `SummaryEntry.parentId?: SummaryId` — the L_{n+1} summary this one was a source for, if any. Multiple L1s share a parent L2; multiple L2s share a parent L3. Renamed from `mergedInto` to make the new meaning explicit (and so older code paths reading the old field name fail loudly).
-- **Render state** (a new state slot, branch-scoped per PR #14): `agents/<agent>/autobio:renderState`, an array of region records, each:
-
-```typescript
-interface RegionRecord {
-  /** Stable region identifier. For an L1 region: the L1's id. For an L2
-   *  region: the L2's id. For an L0 region: the messageId range start. */
-  regionId: string;
-  /** First and last source-message IDs covered by this region. */
-  firstMessageId: MessageId;
-  lastMessageId: MessageId;
-  /** Current display resolution. */
-  resolution: 'L0' | 'L1' | 'L2' | 'L3';
-  /** True if the agent explicitly unfolded this region (V2) — picker must
-   *  not refold it without the agent's consent. */
+  /** True if the agent explicitly fixed this chunk's resolution (V2). The
+   *  picker must not change the resolution while this is true. Default false. */
   lockedByAgent: boolean;
-  /** Sequence at which this region's resolution was last changed.
-   *  Used for telemetry / debugging. */
-  lastChangedAt: Sequence;
+
+  /** Sequence at which currentResolution was last set. Telemetry / debugging. */
+  resolutionChangedAt?: Sequence;
+
+  /** If this MessageEntry is a shard of a larger logical message, the group
+   *  id shared with its sibling shards. See §3.6. Default null. */
+  bodyGroupId?: string;
 }
 ```
 
-The render-state slot is an `append_log` with `editStateItem` semantics: each fold/unfold writes a new entry; `getStateJson` returns the latest array. Branch-scoped, so forks inherit the resolution choices at the fork point.
+Edits to `currentResolution` follow the existing chronicle pattern (append a delta record; replay reconstructs state). The same pattern already supports `SummaryEntry.mergedInto` edits today, so the cost model is known.
 
-### 4.2 Backward compatibility
+### 3.4 The summary tree
 
-Existing chronicles have `SummaryEntry.mergedInto` populated. On strategy `initialize()`:
+`SummaryEntry.mergedInto` is renamed `parentId` and becomes **archive metadata only**:
 
-1. Detect any `mergedInto` pointers.
-2. Synthesize a `RenderState` matching their effect: for each chain `L1 → L2 → L3`, emit a `RegionRecord` with `resolution: L3` covering the union of the L1's source ranges, `lockedByAgent: false`.
-3. **Migrate-in-place** by writing the synthesized render-state to the slot, then ignoring `mergedInto` thereafter (treat as advisory hint that can be lifted in V2's unfold).
+- `parentId?: SummaryId` — the L_{k+1} summary this one is a source for, if produced. Multiple L_k summaries share a parent L_{k+1}. Set once at archive-write time. Never used by the render path (which now consults per-chunk state instead).
+- `level: number` — the summary's level (1 for L1, 2 for L2, …).
 
-This means: **existing Lena chronicles continue to render the same way after the change**, but new folds are pressure-driven and the agent (V2) can eventually unfold the pre-stamped regions.
+The rename is intentional: old code paths reading `mergedInto` to make display decisions will fail loudly. Display decisions live in `MessageEntry.currentResolution` now.
 
-## 5. Operations
+### 3.5 Pluggable folding strategy
 
-### 5.1 `summarize_chunk` (archive write, unchanged in spirit)
-
-`tick()` continues to walk the compression queue and produce L1 summaries from raw chunks via the LLM. Idempotent by `source_hash`. **No render-state change.** This is the spec's archive write.
-
-L2 and L3 summaries are no longer produced by `checkMergeThreshold` on quantity. Instead, they're produced lazily: when the picker decides to raise a region to L2 (or L3) and no archive summary exists yet for that range, the picker enqueues a summarize_chunk-at-level work item and falls back to a lower resolution for THIS compile. Next tick produces the L2; next compile uses it.
-
-Optional optimization (V2-friendly): a background loop that speculatively produces L2s and L3s ahead of time so the picker never has to wait. Cheap LLM calls, and the spec endorses speculative archive work.
-
-### 5.2 `fold` (live-view mutation, new entry point)
-
-Internal function called by the picker. Signature:
+The picker is a generic orchestrator. Decisions are delegated to a `FoldingStrategy`:
 
 ```typescript
-function fold(region: RegionRecord, toResolution: Resolution): void {
-  // Update render state: region's resolution = toResolution.
-  // Append a state record to autobio:renderState.
+type FoldOp =
+  | { kind: 'raise'; groupRoot: SummaryId }       // group-fold up one level
+  | { kind: 'lower'; groupRoot: SummaryId }       // refold down (non-monotonic)
+  | { kind: 'produce'; level: number; range: ChunkRange };  // lazy production
+
+interface FoldingState {
+  chunks: Iterable<ChunkView>;       // ordered, includes resolution + lineage
+  summaries: SummaryTree;             // archive lookup
+  pins: Set<ChunkId>;
+  head: ChunkRange;
+  tail: ChunkRange;
+  tokenCount(): number;
+}
+
+interface FoldingStrategy {
+  /** Return the next fold operation, or null if no more folds needed. */
+  selectNextFold(state: FoldingState, budget: TokenBudget): FoldOp | null;
+}
+```
+
+The picker's loop:
+
+```
+let op = strategy.selectNextFold(state, budget)
+while op:
+  apply(op, state)
+  op = strategy.selectNextFold(state, budget)
+emit(state)
+```
+
+Strategies shipped in V1:
+
+- **`FlatProfileStrategy`** (default). Aims for roughly-equal counts of *visible items* at each non-trivial level. Monotonic (only emits `raise`). See §3.7.
+- **`OldestFirstStrategy`**. The behavior originally proposed in this doc's rev 1. Monotonic. Kept for comparison and as a fallback during early rollout.
+
+Strategies envisioned for later (not V1 scope, but the interface accommodates them):
+
+- `AgentDirectedStrategy` (V2) — honors `unfold`/`refold` operations from the agent; emits compensation `raise`/`lower` ops to keep within budget.
+- `ContentImportanceStrategy` — uses content scoring (embeddings, heuristics) to prefer folding low-importance regions.
+- `TopicCoherentStrategy` — folds contiguous regions of related content together.
+
+### 3.6 Sub-message chunking via `bodyGroupId`
+
+Any message whose token count exceeds `chunkThreshold` (default 8K) is split into shards at ingestion. Each shard is its own `MessageEntry` with:
+
+- A stable `bodyGroupId` shared with its sibling shards.
+- A `sourceHash` over the shard's content, for summary idempotency.
+- The same `role` as the original message.
+- A `range: { startByte, endByte }` into the original content, for byte-faithful reassembly.
+
+**Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, JSON top-level keys), token-bucket fallback (default `chunkSize` = 4K tokens, no overlap). Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
+
+**Rendering**: before emitting to the API, the render path groups consecutive entries with the same `bodyGroupId` and concatenates their bodies into a single API message. The role is the group's role. For shards folded to a non-zero `currentResolution`, the shard's body in the concatenation is replaced by its L_k recall pair. The model sees one user message with a mix of raw and summarized content; there are no turn markers between shards because they're inside one message body.
+
+This unifies docs and oversize chat messages: both go through the same chunker, both use `bodyGroupId`, both are foldable at sub-message granularity. The picker doesn't know which is which.
+
+### 3.7 Flat profile strategy
+
+The default strategy. Pseudocode:
+
+```
+selectNextFold(state, budget):
+  if state.tokenCount() <= budget * (1 - slack):
+    return null   // we're below target — no fold needed
+
+  // Count visible items at each level currently in use.
+  counts = map<level, int>
+  for chunk in state.foldableMiddle():
+    counts[chunk.currentResolution] += 1
+  // Note: a group of N chunks at level k contributes N to counts[k],
+  // but renders as a single recall pair — adjust to count rendered items.
+  // For each level k, the number of *rendered items* at level k is
+  // the number of distinct L_k ancestors among chunks at currentResolution = k.
+  visible = map<level, int>
+  for chunk in state.foldableMiddle():
+    visible[chunk.currentResolution].add(chunk.ancestorAt(chunk.currentResolution))
+  visibleCounts = { k: len(visible[k]) for k in visible }
+
+  // Pick the most-populous level. Tiebreak: lower level (so we fold
+  // older fragmented detail before consolidating coarser regions).
+  k = argmax(visibleCounts)
+  // Within that level, pick the oldest group eligible to raise.
+  groupRoot = oldestRaisableGroupAtLevel(state, k)
+  if !groupRoot:
+    // Try to produce the next level.
+    return { kind: 'produce', level: k+1, range: oldestGroupRange(state, k) }
+  return { kind: 'raise', groupRoot: groupRoot }
+```
+
+Properties:
+- **Even distribution across levels in steady state.** With enough budget pressure, the picker spreads the fold depth roughly evenly: more recent regions at lower levels, older regions at higher levels, with no sudden cliffs.
+- **Oldest-first behavior preserved *within* a level**, so the narrative property "memory fades chronologically" still holds.
+- **Cache cost: bounded re-raises.** A chunk is raised at level k once when level k becomes the most-populous, then again at level k+1 only after k+1 becomes the most populous in turn — typically many turns later.
+
+### 3.8 Group-fold semantics
+
+The atomic operation is `raiseGroup(groupRoot: SummaryId)`:
+
+```
+raiseGroup(groupRoot):
+  for chunk in chunksUnder(groupRoot):
+    if chunk.lockedByAgent:
+      continue   // skip locked chunks; group fold becomes partial
+    chunk.currentResolution = max(chunk.currentResolution, groupRoot.level)
+    chunk.resolutionChangedAt = now()
+```
+
+`chunksUnder(groupRoot)` walks the summary tree down from `groupRoot` to all leaf chunks under it. The `max` matters: a chunk already at a higher resolution isn't lowered when an intermediate group containing it is folded later.
+
+**Locked chunks block group-fold partially.** If chunk C is `lockedByAgent: true` and the picker raises C's level-k ancestor group, every chunk in the group *except* C flips to level k. C stays at its current resolution. The rendered output then has a hole inside what was a contiguous group — strategy must handle this in its eligibility check (only consider a group raisable if at least one chunk inside is unlocked, ideally most).
+
+**Producing missing summaries.** If `raiseGroup(groupRoot)` requires L_{k+1} and no L_{k+1} exists yet, the strategy returns a `produce` op instead. The picker enqueues background summarization and returns null (defer fold to next compile). The compile emits at the current state, possibly over budget for one turn — see §3.10 for the fallback when over-budget can't be tolerated.
+
+### 3.9 Cache stickiness, honestly
+
+The rev-1 doc claimed monotonic raises preserve cache. That's true but oversold. Concretely:
+
+- A given chunk's rendered content only ever moves up the level chain (raw → L1 → L2 → …), never reverses. So a chunk's *contribution* to the prefix is monotone-in-resolution.
+- But the chunk's *position* in the prefix has different content over time. When the picker raises chunk C from L1 to L2, the byte sequence at C's position changes — cache miss propagates forward from there.
+- The cache benefit comes from *between raises*. In steady state, the picker is a no-op (total ≤ budget × (1 − slack)) — full cache hit. The picker's job is to minimize how often raises happen at any given position.
+
+Two design implications:
+
+1. **Slack is essential, not nice-to-have.** Without slack, total bounces above and below budget each turn → picker fires every turn → cache rebuilt every turn. With slack: picker fires only when total exceeds budget, raises until total ≤ budget × (1 − slack), then is silent for many turns.
+
+2. **Strategies should be stingy.** The default `FlatProfileStrategy` raises one group at a time and exits as soon as the budget is met, rather than aggressively folding to maximize headroom.
+
+V2's agent-driven `unfold` violates monotonicity intentionally — the agent decided detail was worth a cache miss. The architecture permits non-monotonic strategies; V1 does not ship one.
+
+### 3.10 Hard-fail fallback
+
+If the strategy returns null while total still exceeds the model's hard context limit (not just the soft budget), the picker enters fallback:
+
+1. **Shrink the tail from its left edge.** Truncate the oldest chunks of the recent window. Each truncated chunk's source content stays in the archive (L0 still exists in the chunk store), so this is reversible if conditions change later.
+2. **If the tail can't shrink further** (e.g., it's at minimum size, or the most recent message alone exceeds the limit): truncate the head from the right edge. Last resort because the head is usually pinned for instruction-following reasons.
+3. **If neither can give**: raise an `OverBudgetError` to the strategy host. Application-level handling at this point; we've done all we can.
+
+This case should be unreachable in practice with unbounded L_n: only one chunk shouldn't fit on its own, and even then, lower-level shards via `bodyGroupId` chunking break it up.
+
+### 3.11 Recent-window slide
+
+The tail (recent window) is defined by token count from the latest chunk backward: `tail = the most recent K tokens worth of chunks`. As new chunks arrive, the tail's left edge slides forward, exposing previously-tail chunks to the picker.
+
+Algorithm: chunks transitioning out of the tail default to `currentResolution: 0`. They become eligible for raising on the next compile if pressure requires it. No special handling beyond the picker's normal eligibility check.
+
+Edge cases:
+- **A single chunk larger than K tokens**: the tail expands to include the whole chunk, even past K. The picker can't fold the most recent chunk ever — only previous ones. Combined with `bodyGroupId` chunking at ingestion, this is bounded by `chunkSize`, not message size.
+- **Chunks at the tail boundary mid-bodyGroup**: the tail is defined over chunks, not over logical messages. A bodyGroup may straddle the boundary — its newer shards are tail-protected, older shards are picker-eligible. Render concatenates them back into one API message regardless.
+
+## 4. Operations
+
+### 4.1 `summarize_chunk` — archive write, eager
+
+`tick()` continues to walk the compression queue and produce L1 summaries from raw chunks via the LLM. Idempotent by `sourceHash`. **No display change.** This is the spec's archive write.
+
+L_k summaries for `k > 1` are produced **lazily on strategy request** (a `produce` op from `selectNextFold`). A background loop *may* speculatively produce higher-level summaries ahead of demand to avoid picker latency; the spec endorses speculative archive work. Whether to ship the speculative loop in V1 is an open question (§7).
+
+### 4.2 `fold` — display mutation
+
+```typescript
+function fold(groupRoot: SummaryId): void {
+  // Walk the summary tree down from groupRoot; set every unlocked leaf
+  // chunk's currentResolution to max(current, groupRoot.level).
   // No LLM call. No archive change.
 }
 ```
 
-Folding a region to `L2` collapses the L1 regions it covered into the single L2 region (the underlying summary tree dictates the cover). Folding to `L3` collapses L2 regions analogously.
-
-### 5.3 `unfold` (V2 hook, sketch only)
+### 4.3 `unfold` (V2 hook, sketch only)
 
 ```typescript
-function unfold(regionId: string, opts?: { lock?: boolean }): void {
-  // Lower this region's resolution by one step (or to L0 if requested).
-  // If opts.lock, set lockedByAgent so the picker won't refold it
-  // without the agent's consent.
-  // Re-render budget; if over budget, fold something ELSE to compensate.
+function unfold(chunkId: ChunkId, opts?: { lock?: boolean }): void {
+  // Lower this chunk's currentResolution by one step (or to 0 if requested).
+  // If opts.lock (default true), set lockedByAgent so the picker won't
+  // re-raise it on the next compile without the agent's consent.
+  // The picker is then run; if over budget, it folds something else to compensate.
 }
 ```
 
-V2 exposes this as a tool the agent can call. The fold-to-compensate part is the spec's "trading resolution in one region for resolution in another." V1 stubs unfold but doesn't expose a tool yet.
+V2 exposes this as a tool the agent can call. V1 has the internal function (used only by migration today) but no agent-facing tool. Default `lock: true` — explicit unfolds are meaningful, casual ones are rare.
 
-### 5.4 `select` (changed)
+### 4.4 `select` — render path
 
-The hierarchical select path consults `RenderState` instead of `mergedInto`. For each region in chronological order:
+Walk chunks in source order. For each chunk:
+- If `currentResolution == 0`: emit raw content.
+- If `currentResolution == k > 0`: emit the L_k recall pair for the chunk's L_k ancestor. (Adjacent chunks sharing the same L_k ancestor emit the recall pair once.)
 
-- `L0` → emit raw messages
-- `L1` → emit L1's recall pair
-- `L2` → emit L2's recall pair
-- `L3` → emit L3's recall pair
+After this walk, group consecutive entries with the same `bodyGroupId` and concatenate their bodies into a single API message. Pinned chunks (`pins` slot) always render at L0 regardless of `currentResolution`.
 
-Head and tail are special-cased to always `L0`. The picker has already raised middle regions as needed.
+The positioned-recall-pair logic from PR #15 survives: pins are interleaved with non-pinned regions in chronological order. The grouping is now driven by `currentResolution` + `bodyGroupId` instead of `mergedInto`.
 
-The existing positioned-recall-pair logic (PR #15 gap #2) survives intact — it interleaves summary recall pairs with raw pinned messages in chronological position. With `RenderState`, that interleaving is computed from the same per-region table.
-
-## 6. The picker algorithm in detail
+## 5. The picker, in detail
 
 The picker runs once per `compile()`. Given:
 
-- `totalBudget`: max tokens (from `TokenBudget.maxTokens - reserveForResponse`)
-- `slack`: `compressionSlackRatio` (default 0.1)
-- `targetBudget = totalBudget * (1 - slack)` (the hysteresis target)
-- `renderState`: the persisted per-region resolutions (read at compile start)
-- `messageStore`, `summaries`, `pins`, etc.
+- `totalBudget` = `TokenBudget.maxTokens - reserveForResponse`
+- `slack` = `compressionSlackRatio` (default 0.1; see §7 open question)
+- `strategy` = configured `FoldingStrategy` instance
+- Chunk store, summary tree, pins, head/tail bounds
 
 ```
-1. Identify the head window (first M tokens, kept raw)
-2. Identify the tail window (last K tokens, kept raw)
-3. Initialize a workingState from renderState:
-   - For any new region (region not yet in renderState — typically the
-     newest L1 that just landed in the middle), default to L0
-4. Loop:
-   - Compute total tokens of the would-be-rendered context with
-     workingState's current resolutions
-   - If total ≤ targetBudget: break (we have headroom)
-   - Find the OLDEST region in workingState whose resolution can be
-     raised (L0 → L1 if an L1 summary exists or can be queued; same
-     for L1 → L2; same for L2 → L3)
-   - If no such region exists: break (we've folded everything we can)
-   - Raise that region's resolution by one step
-5. If workingState differs from renderState, persist the diffs to
-   autobio:renderState (one append per changed region)
-6. Render using workingState
+1. Build FoldingState (read-only view over chunks + summaries).
+2. op = strategy.selectNextFold(state, totalBudget)
+3. While op:
+   - if op.kind == 'raise':   fold(op.groupRoot); update chunk state
+   - if op.kind == 'lower':   (V2 only) lower one step; update chunk state
+   - if op.kind == 'produce': enqueue background summarization; break
+   - op = strategy.selectNextFold(state, totalBudget)
+4. If any chunk state changed, persist via delta records.
+5. If still over hard limit, invoke fallback (§3.10).
+6. Render using updated state.
 ```
 
-The "raise by one step" rule is critical for caching: a region only ever moves up the hierarchy, not down. Concretely the cache-miss boundary moves *forward in conversation position* monotonically (the new fold is the leftmost mismatch from the previous compile's render), and once a prefix is committed it survives unchanged across turns until the next region in front of it folds.
+Token counting (§7 open question): each chunk has a cached `tokensL0` from ingestion-time tokenization. Each summary has `tokensRecallPair` from its production. Render-time total = sum of (raw chunks at L0) + (one recall pair per distinct L_k ancestor among non-L0 chunks) + pinned chunks + head + tail.
 
-If a region needs to be raised but the next-level summary doesn't exist in the archive yet:
+## 6. Migration
 
-- **Option A**: enqueue the summary for next tick and leave this region at its current resolution. The compile may then go over budget for this turn; we accept that and rely on subsequent turns to catch up.
-- **Option B**: synchronously summarize before completing the compile. This is the original "compile awaits compression" behavior we explicitly moved away from in `3e42e98` for latency reasons.
+### 6.1 Schema migration
 
-V1 ships Option A. (V2 might add a third option: emit at the lower resolution but truncate the tail until summaries are ready — another lever the spec implicitly allows by saying "or accepting a shorter tail.")
+Existing chronicles have `SummaryEntry.mergedInto` populated and `MessageEntry.currentResolution` absent. On strategy `initialize()`:
 
-## 7. Cache implications, made explicit
+1. **Default mode (conservative)** — preserves the chronicle's current rendered shape. For each `mergedInto` chain `L1 → L2 → L3`, walk down to leaf chunks and set their `currentResolution` to the level of the topmost ancestor that has `mergedInto == null` (i.e., the level actually rendered today).
+2. **Recovery mode (`config.migrationRecoveryMode: true`)** — recomputes resolution from current budget. Sets all chunks to `currentResolution: 0`, then runs the configured strategy until budget is met. For over-folded chronicles like Lena's, this produces the resolution the picker would have chosen if it had been running all along.
+3. **Rename `mergedInto` → `parentId`.** Field rename, automatic write on any read. Old reads of `mergedInto` for display purposes are now bugs that surface loudly.
 
-Cache behavior of the picker, conversation turn by conversation turn:
+Recovery mode is opt-in because it costs LLM calls to produce missing L_k summaries (if not already in the archive) and changes the prefix the agent sees on its next compile — both worth a deliberate operator decision.
 
-```
-Turn 1, 50K tokens, all L0:           [head][raw....][tail]
-Turn 2, 70K tokens, all L0:           [head][raw.......][tail]
-Turn 3, 90K tokens, all L0:           [head][raw..........][tail]
-Turn 4, 120K tokens, BUDGET 100K:     [head][L1][raw....][tail]
-                                            ^ cache miss starts here
-Turn 5, 140K tokens, all L0+1×L1:     [head][L1][raw......][tail]
-                                            cache hits up to here
-Turn 6, 170K tokens, fold deeper:     [head][L1][L1][raw...][tail]
-                                                ^ second fold, cache miss starts here
-Turn 7-10, more L1 folds at oldest:   [head][L1][L1][L1][L1][raw..][tail]
-Turn 11, enough L1s for L2 to help:   [head][L2  ][L1][L1][raw..][tail]
-                                            ^ third type of cache miss
-```
+### 6.2 Rollout phases
 
-Key properties:
+**Phase 1 — Default off behind feature flag.**
+- Add `bodyGroupId`, chunker, on-chunk state, picker, strategies, lazy production, hard-fail fallback, migration code.
+- Feature flag `config.adaptiveResolution: true` activates the new path.
+- Existing chronicles keep rendering as today (default migration mode). New chronicles can opt in.
+- `checkMergeThreshold` continues to run on non-`bodyGroupId` chunks for backward compat.
 
-- **Cache hit width grows over time** until pressure forces a new fold.
-- **Each fold creates one cache-miss boundary** at the fold position, but the *new* prefix becomes the cache key for subsequent turns.
-- **An L1→L2 fold-up** (consolidating multiple existing L1 regions into one L2 region) is a single cache miss at the start of the affected L1 range. It's strictly better than re-folding multiple L1s into multiple new L1s of different sizes (which the current threshold-driven implementation does at every merge boundary).
-- **The picker never inserts a fold in the middle** — folds always happen at the chronologically-oldest unfolded region. So mid-conversation cache rebuilds don't occur.
-
-V2's agent-driven `unfold` violates this monotonicity intentionally, and the cache cost is taken explicitly (the agent decided that seeing the detail was worth a cache miss). V2 should also expose pressure-driven refold so that an agent who unfolded too much can have the picker re-fold the agent's region — but only if `lockedByAgent` is false, since agent locks survive the next picker run.
-
-## 8. V2 considerations folded into V1 design
-
-The data model above already accommodates V2:
-
-- `lockedByAgent` field on `RegionRecord` is the agent-control hook. V1 always writes `false`; V2 exposes a `lock: true` option on `unfold`.
-- `unfold(regionId)` is the V2 tool. V1 has the internal function (used only by migration today) but no agent-facing tool.
-- The picker's "find oldest non-locked region" skip honors agent locks once V2 introduces them, with no other code changes needed.
-- The render-state slot is branch-scoped (PR #14's persistence model), so an agent's unfold on a branch doesn't leak into other branches. This matters because V2 might want to fork "let me look at this in detail" branches without polluting the main timeline.
-
-What V2 adds beyond V1:
-
-- The `unfold` / `refold` tools, plus their delegation to the picker for compensation folds.
-- A "soft pressure" mode where the picker can suggest unfolds to the agent rather than fold automatically — useful for "I have unused budget; want to see anything in higher detail?"
-- Possibly: per-region pin metadata that says "this region is high-value, refold last." Currently we have one pin layer (`agents/<agent>/autobio:pins`) for keep-raw-no-matter-what; V2 might add a softer prefer-detailed-resolution hint.
-
-## 9. Migration plan
-
-The change is invasive. Suggested rollout:
-
-### Phase 1 — Add the new state slot + picker, dual-write
-
-- Add `RenderState` slot, populate on initialize from existing `mergedInto` pointers.
-- Wire picker into `select()`, gated behind a feature flag (`config.adaptiveResolution: true`). Default off.
-- `checkMergeThreshold` and `mergedInto` continue to operate as today.
-- A/B test: same conversation rendered with old logic vs. picker, compare outputs.
-
-### Phase 2 — Switch default; deprecate the threshold path
-
+**Phase 2 — Switch default; deprecate threshold path.**
 - Default `adaptiveResolution: true`.
-- `checkMergeThreshold` becomes a no-op (or emits a deprecation warning when invoked).
-- `mergedInto` is no longer written by new merges (existing pointers remain for back-compat in render).
+- `checkMergeThreshold` becomes a no-op (emits deprecation warning).
+- New merges go through the picker.
 
-### Phase 3 — Remove the threshold path
+**Phase 3 — Delete threshold path.**
+- Remove `checkMergeThreshold`, related tests.
+- One-time forward migration of any remaining unmigrated chronicles.
 
-- Delete `checkMergeThreshold`, `mergedInto` writes, related tests.
-- Migrate any remaining chronicles forward (one-time migration script).
+## 7. Open questions
 
-This staging keeps existing deployments stable while we validate the picker against real workloads.
+1. **Slack default value.** 10% (rev 1's guess) vs 15% vs adaptive (based on observed turn-over-turn token delta variance). Probably 10% is fine but should be tuned against real workloads.
 
-## 10. Open questions
+2. **Token counting fidelity.** Picker decisions hinge on token counts. Per-chunk and per-summary cached counts (from tokenizer at production time) vs estimate (4 chars ≈ 1 token) vs real-tokenize-on-every-compile. Cached counts are accurate and cheap as long as we always use the same tokenizer; recommend that.
 
-1. **Region boundaries when L1s overlap on the same chunk.** Can two L1s ever cover the same source range? Today they shouldn't (production is idempotent on `source_hash`), but defensive checks in the picker need a tie-breaker.
+3. **Speculative L_{k+1} production.** Whether V1 ships a background loop that produces higher-level summaries ahead of demand, or only produces them on strategy request. Background pre-production avoids picker latency at first fold but spends LLM tokens that might never be needed. Default V1: lazy only. Background opt-in via `config.speculativeProduction: true`.
 
-2. **Pins interaction.** The spec says pins are display locks, not write locks. The picker must skip pinned regions when selecting fold targets. But what if the only way to fit budget is folding a pinned region? Spec implies: accept being over budget rather than violate a pin. Confirm.
+4. **Recall pair format consistency across levels.** Under adaptive resolution, the same chunk might be rendered as an L_k recall on one turn and L_{k+1} on a later turn. Each summary is faithful to its own as-of moment, so this is *monotonic memory fading* by construction (more detail → less detail, never reverse) — promote to design property in §3.9 if reviewers agree.
 
-3. **Recall-pair format consistency.** Today recall pairs for L1/L2/L3 are formatted slightly differently (level-specific headers). Under adaptive resolution, the same chunk might render as an L1 recall on turn 5 and an L2 recall on turn 11. The agent sees a different summary content for what it remembers as "the same memory" — does this break the as-of invariant from the spec? Probably not (each summary is faithful to its own as-of moment), but worth thinking through.
+5. **Pins interaction.** Spec says pins are display locks, not write locks. The picker must skip pinned chunks. If the only way to fit budget is folding a pinned chunk, the spec implies accept being over budget rather than violate a pin → fallback in §3.10 kicks in. Confirm.
 
-4. **L2/L3 production lag.** If picker decides to raise to L2 and the L2 summary doesn't exist yet, V1 ships Option A (defer fold, accept over-budget for this turn). What's the recovery story if the deferral compounds (more turns push tokens higher, but L2 never gets produced fast enough)? Probably: prioritize fold-imminent summaries in the background tick queue.
+6. **Branching semantics for on-chunk state.** New chronicle branches inherit chunk state at the fork point via the existing branch-scoped slot model. An agent unfold on branch A does not leak into branch B. Believed to come for free from existing chronicle copy-on-write, but verify with an explicit test.
 
-5. **Default `slack`.** 10% seems reasonable but is plucked from intuition. Should be tuned against real conversation data.
+7. **Telemetry.** `getRenderStats()` needs extension. Suggested: per-level chunk counts, picker iterations and fold ops this compile, lazy production queue depth, total raises since chronicle start. The `RenderStats` interface (PR #16) needs updating.
 
-6. **Migration for in-flight branches.** Some users may have multiple existing branches with different `mergedInto` states. Phase 1 migration synthesizes RenderState per branch — but the synthesized state assumes "show what was being shown." If a user expects unfold to recover what was originally raw, they're disappointed (the original raw chunks are in the archive, but their region was stamped to L3 already). V2's unfold helps here. Document.
+8. **`lockedByAgent` programmatic API in V1.** V1 ships no agent tool, but should the field be settable via a programmatic strategy-host API so module developers can experiment? Lean: yes, set-only (no agent-facing tool until V2).
 
-7. **Telemetry.** What should `getRenderStats()` report under the new model? At minimum: per-resolution live region counts, total folds since last compile, picker iterations. The `RenderStats` interface (added in PR #16) needs extension.
+## 8. Implementation scope
 
-## 11. Implementation scope estimate
+Estimated breakdown:
 
-- New state slot + types: ~80 LOC
-- Picker algorithm: ~150 LOC
-- Integration in `select()` (mostly subtraction from existing code): ~50 LOC net
-- Migration on `initialize`: ~60 LOC
-- Tests: ~250 LOC (picker behaviors, migration, cache-stickiness over a turn sequence, V2 hooks plumbed but not exposed)
-- Deprecation glue for phase 1/2: ~30 LOC
+| Component | LOC |
+|---|---|
+| `bodyGroupId` field + render concat | ~30 |
+| Chunker module (structural + token-bucket, ingestion-time) | ~80 |
+| On-chunk state fields + edit-record plumbing | ~40 |
+| `FoldingStrategy` interface + `FlatProfileStrategy` + `OldestFirstStrategy` | ~200 |
+| Picker orchestrator loop | ~30 |
+| Lazy summary production at arbitrary level | ~80 |
+| Token-counting cache on chunks and summaries | ~40 |
+| Recent-window-slide handling in eligibility check | ~20 |
+| Hard-fail fallback (tail shrink, head truncate, error) | ~40 |
+| Migration code (default + recovery mode) | ~100 |
+| Deprecation glue for phase 1/2 | ~30 |
+| Tests | ~400 |
 
-Total: ~600 LOC of new + ~80 LOC deleted, with a feature flag controlling the rollout.
+**Total: ~1100 LOC new + ~80 LOC deleted.** Feature flag controls rollout.
 
-## 12. Related work
+Realistic timeline: 2 weeks of focused implementation + 1 week of integration testing on real chronicles + migration day.
+
+## 9. Related work
 
 - [`hermes-autobio/docs/hierarchical-autobiographical-memory.md`](../../hermes-autobio/docs/hierarchical-autobiographical-memory.md) — the canonical spec this design implements.
-- PR #15 — added the autobio spec gaps (positioned recall, pins, search, etc.); established the type-guard pattern this design uses for `RenderState`.
-- PR #16 — fixed the silent-message-drop on `compile()` in hierarchical mode; the picker's "fold the oldest" logic depends on the raw-fallback for uncompressed chunks still being there.
-- PR #17 — fixed `MessageStore.get` returning slot index as sequence; chained branching now works, which the picker relies on when navigating region boundaries across forks.
+- PR #14 — branch-scoped persistence model; on-chunk state is branched naturally via the same mechanism.
+- PR #15 — autobio spec gaps (positioned recall, pins, search). Established the type-guard pattern this design uses.
+- PR #16 — fixed silent-message-drop on `compile()` in hierarchical mode.
+- PR #17 — fixed `MessageStore.get` returning slot index as sequence; chained branching now works.
 
-## 13. Decision needed
+## 10. Decisions still owed
 
 This design is concrete enough to either implement or critique. Specifically, please weigh in on:
 
-- **The migration story.** Is it acceptable for existing chronicles to render the same way they do today (just via the new state slot), with unfold only available in V2? Or do we need to preserve the option to recover original-raw NOW?
-- **The slack value default.** 10%? 15%?
-- **The deferred-L2/L3-production policy** (Option A vs B vs C in §6). V1 ships Option A, but if any of you run a workload where compile latency isn't the bottleneck and budget-overage is, B might be acceptable.
-- **`lockedByAgent` semantics.** Is the V1 stub (always-false) enough? Or should we expose at least a programmatic API (no tool yet) so module hosts can set locks?
+- **Recovery mode for over-folded chronicles.** §6.1 ships it as opt-in. Lena's chronicle is the obvious target. Confirm: opt-in only, or default-on for chronicles where the picker-recomputed resolution would meaningfully differ from the as-stored resolution?
+- **Slack default.** §7 #1 — 10%, 15%, or adaptive?
+- **Speculative production.** §7 #3 — lazy-only in V1, or also ship the background pre-producer?
+- **`lockedByAgent` programmatic API in V1.** §7 #8 — set-only programmatic API even without a tool?
+
+Once these are settled the design is implementation-ready.
