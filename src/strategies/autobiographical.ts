@@ -19,6 +19,17 @@ import type {
   SearchResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
+import { getSummaryParentId } from '../types/strategy.js';
+import { Picker, type PickerChunk } from '../adaptive/picker.js';
+import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
+import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
+import type {
+  FoldingStrategy,
+  FoldingBudget,
+  ChunkId,
+  SummaryId,
+} from '../adaptive/folding-strategy.js';
+import type { MessageId } from '../types/message.js';
 
 /**
  * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
@@ -98,11 +109,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
+  protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
+  protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
   /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
   protected pinIdCounter = 0;
+
+  /**
+   * Per-message resolution state for the adaptive-resolution picker.
+   *  - Key: MessageId
+   *  - Value: currentResolution (0 = render raw, k>0 = render L_k recall)
+   *
+   * Maintained only when `config.adaptiveResolution` is true. Loaded from
+   * the chronicle on `initialize()` and persisted via the resolutions state
+   * slot so resolutions survive process restart and follow branches.
+   */
+  protected resolutions: Map<MessageId, number> = new Map();
+
+  /**
+   * Per-message lock state for the adaptive-resolution picker. Set via the
+   * programmatic `lockChunk(id)` API on the strategy. Locked messages are
+   * skipped by the picker. Persisted via the locks state slot.
+   */
+  protected locked: Set<MessageId> = new Set();
+
+  /** Lazy picker instance, built from config.foldingStrategy. */
+  private _adaptivePicker: Picker | null = null;
 
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
@@ -115,6 +149,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.l2BudgetTokens ??= 30000;
       this.config.l1BudgetTokens ??= 30000;
     }
+    // Adaptive-resolution defaults
+    if (this.config.adaptiveResolution) {
+      this.config.foldingStrategy ??= 'flat-profile';
+      this.config.compressionSlackRatio ??= 0.1;
+      this.config.speculativeProduction ??= true;
+    }
+  }
+
+  /**
+   * Lock a message so the adaptive picker won't change its resolution.
+   * No-op when adaptiveResolution is false. Set-only programmatic API per
+   * the design (no agent-facing tool in V1).
+   */
+  lockChunk(id: MessageId): void {
+    this.locked.add(id);
+  }
+
+  /**
+   * Unlock a message so the adaptive picker may again change its resolution.
+   * No-op when adaptiveResolution is false.
+   */
+  unlockChunk(id: MessageId): void {
+    this.locked.delete(id);
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
@@ -587,6 +644,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.rebuildChunks(store);
 
+    if (this.config.adaptiveResolution) {
+      return this.selectAdaptive(store, budget);
+    }
     return this.config.hierarchical
       ? this.selectHierarchical(store, budget)
       : this.selectLegacy(store, log, budget);
@@ -1229,6 +1289,283 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw error;
     }
   }
+
+  // ============================================================================
+  // Adaptive resolution (picker-driven) path
+  // ============================================================================
+
+  /**
+   * Select context entries using the adaptive-resolution picker.
+   *
+   * Builds per-message PickerChunks from compressible messages, runs the
+   * configured FoldingStrategy under token-budget pressure, and emits the
+   * resulting per-message resolutions as ContextEntry[]. Adjacent messages
+   * sharing the same L_k ancestor emit the recall pair once.
+   *
+   * See `docs/adaptive-resolution-design.md` §3, §5.
+   */
+  protected selectAdaptive(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    const entries: ContextEntry[] = [];
+    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const messages = store.getAll();
+    const msgCap = this.config.maxMessageTokens;
+
+    // ----- 1. Build head/tail sets and emit head entries -----
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = this.getRecentWindowStart(store);
+
+    const headMessageIds = new Set<MessageId>();
+    const tailMessageIds = new Set<MessageId>();
+    let headTokens = 0;
+    let tailTokens = 0;
+
+    let totalTokens = 0;
+
+    // Emit head entries verbatim
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      if (totalTokens + tokens > maxTokens) break;
+      entries.push({
+        index: entries.length,
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content,
+      });
+      totalTokens += tokens;
+      headMessageIds.add(msg.id);
+      headTokens += tokens;
+    }
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
+    }
+
+    // Compute tail message IDs (will be emitted at end)
+    const effectiveRecentStart = Math.max(recentStart, headEnd);
+    for (let i = effectiveRecentStart; i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      tailMessageIds.add(msg.id);
+      tailTokens += tokens;
+    }
+
+    // ----- 2. Build PickerChunks for messages in the middle -----
+    // For each compressible (non-head, non-tail) message we create one
+    // PickerChunk. Its l1Id is determined by the existing chunks that
+    // group messages into L1 summaries.
+    const chunksByMessageId = new Map<MessageId, Chunk>();
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) {
+        chunksByMessageId.set(m.id, ch);
+      }
+    }
+
+    const pickerChunks: PickerChunk[] = [];
+    for (let i = headEnd; i < effectiveRecentStart && i < messages.length; i++) {
+      const msg = messages[i];
+      const ch = chunksByMessageId.get(msg.id);
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: this.resolutions.get(msg.id) ?? 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: false, // pins not yet integrated; future work
+        l1Id: ch?.summaryId,
+      });
+    }
+
+    // Also include head and tail in PickerChunks (so token accounting matches)
+    // — but mark them as in-head/in-tail so the picker won't fold them.
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: true, // treat head as pinned for picker purposes
+        l1Id: undefined,
+      });
+    }
+    for (let i = effectiveRecentStart; i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: true, // treat tail as pinned for picker purposes
+        l1Id: undefined,
+      });
+    }
+
+    // ----- 3. Build summaries map and recall-pair tokens -----
+    const summariesMap = new Map<SummaryId, SummaryEntry>();
+    const recallPairTokens = new Map<SummaryId, number>();
+    for (const s of this.summaries) {
+      summariesMap.set(s.id, s);
+      // recall pair = the summary's text wrapped as a Q&A pair. Approximate
+      // as s.tokens + small overhead for the "What do you remember?" label.
+      recallPairTokens.set(s.id, s.tokens + 20);
+    }
+
+    // ----- 4. Run the picker -----
+    const totalBudget = maxTokens - totalTokens; // tokens left after head
+    const slack = this.config.compressionSlackRatio ?? 0.1;
+    const foldingBudget: FoldingBudget = {
+      totalBudget,
+      targetBudget: totalBudget * (1 - slack),
+      slack,
+    };
+
+    const headSetForPicker = new Set<ChunkId>(headMessageIds);
+    const tailSetForPicker = new Set<ChunkId>(tailMessageIds);
+
+    const picker = this.getAdaptivePicker();
+    const result = picker.run(
+      {
+        chunks: pickerChunks,
+        summaries: summariesMap,
+        recallPairTokens,
+        headChunkIds: headSetForPicker,
+        tailChunkIds: tailSetForPicker,
+        headTokens,
+        tailTokens,
+      },
+      foldingBudget
+    );
+
+    // Commit the new resolutions back to strategy state for next compile.
+    for (const [id, level] of result.finalResolutions) {
+      if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
+      if (this.locked.has(id)) continue;
+      this.resolutions.set(id, level);
+    }
+
+    // ----- 5. Emit middle entries in source order -----
+    // Walk middle messages. For each, look up its current resolution. If 0,
+    // emit raw. If k>0, emit the recall pair for its L_k ancestor (but only
+    // once per distinct ancestor).
+    const emittedAncestors = new Set<SummaryId>();
+    const summaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
+
+    for (let i = headEnd; i < effectiveRecentStart && i < messages.length; i++) {
+      const msg = messages[i];
+      const resolution = result.finalResolutions.get(msg.id) ?? 0;
+      if (resolution === 0) {
+        const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+        const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+        if (totalTokens + tokens > maxTokens) break;
+        entries.push({
+          index: entries.length,
+          sourceMessageId: msg.id,
+          sourceRelation: 'copy',
+          participant: msg.participant,
+          content,
+        });
+        totalTokens += tokens;
+      } else {
+        // Find the L_resolution ancestor
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId);
+        if (!ancestor) {
+          // Resolution set but summary missing — emit raw as a safety net.
+          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+          const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+          if (totalTokens + tokens > maxTokens) break;
+          entries.push({
+            index: entries.length,
+            sourceMessageId: msg.id,
+            sourceRelation: 'copy',
+            participant: msg.participant,
+            content,
+          });
+          totalTokens += tokens;
+          continue;
+        }
+        if (emittedAncestors.has(ancestor.id)) continue;
+        emittedAncestors.add(ancestor.id);
+
+        // Emit the recall pair: Context Manager prompt + summary answer.
+        const questionEntry: ContextEntry = {
+          index: entries.length,
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: summaryLabel }],
+          sourceRelation: 'derived',
+        };
+        const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+        const answerEntry: ContextEntry = {
+          index: entries.length + 1,
+          participant: summaryParticipant,
+          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+          sourceRelation: 'derived',
+        };
+        const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+        if (totalTokens + pairTokens > maxTokens) break;
+        entries.push(questionEntry);
+        entries.push(answerEntry);
+        totalTokens += pairTokens;
+      }
+    }
+
+    // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
+    this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+
+    this.trimOrphanedToolUse(entries);
+    return entries;
+  }
+
+  /** Get (lazily constructing) the configured picker instance. */
+  protected getAdaptivePicker(): Picker {
+    if (this._adaptivePicker) return this._adaptivePicker;
+    const strategy: FoldingStrategy =
+      this.config.foldingStrategy === 'oldest-first'
+        ? new OldestFirstStrategy()
+        : new FlatProfileStrategy();
+    this._adaptivePicker = new Picker(strategy);
+    return this._adaptivePicker;
+  }
+
+  /**
+   * Walk the summary tree to find the L_k ancestor of a message.
+   * Returns null if no ancestor exists at that level (e.g., L_k not yet produced).
+   */
+  protected findAncestorAt(
+    messageId: MessageId,
+    level: number,
+    chunksByMessageId: ReadonlyMap<MessageId, Chunk>
+  ): SummaryEntry | null {
+    if (level <= 0) return null;
+    const chunk = chunksByMessageId.get(messageId);
+    if (!chunk?.summaryId) return null;
+    let current: SummaryEntry | undefined = this.summaries.find((s) => s.id === chunk.summaryId);
+    while (current && current.level < level) {
+      const parentId = getSummaryParentId(current);
+      if (!parentId) return null;
+      current = this.summaries.find((s) => s.id === parentId);
+    }
+    if (!current || current.level !== level) return null;
+    return current;
+  }
+
+  // ============================================================================
+  // Hierarchical (threshold-driven) path
+  // ============================================================================
 
   /**
    * Select context entries using hierarchical compression with budget carryover.

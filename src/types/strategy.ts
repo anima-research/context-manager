@@ -379,6 +379,39 @@ export interface AutobiographicalConfig {
    * that overflow is rare, and when it does happen you want to know.
    */
   enforceBudget?: boolean;
+
+  // --- Adaptive resolution (per docs/adaptive-resolution-design.md) ---
+
+  /**
+   * Enable picker-driven adaptive resolution. When true, `select()` uses
+   * the FoldingStrategy + Picker to choose per-message resolution under
+   * token-budget pressure rather than the threshold-driven `checkMergeThreshold`
+   * path. Default: false (existing hierarchical behavior preserved).
+   */
+  adaptiveResolution?: boolean;
+
+  /**
+   * Folding strategy name when adaptiveResolution is on. One of:
+   *   'flat-profile' (default) — level-equalizing
+   *   'oldest-first' — chronological
+   * Custom strategies can be plugged in by the host application.
+   */
+  foldingStrategy?: 'flat-profile' | 'oldest-first';
+
+  /**
+   * Slack ratio (hysteresis) for the picker. The picker folds until total
+   * tokens ≤ budget * (1 - slack), and stays quiet while between slack
+   * and budget. Default 0.1.
+   */
+  compressionSlackRatio?: number;
+
+  /**
+   * Enable bottom-up speculative pre-production of higher-level summaries.
+   * When a new L_k summary is produced, if N siblings exist that would share
+   * an L_{k+1} parent, the L_{k+1} is enqueued for production immediately
+   * (no picker request needed). Default true when adaptiveResolution is on.
+   */
+  speculativeProduction?: boolean;
 }
 
 /**
