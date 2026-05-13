@@ -4,6 +4,7 @@
 
 ## Changelog
 
+- **rev 2.2 (2026-05-13)**: Revised bodyGroup rendering. Rev 2 proposed one composite message with inline `[Section summary]` markers for folded portions; rev 2.2 switches to standard Q+A recall pairs interleaved with raw runs. Matches the existing agent experience for summaries. See §3.6.
 - **rev 2.1 (2026-05-12)**: Settled outstanding decisions. Slack default = 10%. Speculative production = bottom-up background pre-producer, default-on. `lockedByAgent` programmatic API set-only in V1, no agent tool. Migration deferred to follow-up PR; V1 validates via re-ingest on fresh chronicles.
 - **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis.
 - **rev 1 (2026-05-12)**: Initial draft.
@@ -175,7 +176,26 @@ Any message whose token count exceeds `chunkThreshold` (default 8K) is split int
 
 **Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, JSON top-level keys), token-bucket fallback (default `chunkSize` = 4K tokens, no overlap). Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
 
-**Rendering**: before emitting to the API, the render path groups consecutive entries with the same `bodyGroupId` and concatenates their bodies into a single API message. The role is the group's role. For shards folded to a non-zero `currentResolution`, the shard's body in the concatenation is replaced by its L_k recall pair. The model sees one user message with a mix of raw and summarized content; there are no turn markers between shards because they're inside one message body.
+**Rendering** (revised — see §3.6.1 for the implemented model):
+- **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message whose body is the byte-faithful concatenation of those shards. The role is the group's role. KV cache preserved across the run.
+- **Folded run** (consecutive shards under the same L_k ancestor) → emitted as a standard Q+A recall pair (one Context Manager question + one summaryParticipant answer carrying the summary text). The same format used for chat summaries elsewhere — consistent agent experience.
+
+A bodyGroup with mixed resolutions therefore renders as multiple alternating entries: raw composite User message → recall pair → raw composite User message → recall pair → … The KV cache breaks at the fold boundaries (where the byte sequence changes anyway), but raw runs between folds stay cache-stable.
+
+This was a deliberate departure from rev 2 of this doc, which proposed one composite message with inline `[Section summary (...)]` markers for folded portions. The Q+A format won out because:
+1. The agent's existing experience of "remembered" content is the Q+A format — using the same format inside docs keeps semantics consistent.
+2. The cache cost is the same: folding already invalidates cache at the fold boundary.
+3. Inline markers were ad-hoc and made the rendered body harder to inspect / parse.
+
+### 3.6.1 BodyGroup rendering algorithm
+
+Within a single bodyGroup, walk shards in source order accumulating "runs":
+- `raw` run = consecutive shards at L0; flushed as one User message with concatenated text.
+- `summary` run = consecutive shards under the same L_k ancestor; flushed as a Q+A pair (deduped: same ancestor never emits twice).
+
+A run breaks (and the previous run flushes) when:
+- the resolution transitions L0 ↔ Lk
+- the L_k ancestor changes
 
 This unifies docs and oversize chat messages: both go through the same chunker, both use `bodyGroupId`, both are foldable at sub-message granularity. The picker doesn't know which is which.
 
