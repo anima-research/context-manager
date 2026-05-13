@@ -1724,8 +1724,98 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
     this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
 
-    this.trimOrphanedToolUse(entries);
-    return entries;
+    // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
+    // Both head and tail emission paths emit shards as separate ContextEntries.
+    // The middle path already merges consecutive same-bodyGroup raw shards into
+    // one composite entry, but head/tail don't. This pass closes that gap so
+    // a sharded message renders as ONE API message regardless of which region
+    // it falls into (preserves KV cache through region transitions).
+    const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
+
+    this.trimOrphanedToolUse(merged);
+    return merged;
+  }
+
+  /**
+   * Walk an entries array; for every run of consecutive entries that
+   *  (a) have sourceRelation: 'copy' (raw, not a synthesized recall pair)
+   *  (b) have sourceMessageId pointing to messages in the same bodyGroup
+   * merge them into one composite entry whose body is the byte-faithful
+   * concatenation of their text content. Other entries pass through.
+   *
+   * Reindexes the returned array.
+   */
+  protected mergeAdjacentBodyGroupRaw(
+    entries: ContextEntry[],
+    store: MessageStoreView
+  ): ContextEntry[] {
+    if (entries.length === 0) return entries;
+
+    // Look up bodyGroupId by sourceMessageId via the message store.
+    const groupOf = (sourceMessageId?: string): string | undefined => {
+      if (!sourceMessageId) return undefined;
+      const m = store.get(sourceMessageId);
+      return m?.bodyGroupId;
+    };
+
+    const out: ContextEntry[] = [];
+    let i = 0;
+    while (i < entries.length) {
+      const entry = entries[i];
+      const groupId = entry.sourceRelation === 'copy' ? groupOf(entry.sourceMessageId) : undefined;
+      if (!groupId) {
+        out.push({ ...entry, index: out.length });
+        i++;
+        continue;
+      }
+      // Collect run of consecutive raw entries with same bodyGroupId.
+      const run: ContextEntry[] = [entry];
+      let j = i + 1;
+      while (
+        j < entries.length &&
+        entries[j].sourceRelation === 'copy' &&
+        groupOf(entries[j].sourceMessageId) === groupId
+      ) {
+        run.push(entries[j]);
+        j++;
+      }
+      if (run.length === 1) {
+        out.push({ ...entry, index: out.length });
+        i++;
+        continue;
+      }
+      // Sort the run by the underlying shardIndex to ensure byte-faithful
+      // ordering. (Head/tail emission keeps chronological order, but defending
+      // against reorderings is cheap.)
+      const sortedRun = [...run].sort((a, b) => {
+        const ma = a.sourceMessageId ? store.get(a.sourceMessageId) : null;
+        const mb = b.sourceMessageId ? store.get(b.sourceMessageId) : null;
+        return (ma?.shardIndex ?? 0) - (mb?.shardIndex ?? 0);
+      });
+      // Build merged text content. Non-text blocks (rare in shards) are
+      // preserved on the first shard's entry only.
+      const mergedTextParts: string[] = [];
+      const nonTextBlocks: ContentBlock[] = [];
+      for (const r of sortedRun) {
+        for (const block of r.content) {
+          if (block.type === 'text') mergedTextParts.push(block.text);
+          else nonTextBlocks.push(block);
+        }
+      }
+      const mergedContent: ContentBlock[] = [
+        ...nonTextBlocks,
+        { type: 'text', text: mergedTextParts.join('') },
+      ];
+      out.push({
+        index: out.length,
+        sourceMessageId: sortedRun[0].sourceMessageId,
+        sourceRelation: 'copy',
+        participant: sortedRun[0].participant,
+        content: mergedContent,
+      });
+      i = j;
+    }
+    return out;
   }
 
   /** Get (lazily constructing) the configured picker instance. */

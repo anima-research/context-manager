@@ -269,6 +269,60 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
+  it('flag on: tail-only bodyGroup renders as ONE composite User message (not N turns)', async () => {
+    const mock = makeMockMembrane();
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 300,
+      recentWindowTokens: 100_000, // big tail so the doc fits entirely in tail
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: mock as any,
+    });
+
+    const paras: string[] = [];
+    for (let p = 0; p < 16; p++) {
+      paras.push(`Section ${p}: ` + 'distinctive-text '.repeat(40));
+    }
+    const bigBody = paras.join('\n\n');
+    manager.addMessage('User', [{ type: 'text', text: bigBody }]);
+
+    const all = manager.getAllMessages();
+    assert.ok(all.length > 1, 'doc should be sharded');
+
+    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 1000 });
+
+    // The doc is entirely in tail. After the post-processing pass in
+    // selectAdaptive, it should render as exactly ONE composite User
+    // message — NOT N separate messages.
+    const userEntries = compiled.messages.filter((m) => m.participant.toLowerCase() === 'user');
+    assert.ok(userEntries.length > 0, 'should have user entries');
+
+    const entriesWithSection0 = userEntries.filter((m) =>
+      m.content
+        .filter((b: any) => b.type === 'text')
+        .some((b: any) => b.text.includes('Section 0:'))
+    );
+    assert.equal(
+      entriesWithSection0.length,
+      1,
+      'Section 0 should appear in exactly one user entry (composite)'
+    );
+    const compositeEntry = entriesWithSection0[0];
+    const compositeText = compositeEntry.content
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('');
+    assert.ok(
+      compositeText.includes('Section 15:'),
+      'composite should also contain the last section (all shards merged)'
+    );
+    assert.equal(compositeText, bigBody, 'composite text should reassemble original body byte-for-byte');
+    manager.close();
+  });
+
   it('flag on: non-text content (e.g., tool_use blocks) is preserved on first shard', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
