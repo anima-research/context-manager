@@ -1252,6 +1252,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries when the queue eventually drains.
    */
   protected checkMergeThreshold(): void {
+    if (this.config.speculativeProduction) {
+      this.checkMergeThresholdRecursive();
+      return;
+    }
+
     const threshold = this.config.mergeThreshold ?? 6;
 
     // IDs that are already part of a queued merge — exclude them from
@@ -1285,6 +1290,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         level: 3,
         sourceIds: toMerge.map(s => s.id),
       });
+    }
+  }
+
+  /**
+   * Bottom-up speculative pre-producer (design doc §3.5 / §7.2).
+   *
+   * Recursive variant of `checkMergeThreshold` for the unbounded L_n
+   * design. Walks every level present in the archive; for any level k
+   * with ≥ N orphans (no parent), enqueues an L_{k+1} merge. After that
+   * L_{k+1} is produced and `executeMerge` calls this again, the recursion
+   * naturally cascades: 6 L1s → 1 L2; 6 L2s → 1 L3; 6 L3s → 1 L4; ...
+   *
+   * Only fires when `config.speculativeProduction` is true. Default true
+   * for adaptiveResolution=true, false otherwise. The non-speculative path
+   * (above) preserves the original L1→L2→L3 behavior for non-adaptive
+   * deployments.
+   */
+  protected checkMergeThresholdRecursive(): void {
+    const threshold = this.config.mergeThreshold ?? 6;
+
+    // Build per-level sets of source-ids already enqueued for merging,
+    // so we don't re-enqueue them while a merge is pending.
+    const queuedSources = new Map<number, Set<string>>();
+    for (const m of this.mergeQueue) {
+      // m.level is the TARGET level; the sources are at level (m.level - 1).
+      const sourceLevel = m.level - 1;
+      if (!queuedSources.has(sourceLevel)) queuedSources.set(sourceLevel, new Set());
+      for (const id of m.sourceIds) queuedSources.get(sourceLevel)!.add(id);
+    }
+
+    // Walk every level present in the archive. Iterate from low to high
+    // so when an L_{k+1} merge is enqueued and immediately produced, this
+    // same check sees the new L_{k+1} on the next call and can roll up.
+    let maxLevel = 0;
+    for (const s of this.summaries) {
+      if (s.level > maxLevel) maxLevel = s.level;
+    }
+    for (let level = 1; level <= maxLevel; level++) {
+      const queued = queuedSources.get(level) ?? new Set();
+      const unmerged = this.summaries.filter(
+        s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
+      );
+      if (unmerged.length >= threshold) {
+        const toMerge = unmerged.slice(0, threshold);
+        this.enqueueMerge({
+          level: level + 1,
+          sourceIds: toMerge.map(s => s.id),
+        });
+      }
     }
   }
 
@@ -1327,18 +1381,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Build message array
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // Higher-level context (anti-redundant)
-    if (targetLevel === 2) {
-      // For L2 merge: show L3 summaries as context
-      const shownL3 = this.summaries.filter(s => s.level === 3 && !s.mergedInto);
-      for (const s of shownL3) {
+    // Higher-level context (anti-redundant).
+    //
+    // For an L_n merge, show any existing L_{n+1} summaries so the LLM
+    // doesn't repeat what's already abstracted at the next level up.
+    // Generalized from the original L2-specific path for unbounded L_n
+    // per the adaptive-resolution design.
+    if (targetLevel >= 2) {
+      const higherLevel = targetLevel + 1;
+      const shownHigher = this.summaries.filter(
+        s => s.level === higherLevel && !getSummaryParentId(s),
+      );
+      for (const s of shownHigher) {
         llmMessages.push({
           participant,
           content: [{ type: 'text', text: s.content }],
         });
       }
     }
-    // For L3 merge: no higher context exists
 
     // The source summaries as agent's own memories
     for (const source of sources) {
