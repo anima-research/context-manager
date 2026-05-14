@@ -84,15 +84,32 @@ function formatDocChunkInstruction(
   );
 }
 
-/** Merge instruction for L2/L3+ consolidation. */
-function formatMergeInstruction(n: number, targetTokens: number): string {
+/**
+ * Merge instruction for L2/L3+ consolidation.
+ *
+ * The model has just been shown content ONE LEVEL DEEPER than its
+ * sources: raw messages for an L2 merge (sources are L1s), L1 memories
+ * for an L3 merge (sources are L2s), etc. The instruction describes
+ * the content the model just saw and asks for a consolidation at
+ * `targetLevel`.
+ */
+function formatMergeInstruction(
+  targetLevel: number,
+  sourceLevelShown: number,
+  targetTokens: number,
+): string {
+  const seenDescription =
+    sourceLevelShown === 0
+      ? 'the slices of recent experience above (raw conversation)'
+      : `the L${sourceLevelShown} memories above`;
   return (
-    `You are consolidating ${n} earlier memories into a single higher-level ` +
-    'memory. The memories below are in chronological order. Write a new ' +
-    'memory that preserves the through-line: what happened, what was ' +
-    'decided, what remains open, what concrete details future you will ' +
-    `want to reach for. Speak in the first person. Target ~${targetTokens} ` +
-    'tokens. Output only the memory body.'
+    `You have just reviewed ${seenDescription}, in chronological order. ` +
+    `They cover the stretch of experience you are about to consolidate into a ` +
+    `single L${targetLevel} memory. Write a memory that preserves the ` +
+    `through-line: what happened, what was decided, what remains open, what ` +
+    `concrete details future you will want to reach for. Speak in the first ` +
+    `person. Target ~${targetTokens} tokens. Output only the memory body — ` +
+    `no preamble, no meta-commentary about summarizing.`
   );
 }
 
@@ -1489,28 +1506,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
 
-    // Build the merge prompt per hermes-autobio spec:
+    // Build the merge prompt with one-level-deeper target expansion +
+    // prefix of older context:
     //
-    // Each source memory is narrativized as a CM-asks / agent-recalls
-    // pair — the header (CM voice, user role) sets up which memory is
-    // being recalled, the body (agent voice, assistant role) is the
-    // first-person content. This honors two invariants:
-    //   - Bodies are the agent's autobiographical recall — putting them
-    //     under user role would tell the model "the user told me X
-    //     happened" rather than "I remember X."
-    //   - Headers ("[CM] Recall memory N/M (id)") are CM-voiced labels,
-    //     not produced by the LLM — assistant role would falsely
-    //     attribute synthetic metadata to the agent.
+    //   1. PREFIX — head messages + prior L1 recall pairs for content
+    //      that comes chronologically BEFORE the merge range. "Fill
+    //      lower orbitals first" per the spec: regardless of how
+    //      compressed the live view is, the summarizer always gets L1
+    //      fidelity for prior content. Older L2/L3 markers exist for
+    //      live-view compactness, not for the summarizer.
+    //
+    //   2. TARGET — the sources expanded ONE LEVEL DEEPER than they
+    //      themselves are. For L2 merge (sources at L1): expand to
+    //      raw L0 messages — the model sees the actual conversation
+    //      that the 6 L1s consolidate. For L3 merge (sources at L2):
+    //      expand to the L1s under each L2 (36 L1s as recall pairs).
+    //      For L_n merge (sources at L_{n-1}): expand to L_{n-2}.
+    //      This gives the model substantively more content to ground
+    //      the consolidation in than just the 6 surface summaries.
+    //
+    //   3. INSTRUCTION — "consolidate N memories preserving the
+    //      through-line, in first person".
+    //
+    // No tail-after-merge: same as-of principle as L1 compression. The
+    // consolidation is being formed at the moment the last source was
+    // ready, so nothing after that is visible.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    for (let i = 0; i < sources.length; i++) {
-      const s = sources[i];
+    // Build lookup maps
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const allMessages = ctx.messageStore.getAll();
+    const messageById = new Map<MessageId, typeof allMessages[number]>();
+    for (const m of allMessages) messageById.set(m.id, m);
+
+    // Compute every leaf message id covered by this merge's lineage —
+    // these are part of the TARGET and must not also appear in the
+    // PREFIX as head content.
+    const sourceLeafIds = new Set<MessageId>();
+    const collectLeaves = (s: SummaryEntry): void => {
+      if (s.sourceLevel === 0) {
+        for (const id of s.sourceIds) sourceLeafIds.add(id);
+      } else {
+        for (const childId of s.sourceIds) {
+          const child = summariesById.get(childId);
+          if (child) collectLeaves(child);
+        }
+      }
+    };
+    for (const src of sources) collectLeaves(src);
+
+    // Find the start of the merge range in the message store.
+    const mergeFirstMsgId = sources[0].sourceRange.first;
+    const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
+
+    // ---- 1. PREFIX: prior L1 recall pairs (chronologically before merge range) ----
+    // L1s whose entire source range is before the merge range and that
+    // aren't part of the merge tree. Sort by source position.
+    const priorL1s = this.summaries
+      .filter((s) => s.level === 1)
+      .filter((s) => {
+        // Exclude any L1 that's an ancestor of our merge target
+        for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
+        // Include only if it starts strictly before the merge range
+        const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
+        return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
+      })
+      .sort((a, b) => {
+        const ai = allMessages.findIndex((m) => m.id === a.sourceRange.first);
+        const bi = allMessages.findIndex((m) => m.id === b.sourceRange.first);
+        return ai - bi;
+      });
+
+    const priorL1MessageIds = new Set<MessageId>();
+    for (const s of priorL1s) {
+      for (const id of s.sourceIds) priorL1MessageIds.add(id);
+    }
+
+    for (const s of priorL1s) {
       llmMessages.push({
         participant: 'Context Manager',
-        content: [{
-          type: 'text',
-          text: `[CM] Recall memory ${i + 1}/${sources.length} (${s.id}).`,
-        }],
+        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
       llmMessages.push({
         participant,
@@ -1518,12 +1594,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // Consolidation instruction
+    // Head raw messages: before merge range, not in any prior L1, not
+    // part of the merge target tree.
+    if (mergeStartIdx >= 0) {
+      for (let i = 0; i < mergeStartIdx; i++) {
+        const m = allMessages[i];
+        if (priorL1MessageIds.has(m.id)) continue;
+        if (sourceLeafIds.has(m.id)) continue;
+        llmMessages.push({ participant: m.participant, content: m.content });
+      }
+    }
+
+    // ---- 2. TARGET: expand sources one level deeper ----
+    // For L2 (sources at L1, sourceLevel=0): expand to raw L0 messages.
+    // For L3+ (sources at L_{n-1}, sourceLevel=n-2): expand to L_{n-2}
+    //   summaries as recall pairs.
+    for (const src of sources) {
+      if (src.sourceLevel === 0) {
+        // Source is an L1; its sourceIds are raw message ids. Emit them raw.
+        for (const messageId of src.sourceIds) {
+          const m = messageById.get(messageId);
+          if (m) {
+            llmMessages.push({ participant: m.participant, content: m.content });
+          }
+        }
+      } else {
+        // Source is L2+; its sourceIds point to summaries one level
+        // below. Emit each as a recall pair.
+        for (const childId of src.sourceIds) {
+          const child = summariesById.get(childId);
+          if (!child) continue;
+          llmMessages.push({
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
+          });
+          llmMessages.push({
+            participant,
+            content: [{ type: 'text', text: child.content }],
+          });
+        }
+      }
+    }
+
+    // ---- 3. INSTRUCTION ----
+    // sourceLevelShown is the level of content the model actually sees
+    // (one level below the sources themselves).
+    const sourceLevelShown =
+      sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
         type: 'text',
-        text: formatMergeInstruction(sources.length, targetTokens),
+        text: formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens),
       }],
     });
 
