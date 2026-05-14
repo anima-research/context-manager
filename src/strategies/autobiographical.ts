@@ -127,7 +127,7 @@ function formatReadingChunkInstruction(
 }
 
 /**
- * Merge instruction for L2/L3+ consolidation.
+ * Merge instruction for L2/L3+ consolidation (conversation/general case).
  *
  * The model has just been shown content ONE LEVEL DEEPER than its
  * sources: raw messages for an L2 merge (sources are L1s), L1 memories
@@ -152,6 +152,45 @@ function formatMergeInstruction(
     `concrete details future you will want to reach for. Speak in the first ` +
     `person. Target ~${targetTokens} tokens. Output only the memory body — ` +
     `no preamble, no meta-commentary about summarizing.`
+  );
+}
+
+/**
+ * Reading-mode merge instruction. Used when the merge's leaf messages
+ * are all part of a substantially-larger sharded message — i.e., the
+ * agent has been reading a doc/long-message rather than conversing.
+ *
+ * Analogous to formatReadingChunkInstruction: avoids forcing a
+ * "document" or "message" frame, asks what reading the stretch was
+ * like and what was understood. Forces the agent's vantage point —
+ * only the reader can describe what reading was like — and so prevents
+ * the drift into the content author's voice that happens when the
+ * instruction asks for an impersonal summary.
+ */
+function formatReadingMergeInstruction(
+  targetLevel: number,
+  sourceLevelShown: number,
+  totalTokens: number,
+  targetTokens: number,
+): string {
+  const seenDescription =
+    sourceLevelShown === 0
+      ? 'the portions of text you read above (raw passages from a larger piece)'
+      : `your earlier L${sourceLevelShown} reflections above on portions you read`;
+  return (
+    `You have just re-experienced ${seenDescription}, in chronological order. ` +
+    `They cover a contiguous stretch of a substantial body of text you have ` +
+    `been reading — approximately ${totalTokens} tokens in total across all ` +
+    `of it. The portions above cover the stretch you are now consolidating ` +
+    `at L${targetLevel}.\n\n` +
+    `Reflect across the stretch: what was it like, reading these portions ` +
+    `together? What did you come to understand that you couldn't have from ` +
+    `any single portion alone? What recurring patterns, frameworks, or ` +
+    `concerns emerged? Be substantive — name the specific claims, people, ` +
+    `dates, and phrases that defined this stretch of your reading.\n\n` +
+    `Speak in your own voice as the one who read these portions. Target ` +
+    `~${targetTokens} tokens. Output only the body of your consolidation — ` +
+    `no preamble.`
   );
 }
 
@@ -1775,11 +1814,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (one level below the sources themselves).
     const sourceLevelShown =
       sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
+
+    // Reading-mode detection: when ALL the merge's leaf messages are
+    // shards of the same bodyGroup, we know the agent was reading a
+    // substantially larger message rather than conversing. The
+    // reading-mode merge instruction asks what reading the stretch was
+    // like instead of asking for an impersonal consolidation, which
+    // forces the agent's vantage point and prevents drift into the
+    // content author's voice. Same principle as the L1 case.
+    let mergeReadingContext: { totalTokens: number } | null = null;
+    if (sourceLeafIds.size > 0) {
+      const leafBodyGroupIds = new Set<string | undefined>();
+      for (const leafId of sourceLeafIds) {
+        const m = messageById.get(leafId);
+        leafBodyGroupIds.add(m?.bodyGroupId);
+      }
+      if (leafBodyGroupIds.size === 1) {
+        const groupId = [...leafBodyGroupIds][0];
+        if (groupId) {
+          let totalTokens = 0;
+          for (const m of allMessages) {
+            if (m.bodyGroupId === groupId) {
+              totalTokens += ctx.messageStore.estimateTokens(m);
+            }
+          }
+          mergeReadingContext = { totalTokens };
+        }
+      }
+    }
+    const mergeInstructionText = mergeReadingContext
+      ? formatReadingMergeInstruction(
+          targetLevel,
+          sourceLevelShown,
+          mergeReadingContext.totalTokens,
+          targetTokens,
+        )
+      : formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
         type: 'text',
-        text: formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens),
+        text: mergeInstructionText,
       }],
     });
 
