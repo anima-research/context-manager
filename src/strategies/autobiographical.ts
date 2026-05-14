@@ -89,27 +89,40 @@ function formatInstruction(targetTokens: number): string {
   );
 }
 
-/** Compression instruction for doc-shard chunks (bodyGroup-aware). */
-function formatDocChunkInstruction(
-  doc: { title: string; style: string; originalTokens: number },
+/**
+ * Compression instruction for chunks that are part of a substantially larger
+ * message (≥ 2× the chunk's own token size).
+ *
+ * Avoids forcing a "document" or "message" frame — just describes the
+ * experience: the agent has been reading a substantial piece of text, of
+ * which the slice is a portion. Asks what reading was like and what was
+ * learned. This naturally elicits first-person agent voice ("I read…", "I
+ * learned…", "I noticed…") and preserves concrete content via the
+ * "specific claims, names, dates" guidance.
+ *
+ * Rationale: when chunks are shards of a much larger user-shared message,
+ * the chunk content is heavily first-person from someone other than the
+ * agent. Asking "form a memory of what this contained" lets the model
+ * adopt the dominant voice of the chunk content. Asking "what was reading
+ * this like, what did you learn" forces the model to reflect from its own
+ * vantage point — only the agent can describe what reading something was
+ * like from its own perspective.
+ */
+function formatReadingChunkInstruction(
+  totalTokens: number,
   targetTokens: number,
 ): string {
   return (
-    `You just read a slice of document "${doc.title}" (${doc.style}, approximately ` +
-    `${doc.originalTokens} tokens total in the full document). Earlier slices ` +
-    'of this same document are in your memory above as L1s — they are in ' +
-    'chronological order within the document. What comes after this slice ' +
-    'you have NOT yet read; treat yourself as reading the document in ' +
-    'order, not yet knowing what lies ahead.\n\n' +
-    'Write the memory of what this slice contained. Preserve concrete ' +
-    'detail aggressively:\n' +
-    '- Timestamps, dates, IDs, numeric values, quoted phrases\n' +
-    '- Key events, decisions, contradictions with earlier slices\n' +
-    '- Structural markers (section titles, entry boundaries) that help ' +
-    'you locate this slice within the whole later\n\n' +
-    `Speak in the first person. Target ~${targetTokens} tokens. Output ` +
-    'only the memory body — no preamble, no meta-commentary about ' +
-    'summarizing.'
+    `You have just been reading a substantial body of text — approximately ` +
+    `${totalTokens} tokens total in this piece, of which what you just read ` +
+    `is a portion. Earlier portions are in your memory above as your prior ` +
+    `reflections; what comes after, you have not yet read.\n\n` +
+    `Reflect on this reading: what was it like? What did you learn? What ` +
+    `stood out? Be substantive — name the specific claims, frameworks, ` +
+    `people, dates, and phrases that struck you. What is now in your ` +
+    `understanding that wasn't before you read this portion?\n\n` +
+    `Speak in your own voice as the one reading. Target ~${targetTokens} ` +
+    `tokens. Output only the body of your reflection — no preamble.`
   );
 }
 
@@ -1369,10 +1382,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       llmMessages.push({ participant: m.participant, content: m.content });
     }
 
-    // ---- 5. Instruction (doc-aware) ----
+    // ---- 5. Instruction (reading-mode aware) ----
+    //
+    // When the chunk is a portion of a substantially larger sharded message
+    // (≥ 2× chunk size), use the reading-mode instruction. It avoids the
+    // "form a memory of what this contained" framing — which, for content
+    // heavily first-person from someone other than the agent (a user-shared
+    // doc), leads the model to adopt the content author's voice. Instead,
+    // it asks what reading was like and what was learned, forcing the
+    // model to reflect from its own vantage point in agent-first-person.
     const docContext = this.detectDocContext(chunk, ctx);
     const instructionText = docContext
-      ? formatDocChunkInstruction(docContext, targetTokens)
+      ? formatReadingChunkInstruction(docContext.totalTokens, targetTokens)
       : formatInstruction(targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
@@ -2692,15 +2713,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * If the chunk's messages are all shards of the same bodyGroup, return
-   * doc-context metadata for the spec's DOC_CHUNK instruction (which
-   * explicitly tells the model "earlier slices are in your memory; later
-   * slices unread"). Returns null otherwise.
+   * If the chunk is part of a substantially larger sharded message (total
+   * bodyGroup tokens ≥ 2× the chunk's own tokens), return reading-context
+   * metadata for the reading instruction. The 2× threshold means the
+   * chunk represents a portion of something significantly larger — the
+   * agent is reading, not conversing.
+   *
+   * Returns null when the chunk is a whole message (no bodyGroup), or
+   * when bodyGroup total is < 2× chunk size (degenerate case — chunk
+   * effectively IS the whole message). In those cases the standard
+   * (non-reading) instruction is appropriate.
    */
   protected detectDocContext(
     chunk: Chunk,
     ctx: StrategyContext,
-  ): { title: string; style: string; originalTokens: number } | null {
+  ): { totalTokens: number; chunkTokens: number } | null {
     if (chunk.messages.length === 0) return null;
     const firstGroupId = chunk.messages[0].bodyGroupId;
     if (!firstGroupId) return null;
@@ -2708,25 +2735,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const m of chunk.messages) {
       if (m.bodyGroupId !== firstGroupId) return null;
     }
-    // Count total shards in this bodyGroup across the whole store and
-    // sum their tokens — gives the model an "approximately N tokens
-    // total in the full document" anchor.
+    // Total tokens of the original message (sum of all shards in the bodyGroup).
     const allMessages = ctx.messageStore.getAll();
-    let originalTokens = 0;
+    let totalTokens = 0;
     for (const m of allMessages) {
       if (m.bodyGroupId === firstGroupId) {
-        originalTokens += ctx.messageStore.estimateTokens(m);
+        totalTokens += ctx.messageStore.estimateTokens(m);
       }
     }
-    // Title: use the first message's sourceId from metadata if available,
-    // else a short prefix of the bodyGroupId for uniqueness.
-    const title =
-      (chunk.messages[0].metadata?.sourceId as string | undefined) ??
-      `doc-${firstGroupId.slice(0, 16)}`;
+    // Tokens in this chunk specifically.
+    let chunkTokens = 0;
+    for (const m of chunk.messages) {
+      chunkTokens += ctx.messageStore.estimateTokens(m);
+    }
+    // Reading-mode threshold: the original message must be substantially
+    // larger than this chunk. 2× means the chunk is at most half of the
+    // whole — clearly a portion of something bigger.
+    if (chunkTokens === 0 || totalTokens < 2 * chunkTokens) return null;
     return {
-      title,
-      style: 'chronological',
-      originalTokens,
+      totalTokens,
+      chunkTokens,
     };
   }
 
