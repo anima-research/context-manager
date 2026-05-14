@@ -20,6 +20,8 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
@@ -47,16 +49,10 @@ import type { IngressChunkResult } from '../types/strategy.js';
 function logCompressionCall(entry: Record<string, unknown>): void {
   const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
   if (!logPath) return;
-  // Defer fs imports so this module stays usable in environments that
-  // don't expose fs (e.g. browser builds — unlikely here but cheap).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const fs = require('node:fs') as typeof import('node:fs');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const path = require('node:path') as typeof import('node:path');
   try {
-    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    mkdirSync(dirname(logPath), { recursive: true });
     const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
-    fs.appendFileSync(logPath, line);
+    appendFileSync(logPath, line);
   } catch (err) {
     console.warn('compression log write failed:', err);
   }
