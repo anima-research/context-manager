@@ -34,6 +34,35 @@ import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
 /**
+ * Append a JSONL entry describing one compression LLM call to the path
+ * given by `CONTEXT_MANAGER_COMPRESSION_LOG`. No-op if the env var isn't
+ * set. Called at every L1 and merge LLM-call site so we can audit the
+ * exact prompts and responses post-hoc — no reconstruction, no
+ * assumption about whether the strategy code matches what produced
+ * historical summaries.
+ *
+ * Failures to write are logged to stderr but don't propagate — logging
+ * is non-essential observability and should never break compression.
+ */
+function logCompressionCall(entry: Record<string, unknown>): void {
+  const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  if (!logPath) return;
+  // Defer fs imports so this module stays usable in environments that
+  // don't expose fs (e.g. browser builds — unlikely here but cheap).
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require('node:fs') as typeof import('node:fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const path = require('node:path') as typeof import('node:path');
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
+    fs.appendFileSync(logPath, line);
+  } catch (err) {
+    console.warn('compression log write failed:', err);
+  }
+}
+
+/**
  * In-band marker shown to the summarizer just before the chunk it's
  * about to memorize. Primes attention without disrupting KV state —
  * the agent has seen this exact wording before every prior compression
@@ -1326,14 +1355,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Collapse consecutive same-participant messages for API compliance
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
+    const systemPrompt =
+      'You are forming autobiographical memories of an ongoing conversation. ' +
+      'Speak in the first person from your own perspective; the messages above ' +
+      'are your actual experience and prior recollections.';
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are forming autobiographical memories of an ongoing conversation. Speak in the first person from your own perspective; the messages above are your actual experience and prior recollections.',
+      system: systemPrompt,
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
       },
     };
+
+    const callStart = Date.now();
+    let logResponse: string | undefined;
+    let logError: string | undefined;
+    let logSummaryId: string | undefined;
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
@@ -1341,6 +1379,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      logResponse = summaryText;
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
@@ -1362,11 +1401,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunk.compressed = true;
       chunk.summaryId = entry.id;
       this._compressionCount++;
+      logSummaryId = entry.id;
 
       this.checkMergeThreshold();
     } catch (error) {
       console.error('Failed to compress chunk (hierarchical):', error);
+      logError = error instanceof Error ? error.message : String(error);
       throw error;
+    } finally {
+      logCompressionCall({
+        operation: 'compress_l1',
+        system: systemPrompt,
+        messages: collapsed.map((m) => ({
+          participant: m.participant,
+          // Flatten content for logging — store text only; binary content
+          // would bloat the log and isn't typical in compression input.
+          text: m.content
+            .filter((b: ContentBlock) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join(''),
+        })),
+        metadata: {
+          chunk_message_ids: chunk.messages.map((m) => m.id),
+          chunk_size: chunk.messages.length,
+          prior_l1_count: priorL1s.length,
+          has_doc_context: docContext !== null,
+          doc_context: docContext,
+          target_tokens: targetTokens,
+          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          latency_ms: Date.now() - callStart,
+          summary_id: logSummaryId,
+        },
+        response: logResponse,
+        error: logError,
+      });
     }
   }
 
@@ -1651,14 +1719,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
+    const systemPrompt =
+      'You are consolidating prior autobiographical memories. Speak in the ' +
+      'first person; the memories above are your own.';
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are consolidating prior autobiographical memories. Speak in the first person; the memories above are your own.',
+      system: systemPrompt,
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
       },
     };
+
+    const callStart = Date.now();
+    let logResponse: string | undefined;
+    let logError: string | undefined;
+    let logNewSummaryId: string | undefined;
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
@@ -1666,6 +1742,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      logResponse = mergedText;
 
       // Compute source range from constituent summaries
       const sourceRange = {
@@ -1684,6 +1761,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceRange,
         created: Date.now(),
       };
+      logNewSummaryId = newEntry.id;
 
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
@@ -1700,7 +1778,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
     } catch (error) {
       console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+      logError = error instanceof Error ? error.message : String(error);
       throw error;
+    } finally {
+      logCompressionCall({
+        operation: `merge_l${targetLevel}`,
+        system: systemPrompt,
+        messages: collapsed.map((m) => ({
+          participant: m.participant,
+          text: m.content
+            .filter((b: ContentBlock) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join(''),
+        })),
+        metadata: {
+          target_level: targetLevel,
+          source_ids: sourceIds,
+          source_level: sources[0]?.level ?? null,
+          source_level_shown: sourceLevelShown,
+          target_tokens: targetTokens,
+          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          latency_ms: Date.now() - callStart,
+          summary_id: logNewSummaryId,
+        },
+        response: logResponse,
+        error: logError,
+      });
     }
   }
 
