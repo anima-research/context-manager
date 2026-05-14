@@ -1313,21 +1313,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // ---- 2. Head messages (raw, not covered by prior L1s) ----
-    const priorL1MessageIds = new Set<string>();
-    for (const s of priorL1s) {
-      for (const id of s.sourceIds) priorL1MessageIds.add(id);
+    // ---- 2. Head window (raw, ALWAYS present) ----
+    //
+    // The head is the foundational identity anchor: the actual opening
+    // of the chronicle (the user's first message, the agent's first
+    // reply, the system context if any). It establishes WHO is speaking
+    // to WHOM. Without it, when the chunk content is heavily first-person
+    // from someone other than the agent (e.g., a user-shared document),
+    // the agent loses its first-person grounding and drifts into the
+    // content author's voice.
+    //
+    // The head is the configured head window — not "everything before
+    // the chunk." For doc-heavy chronicles, "everything before" would
+    // be hundreds of thousands of tokens; the recall pairs already
+    // represent that intermediate content. The head is just the
+    // permanent prefix that the original instance always saw.
+    //
+    // Head messages are excluded from compression by `getCompressibleMessages`
+    // (they're outside the chunking range), so they won't appear in
+    // any L1's sourceIds — no overlap with the recall pairs above.
+    const allMessages = ctx.messageStore.getAll();
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      llmMessages.push({ participant: m.participant, content: m.content });
     }
+
+    // Any raw messages between the head and the chunk that aren't yet
+    // represented by an L1 — usually empty in adaptive-resolution mode,
+    // since chunking proceeds contiguously and L1s exist for everything
+    // up to the chunk being processed.
     const chunkFirstId = chunk.messages[0]?.id;
     if (chunkFirstId) {
-      const allMessages = ctx.messageStore.getAll();
+      const priorL1MessageIds = new Set<string>();
+      for (const s of priorL1s) {
+        for (const id of s.sourceIds) priorL1MessageIds.add(id);
+      }
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
-      if (chunkStartIdx > 0) {
-        for (let i = 0; i < chunkStartIdx; i++) {
-          const m = allMessages[i];
-          if (priorL1MessageIds.has(m.id)) continue;
-          llmMessages.push({ participant: m.participant, content: m.content });
-        }
+      for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
+        const m = allMessages[i];
+        if (priorL1MessageIds.has(m.id)) continue;
+        llmMessages.push({ participant: m.participant, content: m.content });
       }
     }
 
@@ -1355,13 +1382,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Collapse consecutive same-participant messages for API compliance
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
-    const systemPrompt =
-      'You are forming autobiographical memories of an ongoing conversation. ' +
-      'Speak in the first person from your own perspective; the messages above ' +
-      'are your actual experience and prior recollections.';
+    // NO system prompt. The agent's identity is established by the head
+    // (the actual conversation opening — user message + agent reply that
+    // grounded the original instance). A system prompt would (a) add a
+    // synthetic header the original instance never saw, disturbing KV
+    // consistency between the summarizer and the original instance, and
+    // (b) provide an alternative identity source that competes with the
+    // structural one carried by the conversation itself. Anchoring
+    // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: systemPrompt,
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -1411,7 +1441,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       logCompressionCall({
         operation: 'compress_l1',
-        system: systemPrompt,
+        system: null,
         messages: collapsed.map((m) => ({
           participant: m.participant,
           // Flatten content for logging — store text only; binary content
@@ -1628,7 +1658,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mergeFirstMsgId = sources[0].sourceRange.first;
     const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
 
-    // ---- 1. PREFIX: prior L1 recall pairs (chronologically before merge range) ----
+    // ---- 1a. HEAD WINDOW (raw, ALWAYS present) ----
+    //
+    // The head window is the foundational identity anchor — the actual
+    // opening of the chronicle. It establishes who is speaking to whom.
+    // Without it, when the merge target's content is heavily first-person
+    // from someone other than the agent, the agent loses its first-person
+    // grounding and drifts into the content author's voice.
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // ---- 1b. PRIOR L1 RECALL PAIRS (chronologically before merge range) ----
     // L1s whose entire source range is before the merge range and that
     // aren't part of the merge tree. Sort by source position.
     const priorL1s = this.summaries
@@ -1662,10 +1706,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // Head raw messages: before merge range, not in any prior L1, not
-    // part of the merge target tree.
+    // Raw middle: any messages between the head window and the merge
+    // range that aren't covered by a prior L1 or the merge tree.
+    // Usually empty (chunking is contiguous).
     if (mergeStartIdx >= 0) {
-      for (let i = 0; i < mergeStartIdx; i++) {
+      for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
         if (priorL1MessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
@@ -1719,12 +1764,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
-    const systemPrompt =
-      'You are consolidating prior autobiographical memories. Speak in the ' +
-      'first person; the memories above are your own.';
+    // NO system prompt — identity is established by the head window
+    // (present at the start of llmMessages above) and by the prior
+    // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: systemPrompt,
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -1783,7 +1827,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
-        system: systemPrompt,
+        system: null,
         messages: collapsed.map((m) => ({
           participant: m.participant,
           text: m.content

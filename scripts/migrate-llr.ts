@@ -189,6 +189,13 @@ async function main() {
     adaptiveResolution: true,
     targetChunkTokens: 3000,
     recentWindowTokens: 30000,
+    // Preserve the chronicle's actual opening as the head window. Even
+    // a small head (the user's first turn + agent's first reply) is
+    // the identity anchor that prevents the summarizer from drifting
+    // into the voice of whoever wrote the document above. ~200 tokens
+    // covers a typical chat opener + 1-2 short doc-preamble messages
+    // without spilling into the doc itself.
+    headWindowTokens: 200,
     mergeThreshold: 6,
     compressionSlackRatio: 0.1,
     ...(real && compressionModel ? { compressionModel } : {}),
