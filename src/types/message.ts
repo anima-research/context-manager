@@ -47,6 +47,40 @@ export interface StoredMessage {
   timestamp: Date;
   /** IDs of messages that caused this one (from Chronicle causation) */
   causedBy?: MessageId[];
+
+  /**
+   * If this message is a shard of a larger logical message (chunked at
+   * ingestion because it exceeded `chunkThreshold`), this is the stable
+   * group id shared with sibling shards. Shards with the same id are
+   * concatenated into one API message at render time. Null/undefined
+   * for messages that fit in a single chunk. See
+   * `docs/adaptive-resolution-design.md` §3.6.
+   */
+  bodyGroupId?: string;
+
+  /**
+   * The shard's order within its bodyGroup, starting at 0. Only meaningful
+   * when `bodyGroupId` is set. Used to reassemble shards into byte-faithful
+   * order at render time.
+   */
+  shardIndex?: number;
+
+  /**
+   * Current display resolution for this chunk:
+   *  - 0  = render raw content
+   *  - k>0 = render the L_k summary that covers this chunk
+   *
+   * Set by the picker (or the agent in V2). Default 0. See
+   * `docs/adaptive-resolution-design.md` §3.3.
+   */
+  currentResolution?: number;
+
+  /**
+   * If true, the picker must not change `currentResolution` for this chunk.
+   * Set by `lockChunk()` (programmatic API) or, in V2, by the agent's
+   * `unfold` tool. Default false.
+   */
+  lockedByAgent?: boolean;
 }
 
 /**
@@ -85,6 +119,15 @@ export interface StoredMessageInternal {
   metadata?: MessageMetadata;
   timestamp: number; // Unix timestamp for storage
   causedBy?: MessageId[];
+
+  /** See StoredMessage.bodyGroupId */
+  bodyGroupId?: string;
+  /** See StoredMessage.shardIndex */
+  shardIndex?: number;
+  /** See StoredMessage.currentResolution */
+  currentResolution?: number;
+  /** See StoredMessage.lockedByAgent */
+  lockedByAgent?: boolean;
 }
 
 /**

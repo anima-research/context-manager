@@ -19,6 +19,177 @@ import type {
   SearchResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
+import { getSummaryParentId } from '../types/strategy.js';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
+import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
+import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
+import type {
+  FoldingStrategy,
+  FoldingBudget,
+  FoldOp,
+  ChunkId,
+  SummaryId,
+} from '../adaptive/folding-strategy.js';
+import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
+import type { MessageId } from '../types/message.js';
+import type { IngressChunkResult } from '../types/strategy.js';
+
+/**
+ * Append a JSONL entry describing one compression LLM call to the path
+ * given by `CONTEXT_MANAGER_COMPRESSION_LOG`. No-op if the env var isn't
+ * set. Called at every L1 and merge LLM-call site so we can audit the
+ * exact prompts and responses post-hoc — no reconstruction, no
+ * assumption about whether the strategy code matches what produced
+ * historical summaries.
+ *
+ * Failures to write are logged to stderr but don't propagate — logging
+ * is non-essential observability and should never break compression.
+ */
+function logCompressionCall(entry: Record<string, unknown>): void {
+  const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  if (!logPath) return;
+  try {
+    mkdirSync(dirname(logPath), { recursive: true });
+    const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
+    appendFileSync(logPath, line);
+  } catch (err) {
+    console.warn('compression log write failed:', err);
+  }
+}
+
+/**
+ * In-band marker shown to the summarizer just before the chunk it's
+ * about to memorize. Primes attention without disrupting KV state —
+ * the agent has seen this exact wording before every prior compression
+ * in its history, so the model treats memory formation as a recurring
+ * narrated event rather than a fresh instruction each time.
+ *
+ * Wording matches `hermes-autobio/plugins/autobio/compression.py`
+ * `_MARKER` so the in-band primer is consistent across the codebase.
+ */
+const COMPRESSION_MARKER =
+  'System: You will soon form a new memory, get ready. ' +
+  'The messages that follow are the slice of recent experience you are ' +
+  'about to compress. After them, write the memory in your own voice.';
+
+/** Standard compression instruction for chat/general chunks. */
+function formatInstruction(targetTokens: number): string {
+  return (
+    'Write the memory of events since the most recent memory system ' +
+    'notification. Speak in the first person from your own perspective. ' +
+    'Preserve concrete details — file paths, exact values, decisions, ' +
+    `unresolved questions, the user\'s active asks. Target ~${targetTokens} ` +
+    'tokens. Output only the memory body — no preamble, no section headers ' +
+    'unless they help preservation, no meta-commentary about summarizing.'
+  );
+}
+
+/**
+ * Compression instruction for chunks that are part of a substantially larger
+ * message (≥ 2× the chunk's own token size).
+ *
+ * Avoids forcing a "document" or "message" frame — just describes the
+ * experience: the agent has been reading a substantial piece of text, of
+ * which the slice is a portion. Asks what reading was like and what was
+ * learned. This naturally elicits first-person agent voice ("I read…", "I
+ * learned…", "I noticed…") and preserves concrete content via the
+ * "specific claims, names, dates" guidance.
+ *
+ * Rationale: when chunks are shards of a much larger user-shared message,
+ * the chunk content is heavily first-person from someone other than the
+ * agent. Asking "form a memory of what this contained" lets the model
+ * adopt the dominant voice of the chunk content. Asking "what was reading
+ * this like, what did you learn" forces the model to reflect from its own
+ * vantage point — only the agent can describe what reading something was
+ * like from its own perspective.
+ */
+function formatReadingChunkInstruction(
+  totalTokens: number,
+  targetTokens: number,
+): string {
+  return (
+    `You have just been reading a substantial body of text — approximately ` +
+    `${totalTokens} tokens total in this piece, of which what you just read ` +
+    `is a portion. Earlier portions are in your memory above as your prior ` +
+    `reflections; what comes after, you have not yet read.\n\n` +
+    `Reflect on this reading: what was it like? What did you learn? What ` +
+    `stood out? Be substantive — name the specific claims, frameworks, ` +
+    `people, dates, and phrases that struck you. What is now in your ` +
+    `understanding that wasn't before you read this portion?\n\n` +
+    `Speak in your own voice as the one reading. Target ~${targetTokens} ` +
+    `tokens. Output only the body of your reflection — no preamble.`
+  );
+}
+
+/**
+ * Merge instruction for L2/L3+ consolidation (conversation/general case).
+ *
+ * The model has just been shown content ONE LEVEL DEEPER than its
+ * sources: raw messages for an L2 merge (sources are L1s), L1 memories
+ * for an L3 merge (sources are L2s), etc. The instruction describes
+ * the content the model just saw and asks for a consolidation at
+ * `targetLevel`.
+ */
+function formatMergeInstruction(
+  targetLevel: number,
+  sourceLevelShown: number,
+  targetTokens: number,
+): string {
+  const seenDescription =
+    sourceLevelShown === 0
+      ? 'the slices of recent experience above (raw conversation)'
+      : `the L${sourceLevelShown} memories above`;
+  return (
+    `You have just reviewed ${seenDescription}, in chronological order. ` +
+    `They cover the stretch of experience you are about to consolidate into a ` +
+    `single L${targetLevel} memory. Write a memory that preserves the ` +
+    `through-line: what happened, what was decided, what remains open, what ` +
+    `concrete details future you will want to reach for. Speak in the first ` +
+    `person. Target ~${targetTokens} tokens. Output only the memory body — ` +
+    `no preamble, no meta-commentary about summarizing.`
+  );
+}
+
+/**
+ * Reading-mode merge instruction. Used when the merge's leaf messages
+ * are all part of a substantially-larger sharded message — i.e., the
+ * agent has been reading a doc/long-message rather than conversing.
+ *
+ * Analogous to formatReadingChunkInstruction: avoids forcing a
+ * "document" or "message" frame, asks what reading the stretch was
+ * like and what was understood. Forces the agent's vantage point —
+ * only the reader can describe what reading was like — and so prevents
+ * the drift into the content author's voice that happens when the
+ * instruction asks for an impersonal summary.
+ */
+function formatReadingMergeInstruction(
+  targetLevel: number,
+  sourceLevelShown: number,
+  totalTokens: number,
+  targetTokens: number,
+): string {
+  const seenDescription =
+    sourceLevelShown === 0
+      ? 'the portions of text you read above (raw passages from a larger piece)'
+      : `your earlier L${sourceLevelShown} reflections above on portions you read`;
+  return (
+    `You have just re-experienced ${seenDescription}, in chronological order. ` +
+    `They cover a contiguous stretch of a substantial body of text you have ` +
+    `been reading — approximately ${totalTokens} tokens in total across all ` +
+    `of it. The portions above cover the stretch you are now consolidating ` +
+    `at L${targetLevel}.\n\n` +
+    `Reflect across the stretch: what was it like, reading these portions ` +
+    `together? What did you come to understand that you couldn't have from ` +
+    `any single portion alone? What recurring patterns, frameworks, or ` +
+    `concerns emerged? Be substantive — name the specific claims, people, ` +
+    `dates, and phrases that defined this stretch of your reading.\n\n` +
+    `Speak in your own voice as the one who read these portions. Target ` +
+    `~${targetTokens} tokens. Output only the body of your consolidation — ` +
+    `no preamble.`
+  );
+}
 
 /**
  * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
@@ -119,11 +290,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
+  protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
+  protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
   /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
   protected pinIdCounter = 0;
+
+  /**
+   * Per-message resolution state for the adaptive-resolution picker.
+   *  - Key: MessageId
+   *  - Value: currentResolution (0 = render raw, k>0 = render L_k recall)
+   *
+   * Maintained only when `config.adaptiveResolution` is true. Loaded from
+   * the chronicle on `initialize()` and persisted via the resolutions state
+   * slot so resolutions survive process restart and follow branches.
+   */
+  protected resolutions: Map<MessageId, number> = new Map();
+
+  /**
+   * Per-message lock state for the adaptive-resolution picker. Set via the
+   * programmatic `lockChunk(id)` API on the strategy. Locked messages are
+   * skipped by the picker. Persisted via the locks state slot.
+   */
+  protected locked: Set<MessageId> = new Set();
+
+  /** Lazy picker instance, built from config.foldingStrategy. */
+  private _adaptivePicker: Picker | null = null;
 
   constructor(config: Partial<AutobiographicalConfig> = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
@@ -136,6 +330,97 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.l2BudgetTokens ??= 30000;
       this.config.l1BudgetTokens ??= 30000;
     }
+    // Adaptive-resolution defaults
+    if (this.config.adaptiveResolution) {
+      this.config.foldingStrategy ??= 'flat-profile';
+      this.config.compressionSlackRatio ??= 0.1;
+      this.config.speculativeProduction ??= true;
+    }
+  }
+
+  /**
+   * Lock a message so the adaptive picker won't change its resolution.
+   * No-op when adaptiveResolution is false. Set-only programmatic API per
+   * the design (no agent-facing tool in V1). Persisted to chronicle.
+   */
+  lockChunk(id: MessageId): void {
+    if (this.locked.has(id)) return;
+    this.locked.add(id);
+    this.persistLocks();
+  }
+
+  /**
+   * Unlock a message so the adaptive picker may again change its resolution.
+   * No-op when adaptiveResolution is false. Persisted to chronicle.
+   */
+  unlockChunk(id: MessageId): void {
+    if (!this.locked.has(id)) return;
+    this.locked.delete(id);
+    this.persistLocks();
+  }
+
+  /**
+   * Ingestion-time chunking hook.
+   *
+   * Active only when `config.adaptiveResolution` is true. Inspects the
+   * incoming message's text content; if its approximate token count
+   * exceeds the chunker's threshold, splits it into shards with a stable
+   * shared `bodyGroupId`. The framework then stores each shard as its own
+   * StoredMessage, and the render path concatenates them back into one
+   * API message at compile time (preserving KV cache structure).
+   *
+   * Multi-block content: text blocks are concatenated for chunking, then
+   * the resulting shards are emitted as text blocks. Non-text blocks
+   * (images, tool results) are passed through unchanged on the first
+   * shard only — they don't get split.
+   *
+   * See `docs/adaptive-resolution-design.md` §3.6.
+   */
+  chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
+    if (!this.config.adaptiveResolution) return null;
+
+    // Separate text and non-text blocks.
+    const textParts: string[] = [];
+    const nonTextBlocks: ContentBlock[] = [];
+    for (const block of content) {
+      if (block.type === 'text') {
+        textParts.push(block.text);
+      } else {
+        nonTextBlocks.push(block);
+      }
+    }
+    if (textParts.length === 0) return null;
+    const combined = textParts.join('');
+
+    // Threshold and shard size derive from the strategy's existing
+    // targetChunkTokens setting: a message over 2x targetChunkTokens
+    // gets sharded into pieces of ~targetChunkTokens each. This keeps
+    // doc shards the same size as chat-message chunks for L1 production
+    // consistency.
+    const target = this.config.targetChunkTokens ?? DEFAULT_CHUNKER_OPTIONS.chunkSize;
+    const chunkerOpts = {
+      chunkThreshold: target * 2,
+      chunkSize: target,
+      charsPerToken: DEFAULT_CHUNKER_OPTIONS.charsPerToken,
+    };
+
+    const sharded = chunkMessage(combined, chunkerOpts);
+    if (!sharded.wasSharded) return null;
+
+    // Build IngressChunkResult. Non-text blocks (if any) go on shard 0
+    // so the agent doesn't lose attachments. They're outside the chunker's
+    // concern but should still be available on the first shard.
+    const shards = sharded.shards.map((s) => ({
+      content: ([{ type: 'text', text: s.content }] as ContentBlock[]).concat(
+        s.index === 0 ? nonTextBlocks : []
+      ),
+      shardIndex: s.index,
+    }));
+
+    return {
+      bodyGroupId: sharded.bodyGroupId,
+      shards,
+    };
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
@@ -190,6 +475,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strategy: 'snapshot',
       });
     } catch { /* already registered */ }
+    // Adaptive-resolution state slots — only registered when the flag is on
+    // so chronicles without the flag don't accumulate unused slots.
+    if (this.config.adaptiveResolution) {
+      try {
+        this.store.registerState({
+          id: this.resolutionsStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+      try {
+        this.store.registerState({
+          id: this.locksStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+    }
   }
 
   /**
@@ -226,6 +527,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pins = [];
       this.pinIdCounter = 0;
     }
+
+    // Adaptive-resolution state — only present when flag was/is on
+    if (this.config.adaptiveResolution) {
+      const resState = this.store.getStateJson(this.resolutionsStateId);
+      this.resolutions = new Map();
+      if (resState && typeof resState === 'object') {
+        for (const [k, v] of Object.entries(resState as Record<string, unknown>)) {
+          if (typeof v === 'number' && v > 0) {
+            this.resolutions.set(k, v);
+          }
+        }
+      }
+      const lockState = this.store.getStateJson(this.locksStateId);
+      this.locked = new Set();
+      if (Array.isArray(lockState)) {
+        for (const id of lockState) {
+          if (typeof id === 'string') this.locked.add(id);
+        }
+      }
+    }
   }
 
   /** Persist the current pins + counter as a single snapshot. */
@@ -234,6 +555,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       pins: this.pins,
       counter: this.pinIdCounter,
     });
+  }
+
+  /** Persist the current resolutions snapshot. Only stores non-zero entries
+   *  to keep the slot compact. */
+  protected persistResolutions(): void {
+    if (!this.store) return;
+    const out: Record<string, number> = {};
+    for (const [id, level] of this.resolutions) {
+      if (level > 0) out[id] = level;
+    }
+    this.store.setStateJson(this.resolutionsStateId, out);
+  }
+
+  /** Persist the current locked-id snapshot. */
+  protected persistLocks(): void {
+    if (!this.store) return;
+    this.store.setStateJson(this.locksStateId, Array.from(this.locked));
   }
 
   // ============================================================================
@@ -447,6 +785,137 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return merge;
   }
 
+  /**
+   * Translate produce ops emitted by the picker into concrete work items on
+   * the strategy's own queues. Two cases:
+   *
+   *  - `level === 1`: the picker has asked for L1 coverage on a raw chunk.
+   *    In the autobio chunker model, each chunk maps to exactly one L1, so
+   *    we locate the chunk whose messages fall in `op.range` and ensure
+   *    it is queued for L1 compression. If the chunker hasn't realized the
+   *    message yet, we skip silently — the next `rebuildChunks` will pick
+   *    it up.
+   *
+   *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
+   *    range. We gather unmerged L_{n-1} summaries whose source ranges
+   *    fall within that range (de-duplicated against entries already in
+   *    `mergeQueue`) and enqueue a single merge over them. The merge fires
+   *    on the next `tick()`.
+   *
+   * The handler is conservative: it never enqueues a singleton or empty
+   * merge, and it never re-enqueues an id that's already pending. That
+   * keeps the next-compile picker loop convergent even when the same
+   * produce op gets re-emitted before the work completes.
+   */
+  protected handleProducedOps(ops: readonly FoldOp[]): void {
+    for (const op of ops) {
+      if (op.kind !== 'produce') continue;
+      if (op.level === 1) {
+        this.enqueueL1ForRange(op.range.firstChunkId, op.range.lastChunkId);
+      } else if (op.level >= 2) {
+        this.enqueueMergeForRange(
+          op.level,
+          op.range.firstChunkId,
+          op.range.lastChunkId,
+        );
+      }
+    }
+  }
+
+  /**
+   * Ensure that chunks whose message range overlaps [firstMsgId..lastMsgId]
+   * are queued for L1 compression. No-op if the matching chunk is already
+   * compressed or already in the queue.
+   */
+  protected enqueueL1ForRange(firstMsgId: MessageId, lastMsgId: MessageId): void {
+    const messageIdToChunk = new Map<MessageId, Chunk>();
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) messageIdToChunk.set(m.id, ch);
+    }
+    const candidates = new Set<Chunk>();
+    const first = messageIdToChunk.get(firstMsgId);
+    const last = messageIdToChunk.get(lastMsgId);
+    if (first) candidates.add(first);
+    if (last) candidates.add(last);
+    // Also catch chunks fully spanned by the range (rare, but supports the
+    // case where the picker requests an L1 that should logically cover
+    // multiple chunks worth of messages — we err on the side of producing
+    // L1s for every spanned chunk).
+    if (first && last && first.index !== last.index) {
+      const [lo, hi] = first.index < last.index
+        ? [first.index, last.index]
+        : [last.index, first.index];
+      for (let i = lo; i <= hi; i++) {
+        const ch = this.chunks[i];
+        if (ch) candidates.add(ch);
+      }
+    }
+    for (const chunk of candidates) {
+      if (chunk.compressed) continue;
+      if (this.compressionQueue.includes(chunk.index)) continue;
+      this.compressionQueue.push(chunk.index);
+    }
+  }
+
+  /**
+   * Enqueue an L_{targetLevel} merge over unmerged L_{targetLevel-1}
+   * summaries whose source ranges fall within [firstMsgId..lastMsgId].
+   * No-op if fewer than 2 viable sources are available (a singleton merge
+   * would just rename a summary without consolidating).
+   */
+  protected enqueueMergeForRange(
+    targetLevel: number,
+    firstMsgId: MessageId,
+    lastMsgId: MessageId,
+  ): void {
+    const sourceLevel = targetLevel - 1;
+
+    // IDs already enqueued at this target level.
+    const queuedAtLevel = new Set<string>();
+    for (const m of this.mergeQueue) {
+      if (m.level === targetLevel) {
+        for (const id of m.sourceIds) queuedAtLevel.add(id);
+      }
+    }
+
+    // Sequence index per message id, for "within range" tests. Use the
+    // current chunk store as the ordering source.
+    const messageOrder = new Map<MessageId, number>();
+    let seq = 0;
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) {
+        messageOrder.set(m.id, seq++);
+      }
+    }
+    const firstSeq = messageOrder.get(firstMsgId);
+    const lastSeq = messageOrder.get(lastMsgId);
+
+    const inRange = (msgId: MessageId): boolean => {
+      if (firstSeq === undefined || lastSeq === undefined) return true;
+      const s = messageOrder.get(msgId);
+      if (s === undefined) return false;
+      const [lo, hi] = firstSeq <= lastSeq ? [firstSeq, lastSeq] : [lastSeq, firstSeq];
+      return s >= lo && s <= hi;
+    };
+
+    const sources: SummaryEntry[] = [];
+    for (const s of this.summaries) {
+      if (s.level !== sourceLevel) continue;
+      if (getSummaryParentId(s)) continue;
+      if (queuedAtLevel.has(s.id)) continue;
+      if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
+      sources.push(s);
+    }
+    if (sources.length < 2) return;
+
+    const N = this.config.mergeThreshold ?? 6;
+    const toMerge = sources.slice(0, N);
+    this.enqueueMerge({
+      level: targetLevel as SummaryLevel,
+      sourceIds: toMerge.map((s) => s.id),
+    });
+  }
+
   checkReadiness(): ReadinessState {
     if (this.pendingCompression) {
       return {
@@ -633,6 +1102,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.rebuildChunks(store);
 
+    if (this.config.adaptiveResolution) {
+      return this.selectAdaptive(store, budget);
+    }
     return this.config.hierarchical
       ? this.selectHierarchical(store, budget)
       : this.selectLegacy(store, log, budget);
@@ -1030,45 +1502,140 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('No membrane instance for compression');
     }
 
-    const chunkMessageIds = new Set(chunk.messages.map(m => m.id));
-    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(chunkMessageIds);
-
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
-    const chunkContent = this.formatChunkForCompression(chunk);
+    const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
-    // Build message array: prior summaries as assistant, then instruction
+    // Build the KV-preserving prompt per hermes-autobio spec:
+    //
+    //   1. Prior L1 summaries — narrativized as CM-asks / agent-recalls
+    //      pairs, in source order. ALL existing L1s at L1 fidelity
+    //      regardless of merge state ("fill lower orbitals first").
+    //   2. Head — raw messages before the chunk that aren't already
+    //      represented by a prior L1.
+    //   3. Marker — in-band signal that a memory is about to form.
+    //   4. Chunk — raw messages being compressed, as the agent
+    //      experienced them.
+    //   5. Instruction — doc-aware if the chunk is part of a bodyGroup.
+    //
+    // There is intentionally NO tail_after_chunk: that would leak
+    // future information into the model's KV state and corrupt the
+    // as-of framing of memory formation.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // Prior summaries as agent's own recollections (L3 → L2 → L1 gradient)
-    const allPriorSummaries = [...shownL3, ...shownL2, ...shownL1];
-    for (const s of allPriorSummaries) {
+    // ---- 1. Prior L1 recall pairs ----
+    // Sort by source position so the agent walks its prior memories
+    // chronologically, matching how it would have formed them.
+    const priorL1s = this.summaries
+      .filter((s) => s.level === 1)
+      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+    for (const s of priorL1s) {
       llmMessages.push({
-        participant: this.config.summaryParticipant ?? 'Claude',
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
+      });
+      llmMessages.push({
+        participant: agentParticipant,
         content: [{ type: 'text', text: s.content }],
       });
     }
 
-    // Context Manager instruction with chunk content
-    const instruction = this.getCompressionInstruction(chunk, targetTokens);
+    // ---- 2. Head window (raw, ALWAYS present) ----
+    //
+    // The head is the foundational identity anchor: the actual opening
+    // of the chronicle (the user's first message, the agent's first
+    // reply, the system context if any). It establishes WHO is speaking
+    // to WHOM. Without it, when the chunk content is heavily first-person
+    // from someone other than the agent (e.g., a user-shared document),
+    // the agent loses its first-person grounding and drifts into the
+    // content author's voice.
+    //
+    // The head is the configured head window — not "everything before
+    // the chunk." For doc-heavy chronicles, "everything before" would
+    // be hundreds of thousands of tokens; the recall pairs already
+    // represent that intermediate content. The head is just the
+    // permanent prefix that the original instance always saw.
+    //
+    // Head messages are excluded from compression by `getCompressibleMessages`
+    // (they're outside the chunking range), so they won't appear in
+    // any L1's sourceIds — no overlap with the recall pairs above.
+    const allMessages = ctx.messageStore.getAll();
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // Any raw messages between the head and the chunk that aren't yet
+    // represented by an L1 — usually empty in adaptive-resolution mode,
+    // since chunking proceeds contiguously and L1s exist for everything
+    // up to the chunk being processed.
+    const chunkFirstId = chunk.messages[0]?.id;
+    if (chunkFirstId) {
+      const priorL1MessageIds = new Set<string>();
+      for (const s of priorL1s) {
+        for (const id of s.sourceIds) priorL1MessageIds.add(id);
+      }
+      const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
+      for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
+        const m = allMessages[i];
+        if (priorL1MessageIds.has(m.id)) continue;
+        llmMessages.push({ participant: m.participant, content: m.content });
+      }
+    }
+
+    // ---- 3. In-band marker ----
     llmMessages.push({
       participant: 'Context Manager',
-      content: [{
-        type: 'text',
-        text: `[Context Manager] We are ready to form a long-term memory. Here is the conversation to remember:\n\n${chunkContent}\n\n${instruction}`,
-      }],
+      content: [{ type: 'text', text: COMPRESSION_MARKER }],
+    });
+
+    // ---- 4. Chunk messages raw ----
+    for (const m of chunk.messages) {
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // ---- 5. Instruction (reading-mode aware) ----
+    //
+    // When the chunk is a portion of a substantially larger sharded message
+    // (≥ 2× chunk size), use the reading-mode instruction. It avoids the
+    // "form a memory of what this contained" framing — which, for content
+    // heavily first-person from someone other than the agent (a user-shared
+    // doc), leads the model to adopt the content author's voice. Instead,
+    // it asks what reading was like and what was learned, forcing the
+    // model to reflect from its own vantage point in agent-first-person.
+    const docContext = this.detectDocContext(chunk, ctx);
+    const instructionText = docContext
+      ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
+      : this.getCompressionInstruction(chunk, targetTokens);
+    llmMessages.push({
+      participant: 'Context Manager',
+      content: [{ type: 'text', text: instructionText }],
     });
 
     // Collapse consecutive same-participant messages for API compliance
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
+    // NO system prompt. The agent's identity is established by the head
+    // (the actual conversation opening — user message + agent reply that
+    // grounded the original instance). A system prompt would (a) add a
+    // synthetic header the original instance never saw, disturbing KV
+    // consistency between the summarizer and the original instance, and
+    // (b) provide an alternative identity source that competes with the
+    // structural one carried by the conversation itself. Anchoring
+    // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are forming autobiographical memories of a conversation.',
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
       },
     };
+
+    const callStart = Date.now();
+    let logResponse: string | undefined;
+    let logError: string | undefined;
+    let logSummaryId: string | undefined;
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
@@ -1076,6 +1643,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      logResponse = summaryText;
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
@@ -1097,11 +1665,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunk.compressed = true;
       chunk.summaryId = entry.id;
       this._compressionCount++;
+      logSummaryId = entry.id;
 
       this.checkMergeThreshold();
     } catch (error) {
       console.error('Failed to compress chunk (hierarchical):', error);
+      logError = error instanceof Error ? error.message : String(error);
       throw error;
+    } finally {
+      logCompressionCall({
+        operation: 'compress_l1',
+        system: null,
+        messages: collapsed.map((m) => ({
+          participant: m.participant,
+          // Flatten content for logging — store text only; binary content
+          // would bloat the log and isn't typical in compression input.
+          text: m.content
+            .filter((b: ContentBlock) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join(''),
+        })),
+        metadata: {
+          chunk_message_ids: chunk.messages.map((m) => m.id),
+          chunk_size: chunk.messages.length,
+          prior_l1_count: priorL1s.length,
+          has_doc_context: docContext !== null,
+          doc_context: docContext,
+          target_tokens: targetTokens,
+          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          latency_ms: Date.now() - callStart,
+          summary_id: logSummaryId,
+        },
+        response: logResponse,
+        error: logError,
+      });
     }
   }
 
@@ -1115,6 +1712,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries when the queue eventually drains.
    */
   protected checkMergeThreshold(): void {
+    if (this.config.speculativeProduction) {
+      this.checkMergeThresholdRecursive();
+      return;
+    }
+
     const threshold = this.config.mergeThreshold ?? 6;
 
     // IDs that are already part of a queued merge — exclude them from
@@ -1148,6 +1750,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         level: 3,
         sourceIds: toMerge.map(s => s.id),
       });
+    }
+  }
+
+  /**
+   * Bottom-up speculative pre-producer (design doc §3.5 / §7.2).
+   *
+   * Recursive variant of `checkMergeThreshold` for the unbounded L_n
+   * design. Walks every level present in the archive; for any level k
+   * with ≥ N orphans (no parent), enqueues an L_{k+1} merge. After that
+   * L_{k+1} is produced and `executeMerge` calls this again, the recursion
+   * naturally cascades: 6 L1s → 1 L2; 6 L2s → 1 L3; 6 L3s → 1 L4; ...
+   *
+   * Only fires when `config.speculativeProduction` is true. Default true
+   * for adaptiveResolution=true, false otherwise. The non-speculative path
+   * (above) preserves the original L1→L2→L3 behavior for non-adaptive
+   * deployments.
+   */
+  protected checkMergeThresholdRecursive(): void {
+    const threshold = this.config.mergeThreshold ?? 6;
+
+    // Build per-level sets of source-ids already enqueued for merging,
+    // so we don't re-enqueue them while a merge is pending.
+    const queuedSources = new Map<number, Set<string>>();
+    for (const m of this.mergeQueue) {
+      // m.level is the TARGET level; the sources are at level (m.level - 1).
+      const sourceLevel = m.level - 1;
+      if (!queuedSources.has(sourceLevel)) queuedSources.set(sourceLevel, new Set());
+      for (const id of m.sourceIds) queuedSources.get(sourceLevel)!.add(id);
+    }
+
+    // Walk every level present in the archive. Iterate from low to high
+    // so when an L_{k+1} merge is enqueued and immediately produced, this
+    // same check sees the new L_{k+1} on the next call and can roll up.
+    let maxLevel = 0;
+    for (const s of this.summaries) {
+      if (s.level > maxLevel) maxLevel = s.level;
+    }
+    for (let level = 1; level <= maxLevel; level++) {
+      const queued = queuedSources.get(level) ?? new Set();
+      const unmerged = this.summaries.filter(
+        s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
+      );
+      if (unmerged.length >= threshold) {
+        const toMerge = unmerged.slice(0, threshold);
+        this.enqueueMerge({
+          level: level + 1,
+          sourceIds: toMerge.map(s => s.id),
+        });
+      }
     }
   }
 
@@ -1187,50 +1838,217 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
 
-    // Build message array
+    // Build the merge prompt with one-level-deeper target expansion +
+    // prefix of older context:
+    //
+    //   1. PREFIX — head messages + prior L1 recall pairs for content
+    //      that comes chronologically BEFORE the merge range. "Fill
+    //      lower orbitals first" per the spec: regardless of how
+    //      compressed the live view is, the summarizer always gets L1
+    //      fidelity for prior content. Older L2/L3 markers exist for
+    //      live-view compactness, not for the summarizer.
+    //
+    //   2. TARGET — the sources expanded ONE LEVEL DEEPER than they
+    //      themselves are. For L2 merge (sources at L1): expand to
+    //      raw L0 messages — the model sees the actual conversation
+    //      that the 6 L1s consolidate. For L3 merge (sources at L2):
+    //      expand to the L1s under each L2 (36 L1s as recall pairs).
+    //      For L_n merge (sources at L_{n-1}): expand to L_{n-2}.
+    //      This gives the model substantively more content to ground
+    //      the consolidation in than just the 6 surface summaries.
+    //
+    //   3. INSTRUCTION — "consolidate N memories preserving the
+    //      through-line, in first person".
+    //
+    // No tail-after-merge: same as-of principle as L1 compression. The
+    // consolidation is being formed at the moment the last source was
+    // ready, so nothing after that is visible.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // Higher-level context (anti-redundant)
-    if (targetLevel === 2) {
-      // For L2 merge: show L3 summaries as context
-      const shownL3 = this.summaries.filter(s => s.level === 3 && !s.mergedInto);
-      for (const s of shownL3) {
-        llmMessages.push({
-          participant,
-          content: [{ type: 'text', text: s.content }],
-        });
-      }
-    }
-    // For L3 merge: no higher context exists
+    // Build lookup maps
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const allMessages = ctx.messageStore.getAll();
+    const messageById = new Map<MessageId, typeof allMessages[number]>();
+    for (const m of allMessages) messageById.set(m.id, m);
 
-    // The source summaries as agent's own memories
-    for (const source of sources) {
+    // Compute every leaf message id covered by this merge's lineage —
+    // these are part of the TARGET and must not also appear in the
+    // PREFIX as head content.
+    const sourceLeafIds = new Set<MessageId>();
+    const collectLeaves = (s: SummaryEntry): void => {
+      if (s.sourceLevel === 0) {
+        for (const id of s.sourceIds) sourceLeafIds.add(id);
+      } else {
+        for (const childId of s.sourceIds) {
+          const child = summariesById.get(childId);
+          if (child) collectLeaves(child);
+        }
+      }
+    };
+    for (const src of sources) collectLeaves(src);
+
+    // Find the start of the merge range in the message store.
+    const mergeFirstMsgId = sources[0].sourceRange.first;
+    const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
+
+    // ---- 1a. HEAD WINDOW (raw, ALWAYS present) ----
+    //
+    // The head window is the foundational identity anchor — the actual
+    // opening of the chronicle. It establishes who is speaking to whom.
+    // Without it, when the merge target's content is heavily first-person
+    // from someone other than the agent, the agent loses its first-person
+    // grounding and drifts into the content author's voice.
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // ---- 1b. PRIOR L1 RECALL PAIRS (chronologically before merge range) ----
+    // L1s whose entire source range is before the merge range and that
+    // aren't part of the merge tree. Sort by source position.
+    const priorL1s = this.summaries
+      .filter((s) => s.level === 1)
+      .filter((s) => {
+        // Exclude any L1 that's an ancestor of our merge target
+        for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
+        // Include only if it starts strictly before the merge range
+        const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
+        return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
+      })
+      .sort((a, b) => {
+        const ai = allMessages.findIndex((m) => m.id === a.sourceRange.first);
+        const bi = allMessages.findIndex((m) => m.id === b.sourceRange.first);
+        return ai - bi;
+      });
+
+    const priorL1MessageIds = new Set<MessageId>();
+    for (const s of priorL1s) {
+      for (const id of s.sourceIds) priorL1MessageIds.add(id);
+    }
+
+    for (const s of priorL1s) {
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
+      });
       llmMessages.push({
         participant,
-        content: [{ type: 'text', text: source.content }],
+        content: [{ type: 'text', text: s.content }],
       });
     }
 
-    // Consolidation instruction
-    const mergeInstruction = this.getMergeInstruction(targetLevel, sources, targetTokens);
+    // Raw middle: any messages between the head window and the merge
+    // range that aren't covered by a prior L1 or the merge tree.
+    // Usually empty (chunking is contiguous).
+    if (mergeStartIdx >= 0) {
+      for (let i = headEndIdx; i < mergeStartIdx; i++) {
+        const m = allMessages[i];
+        if (priorL1MessageIds.has(m.id)) continue;
+        if (sourceLeafIds.has(m.id)) continue;
+        llmMessages.push({ participant: m.participant, content: m.content });
+      }
+    }
+
+    // ---- 2. TARGET: expand sources one level deeper ----
+    // For L2 (sources at L1, sourceLevel=0): expand to raw L0 messages.
+    // For L3+ (sources at L_{n-1}, sourceLevel=n-2): expand to L_{n-2}
+    //   summaries as recall pairs.
+    for (const src of sources) {
+      if (src.sourceLevel === 0) {
+        // Source is an L1; its sourceIds are raw message ids. Emit them raw.
+        for (const messageId of src.sourceIds) {
+          const m = messageById.get(messageId);
+          if (m) {
+            llmMessages.push({ participant: m.participant, content: m.content });
+          }
+        }
+      } else {
+        // Source is L2+; its sourceIds point to summaries one level
+        // below. Emit each as a recall pair.
+        for (const childId of src.sourceIds) {
+          const child = summariesById.get(childId);
+          if (!child) continue;
+          llmMessages.push({
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
+          });
+          llmMessages.push({
+            participant,
+            content: [{ type: 'text', text: child.content }],
+          });
+        }
+      }
+    }
+
+    // ---- 3. INSTRUCTION ----
+    // sourceLevelShown is the level of content the model actually sees
+    // (one level below the sources themselves).
+    const sourceLevelShown =
+      sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
+
+    // Reading-mode detection: when ALL the merge's leaf messages are
+    // shards of the same bodyGroup, we know the agent was reading a
+    // substantially larger message rather than conversing. The
+    // reading-mode merge instruction asks what reading the stretch was
+    // like instead of asking for an impersonal consolidation, which
+    // forces the agent's vantage point and prevents drift into the
+    // content author's voice. Same principle as the L1 case.
+    let mergeReadingContext: { totalTokens: number } | null = null;
+    if (sourceLeafIds.size > 0) {
+      const leafBodyGroupIds = new Set<string | undefined>();
+      for (const leafId of sourceLeafIds) {
+        const m = messageById.get(leafId);
+        leafBodyGroupIds.add(m?.bodyGroupId);
+      }
+      if (leafBodyGroupIds.size === 1) {
+        const groupId = [...leafBodyGroupIds][0];
+        if (groupId) {
+          let totalTokens = 0;
+          for (const m of allMessages) {
+            if (m.bodyGroupId === groupId) {
+              totalTokens += ctx.messageStore.estimateTokens(m);
+            }
+          }
+          mergeReadingContext = { totalTokens };
+        }
+      }
+    }
+    const mergeInstructionText = mergeReadingContext
+      ? this.getReadingMergeInstruction(
+          targetLevel,
+          sources,
+          mergeReadingContext.totalTokens,
+          targetTokens,
+        )
+      : this.getMergeInstruction(targetLevel, sources, targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
         type: 'text',
-        text: `[Context Manager] ${mergeInstruction}`,
+        text: mergeInstructionText,
       }],
     });
 
     const collapsed = this.collapseConsecutiveMessages(llmMessages);
 
+    // NO system prompt — identity is established by the head window
+    // (present at the start of llmMessages above) and by the prior
+    // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
       messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
-      system: 'You are forming autobiographical memories of a conversation.',
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
       },
     };
+
+    const callStart = Date.now();
+    let logResponse: string | undefined;
+    let logError: string | undefined;
+    let logNewSummaryId: string | undefined;
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
@@ -1238,6 +2056,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      logResponse = mergedText;
 
       // Compute source range from constituent summaries
       const sourceRange = {
@@ -1256,6 +2075,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceRange,
         created: Date.now(),
       };
+      logNewSummaryId = newEntry.id;
 
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
@@ -1272,9 +2092,601 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
     } catch (error) {
       console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+      logError = error instanceof Error ? error.message : String(error);
       throw error;
+    } finally {
+      logCompressionCall({
+        operation: `merge_l${targetLevel}`,
+        system: null,
+        messages: collapsed.map((m) => ({
+          participant: m.participant,
+          text: m.content
+            .filter((b: ContentBlock) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join(''),
+        })),
+        metadata: {
+          target_level: targetLevel,
+          source_ids: sourceIds,
+          source_level: sources[0]?.level ?? null,
+          source_level_shown: sourceLevelShown,
+          target_tokens: targetTokens,
+          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          latency_ms: Date.now() - callStart,
+          summary_id: logNewSummaryId,
+        },
+        response: logResponse,
+        error: logError,
+      });
     }
   }
+
+  // ============================================================================
+  // Adaptive resolution (picker-driven) path
+  // ============================================================================
+
+  /**
+   * Select context entries using the adaptive-resolution picker.
+   *
+   * Builds per-message PickerChunks from compressible messages, runs the
+   * configured FoldingStrategy under token-budget pressure, and emits the
+   * resulting per-message resolutions as ContextEntry[]. Adjacent messages
+   * sharing the same L_k ancestor emit the recall pair once.
+   *
+   * See `docs/adaptive-resolution-design.md` §3, §5.
+   */
+  protected selectAdaptive(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    const entries: ContextEntry[] = [];
+    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const messages = store.getAll();
+    const msgCap = this.config.maxMessageTokens;
+
+    // ----- 1. Build head/tail sets and emit head entries -----
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = this.getRecentWindowStart(store);
+
+    const headMessageIds = new Set<MessageId>();
+    const tailMessageIds = new Set<MessageId>();
+    let headTokens = 0;
+    let tailTokens = 0;
+
+    let totalTokens = 0;
+
+    // Emit head entries verbatim
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      if (totalTokens + tokens > maxTokens) break;
+      entries.push({
+        index: entries.length,
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content,
+      });
+      totalTokens += tokens;
+      headMessageIds.add(msg.id);
+      headTokens += tokens;
+    }
+    if (entries.length > 0) {
+      entries[entries.length - 1].cacheMarker = true;
+    }
+
+    // Compute tail message IDs (will be emitted at end)
+    const effectiveRecentStart = Math.max(recentStart, headEnd);
+    for (let i = effectiveRecentStart; i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      tailMessageIds.add(msg.id);
+      tailTokens += tokens;
+    }
+
+    // ----- 2. Build PickerChunks for messages in the middle -----
+    // For each compressible (non-head, non-tail) message we create one
+    // PickerChunk. Its l1Id is determined by the existing chunks that
+    // group messages into L1 summaries.
+    const chunksByMessageId = new Map<MessageId, Chunk>();
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) {
+        chunksByMessageId.set(m.id, ch);
+      }
+    }
+
+    // Pinned-position set so the picker doesn't fold messages the user
+    // explicitly marked as keep-raw. Built once and reused.
+    const pinnedSet = this.pinnedPositions(messages);
+
+    // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
+    // calls during emission.
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+
+    const pickerChunks: PickerChunk[] = [];
+    for (let i = headEnd; i < effectiveRecentStart && i < messages.length; i++) {
+      const msg = messages[i];
+      const ch = chunksByMessageId.get(msg.id);
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: this.resolutions.get(msg.id) ?? 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: pinnedSet.has(i),
+        l1Id: ch?.summaryId,
+      });
+    }
+
+    // Also include head and tail in PickerChunks (so token accounting matches)
+    // — but mark them as in-head/in-tail so the picker won't fold them.
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: true, // treat head as pinned for picker purposes
+        l1Id: undefined,
+      });
+    }
+    for (let i = effectiveRecentStart; i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
+      pickerChunks.push({
+        id: msg.id,
+        sequence: i,
+        rawTokens: tokens,
+        currentResolution: 0,
+        lockedByAgent: this.locked.has(msg.id),
+        pinned: true, // treat tail as pinned for picker purposes
+        l1Id: undefined,
+      });
+    }
+
+    // ----- 3. Build summaries map and recall-pair tokens -----
+    const summariesMap = new Map<SummaryId, SummaryEntry>();
+    const recallPairTokens = new Map<SummaryId, number>();
+    for (const s of this.summaries) {
+      summariesMap.set(s.id, s);
+      // recall pair = the summary's text wrapped as a Q&A pair. Approximate
+      // as s.tokens + small overhead for the "What do you remember?" label.
+      recallPairTokens.set(s.id, s.tokens + 20);
+    }
+
+    // ----- 4. Run the picker -----
+    const totalBudget = maxTokens - totalTokens; // tokens left after head
+    const slack = this.config.compressionSlackRatio ?? 0.1;
+    const foldingBudget: FoldingBudget = {
+      totalBudget,
+      targetBudget: totalBudget * (1 - slack),
+      slack,
+    };
+
+    const headSetForPicker = new Set<ChunkId>(headMessageIds);
+    const tailSetForPicker = new Set<ChunkId>(tailMessageIds);
+
+    const picker = this.getAdaptivePicker();
+    const result = picker.run(
+      {
+        chunks: pickerChunks,
+        summaries: summariesMap,
+        recallPairTokens,
+        headChunkIds: headSetForPicker,
+        tailChunkIds: tailSetForPicker,
+        headTokens,
+        tailTokens,
+      },
+      foldingBudget
+    );
+
+    // Commit the new resolutions back to strategy state for next compile.
+    // Persist to chronicle only if anything actually changed — avoids
+    // unnecessary state-slot writes on no-op compiles (which is the common
+    // case in steady state with slack).
+    let resolutionsChanged = false;
+    let deepestLevel = 0;
+    for (const [id, level] of result.finalResolutions) {
+      if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
+      if (this.locked.has(id)) continue;
+      const prev = this.resolutions.get(id) ?? 0;
+      if (prev !== level) {
+        this.resolutions.set(id, level);
+        resolutionsChanged = true;
+      }
+      if (level > deepestLevel) deepestLevel = level;
+    }
+    if (resolutionsChanged) {
+      this.persistResolutions();
+    }
+
+    // Wire produce ops into the strategy's own production queues so that
+    // requested-but-not-yet-existing summaries actually get built. The
+    // speculative pre-producer covers most cases ambiently, but when it is
+    // disabled (`speculativeProduction: false`) or hasn't reached the level
+    // the picker just asked for, the request would otherwise be dropped and
+    // the picker would re-emit it on every subsequent compile. Handling it
+    // here makes the produce path observable and convergent.
+    //
+    // The actual compression/merge work runs asynchronously via the next
+    // `tick()` invocation (or the speculative drain kicked from
+    // `onNewMessage`). This call only enqueues; it does not await.
+    if (result.produced.length > 0) {
+      this.handleProducedOps(result.produced);
+    }
+
+    // Hard-fail check: if the picker exhausted itself but the final render
+    // would still exceed the HARD budget (not just the soft target), surface
+    // an OverBudgetError to the host rather than silently dropping entries.
+    // The strategy has done all it can; the application has to decide what
+    // to do next (raise budget, switch model, drop windows, etc.).
+    if (result.exhausted && result.finalTokens > totalBudget) {
+      throw new OverBudgetError({
+        budget: totalBudget,
+        actual: result.finalTokens,
+        diagnostics: {
+          headTokens,
+          tailTokens,
+          middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
+          middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
+          deepestLevel,
+        },
+      });
+    }
+
+    // ----- 5. Emit middle entries in source order -----
+    // Walk middle messages. Handle two cases:
+    //  - bodyGroupId set: collect all consecutive shards from the same group,
+    //    emit ONE combined entry with concatenated content (raw shards + inline
+    //    summary text for folded shards). This preserves KV — the model sees
+    //    one continuous user message instead of N turns.
+    //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
+    const emittedAncestors = new Set<SummaryId>();
+    const summaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
+
+    let i = headEnd;
+    while (i < effectiveRecentStart && i < messages.length) {
+      const msg = messages[i];
+
+      if (msg.bodyGroupId) {
+        // Collect the full run of consecutive shards sharing this bodyGroupId.
+        const groupId = msg.bodyGroupId;
+        const groupStart = i;
+        while (
+          i < effectiveRecentStart &&
+          i < messages.length &&
+          messages[i].bodyGroupId === groupId
+        ) {
+          i++;
+        }
+        const groupMessages = messages.slice(groupStart, i);
+        // Sort by shardIndex to ensure byte-faithful ordering.
+        const sortedShards = [...groupMessages].sort(
+          (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
+        );
+
+        // Walk shards in order, accumulating "runs":
+        //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
+        //    message with their text concatenated.
+        //  - a 'summary' run is consecutive shards under the same L_k
+        //    ancestor; flushed as a Q+A recall pair (Context Manager
+        //    question + summaryParticipant answer), emitted once per
+        //    distinct ancestor.
+        // The run breaks (and the previous run flushes) when:
+        //  - resolution transitions raw ↔ folded
+        //  - the L_k ancestor changes
+        type Run =
+          | { kind: 'raw'; parts: string[] }
+          | { kind: 'summary'; ancestor: SummaryEntry };
+        let currentRun: Run | null = null;
+        const participant = sortedShards[0].participant;
+
+        const flushRun = (): boolean => {
+          if (!currentRun) return true;
+          if (currentRun.kind === 'raw') {
+            const text = currentRun.parts.join('');
+            const content: ContentBlock[] = [{ type: 'text', text }];
+            // Deliberately do NOT apply maxMessageTokens here: the picker
+            // is the authority on how much of the doc renders raw vs.
+            // summarized. Truncating the composite would silently lose
+            // doc content that the picker explicitly chose to keep raw.
+            // (`maxMessageTokens` is for per-message caps on chat / tool
+            // results, not for sharded bodyGroup composites.)
+            const tokens = this.estimateTokens(content);
+            if (totalTokens + tokens > maxTokens) {
+              currentRun = null;
+              return false;
+            }
+            entries.push({
+              index: entries.length,
+              sourceMessageId: undefined,
+              sourceRelation: 'copy',
+              participant,
+              content,
+            });
+            totalTokens += tokens;
+          } else {
+            // summary run — emit Q+A pair, dedup at the strategy level
+            const ancestor = currentRun.ancestor;
+            if (!emittedAncestors.has(ancestor.id)) {
+              emittedAncestors.add(ancestor.id);
+              const questionEntry: ContextEntry = {
+                index: entries.length,
+                participant: 'Context Manager',
+                content: [{ type: 'text', text: summaryLabel }],
+                sourceRelation: 'derived',
+              };
+              const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+              const answerEntry: ContextEntry = {
+                index: entries.length + 1,
+                participant: summaryParticipant,
+                content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+                sourceRelation: 'derived',
+              };
+              const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+              if (totalTokens + pairTokens > maxTokens) {
+                currentRun = null;
+                return false;
+              }
+              entries.push(questionEntry);
+              entries.push(answerEntry);
+              totalTokens += pairTokens;
+            }
+          }
+          currentRun = null;
+          return true;
+        };
+
+        let budgetExhausted = false;
+        for (const shard of sortedShards) {
+          const resolution = result.finalResolutions.get(shard.id) ?? 0;
+          if (resolution === 0) {
+            if (currentRun?.kind !== 'raw') {
+              if (!flushRun()) { budgetExhausted = true; break; }
+              currentRun = { kind: 'raw', parts: [] };
+            }
+            for (const block of shard.content) {
+              if (block.type === 'text') (currentRun as { kind: 'raw'; parts: string[] }).parts.push(block.text);
+            }
+          } else {
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById);
+            if (!ancestor) {
+              // Fall back to raw
+              if (currentRun?.kind !== 'raw') {
+                if (!flushRun()) { budgetExhausted = true; break; }
+                currentRun = { kind: 'raw', parts: [] };
+              }
+              for (const block of shard.content) {
+                if (block.type === 'text') (currentRun as { kind: 'raw'; parts: string[] }).parts.push(block.text);
+              }
+              continue;
+            }
+            // If we're already in a summary run for the SAME ancestor, this
+            // shard is covered — skip silently.
+            if (currentRun?.kind === 'summary' && currentRun.ancestor.id === ancestor.id) {
+              continue;
+            }
+            if (!flushRun()) { budgetExhausted = true; break; }
+            currentRun = { kind: 'summary', ancestor };
+          }
+        }
+        if (!budgetExhausted) {
+          if (!flushRun()) budgetExhausted = true;
+        }
+        if (budgetExhausted) break;
+        continue;
+      }
+
+      // Non-shard path: existing behavior.
+      const resolution = result.finalResolutions.get(msg.id) ?? 0;
+      if (resolution === 0) {
+        const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+        const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+        if (totalTokens + tokens > maxTokens) break;
+        entries.push({
+          index: entries.length,
+          sourceMessageId: msg.id,
+          sourceRelation: 'copy',
+          participant: msg.participant,
+          content,
+        });
+        totalTokens += tokens;
+        i++;
+      } else {
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById);
+        if (!ancestor) {
+          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+          const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+          if (totalTokens + tokens > maxTokens) break;
+          entries.push({
+            index: entries.length,
+            sourceMessageId: msg.id,
+            sourceRelation: 'copy',
+            participant: msg.participant,
+            content,
+          });
+          totalTokens += tokens;
+          i++;
+          continue;
+        }
+        if (emittedAncestors.has(ancestor.id)) {
+          i++;
+          continue;
+        }
+        emittedAncestors.add(ancestor.id);
+        const questionEntry: ContextEntry = {
+          index: entries.length,
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: summaryLabel }],
+          sourceRelation: 'derived',
+        };
+        const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+        const answerEntry: ContextEntry = {
+          index: entries.length + 1,
+          participant: summaryParticipant,
+          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+          sourceRelation: 'derived',
+        };
+        const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+        if (totalTokens + pairTokens > maxTokens) break;
+        entries.push(questionEntry);
+        entries.push(answerEntry);
+        totalTokens += pairTokens;
+        i++;
+      }
+    }
+
+    // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
+    this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+
+    // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
+    // Both head and tail emission paths emit shards as separate ContextEntries.
+    // The middle path already merges consecutive same-bodyGroup raw shards into
+    // one composite entry, but head/tail don't. This pass closes that gap so
+    // a sharded message renders as ONE API message regardless of which region
+    // it falls into (preserves KV cache through region transitions).
+    const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
+
+    this.trimOrphanedToolUse(merged);
+    return merged;
+  }
+
+  /**
+   * Walk an entries array; for every run of consecutive entries that
+   *  (a) have sourceRelation: 'copy' (raw, not a synthesized recall pair)
+   *  (b) have sourceMessageId pointing to messages in the same bodyGroup
+   * merge them into one composite entry whose body is the byte-faithful
+   * concatenation of their text content. Other entries pass through.
+   *
+   * Reindexes the returned array.
+   */
+  protected mergeAdjacentBodyGroupRaw(
+    entries: ContextEntry[],
+    store: MessageStoreView
+  ): ContextEntry[] {
+    if (entries.length === 0) return entries;
+
+    // Look up bodyGroupId by sourceMessageId via the message store.
+    const groupOf = (sourceMessageId?: string): string | undefined => {
+      if (!sourceMessageId) return undefined;
+      const m = store.get(sourceMessageId);
+      return m?.bodyGroupId;
+    };
+
+    const out: ContextEntry[] = [];
+    let i = 0;
+    while (i < entries.length) {
+      const entry = entries[i];
+      const groupId = entry.sourceRelation === 'copy' ? groupOf(entry.sourceMessageId) : undefined;
+      if (!groupId) {
+        out.push({ ...entry, index: out.length });
+        i++;
+        continue;
+      }
+      // Collect run of consecutive raw entries with same bodyGroupId.
+      const run: ContextEntry[] = [entry];
+      let j = i + 1;
+      while (
+        j < entries.length &&
+        entries[j].sourceRelation === 'copy' &&
+        groupOf(entries[j].sourceMessageId) === groupId
+      ) {
+        run.push(entries[j]);
+        j++;
+      }
+      if (run.length === 1) {
+        out.push({ ...entry, index: out.length });
+        i++;
+        continue;
+      }
+      // Sort the run by the underlying shardIndex to ensure byte-faithful
+      // ordering. (Head/tail emission keeps chronological order, but defending
+      // against reorderings is cheap.)
+      const sortedRun = [...run].sort((a, b) => {
+        const ma = a.sourceMessageId ? store.get(a.sourceMessageId) : null;
+        const mb = b.sourceMessageId ? store.get(b.sourceMessageId) : null;
+        return (ma?.shardIndex ?? 0) - (mb?.shardIndex ?? 0);
+      });
+      // Build merged text content. Non-text blocks (rare in shards) are
+      // preserved on the first shard's entry only.
+      const mergedTextParts: string[] = [];
+      const nonTextBlocks: ContentBlock[] = [];
+      for (const r of sortedRun) {
+        for (const block of r.content) {
+          if (block.type === 'text') mergedTextParts.push(block.text);
+          else nonTextBlocks.push(block);
+        }
+      }
+      const mergedContent: ContentBlock[] = [
+        ...nonTextBlocks,
+        { type: 'text', text: mergedTextParts.join('') },
+      ];
+      out.push({
+        index: out.length,
+        sourceMessageId: sortedRun[0].sourceMessageId,
+        sourceRelation: 'copy',
+        participant: sortedRun[0].participant,
+        content: mergedContent,
+      });
+      i = j;
+    }
+    return out;
+  }
+
+  /** Get (lazily constructing) the configured picker instance. */
+  protected getAdaptivePicker(): Picker {
+    if (this._adaptivePicker) return this._adaptivePicker;
+    const strategy: FoldingStrategy =
+      this.config.foldingStrategy === 'oldest-first'
+        ? new OldestFirstStrategy()
+        : new FlatProfileStrategy();
+    this._adaptivePicker = new Picker(strategy);
+    return this._adaptivePicker;
+  }
+
+  /**
+   * Walk the summary tree to find the L_k ancestor of a message.
+   * Returns null if no ancestor exists at that level (e.g., L_k not yet produced).
+   *
+   * Takes a pre-built summariesById map to avoid O(summaries) lookups per
+   * call — for a chronicle with thousands of summaries and hundreds of
+   * middle messages, the O(n) `find` would dominate compile latency.
+   */
+  protected findAncestorAt(
+    messageId: MessageId,
+    level: number,
+    chunksByMessageId: ReadonlyMap<MessageId, Chunk>,
+    summariesById?: ReadonlyMap<string, SummaryEntry>,
+  ): SummaryEntry | null {
+    if (level <= 0) return null;
+    const chunk = chunksByMessageId.get(messageId);
+    if (!chunk?.summaryId) return null;
+    const lookup = (id: string): SummaryEntry | undefined =>
+      summariesById ? summariesById.get(id) : this.summaries.find((s) => s.id === id);
+    let current: SummaryEntry | undefined = lookup(chunk.summaryId);
+    while (current && current.level < level) {
+      const parentId = getSummaryParentId(current);
+      if (!parentId) return null;
+      current = lookup(parentId);
+    }
+    if (!current || current.level !== level) return null;
+    return current;
+  }
+
+  // ============================================================================
+  // Hierarchical (threshold-driven) path
+  // ============================================================================
 
   /**
    * Select context entries using hierarchical compression with budget carryover.
@@ -1552,23 +2964,113 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Build the compression instruction for an L1 chunk.
-   * Override in subclasses for phase-aware prompts.
+   * Build the compression instruction for an L1 chunk in the hierarchical
+   * path. Override in subclasses for domain-specific prompts (e.g.,
+   * phase-aware prompts in KnowledgeStrategy).
+   *
+   * Default returns the KV-preserving first-person instruction matching
+   * the hermes-autobio spec. The doc/reading-mode variant is exposed via
+   * {@link getReadingChunkInstruction}.
    */
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
-    return `Starting from my last message, please describe everything that has happened. Aim for about ${targetTokens} tokens. Describe it as you would to yourself, as if you are remembering what has happened.`;
+    return formatInstruction(targetTokens);
+  }
+
+  /**
+   * Build the compression instruction for an L1 chunk that is part of a
+   * substantially larger sharded message (reading mode). Override in
+   * subclasses if domain logic needs to vary the reading-mode prompt.
+   *
+   * Default returns the reading-mode instruction that asks the model to
+   * reflect on what reading was like rather than form a memory "of what
+   * the chunk contained", which prevents voice drift into the content
+   * author's perspective.
+   */
+  protected getReadingChunkInstruction(
+    chunk: Chunk,
+    totalTokens: number,
+    targetTokens: number,
+  ): string {
+    return formatReadingChunkInstruction(totalTokens, targetTokens);
+  }
+
+  /**
+   * If the chunk is part of a substantially larger sharded message (total
+   * bodyGroup tokens ≥ 2× the chunk's own tokens), return reading-context
+   * metadata for the reading instruction. The 2× threshold means the
+   * chunk represents a portion of something significantly larger — the
+   * agent is reading, not conversing.
+   *
+   * Returns null when the chunk is a whole message (no bodyGroup), or
+   * when bodyGroup total is < 2× chunk size (degenerate case — chunk
+   * effectively IS the whole message). In those cases the standard
+   * (non-reading) instruction is appropriate.
+   */
+  protected detectDocContext(
+    chunk: Chunk,
+    ctx: StrategyContext,
+  ): { totalTokens: number; chunkTokens: number } | null {
+    if (chunk.messages.length === 0) return null;
+    const firstGroupId = chunk.messages[0].bodyGroupId;
+    if (!firstGroupId) return null;
+    // All messages in the chunk must share the same bodyGroupId
+    for (const m of chunk.messages) {
+      if (m.bodyGroupId !== firstGroupId) return null;
+    }
+    // Total tokens of the original message (sum of all shards in the bodyGroup).
+    const allMessages = ctx.messageStore.getAll();
+    let totalTokens = 0;
+    for (const m of allMessages) {
+      if (m.bodyGroupId === firstGroupId) {
+        totalTokens += ctx.messageStore.estimateTokens(m);
+      }
+    }
+    // Tokens in this chunk specifically.
+    let chunkTokens = 0;
+    for (const m of chunk.messages) {
+      chunkTokens += ctx.messageStore.estimateTokens(m);
+    }
+    // Reading-mode threshold: the original message must be substantially
+    // larger than this chunk. 2× means the chunk is at most half of the
+    // whole — clearly a portion of something bigger.
+    if (chunkTokens === 0 || totalTokens < 2 * chunkTokens) return null;
+    return {
+      totalTokens,
+      chunkTokens,
+    };
   }
 
   /**
    * Build the merge instruction for combining summaries into a higher level.
    * Override in subclasses for domain-specific merge prompts.
+   *
+   * Default returns the KV-preserving merge instruction. The reading-mode
+   * variant (used when all leaves share a bodyGroup of substantial size)
+   * is exposed via {@link getReadingMergeInstruction}.
    */
   protected getMergeInstruction(
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
     targetTokens: number
   ): string {
-    return `Please consolidate the memories since my last message into a single cohesive memory. Aim for about ${targetTokens} tokens. Write as you would to yourself — this is your autobiography, capturing the arc of what happened.`;
+    const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
+    return formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+  }
+
+  /**
+   * Build the reading-mode merge instruction. Used when all leaf messages
+   * underlying the merge share a bodyGroup of substantial size — the agent
+   * has been reading a doc rather than conversing. Override in subclasses
+   * if domain logic needs to vary the reading-mode merge prompt.
+   */
+  protected getReadingMergeInstruction(
+    targetLevel: SummaryLevel,
+    sources: SummaryEntry[],
+    totalTokens: number,
+    targetTokens: number,
+  ): string {
+    const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
+    return formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 
   /**

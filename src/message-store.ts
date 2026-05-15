@@ -102,13 +102,30 @@ export class MessageStore {
   }
 
   /**
+   * Optional extra fields for `append`, used by callers that need to set
+   * adaptive-resolution metadata (bodyGroupId for shards, initial
+   * resolution state, etc.) at ingestion time.
+   */
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
+
+  /**
    * Append a new message to the store.
+   *
+   * `extra` is an optional bag of adaptive-resolution metadata
+   * (bodyGroupId / shardIndex / currentResolution / lockedByAgent) that
+   * callers may set at ingestion. Field semantics match StoredMessage.
    */
   append(
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
-    causedBy?: MessageId[]
+    causedBy?: MessageId[],
+    extra?: {
+      bodyGroupId?: string;
+      shardIndex?: number;
+      currentResolution?: number;
+      lockedByAgent?: boolean;
+    }
   ): StoredMessage {
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
@@ -120,6 +137,7 @@ export class MessageStore {
       metadata,
       timestamp: Date.now(),
       causedBy,
+      ...(extra ?? {}),
     };
 
     const record = this.store.appendToStateJson(this.stateId, partialInternal);
@@ -166,6 +184,7 @@ export class MessageStore {
       metadata,
       timestamp: new Date(partialInternal.timestamp),
       causedBy,
+      ...(extra ?? {}),
     };
 
     // Update index
@@ -177,6 +196,11 @@ export class MessageStore {
 
   /**
    * Edit a message's content.
+   *
+   * Throws if `messageId` belongs to a bodyGroup (i.e., is a shard of a
+   * larger sharded message). Editing one shard would silently corrupt the
+   * bodyGroup's byte-faithful reassembly invariant. To replace a sharded
+   * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
     const index = this.idToIndex.get(messageId);
@@ -187,6 +211,13 @@ export class MessageStore {
     const oldMessage = this.getInternal(index);
     if (!oldMessage) {
       throw new Error(`Message not found at index: ${index}`);
+    }
+
+    if (oldMessage.bodyGroupId) {
+      throw new Error(
+        `Cannot edit shard ${messageId}: it is part of bodyGroup ${oldMessage.bodyGroupId}. ` +
+          `Sharded messages are immutable — remove the whole bodyGroup and re-append instead.`,
+      );
     }
 
     const oldContent = this.blobManager.resolveBlobs(oldMessage.content);
@@ -205,11 +236,24 @@ export class MessageStore {
 
   /**
    * Remove a message from the store.
+   *
+   * For a sharded message (one shard of a bodyGroup), the caller MUST
+   * remove all shards in the group together — removing one shard would
+   * orphan the rest and break byte-faithful reassembly. Use
+   * `removeBodyGroup(id)` for that case.
    */
   remove(messageId: MessageId): void {
     const index = this.idToIndex.get(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
+    }
+
+    const target = this.getInternal(index);
+    if (target?.bodyGroupId) {
+      throw new Error(
+        `Cannot remove shard ${messageId} in isolation: it is part of bodyGroup ${target.bodyGroupId}. ` +
+          `Use removeBodyGroup(${messageId}) to remove all shards atomically.`,
+      );
     }
 
     this.store.redactStateItems(this.stateId, index, index + 1);
@@ -219,7 +263,46 @@ export class MessageStore {
   }
 
   /**
+   * Remove every shard of the bodyGroup containing `messageId`. If the
+   * message is not part of a bodyGroup, falls back to single-message
+   * remove. Atomic from the caller's perspective.
+   */
+  removeBodyGroup(messageId: MessageId): void {
+    const index = this.idToIndex.get(messageId);
+    if (index === undefined) {
+      throw new Error(`Message not found: ${messageId}`);
+    }
+    const target = this.getInternal(index);
+    if (!target?.bodyGroupId) {
+      // Not sharded — defer to normal remove path (re-look up via getInternal
+      // since the normal `remove` checks bodyGroupId).
+      this.store.redactStateItems(this.stateId, index, index + 1);
+      this.rebuildIndex();
+      this.emit({ type: 'remove', messageId });
+      return;
+    }
+    // Find the contiguous run of shards with this bodyGroupId. Shards are
+    // stored consecutively (they're appended one after the other at
+    // ingestion), so we can scan outward from `index`.
+    const groupId = target.bodyGroupId;
+    const all = this.getAllInternal();
+    let from = index;
+    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
+    let to = index;
+    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const firstId = all[from].id;
+    const lastId = all[to].id;
+    this.store.redactStateItems(this.stateId, from, to + 1);
+    this.rebuildIndex();
+    this.emit({ type: 'removeRange', fromId: firstId, toId: lastId });
+  }
+
+  /**
    * Remove a range of messages from the store.
+   *
+   * If the range starts or ends in the middle of a bodyGroup, throws —
+   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
+   * to remove an entire group, then call `removeRange` over plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
     const fromIndex = this.idToIndex.get(fromId);
@@ -230,6 +313,21 @@ export class MessageStore {
     }
     if (toIndex === undefined) {
       throw new Error(`Message not found: ${toId}`);
+    }
+
+    // Verify the range doesn't bisect a bodyGroup.
+    const all = this.getAllInternal();
+    const startGroup = all[fromIndex].bodyGroupId;
+    const endGroup = all[toIndex].bodyGroupId;
+    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+      throw new Error(
+        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+      );
+    }
+    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+      throw new Error(
+        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+      );
     }
 
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
@@ -483,7 +581,7 @@ export class MessageStore {
     id: MessageId,
     _index: number,
   ): StoredMessage {
-    return {
+    const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
       // (see `add()` line 131: `sequence: record.sequence`). The previous
@@ -503,6 +601,12 @@ export class MessageStore {
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,
     };
+    // Carry adaptive-resolution fields through unchanged.
+    if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
+    if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
+    if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
+    if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
+    return stored;
   }
 }
 

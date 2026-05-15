@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane } from '@animalabs/membrane';
+import type { Membrane, ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
 
@@ -125,6 +125,41 @@ export interface ContextStrategy {
     log: ContextLogView,
     budget: TokenBudget
   ): ContextEntry[];
+
+  /**
+   * Optional: at ingestion time, decide whether to split this incoming
+   * message into multiple shards (because it's too large to be a single
+   * fold unit). If returned, the framework stores each shard as a separate
+   * StoredMessage with the shared `bodyGroupId` and per-shard `shardIndex`,
+   * and the render path will reassemble them into one API message at
+   * compile time.
+   *
+   * Return null or undefined to skip chunking (message stored as one record).
+   *
+   * See `docs/adaptive-resolution-design.md` §3.6.
+   */
+  chunkIngressMessage?(
+    participant: string,
+    content: ContentBlock[]
+  ): IngressChunkResult | null;
+}
+
+/**
+ * Result of a strategy's ingestion-time chunking decision.
+ */
+export interface IngressChunkResult {
+  /** Stable id shared by all shards of this message. */
+  bodyGroupId: string;
+  /**
+   * The shards in source order. Each becomes a separate StoredMessage.
+   * Concatenating the shards' text content must reproduce the original
+   * message body byte-for-byte.
+   */
+  shards: Array<{
+    content: ContentBlock[];
+    /** Order within the bodyGroup, starting at 0. */
+    shardIndex: number;
+  }>;
 }
 
 /**
@@ -379,40 +414,104 @@ export interface AutobiographicalConfig {
    * that overflow is rare, and when it does happen you want to know.
    */
   enforceBudget?: boolean;
+
+  // --- Adaptive resolution (per docs/adaptive-resolution-design.md) ---
+
+  /**
+   * Enable picker-driven adaptive resolution. When true, `select()` uses
+   * the FoldingStrategy + Picker to choose per-message resolution under
+   * token-budget pressure rather than the threshold-driven `checkMergeThreshold`
+   * path. Default: false (existing hierarchical behavior preserved).
+   */
+  adaptiveResolution?: boolean;
+
+  /**
+   * Folding strategy name when adaptiveResolution is on. One of:
+   *   'flat-profile' (default) — level-equalizing
+   *   'oldest-first' — chronological
+   * Custom strategies can be plugged in by the host application.
+   */
+  foldingStrategy?: 'flat-profile' | 'oldest-first';
+
+  /**
+   * Slack ratio (hysteresis) for the picker. The picker folds until total
+   * tokens ≤ budget * (1 - slack), and stays quiet while between slack
+   * and budget. Default 0.1.
+   */
+  compressionSlackRatio?: number;
+
+  /**
+   * Enable bottom-up speculative pre-production of higher-level summaries.
+   * When a new L_k summary is produced, if N siblings exist that would share
+   * an L_{k+1} parent, the L_{k+1} is enqueued for production immediately
+   * (no picker request needed). Default true when adaptiveResolution is on.
+   */
+  speculativeProduction?: boolean;
 }
 
 /**
  * Compression level in the hierarchical pyramid.
+ *
+ * Historically constrained to 1 | 2 | 3. As of the adaptive-resolution design
+ * (`docs/adaptive-resolution-design.md`), levels are unbounded: the picker
+ * can recursively produce L4, L5, ... as needed. The narrower literal type
+ * is kept as `LegacySummaryLevel` for code that still assumes the old shape.
  */
-export type SummaryLevel = 1 | 2 | 3;
+export type SummaryLevel = number;
+
+/**
+ * The narrow level type used by pre-adaptive-resolution code paths.
+ * Prefer `SummaryLevel` for new code.
+ */
+export type LegacySummaryLevel = 1 | 2 | 3;
 
 /**
  * A summary entry in the hierarchical memory pyramid.
  * L1: compressed from raw message chunks.
- * L2: merged from mergeThreshold L1s.
- * L3: merged from mergeThreshold L2s.
+ * L_{k>1}: merged from mergeThreshold L_{k-1}s.
  */
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
   id: string;
-  /** Compression level */
+  /** Compression level (1, 2, 3, ... — unbounded in the adaptive-resolution design) */
   level: SummaryLevel;
   /** The summary text */
   content: string;
-  /** Estimated token count (content.length / 4) */
+  /** Estimated token count (content.length / 4 or tokenizer-cached) */
   tokens: number;
-  /** Level of the sources: 0 = raw messages, 1 = L1s, 2 = L2s */
-  sourceLevel: 0 | 1 | 2;
-  /** IDs of source items (message IDs for L1, summary IDs for L2/L3) */
+  /**
+   * Level of the sources: 0 = raw messages, k = L_k summaries.
+   * Pre-adaptive code uses 0 | 1 | 2; new code may produce higher values.
+   */
+  sourceLevel: number;
+  /** IDs of source items (message IDs for L1, summary IDs for L_{k>1}) */
   sourceIds: string[];
   /** Range of original message IDs covered */
   sourceRange: { first: string; last: string };
-  /** If merged into a higher-level summary, that summary's ID */
+  /**
+   * The L_{level+1} summary this one is a source for, if produced.
+   * Pure archive metadata in the adaptive-resolution design — display
+   * decisions live on per-chunk `currentResolution`, not here.
+   */
+  parentId?: string;
+  /**
+   * @deprecated Renamed to `parentId` in the adaptive-resolution design.
+   * Kept for read compatibility with chronicles produced by the old
+   * threshold-driven path. New writes should set `parentId` only.
+   */
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
+}
+
+/**
+ * Helper: read the parent pointer from a summary, accepting either the
+ * new `parentId` field or the deprecated `mergedInto` alias.
+ */
+export function getSummaryParentId(s: SummaryEntry): string | undefined {
+  return s.parentId ?? s.mergedInto;
 }
 
 /**
