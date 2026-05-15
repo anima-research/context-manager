@@ -60,6 +60,27 @@ export interface Chunk {
 }
 
 /**
+ * Point-in-time snapshot of compression progress, returned from
+ * `AutobiographicalStrategy.getProgressSnapshot()`. External observers
+ * (warmup scripts, dashboards) use this to track convergence without
+ * reaching into the strategy's protected fields.
+ */
+export interface AutobiographicalProgressSnapshot {
+  /** All chunks the strategy is tracking, compressed or not. */
+  totalChunks: number;
+  /** Chunks that already have an L1 summary. */
+  chunksCompressed: number;
+  /** Chunks queued for L1 compression. */
+  l1QueueLength: number;
+  /** Pending L1→L2 and L2→L3 merges. */
+  mergeQueueLength: number;
+  /** Stored summary counts per level (1 = raw L1, 2 = L1→L2 merge, 3 = L2→L3 merge). */
+  summaryCounts: { l1: number; l2: number; l3: number };
+  /** True if a compression or merge LLM call is currently in flight. */
+  pending: boolean;
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -578,6 +599,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.pendingCompression = null;
       }
     }
+  }
+
+  /**
+   * Snapshot of compression progress. Intended for external observers
+   * (warmup scripts, dashboards) that need to track convergence without
+   * reaching into protected fields. Values are point-in-time copies; mutating
+   * them does not affect strategy state.
+   */
+  getProgressSnapshot(): AutobiographicalProgressSnapshot {
+    let chunksCompressed = 0;
+    for (const c of this.chunks) if (c.compressed) chunksCompressed++;
+    let l1 = 0, l2 = 0, l3 = 0;
+    for (const s of this.summaries) {
+      if (s.level === 1) l1++;
+      else if (s.level === 2) l2++;
+      else if (s.level === 3) l3++;
+    }
+    return {
+      totalChunks: this.chunks.length,
+      chunksCompressed,
+      l1QueueLength: this.compressionQueue.length,
+      mergeQueueLength: this.mergeQueue.length,
+      summaryCounts: { l1, l2, l3 },
+      pending: this.pendingCompression !== null,
+    };
   }
 
   select(
