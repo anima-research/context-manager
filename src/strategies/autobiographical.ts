@@ -1507,11 +1507,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Build the KV-preserving prompt per hermes-autobio spec:
     //
-    //   1. Prior L1 summaries — narrativized as CM-asks / agent-recalls
-    //      pairs, in source order. ALL existing L1s at L1 fidelity
-    //      regardless of merge state ("fill lower orbitals first").
+    //   1. Prior summaries — narrativized as CM-asks / agent-recalls
+    //      pairs, in source order. The unmerged frontier of the
+    //      summary forest: any summary that has not yet been merged
+    //      into a higher level. After merges run, the L_{k+1} replaces
+    //      its L_k children — using the children plus their parent
+    //      doubles the prompt size unboundedly.
     //   2. Head — raw messages before the chunk that aren't already
-    //      represented by a prior L1.
+    //      represented by a prior summary.
     //   3. Marker — in-band signal that a memory is about to form.
     //   4. Chunk — raw messages being compressed, as the agent
     //      experienced them.
@@ -1522,13 +1525,53 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // as-of framing of memory formation.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // ---- 1. Prior L1 recall pairs ----
-    // Sort by source position so the agent walks its prior memories
-    // chronologically, matching how it would have formed them.
-    const priorL1s = this.summaries
-      .filter((s) => s.level === 1)
+    // ---- 1. Prior recall pairs ----
+    // Filter to the unmerged frontier: any summary whose `mergedInto`
+    // is unset. After merge, the children's mergedInto points at the
+    // parent and the parent stands alone with that source range. The
+    // original "ALL L1s regardless of merge state" rule was a fidelity
+    // optimization that scales catastrophically: a 4000-message import
+    // converged to ~500 L1s that never aged out, blowing the 200k
+    // window around chunk 118.
+    const priorSummaries = this.summaries
+      .filter((s) => !s.mergedInto)
       .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
-    for (const s of priorL1s) {
+
+    // Token-budget cap on recall pairs as defense-in-depth. With merged
+    // exclusion the set is bounded by `mergeThreshold^depth`, but a
+    // conversation with thousands of unmerged top-level summaries can
+    // still overflow. Newest-first selection so proximate context is
+    // preferred; the kept set is re-sorted chronologically below. We
+    // always keep at least one summary even if it's larger than the
+    // budget — otherwise a single oversized summary would leave the
+    // model with no compressed context at all.
+    const recallBudget = this.config.compressionRecallBudgetTokens ?? 150_000;
+    const keptSummaries: SummaryEntry[] = [];
+    let recallTokens = 0;
+    for (let i = priorSummaries.length - 1; i >= 0; i--) {
+      const s = priorSummaries[i]!;
+      const approxTokens = Math.ceil(s.content.length / 4);
+      if (recallTokens + approxTokens > recallBudget && keptSummaries.length > 0) break;
+      keptSummaries.push(s);
+      recallTokens += approxTokens;
+    }
+    keptSummaries.reverse();
+    if (keptSummaries.length < priorSummaries.length) {
+      const dropped = priorSummaries.length - keptSummaries.length;
+      console.warn(
+        `autobio: recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
+          `~${recallTokens} tokens, budget ${recallBudget}; ${dropped} oldest dropped this compression).`,
+      );
+      logCompressionCall({
+        event: 'recall-budget-capped',
+        kept: keptSummaries.length,
+        total: priorSummaries.length,
+        tokens: recallTokens,
+        budgetTokens: recallBudget,
+      });
+    }
+
+    for (const s of keptSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
@@ -1567,19 +1610,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Any raw messages between the head and the chunk that aren't yet
-    // represented by an L1 — usually empty in adaptive-resolution mode,
-    // since chunking proceeds contiguously and L1s exist for everything
-    // up to the chunk being processed.
+    // represented by any summary — usually empty in adaptive-resolution
+    // mode, since chunking proceeds contiguously and summaries cover
+    // everything up to the chunk being processed. Uses the full
+    // priorSummaries set (not the budget-capped keptSummaries) because
+    // the dedup question is "is this raw message covered by *any* live
+    // summary?" — a budget-dropped summary doesn't make the underlying
+    // raw messages reappear.
     const chunkFirstId = chunk.messages[0]?.id;
     if (chunkFirstId) {
-      const priorL1MessageIds = new Set<string>();
-      for (const s of priorL1s) {
-        for (const id of s.sourceIds) priorL1MessageIds.add(id);
+      const priorSummaryMessageIds = new Set<string>();
+      for (const s of priorSummaries) {
+        for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
       }
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
         const m = allMessages[i];
-        if (priorL1MessageIds.has(m.id)) continue;
+        if (priorSummaryMessageIds.has(m.id)) continue;
         llmMessages.push({ participant: m.participant, content: m.content });
       }
     }
@@ -1688,7 +1735,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
           chunk_size: chunk.messages.length,
-          prior_l1_count: priorL1s.length,
+          prior_summary_count: priorSummaries.length,
+          prior_summary_count_kept: keptSummaries.length,
+          prior_summary_tokens: recallTokens,
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,

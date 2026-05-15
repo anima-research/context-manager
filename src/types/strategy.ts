@@ -338,6 +338,19 @@ export interface AutobiographicalConfig {
   l1BudgetTokens?: number;
 
   /**
+   * Cap on the total tokens of recall-pair prior-summary content
+   * included in each chunk compression request (default: 150000).
+   *
+   * Defends against the case where the unmerged frontier itself is
+   * large enough to overflow the API window. The cap walks summaries
+   * newest-first so proximate context survives; the kept set is then
+   * re-sorted chronologically. Set higher (or to Infinity) if you want
+   * to surface overflow via a 400 rather than silently drop oldest
+   * memories from the compression context.
+   */
+  compressionRecallBudgetTokens?: number;
+
+  /**
    * When true (default), each selected summary emits as its own positioned
    * Q/A recall pair, sorted chronologically by source range. When false,
    * all selected summaries are concatenated into one Q/A pair between head
