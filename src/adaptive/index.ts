@@ -46,10 +46,6 @@ export {
 // Render helpers
 export { concatBodyGroups, placeholderRecallText } from './render.js';
 
-// Lock API
-export {
-  lockChunk,
-  unlockChunk,
-  InMemoryLockStore,
-  type ChunkLockStore,
-} from './lock-api.js';
+// Chunk locking is exposed as a method on `AutobiographicalStrategy`
+// (`lockChunk(id)` / `unlockChunk(id)`); there is no standalone lock API at
+// the adaptive layer. The picker honors `PickerChunk.lockedByAgent`.

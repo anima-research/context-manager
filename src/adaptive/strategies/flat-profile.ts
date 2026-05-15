@@ -70,12 +70,17 @@ export class FlatProfileStrategy implements FoldingStrategy {
     const parentSummary = oldestChunk.ancestorAt(parentLevel);
     if (!parentSummary) {
       // L_{k+1} not produced for this chunk's group yet — request it.
-      // We need to determine the range of chunks that should be summarized.
-      // For level 0 (raw → L1), the range is determined by the chunker /
-      // existing L1 production logic; we pass the chunk's own id as a hint.
-      // For level k > 0, the range is the chunks under all siblings at level k
-      // sharing a future L_{k+1} parent — but since the L_{k+1} doesn't exist
-      // yet, we use the chunk's existing L_k ancestor's range.
+      //
+      // Range semantics differ by level:
+      //  - bestLevel === 0: the caller is asking for an L1 covering this
+      //    raw chunk. In the autobio chunker model the chunk-to-L1 mapping
+      //    is 1:1 — a chunk's message span IS the L1's source range — so
+      //    a single-chunk range is the correct request. (Strategies that
+      //    bundle N raw chunks into one L1 would override this.)
+      //  - bestLevel > 0: the caller is asking for an L_{k+1} merge. We
+      //    use the chunk's existing L_k ancestor's range as a request
+      //    hint; the consumer expands it to cover the full sibling set
+      //    at L_k that should consolidate into the missing L_{k+1}.
       const lkAncestor = bestLevel === 0 ? null : oldestChunk.ancestorAt(bestLevel);
       const range = lkAncestor
         ? {

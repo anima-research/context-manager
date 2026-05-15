@@ -28,6 +28,7 @@ import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingStrategy,
   FoldingBudget,
+  FoldOp,
   ChunkId,
   SummaryId,
 } from '../adaptive/folding-strategy.js';
@@ -763,6 +764,137 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return merge;
   }
 
+  /**
+   * Translate produce ops emitted by the picker into concrete work items on
+   * the strategy's own queues. Two cases:
+   *
+   *  - `level === 1`: the picker has asked for L1 coverage on a raw chunk.
+   *    In the autobio chunker model, each chunk maps to exactly one L1, so
+   *    we locate the chunk whose messages fall in `op.range` and ensure
+   *    it is queued for L1 compression. If the chunker hasn't realized the
+   *    message yet, we skip silently — the next `rebuildChunks` will pick
+   *    it up.
+   *
+   *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
+   *    range. We gather unmerged L_{n-1} summaries whose source ranges
+   *    fall within that range (de-duplicated against entries already in
+   *    `mergeQueue`) and enqueue a single merge over them. The merge fires
+   *    on the next `tick()`.
+   *
+   * The handler is conservative: it never enqueues a singleton or empty
+   * merge, and it never re-enqueues an id that's already pending. That
+   * keeps the next-compile picker loop convergent even when the same
+   * produce op gets re-emitted before the work completes.
+   */
+  protected handleProducedOps(ops: readonly FoldOp[]): void {
+    for (const op of ops) {
+      if (op.kind !== 'produce') continue;
+      if (op.level === 1) {
+        this.enqueueL1ForRange(op.range.firstChunkId, op.range.lastChunkId);
+      } else if (op.level >= 2) {
+        this.enqueueMergeForRange(
+          op.level,
+          op.range.firstChunkId,
+          op.range.lastChunkId,
+        );
+      }
+    }
+  }
+
+  /**
+   * Ensure that chunks whose message range overlaps [firstMsgId..lastMsgId]
+   * are queued for L1 compression. No-op if the matching chunk is already
+   * compressed or already in the queue.
+   */
+  protected enqueueL1ForRange(firstMsgId: MessageId, lastMsgId: MessageId): void {
+    const messageIdToChunk = new Map<MessageId, Chunk>();
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) messageIdToChunk.set(m.id, ch);
+    }
+    const candidates = new Set<Chunk>();
+    const first = messageIdToChunk.get(firstMsgId);
+    const last = messageIdToChunk.get(lastMsgId);
+    if (first) candidates.add(first);
+    if (last) candidates.add(last);
+    // Also catch chunks fully spanned by the range (rare, but supports the
+    // case where the picker requests an L1 that should logically cover
+    // multiple chunks worth of messages — we err on the side of producing
+    // L1s for every spanned chunk).
+    if (first && last && first.index !== last.index) {
+      const [lo, hi] = first.index < last.index
+        ? [first.index, last.index]
+        : [last.index, first.index];
+      for (let i = lo; i <= hi; i++) {
+        const ch = this.chunks[i];
+        if (ch) candidates.add(ch);
+      }
+    }
+    for (const chunk of candidates) {
+      if (chunk.compressed) continue;
+      if (this.compressionQueue.includes(chunk.index)) continue;
+      this.compressionQueue.push(chunk.index);
+    }
+  }
+
+  /**
+   * Enqueue an L_{targetLevel} merge over unmerged L_{targetLevel-1}
+   * summaries whose source ranges fall within [firstMsgId..lastMsgId].
+   * No-op if fewer than 2 viable sources are available (a singleton merge
+   * would just rename a summary without consolidating).
+   */
+  protected enqueueMergeForRange(
+    targetLevel: number,
+    firstMsgId: MessageId,
+    lastMsgId: MessageId,
+  ): void {
+    const sourceLevel = targetLevel - 1;
+
+    // IDs already enqueued at this target level.
+    const queuedAtLevel = new Set<string>();
+    for (const m of this.mergeQueue) {
+      if (m.level === targetLevel) {
+        for (const id of m.sourceIds) queuedAtLevel.add(id);
+      }
+    }
+
+    // Sequence index per message id, for "within range" tests. Use the
+    // current chunk store as the ordering source.
+    const messageOrder = new Map<MessageId, number>();
+    let seq = 0;
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) {
+        messageOrder.set(m.id, seq++);
+      }
+    }
+    const firstSeq = messageOrder.get(firstMsgId);
+    const lastSeq = messageOrder.get(lastMsgId);
+
+    const inRange = (msgId: MessageId): boolean => {
+      if (firstSeq === undefined || lastSeq === undefined) return true;
+      const s = messageOrder.get(msgId);
+      if (s === undefined) return false;
+      const [lo, hi] = firstSeq <= lastSeq ? [firstSeq, lastSeq] : [lastSeq, firstSeq];
+      return s >= lo && s <= hi;
+    };
+
+    const sources: SummaryEntry[] = [];
+    for (const s of this.summaries) {
+      if (s.level !== sourceLevel) continue;
+      if (getSummaryParentId(s)) continue;
+      if (queuedAtLevel.has(s.id)) continue;
+      if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
+      sources.push(s);
+    }
+    if (sources.length < 2) return;
+
+    const N = this.config.mergeThreshold ?? 6;
+    const toMerge = sources.slice(0, N);
+    this.enqueueMerge({
+      level: targetLevel as SummaryLevel,
+      sourceIds: toMerge.map((s) => s.id),
+    });
+  }
+
   checkReadiness(): ReadinessState {
     if (this.pendingCompression) {
       return {
@@ -1428,8 +1560,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // model to reflect from its own vantage point in agent-first-person.
     const docContext = this.detectDocContext(chunk, ctx);
     const instructionText = docContext
-      ? formatReadingChunkInstruction(docContext.totalTokens, targetTokens)
-      : formatInstruction(targetTokens);
+      ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
+      : this.getCompressionInstruction(chunk, targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
       content: [{ type: 'text', text: instructionText }],
@@ -1839,13 +1971,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     const mergeInstructionText = mergeReadingContext
-      ? formatReadingMergeInstruction(
+      ? this.getReadingMergeInstruction(
           targetLevel,
-          sourceLevelShown,
+          sources,
           mergeReadingContext.totalTokens,
           targetTokens,
         )
-      : formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+      : this.getMergeInstruction(targetLevel, sources, targetTokens);
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
@@ -2130,6 +2262,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (resolutionsChanged) {
       this.persistResolutions();
+    }
+
+    // Wire produce ops into the strategy's own production queues so that
+    // requested-but-not-yet-existing summaries actually get built. The
+    // speculative pre-producer covers most cases ambiently, but when it is
+    // disabled (`speculativeProduction: false`) or hasn't reached the level
+    // the picker just asked for, the request would otherwise be dropped and
+    // the picker would re-emit it on every subsequent compile. Handling it
+    // here makes the produce path observable and convergent.
+    //
+    // The actual compression/merge work runs asynchronously via the next
+    // `tick()` invocation (or the speculative drain kicked from
+    // `onNewMessage`). This call only enqueues; it does not await.
+    if (result.produced.length > 0) {
+      this.handleProducedOps(result.produced);
     }
 
     // Hard-fail check: if the picker exhausted itself but the final render
@@ -2771,16 +2918,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Build the compression instruction for an L1 chunk.
+   * Build the compression instruction for an L1 chunk in the hierarchical
+   * path. Override in subclasses for domain-specific prompts (e.g.,
+   * phase-aware prompts in KnowledgeStrategy).
    *
-   * @deprecated The KV-preserving prompt builder in
-   *   `compressChunkHierarchical` uses `formatInstruction()` /
-   *   `formatDocChunkInstruction()` directly. This method is retained
-   *   for the legacy single-level path (`selectLegacy`) and for any
-   *   subclasses that override it for phase-aware prompts.
+   * Default returns the KV-preserving first-person instruction matching
+   * the hermes-autobio spec. The doc/reading-mode variant is exposed via
+   * {@link getReadingChunkInstruction}.
    */
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
-    return `Starting from my last message, please describe everything that has happened. Aim for about ${targetTokens} tokens. Describe it as you would to yourself, as if you are remembering what has happened.`;
+    return formatInstruction(targetTokens);
+  }
+
+  /**
+   * Build the compression instruction for an L1 chunk that is part of a
+   * substantially larger sharded message (reading mode). Override in
+   * subclasses if domain logic needs to vary the reading-mode prompt.
+   *
+   * Default returns the reading-mode instruction that asks the model to
+   * reflect on what reading was like rather than form a memory "of what
+   * the chunk contained", which prevents voice drift into the content
+   * author's perspective.
+   */
+  protected getReadingChunkInstruction(
+    chunk: Chunk,
+    totalTokens: number,
+    targetTokens: number,
+  ): string {
+    return formatReadingChunkInstruction(totalTokens, targetTokens);
   }
 
   /**
@@ -2832,13 +2997,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Build the merge instruction for combining summaries into a higher level.
    * Override in subclasses for domain-specific merge prompts.
+   *
+   * Default returns the KV-preserving merge instruction. The reading-mode
+   * variant (used when all leaves share a bodyGroup of substantial size)
+   * is exposed via {@link getReadingMergeInstruction}.
    */
   protected getMergeInstruction(
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
     targetTokens: number
   ): string {
-    return `Please consolidate the memories since my last message into a single cohesive memory. Aim for about ${targetTokens} tokens. Write as you would to yourself — this is your autobiography, capturing the arc of what happened.`;
+    const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
+    return formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+  }
+
+  /**
+   * Build the reading-mode merge instruction. Used when all leaf messages
+   * underlying the merge share a bodyGroup of substantial size — the agent
+   * has been reading a doc rather than conversing. Override in subclasses
+   * if domain logic needs to vary the reading-mode merge prompt.
+   */
+  protected getReadingMergeInstruction(
+    targetLevel: SummaryLevel,
+    sources: SummaryEntry[],
+    totalTokens: number,
+    targetTokens: number,
+  ): string {
+    const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
+    return formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 
   /**

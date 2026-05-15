@@ -17,7 +17,6 @@ import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.
 import type { FoldingBudget, ChunkId } from '../../src/adaptive/folding-strategy.js';
 import { chunkMessage } from '../../src/adaptive/chunker.js';
 import { MockChronicle, DEFAULT_MERGE_THRESHOLD } from './harness.js';
-import { lockChunk, unlockChunk, InMemoryLockStore } from '../../src/adaptive/lock-api.js';
 
 const BUDGET = (totalBudget: number, slack = 0.1): FoldingBudget => ({
   totalBudget,
@@ -180,7 +179,7 @@ test('integration: bodyGroupId chunks fold independently within one doc', () => 
   assert.ok(l0Count > 0 && l1Count > 0, `expected mixed L0+L1 within doc, got L0=${l0Count} L1=${l1Count}`);
 });
 
-test('integration: lock API prevents picker from raising a chunk', () => {
+test('integration: lockedByAgent prevents picker from raising a chunk', () => {
   const chronicle = new MockChronicle({ mergeThreshold: 6, recallPairTokens: 200 });
   for (let i = 0; i < 12; i++) {
     chronicle.addChunk({ id: `c-${i.toString().padStart(4, '0')}`, rawTokens: 100 });
@@ -189,12 +188,19 @@ test('integration: lock API prevents picker from raising a chunk', () => {
     chronicle.produceL1(chronicle.chunks.slice(i, i + 6).map((c) => c.id));
   }
 
-  // Lock chunk c-0002 via the API
-  const lockStore = new InMemoryLockStore();
-  lockChunk(lockStore, 'c-0002');
-  for (const c of chronicle.chunks) {
-    if (lockStore.isLocked(c.id)) c.lockedByAgent = true;
-  }
+  // Lock chunk c-0002 by setting lockedByAgent directly. In production this
+  // is set via AutobiographicalStrategy.lockChunk(id); here we exercise the
+  // picker's contract that lockedByAgent freezes a chunk's resolution.
+  const lockChunk = (id: ChunkId): void => {
+    for (const c of chronicle.chunks) if (c.id === id) c.lockedByAgent = true;
+  };
+  const unlockChunk = (id: ChunkId): void => {
+    for (const c of chronicle.chunks) if (c.id === id) c.lockedByAgent = false;
+  };
+  const isLocked = (id: ChunkId): boolean =>
+    chronicle.chunks.find((c) => c.id === id)?.lockedByAgent === true;
+
+  lockChunk('c-0002');
 
   const tailInfo = chronicle.computeHeadTail({ headTokens: 0, tailTokens: 100 });
   const picker = new Picker(new FlatProfileStrategy());
@@ -216,15 +222,11 @@ test('integration: lock API prevents picker from raising a chunk', () => {
       assert.equal(result.finalResolutions.get(sibling), 1, `${sibling} should be L1`);
     }
   }
-  // Verify the lock-store agrees with chunk state.
-  assert.equal(lockStore.isLocked('c-0002'), true);
+  assert.equal(isLocked('c-0002'), true);
 
   // Unlock and verify the lock state is cleared.
-  unlockChunk(lockStore, 'c-0002');
-  assert.equal(lockStore.isLocked('c-0002'), false);
-  for (const c of chronicle.chunks) {
-    c.lockedByAgent = lockStore.isLocked(c.id);
-  }
+  unlockChunk('c-0002');
+  assert.equal(isLocked('c-0002'), false);
   chronicle.applyResolutions(result.finalResolutions);
 
   // Without new pressure, the picker won't refire — that's correct

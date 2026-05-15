@@ -214,6 +214,88 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     manager.close();
   });
 
+  it('flag on + speculativeProduction off: produce ops from picker are enqueued, not dropped', async () => {
+    // When the speculative pre-producer is disabled, an L_n that the picker
+    // requires must be enqueued in response to the picker's produce ops —
+    // otherwise the next compile re-emits the same op and the strategy
+    // never makes progress.
+    const mock = makeMockMembrane();
+    const strategy = new AutobiographicalStrategy({
+      targetChunkTokens: 50,
+      recentWindowTokens: 50,
+      adaptiveResolution: true,
+      speculativeProduction: false,
+      mergeThreshold: 3,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: mock as any,
+    });
+
+    // Drive enough turns to build several L1s (threshold=3 keeps the
+    // legacy non-speculative checkMergeThreshold honest: L1→L2 fires when
+    // 3 unmerged L1s exist; we want more than that so the picker can ask
+    // for an L_n the legacy path hasn't enqueued).
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage('User', [{ type: 'text', text: `T${i}. ` + 'word '.repeat(20) }]);
+    }
+    while (!manager.isReady()) {
+      await manager.tick();
+    }
+
+    const summariesByLevel = (): Record<number, number> => {
+      const out: Record<number, number> = {};
+      for (const s of (strategy as any).summaries as Array<{ level: number }>) {
+        out[s.level] = (out[s.level] ?? 0) + 1;
+      }
+      return out;
+    };
+
+    // Synthesize a produce op as if the picker had requested an L2 over
+    // the L1 range. handleProducedOps is the unit under test.
+    const l1s = ((strategy as any).summaries as Array<{
+      level: number;
+      sourceRange: { first: string; last: string };
+    }>).filter((s) => s.level === 1);
+
+    if (l1s.length >= 2) {
+      const firstL1 = l1s[0];
+      const lastL1 = l1s[l1s.length - 1];
+      const queueBefore = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
+
+      // Directly invoke the handler with a synthetic produce op covering
+      // the L1 range. This is what selectAdaptive does when the picker
+      // returns produce ops; here we test it in isolation.
+      (strategy as any).handleProducedOps([
+        {
+          kind: 'produce',
+          level: 2,
+          range: {
+            firstChunkId: firstL1.sourceRange.first,
+            lastChunkId: lastL1.sourceRange.last,
+          },
+        },
+      ]);
+
+      const queueAfter = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
+      assert.ok(
+        queueAfter > queueBefore,
+        `expected handleProducedOps to enqueue an L2 merge; queue went ${queueBefore} → ${queueAfter}`
+      );
+
+      // Run the merge through.
+      while (!manager.isReady()) {
+        await manager.tick();
+      }
+
+      const counts = summariesByLevel();
+      assert.ok(counts[2] >= 1, `expected at least one L2 to exist after draining; got ${JSON.stringify(counts)}`);
+    }
+
+    manager.close();
+  });
+
   it('flag on: monotonic resolution across multiple compiles (no thrashing)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({

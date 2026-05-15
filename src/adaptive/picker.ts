@@ -36,7 +36,6 @@ import { getSummaryParentId } from '../types/strategy.js';
  * See `docs/adaptive-resolution-design.md` §3.10.
  */
 export class OverBudgetError extends Error {
-  readonly name = 'OverBudgetError';
   /** The hard budget the strategy was trying to fit under. */
   readonly budget: number;
   /** The token count the strategy could not reduce below `budget`. */
@@ -61,6 +60,9 @@ export class OverBudgetError extends Error {
         ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} chunks,` +
         ` deepest fold level=L${opts.diagnostics.deepestLevel})`
     );
+    // Writable per Error convention so instanceof-by-name works across
+    // iframe / vm boundaries; the field stays writable on the prototype.
+    this.name = 'OverBudgetError';
     this.budget = opts.budget;
     this.actual = opts.actual;
     this.diagnostics = opts.diagnostics;
@@ -123,7 +125,26 @@ export interface PickerResult {
   iterations: number;
 }
 
-const MAX_ITERATIONS = 10_000;
+/**
+ * Floor for the per-run loop bound. Scales with chronicle size to keep the
+ * picker from spuriously declaring non-convergence on large stores. See
+ * {@link iterationBound}.
+ */
+const MIN_ITERATIONS = 1_000;
+
+/**
+ * Compute the per-run loop bound from chronicle size. A well-behaved strategy
+ * converges in at most ~one op per chunk per level (`chunks.length * log_N`),
+ * so `chunks.length * 10` is a generous safety net at any reasonable N, and
+ * `MIN_ITERATIONS` ensures small chronicles still get adequate headroom for
+ * exploratory ops before the strategy commits to a fold.
+ *
+ * Returning a numeric bound rather than a constant means a 5K-chunk run no
+ * longer trips a fixed 10K ceiling that wasn't sized for it.
+ */
+function iterationBound(chunkCount: number): number {
+  return Math.max(MIN_ITERATIONS, chunkCount * 10);
+}
 
 export class Picker {
   constructor(private readonly strategy: FoldingStrategy) {}
@@ -133,8 +154,9 @@ export class Picker {
     const applied: FoldOp[] = [];
     const produced: FoldOp[] = [];
     let iterations = 0;
+    const maxIterations = iterationBound(inputs.chunks.length);
 
-    while (iterations < MAX_ITERATIONS) {
+    while (iterations < maxIterations) {
       const op = this.strategy.selectNextFold(state, budget);
       if (!op) break;
       iterations++;
@@ -152,9 +174,10 @@ export class Picker {
       }
     }
 
-    if (iterations >= MAX_ITERATIONS) {
+    if (iterations >= maxIterations) {
       throw new Error(
-        `Picker: strategy ${this.strategy.name} exceeded MAX_ITERATIONS (${MAX_ITERATIONS}); likely non-converging`
+        `Picker: strategy ${this.strategy.name} exceeded iteration bound (${maxIterations}` +
+          ` for ${inputs.chunks.length} chunks); likely non-converging`
       );
     }
 
