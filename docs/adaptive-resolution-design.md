@@ -1,9 +1,10 @@
 # Adaptive Resolution for AutobiographicalStrategy
 
-**Status:** Design draft (revision 2) · **Author(s):** antra-tess + Claude (Opus 4.7) · **Date:** 2026-05-12
+**Status:** Implemented (PR #19) · **Author(s):** antra-tess + Claude (Opus 4.7) · **Date:** 2026-05-12 (last reconciled 2026-05-15)
 
 ## Changelog
 
+- **rev 3.0 (2026-05-15)**: Reconciliation pass against the implementation that landed in PR #19. The architectural shape from rev 2.3 stood; this revision corrects the spots where the implementation diverged from or extended the doc — per-chunk state lives in dedicated state slots rather than on `MessageEntry` records, `mergedInto` is retained as a read-compat alias for `parentId` rather than removed, `FoldingState` is methods-not-fields, the picker returns `produced` ops for the strategy to route (not the picker itself), and the scope grew ~3× over the rev-2 estimate. Lock API simplified to strategy methods only.
 - **rev 2.3 (2026-05-13)**: Replaced the three-step hard-fail escalation ladder (tail-shrink → head-truncate → throw) with throw-only. The strategy raises `OverBudgetError` when the picker is exhausted and the result still exceeds the hard budget; the host decides how to recover. See §3.10.
 - **rev 2.2 (2026-05-13)**: Revised bodyGroup rendering. Rev 2 proposed one composite message with inline `[Section summary]` markers for folded portions; rev 2.2 switches to standard Q+A recall pairs interleaved with raw runs. Matches the existing agent experience for summaries. See §3.6.
 - **rev 2.1 (2026-05-12)**: Settled outstanding decisions. Slack default = 10%. Speculative production = bottom-up background pre-producer, default-on. `lockedByAgent` programmatic API set-only in V1, no agent tool. Migration deferred to follow-up PR; V1 validates via re-ingest on fresh chronicles.
@@ -89,36 +90,53 @@ A **region** at level k is not a stored object. It is the maximal contiguous run
 
 ```typescript
 interface MessageEntry {
-  // ... existing fields (id, role, content, timestamps, etc.) ...
+  // ... existing fields (id, participant, content, timestamps, etc.) ...
 
   /** The chunk's current display resolution. 0 = render raw; k > 0 = render
    *  the L_k ancestor's recall pair (collapsing this chunk and its
    *  L_k-sharing siblings into one rendered item). Default 0. */
-  currentResolution: number;
+  currentResolution?: number;
 
-  /** True if the agent explicitly fixed this chunk's resolution (V2). The
-   *  picker must not change the resolution while this is true. Default false. */
-  lockedByAgent: boolean;
+  /** True if the picker is forbidden from changing currentResolution for
+   *  this chunk. Set by `lockChunk()` (programmatic API) or, in V2, by the
+   *  agent's `unfold` tool. Default false. */
+  lockedByAgent?: boolean;
 
-  /** Sequence at which currentResolution was last set. Telemetry / debugging. */
-  resolutionChangedAt?: Sequence;
-
-  /** If this MessageEntry is a shard of a larger logical message, the group
-   *  id shared with its sibling shards. See §3.6. Default null. */
+  /** If this MessageEntry is a shard of a larger logical message, the
+   *  stable group id shared with its sibling shards. See §3.6. Default
+   *  undefined. */
   bodyGroupId?: string;
+
+  /** The shard's position within its bodyGroup, starting at 0. Only
+   *  meaningful when bodyGroupId is set. Used to reassemble shards into
+   *  byte-faithful order at render time. */
+  shardIndex?: number;
 }
 ```
 
-Edits to `currentResolution` follow the existing chronicle pattern (append a delta record; replay reconstructs state). The same pattern already supports `SummaryEntry.mergedInto` edits today, so the cost model is known.
+All adaptive-resolution fields are optional so chronicles produced by the
+pre-adaptive code path remain readable with no migration. The
+`AutobiographicalStrategy` persists `currentResolution` and `lockedByAgent`
+via dedicated state slots (`autobio:resolutions`, `autobio:locks`), keyed
+by `MessageId`, rather than mutating the message records themselves.
+Branching is therefore inherited for free from Chronicle's
+copy-on-write state slots.
 
 ### 3.4 The summary tree
 
-`SummaryEntry.mergedInto` is renamed `parentId` and becomes **archive metadata only**:
+`SummaryEntry` gains a `parentId` field and reframes the existing
+`mergedInto` field as **archive metadata only**:
 
-- `parentId?: SummaryId` — the L_{k+1} summary this one is a source for, if produced. Multiple L_k summaries share a parent L_{k+1}. Set once at archive-write time. Never used by the render path (which now consults per-chunk state instead).
+- `parentId?: SummaryId` — the L_{k+1} summary this one is a source for, if produced. Multiple L_k summaries share a parent L_{k+1}. Set when the merge result is archived.
+- `mergedInto?: SummaryId` — deprecated alias for `parentId`, retained for read compatibility with chronicles produced by the old threshold-driven path. New writes only set `parentId`; reads consult either via the `getSummaryParentId(s)` helper.
 - `level: number` — the summary's level (1 for L1, 2 for L2, …).
 
-The rename is intentional: old code paths reading `mergedInto` to make display decisions will fail loudly. Display decisions live in `MessageEntry.currentResolution` now.
+Neither pointer is consulted by the render path under
+`adaptiveResolution: true`; display decisions live in the
+`currentResolution` slot indexed by `MessageId`. The dual-field setup
+exists so a chronicle written by the pre-adaptive code path continues to
+load and read correctly, with the picker treating it as a from-scratch
+fresh chronicle for resolution purposes (see §6.1).
 
 ### 3.5 Pluggable folding strategy
 
@@ -131,29 +149,50 @@ type FoldOp =
   | { kind: 'produce'; level: number; range: ChunkRange };  // lazy production
 
 interface FoldingState {
-  chunks: Iterable<ChunkView>;       // ordered, includes resolution + lineage
-  summaries: SummaryTree;             // archive lookup
-  pins: Set<ChunkId>;
-  head: ChunkRange;
-  tail: ChunkRange;
+  /** All chunks in source order (oldest first). */
+  chunks(): readonly ChunkView[];
+  /** Foldable chunks — middle of the chronicle, not pinned, not locked. */
+  foldableMiddle(): readonly ChunkView[];
+  /** Archive lookup by summary id. */
+  getSummary(id: SummaryId): SummaryEntry | null;
+  /** All leaf chunks under a given summary (recursive walk). */
+  leavesUnder(groupRoot: SummaryId): readonly ChunkView[];
+  /** Total tokens that would render under the current per-chunk resolutions. */
   tokenCount(): number;
 }
 
+interface FoldingBudget {
+  totalBudget: number;   // hard maximum
+  targetBudget: number;  // soft target = totalBudget * (1 − slack)
+  slack: number;
+}
+
 interface FoldingStrategy {
+  readonly name: string;
   /** Return the next fold operation, or null if no more folds needed. */
-  selectNextFold(state: FoldingState, budget: TokenBudget): FoldOp | null;
+  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null;
 }
 ```
 
-The picker's loop:
+`FoldingState` is methods-not-fields: head/tail/pinned/locked filtering is
+internalized in `foldableMiddle()` so strategies don't need to re-derive
+the eligibility set. The picker's `MutableFoldingState` is the
+implementation; strategies see a read-only view.
+
+The picker's loop, simplified:
 
 ```
-let op = strategy.selectNextFold(state, budget)
-while op:
-  apply(op, state)
+applied = []; produced = []
+loop:
   op = strategy.selectNextFold(state, budget)
-emit(state)
+  if not op: break
+  if op.kind in {'raise','lower'}: apply(op); applied.push(op); continue
+  if op.kind == 'produce':         produced.push(op); break   // defer to caller
+return { finalResolutions, applied, produced, exhausted, ... }
 ```
+
+`produced` is returned to the caller (the strategy) rather than acted on
+inside the picker — see §3.8 and §5.
 
 Strategies shipped in V1:
 
@@ -168,14 +207,21 @@ Strategies envisioned for later (not V1 scope, but the interface accommodates th
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
-Any message whose token count exceeds `chunkThreshold` (default 8K) is split into shards at ingestion. Each shard is its own `MessageEntry` with:
+Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is split into shards at ingestion. Each shard is its own `MessageEntry` with:
 
 - A stable `bodyGroupId` shared with its sibling shards.
-- A `sourceHash` over the shard's content, for summary idempotency.
-- The same `role` as the original message.
-- A `range: { startByte, endByte }` into the original content, for byte-faithful reassembly.
+- A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.
+- The same `participant` as the original message.
 
-**Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, JSON top-level keys), token-bucket fallback (default `chunkSize` = 4K tokens, no overlap). Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
+The chunker (`src/adaptive/chunker.ts`) additionally computes a per-shard
+`sourceHash` and `{ startByte, endByte }` range, but those live in the
+chunker's `Shard` output, not on the persisted `MessageEntry`. The hash is
+used at production time to make L1 archival idempotent on identical
+content; the byte range is consumed at the same time and not needed
+afterward since re-ingesting the original body deterministically reproduces
+the same shard boundaries.
+
+**Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, blank-line paragraph breaks), token-bucket fallback (default `chunkSize` = 4096 tokens, no overlap), last-resort hard split at the largest UTF-8-safe position when no structural seam exists. Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
 
 **Rendering** (revised — see §3.6.1 for the implemented model):
 - **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message whose body is the byte-faithful concatenation of those shards. The role is the group's role. KV cache preserved across the run.
@@ -255,7 +301,24 @@ raiseGroup(groupRoot):
 
 **Locked chunks block group-fold partially.** If chunk C is `lockedByAgent: true` and the picker raises C's level-k ancestor group, every chunk in the group *except* C flips to level k. C stays at its current resolution. The rendered output then has a hole inside what was a contiguous group — strategy must handle this in its eligibility check (only consider a group raisable if at least one chunk inside is unlocked, ideally most).
 
-**Producing missing summaries.** If `raiseGroup(groupRoot)` requires L_{k+1} and no L_{k+1} exists yet, the strategy returns a `produce` op instead. The picker enqueues background summarization and returns null (defer fold to next compile). The compile emits at the current state, possibly over budget for one turn — see §3.10 for the fallback when over-budget can't be tolerated.
+**Producing missing summaries.** If `raiseGroup(groupRoot)` requires
+L_{k+1} and no L_{k+1} exists yet, the strategy emits a `produce` op
+instead of a `raise`. The picker collects produce ops in
+`PickerResult.produced` and stops (one produce op per `run()` call). The
+caller — `AutobiographicalStrategy.selectAdaptive` — routes each op via
+`handleProducedOps`:
+
+- `level === 1`: locate the chunks whose messages fall in `op.range` and
+  ensure they are queued for L1 compression (`compressionQueue.push`).
+- `level >= 2`: gather unmerged L_{level-1} summaries whose source ranges
+  fall within `op.range` (deduped against entries already in
+  `mergeQueue`) and enqueue a single L_{level} merge over them.
+
+The actual LLM work runs asynchronously on the next `tick()` (or the
+speculative drain kicked off from `onNewMessage`). The compile that
+emitted the produce op returns whatever state was achievable; the next
+compile sees the now-existing L_{k+1} and folds further. See §3.10 for
+how this composes with the hard-fail check.
 
 ### 3.9 Cache stickiness, honestly
 
@@ -305,9 +368,27 @@ Edge cases:
 
 ### 4.1 `summarize_chunk` — archive write, eager
 
-`tick()` continues to walk the compression queue and produce L1 summaries from raw chunks via the LLM. Idempotent by `sourceHash`. **No display change.** This is the spec's archive write.
+`tick()` continues to walk the compression queue and produce L1 summaries
+from raw chunks via the LLM. Idempotent by `sourceHash` (same input →
+same shard boundaries → same archive entries). **No display change.**
+This is the spec's archive write.
 
-L_k summaries for `k > 1` are produced **lazily on strategy request** (a `produce` op from `selectNextFold`). A background loop *may* speculatively produce higher-level summaries ahead of demand to avoid picker latency; the spec endorses speculative archive work. Whether to ship the speculative loop in V1 is an open question (§7).
+L_k summaries for `k > 1` come from two complementary paths in V1:
+
+- **Speculative bottom-up pre-producer** (`config.speculativeProduction`,
+  default-on under `adaptiveResolution`): when a new L_k lands, if N
+  siblings now share a (would-be) L_{k+1} parent, the pre-producer
+  enqueues the L_{k+1} merge immediately. Walks all levels recursively so
+  the chain climbs as far as the source counts justify. Bounded by
+  `maxSpeculativeL1s` to keep cost-sensitive deployments honest.
+- **Reactive on `produce` op** (§3.8): if the picker requests an L_n the
+  pre-producer hasn't reached yet (either because the deployment opted
+  out, or because the speculation cap held it back), `handleProducedOps`
+  enqueues the merge so the next `tick()` makes it.
+
+Both paths feed the same `mergeQueue`. Idempotency on `sourceHash` means
+the worst case for a duplicate enqueue is a no-op merge, not a divergent
+archive.
 
 ### 4.2 `fold` — display mutation
 
@@ -344,27 +425,44 @@ The positioned-recall-pair logic from PR #15 survives: pins are interleaved with
 
 ## 5. The picker, in detail
 
-The picker runs once per `compile()`. Given:
+The picker runs once per `compile()` under the `selectAdaptive` path.
+Given:
 
-- `totalBudget` = `TokenBudget.maxTokens - reserveForResponse`
-- `slack` = `compressionSlackRatio` (default 0.1; see §7 open question)
+- `totalBudget` = `TokenBudget.maxTokens - reserveForResponse - headTokens`
+- `slack` = `compressionSlackRatio` (default 0.1)
 - `strategy` = configured `FoldingStrategy` instance
-- Chunk store, summary tree, pins, head/tail bounds
+- Chunk store, summary tree, head/tail sets
 
 ```
-1. Build FoldingState (read-only view over chunks + summaries).
-2. op = strategy.selectNextFold(state, totalBudget)
-3. While op:
-   - if op.kind == 'raise':   fold(op.groupRoot); update chunk state
-   - if op.kind == 'lower':   (V2 only) lower one step; update chunk state
-   - if op.kind == 'produce': enqueue background summarization; break
-   - op = strategy.selectNextFold(state, totalBudget)
-4. If any chunk state changed, persist via delta records.
-5. If picker exhausted AND finalTokens > hard budget, throw OverBudgetError (§3.10).
-6. Render using updated state.
+[picker.run]
+1. Build MutableFoldingState (mutable internal view over chunks + summaries).
+2. op = strategy.selectNextFold(state, budget)
+3. While op AND iterations < bound:
+   - if op.kind == 'raise':   applyRaise; applied.push(op); continue
+   - if op.kind == 'lower':   (V2) applyLower; applied.push(op); continue
+   - if op.kind == 'produce': produced.push(op); break
+4. Return { finalResolutions, applied, produced, finalTokens,
+            budgetMet, exhausted, iterations }.
+
+[selectAdaptive — strategy side, after picker.run]
+5. Commit finalResolutions to strategy state; persist if changed.
+6. If produced.length > 0: handleProducedOps to route into compression
+   queue / merge queue (§3.8).
+7. If exhausted AND finalTokens > totalBudget: throw OverBudgetError.
+8. Walk middle messages and emit context entries, grouping bodyGroup
+   shards via the rendering algorithm in §3.6.1.
 ```
 
-Token counting (§7 open question): each chunk has a cached `tokensL0` from ingestion-time tokenization. Each summary has `tokensRecallPair` from its production. Render-time total = sum of (raw chunks at L0) + (one recall pair per distinct L_k ancestor among non-L0 chunks) + pinned chunks + head + tail.
+The iteration bound is `max(1000, chunks.length * 10)` — scales with
+chronicle size so non-convergence detection doesn't trip on large stores
+that legitimately need more ops than a fixed ceiling allows.
+
+Token counting: each chunk's `rawTokens` is computed at picker-input
+construction time (delegated to `MessageStoreView.estimateTokens`); each
+summary's `tokens` comes from its production record, with a `+20` overhead
+for the recall-pair label. Render-time total = sum of (raw chunks at L0)
++ (one recall pair per distinct L_k ancestor among non-L0 chunks) +
+pinned chunks + head + tail.
 
 ## 6. Migration
 
@@ -413,7 +511,14 @@ These were debated during the rev-2 revision and are now locked unless implement
 
 2. **Speculative production: background pre-producer, default-on.** When a new L_k summary lands, if N siblings exist that would share an L_{k+1} parent, the pre-producer enqueues the L_{k+1} summary immediately. Bottom-up, bounded, idempotent on `sourceHash`. Avoids first-fold latency at the cost of LLM tokens that may not be used. Disable via `config.speculativeProduction: false` for cost-sensitive deployments.
 
-3. **`lockedByAgent` programmatic API in V1: set-only.** Strategy hosts expose `lockChunk(chunkId)` / `unlockChunk(chunkId)`. No agent-facing tool until V2, but the lock is observable and settable by module code so content-aware strategies can experiment now.
+3. **`lockedByAgent` programmatic API in V1: set-only.**
+   `AutobiographicalStrategy` exposes `lockChunk(id)` / `unlockChunk(id)`
+   methods that persist via the `autobio:locks` state slot. The picker
+   honors `PickerChunk.lockedByAgent`. No agent-facing tool until V2, but
+   the lock is settable by module code so content-aware strategies can
+   experiment now. (An earlier draft proposed a separate `lock-api.ts`
+   surface with an `InMemoryLockStore`; that was removed in favor of the
+   strategy methods as the single canonical surface.)
 
 4. **Migration deferred (§6).** V1 ships compatibility for *reading* legacy chronicles without active migration. Re-ingest is the validation path.
 
@@ -431,28 +536,34 @@ These were debated during the rev-2 revision and are now locked unless implement
 
 ## 9. Implementation scope
 
-Estimated breakdown:
+Implemented breakdown vs original estimate (PR #19; `git diff main..feat/adaptive-resolution --stat`):
 
-| Component | LOC |
-|---|---|
-| `bodyGroupId` field + render concat | ~30 |
-| Chunker module (structural + token-bucket, ingestion-time) | ~80 |
-| On-chunk state fields + edit-record plumbing | ~40 |
-| `FoldingStrategy` interface + `FlatProfileStrategy` + `OldestFirstStrategy` | ~200 |
-| Picker orchestrator loop | ~30 |
-| Lazy summary production at arbitrary level | ~80 |
-| Background pre-producer (bottom-up speculative L_{k+1}) | ~80 |
-| `lockChunk` / `unlockChunk` programmatic API | ~20 |
-| Token-counting cache on chunks and summaries | ~40 |
-| Recent-window-slide handling in eligibility check | ~20 |
-| Hard-fail check + OverBudgetError class | ~25 |
-| Legacy-chronicle read compatibility (`mergedInto` → `parentId` rename, default `currentResolution: 0`) | ~30 |
-| Deprecation glue for phase 1/2 | ~30 |
-| Tests | ~400 |
+| Component | Estimated | Actual |
+|---|---:|---:|
+| `src/adaptive/chunker.ts` (structural + token-bucket, ingestion-time) | ~80 | ~320 |
+| `src/adaptive/folding-strategy.ts` (interface + types) | — | ~130 |
+| `src/adaptive/picker.ts` (orchestrator + OverBudgetError + state) | ~80 | ~440 |
+| `src/adaptive/strategies/flat-profile.ts` + `oldest-first.ts` | ~200 | ~140 |
+| `src/adaptive/render.ts` (bodyGroup concat) | ~30 | ~115 |
+| `src/types/message.ts`, `src/types/strategy.ts` (state fields) | ~70 | ~160 |
+| `src/strategies/autobiographical.ts` wiring (selectAdaptive, ingestion, persistence, handleProducedOps, deep-level merges) | ~250 | ~1620 |
+| `src/message-store.ts` (sharded-ingestion path, bodyGroup support) | ~20 | ~155 |
+| `src/context-manager.ts` (compile path glue) | — | ~30 |
+| Tests (`test/adaptive/**`) | ~400 | ~3400 |
 
-**Total: ~1100 LOC new + ~80 LOC deleted.** Feature flag controls rollout. Migration code deferred to a follow-up PR (§6.2).
+The implementation overshot the design's ~1100 LOC estimate by roughly 3×.
+Most of the overrun lives in `autobiographical.ts` (selectAdaptive plus
+the ingestion/persistence/merge plumbing that the design treated as a
+trivial wire-up), the test suite (~8× the estimate, covering shard
+immutability, persistence, branching, doc-plus-chat interleaving, deep
+levels, and a long-chronicle stress run), and prompt-engineering work
+that emerged during implementation (reading-mode prompts for sharded
+bodies, KV-preserving merge prompts — see PR #19). The design's
+architectural shape stayed intact; the cost was in the integration
+surface, not in the model.
 
-Realistic timeline: 2 weeks of focused implementation + 1 week of integration testing + re-ingest validation against the target workload.
+Feature flag (`config.adaptiveResolution`) controls rollout. Migration
+code remains deferred to a follow-up PR (§6.2).
 
 ## 10. Related work
 
@@ -464,4 +575,16 @@ Realistic timeline: 2 weeks of focused implementation + 1 week of integration te
 
 ## 11. Status
 
-All architectural decisions are settled (§7). Remaining open items in §8 are implementation-level details that can be resolved during the work itself without changing the design. The design is **implementation-ready**.
+Implemented in PR #19 (`feat/adaptive-resolution`, anima-research/context-manager). All §7 architectural decisions held through implementation. Resolution of the §8 open questions in the as-shipped system:
+
+1. **Token counting** — picker uses `MessageStoreView.estimateTokens` for raw chunks and stored `SummaryEntry.tokens` for summaries, plus a +20 overhead for recall-pair labels. No bespoke tokenizer integration; the chars-per-token approximation is consistent with the chronicle's existing accounting.
+2. **Recall pair format consistency** — promoted to a design property in §3.9 (monotonic memory fading by construction).
+3. **Pins interaction** — pins always render raw; picker's `foldableMiddle()` excludes pinned chunks. If a pin pushes total over the hard budget, `OverBudgetError` fires (§3.10).
+4. **Branching semantics** — chunk state lives in branch-scoped Chronicle state slots (`autobio:resolutions`, `autobio:locks`); branching inherits the slots via Chronicle's copy-on-write. Verified by `test/adaptive/branching.test.ts`.
+5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `iterations`, `applied`, `produced`, `finalTokens`, `budgetMet`, `exhausted` for observability at the call site. A formal `RenderStats` extension is still pending.
+
+Out of scope for V1, still pending for follow-up:
+
+- Migration of existing chronicles with `mergedInto` chains (§6.2). The deployment validation path remains re-ingestion on a fresh chronicle.
+- Phase 2/3 rollout (§6.3): switching default to `adaptiveResolution: true` and deleting the threshold path.
+- V2 agent-driven unfold/refold tools (§4.3) and `AgentDirectedStrategy`.
