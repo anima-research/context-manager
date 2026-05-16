@@ -339,14 +339,25 @@ export interface AutobiographicalConfig {
 
   /**
    * Cap on the total tokens of recall-pair prior-summary content
-   * included in each chunk compression request (default: 150000).
+   * included in each LLM request that builds recall pairs:
+   *
+   *   - L1 chunk compression (`compressChunkHierarchical`)
+   *   - L_n merges (`executeMerge`)
    *
    * Defends against the case where the unmerged frontier itself is
-   * large enough to overflow the API window. The cap walks summaries
-   * newest-first so proximate context survives; the kept set is then
-   * re-sorted chronologically. Set higher (or to Infinity) if you want
-   * to surface overflow via a 400 rather than silently drop oldest
-   * memories from the compression context.
+   * large enough to overflow the API window. Walks newest-first so
+   * proximate context survives; the kept set is then re-sorted
+   * chronologically. Each summary takes (its content tokens + 50 for
+   * the wrapping "[CM] Recall memory <id>." question).
+   *
+   * Default 100000 — chosen so that even an L_n merge (which packs
+   * recall + head + expanded target + instruction into one request)
+   * fits inside a 200k window. For larger context models or
+   * shallower hierarchies, raise this; on Sonnet/Opus default windows,
+   * the practical ceiling is roughly 130k.
+   *
+   * Set to Infinity to disable the cap and surface overflow as a
+   * 400 from the API rather than silently dropping oldest memories.
    */
   compressionRecallBudgetTokens?: number;
 

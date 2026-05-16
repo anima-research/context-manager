@@ -747,6 +747,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Mark a summary as merged into a higher-level summary, updating the
    * chronicle copy at the same index. Index is the position in `this.summaries`.
    */
+  /**
+   * Token-budget cap for recall-pair summary sets. Walks newest→oldest
+   * keeping each summary that still fits; skips (rather than breaks at)
+   * a summary that would put us over budget, so a heterogeneous set
+   * fills the remaining slots with smaller siblings instead of stopping
+   * at the first oversized one. The kept set is re-sorted chronologically.
+   *
+   * Used by both `compressChunkHierarchical` (the L1 compression prompt
+   * recall pairs) and `executeMerge` (the merge prompt recall pairs).
+   * Without the cap, both sites grow their recall set linearly with
+   * conversation length and overflow the 200k window around the same
+   * point — observed empirically at ~chunk 118 in a 4000-message import.
+   *
+   * Per-summary +50 token overhead accounts for the "[CM] Recall memory
+   * <id>." question turn that wraps each recall body. Rough but defensive.
+   */
+  protected capRecallPairs(
+    summariesChronological: SummaryEntry[],
+    maxTokens: number,
+  ): { kept: SummaryEntry[]; keptTokens: number } {
+    const kept: SummaryEntry[] = [];
+    let total = 0;
+    for (let i = summariesChronological.length - 1; i >= 0; i--) {
+      const s = summariesChronological[i]!;
+      const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50;
+      if (total + est > maxTokens) continue;
+      kept.push(s);
+      total += est;
+    }
+    kept.reverse();
+    return { kept, keptTokens: total };
+  }
+
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
     entry.mergedInto = mergedIntoId;
     if (!this.store) return;
@@ -1537,33 +1570,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter((s) => !s.mergedInto)
       .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
 
-    // Token-budget cap on recall pairs as defense-in-depth. With merged
-    // exclusion the set is bounded by `mergeThreshold^depth`, but a
-    // conversation with thousands of unmerged top-level summaries can
-    // still overflow. Newest-first selection so proximate context is
-    // preferred; the kept set is re-sorted chronologically below. We
-    // always keep at least one summary even if it's larger than the
-    // budget — otherwise a single oversized summary would leave the
-    // model with no compressed context at all.
-    const recallBudget = this.config.compressionRecallBudgetTokens ?? 150_000;
-    const keptSummaries: SummaryEntry[] = [];
-    let recallTokens = 0;
-    for (let i = priorSummaries.length - 1; i >= 0; i--) {
-      const s = priorSummaries[i]!;
-      const approxTokens = Math.ceil(s.content.length / 4);
-      if (recallTokens + approxTokens > recallBudget && keptSummaries.length > 0) break;
-      keptSummaries.push(s);
-      recallTokens += approxTokens;
-    }
-    keptSummaries.reverse();
+    // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
+    // merged exclusion the unmerged frontier can be large at extreme scale.
+    const recallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+    const { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
+      priorSummaries,
+      recallBudget,
+    );
     if (keptSummaries.length < priorSummaries.length) {
       const dropped = priorSummaries.length - keptSummaries.length;
       console.warn(
-        `autobio: recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
+        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
           `~${recallTokens} tokens, budget ${recallBudget}; ${dropped} oldest dropped this compression).`,
       );
       logCompressionCall({
         event: 'recall-budget-capped',
+        site: 'compression',
         kept: keptSummaries.length,
         total: priorSummaries.length,
         tokens: recallTokens,
@@ -1955,15 +1977,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       llmMessages.push({ participant: m.participant, content: m.content });
     }
 
-    // ---- 1b. PRIOR L1 RECALL PAIRS (chronologically before merge range) ----
-    // L1s whose entire source range is before the merge range and that
-    // aren't part of the merge tree. Sort by source position.
-    const priorL1s = this.summaries
-      .filter((s) => s.level === 1)
+    // ---- 1b. PRIOR RECALL PAIRS (chronologically before merge range) ----
+    // The unmerged frontier of summaries whose source range is before the
+    // merge range and which aren't part of the merge tree. Originally this
+    // was filtered to `level === 1` (the "L1 fidelity for prior content"
+    // intent) but at 4000+ messages that produces hundreds of L1s and
+    // overflows the model window. Switching to the unmerged frontier
+    // (`!mergedInto`) lets a merged L1 drop out in favour of its L2/L3
+    // parent — the same rule used everywhere else and now in
+    // `compressChunkHierarchical`. The cap below is the defense-in-depth.
+    const priorSummariesAll = this.summaries
+      .filter((s) => !s.mergedInto)
       .filter((s) => {
-        // Exclude any L1 that's an ancestor of our merge target
         for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
-        // Include only if it starts strictly before the merge range
         const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
         return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
       })
@@ -1973,12 +1999,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return ai - bi;
       });
 
-    const priorL1MessageIds = new Set<MessageId>();
-    for (const s of priorL1s) {
-      for (const id of s.sourceIds) priorL1MessageIds.add(id);
+    const mergeRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+    const { kept: keptPriorSummaries, keptTokens: mergeRecallTokens } = this.capRecallPairs(
+      priorSummariesAll,
+      mergeRecallBudget,
+    );
+    if (keptPriorSummaries.length < priorSummariesAll.length) {
+      const dropped = priorSummariesAll.length - keptPriorSummaries.length;
+      console.warn(
+        `autobio: merge recall-pair budget capped (${keptPriorSummaries.length}/${priorSummariesAll.length} summaries kept, ` +
+          `~${mergeRecallTokens} tokens, budget ${mergeRecallBudget}; ${dropped} oldest dropped this merge).`,
+      );
+      logCompressionCall({
+        event: 'recall-budget-capped',
+        site: 'merge',
+        targetLevel,
+        kept: keptPriorSummaries.length,
+        total: priorSummariesAll.length,
+        tokens: mergeRecallTokens,
+        budgetTokens: mergeRecallBudget,
+      });
     }
 
-    for (const s of priorL1s) {
+    // The full unmerged-frontier set covers what's "compressed somewhere"
+    // for the raw-middle dedup below — a budget-dropped recall pair
+    // doesn't make its underlying raw messages reappear.
+    const priorSummaryMessageIds = new Set<MessageId>();
+    for (const s of priorSummariesAll) {
+      for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
+    }
+
+    for (const s of keptPriorSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
@@ -1990,12 +2041,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Raw middle: any messages between the head window and the merge
-    // range that aren't covered by a prior L1 or the merge tree.
+    // range that aren't covered by a prior summary or the merge tree.
     // Usually empty (chunking is contiguous).
     if (mergeStartIdx >= 0) {
       for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
-        if (priorL1MessageIds.has(m.id)) continue;
+        if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
         llmMessages.push({ participant: m.participant, content: m.content });
       }
