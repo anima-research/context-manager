@@ -20,6 +20,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
+import { splitMixedToolMessages } from '../normalize-tool-messages.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
@@ -1682,8 +1683,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       content: [{ type: 'text', text: instructionText }],
     });
 
+    // Split any bundled tool_use+tool_result cycles in non-user turns into
+    // separate API-shape messages. claude.ai-imported sessions carry these
+    // bundles (a tool_result in an assistant message rejects the request);
+    // for fresh imports the conhost importer splits at ingest time, but
+    // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
+    const split = splitMixedToolMessages(llmMessages);
+
     // Collapse consecutive same-participant messages for API compliance
-    const collapsed = this.collapseConsecutiveMessages(llmMessages);
+    const collapsed = this.collapseConsecutiveMessages(split);
 
     // NO system prompt. The agent's identity is established by the head
     // (the actual conversation opening — user message + agent reply that
@@ -2132,7 +2140,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }],
     });
 
-    const collapsed = this.collapseConsecutiveMessages(llmMessages);
+    // Same bundled-tool-cycle defense as compressChunkHierarchical.
+    const split = splitMixedToolMessages(llmMessages);
+    const collapsed = this.collapseConsecutiveMessages(split);
 
     // NO system prompt — identity is established by the head window
     // (present at the start of llmMessages above) and by the prior
