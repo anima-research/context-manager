@@ -144,7 +144,7 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    const record = this.store.appendToStateJsonAssigning(
+    const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
       'id',
