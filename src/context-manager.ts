@@ -25,6 +25,7 @@ import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
+import { splitMixedToolMessages } from './normalize-tool-messages.js';
 
 /**
  * Base configuration for ContextManager.
@@ -493,12 +494,30 @@ export class ContextManager {
       effectiveBudget
     );
 
-    // Convert to NormalizedMessage[]
-    const messages: NormalizedMessage[] = entries.map((entry) => ({
-      participant: entry.participant,
-      content: entry.content,
-      ...(entry.cacheMarker ? { cacheBreakpoint: true } : {}),
-    }));
+    // Convert to NormalizedMessage[]. We split each entry individually
+    // so we know the output-count per input and can re-attach cache
+    // markers to the last output of each (matching the marker's
+    // "cache up to here" intent).
+    //
+    // Splitting handles the claude.ai bundled-tool-cycle artifact: a
+    // non-user message containing `tool_result` blocks becomes a sequence
+    // of agent/user/agent turns so the API accepts it. Already-API-shape
+    // messages pass through untouched. See `src/normalize-tool-messages.ts`.
+    const messages: NormalizedMessage[] = [];
+    for (const entry of entries) {
+      const splitParts = splitMixedToolMessages([
+        { participant: entry.participant, content: entry.content },
+      ]);
+      for (let i = 0; i < splitParts.length; i++) {
+        const part = splitParts[i];
+        const isLast = i === splitParts.length - 1;
+        messages.push({
+          participant: part.participant,
+          content: part.content,
+          ...(entry.cacheMarker && isLast ? { cacheBreakpoint: true } : {}),
+        });
+      }
+    }
 
     // If no injections, log and return early
     if (!injections || injections.length === 0) {

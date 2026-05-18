@@ -130,7 +130,6 @@ export class MessageStore {
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
-    // Append to Chronicle first to get the record ID
     const partialInternal = {
       participant,
       content: storedContent,
@@ -140,45 +139,22 @@ export class MessageStore {
       ...(extra ?? {}),
     };
 
-    const record = this.store.appendToStateJson(this.stateId, partialInternal);
+    // Single atomic op: chronicle peeks the next record id+sequence under its
+    // write lock, splices them into the payload as `id` and `sequence`, and
+    // writes one record. The reconstructed state sees a fully-populated
+    // StoredMessageInternal, and `branchAt(messageId)` forks at this
+    // message's own sequence — exactly the post-fork-visible point.
+    const record = this.store.appendToStateJsonWithIdentity(
+      this.stateId,
+      partialInternal,
+      'id',
+      'sequence',
+    );
     const index = this.length() - 1;
 
-    // The append's payload doesn't carry the chronicle record's id /
-    // sequence — those are only known once the append returns. We patch
-    // them in via editStateItem below. The patch creates a new chronicle
-    // record at `record.sequence + 1` (the next sequence; nothing else
-    // writes between the append and the edit inside this function).
-    //
-    // We store the EDIT'S sequence (not the original append's) as the
-    // canonical "this message is fully readable at and after this seq"
-    // marker. Why: `ContextManager.branchAt(messageId)` forwards
-    // `message.sequence` to `chronicle.createBranchAt`, which forks
-    // visibility at that exact seq. If `sequence` pointed at the original
-    // append (record.sequence), the new branch would see the pre-patch
-    // payload (id/sequence undefined). Pointing at the edit's seq
-    // includes the patched payload in the inherited records — so a
-    // forked branch sees this message in its fully-established form.
-    //
-    // Invariant: this function does exactly ONE chronicle write between
-    // the append and the edit (the edit itself). If that ever changes,
-    // the +1 expression must be updated to match (or refactored to
-    // capture editStateItem's returned record.sequence — which is
-    // chicken-and-egg here since we need the value inside the payload
-    // we're writing).
-    const commitSequence = record.sequence + 1;
-    const fullInternal: StoredMessageInternal = {
-      id: record.id,
-      sequence: commitSequence,
-      ...partialInternal,
-    };
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(fullInternal)));
-
-    // Build full message with ID and sequence from record. The sequence
-    // we expose is the commit sequence (matches what's stored), so
-    // `branchAt(messageId)` forks at the right place for any caller.
     const message: StoredMessage = {
       id: record.id,
-      sequence: commitSequence,
+      sequence: record.sequence,
       participant,
       content, // Original content with inline data
       metadata,
@@ -187,9 +163,7 @@ export class MessageStore {
       ...(extra ?? {}),
     };
 
-    // Update index
     this.idToIndex.set(message.id, index);
-
     this.emit({ type: 'add', message });
     return message;
   }

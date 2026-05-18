@@ -13,6 +13,9 @@ export { PassthroughStrategy } from './strategies/passthrough.js';
 export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot } from './strategies/autobiographical.js';
 export { KnowledgeStrategy } from './strategies/knowledge.js';
 
+// Utilities
+export { splitMixedToolMessages } from './normalize-tool-messages.js';
+
 // Types
 export type {
   // Message types

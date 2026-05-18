@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/context-manager",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Context management layer for LLM-based agents using Chronicle and Membrane",
   "type": "module",
   "main": "dist/src/index.js",
@@ -35,7 +35,7 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "@animalabs/chronicle": "^0.1.0",
+    "@animalabs/chronicle": "^0.2.0",
     "@animalabs/membrane": "^0.5.40"
   },
   "devDependencies": {
