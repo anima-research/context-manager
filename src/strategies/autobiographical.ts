@@ -20,7 +20,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
-import { splitMixedToolMessages } from '../normalize-tool-messages.js';
+import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
@@ -1693,6 +1693,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Collapse consecutive same-participant messages for API compliance
     const collapsed = this.collapseConsecutiveMessages(split);
 
+    // Defense in depth against chunk boundaries that cut a tool cycle
+    // (rebuildChunks tries to avoid this, but covers only the most common
+    // case). The API rejects any tool_use that isn't immediately followed
+    // by its tool_result, and any tool_result that doesn't follow a use.
+    const cleaned = stripUnpairedToolBlocks(collapsed);
+
     // NO system prompt. The agent's identity is established by the head
     // (the actual conversation opening — user message + agent reply that
     // grounded the original instance). A system prompt would (a) add a
@@ -1702,7 +1708,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural one carried by the conversation itself. Anchoring
     // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
-      messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
+      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -1753,7 +1759,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
-        messages: collapsed.map((m) => ({
+        messages: cleaned.map((m) => ({
           participant: m.participant,
           // Flatten content for logging — store text only; binary content
           // would bloat the log and isn't typical in compression input.
@@ -2143,12 +2149,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Same bundled-tool-cycle defense as compressChunkHierarchical.
     const split = splitMixedToolMessages(llmMessages);
     const collapsed = this.collapseConsecutiveMessages(split);
+    const cleaned = stripUnpairedToolBlocks(collapsed);
 
     // NO system prompt — identity is established by the head window
     // (present at the start of llmMessages above) and by the prior
     // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
-      messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
+      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -2208,7 +2215,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
         system: null,
-        messages: collapsed.map((m) => ({
+        messages: cleaned.map((m) => ({
           participant: m.participant,
           text: m.content
             .filter((b: ContentBlock) => b.type === 'text')
@@ -3410,6 +3417,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         currentTokens >= this.config.targetChunkTokens &&
         currentChunk.length >= 4;
 
+      // Don't close a chunk on a message containing a tool_use block —
+      // the matching tool_result lives in the immediately-following user
+      // message, and the Anthropic API rejects a request where a tool_use
+      // isn't immediately followed by its tool_result. Defer the close
+      // by one iteration so the result rides along in the same chunk.
+      // The stripUnpairedToolBlocks runtime pass is a safety net for the
+      // rare case where a tool_use is the very last message in the store.
+      if (shouldClose && this.lastMessageContainsToolUse(currentChunk)) {
+        continue;
+      }
+
       if (shouldClose) {
         const chunk = this.createChunk(
           this.chunks.length,
@@ -3446,6 +3464,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.compressionQueue.push(chunk.index);
       }
     }
+  }
+
+  /**
+   * Returns true if the last message in the chunk-in-progress contains a
+   * `tool_use` block. Used by `rebuildChunks` to defer chunk closure until
+   * the matching `tool_result` (in the immediately-following user message)
+   * is pulled into the same chunk. See `stripUnpairedToolBlocks` for the
+   * runtime safety net.
+   */
+  protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
+    const last = chunk[chunk.length - 1];
+    if (!last) return false;
+    return last.content.some((b) => b.type === 'tool_use');
   }
 
   protected createChunk(

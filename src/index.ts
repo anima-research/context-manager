@@ -14,7 +14,7 @@ export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot } from 
 export { KnowledgeStrategy } from './strategies/knowledge.js';
 
 // Utilities
-export { splitMixedToolMessages } from './normalize-tool-messages.js';
+export { splitMixedToolMessages, stripUnpairedToolBlocks } from './normalize-tool-messages.js';
 
 // Types
 export type {

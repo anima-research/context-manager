@@ -13,7 +13,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { splitMixedToolMessages } from '../src/index.js';
+import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 function mkBlocks(spec: string): ContentBlock[] {
@@ -112,5 +112,73 @@ describe('splitMixedToolMessages', () => {
 
   it('returns an empty array for empty input', () => {
     assert.deepEqual(splitMixedToolMessages([]), []);
+  });
+});
+
+describe('stripUnpairedToolBlocks', () => {
+  const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
+  const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res' });
+  const t = (text: string): ContentBlock => ({ type: 'text', text });
+
+  it('passes through paired tool_use/tool_result unchanged', () => {
+    const input = [
+      { participant: 'agent', content: [t('hi'), u('A')] },
+      { participant: 'user', content: [r('A')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text', 'tool_use'],
+      ['tool_result'],
+    ]);
+  });
+
+  it('strips a tool_use whose tool_result is absent (chunk-boundary tail)', () => {
+    const input = [
+      { participant: 'agent', content: [t('preamble'), u('A')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.equal(out.length, 1);
+    assert.deepEqual(out[0].content.map((b) => b.type), ['text']);
+  });
+
+  it('strips a tool_result whose tool_use is absent (chunk-boundary head)', () => {
+    const input = [
+      { participant: 'user', content: [r('A')] },
+      { participant: 'agent', content: [t('reply')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.equal(out.length, 2);
+    assert.deepEqual(out[0].content.map((b) => b.type), ['text']);
+    assert.equal((out[0].content[0] as { text: string }).text, '[tool call omitted — spans chunk boundary]');
+    assert.deepEqual(out[1].content.map((b) => b.type), ['text']);
+  });
+
+  it('keeps paired blocks and strips only the unpaired ones in a mixed message', () => {
+    const input = [
+      { participant: 'agent', content: [u('A'), u('B'), u('C')] },
+      { participant: 'user', content: [r('B'), r('C')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out[0].content.map((b) => (b as { id?: string }).id ?? b.type), ['B', 'C']);
+    assert.deepEqual(out[1].content.map((b) => (b as { toolUseId?: string }).toolUseId ?? b.type), ['B', 'C']);
+  });
+
+  it('replaces empty content with a placeholder text block', () => {
+    const input = [{ participant: 'agent', content: [u('A')] }];
+    const out = stripUnpairedToolBlocks(input);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].content.length, 1);
+    assert.equal(out[0].content[0].type, 'text');
+    assert.match((out[0].content[0] as { text: string }).text, /tool call omitted/);
+  });
+
+  it('returns an empty array for empty input', () => {
+    assert.deepEqual(stripUnpairedToolBlocks([]), []);
+  });
+
+  it('preserves reference identity for unchanged messages', () => {
+    const msg = { participant: 'user', content: [t('hello')] };
+    const out = stripUnpairedToolBlocks([msg]);
+    assert.strictEqual(out[0].content, msg.content);
   });
 });
