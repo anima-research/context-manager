@@ -210,6 +210,64 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
+  it('Bug 10: raw middle dedup correctly handles L2+ summaries (no message leak)', async () => {
+    cleanup();
+    const { membrane, calls } = createValidatingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+      mergeThreshold: 3,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+
+    // 100 messages → enough chunks to drive a multi-level merge cascade
+    // (L1s → L2s → L3) so executeMerge runs with L2s in its prior
+    // frontier. Each message has a distinctive marker (`RAW-N`) so we
+    // can count how many leak into requests as raw content.
+    const filler = (n: number) => 'word '.repeat(n);
+    for (let i = 0; i < 100; i++) {
+      manager.addMessage(i % 2 === 0 ? 'agent' : 'user', [
+        t(`RAW-${i} ${filler(8)}`),
+      ]);
+    }
+
+    await drain(manager);
+
+    const snap = strategy.getProgressSnapshot();
+    assert.ok(
+      snap.summaryCounts.l2 >= 2,
+      `expected >=2 L2 summaries to exercise the bug (got l2=${snap.summaryCounts.l2})`,
+    );
+
+    // Count raw conversation messages in each request. The expansion bug
+    // allowed ~all messages to leak in (the bug report saw 256 user +
+    // 262 agent for a 4234-msg conversation). With the fix, per-request
+    // raw-message count should be bounded by the merge target's leaf
+    // size — for mergeThreshold=3 with ~3-msg L1s, that's <= ~25.
+    const RAW_MSG_LIMIT = 40;
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      let rawCount = 0;
+      for (const m of call.messages) {
+        for (const block of m.content) {
+          const text = (block as { text?: string }).text ?? '';
+          if (text.includes('RAW-')) rawCount++;
+        }
+      }
+      assert.ok(
+        rawCount <= RAW_MSG_LIMIT,
+        `call ${i}: ${rawCount} raw messages in request — raw middle is leaking already-summarized content (Bug 10)`,
+      );
+    }
+    await manager.close();
+  });
+
   it('runtime splitMixedToolMessages handles bundled cycles in source data', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();

@@ -1642,9 +1642,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // raw messages reappear.
     const chunkFirstId = chunk.messages[0]?.id;
     if (chunkFirstId) {
-      const priorSummaryMessageIds = new Set<string>();
+      // Expand summary sourceIds down to leaf message IDs. An L2 in
+      // `priorSummaries` has L1 IDs in its sourceIds, not message IDs;
+      // a flat walk would miss every message it transitively covers.
+      // (Bug 10 — same shape as executeMerge.)
+      const summariesById = new Map<string, SummaryEntry>();
+      for (const s of this.summaries) summariesById.set(s.id, s);
+      const priorSummaryMessageIds = new Set<MessageId>();
+      for (const s of this.summaries) {
+        if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
       for (const s of priorSummaries) {
-        for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
+        this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
       }
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
@@ -2038,9 +2047,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The full unmerged-frontier set covers what's "compressed somewhere"
     // for the raw-middle dedup below — a budget-dropped recall pair
     // doesn't make its underlying raw messages reappear.
+    //
+    // Critical: `sourceIds` on an L2+ summary points at L1 IDs, not raw
+    // message IDs. The dedup happens against raw message IDs, so we must
+    // recursively expand each summary down to its leaf message IDs.
+    // Without this, every message under any L2 leaks back in as raw text
+    // (Bug 10: 525-message merge requests on a 4234-msg conversation).
+    // Also expand merged L1s as defense in depth.
     const priorSummaryMessageIds = new Set<MessageId>();
+    for (const s of this.summaries) {
+      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
     for (const s of priorSummariesAll) {
-      for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
+      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
 
     for (const s of keptPriorSummaries) {
@@ -2799,6 +2818,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (!current || current.level !== level) return null;
     return current;
+  }
+
+  /**
+   * Recursively expand a summary's `sourceIds` down to the leaf message IDs
+   * it covers, adding each leaf into `out`.
+   *
+   * Required because `SummaryEntry.sourceIds` are level-relative: an L1's
+   * sourceIds are raw message IDs (sourceLevel=0), but an L2's sourceIds
+   * are L1 IDs (sourceLevel=1), and so on. Any dedup that walks `sourceIds`
+   * directly only works for L1s — once L2+ summaries enter the picture
+   * (which happens as soon as `mergeThreshold` L1s accumulate during
+   * interleaved compression+merge ticks), the dedup silently fails and
+   * already-summarized messages leak back into the request as raw text.
+   * That's how Bug 10 produced 200k+ token merge prompts on a 4234-msg
+   * import.
+   *
+   * Callers should also expand merged L1s (not just the unmerged frontier)
+   * as defense in depth — a stale `mergedInto` pointer or a partially
+   * applied merge shouldn't surface raw messages.
+   */
+  protected expandSummaryToLeafMessageIds(
+    summary: SummaryEntry,
+    summariesById: ReadonlyMap<string, SummaryEntry>,
+    out: Set<MessageId>,
+  ): void {
+    if (summary.sourceLevel === 0) {
+      for (const id of summary.sourceIds) out.add(id);
+      return;
+    }
+    for (const childId of summary.sourceIds) {
+      const child = summariesById.get(childId);
+      if (child) this.expandSummaryToLeafMessageIds(child, summariesById, out);
+    }
   }
 
   // ============================================================================
