@@ -2837,19 +2837,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Callers should also expand merged L1s (not just the unmerged frontier)
    * as defense in depth — a stale `mergedInto` pointer or a partially
    * applied merge shouldn't surface raw messages.
+   *
+   * `visited` guards against pathological cycles in the summary graph (a
+   * corrupted store or a future merge regression that lets a summary
+   * reference itself). The hierarchy is a DAG by construction, but a
+   * stack overflow during compression — exactly when the safety net is
+   * supposed to save the session — is too steep a price for trusting that.
    */
   protected expandSummaryToLeafMessageIds(
     summary: SummaryEntry,
     summariesById: ReadonlyMap<string, SummaryEntry>,
     out: Set<MessageId>,
+    visited: Set<string> = new Set(),
   ): void {
+    if (visited.has(summary.id)) return;
+    visited.add(summary.id);
     if (summary.sourceLevel === 0) {
       for (const id of summary.sourceIds) out.add(id);
       return;
     }
     for (const childId of summary.sourceIds) {
       const child = summariesById.get(childId);
-      if (child) this.expandSummaryToLeafMessageIds(child, summariesById, out);
+      if (child) this.expandSummaryToLeafMessageIds(child, summariesById, out, visited);
     }
   }
 

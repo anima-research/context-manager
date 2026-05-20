@@ -149,7 +149,7 @@ describe('stripUnpairedToolBlocks', () => {
     const out = stripUnpairedToolBlocks(input);
     assert.equal(out.length, 2);
     assert.deepEqual(out[0].content.map((b) => b.type), ['text']);
-    assert.equal((out[0].content[0] as { text: string }).text, '[tool call omitted — spans chunk boundary]');
+    assert.equal((out[0].content[0] as { text: string }).text, '[tool call omitted]');
     assert.deepEqual(out[1].content.map((b) => b.type), ['text']);
   });
 

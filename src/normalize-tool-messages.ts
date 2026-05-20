@@ -31,62 +31,6 @@ import type { ContentBlock } from '@animalabs/membrane';
  * runtime pass handles legacy sessions imported before that fix landed,
  * and acts as a safety net for any future bundling source.
  */
-/**
- * Strip `tool_use` blocks whose IDs have no matching `tool_result` anywhere
- * in the message list, and `tool_result` blocks whose IDs have no matching
- * `tool_use`. If stripping leaves a message with no blocks, replace its
- * content with a placeholder text block so the message stays structurally
- * valid (collapse/rendering paths assume non-empty content).
- *
- * Why this exists: the Anthropic API requires every `tool_use` to be
- * followed by its `tool_result` in the immediately-next message (and every
- * `tool_result` to follow its `tool_use`). During L1 compression, the
- * chunker can cut a tool cycle: the `tool_use` sits at the end of chunk N
- * and the `tool_result` opens chunk N+1, so chunk N's compression payload
- * contains an orphan `tool_use` at its tail (and chunk N+1 would contain
- * an orphan `tool_result` at its head if not for the head/recall context).
- *
- * Cleaner upstream: have the chunker avoid cutting cycles (extend the
- * chunk by one when it would close on a `tool_use`). The chunker does this
- * via the `hasTrailingToolUse` check in `rebuildChunks`. This runtime pass
- * is defense in depth — it also covers any future call site or edge case
- * where messages reach the request shape with unpaired blocks.
- */
-export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
-  messages: readonly T[],
-): Array<{ participant: string; content: ContentBlock[] }> {
-  const useIds = new Set<string>();
-  const resultIds = new Set<string>();
-  for (const msg of messages) {
-    for (const block of msg.content) {
-      if (block.type === 'tool_use') useIds.add((block as { id: string }).id);
-      else if (block.type === 'tool_result') {
-        resultIds.add((block as { toolUseId: string }).toolUseId);
-      }
-    }
-  }
-  return messages.map((msg) => {
-    const trimmed = msg.content.filter((block) => {
-      if (block.type === 'tool_use') {
-        return resultIds.has((block as { id: string }).id);
-      }
-      if (block.type === 'tool_result') {
-        return useIds.has((block as { toolUseId: string }).toolUseId);
-      }
-      return true;
-    });
-    if (trimmed.length === msg.content.length) {
-      return { participant: msg.participant, content: msg.content };
-    }
-    return {
-      participant: msg.participant,
-      content: trimmed.length > 0
-        ? trimmed
-        : [{ type: 'text', text: '[tool call omitted — spans chunk boundary]' }],
-    };
-  });
-}
-
 export function splitMixedToolMessages<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
@@ -124,4 +68,65 @@ export function splitMixedToolMessages<T extends { participant: string; content:
     flushPre();
   }
   return out;
+}
+
+/**
+ * Strip `tool_use` blocks whose IDs have no matching `tool_result` anywhere
+ * in the message list, and `tool_result` blocks whose IDs have no matching
+ * `tool_use`. If stripping leaves a message with no blocks, replace its
+ * content with a placeholder text block so the message stays structurally
+ * valid (collapse/rendering paths assume non-empty content).
+ *
+ * Why this exists: the Anthropic API requires every `tool_use` to be
+ * followed by its `tool_result` in the immediately-next message (and every
+ * `tool_result` to follow its `tool_use`). Two ways this becomes a problem
+ * in compression:
+ *
+ *   - chunk boundaries: the chunker can cut a cycle, leaving a `tool_use`
+ *     at the tail of chunk N and its `tool_result` at the head of N+1.
+ *     `rebuildChunks` defers closing on a `tool_use` to avoid this, but
+ *     can't help when the `tool_use` is the very last message in the
+ *     store (no next message to ride along).
+ *   - any future call site that builds a request from raw messages without
+ *     also handling cycle pairing.
+ *
+ * The placeholder is intentionally generic ("[tool call omitted]") rather
+ * than naming a specific cause: this function fires for the chunk-boundary
+ * case AND the very-last-message case AND any future not-yet-anticipated
+ * source of unpaired blocks. Anything more specific would mislead the
+ * debugger reading the compressed conversation later.
+ */
+export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
+  messages: readonly T[],
+): Array<{ participant: string; content: ContentBlock[] }> {
+  const useIds = new Set<string>();
+  const resultIds = new Set<string>();
+  for (const msg of messages) {
+    for (const block of msg.content) {
+      if (block.type === 'tool_use') useIds.add((block as { id: string }).id);
+      else if (block.type === 'tool_result') {
+        resultIds.add((block as { toolUseId: string }).toolUseId);
+      }
+    }
+  }
+  return messages.map((msg) => {
+    const trimmed = msg.content.filter((block) => {
+      if (block.type === 'tool_use') {
+        return resultIds.has((block as { id: string }).id);
+      }
+      if (block.type === 'tool_result') {
+        return useIds.has((block as { toolUseId: string }).toolUseId);
+      }
+      return true;
+    });
+    if (trimmed.length === msg.content.length) {
+      return { participant: msg.participant, content: msg.content };
+    }
+    return {
+      participant: msg.participant,
+      content: trimmed.length > 0
+        ? trimmed
+        : [{ type: 'text', text: '[tool call omitted]' }],
+    };
+  });
 }
