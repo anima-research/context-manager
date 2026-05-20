@@ -20,7 +20,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
-import { splitMixedToolMessages } from '../normalize-tool-messages.js';
+import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
@@ -1642,9 +1642,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // raw messages reappear.
     const chunkFirstId = chunk.messages[0]?.id;
     if (chunkFirstId) {
-      const priorSummaryMessageIds = new Set<string>();
+      // Expand summary sourceIds down to leaf message IDs. An L2 in
+      // `priorSummaries` has L1 IDs in its sourceIds, not message IDs;
+      // a flat walk would miss every message it transitively covers.
+      // (Bug 10 — same shape as executeMerge.)
+      const summariesById = new Map<string, SummaryEntry>();
+      for (const s of this.summaries) summariesById.set(s.id, s);
+      const priorSummaryMessageIds = new Set<MessageId>();
+      for (const s of this.summaries) {
+        if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
       for (const s of priorSummaries) {
-        for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
+        this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
       }
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
@@ -1693,6 +1702,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Collapse consecutive same-participant messages for API compliance
     const collapsed = this.collapseConsecutiveMessages(split);
 
+    // Defense in depth against chunk boundaries that cut a tool cycle
+    // (rebuildChunks tries to avoid this, but covers only the most common
+    // case). The API rejects any tool_use that isn't immediately followed
+    // by its tool_result, and any tool_result that doesn't follow a use.
+    const cleaned = stripUnpairedToolBlocks(collapsed);
+
     // NO system prompt. The agent's identity is established by the head
     // (the actual conversation opening — user message + agent reply that
     // grounded the original instance). A system prompt would (a) add a
@@ -1702,7 +1717,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural one carried by the conversation itself. Anchoring
     // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
-      messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
+      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -1753,7 +1768,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
-        messages: collapsed.map((m) => ({
+        messages: cleaned.map((m) => ({
           participant: m.participant,
           // Flatten content for logging — store text only; binary content
           // would bloat the log and isn't typical in compression input.
@@ -2032,9 +2047,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The full unmerged-frontier set covers what's "compressed somewhere"
     // for the raw-middle dedup below — a budget-dropped recall pair
     // doesn't make its underlying raw messages reappear.
+    //
+    // Critical: `sourceIds` on an L2+ summary points at L1 IDs, not raw
+    // message IDs. The dedup happens against raw message IDs, so we must
+    // recursively expand each summary down to its leaf message IDs.
+    // Without this, every message under any L2 leaks back in as raw text
+    // (Bug 10: 525-message merge requests on a 4234-msg conversation).
+    // Also expand merged L1s as defense in depth.
     const priorSummaryMessageIds = new Set<MessageId>();
+    for (const s of this.summaries) {
+      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
     for (const s of priorSummariesAll) {
-      for (const id of s.sourceIds) priorSummaryMessageIds.add(id);
+      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
 
     for (const s of keptPriorSummaries) {
@@ -2143,12 +2168,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Same bundled-tool-cycle defense as compressChunkHierarchical.
     const split = splitMixedToolMessages(llmMessages);
     const collapsed = this.collapseConsecutiveMessages(split);
+    const cleaned = stripUnpairedToolBlocks(collapsed);
 
     // NO system prompt — identity is established by the head window
     // (present at the start of llmMessages above) and by the prior
     // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
-      messages: collapsed.map(m => ({ participant: m.participant, content: m.content })),
+      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         maxTokens: Math.round(targetTokens * 1.5),
@@ -2208,7 +2234,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
         system: null,
-        messages: collapsed.map((m) => ({
+        messages: cleaned.map((m) => ({
           participant: m.participant,
           text: m.content
             .filter((b: ContentBlock) => b.type === 'text')
@@ -2792,6 +2818,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (!current || current.level !== level) return null;
     return current;
+  }
+
+  /**
+   * Recursively expand a summary's `sourceIds` down to the leaf message IDs
+   * it covers, adding each leaf into `out`.
+   *
+   * Required because `SummaryEntry.sourceIds` are level-relative: an L1's
+   * sourceIds are raw message IDs (sourceLevel=0), but an L2's sourceIds
+   * are L1 IDs (sourceLevel=1), and so on. Any dedup that walks `sourceIds`
+   * directly only works for L1s — once L2+ summaries enter the picture
+   * (which happens as soon as `mergeThreshold` L1s accumulate during
+   * interleaved compression+merge ticks), the dedup silently fails and
+   * already-summarized messages leak back into the request as raw text.
+   * That's how Bug 10 produced 200k+ token merge prompts on a 4234-msg
+   * import.
+   *
+   * Callers should also expand merged L1s (not just the unmerged frontier)
+   * as defense in depth — a stale `mergedInto` pointer or a partially
+   * applied merge shouldn't surface raw messages.
+   *
+   * `visited` guards against pathological cycles in the summary graph (a
+   * corrupted store or a future merge regression that lets a summary
+   * reference itself). The hierarchy is a DAG by construction, but a
+   * stack overflow during compression — exactly when the safety net is
+   * supposed to save the session — is too steep a price for trusting that.
+   */
+  protected expandSummaryToLeafMessageIds(
+    summary: SummaryEntry,
+    summariesById: ReadonlyMap<string, SummaryEntry>,
+    out: Set<MessageId>,
+    visited: Set<string> = new Set(),
+  ): void {
+    if (visited.has(summary.id)) return;
+    visited.add(summary.id);
+    if (summary.sourceLevel === 0) {
+      for (const id of summary.sourceIds) out.add(id);
+      return;
+    }
+    for (const childId of summary.sourceIds) {
+      const child = summariesById.get(childId);
+      if (child) this.expandSummaryToLeafMessageIds(child, summariesById, out, visited);
+    }
   }
 
   // ============================================================================
@@ -3410,6 +3478,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         currentTokens >= this.config.targetChunkTokens &&
         currentChunk.length >= 4;
 
+      // Don't close a chunk on a message containing a tool_use block —
+      // the matching tool_result lives in the immediately-following user
+      // message, and the Anthropic API rejects a request where a tool_use
+      // isn't immediately followed by its tool_result. Defer the close
+      // by one iteration so the result rides along in the same chunk.
+      // The stripUnpairedToolBlocks runtime pass is a safety net for the
+      // rare case where a tool_use is the very last message in the store.
+      if (shouldClose && this.lastMessageContainsToolUse(currentChunk)) {
+        continue;
+      }
+
       if (shouldClose) {
         const chunk = this.createChunk(
           this.chunks.length,
@@ -3446,6 +3525,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.compressionQueue.push(chunk.index);
       }
     }
+  }
+
+  /**
+   * Returns true if the last message in the chunk-in-progress contains a
+   * `tool_use` block. Used by `rebuildChunks` to defer chunk closure until
+   * the matching `tool_result` (in the immediately-following user message)
+   * is pulled into the same chunk. See `stripUnpairedToolBlocks` for the
+   * runtime safety net.
+   */
+  protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
+    const last = chunk[chunk.length - 1];
+    if (!last) return false;
+    return last.content.some((b) => b.type === 'tool_use');
   }
 
   protected createChunk(
