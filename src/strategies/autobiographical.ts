@@ -1056,12 +1056,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.rebuildChunks(store);
 
+    let entries: ContextEntry[];
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget);
+      entries = this.selectAdaptive(store, budget);
+    } else {
+      entries = this.config.hierarchical
+        ? this.selectHierarchical(store, budget)
+        : this.selectLegacy(store, log, budget);
     }
-    return this.config.hierarchical
-      ? this.selectHierarchical(store, budget)
-      : this.selectLegacy(store, log, budget);
+    // Single post-pass across every compile path: strip stale images to text
+    // placeholders so the live image payload stays bounded regardless of how
+    // far back the verbatim text window reaches.
+    this.applyImageStripping(entries, store);
+    return entries;
   }
 
   /**
@@ -3333,6 +3340,69 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected chunkKey(chunk: Chunk): string {
     return chunk.messages.map((m) => m.id).join(':');
+  }
+
+  /** True if any content block is a live image. */
+  protected hasImageBlock(content: ContentBlock[]): boolean {
+    return content.some((b) => b.type === 'image');
+  }
+
+  /** Message index marking the image-strip depth boundary: walks newest→oldest
+   *  summing the same per-message estimate as getRecentWindowStart, and returns
+   *  the index of the first message still within `depthTokens`. Messages before
+   *  this index have their images stripped to placeholders. */
+  protected getImageStripStart(store: MessageStoreView, depthTokens: number): number {
+    const messages = store.getAll();
+    let tokens = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      tokens += store.estimateTokens(messages[i]);
+      if (tokens > depthTokens) return i + 1;
+    }
+    return 0;
+  }
+
+  /** Post-pass over compiled entries: replace image blocks with a text
+   *  placeholder once they fall outside the live-image window — either deeper
+   *  than `imageStripDepthTokens` from the newest message, or beyond the
+   *  `maxLiveImages` most-recent images (counted newest-first). Summaries are
+   *  already text, so they're naturally unaffected. The adjacent
+   *  "[image attachment: <name>]" text added at ingest preserves the filename,
+   *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
+   *  a compiled context back over budget. */
+  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
+    const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
+    const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
+    if (maxLive === 0 && depthTokens === 0) return;             // policy disabled
+
+    const messages = store.getAll();
+    const posById = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) posById.set(messages[i].id, i);
+    const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
+
+    // Image-bearing entries, newest-first by source position. Entries with no
+    // resolvable source position sort last (pos -1) and never count as "live".
+    const ordered = entries
+      .map((entry, idx) => ({
+        idx,
+        pos: entry.sourceMessageId !== undefined ? posById.get(entry.sourceMessageId) ?? -1 : -1,
+      }))
+      .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
+      .sort((a, b) => b.pos - a.pos);
+
+    let keptImages = 0;
+    for (const { idx, pos } of ordered) {
+      const entry = entries[idx];
+      const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
+      entry.content = entry.content.map((block) => {
+        if (block.type !== 'image') return block;
+        const overCount = maxLive > 0 && keptImages >= maxLive;
+        if (tooDeep || overCount) {
+          return { type: 'text', text: '[image dropped from live context]' } as ContentBlock;
+        }
+        keptImages++;
+        return block;
+      });
+    }
   }
 
   protected getRecentWindowStart(store: MessageStoreView): number {
