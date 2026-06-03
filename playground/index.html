@@ -96,7 +96,11 @@
       <span style="color:var(--dim)">▒ tail (kept raw)</span>
     </div>
 
-    <h3>resolution distribution</h3>
+    <h3>context makeup — tokens (rendered, oldest → newest)</h3>
+    <canvas id="makeup" height="46"></canvas>
+    <div class="note" id="makeupNote"></div>
+
+    <h3>resolution distribution — chunk count</h3>
     <div class="dist" id="dist"></div>
     <div class="note" id="distNote"></div>
   </div>
@@ -104,7 +108,7 @@
 <div id="tip"></div>
 
 <script type="module">
-import { SummaryTree, ValueFunction, solveStableFrontier } from './solver.js';
+import { SummaryTree, ValueFunction, solveStableFrontier, renderLayout } from './solver.js';
 
 const COL = ['#4ade80','#facc15','#fb923c','#f87171','#c084fc'];
 const colorFor = (lvl) => COL[Math.min(lvl, COL.length - 1)];
@@ -207,6 +211,33 @@ function render(res, budget, tail) {
     ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,H); ctx.stroke();
   }
   cv._geom = { bw, n };
+
+  renderMakeup(res);
+}
+
+function renderMakeup(res) {
+  const layout = renderLayout(inputs, tree, res.resolutions);
+  const total = layout.totalTokens || 1;
+  const cat = {}; let rawUnits = 0, recallUnits = 0;
+  for (const u of layout.units) {
+    const lvl = u.kind === 'raw' ? 0 : (tree.summary(u.key)?.level ?? 1);
+    if (u.kind === 'raw') rawUnits++; else recallUnits++;
+    cat[lvl] = (cat[lvl] ?? 0) + u.tokens;
+  }
+  const cv = $('makeup'); const W = cv.clientWidth, H = 46;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio); ctx.clearRect(0,0,W,H);
+  let x = 0;
+  for (const u of layout.units) {
+    const lvl = u.kind === 'raw' ? 0 : (tree.summary(u.key)?.level ?? 1);
+    const w = u.tokens / total * W;
+    ctx.fillStyle = colorFor(lvl); ctx.fillRect(x, 0, Math.max(0.5, w), H);
+    x += w;
+  }
+  const parts = [];
+  for (const lvl of Object.keys(cat).map(Number).sort((a,b)=>a-b))
+    parts.push(`${lvl===0?'raw':'L'+lvl} ${fmt(cat[lvl])} (${(cat[lvl]/total*100).toFixed(0)}%)`);
+  $('makeupNote').textContent = `${fmt(total)} tokens · ${rawUnits} raw + ${recallUnits} recalls  —  ${parts.join('  ·  ')}`;
 }
 
 // hover tooltip
