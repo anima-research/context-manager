@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Best-fit folding playground</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#30363d; --txt:#c9d1d9; --dim:#8b949e;
+          --raw:#4ade80; --l1:#facc15; --l2:#fb923c; --l3:#f87171; --l4:#c084fc; --acc:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .meta { color:var(--dim); }
+  main { display:grid; grid-template-columns:300px 1fr; gap:0; height:calc(100vh - 52px); }
+  .controls { padding:16px 18px; border-right:1px solid var(--line); overflow:auto; }
+  .stage { padding:18px; overflow:auto; }
+  .ctl { margin-bottom:16px; }
+  .ctl label { display:flex; justify-content:space-between; color:var(--dim); margin-bottom:4px; }
+  .ctl label b { color:var(--txt); font-weight:600; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  .row { display:flex; gap:8px; }
+  button { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--acc); }
+  .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:16px; }
+  .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .metric .v { font-size:18px; font-weight:600; }
+  .metric .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .bar { height:10px; background:#21262d; border-radius:5px; overflow:hidden; margin-top:6px; }
+  .bar > i { display:block; height:100%; background:var(--acc); }
+  .bar.over > i { background:var(--l3); }
+  canvas { width:100%; display:block; background:var(--panel); border:1px solid var(--line); border-radius:8px; image-rendering:pixelated; }
+  .legend { display:flex; gap:14px; margin:10px 0 4px; color:var(--dim); flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .sw { width:11px; height:11px; border-radius:2px; display:inline-block; }
+  .dist { display:flex; height:22px; border-radius:6px; overflow:hidden; border:1px solid var(--line); margin-top:6px; }
+  .dist > i { height:100%; }
+  .note { color:var(--dim); font-size:11px; margin-top:8px; }
+  #tip { position:fixed; pointer-events:none; background:#000; border:1px solid var(--line); padding:4px 7px; border-radius:5px; font-size:11px; display:none; white-space:nowrap; z-index:9; }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:18px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Best-fit folding playground</h1>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<main>
+  <div class="controls">
+    <div class="ctl"><label>budget <b><span id="budgetPct">40</span>% · <span id="budgetAbs">—</span></b></label>
+      <input id="budget" type="range" min="2" max="100" value="40" /></div>
+    <div class="ctl"><label>λ (KV stability) <b id="lambdaV">0.010</b></label>
+      <input id="lambda" type="range" min="0" max="100" value="20" /></div>
+    <div class="ctl"><label>recency half-life <b id="halfV">50</b> chunks</label>
+      <input id="half" type="range" min="2" max="400" value="50" /></div>
+    <div class="ctl"><label>min weight <b id="minwV">0.010</b></label>
+      <input id="minw" type="range" min="0" max="100" value="1" /></div>
+    <div class="ctl"><label>tail kept raw <b><span id="tailTok">0</span> tok</b></label>
+      <input id="tail" type="range" min="0" max="100" value="0" /></div>
+
+    <h3>F_prev (KV baseline)</h3>
+    <div class="row">
+      <button id="anchor">Use current as F_prev</button>
+      <button id="resetPrev">Reset to stored</button>
+    </div>
+    <div class="note" id="prevNote">F_prev = stored resolutions</div>
+
+    <h3>solver</h3>
+    <div class="ctl"><label>candidate cap <b id="capV">32</b></label>
+      <input id="cap" type="range" min="2" max="256" value="32" /></div>
+    <div class="ctl"><label>μ iterations <b id="muV">40</b></label>
+      <input id="mu" type="range" min="10" max="80" value="40" /></div>
+    <div class="note" id="time">—</div>
+  </div>
+
+  <div class="stage">
+    <div class="metrics">
+      <div class="metric"><div class="k">tokens / budget</div><div class="v"><span id="mTokens">—</span></div>
+        <div class="bar" id="mBar"><i></i></div></div>
+      <div class="metric"><div class="k">value</div><div class="v" id="mValue">—</div></div>
+      <div class="metric"><div class="k">KV cost (vs F_prev)</div><div class="v" id="mKv">—</div></div>
+      <div class="metric"><div class="k">boundary S</div><div class="v" id="mS">—</div></div>
+      <div class="metric"><div class="k">raw total</div><div class="v" id="mRaw">—</div></div>
+    </div>
+
+    <h3>frontier — chunks oldest → newest</h3>
+    <canvas id="film" height="80"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--raw)"></i>raw</span>
+      <span><i class="sw" style="background:var(--l1)"></i>L1</span>
+      <span><i class="sw" style="background:var(--l2)"></i>L2</span>
+      <span><i class="sw" style="background:var(--l3)"></i>L3</span>
+      <span><i class="sw" style="background:var(--l4)"></i>L4+</span>
+      <span style="color:var(--acc)">│ boundary S</span>
+      <span>▲ changed vs F_prev</span>
+      <span style="color:var(--dim)">▒ tail (kept raw)</span>
+    </div>
+
+    <h3>resolution distribution</h3>
+    <div class="dist" id="dist"></div>
+    <div class="note" id="distNote"></div>
+  </div>
+</main>
+<div id="tip"></div>
+
+<script type="module">
+import { SummaryTree, ValueFunction, solveStableFrontier } from './solver.js';
+
+const COL = ['#4ade80','#facc15','#fb923c','#f87171','#c084fc'];
+const colorFor = (lvl) => COL[Math.min(lvl, COL.length - 1)];
+const fmt = (n) => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n|0);
+
+const $ = (id) => document.getElementById(id);
+let inputs, tree, chunks, rawTotal, newestSeq, fprev, lastRes;
+
+async function boot() {
+  const payload = await (await fetch('./data/lena.json')).json();
+  chunks = payload.chunks.slice().sort((a,b)=>a.sequence-b.sequence);
+  inputs = {
+    chunks,
+    summaries: new Map(payload.summaries.map(s=>[s.id,s])),
+    recallPairTokens: new Map(payload.recallPairTokens),
+    headTokens:0, tailTokens:0, headChunkIds:new Set(), tailChunkIds:new Set(),
+  };
+  tree = new SummaryTree(inputs);
+  rawTotal = chunks.reduce((a,c)=>a+c.rawTokens,0);
+  newestSeq = payload.newestSequence;
+  fprev = new Map(chunks.map(c=>[c.id, c.currentResolution]));
+  $('meta').textContent = `${payload.meta.store} · ${chunks.length} chunks · ${payload.summaries.length} summaries · ${fmt(rawTotal)} raw tokens`;
+  $('mRaw').textContent = fmt(rawTotal);
+  $('tail').max = String(Math.round(rawTotal*0.6));
+  solveAndRender();
+}
+
+function tailSetFor(tailTok) {
+  const s = new Set();
+  if (tailTok <= 0) return s;
+  let used = 0;
+  for (let i = chunks.length-1; i >= 0; i--) { s.add(chunks[i].id); used += chunks[i].rawTokens; if (used >= tailTok) break; }
+  return s;
+}
+
+let timer = null;
+function schedule() { clearTimeout(timer); timer = setTimeout(solveAndRender, 60); }
+
+function solveAndRender() {
+  const pct = +$('budget').value;
+  const budget = Math.round(rawTotal * pct/100);
+  const lambda = Math.pow(10, (+$('lambda').value/100)*4 - 3); // 0.001 … 10, log
+  const half = +$('half').value;
+  const minw = (+$('minw').value/100) * 0.2; // 0 … 0.2
+  const tailTok = +$('tail').value;
+  const cap = +$('cap').value, mu = +$('mu').value;
+  $('budgetPct').textContent = pct; $('budgetAbs').textContent = fmt(budget);
+  $('lambdaV').textContent = lambda.toFixed(3); $('halfV').textContent = half;
+  $('minwV').textContent = minw.toFixed(3); $('tailTok').textContent = fmt(tailTok);
+  $('capV').textContent = cap; $('muV').textContent = mu;
+
+  const tail = tailSetFor(tailTok);
+  const value = new ValueFunction(newestSeq, { recencyHalfLifeChunks: half, minWeight: minw });
+  const t0 = performance.now();
+  const res = solveStableFrontier(inputs, tree, {
+    previous: fprev, budgetTokens: budget, value, lambda,
+    isFoldable: (id) => !tail.has(id), candidateCap: cap, muIterations: mu,
+  });
+  const dt = performance.now() - t0;
+  lastRes = res;
+  $('time').textContent = `solved in ${dt.toFixed(0)} ms`;
+  render(res, budget, tail);
+}
+
+function render(res, budget, tail) {
+  $('mTokens').textContent = `${fmt(res.tokens)} / ${fmt(budget)}`;
+  $('mValue').textContent = fmt(res.value);
+  $('mKv').textContent = fmt(res.kvCost) + (res.overBudget ? ' ⚠over' : '');
+  $('mS').textContent = res.boundarySequence >= chunks.length ? 'none' : `#${res.boundarySequence}`;
+  const bar = $('mBar'); bar.classList.toggle('over', res.tokens > budget);
+  bar.firstElementChild.style.width = Math.min(100, res.tokens/budget*100) + '%';
+
+  // distribution
+  const dist = {}; for (const c of chunks) { const l = res.resolutions.get(c.id) ?? 0; dist[l]=(dist[l]??0)+1; }
+  const distEl = $('dist'); distEl.innerHTML = '';
+  const parts = [];
+  for (const lvl of Object.keys(dist).map(Number).sort((a,b)=>a-b)) {
+    const n = dist[lvl]; const i = document.createElement('i');
+    i.style.width = (n/chunks.length*100)+'%'; i.style.background = colorFor(lvl);
+    i.title = `L${lvl}: ${n}`; distEl.appendChild(i); parts.push(`L${lvl} ${n}`);
+  }
+  $('distNote').textContent = parts.join('  ·  ');
+
+  // filmstrip
+  const cv = $('film'); const W = cv.clientWidth, H = 80;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.clearRect(0,0,W,H);
+  const n = chunks.length, bw = W / n;
+  for (let i=0;i<n;i++) {
+    const c = chunks[i]; const lvl = res.resolutions.get(c.id) ?? 0;
+    const x = i*bw;
+    if (tail.has(c.id)) { ctx.fillStyle = 'rgba(139,148,158,0.18)'; ctx.fillRect(x,0,Math.max(1,bw),H); }
+    ctx.fillStyle = colorFor(lvl); ctx.fillRect(x, 14, Math.max(1,bw), H-14);
+    if ((res.resolutions.get(c.id)??0) !== (fprev.get(c.id)??0)) { ctx.fillStyle = '#fff'; ctx.fillRect(x, 0, Math.max(1,bw), 4); }
+  }
+  // boundary S line
+  if (res.boundarySequence < n) {
+    const sx = res.boundarySequence * bw;
+    ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,H); ctx.stroke();
+  }
+  cv._geom = { bw, n };
+}
+
+// hover tooltip
+$('film').addEventListener('mousemove', (e) => {
+  if (!lastRes) return;
+  const cv = $('film'); const r = cv.getBoundingClientRect();
+  const i = Math.floor((e.clientX - r.left) / (cv.clientWidth / chunks.length));
+  const c = chunks[Math.max(0,Math.min(chunks.length-1,i))]; if (!c) return;
+  const lvl = lastRes.resolutions.get(c.id) ?? 0; const was = fprev.get(c.id) ?? 0;
+  const tip = $('tip'); tip.style.display='block'; tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px';
+  tip.textContent = `#${c.sequence} ${c.id.slice(0,10)} · ${c.rawTokens}t · L${lvl}${lvl!==was?` (was L${was})`:''}`;
+});
+$('film').addEventListener('mouseleave', () => { $('tip').style.display='none'; });
+
+for (const id of ['budget','lambda','half','minw','tail','cap','mu'])
+  $(id).addEventListener('input', schedule);
+$('anchor').addEventListener('click', () => { if (lastRes) { fprev = new Map(lastRes.resolutions); $('prevNote').textContent='F_prev = snapshot of last solve'; solveAndRender(); } });
+$('resetPrev').addEventListener('click', () => { fprev = new Map(chunks.map(c=>[c.id,c.currentResolution])); $('prevNote').textContent='F_prev = stored resolutions'; solveAndRender(); });
+window.addEventListener('resize', () => lastRes && render(lastRes, Math.round(rawTotal*(+$('budget').value)/100), tailSetFor(+$('tail').value)));
+
+boot();
+</script>
+</body>
+</html>
