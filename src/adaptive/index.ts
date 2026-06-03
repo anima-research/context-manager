@@ -33,6 +33,31 @@ export type {
 // Concrete strategies
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
+export { BestFitStrategy, type BestFitOptions } from './strategies/best-fit.js';
+
+// V2 best-fit frontier solver (see docs/best-fit-frontier-resolution.md)
+export {
+  SummaryTree,
+  nodeTokens,
+  type TreeNode,
+  type LeafNode,
+  type SummaryNode,
+} from './summary-tree.js';
+export {
+  renderLayout,
+  kvCost,
+  earliestDivergenceIndex,
+  type RenderLayout,
+  type RenderedUnit,
+  type Frontier,
+} from './render-offsets.js';
+export { ValueFunction, type ValueParams } from './value-function.js';
+export { solveFrontier, type SolveParams, type SolveResult } from './best-fit-solver.js';
+export {
+  solveStableFrontier,
+  type StableSolveParams,
+  type StableSolveResult,
+} from './stable-frontier.js';
 
 // Picker
 export {

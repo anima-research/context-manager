@@ -442,9 +442,12 @@ export interface AutobiographicalConfig {
    * Folding strategy name when adaptiveResolution is on. One of:
    *   'flat-profile' (default) — level-equalizing
    *   'oldest-first' — chronological
+   *   'best-fit' — V2 budget-optimal frontier with KV-stability (needs a value
+   *     function + λ; the host instantiates BestFitStrategy directly rather than
+   *     by name, as it carries config the others don't).
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'best-fit';
 
   /**
    * Slack ratio (hysteresis) for the picker. The picker folds until total
