@@ -1,2 +1,4 @@
 dist
 node_modules
+# Best-fit playground: generated real-chronicle payloads (real content — do not commit)
+playground/data/
