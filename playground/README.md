@@ -18,12 +18,20 @@ npm run build
 npx esbuild playground/entry.mjs --bundle --format=esm --platform=browser \
   --outfile=playground/solver.js
 
-# 3. Export a real chronicle store → playground/data/<name>.json
-#    (compile the script once, per scripts/README.md)
+# 3. Export a REAL agent's chronicle → playground/data/<name>.json
+#    Compile the script once (per scripts/README.md):
 npx tsc scripts/export-picker-inputs.ts --outDir dist --target ES2022 \
   --module NodeNext --moduleResolution NodeNext --esModuleInterop \
   --skipLibCheck --resolveJsonModule
-node dist/scripts/export-picker-inputs.js <store-path> --out playground/data/lena.json
+#    Snapshot the live store read-only (avoid touching the running agent's lock),
+#    then export with the deployment's namespace. For Lena (local lena-cm deploy):
+cp -R ~/lena-cm/data/sessions/<session-id> /tmp/lena-real && rm -f /tmp/lena-real/LOCK
+node dist/scripts/export-picker-inputs.js /tmp/lena-real --ns agents/lena \
+  --out playground/data/lena.json
+#    The namespace is the agent's state prefix (grep the store's records.log for
+#    "autobio:summaries" to discover it). Summaries are REAL recollections with
+#    real token sizes — do NOT mock-migrate (mock summaries are ~33 tokens and
+#    make folding look ~50× cheaper than reality).
 
 # 4. Serve (fetch() needs http, not file://)
 python3 -m http.server 8044 --directory playground
@@ -33,14 +41,13 @@ python3 -m http.server 8044 --directory playground
 `index.html` currently fetches `./data/lena.json`. Point it at another payload
 to explore a different agent.
 
-To produce a store from a raw `{model, messages:[{role,content}]}` transcript,
-use `scripts/migrate-llr.js <input.json> <store-path> --mock` first.
-
 ## Notes
 
 - `solver.js` (bundle) and `data/` (real conversation content) are gitignored —
-  regenerate them with the steps above.
-- The Lena run shows the **coarse-granularity gap** in the wild: with λ up, the
-  solver freezes a heavily-folded `F_prev` rather than pay KV cost to un-fold
-  low-value old content — visible as under-fill (tokens ≪ budget, KV cost 0).
-  Drop λ to watch it fill.
+  regenerate them with the steps above. **Never commit `data/`** — it holds the
+  agent's real recollections.
+- On real Lena data, the token makeup shows L1 recalls taking a meaningful share
+  of the budget (~22% at 40%, ~62% at 15%) — real folding economics. At tight
+  budgets the stable solver can return *over* budget (granularity + KV
+  stickiness); lowering λ helps. These are the kinds of behaviors the playground
+  exists to surface.

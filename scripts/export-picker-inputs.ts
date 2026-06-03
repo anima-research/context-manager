@@ -52,17 +52,23 @@ async function main() {
   }
   const outIdx = args.indexOf('--out');
   const outPath = outIdx >= 0 ? args[outIdx + 1] : 'playground/data/chronicle.json';
+  const nsIdx = args.indexOf('--ns');
+  const namespace = nsIdx >= 0 ? args[nsIdx + 1] : undefined;
 
+  // Match the deployment recipe so head/tail + msgCap line up with reality.
   const strategy = new AutobiographicalStrategy({
     adaptiveResolution: true,
-    targetChunkTokens: 3000,
+    headWindowTokens: 4000,
     recentWindowTokens: 30000,
+    maxMessageTokens: 10000,
     mergeThreshold: 6,
+    compressionModel: 'claude-opus-4-6',
   });
   const manager = await ContextManager.open({
     path: storePath,
     strategy,
     membrane: makeMockMembrane() as never,
+    ...(namespace ? { namespace } : {}),
   });
 
   const messages = manager.getAllMessages();
