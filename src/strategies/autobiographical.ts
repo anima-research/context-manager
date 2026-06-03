@@ -224,8 +224,6 @@ export interface Chunk {
   tokens: number;
   /** Whether this chunk has been compressed */
   compressed: boolean;
-  /** The diary entry if compressed (legacy mode) */
-  diary?: string;
   /** ID of the L1 SummaryEntry (hierarchical mode) */
   summaryId?: string;
   /** Phase type tag (set by KnowledgeStrategy for semantic chunking) */
@@ -1065,9 +1063,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       if (!chunk || chunk.compressed) return;
 
-      this.pendingCompression = this.config.hierarchical
-        ? this.compressChunkHierarchical(chunk, ctx)
-        : this.compressChunkLegacy(chunk, ctx);
+      this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
       try {
         await this.pendingCompression;
@@ -1141,9 +1137,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.adaptiveResolution) {
       entries = this.selectAdaptive(store, budget);
     } else {
-      entries = this.config.hierarchical
-        ? this.selectHierarchical(store, budget)
-        : this.selectLegacy(store, log, budget);
+      entries = this.selectHierarchical(store, budget);
     }
     // Single post-pass across every compile path: strip stale images to text
     // placeholders so the live image payload stays bounded regardless of how
@@ -1220,130 +1214,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
-  // ============================================================================
-  // Legacy (single-level) path
-  // ============================================================================
-
-  protected selectLegacy(
-    store: MessageStoreView,
-    _log: ContextLogView,
-    budget: TokenBudget
-  ): ContextEntry[] {
-    const entries: ContextEntry[] = [];
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
-    let totalTokens = 0;
-    const messages = store.getAll();
-    const msgCap = this.config.maxMessageTokens;
-
-    // 1. Head window: preserved verbatim as raw copies
-    const headStart = this.getHeadWindowStartIndex(store);
-    const headEnd = this.getHeadWindowEnd(store);
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
-      const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
-
-      entries.push({
-        index: entries.length,
-        sourceMessageId: msg.id,
-        sourceRelation: 'copy',
-        participant: msg.participant,
-        content,
-      });
-      totalTokens += tokens;
-    }
-    // Mark the last head entry as a cache boundary (even if budget truncated the window)
-    if (entries.length > 0) {
-      entries[entries.length - 1].cacheMarker = true;
-    }
-
-    // 2. Middle zone: compressed chunks as diary pairs, uncompressed as raw messages.
-    const rawRecentStart = this.getRecentWindowStart(store);
-    // Track which message IDs are covered by chunks
-    const coveredByChunks = new Set<string>();
-
-    for (const chunk of this.chunks) {
-      for (const m of chunk.messages) coveredByChunks.add(m.id);
-
-      if (chunk.compressed && chunk.diary) {
-        const contextLabel = this.config.summaryContextLabel ?? 'Here is a summary of earlier conversation context:';
-        const summaryParticipant = this.config.summaryParticipant ?? 'Summary';
-
-        const questionEntry: ContextEntry = {
-          index: entries.length,
-          participant: 'Context Manager',
-          content: [{ type: 'text', text: contextLabel }],
-          sourceRelation: 'derived',
-        };
-
-        // Synthesised summary turns must respect maxMessageTokens just like raw
-        // copies do — otherwise a runaway diary can starve recent messages.
-        const answerContent: ContentBlock[] = [{ type: 'text', text: chunk.diary }];
-        const answerEntry: ContextEntry = {
-          index: entries.length + 1,
-          participant: summaryParticipant,
-          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
-          sourceRelation: 'derived',
-        };
-
-        const pairTokens = this.estimateTokens(questionEntry.content) +
-                           this.estimateTokens(answerEntry.content);
-
-        if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
-
-        entries.push(questionEntry);
-        entries.push(answerEntry);
-        totalTokens += pairTokens;
-      } else {
-        // Uncompressed: emit raw messages so they aren't lost
-        for (const msg of chunk.messages) {
-          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
-
-          entries.push({
-            index: entries.length,
-            sourceMessageId: msg.id,
-            sourceRelation: 'copy',
-            participant: msg.participant,
-            content,
-          });
-          totalTokens += tokens;
-        }
-      }
-    }
-
-    // Emit gap messages in the compressible zone not covered by any chunk.
-    // Compressible zone: [0, headStart) ∪ [headEnd, rawRecentStart)
-    for (let i = 0; i < rawRecentStart && i < messages.length; i++) {
-      // Skip head window messages (already emitted verbatim above)
-      if (i >= headStart && i < headEnd) continue;
-      if (coveredByChunks.has(messages[i].id)) continue;
-      const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
-
-      entries.push({
-        index: entries.length,
-        sourceMessageId: msg.id,
-        sourceRelation: 'copy',
-        participant: msg.participant,
-        content,
-      });
-      totalTokens += tokens;
-    }
-
-    // 3. Recent uncompressed messages (skip those already in head window)
-    const recentStart = Math.max(this.getRecentWindowStart(store), headEnd);
-    this.emitRecentNewestFirst(entries, store, messages, recentStart, msgCap, maxTokens, totalTokens);
-
-    this.trimOrphanedToolUse(entries);
-    this.pruneToolEntries(entries);
-    return entries;
-  }
-
   /**
    * Emit recent-window messages, evicting OLDEST-first when the budget is tight.
    *
@@ -1399,99 +1269,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content,
       });
     }
-  }
-
-  protected async compressChunkLegacy(chunk: Chunk, ctx: StrategyContext): Promise<void> {
-    if (!ctx.membrane) {
-      throw new Error('No membrane instance for compression');
-    }
-
-    const priorContext = this.buildPriorContextLegacy(chunk, ctx);
-    const chunkContent = this.formatChunkForCompression(chunk);
-
-    const prompt = this.config.diaryUserPrompt ?? this.config.summaryUserPrompt!;
-    const systemPrompt = this.config.diarySystemPrompt ?? this.config.summarySystemPrompt!;
-
-    const messages = [
-      ...priorContext,
-      {
-        participant: 'Context Manager',
-        content: [{ type: 'text' as const, text: prompt.replace('{content}', chunkContent) }],
-      },
-    ];
-
-    const request: NormalizedRequest = {
-      messages: messages.map((m) => ({
-        participant: m.participant,
-        content: m.content,
-      })),
-      system: systemPrompt,
-      config: {
-        model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
-        maxTokens: 2000,
-      },
-    };
-
-    try {
-      const response = await ctx.membrane.complete(request);
-      const diaryText = response.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n');
-
-      chunk.compressed = true;
-      chunk.diary = diaryText;
-      this._compressionCount++;
-    } catch (error) {
-      console.error('Failed to compress chunk:', error);
-      throw error;
-    }
-  }
-
-  protected buildPriorContextLegacy(chunk: Chunk, ctx: StrategyContext): Array<{
-    participant: string;
-    content: ContentBlock[];
-  }> {
-    const context: Array<{ participant: string; content: ContentBlock[] }> = [];
-
-    for (const prevChunk of this.chunks) {
-      if (prevChunk.index >= chunk.index) break;
-      if (!prevChunk.compressed || !prevChunk.diary) continue;
-
-      context.push({
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: this.config.summaryContextLabel ?? 'Summary of earlier context:' }],
-      });
-      context.push({
-        participant: this.config.summaryParticipant ?? 'Summary',
-        content: [{ type: 'text', text: prevChunk.diary }],
-      });
-    }
-
-    // Find the actual position of this chunk's first message in the full array
-    const messages = ctx.messageStore.getAll();
-    const firstMsgId = chunk.messages[0]?.id;
-    const chunkAbsStart = firstMsgId
-      ? messages.findIndex(m => m.id === firstMsgId)
-      : -1;
-
-    if (chunkAbsStart > 0) {
-      const precedingStart = Math.max(0, chunkAbsStart - 50);
-      let tokens = 0;
-
-      for (let i = chunkAbsStart - 1; i >= precedingStart && tokens < 15000; i--) {
-        const msg = messages[i];
-        if (!msg) break;
-
-        tokens += ctx.messageStore.estimateTokens(msg);
-        context.unshift({
-          participant: msg.participant,
-          content: msg.content,
-        });
-      }
-    }
-
-    return context;
   }
 
   // ============================================================================
@@ -2700,6 +2477,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it falls into (preserves KV cache through region transitions).
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
 
+    this.pruneToolEntries(merged);
     this.trimOrphanedToolUse(merged);
     // Place ≤4 cache breakpoints across the FINAL ordered entries so the
     // provider can reuse the stable folded prefix — not just the head. With a
@@ -3628,7 +3406,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const existing = existingCompressed.get(key);
     if (existing) {
       chunk.compressed = true;
-      chunk.diary = existing.diary;
       chunk.summaryId = existing.summaryId;
     }
 
