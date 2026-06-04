@@ -104,3 +104,27 @@ test('stable: re-solve keeps the deep-old prefix stable (changes cluster near ta
   assert.ok(r.kvCost <= r.tokens, 'kv cost is the recomputed suffix, not more');
   assert.ok(r.tokens <= 24_000, 'within budget');
 });
+
+test('stable: large budget un-folds an over-folded F_prev on a long history (history-relative recency)', () => {
+  // Regression for the real Lena finding: a 500k budget filled only ~270k
+  // because the absolute half-life floored old content to worthless, so the
+  // solver wouldn't un-fold it. With the default (history-relative) recency,
+  // a large budget must un-fold the over-folded F_prev to fill.
+  const ch = buildChronicleWithChain({
+    chunkCount: 300, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200,
+  });
+  const inputs = inputsOf(ch);
+  const tree = new SummaryTree(inputs);
+  const value = new ValueFunction(299); // default relative half-life (≈ 0.25 × 299)
+
+  // F_prev: heavily folded to fit a tiny budget.
+  const folded = solveFrontier(tree, { budgetTokens: 4_000, value });
+  assert.ok(folded.tokens < 20_000, 'F_prev starts heavily folded');
+
+  // Budget jumps to most of the 300k raw total → must fill, not freeze F_prev.
+  const grown = solveStableFrontier(inputs, tree, {
+    previous: folded.resolutions, budgetTokens: 250_000, value, lambda: 0.006, candidateCap: 16,
+  });
+  assert.ok(grown.tokens > 150_000, `budget increase must fill (got ${grown.tokens})`);
+  assert.ok(grown.tokens <= 250_000, 'within budget');
+});

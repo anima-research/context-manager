@@ -51,8 +51,8 @@
       <input id="budget" type="range" min="2" max="100" value="40" /></div>
     <div class="ctl"><label>λ (KV stability) <b id="lambdaV">0.010</b></label>
       <input id="lambda" type="range" min="0" max="100" value="20" /></div>
-    <div class="ctl"><label>recency half-life <b id="halfV">50</b> chunks</label>
-      <input id="half" type="range" min="2" max="400" value="50" /></div>
+    <div class="ctl"><label>recency half-life <b id="halfV">25</b>% of history</label>
+      <input id="half" type="range" min="2" max="100" value="25" /></div>
     <div class="ctl"><label>min weight <b id="minwV">0.010</b></label>
       <input id="minw" type="range" min="0" max="100" value="1" /></div>
     <div class="ctl"><label>tail kept raw <b><span id="tailTok">0</span> tok</b></label>
@@ -151,17 +151,17 @@ function solveAndRender() {
   const pct = +$('budget').value;
   const budget = Math.round(rawTotal * pct/100);
   const lambda = Math.pow(10, (+$('lambda').value/100)*4 - 3); // 0.001 … 10, log
-  const half = +$('half').value;
+  const halfPct = +$('half').value;
   const minw = (+$('minw').value/100) * 0.2; // 0 … 0.2
   const tailTok = +$('tail').value;
   const cap = +$('cap').value, mu = +$('mu').value;
   $('budgetPct').textContent = pct; $('budgetAbs').textContent = fmt(budget);
-  $('lambdaV').textContent = lambda.toFixed(3); $('halfV').textContent = half;
+  $('lambdaV').textContent = lambda.toFixed(3); $('halfV').textContent = halfPct;
   $('minwV').textContent = minw.toFixed(3); $('tailTok').textContent = fmt(tailTok);
   $('capV').textContent = cap; $('muV').textContent = mu;
 
   const tail = tailSetFor(tailTok);
-  const value = new ValueFunction(newestSeq, { recencyHalfLifeChunks: half, minWeight: minw });
+  const value = new ValueFunction(newestSeq, { recencyHalfLifeFraction: halfPct / 100, minWeight: minw });
   const t0 = performance.now();
   const res = solveStableFrontier(inputs, tree, {
     previous: fprev, budgetTokens: budget, value, lambda,

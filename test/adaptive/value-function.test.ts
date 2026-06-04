@@ -61,3 +61,19 @@ test('value: nodeValue = weight × rendered tokens; summary uses mean leaf weigh
   meanW /= 6;
   assert.ok(approx(vf.nodeValue(l1, tree), meanW * 200), 'summary value = mean leaf weight × recall tokens');
 });
+
+test('value: default half-life scales with history — old content is not floored', () => {
+  // No explicit half-life → fraction 0.25 of history. The oldest chunk's weight
+  // is history-INDEPENDENT and well above the floor (0.5^(1/0.25) = 0.0625), so
+  // the solver still values un-folding old content and surplus budget can fill.
+  const short = new ValueFunction(99); // 100-chunk history
+  const long = new ValueFunction(9999); // 10000-chunk history
+  assert.ok(approx(short.weight(0), 0.0625, 1e-6), 'oldest weight = 0.5^4');
+  assert.ok(approx(long.weight(0), 0.0625, 1e-6), 'same regardless of history length');
+  assert.ok(short.weight(0) > 0.01, 'not floored to minWeight');
+
+  // The absolute override keeps the old (floor-prone) behavior for callers that
+  // ask for it — an absolute 50-chunk half-life floors very old content.
+  const abs = new ValueFunction(9999, { recencyHalfLifeChunks: 50, minWeight: 0.01 });
+  assert.ok(abs.weight(0) <= 0.01 + 1e-9, 'absolute half-life floors old content on a long history');
+});

@@ -26,9 +26,17 @@ import type { SummaryTree, TreeNode } from './summary-tree.js';
 import { nodeTokens } from './summary-tree.js';
 
 export interface ValueParams {
-  /** Recency half-life in chunk positions: weight = 0.5^(age / halfLife),
-   *  age measured from the newest chunk. Smaller = recency dominates harder.
-   *  Default 50. */
+  /** Recency half-life as a FRACTION of history length (the default mode):
+   *  effective half-life = fraction × newestSequence, so the recency curve
+   *  spans the actual history regardless of how long it is. Default 0.25.
+   *
+   *  This matters: an absolute half-life devalues everything past a few
+   *  half-lives to `minWeight`, so on a long history the solver treats old
+   *  content as worthless and won't spend surplus budget un-folding it — i.e. a
+   *  budget increase fails to take effect. Scaling to history avoids that. */
+  recencyHalfLifeFraction?: number;
+  /** Absolute recency half-life in chunk positions. Overrides the fraction when
+   *  set. weight = 0.5^(age / halfLife), age measured from the newest chunk. */
   recencyHalfLifeChunks?: number;
   /** Floor so very old content keeps a little value (avoids 0). Default 0.01. */
   minWeight?: number;
@@ -50,7 +58,8 @@ export class ValueFunction {
     private readonly newestSequence: number,
     params: ValueParams = {},
   ) {
-    this.halfLife = params.recencyHalfLifeChunks ?? 50;
+    this.halfLife = params.recencyHalfLifeChunks
+      ?? Math.max(1, (params.recencyHalfLifeFraction ?? 0.25) * newestSequence);
     this.minWeight = params.minWeight ?? 0.01;
     this.salienceFn = params.salience ?? (() => 1);
   }
