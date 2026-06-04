@@ -91,6 +91,16 @@ export class SummaryTree {
 
   // ---- node access ----
 
+  /** All leaf nodes in source order (oldest first). */
+  orderedLeaves(): LeafNode[] {
+    return [...this.leaves.values()].sort((a, b) => a.sequence - b.sequence);
+  }
+
+  /** All summary nodes (unordered). */
+  allSummaries(): SummaryNode[] {
+    return [...this.nodes.values()];
+  }
+
   leaf(chunkId: ChunkId): LeafNode | null {
     return this.leaves.get(chunkId) ?? null;
   }

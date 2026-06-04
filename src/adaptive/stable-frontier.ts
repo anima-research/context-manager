@@ -53,6 +53,8 @@ export interface StableSolveParams {
    *  Default 256. */
   candidateCap?: number;
   muIterations?: number;
+  /** Smoothness weight γ for the per-suffix budget-optimal solves. */
+  smoothness?: number;
 }
 
 export interface StableSolveResult {
@@ -108,7 +110,8 @@ export function solveStableFrontier(
       budgetTokens: budgetTokens - prefixTokens,
       value,
       isFoldable: params.isFoldable,
-      muIterations: params.muIterations,
+      iterations: params.muIterations,
+      smoothness: params.smoothness,
     });
 
     const score = pv[j] + suffix.value - lambda * suffix.tokens;

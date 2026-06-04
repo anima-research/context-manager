@@ -44,6 +44,8 @@ export interface BestFitOptions {
   lambda: number;
   candidateCap?: number;
   muIterations?: number;
+  /** Smoothness weight γ (prefer contiguous resolution bands when affordable). */
+  smoothness?: number;
 }
 
 export class BestFitStrategy implements FoldingStrategy {
@@ -91,6 +93,7 @@ export class BestFitStrategy implements FoldingStrategy {
       isFoldable: (id) => !fixed.has(id),
       candidateCap: this.opts.candidateCap,
       muIterations: this.opts.muIterations,
+      smoothness: this.opts.smoothness,
     });
     return result.resolutions;
   }

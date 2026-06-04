@@ -1,28 +1,34 @@
 /**
  * Best-fit frontier solver (docs §3, §6, §11 step 4).
  *
- * Chooses a frontier (antichain cut) over the summary forest that maximizes
- * recency-weighted value subject to a token budget — optimal tree pruning under
- * a knapsack budget. Solved by Lagrangian relaxation on a budget multiplier μ:
- * for a given μ each node independently picks the higher-reward of
+ * Chooses a frontier — a contiguous partition of the chronicle into rendered
+ * units (raw chunks and summary recall-pairs) — that maximizes recency-weighted
+ * value under a token budget, while preferring SMOOTH frontiers (few resolution
+ * changes) when it's affordable.
  *
- *     collapse:  value(node)        − μ · tokens(node)
- *     expand:    Σ children rewards          (recurse)
+ * Formulated as a position-ordered sequence DP over the chunks (oldest →
+ * newest). Each rendered unit picks a level: raw (level 0, one chunk) or a
+ * summary S starting at this position (level S.level, covering S's contiguous
+ * range, one recall pair). The objective is
  *
- * computed bottom-up. Total cost is non-increasing in μ, so binary-searching μ
- * finds the smallest multiplier whose frontier fits the budget — i.e. the
- * frontier that fills the budget without exceeding it, folding lowest-weight
- * (oldest/least-salient) regions first and expanding again when budget returns
- * (bidirectional self-adjust). This is the doc's preferred approach (§6); it is
- * a relaxation, so it can leave a small duality gap vs an exact bucketized DP —
- * acceptable for v1, revisit if integration shows under-fill.
+ *     maximize  Σ value(unit) − λ·tokens(unit) − γ·|Δlevel between adjacent units|
  *
- * The KV-stability term (§4) is layered on top in a later step; this solver is
- * the pure budget-optimal core. Deterministic (no Date.now/Math.random).
+ * - `value` / `tokens`: the fidelity-weighted info and recall/raw cost.
+ * - `λ` (budget multiplier): swept by binary search to fit the token budget.
+ * - `γ` (smoothness): penalizes level changes between adjacent units, so the
+ *   solver prefers contiguous resolution bands. Small γ = "smooth when
+ *   affordable" — it only smooths where the value cost is low; real value
+ *   differences and pins still break it. γ=0 = pure budget-optimal.
+ *
+ * Pins fall out for free: a non-foldable (pinned) chunk only has a raw unit, and
+ * any summary spanning it is excluded — so the cut routes around pins, and the
+ * resulting non-monotonic steps are legitimate (not gratuitous fragmentation).
+ *
+ * Deterministic (no Date.now/Math.random).
  */
 
 import type { ChunkId } from './folding-strategy.js';
-import type { SummaryTree, TreeNode } from './summary-tree.js';
+import type { SummaryTree } from './summary-tree.js';
 import type { ValueFunction } from './value-function.js';
 
 export interface SolveParams {
@@ -30,13 +36,18 @@ export interface SolveParams {
   budgetTokens: number;
   value: ValueFunction;
   /**
-   * Whether a chunk may be folded away. A non-foldable chunk renders raw and
-   * blocks the collapse of any summary covering it (so pins / fixed ranges stay
-   * raw). Default: everything foldable.
+   * Whether a chunk may be folded away. A non-foldable chunk renders raw and no
+   * summary may span it (pins / fixed ranges stay raw). Default: all foldable.
    */
   isFoldable?: (chunkId: ChunkId) => boolean;
-  /** Binary-search iterations on the Lagrange multiplier. Default 60. */
-  muIterations?: number;
+  /**
+   * Smoothness weight γ: penalty per unit of level-change between adjacent
+   * rendered units. Small = prefer contiguous bands where affordable; 0 = pure
+   * value-optimal (may fragment). Default 0.
+   */
+  smoothness?: number;
+  /** Binary-search iterations on the budget multiplier λ. Default 60. */
+  iterations?: number;
 }
 
 export interface SolveResult {
@@ -50,119 +61,128 @@ export interface SolveResult {
   overBudget: boolean;
 }
 
-type Choice = 'raw' | 'collapse' | 'expand';
-interface Eval {
-  reward: number;
+interface Unit {
+  level: number;
+  span: number; // number of chunks covered
+  tokens: number;
   value: number;
-  cost: number;
-  choice: Choice;
 }
 
 export function solveFrontier(tree: SummaryTree, params: SolveParams): SolveResult {
   const { budgetTokens, value } = params;
   const isFoldable = params.isFoldable ?? (() => true);
-  const iterations = params.muIterations ?? 60;
-  const roots = tree.roots();
+  const gamma = params.smoothness ?? 0;
+  const iterations = params.iterations ?? 60;
 
-  const collapsibleMemo = new Map<string, boolean>();
-  const collapsible = (id: string, leafIds: ChunkId[]): boolean => {
-    let c = collapsibleMemo.get(id);
-    if (c === undefined) {
-      c = leafIds.every(isFoldable);
-      collapsibleMemo.set(id, c);
+  const leaves = tree.orderedLeaves();
+  const M = leaves.length;
+  if (M === 0) return { resolutions: new Map(), tokens: 0, value: 0, overBudget: false };
+
+  const posOf = new Map<ChunkId, number>();
+  leaves.forEach((l, i) => posOf.set(l.chunkId, i));
+  const foldable = leaves.map((l) => isFoldable(l.chunkId));
+
+  // ---- Candidate rendered units per start position ----
+  const unitsAt: Unit[][] = Array.from({ length: M }, () => []);
+  for (let pos = 0; pos < M; pos++) {
+    unitsAt[pos].push({ level: 0, span: 1, tokens: leaves[pos].rawTokens, value: value.nodeValue(leaves[pos], tree) });
+  }
+  let maxLevel = 0;
+  for (const s of tree.allSummaries()) {
+    maxLevel = Math.max(maxLevel, s.level);
+    const ids = s.leafChunkIds;
+    if (ids.length === 0) continue;
+    const startPos = posOf.get(ids[0]);
+    const lastPos = posOf.get(ids[ids.length - 1]);
+    if (startPos === undefined || lastPos === undefined) continue;
+    if (lastPos - startPos + 1 !== ids.length) continue; // not a contiguous block
+    let contiguousAndFoldable = true;
+    for (const id of ids) {
+      const pp = posOf.get(id);
+      if (pp === undefined || pp < startPos || pp > lastPos || !foldable[pp]) {
+        contiguousAndFoldable = false;
+        break;
+      }
     }
-    return c;
-  };
-
-  const evalNode = (node: TreeNode, mu: number): Eval => {
-    if (node.kind === 'leaf') {
-      const v = value.nodeValue(node, tree);
-      const cost = node.rawTokens;
-      return { reward: v - mu * cost, value: v, cost, choice: 'raw' };
-    }
-    const collapseV = value.nodeValue(node, tree);
-    const collapse: Eval = {
-      reward: collapseV - mu * node.recallTokens,
-      value: collapseV,
-      cost: node.recallTokens,
-      choice: 'collapse',
-    };
-    const children = tree.children(node);
-    if (children.length === 0) return collapse;
-
-    let reward = 0;
-    let val = 0;
-    let cost = 0;
-    for (const ch of children) {
-      const e = evalNode(ch, mu);
-      reward += e.reward;
-      val += e.value;
-      cost += e.cost;
-    }
-    const expand: Eval = { reward, value: val, cost, choice: 'expand' };
-    if (!collapsible(node.id, node.leafChunkIds)) return expand;
-    return collapse.reward >= expand.reward ? collapse : expand;
-  };
-
-  const totalCost = (mu: number): number => {
-    let c = 0;
-    for (const r of roots) c += evalNode(r, mu).cost;
-    return c;
-  };
-
-  // Bracket μ. cost(0) = all raw (max). For the upper bound we need a μ at which
-  // the frontier is provably maximally folded: at μ ≥ the total all-raw value,
-  // every region's μ·cost term dominates its value, so collapsing always wins.
-  //
-  // (A doubling loop that breaks when "cost stopped dropping" is WRONG here: the
-  // concave value model has plateaus where a whole level stays optimal across a
-  // μ range before the next collapse, so the break stops on a plateau and
-  // reports a too-high minCost — e.g. all-L1 instead of all-L2.)
-  const maxCost = totalCost(0);
-  let maxValue = 0;
-  for (const r of roots) maxValue += evalNode(r, 0).value; // all-raw total value
-  const muHi = Math.max(1, maxValue);
-  const minCost = totalCost(muHi);
-
-  if (maxCost <= budgetTokens) return assignAt(0); // fits fully raw
-  if (minCost > budgetTokens) {
-    const res = assignAt(muHi);
-    res.overBudget = true;
-    return res;
+    if (!contiguousAndFoldable) continue;
+    unitsAt[startPos].push({ level: s.level, span: ids.length, tokens: s.recallTokens, value: value.nodeValue(s, tree) });
   }
 
-  // Smallest μ whose frontier fits the budget.
-  let lo = 0;
-  let hi = muHi;
-  for (let i = 0; i < iterations; i++) {
-    const mid = (lo + hi) / 2;
-    if (totalCost(mid) <= budgetTokens) hi = mid;
-    else lo = mid;
-  }
-  return assignAt(hi);
-
-  function assignAt(mu: number): SolveResult {
-    const resolutions = new Map<ChunkId, number>();
-    const walk = (node: TreeNode): void => {
-      const e = evalNode(node, mu);
-      if (node.kind === 'leaf') {
-        resolutions.set(node.chunkId, 0);
-        return;
+  // ---- Sequence DP for a given λ ----
+  // prevLevel index p: 0 = no previous unit (first), k+1 = previous unit at level k.
+  const P = maxLevel + 2;
+  const solveAt = (lambda: number): { tokens: number; value: number; res: Map<ChunkId, number> } => {
+    // f[pos][p] = best objective for covering [pos, M); choiceUnit[pos][p] = unit index.
+    const f: Float64Array[] = new Array(M + 1);
+    const pick: Int32Array[] = new Array(M + 1);
+    f[M] = new Float64Array(P); // zeros
+    for (let pos = M - 1; pos >= 0; pos--) {
+      const fp = new Float64Array(P);
+      const ch = new Int32Array(P);
+      const us = unitsAt[pos];
+      for (let p = 0; p < P; p++) {
+        const prevLevel = p === 0 ? -1 : p - 1;
+        let best = -Infinity;
+        let bestU = 0;
+        for (let ui = 0; ui < us.length; ui++) {
+          const u = us[ui];
+          const pen = prevLevel < 0 ? 0 : gamma * Math.abs(u.level - prevLevel);
+          const obj = u.value - lambda * u.tokens - pen + f[pos + u.span][u.level + 1];
+          if (obj > best) {
+            best = obj;
+            bestU = ui;
+          }
+        }
+        fp[p] = best;
+        ch[p] = bestU;
       }
-      if (e.choice === 'collapse') {
-        for (const leafId of node.leafChunkIds) resolutions.set(leafId, node.level);
-      } else {
-        for (const ch of tree.children(node)) walk(ch);
-      }
-    };
+      f[pos] = fp;
+      pick[pos] = ch;
+    }
+    // Backtrack from (pos 0, no previous).
+    const res = new Map<ChunkId, number>();
+    let pos = 0;
+    let p = 0;
     let tokens = 0;
     let val = 0;
-    for (const r of roots) {
-      const e = evalNode(r, mu);
-      tokens += e.cost;
-      val += e.value;
-      walk(r);
+    while (pos < M) {
+      const u = unitsAt[pos][pick[pos][p]];
+      for (let k = 0; k < u.span; k++) res.set(leaves[pos + k].chunkId, u.level);
+      tokens += u.tokens;
+      val += u.value;
+      pos += u.span;
+      p = u.level + 1;
     }
-    return { resolutions, tokens, value: val, overBudget: false };
+    return { tokens, value: val, res };
+  };
+
+  // ---- Budget via λ (higher λ → fewer tokens) ----
+  const atZero = solveAt(0); // value-optimal ignoring budget (≈ all raw → max tokens)
+  // Upper bound on λ: total all-raw value guarantees the cost term dominates.
+  let maxValue = 0;
+  for (let pos = 0; pos < M; pos++) maxValue += unitsAt[pos][0].value;
+  const muHi = Math.max(1, maxValue);
+  const folded = solveAt(muHi); // most-folded feasible frontier
+
+  if (atZero.tokens <= budgetTokens) return finalize(atZero, false);
+  if (folded.tokens > budgetTokens) return finalize(folded, true);
+
+  let lo = 0;
+  let hi = muHi;
+  let result = folded;
+  for (let i = 0; i < iterations; i++) {
+    const mid = (lo + hi) / 2;
+    const r = solveAt(mid);
+    if (r.tokens <= budgetTokens) {
+      hi = mid;
+      result = r;
+    } else {
+      lo = mid;
+    }
+  }
+  return finalize(result, false);
+
+  function finalize(r: { tokens: number; value: number; res: Map<ChunkId, number> }, over: boolean): SolveResult {
+    return { resolutions: r.res, tokens: r.tokens, value: r.value, overBudget: over };
   }
 }
