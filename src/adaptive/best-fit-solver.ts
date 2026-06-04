@@ -90,22 +90,29 @@ export function solveFrontier(tree: SummaryTree, params: SolveParams): SolveResu
   let maxLevel = 0;
   for (const s of tree.allSummaries()) {
     maxLevel = Math.max(maxLevel, s.level);
-    const ids = s.leafChunkIds;
-    if (ids.length === 0) continue;
-    const startPos = posOf.get(ids[0]);
-    const lastPos = posOf.get(ids[ids.length - 1]);
-    if (startPos === undefined || lastPos === undefined) continue;
-    if (lastPos - startPos + 1 !== ids.length) continue; // not a contiguous block
-    let contiguousAndFoldable = true;
-    for (const id of ids) {
+    // A summary's sourceIds can reference items absent from the current chunk
+    // set (sharded / migrated ids). Validate against the REAL leaves only — the
+    // recall renders over the chunks actually present.
+    let startPos = Infinity;
+    let lastPos = -Infinity;
+    let count = 0;
+    let allFoldable = true;
+    for (const id of s.leafChunkIds) {
       const pp = posOf.get(id);
-      if (pp === undefined || pp < startPos || pp > lastPos || !foldable[pp]) {
-        contiguousAndFoldable = false;
+      if (pp === undefined) continue; // phantom id — not a chunk in this view
+      count++;
+      if (pp < startPos) startPos = pp;
+      if (pp > lastPos) lastPos = pp;
+      if (!foldable[pp]) {
+        allFoldable = false;
         break;
       }
     }
-    if (!contiguousAndFoldable) continue;
-    unitsAt[startPos].push({ level: s.level, span: ids.length, tokens: s.recallTokens, value: value.nodeValue(s, tree) });
+    if (!allFoldable || count === 0) continue;
+    // Real leaves must exactly fill [startPos, lastPos] (no foreign chunk
+    // interleaved) so the recall can render as one contiguous block.
+    if (lastPos - startPos + 1 !== count) continue;
+    unitsAt[startPos].push({ level: s.level, span: count, tokens: s.recallTokens, value: value.nodeValue(s, tree) });
   }
 
   // ---- Sequence DP for a given λ ----

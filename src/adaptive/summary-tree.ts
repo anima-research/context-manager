@@ -216,12 +216,24 @@ export class SummaryTree {
     };
   }
 
-  /** Walk down to leaf chunk ids; sourceLevel 0 => sourceIds are leaves. */
+  /** Walk down to leaf chunk ids; sourceLevel 0 => sourceIds are leaves.
+   *  Deduplicates leaves and guards against revisiting a summary, so a chunk
+   *  reachable via multiple branches is counted once (real chronicles can have
+   *  such overlap; double-counting breaks range/contiguity and value math). */
   private collectLeafIds(summary: SummaryEntry): ChunkId[] {
     const out: ChunkId[] = [];
+    const seenLeaves = new Set<ChunkId>();
+    const seenSummaries = new Set<SummaryId>();
     const visit = (s: SummaryEntry): void => {
+      if (seenSummaries.has(s.id)) return;
+      seenSummaries.add(s.id);
       if (s.sourceLevel === 0) {
-        for (const mid of s.sourceIds) out.push(mid);
+        for (const mid of s.sourceIds) {
+          if (!seenLeaves.has(mid)) {
+            seenLeaves.add(mid);
+            out.push(mid);
+          }
+        }
       } else {
         for (const sid of s.sourceIds) {
           const child = this.summaries.get(sid);
