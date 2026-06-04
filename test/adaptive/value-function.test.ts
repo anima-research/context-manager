@@ -45,21 +45,25 @@ test('value: salience hook multiplies the recency weight', () => {
   assert.ok(approx(vf.weight(6), Math.pow(0.5, 4 / 50) * 1), 'unsalient chunk = recency only');
 });
 
-test('value: nodeValue = weight × rendered tokens; summary uses mean leaf weight', () => {
+test('value: nodeValue is recency-weighted info retained, concave in fold depth', () => {
   const ch = buildChronicleWithChain({
     chunkCount: 6, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200,
   });
   const tree = new SummaryTree(inputsOf(ch));
-  const vf = new ValueFunction(5, { recencyHalfLifeChunks: 8 });
+  const vf = new ValueFunction(5, { recencyHalfLifeChunks: 8, foldFidelity: 0.6 });
 
-  const leaf = tree.leaf('c-0005')!; // newest leaf
+  // A raw leaf retains all of its weighted raw-token information (weight × tokens).
+  const leaf = tree.leaf('c-0005')!; // newest leaf, 1000 raw tokens
   assert.ok(approx(vf.nodeValue(leaf, tree), vf.weight(5) * 1000));
 
+  // An L1 retains foldFidelity^1 × the SUMMED weighted info of its leaves.
   const l1 = tree.summary('L1-0')!; // covers c0..c5
-  let meanW = 0;
-  for (let s = 0; s <= 5; s++) meanW += vf.weight(s);
-  meanW /= 6;
-  assert.ok(approx(vf.nodeValue(l1, tree), meanW * 200), 'summary value = mean leaf weight × recall tokens');
+  let sumInfo = 0;
+  for (let s = 0; s <= 5; s++) sumInfo += vf.weight(s) * 1000;
+  assert.ok(approx(vf.nodeValue(l1, tree), 0.6 * sumInfo), 'summary value = fidelity × summed weighted info');
+
+  // Folding loses value: the L1 is worth less than its leaves rendered raw.
+  assert.ok(vf.nodeValue(l1, tree) < sumInfo, 'fidelity < 1 → folding loses information');
 });
 
 test('value: default half-life scales with history — old content is not floored', () => {

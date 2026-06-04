@@ -67,9 +67,9 @@ test('stable: λ=0 reproduces the pure budget-optimal solve', () => {
 
 test('stable: a budget INCREASE self-adjusts (un-folds) at a reasonable λ', () => {
   const { inputs, tree, value } = build();
-  // F_prev fitted to a tight budget → folded down to a single L2 (200 tokens).
+  // F_prev fitted to a tight budget → folded down to all-L1 (1200 tokens).
   const prev = solveFrontier(tree, { budgetTokens: 6_000, value });
-  assert.equal(prev.tokens, 200);
+  assert.equal(prev.tokens, 1_200);
 
   // Budget jumps; the stable solver should grow the context, not stay folded.
   const grown = solveStableFrontier(inputs, tree, { previous: prev.resolutions, budgetTokens: 30_000, value, lambda: 0.01 });

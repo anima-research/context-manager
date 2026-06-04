@@ -110,17 +110,18 @@ export function solveFrontier(tree: SummaryTree, params: SolveParams): SolveResu
     return c;
   };
 
-  // Bracket μ: cost(0) = all raw (max); grow μ until cost bottoms out (the
-  // most-folded feasible frontier).
+  // Bracket μ. cost(0) = all raw (max). For the upper bound we need a μ at which
+  // the frontier is provably maximally folded: at μ ≥ the total all-raw value,
+  // every region's μ·cost term dominates its value, so collapsing always wins.
+  //
+  // (A doubling loop that breaks when "cost stopped dropping" is WRONG here: the
+  // concave value model has plateaus where a whole level stays optimal across a
+  // μ range before the next collapse, so the break stops on a plateau and
+  // reports a too-high minCost — e.g. all-L1 instead of all-L2.)
   const maxCost = totalCost(0);
-  let muHi = 1;
-  let prevCost = totalCost(muHi);
-  while (muHi <= 1e9) {
-    const nextCost = totalCost(muHi * 2);
-    muHi *= 2;
-    if (nextCost >= prevCost) break; // cost stopped decreasing → bottomed out
-    prevCost = nextCost;
-  }
+  let maxValue = 0;
+  for (const r of roots) maxValue += evalNode(r, 0).value; // all-raw total value
+  const muHi = Math.max(1, maxValue);
   const minCost = totalCost(muHi);
 
   if (maxCost <= budgetTokens) return assignAt(0); // fits fully raw

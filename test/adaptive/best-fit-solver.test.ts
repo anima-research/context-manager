@@ -110,7 +110,9 @@ test('solver: coarse granularity can under-fill a gap budget (known duality gap)
   // integration shows this hurting in practice.
   const r = solveFrontier(tree, { budgetTokens: 6_000, value });
   assert.ok(r.tokens <= 6_000, 'still fits the budget');
-  assert.ok(r.tokens < 1_000, `gap budget under-fills to ${r.tokens} (≪ 6000)`);
+  // No frontier keeps a raw L1-group (6000) alongside the rest, so the best that
+  // fits 6000 is all-L1 (1200) — it under-fills by the granularity gap.
+  assert.equal(r.tokens, 1_200, `gap budget under-fills to all-L1 (${r.tokens} of 6000)`);
 });
 
 test('solver: respects non-foldable chunks (pins stay raw, block collapse)', () => {
