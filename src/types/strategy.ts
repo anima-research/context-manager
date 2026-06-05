@@ -445,9 +445,20 @@ export interface AutobiographicalConfig {
    *   'best-fit' — V2 budget-optimal frontier with KV-stability (needs a value
    *     function + λ; the host instantiates BestFitStrategy directly rather than
    *     by name, as it carries config the others don't).
+   *   'kv-stable' — the KV-stable context controller: minimizes real prefix
+   *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
+   *     from the live PickerInputs. See docs/kv-stable-context-control.md.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'best-fit';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'best-fit' | 'kv-stable';
+
+  /**
+   * Per-turn divergence reach (tokens) for `foldingStrategy: 'kv-stable'` — the
+   * structural KV-perturbation cap P. Smaller = gentler per-turn cache churn but
+   * less efficient compression; exceeded only to stay under the hard budget.
+   * Default: unbounded within the budget.
+   */
+  kvStableReachTokens?: number;
 
   /**
    * Slack ratio (hysteresis) for the picker. The picker folds until total

@@ -5,3 +5,6 @@ export { renderLayout, kvCost, earliestDivergenceIndex } from '../dist/src/adapt
 export { ValueFunction } from '../dist/src/adaptive/value-function.js';
 export { solveFrontier } from '../dist/src/adaptive/best-fit-solver.js';
 export { solveStableFrontier } from '../dist/src/adaptive/stable-frontier.js';
+export { placeMarkers, evaluateCacheHit } from '../dist/src/adaptive/kv-cache-sim.js';
+export { replaySession } from '../dist/src/adaptive/kv-replay.js';
+export { replayControlled } from '../dist/src/adaptive/kv-control.js';

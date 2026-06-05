@@ -22,8 +22,9 @@ import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
+import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingStrategy,
@@ -2131,9 +2132,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
-    if (entries.length > 0) {
-      entries[entries.length - 1].cacheMarker = true;
-    }
+    // (Cache breakpoints are placed in one pass over the FINAL ordered entries
+    // below — see placeCacheMarkers — capturing the stable folded prefix, not
+    // just the head boundary.)
 
     // Compute tail message IDs (will be emitted at end)
     const effectiveRecentStart = Math.max(recentStart, headEnd);
@@ -2237,19 +2238,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headSetForPicker = new Set<ChunkId>(headMessageIds);
     const tailSetForPicker = new Set<ChunkId>(tailMessageIds);
 
-    const picker = this.getAdaptivePicker();
-    const result = picker.run(
-      {
-        chunks: pickerChunks,
-        summaries: summariesMap,
-        recallPairTokens,
-        headChunkIds: headSetForPicker,
-        tailChunkIds: tailSetForPicker,
-        headTokens,
-        tailTokens,
-      },
-      foldingBudget
-    );
+    const pickerInputs: PickerInputs = {
+      chunks: pickerChunks,
+      summaries: summariesMap,
+      recallPairTokens,
+      headChunkIds: headSetForPicker,
+      tailChunkIds: tailSetForPicker,
+      headTokens,
+      tailTokens,
+    };
+    const picker = this.buildPicker(pickerInputs);
+    const result = picker.run(pickerInputs, foldingBudget);
 
     // Commit the new resolutions back to strategy state for next compile.
     // Persist to chronicle only if anything actually changed — avoids
@@ -2520,7 +2519,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
 
     this.trimOrphanedToolUse(merged);
+    // Place ≤4 cache breakpoints across the FINAL ordered entries so the
+    // provider can reuse the stable folded prefix — not just the head. With a
+    // single head marker the cache hit is ~2%; well-placed breakpoints take the
+    // real strategy to ~50% (docs/kv-stable-context-control.md — marker
+    // placement is the dominant KV lever).
+    this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     return merged;
+  }
+
+  /**
+   * Place up to four `cache_control` breakpoints across the final ordered
+   * entries: the head/system boundary, the end of the folded history (the
+   * stable prefix that persists turn-to-turn — the most valuable), a mid-history
+   * seam, and the very end (for pure-append reuse). Mirrors `placeMarkers` in
+   * the adaptive layer but operates on emitted entries. Idempotent; clears any
+   * pre-existing markers first.
+   */
+  protected placeCacheMarkers(
+    entries: ContextEntry[],
+    headMessageIds: ReadonlySet<MessageId>,
+    tailMessageIds: ReadonlySet<MessageId>,
+  ): void {
+    for (const e of entries) if (e.cacheMarker) e.cacheMarker = false;
+    const n = entries.length;
+    if (n === 0) return;
+
+    let lastHead = -1;
+    let firstTail = n;
+    for (let i = 0; i < n; i++) {
+      const sid = entries[i].sourceMessageId;
+      if (sid && headMessageIds.has(sid)) lastHead = i;
+    }
+    for (let i = 0; i < n; i++) {
+      const sid = entries[i].sourceMessageId;
+      if (sid && tailMessageIds.has(sid)) { firstTail = i; break; }
+    }
+    const historyEnd = firstTail - 1; // last middle (folded-history) entry
+
+    const marks = new Set<number>();
+    if (lastHead >= 0) marks.add(lastHead);                       // system / head block
+    if (historyEnd > lastHead) marks.add(historyEnd);            // stable folded prefix (the big one)
+    if (historyEnd - lastHead > 2) marks.add(lastHead + Math.floor((historyEnd - lastHead) / 2)); // mid-history
+    marks.add(n - 1);                                            // end → pure-append reuse
+
+    for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
   }
 
   /**
@@ -2614,6 +2657,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : new FlatProfileStrategy();
     this._adaptivePicker = new Picker(strategy);
     return this._adaptivePicker;
+  }
+
+  /**
+   * Build the picker for this compile. Instance folding strategies (kv-stable)
+   * need the per-compile `PickerInputs` at construction, so they're built fresh
+   * here; stateless ones (flat-profile / oldest-first) reuse the memoized picker.
+   */
+  protected buildPicker(inputs: PickerInputs): Picker {
+    if (this.config.foldingStrategy === 'kv-stable') {
+      return new Picker(
+        new KvStableStrategy(inputs, {
+          reachTokens: this.config.kvStableReachTokens,
+          mergeThreshold: this.config.mergeThreshold,
+        }),
+      );
+    }
+    return this.getAdaptivePicker();
   }
 
   /**

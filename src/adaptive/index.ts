@@ -34,6 +34,7 @@ export type {
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
 export { BestFitStrategy, type BestFitOptions } from './strategies/best-fit.js';
+export { KvStableStrategy, type KvStableOptions } from './strategies/kv-stable.js';
 
 // V2 best-fit frontier solver (see docs/best-fit-frontier-resolution.md)
 export {
@@ -58,6 +59,36 @@ export {
   type StableSolveParams,
   type StableSolveResult,
 } from './stable-frontier.js';
+
+// KV-cache simulation + session replay (provider-cache stability measurement)
+export {
+  placeMarkers,
+  evaluateCacheHit,
+  CacheStore,
+  MAX_CACHE_MARKERS,
+  type CacheMarker,
+  type CacheHit,
+  type CacheStoreOptions,
+  type CacheReadResult,
+} from './kv-cache-sim.js';
+export {
+  replaySession,
+  type ReplayOptions,
+  type ReplayStep,
+  type ReplayResult,
+} from './kv-replay.js';
+export {
+  replayControlled,
+  planControlledFrontier,
+  foldDepthCap,
+  PRICE,
+  MAX_FOLD_LEVEL,
+  type ControlOptions,
+  type ControlStep,
+  type ControlResult,
+  type ControlPlanParams,
+  type ControlPlan,
+} from './kv-control.js';
 
 // Picker
 export {
