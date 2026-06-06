@@ -1,8 +1,14 @@
 # KV-stable context control
 
-Status: design spec + prototype (`src/adaptive/kv-control.ts`, measured via
-`kv-replay`). Supersedes the framing in `best-fit-frontier-resolution.md` §4
-that models KV stability as a soft `−λ·KVcost` term.
+Status: implemented. `KvStableStrategy` is selectable via
+`config.foldingStrategy: 'kv-stable'`; the controller core (`kv-control.ts`) is
+measured via `kv-replay` and the real-`ContextManager` harness
+(`scripts/replay-strategy.ts`). The earlier half-life/λ best-fit solver
+(`value-function` / `best-fit-solver` / `stable-frontier` / `BestFitStrategy`)
+has been **removed** — it was a stepping-stone whose sliding-half-life value
+model caused the churn the λ term then fought (see "Why this exists"). The
+production baseline is now `flat-profile`; the playground compares it against
+`kv-stable`.
 
 ## Why this exists
 

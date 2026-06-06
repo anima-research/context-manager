@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Best-fit folding playground</title>
+<title>KV-stable context playground</title>
 <style>
   :root { --bg:#0e1116; --panel:#161b22; --line:#30363d; --txt:#c9d1d9; --dim:#8b949e;
           --raw:#4ade80; --l1:#facc15; --l2:#fb923c; --l3:#f87171; --l4:#c084fc; --acc:#58a6ff; }
@@ -42,22 +42,16 @@
 </head>
 <body>
 <header>
-  <h1>Best-fit folding playground</h1>
+  <h1>KV-stable context playground</h1>
   <span class="meta" id="meta">loading…</span>
 </header>
 <main>
   <div class="controls">
     <div class="ctl"><label>budget <b><span id="budgetPct">40</span>% · <span id="budgetAbs">—</span></b></label>
       <input id="budget" type="range" min="2" max="100" value="40" /></div>
-    <div class="ctl"><label>λ (KV stability) <b id="lambdaV">0.010</b></label>
-      <input id="lambda" type="range" min="0" max="100" value="20" /></div>
-    <div class="ctl"><label>smoothness γ <b id="smoothV">200</b></label>
-      <input id="smooth" type="range" min="0" max="1000" value="200" /></div>
-    <div class="ctl"><label>recency half-life <b id="halfV">25</b>% of history</label>
-      <input id="half" type="range" min="2" max="100" value="25" /></div>
-    <div class="ctl"><label>min weight <b id="minwV">0.010</b></label>
-      <input id="minw" type="range" min="0" max="100" value="1" /></div>
-    <div class="ctl"><label>tail kept raw <b><span id="tailTok">0</span> tok</b></label>
+    <div class="ctl"><label>reach P (perturbation cap) <b><span id="reachPct">40</span>% · <span id="reachAbs">—</span></b></label>
+      <input id="reach" type="range" min="2" max="120" value="40" /></div>
+    <div class="ctl"><label>tail kept raw (flat zone) <b><span id="tailTok">0</span> tok</b></label>
       <input id="tail" type="range" min="0" max="100" value="0" /></div>
 
     <h3>F_prev (KV baseline)</h3>
@@ -66,15 +60,9 @@
       <button id="resetPrev">Reset to stored</button>
     </div>
     <div class="note" id="prevNote">F_prev = stored resolutions</div>
-
-    <h3>solver</h3>
-    <div class="ctl"><label>candidate cap <b id="capV">32</b></label>
-      <input id="cap" type="range" min="2" max="256" value="32" /></div>
-    <div class="ctl"><label>μ iterations <b id="muV">40</b></label>
-      <input id="mu" type="range" min="10" max="80" value="40" /></div>
     <div class="note" id="time">—</div>
 
-    <h3>replay — original vs controller</h3>
+    <h3>replay — flat-profile vs controller</h3>
     <div class="ctl"><label>budget B <b><span id="rcapAbs">—</span></b></label>
       <div class="note" style="margin:0">↑ from the “budget” slider above (shared with the live solve)</div></div>
     <div class="ctl"><label>window W (hard wall) <b>×<span id="rwinMul">1.40</span> · <span id="rwinAbs">—</span></b></label>
@@ -87,8 +75,8 @@
       <input id="rmark" type="range" min="1" max="4" value="4" /></div>
     <div class="ctl"><label>steps <b id="rstepV">120</b></label>
       <input id="rstep" type="range" min="20" max="240" value="120" /></div>
-    <button id="runReplay">▶ Run replay — original vs controller</button>
-    <div class="note" id="replayNote">ORIGINAL stable solver (current λ) vs the CONTROLLER (real-cost, flat-zone + reach cap P), replayed under the persistent ≤4-marker cache. Budget = the “budget” slider above; λ / recency / min-weight from those knobs. After the first run it re-runs live on any change.</div>
+    <button id="runReplay">▶ Run replay — flat-profile vs controller</button>
+    <div class="note" id="replayNote">FLAT-PROFILE baseline (the production default) vs the CONTROLLER (kv-stable: flat-zone + reach cap P), replayed under the persistent ≤4-marker cache. Budget = the “budget” slider above; flat zone = “tail kept raw”. After the first run it re-runs live on any change.</div>
 
     <h3>real-strategy trace</h3>
     <button id="loadTrace">▶ Load Node-harness trace</button>
@@ -99,7 +87,6 @@
     <div class="metrics">
       <div class="metric"><div class="k">tokens / budget</div><div class="v"><span id="mTokens">—</span></div>
         <div class="bar" id="mBar"><i></i></div></div>
-      <div class="metric"><div class="k">value</div><div class="v" id="mValue">—</div></div>
       <div class="metric"><div class="k">KV cost (vs F_prev)</div><div class="v" id="mKv">—</div></div>
       <div class="metric"><div class="k">boundary S</div><div class="v" id="mS">—</div></div>
       <div class="metric"><div class="k">raw total</div><div class="v" id="mRaw">—</div></div>
@@ -126,24 +113,24 @@
     <div class="dist" id="dist"></div>
     <div class="note" id="distNote"></div>
 
-    <h3>replay — original (λ solver) vs controller</h3>
+    <h3>replay — flat-profile (baseline) vs kv-stable controller</h3>
     <div class="metrics" id="replayMetrics" style="display:none">
-      <div class="metric"><div class="k">orig recompute</div><div class="v" id="rOrigRe">—</div></div>
+      <div class="metric"><div class="k">flat recompute</div><div class="v" id="rOrigRe">—</div></div>
       <div class="metric"><div class="k">ctrl recompute</div><div class="v" id="rCtrlRe">—</div></div>
-      <div class="metric"><div class="k">orig hit</div><div class="v" id="rOrigHit">—</div></div>
+      <div class="metric"><div class="k">flat hit</div><div class="v" id="rOrigHit">—</div></div>
       <div class="metric"><div class="k">ctrl hit</div><div class="v" id="rCtrlHit">—</div></div>
-      <div class="metric"><div class="k">orig max perturb</div><div class="v" id="rOrigMaxP">—</div></div>
+      <div class="metric"><div class="k">flat max perturb</div><div class="v" id="rOrigMaxP">—</div></div>
       <div class="metric"><div class="k">ctrl max perturb</div><div class="v" id="rCtrlMaxP">—</div></div>
-      <div class="metric"><div class="k">orig rms perturb</div><div class="v" id="rOrigRms">—</div></div>
+      <div class="metric"><div class="k">flat rms perturb</div><div class="v" id="rOrigRms">—</div></div>
       <div class="metric"><div class="k">ctrl rms perturb</div><div class="v" id="rCtrlRms">—</div></div>
     </div>
     <canvas id="replayChart" height="170"></canvas>
     <div class="legend">
-      <span><i class="sw" style="background:var(--l2)"></i>original (λ) cache hit %</span>
+      <span><i class="sw" style="background:var(--l2)"></i>flat-profile cache hit %</span>
       <span><i class="sw" style="background:var(--acc)"></i>controller cache hit %</span>
       <span style="color:var(--l3)">▮ controller per-turn perturbation</span>
     </div>
-    <div class="note" id="replayStatus">click “Run replay” to compare the original λ solver against the controller.</div>
+    <div class="note" id="replayStatus">click “Run replay” to compare the flat-profile baseline against the kv-stable controller.</div>
 
     <h3>real-strategy trace — kv-stable vs flat-profile (real ContextManager, ideal markers)</h3>
     <div class="metrics" id="traceMetrics" style="display:none">
@@ -165,7 +152,7 @@
 <div id="tip"></div>
 
 <script type="module">
-import { SummaryTree, ValueFunction, solveStableFrontier, renderLayout, replaySession, replayControlled } from './solver.js';
+import { SummaryTree, planControlledFrontier, renderLayout, kvCost, replaySession, replayControlled } from './solver.js';
 
 const COL = ['#4ade80','#facc15','#fb923c','#f87171','#c084fc'];
 const colorFor = (lvl) => COL[Math.min(lvl, COL.length - 1)];
@@ -206,41 +193,39 @@ function tailSetFor(tailTok) {
 let timer = null;
 function schedule() { clearTimeout(timer); timer = setTimeout(solveAndRender, 60); }
 
-// λ slider (0..100) → 0.001 … 10 on a log scale. Shared by the live solver and replay.
-const lambdaFromSlider = () => Math.pow(10, (+$('lambda').value/100)*4 - 3);
-
 function solveAndRender() {
   const pct = +$('budget').value;
   const budget = Math.round(rawTotal * pct/100);
-  const lambda = lambdaFromSlider();
-  const halfPct = +$('half').value;
-  const minw = (+$('minw').value/100) * 0.2; // 0 … 0.2
+  const reachPct = +$('reach').value;
+  const reach = Math.round(rawTotal * reachPct/100);
   const tailTok = +$('tail').value;
-  const cap = +$('cap').value, mu = +$('mu').value;
-  const smooth = +$('smooth').value;
   $('budgetPct').textContent = pct; $('budgetAbs').textContent = fmt(budget);
-  $('lambdaV').textContent = lambda.toFixed(3); $('halfV').textContent = halfPct;
-  $('minwV').textContent = minw.toFixed(3); $('tailTok').textContent = fmt(tailTok);
-  $('capV').textContent = cap; $('muV').textContent = mu; $('smoothV').textContent = smooth;
+  $('reachPct').textContent = reachPct; $('reachAbs').textContent = fmt(reach);
+  $('tailTok').textContent = fmt(tailTok);
 
   const tail = tailSetFor(tailTok);
-  const value = new ValueFunction(newestSeq, { recencyHalfLifeFraction: halfPct / 100, minWeight: minw });
   const t0 = performance.now();
-  const res = solveStableFrontier(inputs, tree, {
-    previous: fprev, budgetTokens: budget, value, lambda,
-    isFoldable: (id) => !tail.has(id), candidateCap: cap, muIterations: mu, smoothness: smooth,
+  // kv-stable controller, single-shot: shed to the budget under the reach cap,
+  // holding the flat zone (tail) raw, carrying F_prev forward.
+  const res = planControlledFrontier(inputs, tree, {
+    previous: fprev, triggerTokens: budget, targetTokens: budget, windowTokens: budget,
+    reachTokens: reach, rawZone: tail, now: newestSeq, mergeThreshold: 6,
   });
   const dt = performance.now() - t0;
   lastRes = res;
-  $('time').textContent = `solved in ${dt.toFixed(0)} ms`;
+  $('time').textContent = `planned in ${dt.toFixed(1)} ms`;
   render(res, budget, tail);
 }
 
 function render(res, budget, tail) {
+  // KV cost vs F_prev (recompute tokens) + the churn boundary, computed from
+  // the rendered layouts (planControlledFrontier returns no value/boundary).
+  const kv = kvCost(renderLayout(inputs, tree, fprev), renderLayout(inputs, tree, res.resolutions));
+  let boundary = chunks.length;
+  for (const c of chunks) { if ((fprev.get(c.id)??0) !== (res.resolutions.get(c.id)??0)) { boundary = c.sequence; break; } }
   $('mTokens').textContent = `${fmt(res.tokens)} / ${fmt(budget)}`;
-  $('mValue').textContent = fmt(res.value);
-  $('mKv').textContent = fmt(res.kvCost) + (res.overBudget ? ' ⚠over' : '');
-  $('mS').textContent = res.boundarySequence >= chunks.length ? 'none' : `#${res.boundarySequence}`;
+  $('mKv').textContent = fmt(kv) + (res.escalated ? ' ⚠over' : '');
+  $('mS').textContent = boundary >= chunks.length ? 'none' : `#${boundary}`;
   const bar = $('mBar'); bar.classList.toggle('over', res.tokens > budget);
   bar.firstElementChild.style.width = Math.min(100, res.tokens/budget*100) + '%';
 
@@ -268,9 +253,9 @@ function render(res, budget, tail) {
     ctx.fillStyle = colorFor(lvl); ctx.fillRect(x, 14, Math.max(1,bw), H-14);
     if ((res.resolutions.get(c.id)??0) !== (fprev.get(c.id)??0)) { ctx.fillStyle = '#fff'; ctx.fillRect(x, 0, Math.max(1,bw), 4); }
   }
-  // boundary S line
-  if (res.boundarySequence < n) {
-    const sx = res.boundarySequence * bw;
+  // boundary S line (earliest change vs F_prev)
+  if (boundary < n) {
+    const sx = boundary * bw;
     ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,H); ctx.stroke();
   }
   cv._geom = { bw, n };
@@ -352,26 +337,19 @@ async function runReplay() {
   const reach = Math.round(rawTotal * (+$('rreach').value)/100);
   const markerCount = +$('rmark').value;
   const targetSteps = +$('rstep').value;
-  const lambda = lambdaFromSlider();
 
   const btn = $('runReplay'); btn.disabled = true;
-  $('replayStatus').textContent = `running original + controller over ${chunks.length} chunks…`;
+  $('replayStatus').textContent = `running flat-profile + controller over ${chunks.length} chunks…`;
   await new Promise(r => setTimeout(r, 20)); // let the status paint
 
   const t0 = performance.now();
-  const orig = replaySession(inputs, {
-    budgetTokens: B,
-    valueOptions: { recencyHalfLifeFraction: (+$('half').value)/100, minWeight: (+$('minw').value/100)*0.2 },
-    markerCount, rawTailTokens: attended, targetSteps,
-    candidateCap: +$('cap').value, muIterations: +$('mu').value, smoothness: +$('smooth').value,
-    lambda,
-  });
+  const orig = replaySession(inputs, { budgetTokens: B, markerCount, rawTailTokens: attended, targetSteps });
   const ctrl = replayControlled(inputs, {
     windowTokens: Wtok, budgetTokens: B, attendedWindowTokens: attended, reachTokens: reach,
     markerCount, targetSteps, mergeThreshold: 6,
   });
   const dt = performance.now() - t0;
-  lastReplay = { orig, ctrl, lambda, B, Wtok, reach, dt };
+  lastReplay = { orig, ctrl, B, Wtok, reach, dt };
   btn.disabled = false;
   renderReplay();
   replayRunning = false;
@@ -380,7 +358,7 @@ async function runReplay() {
 
 function renderReplay() {
   if (!lastReplay) return;
-  const { orig, ctrl, lambda, B, reach, dt } = lastReplay;
+  const { orig, ctrl, B, reach, dt } = lastReplay;
   $('replayMetrics').style.display = '';
   const op = perturbStats(orig.steps), cp = perturbStats(ctrl.steps);
   $('rOrigRe').textContent = fmt(orig.totalRecomputed);
@@ -429,7 +407,7 @@ function renderReplay() {
   const dRe = orig.totalRecomputed - ctrl.totalRecomputed;
   const dMax = op.max - cp.max;
   $('replayStatus').textContent =
-    `B=${fmt(B)} reach=${fmt(reach)} · ${ctrl.steps.length} steps · ${dt.toFixed(0)} ms — controller vs λ=${lambda.toFixed(3)}: `
+    `B=${fmt(B)} reach=${fmt(reach)} · ${ctrl.steps.length} steps · ${dt.toFixed(0)} ms — controller vs flat-profile: `
     + `recompute ${dRe>=0?'−':'+'}${fmt(Math.abs(dRe))}, max-perturb ${dMax>=0?'−':'+'}${fmt(Math.abs(dMax))}`
     + (ctrl.escalations ? ` · ⚠ ${ctrl.escalations} escalations (over W)` : '');
 }
@@ -501,7 +479,7 @@ function renderTrace() {
 
 $('loadTrace').addEventListener('click', loadTrace);
 
-for (const id of ['budget','lambda','smooth','half','minw','tail','cap','mu'])
+for (const id of ['budget','reach','tail'])
   $(id).addEventListener('input', () => { schedule(); updateReplayLabels(); scheduleReplay(); });
 $('anchor').addEventListener('click', () => { if (lastRes) { fprev = new Map(lastRes.resolutions); $('prevNote').textContent='F_prev = snapshot of last solve'; solveAndRender(); } });
 $('resetPrev').addEventListener('click', () => { fprev = new Map(chunks.map(c=>[c.id,c.currentResolution])); $('prevNote').textContent='F_prev = stored resolutions'; solveAndRender(); });

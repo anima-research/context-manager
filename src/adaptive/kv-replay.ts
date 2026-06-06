@@ -1,53 +1,42 @@
 /**
- * Session replay for measuring REAL KV-cache stability (docs §4, §4.1).
+ * Session replay for measuring REAL KV-cache stability.
  *
- * The stable solver's λ term exists to protect the provider's KV cache as a
- * conversation grows into a fixed context window: each turn re-solves the
- * frontier carrying the previous frontier forward, and any folding change
- * invalidates the cached prefix from the earliest divergence on. A single
- * one-shot solve can't show whether λ actually pays off — only a *replay* of
- * the whole session can.
+ * `replaySession` is the BASELINE: the production-default `FlatProfileStrategy`
+ * (level-equalizing) run through the real `Picker`, replayed over a growing
+ * session. Compare it against `replayControlled` (the KV-stable controller) to
+ * see what minimizing prefix churn actually buys. (Prior to the half-life/λ
+ * solver's removal this line ran `solveStableFrontier`; the λ value model was
+ * retired — see docs/kv-stable-context-control.md.)
  *
- * `replaySession` reconstructs the session as monotonically-growing visible
- * history and, at each step:
+ * At each step it:
  *   1. exposes only the chunks/summaries that existed by that point
  *      (a summary is available once its youngest covered message has happened —
  *      `SummaryNode.lastSequence <= now`; compression is bottom-up over time);
- *   2. re-solves the frontier under a FIXED token cap, carrying F_prev forward;
+ *   2. folds the middle to a FIXED token cap, carrying F_prev forward, with the
+ *      newest `rawTailTokens` pinned raw (the flat zone);
  *   3. READS a PERSISTENT provider cache (`CacheStore`, Anthropic ≤4
  *      breakpoints) for the longest live stored prefix still byte-identical to
- *      this render — entries written ANY prior turn, not just the last one — then
- *      WRITES this render's new breakpoints back into the store. A prefix the
- *      stable solver kept frozen many turns ago is still a hit today; that
- *      cross-turn memory is the whole point of the λ term, and a single-turn
- *      "compare to previous render" check could not see it.
+ *      this render — entries written ANY prior turn — then WRITES this render's
+ *      breakpoints back. A prefix frozen many turns ago is still a hit today.
  *
- * Run it twice — λ>0 (stable) vs λ=0 (naive re-solve) — to quantify the win.
- *
- * Pure and deterministic: no Date/random; recency is rebuilt per step from that
- * step's newest visible sequence (history-relative, matching the live solver).
+ * Pure and deterministic.
  */
 
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs, PickerChunk } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
 import { SummaryTree } from './summary-tree.js';
-import { ValueFunction, type ValueParams } from './value-function.js';
-import { solveStableFrontier } from './stable-frontier.js';
+import { Picker } from './picker.js';
+import { FlatProfileStrategy } from './strategies/flat-profile.js';
 import { renderLayout, type RenderLayout, type Frontier } from './render-offsets.js';
 import { placeMarkers, CacheStore } from './kv-cache-sim.js';
 
 export interface ReplayOptions {
-  /** Fixed context-window cap each step solves against (tokens). */
+  /** Fixed context-window cap each step folds against (tokens). */
   budgetTokens: number;
-  /** KV-stability weight. 0 = naive budget-optimal re-solve (the baseline). */
-  lambda: number;
-  /** Value-function params (recency etc.); a fresh ValueFunction is built per
-   *  step with that step's newest visible sequence. */
-  valueOptions?: ValueParams;
   /** Cache breakpoints to place per step (1…4). Default 4. */
   markerCount?: number;
-  /** Newest-N tokens kept raw (non-foldable), mirroring the live playground. */
+  /** Newest-N tokens kept raw (the protected flat zone). */
   rawTailTokens?: number;
   /** Approximate number of replay steps (history is down-sampled to this).
    *  Default 120. */
@@ -55,10 +44,6 @@ export interface ReplayOptions {
   /** Cache entries older than this many steps are evicted (provider TTL).
    *  Default Infinity (keep all — the faithful upper bound on reuse). */
   cacheTtlSteps?: number;
-  /** Solver knobs forwarded to solveStableFrontier. */
-  candidateCap?: number;
-  muIterations?: number;
-  smoothness?: number;
 }
 
 export interface ReplayStep {
@@ -126,7 +111,12 @@ export function replaySession(fullInputs: PickerInputs, opts: ReplayOptions): Re
   let totalRecomputed = 0;
 
   for (const now of stepSeqs) {
-    const visible = allChunks.filter((c) => c.sequence <= now);
+    const visiblePlain = allChunks.filter((c) => c.sequence <= now);
+    const tailIds = rawTailSet(visiblePlain, opts.rawTailTokens ?? 0);
+    // Pin the flat zone so flat-profile won't fold it AND it renders as
+    // individual raw units — not collapsed into one fixed-key 'tail' unit,
+    // which would falsely match across turns in the cache.
+    const visible = visiblePlain.map((c) => (tailIds.has(c.id) ? { ...c, pinned: true } : c));
     const summaries = new Map<string, SummaryEntry>();
     const recallPairTokens = new Map<string, number>();
     for (const [id, s] of fullInputs.summaries) {
@@ -148,33 +138,29 @@ export function replaySession(fullInputs: PickerInputs, opts: ReplayOptions): Re
       tailChunkIds: new Set(),
     };
     const tree = new SummaryTree(inputs);
-    const tail = rawTailSet(visible, opts.rawTailTokens ?? 0);
-    const value = new ValueFunction(now, opts.valueOptions ?? {});
 
-    const res = solveStableFrontier(inputs, tree, {
-      previous: fprev,
-      budgetTokens: opts.budgetTokens,
-      value,
-      lambda: opts.lambda,
-      isFoldable: (id) => !tail.has(id),
-      candidateCap: opts.candidateCap,
-      muIterations: opts.muIterations,
-      smoothness: opts.smoothness,
+    // Baseline policy: the production default, FlatProfileStrategy, via the real
+    // Picker — folds the middle to the budget, leaving the pinned flat zone raw.
+    const result = new Picker(new FlatProfileStrategy()).run(inputs, {
+      totalBudget: opts.budgetTokens,
+      targetBudget: opts.budgetTokens,
+      slack: 0,
     });
+    const resolutions = result.finalResolutions;
 
-    const layout = renderLayout(inputs, tree, res.resolutions);
-
+    const layout = renderLayout(inputs, tree, resolutions);
     // READ the persistent cache: longest live stored prefix that still matches.
     const hit = cache.read(layout);
     const recomputedTokens = layout.totalTokens - hit.cachedTokens;
-    // WRITE this render's breakpoints back (hinting at the stable seam), then
-    // advance the turn clock so future reads see this write and age TTL.
-    const boundaryUnitIndex = unitsBeforeSequence(layout, tree, res.boundarySequence);
+    // WRITE this render's breakpoints back (hinting at the earliest change vs
+    // F_prev), then advance the turn clock so future reads see this write.
+    const boundarySeq = earliestChangedSequence(fprev, resolutions, visible);
+    const boundaryUnitIndex = unitsBeforeSequence(layout, tree, boundarySeq);
     cache.write(layout, placeMarkers(layout, markerCount, { boundaryUnitIndex }));
     cache.tick();
 
     let deepestLevel = 0;
-    for (const lvl of res.resolutions.values()) if (lvl > deepestLevel) deepestLevel = lvl;
+    for (const lvl of resolutions.values()) if (lvl > deepestLevel) deepestLevel = lvl;
 
     steps.push({
       now,
@@ -183,15 +169,15 @@ export function replaySession(fullInputs: PickerInputs, opts: ReplayOptions): Re
       cachedTokens: hit.cachedTokens,
       recomputedTokens,
       hitRate: layout.totalTokens > 0 ? hit.cachedTokens / layout.totalTokens : 0,
-      boundarySequence: res.boundarySequence,
-      overBudget: res.overBudget,
+      boundarySequence: boundarySeq,
+      overBudget: result.finalTokens > opts.budgetTokens,
       deepestLevel,
       cacheAgeSteps: hit.ageSteps,
     });
     totalRendered += layout.totalTokens;
     totalRecomputed += recomputedTokens;
 
-    fprev = res.resolutions;
+    fprev = resolutions;
   }
 
   return {
@@ -203,6 +189,19 @@ export function replaySession(fullInputs: PickerInputs, opts: ReplayOptions): Re
 }
 
 // ---------------------------------------------------------------------------
+
+/** Earliest source sequence whose resolution changed `prev → next` (the marker
+ *  hint / churn boundary). MAX_SAFE_INTEGER when nothing changed. */
+function earliestChangedSequence(
+  prev: Frontier,
+  next: ReadonlyMap<ChunkId, number>,
+  ordered: PickerChunk[],
+): number {
+  for (const c of ordered) {
+    if ((prev.get(c.id) ?? 0) !== (next.get(c.id) ?? 0)) return c.sequence;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
 
 /** Chunk ids within the newest `tailTokens` of raw content (kept non-foldable). */
 function rawTailSet(orderedChunks: PickerChunk[], tailTokens: number): Set<ChunkId> {

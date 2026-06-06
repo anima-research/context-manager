@@ -33,10 +33,9 @@ export type {
 // Concrete strategies
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
-export { BestFitStrategy, type BestFitOptions } from './strategies/best-fit.js';
 export { KvStableStrategy, type KvStableOptions } from './strategies/kv-stable.js';
 
-// V2 best-fit frontier solver (see docs/best-fit-frontier-resolution.md)
+// Summary tree + rendered-unit accounting (shared substrate)
 export {
   SummaryTree,
   nodeTokens,
@@ -52,13 +51,6 @@ export {
   type RenderedUnit,
   type Frontier,
 } from './render-offsets.js';
-export { ValueFunction, type ValueParams } from './value-function.js';
-export { solveFrontier, type SolveParams, type SolveResult } from './best-fit-solver.js';
-export {
-  solveStableFrontier,
-  type StableSolveParams,
-  type StableSolveResult,
-} from './stable-frontier.js';
 
 // KV-cache simulation + session replay (provider-cache stability measurement)
 export {

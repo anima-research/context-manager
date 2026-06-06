@@ -15,8 +15,7 @@ import { dirname } from 'node:path';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import {
   SummaryTree,
-  ValueFunction,
-  solveStableFrontier,
+  planControlledFrontier,
   type PickerInputs,
   type PickerChunk,
 } from '../src/adaptive/index.js';
@@ -111,16 +110,17 @@ async function main() {
   // ---- Sanity solve on the real data (proves the path end-to-end) ----
   const newestSeq = chunks.length - 1;
   const tree = new SummaryTree(inputs);
-  const value = new ValueFunction(newestSeq, { recencyHalfLifeChunks: 50 });
   const rawTotal = chunks.reduce((a, c) => a + c.rawTokens, 0);
   const fPrev = new Map(chunks.map((c) => [c.id, c.currentResolution]));
   const budget = Math.round(rawTotal * 0.4);
-  const solved = solveStableFrontier(inputs, tree, {
+  const solved = planControlledFrontier(inputs, tree, {
     previous: fPrev,
-    budgetTokens: budget,
-    value,
-    lambda: 0.01,
-    candidateCap: 64,
+    triggerTokens: budget,
+    targetTokens: budget,
+    windowTokens: budget,
+    rawZone: new Set(),
+    now: newestSeq,
+    mergeThreshold: 6,
   });
   const dist: Record<number, number> = {};
   for (const lvl of solved.resolutions.values()) dist[lvl] = (dist[lvl] ?? 0) + 1;
@@ -130,7 +130,7 @@ async function main() {
   console.log(`messages:     ${messages.length}`);
   console.log(`summaries:    ${summaries.length}`);
   console.log(`raw tokens:   ${rawTotal}`);
-  console.log(`sanity solve: budget=${budget} λ=0.01 → tokens=${solved.tokens}, value=${Math.round(solved.value)}, kvCost=${solved.kvCost}, S=${solved.boundarySequence}`);
+  console.log(`sanity solve (kv-stable): budget=${budget} → tokens=${solved.tokens}, folded=${solved.folded}, escalated=${solved.escalated}`);
   console.log(`resolution distribution: ${JSON.stringify(dist)}`);
 
   // ---- Write the playground payload ----

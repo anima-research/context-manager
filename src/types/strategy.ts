@@ -442,15 +442,12 @@ export interface AutobiographicalConfig {
    * Folding strategy name when adaptiveResolution is on. One of:
    *   'flat-profile' (default) — level-equalizing
    *   'oldest-first' — chronological
-   *   'best-fit' — V2 budget-optimal frontier with KV-stability (needs a value
-   *     function + λ; the host instantiates BestFitStrategy directly rather than
-   *     by name, as it carries config the others don't).
    *   'kv-stable' — the KV-stable context controller: minimizes real prefix
    *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
    *     from the live PickerInputs. See docs/kv-stable-context-control.md.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'best-fit' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
 
   /**
    * Per-turn divergence reach (tokens) for `foldingStrategy: 'kv-stable'` — the
