@@ -186,6 +186,66 @@ function shedToTarget(
   return tokens;
 }
 
+/**
+ * Raise `frontier` resolution in place (UN-fold toward raw) to fill up to
+ * `target`, leveled (L3→L2, L2→L1, L1→raw) and **youngest-first within the reach
+ * window** — the mirror image of `shedToTarget`. Un-folding is a prefix
+ * perturbation too, so it obeys the same reach cap (bounded divergence) and only
+ * lowers whole groups (group-consistent → the picker reaches it via `lower`
+ * ops). Youngest-first spends the budget on the most recent foldable content
+ * (highest value, shallowest divergence). Stops before exceeding `target`.
+ * rawZone/frozen chunks are never touched. Returns final tokens.
+ */
+function expandToTarget(
+  frontier: Map<ChunkId, number>,
+  inputs: PickerInputs,
+  tree: SummaryTree,
+  ordered: PickerChunk[],
+  target: number,
+  reachTokens: number,
+  rawZone: ReadonlySet<ChunkId>,
+  frozen: ReadonlySet<ChunkId>,
+): number {
+  const newerTokens = new Map<ChunkId, number>();
+  let acc = 0;
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    newerTokens.set(ordered[i].id, acc);
+    acc += ordered[i].rawTokens;
+  }
+
+  let tokens = renderLayout(inputs, tree, frontier).totalTokens;
+  for (let level = MAX_FOLD_LEVEL; level >= 1 && tokens < target; level--) {
+    for (let oi = ordered.length - 1; oi >= 0; oi--) {
+      if (tokens >= target) break;
+      const c = ordered[oi]; // youngest-first
+      if ((frontier.get(c.id) ?? 0) !== level) continue;
+      if (rawZone.has(c.id) || frozen.has(c.id)) continue;
+      if ((newerTokens.get(c.id) ?? 0) >= reachTokens) continue;
+      const node = tree.ancestorAt(c.id, level);
+      if (!node) continue;
+      // Lower the WHOLE group to level-1 only if every covered leaf is at this
+      // level and within reach (group-consistent + reach-bounded).
+      let eligible = true;
+      for (const leafId of node.leafChunkIds) {
+        if (
+          (frontier.get(leafId) ?? 0) !== level ||
+          rawZone.has(leafId) || frozen.has(leafId) ||
+          (newerTokens.get(leafId) ?? 0) >= reachTokens
+        ) {
+          eligible = false;
+          break;
+        }
+      }
+      if (!eligible) continue;
+      for (const leafId of node.leafChunkIds) frontier.set(leafId, level - 1);
+      const nt = renderLayout(inputs, tree, frontier).totalTokens;
+      if (nt <= target) tokens = nt; // accept the un-fold
+      else for (const leafId of node.leafChunkIds) frontier.set(leafId, level); // overshoot → revert
+    }
+  }
+  return tokens;
+}
+
 /** Earliest source sequence whose resolution changed `prev → next`. */
 function earliestChangedSequence(
   prev: Frontier,
@@ -229,17 +289,22 @@ const EMPTY_SET: ReadonlySet<ChunkId> = new Set();
 export interface ControlPlanParams {
   /** Carried frontier (F_prev). */
   previous: ReadonlyMap<ChunkId, number>;
-  /** Act only when rendered tokens exceed this (high-watermark / trigger). */
-  triggerTokens: number;
-  /** Shed down to ≤ this (soft target / low-watermark). */
+  /** Fold (deepen) when rendered tokens exceed this (high-watermark). */
+  foldAtTokens: number;
+  /** Un-fold (raise toward raw) when rendered tokens are below this
+   *  (low-watermark). Default = targetTokens. The band (foldAt − expandAt) is a
+   *  no-op dead zone that prevents fold↔unfold oscillation. Set below foldAt. */
+  expandAtTokens?: number;
+  /** The attractor both fold and un-fold aim for (soft target). */
   targetTokens: number;
   /** Hard wall W — fold past the reach cap only to keep under this. */
   windowTokens: number;
-  /** Per-turn divergence reach (perturbation cap P). Default = windowTokens. */
+  /** Per-turn divergence reach (perturbation cap P) — bounds BOTH fold and
+   *  un-fold divergence. Default = windowTokens. */
   reachTokens?: number;
   /** Chunks forced to raw and never folded (flat zone / head / tail / pinned). */
   rawZone: ReadonlySet<ChunkId>;
-  /** Chunks kept at their carried resolution and never folded (locked). */
+  /** Chunks kept at their carried resolution and never touched (locked). */
   frozen?: ReadonlySet<ChunkId>;
   /** Newest source sequence — the age reference for the log-age fold caps. */
   now: number;
@@ -250,20 +315,25 @@ export interface ControlPlanParams {
 export interface ControlPlan {
   resolutions: Map<ChunkId, number>;
   tokens: number;
-  /** A fold (prefix perturbation) happened this turn. */
+  /** A fold (deepen) happened this turn. */
   folded: boolean;
+  /** An un-fold (raise toward raw, to use budget headroom) happened this turn. */
+  expanded: boolean;
   /** Even full folding under caps could not fit under W (terminal). */
   escalated: boolean;
 }
 
 /**
  * Plan one turn's frontier under the controller policy — shared by the replay
- * harness (`replayControlled`) and `KvStableStrategy`, so both run identical
- * logic. Carries F_prev forward, holds the raw zone raw and the frozen set
- * fixed, and — only when over `triggerTokens` — sheds to `targetTokens`
- * (oldest-first, leveled, each chunk bounded by its log-age saliency cap and the
- * `reachTokens` divergence cap), yielding the reach cap only as far as needed to
- * stay under the hard wall W. Pure and deterministic.
+ * harness (`replayControlled`) and `KvStableStrategy`. Carries F_prev forward,
+ * holds the raw zone raw and the frozen set fixed, then drives the rendered size
+ * toward `targetTokens` from EITHER side, both bounded by the `reachTokens`
+ * divergence cap (KV-continuity preserving in both directions):
+ *   - over `foldAtTokens`  → deepen, oldest-first, under the log-age saliency
+ *     caps, yielding the reach cap only as needed to stay under the hard wall W;
+ *   - under `expandAtTokens` → un-fold, youngest-first, to use budget headroom.
+ * The [expandAt, foldAt] dead band leaves F_prev untouched (zero perturbation)
+ * when already in range. Pure and deterministic.
  */
 export function planControlledFrontier(
   inputs: PickerInputs,
@@ -273,6 +343,8 @@ export function planControlledFrontier(
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const frozen = p.frozen ?? EMPTY_SET;
   const mergeThreshold = p.mergeThreshold ?? 6;
+  const reach = p.reachTokens ?? p.windowTokens;
+  const expandAt = p.expandAtTokens ?? p.targetTokens;
 
   const F = new Map<ChunkId, number>();
   for (const c of ordered) {
@@ -282,9 +354,11 @@ export function planControlledFrontier(
   }
 
   let tokens = renderLayout(inputs, tree, F).totalTokens;
+  const before = tokens;
   let folded = false;
+  let expanded = false;
   let escalated = false;
-  if (tokens > p.triggerTokens) {
+  if (tokens > p.foldAtTokens) {
     const flatZoneChunks = p.rawZone.size;
     const caps = new Map<ChunkId, number>();
     for (const c of ordered) {
@@ -295,14 +369,14 @@ export function planControlledFrontier(
           : foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold),
       );
     }
-    tokens = shedToTarget(
-      F, inputs, tree, ordered, caps,
-      p.targetTokens, p.reachTokens ?? p.windowTokens, p.windowTokens,
-    );
-    folded = true;
+    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens);
+    folded = tokens !== before; // a real fold only if it actually changed the render
     if (tokens > p.windowTokens) escalated = true;
+  } else if (tokens < expandAt) {
+    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, frozen);
+    expanded = tokens !== before; // a real un-fold only if it actually changed
   }
-  return { resolutions: F, tokens, folded, escalated };
+  return { resolutions: F, tokens, folded, expanded, escalated };
 }
 
 /**
@@ -361,14 +435,15 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
     const tree = new SummaryTree(inputs);
     const flatZone = rawTailSet(visible, opts.attendedWindowTokens);
     // Plan this turn's frontier via the shared controller policy (the same code
-    // KvStableStrategy runs): carry F_prev, hold the flat zone raw, and — if
-    // over HW — shed to LW under the reach cap, never past the hard wall W.
+    // KvStableStrategy runs): carry F_prev, hold the flat zone raw, fold to LW
+    // when over HW, and un-fold to LW when under it — both reach-bounded, with
+    // [LW, HW] a no-op dead band; never past the hard wall W.
     const plan = planControlledFrontier(inputs, tree, {
-      previous: fprev, triggerTokens: HW, targetTokens: LW, windowTokens: opts.windowTokens,
-      reachTokens, rawZone: flatZone, now, mergeThreshold,
+      previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
+      windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,
     });
     const F = plan.resolutions;
-    const folded = plan.folded;
+    const folded = plan.folded || plan.expanded; // any active prefix change this turn
     const escalated = plan.escalated;
 
     const layout = renderLayout(inputs, tree, F);

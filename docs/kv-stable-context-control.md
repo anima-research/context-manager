@@ -137,26 +137,30 @@ only the optimum when costs are uniform and there are no pins.
 
 `src/adaptive/kv-control.ts` implements a tractable first cut:
 
-- **Hysteresis band [LW, HW]** as the controllable knob (band width ≈ the
-  frequency/amplitude operating point): append every turn; when tokens exceed
-  HW, shed down to ≤ LW; otherwise do nothing (pure append, zero perturbation,
-  full cache hit). HW ≤ B keeps slack to W.
-- **Shed = oldest-first, leveled** (L1 groups, then L2, then L3), each chunk
-  capped by the saliency field, never the flat zone or pins — base-`k` grouping
-  driven by budget, not a clock.
-- **W hard wall + escalation** when caps can't fit under W.
+- **Bidirectional, within a hysteresis band [expandAt, foldAt]** — the frontier
+  is driven toward `target` from EITHER side, both bounded by the reach cap so KV
+  continuity is preserved in both directions:
+  - tokens **> foldAt** → fold (deepen), oldest-first;
+  - tokens **< expandAt** → un-fold (raise toward raw), youngest-first, to use
+    budget headroom (recent content gets the fidelity — shallowest divergence,
+    highest value);
+  - in the **dead band** `[expandAt, foldAt]` → do nothing (pure append, zero
+    perturbation). This is the fix for the fold-only ratchet, which left budget
+    headroom unused and kept resumed conversations needlessly compressed.
+- **Group-consistent, leveled** moves (L1↔L2↔L3 whole groups) so the picker can
+  walk to the target via raise/lower; each fold bounded by the log-age saliency
+  cap; flat zone and pins never touched.
+- **W hard wall + escalation** when even full folding can't fit under W.
 - **`replayControlled`** runs it over a session with the persistent `CacheStore`,
-  reporting per-turn `recomputed`, `cachedTokens`, `perturbation`
-  (= recompute beyond genuinely new content), plus `maxPerturbation` and
-  `rmsPerturbation` — the continuity axis.
+  reporting per-turn `recomputed`, `cachedTokens`, `perturbation`,
+  `maxPerturbation`, `rmsPerturbation` — the continuity axis.
 
-Sweeping band width traces the **cost-vs-continuity frontier** (total billed
-recompute vs max/RMS per-turn perturbation), benchmarkable against the current
-`solveStableFrontier` swept over λ.
+The **reach cap** is the cost↔continuity knob: tighter reach bounds per-turn
+divergence (gentler KV) but compresses less efficiently.
 
 ### Not yet (future work)
-- Adaptive HW from a value-to-go on remaining slack (true recursive-feasibility
-  insurance) instead of a fixed band.
+- Adaptive watermarks from a value-to-go on remaining slack (recursive-feasibility
+  insurance) instead of fixed band edges.
 - LSE saliency with reference/CM-importance kernels (prototype uses log-age +
   flat zone + pins).
 - Real cache-write premium in the billed figure; explicit multi-step lookahead.

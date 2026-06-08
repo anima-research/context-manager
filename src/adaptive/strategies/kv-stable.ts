@@ -85,8 +85,11 @@ export class KvStableStrategy implements FoldingStrategy {
 
     return planControlledFrontier(this.inputs, tree, {
       previous: this.fPrev,
-      // The picker folds until at/below targetBudget; act whenever over it.
-      triggerTokens: budget.targetBudget,
+      // Bidirectional within the slack band: fold when over the hard budget,
+      // un-fold to use headroom when under the soft target. Both reach-bounded;
+      // [targetBudget, totalBudget] is the quiet dead band.
+      foldAtTokens: budget.totalBudget,
+      expandAtTokens: budget.targetBudget,
       targetTokens: budget.targetBudget,
       windowTokens: budget.totalBudget,
       reachTokens: this.opts.reachTokens,

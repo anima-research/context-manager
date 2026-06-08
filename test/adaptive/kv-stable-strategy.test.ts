@@ -49,8 +49,8 @@ test('kv-stable strategy: picker walks to exactly the planned frontier and fits 
   // Independent reference plan (same policy the strategy uses internally).
   let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
   const plan = planControlledFrontier(inputs, tree, {
-    previous: new Map(), triggerTokens: budget.targetBudget, targetTokens: budget.targetBudget,
-    windowTokens: budget.totalBudget, rawZone: new Set(), now, mergeThreshold: 6,
+    previous: new Map(), foldAtTokens: budget.totalBudget, expandAtTokens: budget.targetBudget,
+    targetTokens: budget.targetBudget, windowTokens: budget.totalBudget, rawZone: new Set(), now, mergeThreshold: 6,
   });
 
   const strategy = new KvStableStrategy(inputs, {});

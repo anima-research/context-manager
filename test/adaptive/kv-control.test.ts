@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import {
   replayControlled,
+  planControlledFrontier,
   foldDepthCap,
   type ControlOptions,
 } from '../../src/adaptive/kv-control.js';
@@ -85,13 +86,13 @@ test('W is the only hard wall: escalates instead of exceeding it', () => {
   assert.ok(r.escalations > 0, 'unfoldable content over W must escalate, not silently overflow');
 });
 
-test('reach cap is the cost↔continuity knob: tighter reach = gentler, more frequent folds', () => {
+test('reach cap is the cost↔continuity knob: tighter reach = gentler + less recompute', () => {
   const inputs = session();
-  // Small reach = shallow divergence (gentle KV, frequent) vs large reach (deep,
-  // efficient, rare). With group-consistent folding the robust signals are the
-  // average per-turn perturbation and the fold frequency — worst-case maxPert is
-  // noisy because a too-tight reach occasionally trips an emergency deep fold to
-  // stay under W.
+  // Small reach bounds per-turn divergence (gentle KV) but compresses less
+  // efficiently; large reach reaches deep. The robust signals are average
+  // per-turn perturbation (RMS) and total recompute. (Worst-case maxPert and
+  // fold *frequency* are noisy — a too-tight reach can trip an emergency deep
+  // fold to stay under W.)
   const shallow = replayControlled(inputs, { ...BASE, reachTokens: 8_000 });
   const deep = replayControlled(inputs, { ...BASE, reachTokens: 60_000 });
 
@@ -102,9 +103,37 @@ test('reach cap is the cost↔continuity knob: tighter reach = gentler, more fre
     `tighter reach → lower average per-turn perturbation (${shallow.rmsPerturbation.toFixed(0)} < ${deep.rmsPerturbation.toFixed(0)})`,
   );
   assert.ok(
-    shallow.foldEvents > deep.foldEvents,
-    `tighter reach → more frequent folds (${shallow.foldEvents} > ${deep.foldEvents})`,
+    shallow.totalRecomputed <= deep.totalRecomputed,
+    `tighter reach → no more total recompute (${shallow.totalRecomputed} ≤ ${deep.totalRecomputed})`,
   );
+});
+
+test('bidirectional: under budget with a folded F_prev, un-folds to use headroom', () => {
+  const inputs = session(); // 72 chunks × 1000 = 72k raw
+  const tree = new SummaryTree(inputs);
+  const now = 71;
+  // 1) Fold tight (expandAt 0 → fold-only this call).
+  const folded = planControlledFrontier(inputs, tree, {
+    previous: new Map(), foldAtTokens: 18_000, expandAtTokens: 0, targetTokens: 18_000,
+    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+  });
+  assert.ok(folded.folded && !folded.expanded, 'first call folds down');
+
+  // 2) From that folded state, a generous budget should UN-FOLD to use headroom.
+  const expanded = planControlledFrontier(inputs, tree, {
+    previous: folded.resolutions, foldAtTokens: 50_000, expandAtTokens: 50_000, targetTokens: 50_000,
+    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+  });
+  assert.ok(expanded.expanded && !expanded.folded, 'un-folds, does not fold');
+  assert.ok(expanded.tokens > folded.tokens, `used headroom: ${expanded.tokens} > ${folded.tokens}`);
+  assert.ok(expanded.tokens <= 50_000, `stays within target: ${expanded.tokens} ≤ 50000`);
+
+  // 3) Dead band: within [expandAt, foldAt] nothing changes (zero perturbation).
+  const quiet = planControlledFrontier(inputs, tree, {
+    previous: expanded.resolutions, foldAtTokens: 60_000, expandAtTokens: 40_000, targetTokens: 50_000,
+    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+  });
+  assert.ok(!quiet.folded && !quiet.expanded, 'in-band → no perturbation');
 });
 
 test('controller is deterministic', () => {

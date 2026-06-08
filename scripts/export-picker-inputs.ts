@@ -115,7 +115,8 @@ async function main() {
   const budget = Math.round(rawTotal * 0.4);
   const solved = planControlledFrontier(inputs, tree, {
     previous: fPrev,
-    triggerTokens: budget,
+    foldAtTokens: budget,
+    expandAtTokens: budget,
     targetTokens: budget,
     windowTokens: budget,
     rawZone: new Set(),

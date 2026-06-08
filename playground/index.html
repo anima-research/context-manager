@@ -205,10 +205,10 @@ function solveAndRender() {
 
   const tail = tailSetFor(tailTok);
   const t0 = performance.now();
-  // kv-stable controller, single-shot: shed to the budget under the reach cap,
-  // holding the flat zone (tail) raw, carrying F_prev forward.
+  // kv-stable controller, single-shot: drive to the budget from either side
+  // (fold if over, un-fold if under) under the reach cap, flat zone raw.
   const res = planControlledFrontier(inputs, tree, {
-    previous: fprev, triggerTokens: budget, targetTokens: budget, windowTokens: budget,
+    previous: fprev, foldAtTokens: budget, expandAtTokens: budget, targetTokens: budget, windowTokens: budget,
     reachTokens: reach, rawZone: tail, now: newestSeq, mergeThreshold: 6,
   });
   const dt = performance.now() - t0;
