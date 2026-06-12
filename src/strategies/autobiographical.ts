@@ -17,6 +17,7 @@ import type {
   ProtectedRange,
   SearchQuery,
   SearchResult,
+  RenderStats,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -1173,16 +1174,89 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Useful for TUI / dashboards. The token sums use the strategy's own
    * token estimates (which match what `select()` uses for budget math).
    */
-  getRenderStats(store: MessageStoreView): {
-    head: { messages: number; tokens: number };
-    tail: { messages: number; tokens: number };
-    summaries: {
-      l1: { count: number; tokens: number };
-      l2: { count: number; tokens: number };
-      l3: { count: number; tokens: number };
+  // ===========================================================================
+  // Render-stats instrumentation — inspect, don't reconstruct.
+  //
+  // selectAdaptive/selectHierarchical tally each entry into `_rs` AS THEY EMIT
+  // it (raw head/tail, raw middle the picker kept verbatim, and recall pairs
+  // bucketed by the ancestor summary's level), using the same token numbers the
+  // renderer uses for budget math. `getRenderStats()` returns that committed
+  // snapshot, so it reflects what the last compile actually rendered rather than
+  // re-deriving the full pyramid (which, under adaptive resolution, bears little
+  // resemblance to the folded output).
+  // ===========================================================================
+  private _rs: RenderStats | null = null;
+  private _lastRenderStats: RenderStats | null = null;
+
+  /** Begin a render-stats accumulation for one select() pass. */
+  protected rsBegin(): void {
+    this._rs = {
+      head: { messages: 0, tokens: 0 },
+      tail: { messages: 0, tokens: 0 },
+      middleRaw: { messages: 0, tokens: 0 },
+      summaries: {
+        l1: { count: 0, tokens: 0 },
+        l2: { count: 0, tokens: 0 },
+        l3: { count: 0, tokens: 0 },
+      },
+      pending: { chunks: 0, merges: 0 },
+      total: { messages: 0, tokens: 0 },
     };
-    pending: { chunks: number; merges: number };
-  } {
+  }
+
+  /** Tally one (or `count`) raw message(s) into a raw bucket. */
+  protected rsRaw(bucket: 'head' | 'tail' | 'middleRaw', tokens: number, count = 1): void {
+    const r = this._rs;
+    if (!r) return;
+    r[bucket].messages += count;
+    r[bucket].tokens += tokens;
+  }
+
+  /** Tally one emitted recall pair under its ancestor's level (>=3 folds into l3). */
+  protected rsSummary(level: number, tokens: number): void {
+    const r = this._rs;
+    if (!r) return;
+    const k: 'l1' | 'l2' | 'l3' = level <= 1 ? 'l1' : level === 2 ? 'l2' : 'l3';
+    r.summaries[k].count += 1;
+    r.summaries[k].tokens += tokens;
+  }
+
+  /** Commit the accumulated stats as the last-render snapshot. */
+  protected rsEnd(): void {
+    const r = this._rs;
+    if (!r) return;
+    r.pending = {
+      chunks: this.chunks.filter(c => !c.compressed).length,
+      merges: this.mergeQueue.length,
+    };
+    const s = r.summaries;
+    const summaryMsgs = (s.l1.count + s.l2.count + s.l3.count) * 2; // Q/A pair each
+    r.total = {
+      messages: r.head.messages + r.tail.messages + r.middleRaw.messages + summaryMsgs,
+      tokens:
+        r.head.tokens + r.tail.tokens + r.middleRaw.tokens +
+        s.l1.tokens + s.l2.tokens + s.l3.tokens,
+    };
+    this._lastRenderStats = r;
+    this._rs = null;
+  }
+
+  /**
+   * Stats describing the LAST rendered context. Returns the inspected snapshot
+   * captured during the most recent `select()`. Before any compile has run (no
+   * snapshot yet), falls back to a reconstructed pyramid view so callers still
+   * get a non-null shape.
+   */
+  getRenderStats(store: MessageStoreView): RenderStats {
+    return this._lastRenderStats ?? this.reconstructRenderStats(store);
+  }
+
+  /**
+   * Pre-render fallback: re-derive head/tail windows + the full live pyramid.
+   * NOTE: this is the old "reconstruct" behavior and does NOT reflect adaptive
+   * folding — used only until the first compile populates the inspected stats.
+   */
+  protected reconstructRenderStats(store: MessageStoreView): RenderStats {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
@@ -1199,17 +1273,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sumLevelTokens = (level: SummaryLevel): number =>
       live(level).reduce((acc, s) => acc + s.tokens, 0);
 
+    const head = { messages: headMsgs.length, tokens: sumTokens(headMsgs) };
+    const tail = { messages: tailMsgs.length, tokens: sumTokens(tailMsgs) };
+    const summaries = {
+      l1: { count: live(1).length, tokens: sumLevelTokens(1) },
+      l2: { count: live(2).length, tokens: sumLevelTokens(2) },
+      l3: { count: live(3).length, tokens: sumLevelTokens(3) },
+    };
     return {
-      head: { messages: headMsgs.length, tokens: sumTokens(headMsgs) },
-      tail: { messages: tailMsgs.length, tokens: sumTokens(tailMsgs) },
-      summaries: {
-        l1: { count: live(1).length, tokens: sumLevelTokens(1) },
-        l2: { count: live(2).length, tokens: sumLevelTokens(2) },
-        l3: { count: live(3).length, tokens: sumLevelTokens(3) },
-      },
+      head,
+      tail,
+      middleRaw: { messages: 0, tokens: 0 },
+      summaries,
       pending: {
         chunks: this.chunks.filter(c => !c.compressed).length,
         merges: this.mergeQueue.length,
+      },
+      total: {
+        messages: head.messages + tail.messages
+          + (summaries.l1.count + summaries.l2.count + summaries.l3.count) * 2,
+        tokens: head.tokens + tail.tokens
+          + summaries.l1.tokens + summaries.l2.tokens + summaries.l3.tokens,
       },
     };
   }
@@ -1233,8 +1317,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     msgCap: number,
     maxTokens: number,
     totalTokensBefore: number,
-  ): void {
-    if (recentStart >= messages.length) return;
+  ): { messages: number; tokens: number } {
+    if (recentStart >= messages.length) return { messages: 0, tokens: 0 };
 
     const accepted: number[] = [];
     let acceptedTokens = 0;
@@ -1258,9 +1342,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       accepted.shift();
     }
 
+    let emittedTokens = 0;
     for (const i of accepted) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
+      const tokens = msgCap > 0
+        ? Math.min(store.estimateTokens(msg), msgCap + 50)
+        : store.estimateTokens(msg);
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -1268,7 +1356,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: msg.participant,
         content,
       });
+      emittedTokens += tokens;
     }
+    return { messages: accepted.length, tokens: emittedTokens };
   }
 
   // ============================================================================
@@ -1516,6 +1606,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+      // Text-only on purpose: this is the SUMMARIZER's one-shot response —
+      // its thinking/redacted_thinking blocks are scratch work, not part of
+      // the agent's history, and signed thinking is never valid inside a
+      // rewritten summary anyway.
       const summaryText = response.content
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
@@ -1973,6 +2067,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+      // Text-only on purpose: summarizer scratch thinking is not agent history
       const mergedText = response.content
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
@@ -2057,6 +2152,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * See `docs/adaptive-resolution-design.md` §3, §5.
    */
   protected selectAdaptive(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    this.rsBegin();
     const entries: ContextEntry[] = [];
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
@@ -2090,6 +2186,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       totalTokens += tokens;
       headMessageIds.add(msg.id);
       headTokens += tokens;
+      this.rsRaw('head', tokens);
     }
     // (Cache breakpoints are placed in one pass over the FINAL ordered entries
     // below — see placeCacheMarkers — capturing the stable folded prefix, not
@@ -2335,6 +2432,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content,
             });
             totalTokens += tokens;
+            this.rsRaw('middleRaw', tokens);
           } else {
             // summary run — emit Q+A pair, dedup at the strategy level
             const ancestor = currentRun.ancestor;
@@ -2361,6 +2459,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               entries.push(questionEntry);
               entries.push(answerEntry);
               totalTokens += pairTokens;
+              this.rsSummary(ancestor.level, pairTokens);
             }
           }
           currentRun = null;
@@ -2421,6 +2520,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content,
         });
         totalTokens += tokens;
+        this.rsRaw('middleRaw', tokens);
         i++;
       } else {
         const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById);
@@ -2436,6 +2536,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             content,
           });
           totalTokens += tokens;
+          this.rsRaw('middleRaw', tokens);
           i++;
           continue;
         }
@@ -2462,12 +2563,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
+        this.rsSummary(ancestor.level, pairTokens);
         i++;
       }
     }
 
     // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
-    this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+    const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+    this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
     // Both head and tail emission paths emit shards as separate ContextEntries.
@@ -2485,6 +2588,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    this.rsEnd();
     return merged;
   }
 
@@ -2716,6 +2820,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Matches moltbot's budget waterfall: L3 → L2 → L1 with unused budget flowing down.
    */
   protected selectHierarchical(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    this.rsBegin();
     const entries: ContextEntry[] = [];
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
@@ -2740,6 +2845,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content,
       });
       totalTokens += tokens;
+      this.rsRaw('head', tokens);
     }
     // Mark the last head entry as a cache boundary (even if budget truncated the window)
     if (entries.length > 0) {
@@ -2899,6 +3005,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             entries.push(questionEntry);
             entries.push(answerEntry);
             totalTokens += pairTokens;
+            this.rsSummary(summary.level, pairTokens);
           } else {
             const msg = item.msg;
             const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
@@ -2914,6 +3021,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content,
             });
             totalTokens += tokens;
+            this.rsRaw('middleRaw', tokens);
           }
         }
       } else {
@@ -2947,6 +3055,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           entries.push(questionEntry);
           entries.push(answerEntry);
           totalTokens += pairTokens;
+          for (const s of selectedSummaries) this.rsSummary(s.level, s.tokens);
         }
 
         // Sort by position so uncompressed-middle messages and pins both
@@ -2966,6 +3075,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             content,
           });
           totalTokens += tokens;
+          this.rsRaw('middleRaw', tokens);
         }
       }
     }
@@ -2975,10 +3085,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // budget, the latest messages (the ones the agent actually needs to act
     // on) are preserved and the oldest recent-window messages are dropped.
     const effectiveRecentStart = Math.max(recentStart, headEnd);
-    this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+    const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+    this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     this.trimOrphanedToolUse(entries);
     this.pruneToolEntries(entries);
+    this.rsEnd();
     return entries;
   }
 
@@ -3233,6 +3345,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
 
     const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    // Text-only on purpose: summarizer scratch thinking is not agent history
     return response.content
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
       .map(b => b.text)
