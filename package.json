@@ -36,7 +36,7 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.2.0",
-    "@animalabs/membrane": "^0.5.40"
+    "@animalabs/membrane": "^0.5.64"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

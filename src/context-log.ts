@@ -276,7 +276,12 @@ export class ContextLog {
       case 'text':
         return this.tokenEstimator(block.text);
       case 'thinking':
-        return this.tokenEstimator(block.thinking);
+        // Signature-only blocks (display:'omitted') carry empty thinking text
+        return this.tokenEstimator(block.thinking ?? '');
+      case 'redacted_thinking':
+        // Encrypted reasoning payload, round-tripped verbatim — rough
+        // estimate from the data length so budgeting isn't blind to it.
+        return this.tokenEstimator((block as { data?: string }).data ?? '');
       case 'tool_use':
         return this.tokenEstimator(JSON.stringify(block.input)) + 20;
       case 'tool_result':

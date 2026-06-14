@@ -258,12 +258,25 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 export interface RenderStats {
   head: { messages: number; tokens: number };
   tail: { messages: number; tokens: number };
+  /**
+   * Raw (L0) messages the renderer kept verbatim in the MIDDLE region — i.e.
+   * neither head nor tail. Under adaptive resolution the picker routinely keeps
+   * older messages raw at a resolution gradient; these are real context tokens
+   * that the head/tail/summary buckets don't capture. (Empty for a pure
+   * hierarchical render with no pinned/uncompressed-middle messages.)
+   */
+  middleRaw: { messages: number; tokens: number };
   summaries: {
     l1: { count: number; tokens: number };
     l2: { count: number; tokens: number };
     l3: { count: number; tokens: number };
   };
   pending: { chunks: number; merges: number };
+  /**
+   * Sum across all buckets — the actual rendered context size. A summary is a
+   * Q/A pair, so it counts as 2 messages here.
+   */
+  total: { messages: number; tokens: number };
 }
 
 /**
