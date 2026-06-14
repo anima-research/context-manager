@@ -1134,17 +1134,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.rebuildChunks(store);
 
-    let entries: ContextEntry[];
+    // Image stripping runs inside each select path (before stats commit / cache
+    // markers), so the returned entries are already bounded — see
+    // applyImageStripping.
     if (this.config.adaptiveResolution) {
-      entries = this.selectAdaptive(store, budget);
-    } else {
-      entries = this.selectHierarchical(store, budget);
+      return this.selectAdaptive(store, budget);
     }
-    // Single post-pass across every compile path: strip stale images to text
-    // placeholders so the live image payload stays bounded regardless of how
-    // far back the verbatim text window reaches.
-    this.applyImageStripping(entries, store);
-    return entries;
+    return this.selectHierarchical(store, budget);
   }
 
   /**
@@ -2582,6 +2578,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     this.pruneToolEntries(merged);
     this.trimOrphanedToolUse(merged);
+    // Strip stale images BEFORE placing markers and committing stats, so both
+    // describe the post-strip context the agent actually receives.
+    this.applyImageStripping(merged, store);
     // Place ≤4 cache breakpoints across the FINAL ordered entries so the
     // provider can reuse the stable folded prefix — not just the head. With a
     // single head marker the cache hit is ~2%; well-placed breakpoints take the
@@ -3090,6 +3089,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     this.trimOrphanedToolUse(entries);
     this.pruneToolEntries(entries);
+    // Strip stale images before committing stats so RenderStats.total reflects
+    // the post-strip context (this path places no cache markers).
+    this.applyImageStripping(entries, store);
     this.rsEnd();
     return entries;
   }
@@ -3559,6 +3561,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 0;
   }
 
+  /** Text substituted for an image block once it leaves the live-image window. */
+  private static readonly IMAGE_PLACEHOLDER = '[image dropped from live context]';
+
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
    *  than `imageStripDepthTokens` from the newest message, or beyond the
@@ -3566,7 +3571,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
-   *  a compiled context back over budget. */
+   *  a compiled context back over budget.
+   *
+   *  Runs INSIDE each select path, *before* `rsEnd()` and `placeCacheMarkers`,
+   *  so the committed render stats (and the cache breakpoints) describe the
+   *  post-strip context. As it strips, it decrements the matching raw bucket of
+   *  the in-progress render stats by the reclaimed tokens, keeping
+   *  `RenderStats.total` equal to the real rendered size. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
@@ -3576,6 +3587,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const posById = new Map<string, number>();
     for (let i = 0; i < messages.length; i++) posById.set(messages[i].id, i);
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
+
+    // Same region windows select() bucketed by, so a stripped image's reclaimed
+    // tokens come back out of the bucket it was originally tallied into.
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = Math.max(this.getRecentWindowStart(store), headEnd);
+    const bucketAt = (pos: number): 'head' | 'tail' | 'middleRaw' => {
+      if (pos < 0) return 'middleRaw'; // no resolvable region — keep total == Σbuckets
+      if (pos >= headStart && pos < headEnd) return 'head';
+      if (pos >= recentStart) return 'tail';
+      return 'middleRaw';
+    };
+    const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
 
     // Image-bearing entries, newest-first by source position. Entries with no
     // resolvable source position sort last (pos -1) and never count as "live".
@@ -3591,11 +3615,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
+      const bucket = bucketAt(pos);
       entry.content = entry.content.map((block) => {
         if (block.type !== 'image') return block;
         const overCount = maxLive > 0 && keptImages >= maxLive;
         if (tooDeep || overCount) {
-          return { type: 'text', text: '[image dropped from live context]' } as ContentBlock;
+          // The renderer estimates an image at `tokenEstimate ?? 1600` (see
+          // message-store/context-log). Hand that back to the bucket, less the
+          // placeholder text that replaces it, so the stats match the output.
+          const reclaimed =
+            ((block as { tokenEstimate?: number }).tokenEstimate ?? 1600) - placeholderTokens;
+          if (this._rs && reclaimed > 0) this._rs[bucket].tokens -= reclaimed;
+          return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         keptImages++;
         return block;
