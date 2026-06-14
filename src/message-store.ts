@@ -409,7 +409,7 @@ export class MessageStore {
         }
         return 0;
       case 'image':
-        return block.tokenEstimate ?? 1000; // Default estimate for images
+        return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
       case 'document':
       case 'audio':
       case 'video':

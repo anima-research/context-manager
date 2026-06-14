@@ -23,8 +23,9 @@ import { getSummaryParentId } from '../types/strategy.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Picker, OverBudgetError, type PickerChunk } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
+import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingStrategy,
@@ -1136,12 +1137,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.rebuildChunks(store);
 
+    let entries: ContextEntry[];
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget);
+      entries = this.selectAdaptive(store, budget);
+    } else {
+      entries = this.config.hierarchical
+        ? this.selectHierarchical(store, budget)
+        : this.selectLegacy(store, log, budget);
     }
-    return this.config.hierarchical
-      ? this.selectHierarchical(store, budget)
-      : this.selectLegacy(store, log, budget);
+    // Single post-pass across every compile path: strip stale images to text
+    // placeholders so the live image payload stays bounded regardless of how
+    // far back the verbatim text window reaches.
+    this.applyImageStripping(entries, store);
+    return entries;
   }
 
   /**
@@ -2306,9 +2314,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
-    if (entries.length > 0) {
-      entries[entries.length - 1].cacheMarker = true;
-    }
+    // (Cache breakpoints are placed in one pass over the FINAL ordered entries
+    // below — see placeCacheMarkers — capturing the stable folded prefix, not
+    // just the head boundary.)
 
     // Compute tail message IDs (will be emitted at end)
     const effectiveRecentStart = Math.max(recentStart, headEnd);
@@ -2412,19 +2420,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headSetForPicker = new Set<ChunkId>(headMessageIds);
     const tailSetForPicker = new Set<ChunkId>(tailMessageIds);
 
-    const picker = this.getAdaptivePicker();
-    const result = picker.run(
-      {
-        chunks: pickerChunks,
-        summaries: summariesMap,
-        recallPairTokens,
-        headChunkIds: headSetForPicker,
-        tailChunkIds: tailSetForPicker,
-        headTokens,
-        tailTokens,
-      },
-      foldingBudget
-    );
+    const pickerInputs: PickerInputs = {
+      chunks: pickerChunks,
+      summaries: summariesMap,
+      recallPairTokens,
+      headChunkIds: headSetForPicker,
+      tailChunkIds: tailSetForPicker,
+      headTokens,
+      tailTokens,
+    };
+    const picker = this.buildPicker(pickerInputs);
+    const result = picker.run(pickerInputs, foldingBudget);
 
     // Commit the new resolutions back to strategy state for next compile.
     // Persist to chronicle only if anything actually changed — avoids
@@ -2695,7 +2701,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
 
     this.trimOrphanedToolUse(merged);
+    // Place ≤4 cache breakpoints across the FINAL ordered entries so the
+    // provider can reuse the stable folded prefix — not just the head. With a
+    // single head marker the cache hit is ~2%; well-placed breakpoints take the
+    // real strategy to ~50% (docs/kv-stable-context-control.md — marker
+    // placement is the dominant KV lever).
+    this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     return merged;
+  }
+
+  /**
+   * Place up to four `cache_control` breakpoints across the final ordered
+   * entries: the head/system boundary, the end of the folded history (the
+   * stable prefix that persists turn-to-turn — the most valuable), a mid-history
+   * seam, and the very end (for pure-append reuse). Mirrors `placeMarkers` in
+   * the adaptive layer but operates on emitted entries. Idempotent; clears any
+   * pre-existing markers first.
+   */
+  protected placeCacheMarkers(
+    entries: ContextEntry[],
+    headMessageIds: ReadonlySet<MessageId>,
+    tailMessageIds: ReadonlySet<MessageId>,
+  ): void {
+    for (const e of entries) if (e.cacheMarker) e.cacheMarker = false;
+    const n = entries.length;
+    if (n === 0) return;
+
+    let lastHead = -1;
+    let firstTail = n;
+    for (let i = 0; i < n; i++) {
+      const sid = entries[i].sourceMessageId;
+      if (sid && headMessageIds.has(sid)) lastHead = i;
+    }
+    for (let i = 0; i < n; i++) {
+      const sid = entries[i].sourceMessageId;
+      if (sid && tailMessageIds.has(sid)) { firstTail = i; break; }
+    }
+    const historyEnd = firstTail - 1; // last middle (folded-history) entry
+
+    const marks = new Set<number>();
+    if (lastHead >= 0) marks.add(lastHead);                       // system / head block
+    if (historyEnd > lastHead) marks.add(historyEnd);            // stable folded prefix (the big one)
+    if (historyEnd - lastHead > 2) marks.add(lastHead + Math.floor((historyEnd - lastHead) / 2)); // mid-history
+    marks.add(n - 1);                                            // end → pure-append reuse
+
+    for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
   }
 
   /**
@@ -2789,6 +2839,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : new FlatProfileStrategy();
     this._adaptivePicker = new Picker(strategy);
     return this._adaptivePicker;
+  }
+
+  /**
+   * Build the picker for this compile. Instance folding strategies (kv-stable)
+   * need the per-compile `PickerInputs` at construction, so they're built fresh
+   * here; stateless ones (flat-profile / oldest-first) reuse the memoized picker.
+   */
+  protected buildPicker(inputs: PickerInputs): Picker {
+    if (this.config.foldingStrategy === 'kv-stable') {
+      return new Picker(
+        new KvStableStrategy(inputs, {
+          reachTokens: this.config.kvStableReachTokens,
+          mergeThreshold: this.config.mergeThreshold,
+        }),
+      );
+    }
+    return this.getAdaptivePicker();
   }
 
   /**
@@ -3581,6 +3648,69 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected chunkKey(chunk: Chunk): string {
     return chunk.messages.map((m) => m.id).join(':');
+  }
+
+  /** True if any content block is a live image. */
+  protected hasImageBlock(content: ContentBlock[]): boolean {
+    return content.some((b) => b.type === 'image');
+  }
+
+  /** Message index marking the image-strip depth boundary: walks newest→oldest
+   *  summing the same per-message estimate as getRecentWindowStart, and returns
+   *  the index of the first message still within `depthTokens`. Messages before
+   *  this index have their images stripped to placeholders. */
+  protected getImageStripStart(store: MessageStoreView, depthTokens: number): number {
+    const messages = store.getAll();
+    let tokens = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      tokens += store.estimateTokens(messages[i]);
+      if (tokens > depthTokens) return i + 1;
+    }
+    return 0;
+  }
+
+  /** Post-pass over compiled entries: replace image blocks with a text
+   *  placeholder once they fall outside the live-image window — either deeper
+   *  than `imageStripDepthTokens` from the newest message, or beyond the
+   *  `maxLiveImages` most-recent images (counted newest-first). Summaries are
+   *  already text, so they're naturally unaffected. The adjacent
+   *  "[image attachment: <name>]" text added at ingest preserves the filename,
+   *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
+   *  a compiled context back over budget. */
+  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
+    const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
+    const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
+    if (maxLive === 0 && depthTokens === 0) return;             // policy disabled
+
+    const messages = store.getAll();
+    const posById = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) posById.set(messages[i].id, i);
+    const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
+
+    // Image-bearing entries, newest-first by source position. Entries with no
+    // resolvable source position sort last (pos -1) and never count as "live".
+    const ordered = entries
+      .map((entry, idx) => ({
+        idx,
+        pos: entry.sourceMessageId !== undefined ? posById.get(entry.sourceMessageId) ?? -1 : -1,
+      }))
+      .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
+      .sort((a, b) => b.pos - a.pos);
+
+    let keptImages = 0;
+    for (const { idx, pos } of ordered) {
+      const entry = entries[idx];
+      const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
+      entry.content = entry.content.map((block) => {
+        if (block.type !== 'image') return block;
+        const overCount = maxLive > 0 && keptImages >= maxLive;
+        if (tooDeep || overCount) {
+          return { type: 'text', text: '[image dropped from live context]' } as ContentBlock;
+        }
+        keptImages++;
+        return block;
+      });
+    }
   }
 
   protected getRecentWindowStart(store: MessageStoreView): number {

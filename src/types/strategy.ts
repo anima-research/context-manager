@@ -316,6 +316,19 @@ export interface AutobiographicalConfig {
    *  this limit have their text/tool_result content truncated. 0 = no limit. */
   maxMessageTokens: number;
 
+  // --- Live image policy ---
+
+  /** Maximum number of images kept "live" (sent as real image blocks) in the
+   *  compiled context. Counted newest-first across the whole window; images
+   *  beyond this many are replaced with a text placeholder. 0 = unlimited.
+   *  A hard ceiling for dense bursts that pack many images into the live window. */
+  maxLiveImages?: number;
+  /** Token depth from the newest message beyond which images are stripped to a
+   *  text placeholder, even though the surrounding text stays verbatim. Measured
+   *  the same way as recentWindowTokens (cumulative tokens walked from the tail).
+   *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
+  imageStripDepthTokens?: number;
+
   // Legacy aliases (deprecated, use summary* instead)
   /** @deprecated Use summarySystemPrompt */
   diarySystemPrompt?: string;
@@ -453,9 +466,20 @@ export interface AutobiographicalConfig {
    * Folding strategy name when adaptiveResolution is on. One of:
    *   'flat-profile' (default) — level-equalizing
    *   'oldest-first' — chronological
+   *   'kv-stable' — the KV-stable context controller: minimizes real prefix
+   *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
+   *     from the live PickerInputs. See docs/kv-stable-context-control.md.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+
+  /**
+   * Per-turn divergence reach (tokens) for `foldingStrategy: 'kv-stable'` — the
+   * structural KV-perturbation cap P. Smaller = gentler per-turn cache churn but
+   * less efficient compression; exceeded only to stay under the hard budget.
+   * Default: unbounded within the budget.
+   */
+  kvStableReachTokens?: number;
 
   /**
    * Slack ratio (hysteresis) for the picker. The picker folds until total
@@ -623,6 +647,8 @@ Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
+  maxLiveImages: 6,
+  imageStripDepthTokens: 30000,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
 };

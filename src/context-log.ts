@@ -286,7 +286,7 @@ export class ContextLog {
         }
         return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
       case 'image':
-        return block.tokenEstimate ?? 1000;
+        return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
       case 'document':
       case 'audio':
       case 'video':

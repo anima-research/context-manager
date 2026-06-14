@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV-stable context playground</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#30363d; --txt:#c9d1d9; --dim:#8b949e;
+          --raw:#4ade80; --l1:#facc15; --l2:#fb923c; --l3:#f87171; --l4:#c084fc; --acc:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .meta { color:var(--dim); }
+  main { display:grid; grid-template-columns:300px 1fr; gap:0; height:calc(100vh - 52px); }
+  .controls { padding:16px 18px; border-right:1px solid var(--line); overflow:auto; }
+  .stage { padding:18px; overflow:auto; }
+  .ctl { margin-bottom:16px; }
+  .ctl label { display:flex; justify-content:space-between; color:var(--dim); margin-bottom:4px; }
+  .ctl label b { color:var(--txt); font-weight:600; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  .row { display:flex; gap:8px; }
+  button { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--acc); }
+  .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:16px; }
+  .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .metric .v { font-size:18px; font-weight:600; }
+  .metric .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .bar { height:10px; background:#21262d; border-radius:5px; overflow:hidden; margin-top:6px; }
+  .bar > i { display:block; height:100%; background:var(--acc); }
+  .bar.over > i { background:var(--l3); }
+  canvas { width:100%; display:block; background:var(--panel); border:1px solid var(--line); border-radius:8px; image-rendering:pixelated; }
+  .legend { display:flex; gap:14px; margin:10px 0 4px; color:var(--dim); flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .sw { width:11px; height:11px; border-radius:2px; display:inline-block; }
+  .dist { display:flex; height:22px; border-radius:6px; overflow:hidden; border:1px solid var(--line); margin-top:6px; }
+  .dist > i { height:100%; }
+  .note { color:var(--dim); font-size:11px; margin-top:8px; }
+  #tip { position:fixed; pointer-events:none; background:#000; border:1px solid var(--line); padding:4px 7px; border-radius:5px; font-size:11px; display:none; white-space:nowrap; z-index:9; }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:18px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KV-stable context playground</h1>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<main>
+  <div class="controls">
+    <div class="ctl"><label>budget <b><span id="budgetPct">40</span>% · <span id="budgetAbs">—</span></b></label>
+      <input id="budget" type="range" min="2" max="100" value="40" /></div>
+    <div class="ctl"><label>reach P (perturbation cap) <b><span id="reachPct">40</span>% · <span id="reachAbs">—</span></b></label>
+      <input id="reach" type="range" min="2" max="120" value="40" /></div>
+    <div class="ctl"><label>tail kept raw (flat zone) <b><span id="tailTok">0</span> tok</b></label>
+      <input id="tail" type="range" min="0" max="100" value="0" /></div>
+
+    <h3>F_prev (KV baseline)</h3>
+    <div class="row">
+      <button id="anchor">Use current as F_prev</button>
+      <button id="resetPrev">Reset to stored</button>
+    </div>
+    <div class="note" id="prevNote">F_prev = stored resolutions</div>
+    <div class="note" id="time">—</div>
+
+    <h3>replay — flat-profile vs controller</h3>
+    <div class="ctl"><label>budget B <b><span id="rcapAbs">—</span></b></label>
+      <div class="note" style="margin:0">↑ from the “budget” slider above (shared with the live solve)</div></div>
+    <div class="ctl"><label>window W (hard wall) <b>×<span id="rwinMul">1.40</span> · <span id="rwinAbs">—</span></b></label>
+      <input id="rwin" type="range" min="105" max="220" value="140" /></div>
+    <div class="ctl"><label>attended / flat zone <b><span id="rattAbs">—</span></b></label>
+      <div class="note" style="margin:0">↑ from the “tail kept raw” slider above (the protected raw zone)</div></div>
+    <div class="ctl"><label>reach P (controller) <b><span id="rreachPct">25</span>% · <span id="rreachAbs">—</span></b></label>
+      <input id="rreach" type="range" min="2" max="120" value="25" /></div>
+    <div class="ctl"><label>cache markers <b id="rmarkV">4</b></label>
+      <input id="rmark" type="range" min="1" max="4" value="4" /></div>
+    <div class="ctl"><label>steps <b id="rstepV">120</b></label>
+      <input id="rstep" type="range" min="20" max="240" value="120" /></div>
+    <button id="runReplay">▶ Run replay — flat-profile vs controller</button>
+    <div class="note" id="replayNote">FLAT-PROFILE baseline (the production default) vs the CONTROLLER (kv-stable: flat-zone + reach cap P), replayed under the persistent ≤4-marker cache. Budget = the “budget” slider above; flat zone = “tail kept raw”. After the first run it re-runs live on any change.</div>
+
+    <h3>real-strategy trace</h3>
+    <button id="loadTrace">▶ Load Node-harness trace</button>
+    <div class="note" id="traceNote">loads <code>lena-{kv,flat}-trace.json</code> — the REAL ContextManager run (KvStableStrategy vs FlatProfile, ideal ≤4 markers) from <code>scripts/replay-strategy.js</code>.</div>
+  </div>
+
+  <div class="stage">
+    <div class="metrics">
+      <div class="metric"><div class="k">tokens / budget</div><div class="v"><span id="mTokens">—</span></div>
+        <div class="bar" id="mBar"><i></i></div></div>
+      <div class="metric"><div class="k">KV cost (vs F_prev)</div><div class="v" id="mKv">—</div></div>
+      <div class="metric"><div class="k">boundary S</div><div class="v" id="mS">—</div></div>
+      <div class="metric"><div class="k">raw total</div><div class="v" id="mRaw">—</div></div>
+    </div>
+
+    <h3>frontier — chunks oldest → newest</h3>
+    <canvas id="film" height="80"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--raw)"></i>raw</span>
+      <span><i class="sw" style="background:var(--l1)"></i>L1</span>
+      <span><i class="sw" style="background:var(--l2)"></i>L2</span>
+      <span><i class="sw" style="background:var(--l3)"></i>L3</span>
+      <span><i class="sw" style="background:var(--l4)"></i>L4+</span>
+      <span style="color:var(--acc)">│ boundary S</span>
+      <span>▲ changed vs F_prev</span>
+      <span style="color:var(--dim)">▒ tail (kept raw)</span>
+    </div>
+
+    <h3>context makeup — tokens (rendered, oldest → newest)</h3>
+    <canvas id="makeup" height="46"></canvas>
+    <div class="note" id="makeupNote"></div>
+
+    <h3>resolution distribution — chunk count</h3>
+    <div class="dist" id="dist"></div>
+    <div class="note" id="distNote"></div>
+
+    <h3>replay — flat-profile (baseline) vs kv-stable controller</h3>
+    <div class="metrics" id="replayMetrics" style="display:none">
+      <div class="metric"><div class="k">flat recompute</div><div class="v" id="rOrigRe">—</div></div>
+      <div class="metric"><div class="k">ctrl recompute</div><div class="v" id="rCtrlRe">—</div></div>
+      <div class="metric"><div class="k">flat hit</div><div class="v" id="rOrigHit">—</div></div>
+      <div class="metric"><div class="k">ctrl hit</div><div class="v" id="rCtrlHit">—</div></div>
+      <div class="metric"><div class="k">flat max perturb</div><div class="v" id="rOrigMaxP">—</div></div>
+      <div class="metric"><div class="k">ctrl max perturb</div><div class="v" id="rCtrlMaxP">—</div></div>
+      <div class="metric"><div class="k">flat rms perturb</div><div class="v" id="rOrigRms">—</div></div>
+      <div class="metric"><div class="k">ctrl rms perturb</div><div class="v" id="rCtrlRms">—</div></div>
+    </div>
+    <canvas id="replayChart" height="170"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--l2)"></i>flat-profile cache hit %</span>
+      <span><i class="sw" style="background:var(--acc)"></i>controller cache hit %</span>
+      <span style="color:var(--l3)">▮ controller per-turn perturbation</span>
+    </div>
+    <div class="note" id="replayStatus">click “Run replay” to compare the flat-profile baseline against the kv-stable controller.</div>
+
+    <h3>real-strategy trace — kv-stable vs flat-profile (real ContextManager, ideal markers)</h3>
+    <div class="metrics" id="traceMetrics" style="display:none">
+      <div class="metric"><div class="k">flat recompute</div><div class="v" id="tFlatRe">—</div></div>
+      <div class="metric"><div class="k">kv recompute</div><div class="v" id="tKvRe">—</div></div>
+      <div class="metric"><div class="k">flat hit</div><div class="v" id="tFlatHit">—</div></div>
+      <div class="metric"><div class="k">kv hit</div><div class="v" id="tKvHit">—</div></div>
+      <div class="metric"><div class="k">flat rms perturb</div><div class="v" id="tFlatRms">—</div></div>
+      <div class="metric"><div class="k">kv rms perturb</div><div class="v" id="tKvRms">—</div></div>
+    </div>
+    <canvas id="traceChart" height="150"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--l2)"></i>flat-profile cache hit %</span>
+      <span><i class="sw" style="background:var(--acc)"></i>kv-stable cache hit %</span>
+    </div>
+    <div class="note" id="traceStatus">runs the real strategy turn-by-turn through ContextManager.compile() — load a trace to view.</div>
+  </div>
+</main>
+<div id="tip"></div>
+
+<script type="module">
+import { SummaryTree, planControlledFrontier, renderLayout, kvCost, replaySession, replayControlled } from './solver.js';
+
+const COL = ['#4ade80','#facc15','#fb923c','#f87171','#c084fc'];
+const colorFor = (lvl) => COL[Math.min(lvl, COL.length - 1)];
+const fmt = (n) => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n|0);
+
+const $ = (id) => document.getElementById(id);
+let inputs, tree, chunks, rawTotal, newestSeq, fprev, lastRes;
+
+async function boot() {
+  const payload = await (await fetch('./data/lena.json')).json();
+  chunks = payload.chunks.slice().sort((a,b)=>a.sequence-b.sequence);
+  inputs = {
+    chunks,
+    summaries: new Map(payload.summaries.map(s=>[s.id,s])),
+    recallPairTokens: new Map(payload.recallPairTokens),
+    headTokens:0, tailTokens:0, headChunkIds:new Set(), tailChunkIds:new Set(),
+  };
+  tree = new SummaryTree(inputs);
+  rawTotal = chunks.reduce((a,c)=>a+c.rawTokens,0);
+  newestSeq = payload.newestSequence;
+  fprev = new Map(chunks.map(c=>[c.id, c.currentResolution]));
+  $('meta').textContent = `${payload.meta.store} · ${chunks.length} chunks · ${payload.summaries.length} summaries · ${fmt(rawTotal)} raw tokens`;
+  $('mRaw').textContent = fmt(rawTotal);
+  $('tail').max = String(Math.round(rawTotal*0.6));
+  $('tail').value = String(Math.round(rawTotal*0.05)); // a meaningful default flat zone (shared by live + replay)
+  updateReplayLabels();
+  solveAndRender();
+}
+
+function tailSetFor(tailTok) {
+  const s = new Set();
+  if (tailTok <= 0) return s;
+  let used = 0;
+  for (let i = chunks.length-1; i >= 0; i--) { s.add(chunks[i].id); used += chunks[i].rawTokens; if (used >= tailTok) break; }
+  return s;
+}
+
+let timer = null;
+function schedule() { clearTimeout(timer); timer = setTimeout(solveAndRender, 60); }
+
+function solveAndRender() {
+  const pct = +$('budget').value;
+  const budget = Math.round(rawTotal * pct/100);
+  const reachPct = +$('reach').value;
+  const reach = Math.round(rawTotal * reachPct/100);
+  const tailTok = +$('tail').value;
+  $('budgetPct').textContent = pct; $('budgetAbs').textContent = fmt(budget);
+  $('reachPct').textContent = reachPct; $('reachAbs').textContent = fmt(reach);
+  $('tailTok').textContent = fmt(tailTok);
+
+  const tail = tailSetFor(tailTok);
+  const t0 = performance.now();
+  // kv-stable controller, single-shot: drive to the budget from either side
+  // (fold if over, un-fold if under) under the reach cap, flat zone raw.
+  const res = planControlledFrontier(inputs, tree, {
+    previous: fprev, foldAtTokens: budget, expandAtTokens: budget, targetTokens: budget, windowTokens: budget,
+    reachTokens: reach, rawZone: tail, now: newestSeq, mergeThreshold: 6,
+  });
+  const dt = performance.now() - t0;
+  lastRes = res;
+  $('time').textContent = `planned in ${dt.toFixed(1)} ms`;
+  render(res, budget, tail);
+}
+
+function render(res, budget, tail) {
+  // KV cost vs F_prev (recompute tokens) + the churn boundary, computed from
+  // the rendered layouts (planControlledFrontier returns no value/boundary).
+  const kv = kvCost(renderLayout(inputs, tree, fprev), renderLayout(inputs, tree, res.resolutions));
+  let boundary = chunks.length;
+  for (const c of chunks) { if ((fprev.get(c.id)??0) !== (res.resolutions.get(c.id)??0)) { boundary = c.sequence; break; } }
+  $('mTokens').textContent = `${fmt(res.tokens)} / ${fmt(budget)}`;
+  $('mKv').textContent = fmt(kv) + (res.escalated ? ' ⚠over' : '');
+  $('mS').textContent = boundary >= chunks.length ? 'none' : `#${boundary}`;
+  const bar = $('mBar'); bar.classList.toggle('over', res.tokens > budget);
+  bar.firstElementChild.style.width = Math.min(100, res.tokens/budget*100) + '%';
+
+  // distribution
+  const dist = {}; for (const c of chunks) { const l = res.resolutions.get(c.id) ?? 0; dist[l]=(dist[l]??0)+1; }
+  const distEl = $('dist'); distEl.innerHTML = '';
+  const parts = [];
+  for (const lvl of Object.keys(dist).map(Number).sort((a,b)=>a-b)) {
+    const n = dist[lvl]; const i = document.createElement('i');
+    i.style.width = (n/chunks.length*100)+'%'; i.style.background = colorFor(lvl);
+    i.title = `L${lvl}: ${n}`; distEl.appendChild(i); parts.push(`L${lvl} ${n}`);
+  }
+  $('distNote').textContent = parts.join('  ·  ');
+
+  // filmstrip
+  const cv = $('film'); const W = cv.clientWidth, H = 80;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.clearRect(0,0,W,H);
+  const n = chunks.length, bw = W / n;
+  for (let i=0;i<n;i++) {
+    const c = chunks[i]; const lvl = res.resolutions.get(c.id) ?? 0;
+    const x = i*bw;
+    if (tail.has(c.id)) { ctx.fillStyle = 'rgba(139,148,158,0.18)'; ctx.fillRect(x,0,Math.max(1,bw),H); }
+    ctx.fillStyle = colorFor(lvl); ctx.fillRect(x, 14, Math.max(1,bw), H-14);
+    if ((res.resolutions.get(c.id)??0) !== (fprev.get(c.id)??0)) { ctx.fillStyle = '#fff'; ctx.fillRect(x, 0, Math.max(1,bw), 4); }
+  }
+  // boundary S line (earliest change vs F_prev)
+  if (boundary < n) {
+    const sx = boundary * bw;
+    ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,H); ctx.stroke();
+  }
+  cv._geom = { bw, n };
+
+  renderMakeup(res);
+}
+
+function renderMakeup(res) {
+  const layout = renderLayout(inputs, tree, res.resolutions);
+  const total = layout.totalTokens || 1;
+  const cat = {}; let rawUnits = 0, recallUnits = 0;
+  for (const u of layout.units) {
+    const lvl = u.kind === 'raw' ? 0 : (tree.summary(u.key)?.level ?? 1);
+    if (u.kind === 'raw') rawUnits++; else recallUnits++;
+    cat[lvl] = (cat[lvl] ?? 0) + u.tokens;
+  }
+  const cv = $('makeup'); const W = cv.clientWidth, H = 46;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio); ctx.clearRect(0,0,W,H);
+  let x = 0;
+  for (const u of layout.units) {
+    const lvl = u.kind === 'raw' ? 0 : (tree.summary(u.key)?.level ?? 1);
+    const w = u.tokens / total * W;
+    ctx.fillStyle = colorFor(lvl); ctx.fillRect(x, 0, Math.max(0.5, w), H);
+    x += w;
+  }
+  const parts = [];
+  for (const lvl of Object.keys(cat).map(Number).sort((a,b)=>a-b))
+    parts.push(`${lvl===0?'raw':'L'+lvl} ${fmt(cat[lvl])} (${(cat[lvl]/total*100).toFixed(0)}%)`);
+  $('makeupNote').textContent = `${fmt(total)} tokens · ${rawUnits} raw + ${recallUnits} recalls  —  ${parts.join('  ·  ')}`;
+}
+
+// hover tooltip
+$('film').addEventListener('mousemove', (e) => {
+  if (!lastRes) return;
+  const cv = $('film'); const r = cv.getBoundingClientRect();
+  const i = Math.floor((e.clientX - r.left) / (cv.clientWidth / chunks.length));
+  const c = chunks[Math.max(0,Math.min(chunks.length-1,i))]; if (!c) return;
+  const lvl = lastRes.resolutions.get(c.id) ?? 0; const was = fprev.get(c.id) ?? 0;
+  const tip = $('tip'); tip.style.display='block'; tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px';
+  tip.textContent = `#${c.sequence} ${c.id.slice(0,10)} · ${c.rawTokens}t · L${lvl}${lvl!==was?` (was L${was})`:''}`;
+});
+$('film').addEventListener('mouseleave', () => { $('tip').style.display='none'; });
+
+// ---- replay: original (λ solver) vs controller, over the growing session ----
+let lastReplay = null;
+
+const hitOf = (s) => s.renderedTokens > 0 ? s.cachedTokens / s.renderedTokens : 0;
+
+// Per-step prefix perturbation = recompute beyond genuinely new content (the KV
+// disruption of the attended region). Same definition for both algorithms.
+function perturbStats(steps) {
+  let prevNow = -1, max = 0, sumsq = 0; const series = [];
+  for (const s of steps) {
+    let nc = 0;
+    for (const c of chunks) if (c.sequence > prevNow && c.sequence <= s.now) nc += c.rawTokens;
+    const p = Math.max(0, s.recomputedTokens - nc);
+    series.push(p); if (p > max) max = p; sumsq += p*p; prevNow = s.now;
+  }
+  return { series, max, rms: Math.sqrt(sumsq / Math.max(1, steps.length)) };
+}
+
+let replayRunning = false, replayPending = false, replayTimer = null;
+// Debounced auto-rerun: after the first manual run, changing any control the
+// replay depends on re-runs it (mirrors the live solver), coalescing drags and
+// never overlapping an in-flight run.
+function scheduleReplay() {
+  if (!lastReplay) return; // don't fire the heavy replay until first opened
+  clearTimeout(replayTimer);
+  replayTimer = setTimeout(() => { if (replayRunning) replayPending = true; else runReplay(); }, 300);
+}
+
+async function runReplay() {
+  if (replayRunning) { replayPending = true; return; }
+  replayRunning = true;
+  const B = Math.round(rawTotal * (+$('budget').value)/100);   // shared with the live solve
+  const Wtok = Math.round(B * (+$('rwin').value)/100);          // hard wall = ×mult of budget
+  const attended = +$('tail').value;                            // flat zone = "tail kept raw" (shared)
+  const reach = Math.round(rawTotal * (+$('rreach').value)/100);
+  const markerCount = +$('rmark').value;
+  const targetSteps = +$('rstep').value;
+
+  const btn = $('runReplay'); btn.disabled = true;
+  $('replayStatus').textContent = `running flat-profile + controller over ${chunks.length} chunks…`;
+  await new Promise(r => setTimeout(r, 20)); // let the status paint
+
+  const t0 = performance.now();
+  const orig = replaySession(inputs, { budgetTokens: B, markerCount, rawTailTokens: attended, targetSteps });
+  const ctrl = replayControlled(inputs, {
+    windowTokens: Wtok, budgetTokens: B, attendedWindowTokens: attended, reachTokens: reach,
+    markerCount, targetSteps, mergeThreshold: 6,
+  });
+  const dt = performance.now() - t0;
+  lastReplay = { orig, ctrl, B, Wtok, reach, dt };
+  btn.disabled = false;
+  renderReplay();
+  replayRunning = false;
+  if (replayPending) { replayPending = false; scheduleReplay(); }
+}
+
+function renderReplay() {
+  if (!lastReplay) return;
+  const { orig, ctrl, B, reach, dt } = lastReplay;
+  $('replayMetrics').style.display = '';
+  const op = perturbStats(orig.steps), cp = perturbStats(ctrl.steps);
+  $('rOrigRe').textContent = fmt(orig.totalRecomputed);
+  $('rCtrlRe').textContent = fmt(ctrl.totalRecomputed);
+  $('rOrigHit').textContent = (orig.overallHitRate*100).toFixed(1) + '%';
+  $('rCtrlHit').textContent = (ctrl.overallHitRate*100).toFixed(1) + '%';
+  $('rOrigMaxP').textContent = fmt(op.max);
+  $('rCtrlMaxP').textContent = fmt(cp.max);
+  $('rOrigRms').textContent = fmt(op.rms);
+  $('rCtrlRms').textContent = fmt(cp.rms);
+  // green when the controller is gentler/cheaper than the original
+  $('rCtrlRe').style.color   = ctrl.totalRecomputed <= orig.totalRecomputed ? 'var(--raw)' : 'var(--l3)';
+  $('rCtrlMaxP').style.color = cp.max <= op.max ? 'var(--raw)' : 'var(--l3)';
+  $('rCtrlRms').style.color  = cp.rms <= op.rms ? 'var(--raw)' : 'var(--l3)';
+
+  // chart: hit% lines for both + controller per-turn perturbation strip.
+  const cv = $('replayChart'); const W = cv.clientWidth, H = 170, pad = 6, stripH = 10;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.clearRect(0,0,W,H);
+  const plotH = H - stripH - pad*2;
+  ctx.strokeStyle = '#30363d'; ctx.fillStyle = '#8b949e'; ctx.lineWidth = 1; ctx.font = '10px monospace';
+  for (const g of [0,0.25,0.5,0.75,1]) {
+    const y = pad + plotH*(1-g);
+    ctx.beginPath(); ctx.moveTo(28,y); ctx.lineTo(W,y); ctx.stroke();
+    ctx.fillText((g*100)+'%', 4, y+3);
+  }
+  const xAt = (i, len) => 28 + (W-28-2) * (len<=1?0:i/(len-1));
+  const yAt = (h) => pad + plotH*(1-Math.max(0,Math.min(1,h)));
+  // controller per-turn perturbation strip (normalized by the worse of the two)
+  const pmax = Math.max(1, op.max, cp.max);
+  for (let i=0;i<ctrl.steps.length;i++) {
+    const frac = cp.series[i]/pmax; if (frac <= 0.02) continue;
+    ctx.fillStyle = `rgba(248,113,113,${0.15+0.85*Math.min(1,frac)})`;
+    const x = xAt(i, ctrl.steps.length), x2 = xAt(Math.min(i+1, ctrl.steps.length-1), ctrl.steps.length);
+    ctx.fillRect(x, H-stripH, Math.max(1, x2-x), stripH);
+  }
+  const line = (steps, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    steps.forEach((s,i) => { const x=xAt(i, steps.length), y=yAt(hitOf(s)); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+  };
+  line(orig.steps, '#fb923c'); // original underneath
+  line(ctrl.steps, '#58a6ff'); // controller on top
+
+  const dRe = orig.totalRecomputed - ctrl.totalRecomputed;
+  const dMax = op.max - cp.max;
+  $('replayStatus').textContent =
+    `B=${fmt(B)} reach=${fmt(reach)} · ${ctrl.steps.length} steps · ${dt.toFixed(0)} ms — controller vs flat-profile: `
+    + `recompute ${dRe>=0?'−':'+'}${fmt(Math.abs(dRe))}, max-perturb ${dMax>=0?'−':'+'}${fmt(Math.abs(dMax))}`
+    + (ctrl.escalations ? ` · ⚠ ${ctrl.escalations} escalations (over W)` : '');
+}
+
+function updateReplayLabels() {
+  const B = Math.round(rawTotal*(+$('budget').value)/100);
+  $('rcapAbs').textContent = fmt(B);
+  $('rwinMul').textContent = (+$('rwin').value/100).toFixed(2);  $('rwinAbs').textContent = fmt(Math.round(B*(+$('rwin').value)/100));
+  $('rattAbs').textContent = fmt(+$('tail').value);
+  $('rreachPct').textContent = $('rreach').value;   $('rreachAbs').textContent = fmt(Math.round(rawTotal*(+$('rreach').value)/100));
+  $('rmarkV').textContent = $('rmark').value;       $('rstepV').textContent = $('rstep').value;
+}
+
+$('runReplay').addEventListener('click', runReplay);
+for (const id of ['rwin','rreach','rmark','rstep'])
+  $(id).addEventListener('input', () => { updateReplayLabels(); scheduleReplay(); });
+
+// ---- real-strategy trace viewer (from the Node harness) ----
+let lastTrace = null;
+const traceHit = (s) => s.renderedTokens > 0 ? s.cachedTokens / s.renderedTokens : 0;
+
+async function loadTrace() {
+  $('traceStatus').textContent = 'loading trace…';
+  let kv, flat;
+  try {
+    [kv, flat] = await Promise.all([
+      fetch('./data/lena-kv-trace.json').then(r => { if (!r.ok) throw 0; return r.json(); }),
+      fetch('./data/lena-flat-trace.json').then(r => { if (!r.ok) throw 0; return r.json(); }),
+    ]);
+  } catch {
+    $('traceStatus').textContent = 'no trace files — run: node dist/scripts/replay-strategy.js lena';
+    return;
+  }
+  lastTrace = { kv, flat };
+  renderTrace();
+}
+
+function renderTrace() {
+  if (!lastTrace) return;
+  const { kv, flat } = lastTrace;
+  $('traceMetrics').style.display = '';
+  $('tFlatRe').textContent = fmt(flat.totalRecomputed);
+  $('tKvRe').textContent = fmt(kv.totalRecomputed);
+  $('tFlatHit').textContent = (flat.overallHitRate * 100).toFixed(1) + '%';
+  $('tKvHit').textContent = (kv.overallHitRate * 100).toFixed(1) + '%';
+  $('tFlatRms').textContent = fmt(flat.rmsPerturbation);
+  $('tKvRms').textContent = fmt(kv.rmsPerturbation);
+  $('tKvRe').style.color = kv.totalRecomputed <= flat.totalRecomputed ? 'var(--raw)' : 'var(--l3)';
+  $('tKvRms').style.color = kv.rmsPerturbation <= flat.rmsPerturbation ? 'var(--raw)' : 'var(--l3)';
+
+  const cv = $('traceChart'); const W = cv.clientWidth, H = 150, pad = 6;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  const ctx = cv.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio); ctx.clearRect(0,0,W,H);
+  const plotH = H - pad*2;
+  ctx.strokeStyle = '#30363d'; ctx.fillStyle = '#8b949e'; ctx.lineWidth = 1; ctx.font = '10px monospace';
+  for (const g of [0,0.25,0.5,0.75,1]) { const y = pad + plotH*(1-g); ctx.beginPath(); ctx.moveTo(28,y); ctx.lineTo(W,y); ctx.stroke(); ctx.fillText((g*100)+'%',4,y+3); }
+  const line = (steps, color) => {
+    const pts = steps.filter(s => !s.overBudget);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    pts.forEach((s,i) => { const x = 28 + (W-30)*(pts.length<=1?0:i/(pts.length-1)), y = pad+plotH*(1-traceHit(s)); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+  };
+  line(flat.steps, '#fb923c');
+  line(kv.steps, '#58a6ff');
+
+  const dRe = flat.totalRecomputed - kv.totalRecomputed;
+  $('traceStatus').textContent = `${kv.meta.chunks} msgs · budget ${fmt(kv.meta.budgetTokens)} · kv hit ${(kv.overallHitRate*100).toFixed(1)}% vs flat ${(flat.overallHitRate*100).toFixed(1)}% — kv recompute ${dRe>=0?'−':'+'}${fmt(Math.abs(dRe))} (ideal ≤4 markers; real ContextManager)`;
+}
+
+$('loadTrace').addEventListener('click', loadTrace);
+
+for (const id of ['budget','reach','tail'])
+  $(id).addEventListener('input', () => { schedule(); updateReplayLabels(); scheduleReplay(); });
+$('anchor').addEventListener('click', () => { if (lastRes) { fprev = new Map(lastRes.resolutions); $('prevNote').textContent='F_prev = snapshot of last solve'; solveAndRender(); } });
+$('resetPrev').addEventListener('click', () => { fprev = new Map(chunks.map(c=>[c.id,c.currentResolution])); $('prevNote').textContent='F_prev = stored resolutions'; solveAndRender(); });
+window.addEventListener('resize', () => {
+  if (lastRes) render(lastRes, Math.round(rawTotal*(+$('budget').value)/100), tailSetFor(+$('tail').value));
+  if (lastReplay) renderReplay();
+  if (lastTrace) renderTrace();
+});
+
+boot();
+</script>
+</body>
+</html>
