@@ -107,13 +107,24 @@ export function foldDepthCap(
   flatZone: ReadonlySet<ChunkId>,
   flatZoneChunks: number,
   mergeThreshold: number,
+  maxLevel: number = MAX_FOLD_LEVEL,
 ): number {
   if (chunk.pinned || flatZone.has(chunk.id)) return 0;
   const age = Math.max(0, now - chunk.sequence);
   const ratio = age / Math.max(1, flatZoneChunks);
   if (ratio < 1) return 0; // just outside the flat zone → still raw
   const band = Math.floor(Math.log(ratio) / Math.log(Math.max(2, mergeThreshold))) + 1;
-  return Math.max(0, Math.min(MAX_FOLD_LEVEL, band));
+  return Math.max(0, Math.min(maxLevel, band));
+}
+
+/** Deepest summary level that actually exists in the tree (0 if none). The
+ *  fold depth is bounded by this — NOT a hardcoded constant — so the controller
+ *  uses L4/L5… summaries when production has built them (else it floors at L3 and
+ *  refuses deeper summaries that exist; cf. the lab L3-floor-with-L4-present). */
+function maxAvailableLevel(tree: SummaryTree): number {
+  let m = 0;
+  for (const s of tree.allSummaries()) if (s.level > m) m = s.level;
+  return m;
 }
 
 /**
@@ -137,6 +148,7 @@ function shedToTarget(
   target: number,
   reachTokens: number,
   windowTokens: number,
+  maxFoldLevel: number,
 ): number {
   // Raw tokens strictly newer than each chunk (its distance from the live end).
   const newerTokens = new Map<ChunkId, number>();
@@ -147,7 +159,7 @@ function shedToTarget(
   }
 
   const foldWithinReach = (reach: number, ignoreCaps = false): boolean => {
-    for (let level = 1; level <= MAX_FOLD_LEVEL; level++) {
+    for (let level = 1; level <= maxFoldLevel; level++) {
       for (const c of ordered) {
         // oldest-first within reach
         if ((newerTokens.get(c.id) ?? 0) >= reach) continue;
@@ -218,6 +230,7 @@ function expandToTarget(
   reachTokens: number,
   rawZone: ReadonlySet<ChunkId>,
   frozen: ReadonlySet<ChunkId>,
+  maxFoldLevel: number,
 ): number {
   const newerTokens = new Map<ChunkId, number>();
   let acc = 0;
@@ -227,7 +240,7 @@ function expandToTarget(
   }
 
   let tokens = renderLayout(inputs, tree, frontier).totalTokens;
-  for (let level = MAX_FOLD_LEVEL; level >= 1 && tokens < target; level--) {
+  for (let level = maxFoldLevel; level >= 1 && tokens < target; level--) {
     for (let oi = ordered.length - 1; oi >= 0; oi--) {
       if (tokens >= target) break;
       const c = ordered[oi]; // youngest-first
@@ -358,6 +371,8 @@ export function planControlledFrontier(
   const mergeThreshold = p.mergeThreshold ?? 6;
   const reach = p.reachTokens ?? p.windowTokens;
   const expandAt = p.expandAtTokens ?? p.targetTokens;
+  // Fold as deep as the tree actually goes (L4/L5… when produced), not a constant.
+  const maxFoldLevel = maxAvailableLevel(tree);
 
   const F = new Map<ChunkId, number>();
   for (const c of ordered) {
@@ -379,14 +394,14 @@ export function planControlledFrontier(
         c.id,
         p.rawZone.has(c.id) || frozen.has(c.id)
           ? -1 // hard-protected sentinel: never fold, even in the W emergency
-          : foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold),
+          : foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold, maxFoldLevel),
       );
     }
-    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens);
+    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens, maxFoldLevel);
     folded = tokens !== before; // a real fold only if it actually changed the render
     if (tokens > p.windowTokens) escalated = true;
   } else if (tokens < expandAt) {
-    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, frozen);
+    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, frozen, maxFoldLevel);
     expanded = tokens !== before; // a real un-fold only if it actually changed
   }
   return { resolutions: F, tokens, folded, expanded, escalated };
