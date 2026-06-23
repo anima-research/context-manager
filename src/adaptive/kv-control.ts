@@ -146,7 +146,7 @@ function shedToTarget(
     acc += ordered[i].rawTokens;
   }
 
-  const foldWithinReach = (reach: number): boolean => {
+  const foldWithinReach = (reach: number, ignoreCaps = false): boolean => {
     for (let level = 1; level <= MAX_FOLD_LEVEL; level++) {
       for (const c of ordered) {
         // oldest-first within reach
@@ -155,13 +155,21 @@ function shedToTarget(
         const ancestor = tree.ancestorAt(c.id, level);
         if (!ancestor) continue; // summary not produced yet → can't fold here
         // Group-consistency + reach: fold the WHOLE group to `level` only if
-        // every covered leaf permits it (cap ≥ level) and is within reach. The
-        // picker raises whole groups, so a partially-eligible group would be an
-        // unreachable target (it oscillates). A uniform fold keeps the frontier
-        // group-consistent and the picker convergent.
+        // every covered leaf permits it (within the saliency cap unless
+        // `ignoreCaps`, and within reach). The picker raises whole groups, so a
+        // partially-eligible group would be an unreachable target (it
+        // oscillates). A uniform fold keeps the frontier group-consistent and
+        // the picker convergent. `rawZone`/`frozen` always block (their cap is 0
+        // and stays 0 even under ignoreCaps).
         let eligible = true;
         for (const leafId of ancestor.leafChunkIds) {
-          if ((caps.get(leafId) ?? 0) < level || (newerTokens.get(leafId) ?? 0) >= reach) {
+          const cap = caps.get(leafId) ?? 0;
+          // Normal: respect the saliency depth cap. Emergency (ignoreCaps): only
+          // the hard-protected set (cap = −1: flat zone / pins / locked) blocks;
+          // the age-extended-raw band (cap 0) and shallower-than-cap content all
+          // become foldable to fit under W.
+          const capBlocks = ignoreCaps ? cap < 0 : cap < level;
+          if (capBlocks || (newerTokens.get(leafId) ?? 0) >= reach) {
             eligible = false;
             break;
           }
@@ -178,9 +186,14 @@ function shedToTarget(
 
   foldWithinReach(reachTokens);
   let tokens = renderLayout(inputs, tree, frontier).totalTokens;
-  // Hard wall: yield the reach cap (P) only as far as needed to keep under W.
+  // Hard wall: W is the only hard constraint. If folding within reach + caps
+  // still exceeds W, the emergency lifts BOTH the reach cap (P) AND the saliency
+  // depth cap — the cap is a soft *relevance* shaper, never a feasibility wall.
+  // It still never folds rawZone/frozen (their cap stays 0). (docs
+  // adaptive-resolution-design.md §12.4: fixes OverBudgetError-at-L2 when deeper
+  // summaries exist and would fit.)
   if (tokens > windowTokens) {
-    foldWithinReach(Infinity);
+    foldWithinReach(Infinity, /* ignoreCaps */ true);
     tokens = renderLayout(inputs, tree, frontier).totalTokens;
   }
   return tokens;
@@ -365,7 +378,7 @@ export function planControlledFrontier(
       caps.set(
         c.id,
         p.rawZone.has(c.id) || frozen.has(c.id)
-          ? 0
+          ? -1 // hard-protected sentinel: never fold, even in the W emergency
           : foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold),
       );
     }
