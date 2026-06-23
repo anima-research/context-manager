@@ -150,7 +150,12 @@ only the optimum when costs are uniform and there are no pins.
 - **Group-consistent, leveled** moves (L1↔L2↔L3 whole groups) so the picker can
   walk to the target via raise/lower; each fold bounded by the log-age saliency
   cap; flat zone and pins never touched.
-- **W hard wall + escalation** when even full folding can't fit under W.
+- **W hard wall + escalation** when even full folding can't fit under W. W is
+  the *only* hard constraint: when folding within reach + saliency caps still
+  exceeds W, the emergency lifts **both** the reach cap **and** the depth cap
+  (the cap is a soft relevance shaper, never a feasibility wall) — it still never
+  folds the hard-protected flat zone / pins / locked. (Fixes the
+  `OverBudgetError`-at-L2-when-L3-exists regression; design doc §12.4.)
 - **`replayControlled`** runs it over a session with the persistent `CacheStore`,
   reporting per-turn `recomputed`, `cachedTokens`, `perturbation`,
   `maxPerturbation`, `rmsPerturbation` — the continuity axis.
