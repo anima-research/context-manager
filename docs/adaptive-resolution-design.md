@@ -4,6 +4,8 @@
 
 ## Changelog
 
+- **rev 4.0 (2026-06-22)**: Reconciliation against the post-PR #19 solver evolution (shipped on `main`, `context-manager` >= 0.5.3). Three changes reshaped the picker and are documented in the new **section 12**, which is the current source of truth where it conflicts with sections 3.5/3.7/3.9/5: (a) a `best-fit` sequence-DP strategy was added and the earlier **half-life / value-minus-lambda-KVcost solver was removed** (`ea198a1`) -- flat-profile is the baseline, not a lambda solve; (b) a **`kv-stable`** controller (`kv-control.ts`) landed as the production default -- a receding-horizon policy under a constraint hierarchy that **replaces cache-as-a-cost-term with cache-as-a-structural-constraint** (the reach cap); (c) kv-stable is **bidirectional** (it un-folds to use budget headroom), so the "V1 ships only monotonic strategies" claim in section 3.9 no longer holds. A production limitation surfaced (opus4): the `foldDepthCap` saliency geometry is a hard per-chunk ceiling that mis-scales to the token wall -- see section 12.4.
+
 - **rev 3.0 (2026-05-15)**: Reconciliation pass against the implementation that landed in PR #19. The architectural shape from rev 2.3 stood; this revision corrects the spots where the implementation diverged from or extended the doc — per-chunk state lives in dedicated state slots rather than on `MessageEntry` records, `mergedInto` is retained as a read-compat alias for `parentId` rather than removed, `FoldingState` is methods-not-fields, the picker returns `produced` ops for the strategy to route (not the picker itself), and the scope grew ~3× over the rev-2 estimate. Lock API simplified to strategy methods only.
 - **rev 2.3 (2026-05-13)**: Replaced the three-step hard-fail escalation ladder (tail-shrink → head-truncate → throw) with throw-only. The strategy raises `OverBudgetError` when the picker is exhausted and the result still exceeds the hard budget; the host decides how to recover. See §3.10.
 - **rev 2.2 (2026-05-13)**: Revised bodyGroup rendering. Rev 2 proposed one composite message with inline `[Section summary]` markers for folded portions; rev 2.2 switches to standard Q+A recall pairs interleaved with raw runs. Matches the existing agent experience for summaries. See §3.6.
@@ -334,6 +336,8 @@ Two design implications:
 
 2. **Strategies should be stingy.** The default `FlatProfileStrategy` raises one group at a time and exits as soon as the budget is met, rather than aggressively folding to maximize headroom.
 
+> **Superseded (rev 4.0):** the shipped `kv-stable` controller is already non-monotonic -- it un-folds toward raw to spend budget headroom (section 12.2). Cache continuity no longer rests on monotonicity but on the per-turn **reach cap**. The text below describes `flat-profile` only.
+
 V2's agent-driven `unfold` violates monotonicity intentionally — the agent decided detail was worth a cache miss. The architecture permits non-monotonic strategies; V1 does not ship one.
 
 ### 3.10 Hard-fail behavior
@@ -583,8 +587,63 @@ Implemented in PR #19 (`feat/adaptive-resolution`, anima-research/context-manage
 4. **Branching semantics** — chunk state lives in branch-scoped Chronicle state slots (`autobio:resolutions`, `autobio:locks`); branching inherits the slots via Chronicle's copy-on-write. Verified by `test/adaptive/branching.test.ts`.
 5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `iterations`, `applied`, `produced`, `finalTokens`, `budgetMet`, `exhausted` for observability at the call site. A formal `RenderStats` extension is still pending.
 
+**Note (rev 4.0):** the as-shipped solver has since evolved well past this PR #19 snapshot -- `best-fit` and `kv-stable` strategies, cache-as-reach-cap, bidirectional folding. See **section 12** for the current controller and its open calibration question.
+
 Out of scope for V1, still pending for follow-up:
 
 - Migration of existing chronicles with `mergedInto` chains (§6.2). The deployment validation path remains re-ingestion on a fresh chronicle.
 - Phase 2/3 rollout (§6.3): switching default to `adaptiveResolution: true` and deleting the threshold path.
 - V2 agent-driven unfold/refold tools (§4.3) and `AgentDirectedStrategy`.
+
+
+## 12. Post-PR #19: the kv-stable controller (current default)
+
+Rev 3.0 documented the PR #19 picker with `FlatProfileStrategy` as the only shipped strategy. Three changes since (all on `main`) reshaped the solver. **Where this section conflicts with sections 3.5 / 3.7 / 3.9 / 5, this section is current.**
+
+### 12.1 Strategy lineup (`config.foldingStrategy`)
+
+- **`flat-profile`** -- the baseline. Level-equalizing: when over the soft target, raise the most-populous level, oldest-first, and exit as soon as the budget is met. Monotonic (raises only). No per-chunk depth ceiling, so it descends to whatever level fits the budget -- which is why it stays feasible where kv-stable currently floors out (section 12.4).
+- **`oldest-first`** -- chronological variant of the same shedder.
+- **`best-fit`** -- sequence-DP solver producing a contiguous resolution gradient that maximizes a concave fidelity value under the budget. (The earlier half-life / value-minus-lambda-KVcost best-fit solver was **removed** in `ea198a1`; this is the DP reimplementation.)
+- **`kv-stable`** -- the production controller the deployed agents run. Described below.
+
+### 12.2 kv-stable: a constraint hierarchy, not a cost solve
+
+`KvStableStrategy` (`src/adaptive/kv-control.ts: planControlledFrontier`) is a receding-horizon controller. It **deliberately replaces** the value-minus-lambda-KVcost solve -- that approach made what the model implies a moving target, *creating* the churn the lambda term then fought (see `docs/kv-stable-context-control.md`, "Why this exists"). `CacheStore` / `PRICE` survive only in the *sim* (`kv-cache-sim.ts`) to **measure** churn, never to drive the plan.
+
+The plan is a layered constraint hierarchy:
+
+- **W -- hard token wall** (`windowTokens`): the only hard constraint. Folding may go as deep as needed to stay under W.
+- **P -- per-turn KV-perturbation reach cap** (`reachTokens`, soft): bounds how far back from the live end the frontier may move per turn. **This is the entire cache-stability mechanism** -- structural, not a cost. Lifted (emergency) only when folding within reach cannot meet W.
+- **Saliency field -- per-chunk max fold depth** (soft, shaping): the *relevance* gradient (recent fine, old coarse). See section 12.3.
+
+Bidirectional, within a hysteresis band `[expandAt, foldAt]`:
+- tokens **> foldAt** -> fold/deepen, oldest-first;
+- tokens **< expandAt** -> **un-fold** toward raw, youngest-first, spending budget headroom on recent fidelity.
+
+So kv-stable emits `lower` ops -- **breaking the rev-3.0 / section 3.9 "monotonic only" property.** Continuity is preserved by the reach cap bounding movement in *both* directions, not by monotonicity.
+
+### 12.3 The saliency field (`foldDepthCap`)
+
+Per-chunk depth ceiling handed to the shedder:
+
+```
+foldDepthCap = 0                                      if pinned or in the flat (raw) zone
+             = min(MAX_FOLD_LEVEL,                    otherwise
+                   floor(log_k(age / flatZoneChunks)) + 1)      k = mergeThreshold (default 6)
+```
+
+Intent: a scale-free raw->L1->L2->L3 banding matching the base-k summary-tree geometry -- recent content stays fine, old fades logarithmically. It produces the *relevance* gradient; it is **not** the cache mechanism (that is the reach cap, section 12.2).
+
+### 12.4 Known limitation: the saliency cap is a hard ceiling, mis-scaled to the wall
+
+Surfaced in production (opus4, ~600-message conversation against opus-4's 200k window):
+
+- The cap is enforced as a **hard** ceiling the shedder may not exceed, and the emergency path lifts only **reach (P)**, never depth. So when "fold everything to its cap" still exceeds W, the picker throws `OverBudgetError` ("deepest fold level=L2") -- even when deeper summaries (L3) already exist and would fit. `flat-profile` (no per-chunk ceiling) descends to L3 on the same store and fits.
+- The base `k = mergeThreshold = 6` couples the *fade rate* to the *merge fanout* -- unrelated quantities -- and makes L3 require `age >= k^2 * flatZone ~= 36 flat-zones` of history, more than a window-bound conversation can hold. So kv-stable caps at L2 and floors out around the window size.
+- This contradicts the design's own framing: W is the only **hard** constraint; P and the saliency cap are **soft (shaped)**, and "base-k is not imposed -- it emerges and bends." The cap is currently rigid.
+
+**Cache stability already comes from the reach cap**, so the saliency depth ceiling is doing only relevance shaping. Open (not yet resolved in code):
+- (a) make the cap's *steepness* budget-driven -- solve the slope so "fold to shape" meets W by construction (feasible-by-design; gradient adapts to pressure; likely also fixes the non-convergence seen when the fixed base was naively lowered); or
+- (b) drop the per-chunk ceiling entirely and rely on oldest-first folding under W + the reach cap for both feasibility and an emergent gradient (flat-profile-like, robust, but loses age-graded fidelity).
+
