@@ -2279,7 +2279,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 4. Run the picker -----
-    const totalBudget = maxTokens - totalTokens; // tokens left after head
+    // The picker's token count ALREADY includes the pinned head+tail (it gets
+    // headTokens/tailTokens in pickerInputs and result.finalTokens covers them).
+    // So the budget it folds against is the full maxTokens — NOT maxTokens-head,
+    // which double-counts the head (reserves it twice: once here, once because
+    // finalTokens already includes it). The old form threw ~head-tokens early at
+    // tight budgets and quietly under-used the budget by ~head everywhere.
+    const totalBudget = maxTokens;
     const slack = this.config.compressionSlackRatio ?? 0.1;
     const foldingBudget: FoldingBudget = {
       totalBudget,
