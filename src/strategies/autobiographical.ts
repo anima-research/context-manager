@@ -1005,9 +1005,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected driveSpeculativeDrain(ctx: StrategyContext): void {
     if (this.pendingCompression) return;
-    if (this.compressionQueue.length === 0 && this.mergeQueue.length === 0) return;
-    if (this.isAtSpeculativeCap()) return;
-    if (!this.shouldCompressPreflight()) return;
+    // Merges consolidate existing L_k summaries into L_{k+1} and REDUCE the
+    // unmerged-L1 count; L1 compression PRODUCES new unmerged L1s. The
+    // speculation cap / preflight throttle *production* only — they must never
+    // gate merges, otherwise exceeding the cap (e.g. after a manual backfill)
+    // permanently deadlocks the drain: too many unmerged L1s trips the cap,
+    // which blocks the very merges that would bring the count back down.
+    const hasMerges = this.config.hierarchical === true && this.mergeQueue.length > 0;
+    const hasCompression = this.compressionQueue.length > 0;
+    if (!hasCompression && !hasMerges) return;
+    // Only bail when the *sole* available work is L1 compression that the cap
+    // or preflight currently forbids. Merge work always proceeds.
+    if (!hasMerges && (this.isAtSpeculativeCap() || !this.shouldCompressPreflight())) return;
 
     const beforeChunks = this.compressionQueue.length;
     const beforeMerges = this.mergeQueue.length;
@@ -1030,14 +1039,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Whether the strategy's pending+queued L1 budget has reached the cap
+   * Whether the count of *produced, unmerged* L1 summaries has reached the cap
    * configured by `maxSpeculativeL1s`. If no cap is set, always false.
+   *
+   * The cap bounds how many L1 summaries may sit un-consolidated before the
+   * strategy must merge them into L_{k+1} (bounding prefix churn / merge debt).
+   * It deliberately does NOT count the pending `compressionQueue`: that queue is
+   * the backlog of work to be *drained*, not produced summaries. Counting it
+   * here would let a large backlog permanently trip the cap and block the very
+   * compression that would clear it — a deadlock (merges relieve the cap, but
+   * compression of the backlog never resumes). The throttle is on produced L1s;
+   * the queue drains freely, with merges keeping the unmerged count under the cap.
    */
   protected isAtSpeculativeCap(): boolean {
     const cap = this.config.maxSpeculativeL1s;
     if (cap === undefined || cap < 0) return false;
     const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto).length;
-    return unmergedL1s + this.compressionQueue.length > cap;
+    return unmergedL1s > cap;
   }
 
   /**
@@ -1059,8 +1077,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // Priority 1: Compress raw chunks → L1
-    if (this.compressionQueue.length > 0) {
+    // Priority 1: Compress raw chunks → L1. Skipped while at the speculative
+    // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
+    // priority below still runs to consolidate existing L1s and relieve the cap.
+    // No cap configured → isAtSpeculativeCap() is always false → unchanged.
+    if (this.compressionQueue.length > 0 && !this.isAtSpeculativeCap()) {
       const chunkIndex = this.compressionQueue.shift()!;
       const chunk = this.chunks[chunkIndex];
 

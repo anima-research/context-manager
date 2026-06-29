@@ -50,6 +50,7 @@ async function main() {
   const opt = (k: string, d?: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
   const strategyName = (opt('--strategy', 'kv-stable')) as 'kv-stable' | 'flat-profile' | 'oldest-first';
   const cap = Number(opt('--cap', '0.25'));
+  const absBudget = opt('--budget') ? Number(opt('--budget')) : undefined; // absolute token budget; overrides --cap
   const reach = opt('--reach') ? Number(opt('--reach')) : undefined;
   const ns = opt('--ns');
   const full = args.includes('--full');
@@ -67,6 +68,7 @@ async function main() {
     maxMessageTokens: 10000,
     mergeThreshold: 6,
     compressionModel: 'mock',
+    enforceBudget: false,
     foldingStrategy: strategyName,
     ...(reach !== undefined ? { kvStableReachTokens: reach } : {}),
   };
@@ -82,7 +84,7 @@ async function main() {
 
   const messages = cm.getAllMessages();
   const rawTotal = messages.reduce((a, m) => a + estTokens((m as any).content), 0);
-  const budget = Math.round(rawTotal * cap);
+  const budget = absBudget !== undefined ? absBudget : Math.round(rawTotal * cap);
 
   // Construct context — NO inference.
   let result;

@@ -54,10 +54,13 @@ async function main() {
     recentWindowTokens: 30000,
     mergeThreshold: 6,
   });
+  const nsIdx = args.indexOf('--ns');
+  const ns = nsIdx >= 0 ? args[nsIdx + 1] : undefined;
   const manager = await ContextManager.open({
     path: storePath,
     strategy,
     membrane: makeMockMembrane() as any,
+    ...(ns ? { namespace: ns } : {}),
   });
 
   const messages = manager.getAllMessages();
