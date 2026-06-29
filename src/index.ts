@@ -2,6 +2,9 @@
 export { ContextManager } from './context-manager.js';
 export type { ContextManagerConfig } from './context-manager.js';
 
+// Phase channel (liveness-watchdog observability hook)
+export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-channel.js';
+
 // Storage
 export { MessageStore } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener } from './message-store.js';

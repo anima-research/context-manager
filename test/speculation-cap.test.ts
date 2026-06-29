@@ -7,9 +7,15 @@
  * speculatively-built L1s before there was any real budget pressure.
  *
  * Post-fix:
- *  - `maxSpeculativeL1s` caps the count of (unmerged L1s + queued chunks).
- *    When at cap, `onNewMessage` defers auto-tick — chunks still queue,
- *    but compression doesn't fire until an explicit tick() / compile().
+ *  - `maxSpeculativeL1s` caps the count of *produced, unmerged* L1 summaries.
+ *    When at cap, `onNewMessage` defers auto-tick L1 production — chunks still
+ *    queue, but compression doesn't fire until merges bring the unmerged count
+ *    back under the cap (or an explicit tick() / compile()).
+ *  - The cap does NOT count the pending compression backlog and does NOT gate
+ *    merges: merges consolidate L1s into L_{k+1} and REDUCE the unmerged count,
+ *    so gating them would deadlock (too many unmerged L1s blocks the merges that
+ *    would relieve the cap, and a large backlog blocks the compression that
+ *    would drain it). See the "does not deadlock" regression suite below.
  *  - `shouldCompressPreflight()` is overridable so subclasses can add
  *    custom predictive scheduling.
  */
@@ -176,6 +182,114 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
 
     assert.ok(strategy.hasQueuedChunk(), 'sanity: chunk formed');
     assert.equal(strategy.tickCalls, 0, 'preflight=false must block auto-tick');
+    manager.close();
+  });
+});
+
+/**
+ * Regression: the speculation cap must throttle L1 *production* without
+ * deadlocking. Before this fix, `isAtSpeculativeCap()` counted
+ * `unmergedL1s + compressionQueue.length` and gated the *entire* drain. A store
+ * that accumulated more unmerged L1s than the cap (e.g. a manual backfill) could
+ * never recover: the cap blocked the merges that would reduce the count, and the
+ * backlog blocked the compression that would drain it. (Observed live: an agent
+ * with 79 unmerged L1s, cap 36, and 13 queued merges sat frozen indefinitely.)
+ */
+describe('AutobiographicalStrategy — speculation cap does not deadlock (regression)', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  class DrainStrategy extends AutobiographicalStrategy {
+    public mergeRuns = 0;
+
+    seedL1(content: string): SummaryEntry {
+      const entry: SummaryEntry = {
+        id: `L1-${this.nextSummaryIdCounter()}`,
+        level: 1,
+        content,
+        tokens: Math.ceil(content.length / 4),
+        sourceLevel: 0,
+        sourceIds: ['x'],
+        sourceRange: { first: 'x', last: 'x' },
+        created: Date.now(),
+      };
+      this.pushSummary(entry);
+      return entry;
+    }
+    queueMerge(ids: string[]): void {
+      (this as any).enqueueMerge({ level: 2, sourceIds: ids });
+    }
+    atCap(): boolean { return (this as any).isAtSpeculativeCap(); }
+    unmergedL1(): number {
+      return (this as any).summaries.filter((s: SummaryEntry) => s.level === 1 && !s.mergedInto).length;
+    }
+    get mergeQ(): unknown[] { return (this as any).mergeQueue; }
+    get compQ(): number[] { return (this as any).compressionQueue; }
+
+    // Isolate the drain/cap gating from executeMerge's message-store coupling:
+    // simulate a successful merge by marking the sources merged.
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+      this.mergeRuns++;
+      for (const id of sourceIds) {
+        const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
+        if (s) (s as any).mergedInto = 'L2-test';
+      }
+    }
+  }
+
+  it('cap counts produced unmerged L1s only — a compression backlog must not trip it', async () => {
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      maxSpeculativeL1s: 5,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+    strategy.seedL1('only one'); // 1 produced unmerged L1
+    for (let i = 0; i < 100; i++) strategy.compQ.push(i); // huge pending backlog
+
+    assert.equal(
+      strategy.atCap(),
+      false,
+      'a 100-deep compression backlog with 1 produced L1 must NOT trip a cap of 5 (pre-fix deadlock)',
+    );
+
+    for (let i = 0; i < 5; i++) strategy.seedL1(`x${i}`); // now 6 produced unmerged > 5
+    assert.equal(strategy.atCap(), true, 'six produced unmerged L1s exceed the cap of 5');
+
+    manager.close();
+  });
+
+  it('over-cap with queued merges still drains merges, then the cap clears', async () => {
+    const membrane = { complete: async () => ({ content: [{ type: 'text', text: '[mock]' }] }) };
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      maxSpeculativeL1s: 3,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+
+    const ids: string[] = [];
+    for (let i = 0; i < 8; i++) ids.push(strategy.seedL1(`s${i}`).id); // 8 unmerged > cap 3
+    strategy.queueMerge(ids.slice(0, 6)); // one L2 merge over 6 of them
+
+    assert.equal(strategy.atCap(), true, 'precondition: over the cap');
+    assert.equal(strategy.mergeQ.length, 1, 'precondition: a merge is queued');
+
+    await manager.tick(); // pre-fix: bailed at the cap → permanent deadlock
+
+    assert.equal(strategy.mergeRuns, 1, 'merge must run even while over the speculative cap');
+    assert.equal(strategy.mergeQ.length, 0, 'merge dequeued after success');
+    assert.equal(strategy.unmergedL1(), 2, '6 of 8 L1s consolidated');
+    assert.equal(strategy.atCap(), false, 'cap cleared → L1 compression can resume');
+
     manager.close();
   });
 });
