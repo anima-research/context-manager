@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
+import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
   ResettableStrategy,
@@ -1050,6 +1051,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   async tick(ctx: StrategyContext): Promise<void> {
+    phaseChannel.report('compress-tick'); // liveness-watchdog phase
     if (this.pendingCompression) return;
 
     if (!ctx.membrane) {
@@ -1403,6 +1405,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * No system prompt — framing via message structure only.
    */
   protected async compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext): Promise<void> {
+    phaseChannel.report('compress-chunk'); // liveness-watchdog phase
     if (!ctx.membrane) {
       throw new Error('No membrane instance for compression');
     }
@@ -1681,6 +1684,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries when the queue eventually drains.
    */
   protected checkMergeThreshold(): void {
+    phaseChannel.report('merge-threshold'); // liveness-watchdog phase
     if (this.config.speculativeProduction) {
       this.checkMergeThresholdRecursive();
       return;
@@ -2148,6 +2152,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * See `docs/adaptive-resolution-design.md` §3, §5.
    */
   protected selectAdaptive(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
@@ -2825,6 +2830,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Matches moltbot's budget waterfall: L3 → L2 → L1 with unused budget flowing down.
    */
   protected selectHierarchical(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
