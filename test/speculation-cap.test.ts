@@ -293,3 +293,84 @@ describe('AutobiographicalStrategy — speculation cap does not deadlock (regres
     manager.close();
   });
 });
+
+/**
+ * Regression: `driveSpeculativeDrain` must keep recursing as long as ticks do
+ * real work — using a monotonic work counter, NOT a queue-length delta. A
+ * productive tick can ALSO enqueue a follow-on item (e.g. a merge that schedules
+ * the next-level merge), leaving the queue length unchanged. The old
+ * length-delta check read that as "no progress" and halted the drain with the
+ * backlog only partly cleared — observed live: a single trigger drained ~4 of
+ * Lena's 13 queued merges, then stalled until the next message.
+ */
+describe('AutobiographicalStrategy — drain progresses past flat-length ticks (regression)', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  class FlatQueueStrategy extends AutobiographicalStrategy {
+    public mergeRuns = 0;
+    private refills = 4;
+    private used = new Set<string>();
+
+    seedL1(content: string): SummaryEntry {
+      const entry: SummaryEntry = {
+        id: `L1-${this.nextSummaryIdCounter()}`,
+        level: 1, content, tokens: Math.ceil(content.length / 4),
+        sourceLevel: 0, sourceIds: ['x'], sourceRange: { first: 'x', last: 'x' },
+        created: Date.now(),
+      };
+      this.pushSummary(entry);
+      return entry;
+    }
+    qMerge(ids: string[]): void { (this as any).enqueueMerge({ level: 2, sourceIds: ids }); }
+    get mergeQ(): unknown[] { return (this as any).mergeQueue; }
+
+    // Each merge consolidates its sources AND (for the first few) enqueues a
+    // follow-on merge — so the queue length nets out unchanged that tick.
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+      this.mergeRuns++;
+      for (const id of sourceIds) {
+        const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
+        if (s) (s as any).mergedInto = 'L2-x';
+        this.used.add(id);
+      }
+      if (this.refills-- > 0) {
+        const fresh = (this as any).summaries
+          .filter((s: SummaryEntry) => s.level === 1 && !s.mergedInto && !this.used.has(s.id))
+          .slice(0, 6).map((s: SummaryEntry) => s.id);
+        if (fresh.length >= 2) this.qMerge(fresh);
+      }
+    }
+  }
+
+  it('a single trigger drains all merges even when each enqueues a follow-on (flat length)', async () => {
+    const strategy = new FlatQueueStrategy({
+      headWindowTokens: 0, recentWindowTokens: 5, hierarchical: true, // no cap → merges always allowed
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: { complete: async () => ({ content: [{ type: 'text', text: 'x' }] }) } as any,
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) ids.push(strategy.seedL1(`s${i}`).id);
+    strategy.qMerge(ids.slice(0, 6)); // 1 queued; 4 refills → 5 merges total expected
+
+    // One trigger, as a single onNewMessage would do.
+    (strategy as any).driveSpeculativeDrain((manager as any).createStrategyContext());
+
+    // Let the microtask recursion + async ticks settle.
+    for (let i = 0; i < 100 && strategy.mergeQ.length > 0; i++) {
+      await new Promise(r => setTimeout(r, 10));
+    }
+    await new Promise(r => setTimeout(r, 50));
+
+    assert.ok(
+      strategy.mergeRuns >= 5,
+      `drain must process all merges incl. follow-ons (ran ${strategy.mergeRuns}); pre-fix it halts at 1`,
+    );
+    assert.equal(strategy.mergeQ.length, 0, 'merge queue fully drained from a single trigger');
+    manager.close();
+  });
+});

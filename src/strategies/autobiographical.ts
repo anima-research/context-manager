@@ -272,6 +272,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
   protected _compressionCount = 0;
+  /**
+   * Monotonic counter of tick() operations that actually processed a queue item
+   * (compressed a chunk or executed a merge). `driveSpeculativeDrain` recurses
+   * while this advances — a length-delta check would falsely read "no progress"
+   * when a productive tick also enqueues a follow-on item (net queue length
+   * unchanged), halting the drain with work still queued.
+   */
+  protected _drainProgress = 0;
 
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
@@ -1018,16 +1026,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // or preflight currently forbids. Merge work always proceeds.
     if (!hasMerges && (this.isAtSpeculativeCap() || !this.shouldCompressPreflight())) return;
 
-    const beforeChunks = this.compressionQueue.length;
-    const beforeMerges = this.mergeQueue.length;
+    const progressBefore = this._drainProgress;
 
     this.tick(ctx)
       .then(() => {
-        const afterChunks = this.compressionQueue.length;
-        const afterMerges = this.mergeQueue.length;
-        // Made progress if either queue shrank.
-        const progressed = afterChunks < beforeChunks || afterMerges < beforeMerges;
-        if (!progressed) return;
+        // Progress = the tick actually processed a queue item (compress or
+        // merge), tracked by `_drainProgress`. A queue-length delta is the
+        // wrong signal: a productive merge tick can also enqueue a follow-on
+        // merge, leaving the length unchanged — which the old check misread as
+        // "no progress" and halted the drain mid-backlog. A genuine no-op tick
+        // (empty queues, at-cap with no merges, no membrane) doesn't advance
+        // the counter, so this still stops cleanly (no runaway recursion).
+        if (this._drainProgress === progressBefore) return;
         // Recurse to drain more. queueMicrotask defers until the current
         // task is done, letting other code (the agent's stream consumer)
         // interleave.
@@ -1083,6 +1093,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // No cap configured → isAtSpeculativeCap() is always false → unchanged.
     if (this.compressionQueue.length > 0 && !this.isAtSpeculativeCap()) {
       const chunkIndex = this.compressionQueue.shift()!;
+      this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
 
       if (!chunk || chunk.compressed) return;
@@ -1108,6 +1119,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the next tick() retries it.
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
       const merge = this.mergeQueue[0]!;
+      this._drainProgress++; // executing a merge is real work, even if a
+      // follow-on merge gets enqueued and the queue length nets out unchanged
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
