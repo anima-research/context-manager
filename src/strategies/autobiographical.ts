@@ -534,7 +534,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
-    this.summaries = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
+    const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
+    // Drop empty-content summaries (bugged/empty generations from before the
+    // production guards). Recalling or merging one yields an empty text block →
+    // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
+    this.summaries = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
+    const droppedEmpty = loaded.length - this.summaries.length;
+    if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
 
     const counter = this.store.getStateJson(this.counterStateId);
     this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
@@ -1713,6 +1719,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .join('\n');
       logResponse = summaryText;
 
+      // A bugged/empty generation (summarizer returned no text — spent budget on
+      // thinking, truncated, etc.) must NOT be stored: recalled later it becomes
+      // an empty assistant text block → Anthropic 400 "content must be non-empty".
+      // Leave the chunk raw rather than poisoning memory with an empty summary.
+      if (!summaryText.trim()) {
+        console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — skipping (chunk left raw)`);
+        return;
+      }
+
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
         id: `L1-${this.nextSummaryIdCounter()}`,
@@ -2171,6 +2186,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .map(b => b.text)
         .join('\n');
       logResponse = mergedText;
+
+      // Empty merged generation: skip the merge entirely (do NOT push or mark
+      // sources merged) so we never store/recall an empty summary. Sources stay
+      // unmerged and can be retried.
+      if (!mergedText.trim()) {
+        console.warn(`[autobiographical] empty merged L${targetLevel} summary (${sources.length} sources) — skipping merge`);
+        return;
+      }
 
       // Compute source range from constituent summaries
       const sourceRange = {
@@ -3103,6 +3126,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const item of items) {
           if (item.kind === 'summary') {
             const summary = item.summary;
+            // Defensive: never emit a recall pair for an empty/bugged summary — an
+            // empty assistant text block triggers a 400. (Production guards too,
+            // but a legacy empty summary may already exist in the store.)
+            if (!summary.content || !summary.content.trim()) continue;
             const headerText = this.buildRecallHeader(summary);
             const questionEntry: ContextEntry = {
               index: entries.length,
