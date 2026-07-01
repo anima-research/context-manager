@@ -280,6 +280,59 @@ function expandToTarget(
   return tokens;
 }
 
+/**
+ * Project a per-chunk frontier onto the nearest VALID TREE CUT (group-consistent).
+ *
+ * A leaf folded to level k renders as part of its L_k ancestor node, and that
+ * node is atomic over its whole covered range — so EVERY leaf under it must share
+ * level k, or the node is unrenderable. The picker walks group-atomic raise/lower
+ * ops, so a frontier that folds only SOME leaves under a node is an unreachable
+ * target: it raises the group (over-folding a sibling), lowers it (under-folding
+ * another), forever — non-convergence (the wedge this fixes).
+ *
+ * Frontiers seeded per-chunk from the carried `previous` frontier can violate
+ * this: as a summary group accretes new raw leaves over turns while older leaves
+ * stay folded, its leaves end up at mixed levels. shed/expand only re-consolidate
+ * groups they actively move; a mixed group sitting in the budget dead-band passes
+ * through untouched. This pass repairs it.
+ *
+ * Shallowest-first: where a group disagrees, UN-fold the folded leaves one level
+ * toward raw (preserving continuity), cascading until every folded leaf's group
+ * is unanimous. Monotone (only lowers) → terminates. Any budget breach from the
+ * extra raw is re-folded whole-group by the shed pass that runs afterward.
+ *
+ * Pinned (`fixedLevels`) and frozen (locked) leaves are already made
+ * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
+ * they are held here rather than lowered.
+ */
+function projectToValidCut(
+  F: Map<ChunkId, number>,
+  tree: SummaryTree,
+  ordered: PickerChunk[],
+  frozen: ReadonlySet<ChunkId>,
+  fixedLevels: ReadonlyMap<ChunkId, number>,
+): void {
+  const maxPasses = (ordered.length + 1) * (maxAvailableLevel(tree) + 2);
+  let changed = true;
+  let pass = 0;
+  while (changed && pass++ < maxPasses) {
+    changed = false;
+    for (const c of ordered) {
+      const lvl = F.get(c.id) ?? 0;
+      if (lvl <= 0) continue;
+      if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
+      const node = tree.ancestorAt(c.id, lvl);
+      let unanimous = node != null;
+      if (node) {
+        for (const leafId of node.leafChunkIds) {
+          if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
+        }
+      }
+      if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level (shallowest-first)
+    }
+  }
+}
+
 /** Earliest source sequence whose resolution changed `prev → next`. */
 function earliestChangedSequence(
   prev: Frontier,
@@ -453,6 +506,18 @@ export function planControlledFrontier(
     tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, immovable, maxFoldLevel);
     expanded = tokens !== before; // a real un-fold only if it actually changed
   }
+
+  // Group-consistency (must be the LAST word on F): shed/expand can leave a
+  // summary node partially folded — some leaves at the node's level, others raw
+  // — when only part of the group is affordable/eligible or the tail/reach
+  // boundary bisects it (observed: expand un-folds just the newest leaves of an
+  // L2 node). Such a cut is unrenderable and makes the group-atomic picker
+  // oscillate raise↔lower forever (the wedge). Project onto the nearest valid
+  // tree cut, shallowest-first — un-fold mixed groups toward raw, which preserves
+  // continuity and matches expand's intent to spend headroom on raw.
+  projectToValidCut(F, tree, ordered, frozen, fixedLevels);
+  tokens = renderLayout(inputs, tree, F).totalTokens;
+
   return { resolutions: F, tokens, folded, expanded, escalated };
 }
 
