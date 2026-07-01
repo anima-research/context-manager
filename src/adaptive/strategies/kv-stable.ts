@@ -69,17 +69,53 @@ export class KvStableStrategy implements FoldingStrategy {
   private solve(budget: FoldingBudget): Map<ChunkId, number> {
     const tree = new SummaryTree(this.inputs);
 
-    // Flat zone (forced raw, never folded): head, tail, pinned. Frozen (kept at
-    // their carried resolution, never folded): locked.
+    // Flat zone (forced raw, never folded): head, tail, classic pins. Frozen
+    // (kept at their carried resolution, never folded): locked. V2 dynamic pins
+    // (`pinLevel` / `pinMaxLevel`) are honored as a fixed level or a hard fold-
+    // depth cap — see `planControlledFrontier`.
     const rawZone = new Set<ChunkId>();
     const frozen = new Set<ChunkId>();
+    const fixedLevels = new Map<ChunkId, number>();
+    const pinCaps = new Map<ChunkId, number>();
+    const fixedPins: Array<{ id: ChunkId; level: number }> = [];
     let now = 0;
     for (const c of this.inputs.chunks) {
       if (c.sequence > now) now = c.sequence;
       if (this.inputs.headChunkIds.has(c.id) || this.inputs.tailChunkIds.has(c.id) || c.pinned) {
         rawZone.add(c.id);
+      } else if (c.pinLevel !== undefined) {
+        // Pin-at-level-k: fix exactly at k (0 = raw). k=0 is equivalent to a
+        // classic raw pin, so route it through the raw zone; k>0 is resolved to
+        // its whole L_k node below (group-consistent — see the loop after).
+        if (c.pinLevel <= 0) rawZone.add(c.id);
+        else fixedPins.push({ id: c.id, level: c.pinLevel });
+      } else if (c.pinMaxLevel !== undefined) {
+        // Pin-max-level: a hard fold-depth cap. maxLevel 0 ≡ classic raw pin.
+        if (c.pinMaxLevel <= 0) rawZone.add(c.id);
+        else pinCaps.set(c.id, c.pinMaxLevel);
+        if (c.lockedByAgent) frozen.add(c.id);
       } else if (c.lockedByAgent) {
         frozen.add(c.id);
+      }
+    }
+
+    // Group-consistency for pin-at-level-k: an L_k recall pair is atomic over
+    // its whole covered range, so "cut through the L_k node" (design §7) fixes
+    // EVERY leaf under that node at k — not just the addressed chunk. Fixing a
+    // single sub-chunk while its siblings render raw is an unrenderable (and
+    // non-converging) frontier. Clamp k to the deepest produced level for the
+    // chunk; if none exists, fall back to fixing just the chunk (the controller
+    // clamps it further). Skip leaves already forced raw (head/tail/classic pin).
+    for (const { id, level } of fixedPins) {
+      const eff = Math.min(level, tree.maxLevel(id));
+      if (eff <= 0) { rawZone.add(id); continue; }
+      const node = tree.ancestorAt(id, eff);
+      if (!node) { fixedLevels.set(id, eff); continue; }
+      for (const leaf of node.leafChunkIds) {
+        if (rawZone.has(leaf)) continue;
+        // Finest requirement wins if two pins overlap a leaf.
+        const prev = fixedLevels.get(leaf);
+        fixedLevels.set(leaf, prev === undefined ? eff : Math.min(prev, eff));
       }
     }
 
@@ -95,6 +131,8 @@ export class KvStableStrategy implements FoldingStrategy {
       reachTokens: this.opts.reachTokens,
       rawZone,
       frozen,
+      fixedLevels,
+      pinCaps,
       now,
       mergeThreshold: this.opts.mergeThreshold,
     }).resolutions;

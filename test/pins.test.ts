@@ -201,4 +201,50 @@ describe('AutobiographicalStrategy — pins / documents (gap #3)', () => {
 
     manager.close();
   });
+
+  // ---- V2 dynamic pins: pin-at-level-k / pin-max-level (additive, opt-in) ----
+
+  it('pinAtLevel / level / maxLevel round-trip through listPins and validate', async () => {
+    const strategy = new TestableStrategy({ headWindowTokens: 0, recentWindowTokens: 5 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const m1 = manager.addMessage('user', textBlock('fix me at L2'));
+    const m2 = manager.addMessage('user', textBlock('cap me at L1'));
+    manager.addMessage('user', textBlock('latest'));
+
+    const atId = manager.pinAtLevel(m1, m1, 2, { name: 'at-2' });
+    const capId = manager.pinRange(m2, m2, { maxLevel: 1 });
+    // Invalid bounds are dropped (a classic raw pin), not persisted as junk.
+    const rawId = manager.markDocument(m2, { level: -3 });
+
+    const byId = new Map(manager.listPins().map((p) => [p.id, p]));
+    assert.equal(byId.get(atId)?.level, 2, 'pin-at-level stores level');
+    assert.equal(byId.get(atId)?.maxLevel, undefined, 'level suppresses maxLevel');
+    assert.equal(byId.get(capId)?.maxLevel, 1, 'pin-max-level stores maxLevel');
+    assert.equal(byId.get(capId)?.level, undefined, 'no fixed level on a cap pin');
+    assert.equal(byId.get(rawId)?.level, undefined, 'invalid level dropped → classic pin');
+    assert.equal(byId.get(rawId)?.maxLevel, undefined, 'invalid level dropped → classic pin');
+
+    manager.close();
+  });
+
+  it('level bound survives close/reopen', async () => {
+    let atId: string;
+    {
+      const strategy = new TestableStrategy({ headWindowTokens: 0, recentWindowTokens: 5 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const m1 = manager.addMessage('user', textBlock('survive at L3'));
+      manager.addMessage('user', textBlock('latest'));
+      atId = manager.pinAtLevel(m1, m1, 3);
+      manager.sync();
+      manager.close();
+    }
+    {
+      const strategy = new TestableStrategy({ headWindowTokens: 0, recentWindowTokens: 5 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const pin = manager.listPins().find((p) => p.id === atId);
+      assert.ok(pin, 'leveled pin reloads');
+      assert.equal(pin!.level, 3, 'level bound persisted across reopen');
+      manager.close();
+    }
+  });
 });

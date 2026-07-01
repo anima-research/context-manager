@@ -16,6 +16,7 @@ import type {
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
+  PinLevelOptions,
   SearchQuery,
   SearchResult,
   RenderStats,
@@ -254,6 +255,21 @@ export interface AutobiographicalProgressSnapshot {
 }
 
 /**
+ * Validate + normalize the optional V2 pin fold-depth bounds. Returns only the
+ * fields that are present and valid (non-negative integers), so a classic pin
+ * with no bounds persists exactly as before. `level` takes precedence over
+ * `maxLevel` (pin-at-k is stronger than a cap), so they're never both emitted.
+ */
+function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?: number } {
+  const clean = (v: number | undefined): number | undefined =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : undefined;
+  const level = clean(opts?.level);
+  if (level !== undefined) return { level };
+  const maxLevel = clean(opts?.maxLevel);
+  return maxLevel !== undefined ? { maxLevel } : {};
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -272,6 +288,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
   protected _compressionCount = 0;
+  /**
+   * Monotonic counter of tick() operations that actually processed a queue item
+   * (compressed a chunk or executed a merge). `driveSpeculativeDrain` recurses
+   * while this advances — a length-delta check would falsely read "no progress"
+   * when a productive tick also enqueues a follow-on item (net queue length
+   * unchanged), halting the drain with work still queued.
+   */
+  protected _drainProgress = 0;
 
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
@@ -584,7 +608,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Pin a range of messages so they aren't compressed and render raw at
    * their original position. Returns the pin id.
    */
-  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string {
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string {
     const id = `pin-${this.pinIdCounter++}`;
     this.pins.push({
       id,
@@ -593,6 +617,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       kind: 'pin',
       name: opts?.name,
       created: Date.now(),
+      ...normalizePinLevels(opts),
     });
     this.persistPins();
     return id;
@@ -603,7 +628,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * information the agent wants to retain in full. Functionally a
    * single-message pin with `kind: 'document'`.
    */
-  markDocument(messageId: string, opts?: { name?: string }): string {
+  markDocument(messageId: string, opts?: PinLevelOptions): string {
     const id = `pin-${this.pinIdCounter++}`;
     this.pins.push({
       id,
@@ -612,9 +637,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       kind: 'document',
       name: opts?.name,
       created: Date.now(),
+      ...normalizePinLevels(opts),
     });
     this.persistPins();
     return id;
+  }
+
+  /**
+   * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
+   * fold level `level` (0 = raw). Honored only by `foldingStrategy: 'kv-stable'`;
+   * other strategies fall back to treating the range as raw. Equivalent to
+   * `pinRange(first, last, { level })`.
+   */
+  pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
+    return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
   }
 
   /** Remove a pin or document mark by id. Returns true if removed. */
@@ -732,6 +768,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const lo = Math.min(first, last);
       const hi = Math.max(first, last);
       for (let i = lo; i <= hi; i++) out.add(i);
+    }
+    return out;
+  }
+
+  /**
+   * Resolve the V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
+   * `maxLevel`) to message positions. Only pins that carry a bound appear; a
+   * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
+   * When ranges overlap, the FINEST requirement wins (lowest effective level):
+   * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
+   * solely by the KV-stable controller — see `ProtectedRange`.
+   */
+  protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
+    const out = new Map<number, { level?: number; maxLevel?: number }>();
+    if (this.pins.length === 0) return out;
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+
+    for (const pin of this.pins) {
+      if (pin.level === undefined && pin.maxLevel === undefined) continue;
+      const first = positionOf.get(pin.firstMessageId);
+      const last = positionOf.get(pin.lastMessageId);
+      if (first === undefined || last === undefined) continue;
+      const lo = Math.min(first, last);
+      const hi = Math.max(first, last);
+      for (let i = lo; i <= hi; i++) {
+        const prev = out.get(i) ?? {};
+        // A fixed level is the strongest constraint; when two pins fix the same
+        // position, the shallower (lower) level wins (finest requirement).
+        if (pin.level !== undefined) {
+          prev.level = prev.level === undefined ? pin.level : Math.min(prev.level, pin.level);
+        } else if (pin.maxLevel !== undefined) {
+          prev.maxLevel = prev.maxLevel === undefined ? pin.maxLevel : Math.min(prev.maxLevel, pin.maxLevel);
+        }
+        out.set(i, prev);
+      }
     }
     return out;
   }
@@ -1018,16 +1090,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // or preflight currently forbids. Merge work always proceeds.
     if (!hasMerges && (this.isAtSpeculativeCap() || !this.shouldCompressPreflight())) return;
 
-    const beforeChunks = this.compressionQueue.length;
-    const beforeMerges = this.mergeQueue.length;
+    const progressBefore = this._drainProgress;
 
     this.tick(ctx)
       .then(() => {
-        const afterChunks = this.compressionQueue.length;
-        const afterMerges = this.mergeQueue.length;
-        // Made progress if either queue shrank.
-        const progressed = afterChunks < beforeChunks || afterMerges < beforeMerges;
-        if (!progressed) return;
+        // Progress = the tick actually processed a queue item (compress or
+        // merge), tracked by `_drainProgress`. A queue-length delta is the
+        // wrong signal: a productive merge tick can also enqueue a follow-on
+        // merge, leaving the length unchanged — which the old check misread as
+        // "no progress" and halted the drain mid-backlog. A genuine no-op tick
+        // (empty queues, at-cap with no merges, no membrane) doesn't advance
+        // the counter, so this still stops cleanly (no runaway recursion).
+        if (this._drainProgress === progressBefore) return;
         // Recurse to drain more. queueMicrotask defers until the current
         // task is done, letting other code (the agent's stream consumer)
         // interleave.
@@ -1083,6 +1157,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // No cap configured → isAtSpeculativeCap() is always false → unchanged.
     if (this.compressionQueue.length > 0 && !this.isAtSpeculativeCap()) {
       const chunkIndex = this.compressionQueue.shift()!;
+      this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
 
       if (!chunk || chunk.compressed) return;
@@ -1108,6 +1183,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the next tick() retries it.
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
       const merge = this.mergeQueue[0]!;
+      this._drainProgress++; // executing a merge is real work, even if a
+      // follow-on merge gets enqueued and the queue length nets out unchanged
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
@@ -2237,6 +2314,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Pinned-position set so the picker doesn't fold messages the user
     // explicitly marked as keep-raw. Built once and reused.
     const pinnedSet = this.pinnedPositions(messages);
+    // V2 dynamic-pin fold-depth bounds (level / maxLevel). A position with a
+    // bound is NOT a classic force-raw pin — the KV-stable controller must be
+    // able to move it to/within its bound — so it renders as `pinned: false`
+    // carrying `pinLevel` / `pinMaxLevel` instead.
+    const pinBounds = this.pinLevelBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -2250,13 +2332,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0
         ? Math.min(store.estimateTokens(msg), msgCap + 50)
         : store.estimateTokens(msg);
+      const bound = pinBounds.get(i);
       pickerChunks.push({
         id: msg.id,
         sequence: i,
         rawTokens: tokens,
         currentResolution: this.resolutions.get(msg.id) ?? 0,
         lockedByAgent: this.locked.has(msg.id),
-        pinned: pinnedSet.has(i),
+        // A classic pin (in pinnedSet with no level bound) stays force-raw. A
+        // leveled pin is not force-raw; it carries its bound instead.
+        pinned: pinnedSet.has(i) && bound === undefined,
+        pinLevel: bound?.level,
+        pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId,
       });
     }

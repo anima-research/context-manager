@@ -16,6 +16,7 @@ import type {
   ContextInjection,
   CompileResult,
   ProtectedRange,
+  PinLevelOptions,
   SearchQuery,
   SearchResult,
   SummaryEntry,
@@ -640,7 +641,7 @@ export class ContextManager {
    *
    * Throws if the active strategy doesn't support pins.
    */
-  pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: { name?: string }): string {
+  pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -648,11 +649,21 @@ export class ContextManager {
   }
 
   /**
+   * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
+   * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
+   * only by `foldingStrategy: 'kv-stable'`; other strategies fall back to
+   * treating the range as raw. Returns the new pin id.
+   */
+  pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
+    return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
+  }
+
+  /**
    * Mark a single message as a "document" (semantically a body of
    * information to retain in full). Same effect as a single-message pin
    * with `kind: 'document'`. Returns the new pin id.
    */
-  markDocument(messageId: MessageId, opts?: { name?: string }): string {
+  markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support documents');
     }

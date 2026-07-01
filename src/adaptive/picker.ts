@@ -82,6 +82,19 @@ export interface PickerChunk {
   bodyGroupId?: string;
   pinned: boolean;
   /**
+   * V2 dynamic pin — fix this chunk at EXACTLY this fold level (0 = raw). Set
+   * from a `ProtectedRange.level`. Such a chunk is NOT `pinned` (the controller
+   * must be able to move it to its level), but the KV-stable controller holds it
+   * there and never folds/un-folds it. Ignored by non-kv-stable strategies.
+   */
+  pinLevel?: number;
+  /**
+   * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap).
+   * Set from a `ProtectedRange.maxLevel`. Honored only by the KV-stable
+   * controller (in normal and emergency shedding). Ignored elsewhere.
+   */
+  pinMaxLevel?: number;
+  /**
    * The L1 summary covering this chunk, if any. Higher levels are derived
    * by walking parentId pointers in the summary tree.
    */
