@@ -38,6 +38,7 @@ export type {
   KnowledgeConfig,
   ResettableStrategy,
   ProtectedRange,
+  PinLevelOptions,
   SearchQuery,
   SearchResult,
   SearchableStrategy,

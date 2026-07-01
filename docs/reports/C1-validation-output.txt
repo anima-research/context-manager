@@ -1,0 +1,29 @@
+=== C1 kv-stable validation (real ContextManager pipeline; synthetic content, real folding) ===
+messages=220 build-budget=64,000 avg-tokens=900 summary=600t
+
+--- flat-profile --- (raw total 304,665t · compiles that threw: 0 · deterministic re-compile: YES)
+  budget      rendered   util%   middleRaw    L1       L2       L3     deepest
+  op-64k       50,944    85%     14,310    1,827    4,872        0    L2
+  100k         50,944    53%     14,310    1,827    4,872        0    L2
+  180k         50,944    29%     14,310    1,827    4,872        0    L2
+  300k         50,944    17%     14,310    1,827    4,872        0    L2
+  drop→100k    50,944    53%     14,310    1,827    4,872        0    L2
+
+--- kv-stable --- (raw total 304,665t · compiles that threw: 0 · deterministic re-compile: YES)
+  budget      rendered   util%   middleRaw    L1       L2       L3     deepest
+  op-64k       51,417    86%      5,648   12,789    3,045        0    L2
+  100k         85,474    89%     44,577    7,917    3,045        0    L2
+  180k        158,261    90%    125,281        0    3,045        0    L2
+  300k        263,936    89%    230,956    2,436      609        0    L2
+  drop→100k    81,986    85%     25,864   25,578      609        0    L2
+
+=== PROPERTY CHECKS ===
+  [PASS] A1 kv-stable un-folds on budget increase (100k<180k<300k)  (85,474 → 158,261 → 263,936)
+  [PASS] A2 flat-profile stays stuck on budget increase (the bug)  (100k 50,944 → 300k 50,944 (Δ 0%))
+  [PASS] A3 kv-stable re-folds on budget drop (300k→100k)  (263,936 → 81,986)
+  [PASS] B kv-stable fills 300k headroom better than flat  (util kv 89% vs flat 17%)
+  [PASS] C1 kv-stable sweep is monotone (no oscillation)
+  [PASS] C2 all compiles converged (no picker iteration-bound throw)  (kv threw 0, flat threw 0)
+  [PASS] C3 re-compiling identical state is deterministic (byte-stable render)
+
+ALL PROPERTIES HELD

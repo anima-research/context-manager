@@ -186,8 +186,8 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
  * original chronological position. Implemented by AutobiographicalStrategy.
  */
 export interface PinnableStrategy extends ContextStrategy {
-  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string;
-  markDocument(messageId: string, opts?: { name?: string }): string;
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string;
+  markDocument(messageId: string, opts?: PinLevelOptions): string;
   unpin(pinId: string): boolean;
   listPins(): ReadonlyArray<ProtectedRange>;
 }
@@ -596,6 +596,35 @@ export interface ProtectedRange {
   name?: string;
   /** Creation timestamp (ms since epoch). */
   created: number;
+  /**
+   * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
+   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * frontier cut passes through the L_k node — neither folded deeper nor
+   * un-folded shallower. When set, this range is NOT a classic force-raw pin.
+   * Takes precedence over `maxLevel`. Omitted → not a fixed-level pin.
+   *
+   * Honored only by the KV-stable controller (`foldingStrategy: 'kv-stable'`);
+   * other strategies fall back to treating the range as raw (a safe superset).
+   */
+  level?: number;
+  /**
+   * Pin-max-level (V2 dynamic pins): the covered chunks may fold no DEEPER than
+   * this level — raw..L_k allowed, deeper forbidden — a hard cap honored even
+   * under the window-pressure emergency. `maxLevel: 0` ≡ classic pin-raw.
+   * Ignored when `level` is set. Omitted → this pin imposes no depth cap.
+   *
+   * Honored only by the KV-stable controller; see `level`.
+   */
+  maxLevel?: number;
+}
+
+/** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
+export interface PinLevelOptions {
+  name?: string;
+  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  level?: number;
+  /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
+  maxLevel?: number;
 }
 
 /**

@@ -16,6 +16,7 @@ import type {
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
+  PinLevelOptions,
   SearchQuery,
   SearchResult,
   RenderStats,
@@ -251,6 +252,21 @@ export interface AutobiographicalProgressSnapshot {
   summaryCounts: { l1: number; l2: number; l3: number };
   /** True if a compression or merge LLM call is currently in flight. */
   pending: boolean;
+}
+
+/**
+ * Validate + normalize the optional V2 pin fold-depth bounds. Returns only the
+ * fields that are present and valid (non-negative integers), so a classic pin
+ * with no bounds persists exactly as before. `level` takes precedence over
+ * `maxLevel` (pin-at-k is stronger than a cap), so they're never both emitted.
+ */
+function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?: number } {
+  const clean = (v: number | undefined): number | undefined =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : undefined;
+  const level = clean(opts?.level);
+  if (level !== undefined) return { level };
+  const maxLevel = clean(opts?.maxLevel);
+  return maxLevel !== undefined ? { maxLevel } : {};
 }
 
 /**
@@ -592,7 +608,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Pin a range of messages so they aren't compressed and render raw at
    * their original position. Returns the pin id.
    */
-  pinRange(firstMessageId: string, lastMessageId: string, opts?: { name?: string }): string {
+  pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string {
     const id = `pin-${this.pinIdCounter++}`;
     this.pins.push({
       id,
@@ -601,6 +617,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       kind: 'pin',
       name: opts?.name,
       created: Date.now(),
+      ...normalizePinLevels(opts),
     });
     this.persistPins();
     return id;
@@ -611,7 +628,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * information the agent wants to retain in full. Functionally a
    * single-message pin with `kind: 'document'`.
    */
-  markDocument(messageId: string, opts?: { name?: string }): string {
+  markDocument(messageId: string, opts?: PinLevelOptions): string {
     const id = `pin-${this.pinIdCounter++}`;
     this.pins.push({
       id,
@@ -620,9 +637,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       kind: 'document',
       name: opts?.name,
       created: Date.now(),
+      ...normalizePinLevels(opts),
     });
     this.persistPins();
     return id;
+  }
+
+  /**
+   * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
+   * fold level `level` (0 = raw). Honored only by `foldingStrategy: 'kv-stable'`;
+   * other strategies fall back to treating the range as raw. Equivalent to
+   * `pinRange(first, last, { level })`.
+   */
+  pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
+    return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
   }
 
   /** Remove a pin or document mark by id. Returns true if removed. */
@@ -740,6 +768,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const lo = Math.min(first, last);
       const hi = Math.max(first, last);
       for (let i = lo; i <= hi; i++) out.add(i);
+    }
+    return out;
+  }
+
+  /**
+   * Resolve the V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
+   * `maxLevel`) to message positions. Only pins that carry a bound appear; a
+   * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
+   * When ranges overlap, the FINEST requirement wins (lowest effective level):
+   * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
+   * solely by the KV-stable controller — see `ProtectedRange`.
+   */
+  protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
+    const out = new Map<number, { level?: number; maxLevel?: number }>();
+    if (this.pins.length === 0) return out;
+    const positionOf = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+
+    for (const pin of this.pins) {
+      if (pin.level === undefined && pin.maxLevel === undefined) continue;
+      const first = positionOf.get(pin.firstMessageId);
+      const last = positionOf.get(pin.lastMessageId);
+      if (first === undefined || last === undefined) continue;
+      const lo = Math.min(first, last);
+      const hi = Math.max(first, last);
+      for (let i = lo; i <= hi; i++) {
+        const prev = out.get(i) ?? {};
+        // A fixed level is the strongest constraint; when two pins fix the same
+        // position, the shallower (lower) level wins (finest requirement).
+        if (pin.level !== undefined) {
+          prev.level = prev.level === undefined ? pin.level : Math.min(prev.level, pin.level);
+        } else if (pin.maxLevel !== undefined) {
+          prev.maxLevel = prev.maxLevel === undefined ? pin.maxLevel : Math.min(prev.maxLevel, pin.maxLevel);
+        }
+        out.set(i, prev);
+      }
     }
     return out;
   }
@@ -2250,6 +2314,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Pinned-position set so the picker doesn't fold messages the user
     // explicitly marked as keep-raw. Built once and reused.
     const pinnedSet = this.pinnedPositions(messages);
+    // V2 dynamic-pin fold-depth bounds (level / maxLevel). A position with a
+    // bound is NOT a classic force-raw pin — the KV-stable controller must be
+    // able to move it to/within its bound — so it renders as `pinned: false`
+    // carrying `pinLevel` / `pinMaxLevel` instead.
+    const pinBounds = this.pinLevelBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -2263,13 +2332,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0
         ? Math.min(store.estimateTokens(msg), msgCap + 50)
         : store.estimateTokens(msg);
+      const bound = pinBounds.get(i);
       pickerChunks.push({
         id: msg.id,
         sequence: i,
         rawTokens: tokens,
         currentResolution: this.resolutions.get(msg.id) ?? 0,
         lockedByAgent: this.locked.has(msg.id),
-        pinned: pinnedSet.has(i),
+        // A classic pin (in pinnedSet with no level bound) stays force-raw. A
+        // leveled pin is not force-raw; it carries its bound instead.
+        pinned: pinnedSet.has(i) && bound === undefined,
+        pinLevel: bound?.level,
+        pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId,
       });
     }

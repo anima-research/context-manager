@@ -149,6 +149,7 @@ function shedToTarget(
   reachTokens: number,
   windowTokens: number,
   maxFoldLevel: number,
+  pinCaps: ReadonlyMap<ChunkId, number>,
 ): number {
   // Raw tokens strictly newer than each chunk (its distance from the live end).
   const newerTokens = new Map<ChunkId, number>();
@@ -176,6 +177,13 @@ function shedToTarget(
         let eligible = true;
         for (const leafId of ancestor.leafChunkIds) {
           const cap = caps.get(leafId) ?? 0;
+          // A V2 pin-max-level is a HARD cap: never fold a pinned chunk deeper
+          // than its bound, even in the W emergency (pins are hard-protected).
+          const pinCap = pinCaps.get(leafId);
+          if (pinCap !== undefined && level > pinCap) {
+            eligible = false;
+            break;
+          }
           // Normal: respect the saliency depth cap. Emergency (ignoreCaps): only
           // the hard-protected set (cap = −1: flat zone / pins / locked) blocks;
           // the age-extended-raw band (cap 0) and shallower-than-cap content all
@@ -229,7 +237,7 @@ function expandToTarget(
   target: number,
   reachTokens: number,
   rawZone: ReadonlySet<ChunkId>,
-  frozen: ReadonlySet<ChunkId>,
+  immovable: ReadonlySet<ChunkId>,
   maxFoldLevel: number,
 ): number {
   const newerTokens = new Map<ChunkId, number>();
@@ -245,7 +253,7 @@ function expandToTarget(
       if (tokens >= target) break;
       const c = ordered[oi]; // youngest-first
       if ((frontier.get(c.id) ?? 0) !== level) continue;
-      if (rawZone.has(c.id) || frozen.has(c.id)) continue;
+      if (rawZone.has(c.id) || immovable.has(c.id)) continue;
       if ((newerTokens.get(c.id) ?? 0) >= reachTokens) continue;
       const node = tree.ancestorAt(c.id, level);
       if (!node) continue;
@@ -255,7 +263,7 @@ function expandToTarget(
       for (const leafId of node.leafChunkIds) {
         if (
           (frontier.get(leafId) ?? 0) !== level ||
-          rawZone.has(leafId) || frozen.has(leafId) ||
+          rawZone.has(leafId) || immovable.has(leafId) ||
           (newerTokens.get(leafId) ?? 0) >= reachTokens
         ) {
           eligible = false;
@@ -311,6 +319,7 @@ function rawTailSet(ordered: PickerChunk[], tailTokens: number): Set<ChunkId> {
 }
 
 const EMPTY_SET: ReadonlySet<ChunkId> = new Set();
+const EMPTY_LEVEL_MAP: ReadonlyMap<ChunkId, number> = new Map();
 
 export interface ControlPlanParams {
   /** Carried frontier (F_prev). */
@@ -332,6 +341,20 @@ export interface ControlPlanParams {
   rawZone: ReadonlySet<ChunkId>;
   /** Chunks kept at their carried resolution and never touched (locked). */
   frozen?: ReadonlySet<ChunkId>;
+  /**
+   * V2 pin-at-level-k: chunks fixed to render at EXACTLY the given fold level
+   * (0 = raw). Held there and never folded or un-folded — the frontier cut
+   * passes through that L_k node. A level deeper than the tree has produced is
+   * clamped to the deepest available. (`ProtectedRange.level`.)
+   */
+  fixedLevels?: ReadonlyMap<ChunkId, number>;
+  /**
+   * V2 pin-max-level: per-chunk HARD cap on fold depth — the chunk may fold no
+   * deeper than this level, enforced in normal AND emergency shedding, and any
+   * carried resolution deeper than the cap is un-folded to it at plan start.
+   * (`ProtectedRange.maxLevel`.)
+   */
+  pinCaps?: ReadonlyMap<ChunkId, number>;
   /** Newest source sequence — the age reference for the log-age fold caps. */
   now: number;
   /** Base-k summary grouping. Default 6. */
@@ -368,17 +391,40 @@ export function planControlledFrontier(
 ): ControlPlan {
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const frozen = p.frozen ?? EMPTY_SET;
+  const fixedLevels = p.fixedLevels ?? EMPTY_LEVEL_MAP;
+  const pinCaps = p.pinCaps ?? EMPTY_LEVEL_MAP;
   const mergeThreshold = p.mergeThreshold ?? 6;
   const reach = p.reachTokens ?? p.windowTokens;
   const expandAt = p.expandAtTokens ?? p.targetTokens;
   // Fold as deep as the tree actually goes (L4/L5… when produced), not a constant.
   const maxFoldLevel = maxAvailableLevel(tree);
 
+  // Immovable = never folded OR un-folded by the shed/expand passes: the locked
+  // (frozen) set plus V2 pin-at-level-k chunks (held at their fixed level).
+  const immovable = new Set<ChunkId>(frozen);
+  for (const id of fixedLevels.keys()) immovable.add(id);
+
   const F = new Map<ChunkId, number>();
   for (const c of ordered) {
-    if (p.rawZone.has(c.id)) F.set(c.id, 0);
-    else if (frozen.has(c.id)) F.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
-    else F.set(c.id, p.previous.get(c.id) ?? 0);
+    if (p.rawZone.has(c.id)) {
+      F.set(c.id, 0);
+    } else if (fixedLevels.has(c.id)) {
+      // Pin-at-k: fix to exactly k, clamped to the deepest produced level for
+      // this chunk (can't render at a level whose summary doesn't exist yet).
+      const k = Math.max(0, fixedLevels.get(c.id)!);
+      F.set(c.id, k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id)));
+    } else if (frozen.has(c.id)) {
+      F.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
+    } else {
+      // Carry F_prev, but enforce a pin-max-level immediately: un-fold anything
+      // carried deeper than its cap down to the cap (shallower summaries — its
+      // ancestors — are guaranteed to exist). This is the intended divergence
+      // cost of adding/tightening a pin (design §7).
+      let lvl = p.previous.get(c.id) ?? 0;
+      const cap = pinCaps.get(c.id);
+      if (cap !== undefined && lvl > cap) lvl = Math.max(0, cap);
+      F.set(c.id, lvl);
+    }
   }
 
   let tokens = renderLayout(inputs, tree, F).totalTokens;
@@ -390,18 +436,21 @@ export function planControlledFrontier(
     const flatZoneChunks = p.rawZone.size;
     const caps = new Map<ChunkId, number>();
     for (const c of ordered) {
-      caps.set(
-        c.id,
-        p.rawZone.has(c.id) || frozen.has(c.id)
-          ? -1 // hard-protected sentinel: never fold, even in the W emergency
-          : foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold, maxFoldLevel),
-      );
+      let cap: number;
+      if (p.rawZone.has(c.id) || immovable.has(c.id)) {
+        cap = -1; // hard-protected sentinel: never fold, even in the W emergency
+      } else {
+        cap = foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold, maxFoldLevel);
+        const pinCap = pinCaps.get(c.id);
+        if (pinCap !== undefined) cap = Math.min(cap, Math.max(0, pinCap));
+      }
+      caps.set(c.id, cap);
     }
-    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens, maxFoldLevel);
+    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens, maxFoldLevel, pinCaps);
     folded = tokens !== before; // a real fold only if it actually changed the render
     if (tokens > p.windowTokens) escalated = true;
   } else if (tokens < expandAt) {
-    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, frozen, maxFoldLevel);
+    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, immovable, maxFoldLevel);
     expanded = tokens !== before; // a real un-fold only if it actually changed
   }
   return { resolutions: F, tokens, folded, expanded, escalated };
