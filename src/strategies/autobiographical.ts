@@ -1702,7 +1702,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
-        maxTokens: Math.round(targetTokens * 1.5),
+        // Generous output ceiling so a memory-write is never truncated mid-thought:
+        // targetTokens is a *target*, not a cap, and adaptive models routinely
+        // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
+        // off rich memories (stop=max_tokens).
+        maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
       },
     };
 
@@ -2175,7 +2179,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
-        maxTokens: Math.round(targetTokens * 1.5),
+        // Generous output ceiling so a memory-write is never truncated mid-thought:
+        // targetTokens is a *target*, not a cap, and adaptive models routinely
+        // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
+        // off rich memories (stop=max_tokens).
+        maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
       },
     };
 
