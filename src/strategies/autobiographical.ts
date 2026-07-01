@@ -1546,7 +1546,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
     const priorSummaries = this.summaries
-      .filter((s) => !s.mergedInto)
+      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
+      // recall pair triggers Anthropic 400 "text content blocks must be
+      // non-empty", which stalls ALL compression (mirrors the render-path guard
+      // + load-drop). A single empty summary otherwise poisons every compression.
+      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
       .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
 
     // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
@@ -2002,7 +2006,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // parent — the same rule used everywhere else and now in
     // `compressChunkHierarchical`. The cap below is the defense-in-depth.
     const priorSummariesAll = this.summaries
-      .filter((s) => !s.mergedInto)
+      // Skip empty-content summaries (see compressChunkHierarchical): an empty
+      // text block in the merge recall header 400s and stalls compression.
+      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
       .filter((s) => {
         for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
         const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
