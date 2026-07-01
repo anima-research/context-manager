@@ -31,8 +31,11 @@ import { placeMarkers, CacheStore } from './kv-cache-sim.js';
 /** Provider price multipliers relative to base input tokens (Anthropic-ish). */
 export const PRICE = { miss: 1.0, cacheRead: 0.1, cacheWrite: 1.25 } as const;
 
-/** Deepest fold level the saliency field will ever allow. */
-export const MAX_FOLD_LEVEL = 3;
+/** Safety ceiling on saliency fold depth. The *effective* cap is
+ *  `maxAvailableLevel(tree)` (fold only as deep as summaries actually exist),
+ *  which every caller passes in; this constant is just a high sane upper bound so
+ *  L4/L5/… are allowed as the merge pipeline builds them — never a pin at L3. */
+export const MAX_FOLD_LEVEL = 8;
 
 export interface ControlOptions {
   /** Physical context window — the ONLY hard wall. */
