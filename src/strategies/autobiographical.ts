@@ -270,6 +270,22 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
 }
 
 /**
+ * Drop empty text blocks (`{type:'text', text:''}` or whitespace-only). The
+ * Anthropic API rejects them with 400 "text content blocks must be non-empty",
+ * which — thrown inside the speculative-compression drain — halts ALL
+ * compression. Non-text blocks (tool_use/tool_result/image) pass through
+ * unchanged, so tool pairing is preserved; callers drop any message left with
+ * an empty content array.
+ */
+function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+  return content.filter((b) => {
+    if (b.type !== 'text') return true;
+    const text = (b as { text?: unknown }).text;
+    return typeof text === 'string' && text.trim().length > 0;
+  });
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -1699,7 +1715,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural one carried by the conversation itself. Anchoring
     // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
-      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
+      // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
+      // message left with no content. An empty-content turn (e.g. a silent/skip
+      // turn that produced no text) otherwise reaches the API as an empty text
+      // block → 400 "text content blocks must be non-empty", which throws in the
+      // speculative drain and stalls ALL compression. (Twin of the empty-summary
+      // recall-header guard — together they cover every source of the 400.)
+      messages: cleaned
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .filter(m => m.content.length > 0),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         // Generous output ceiling so a memory-write is never truncated mid-thought:
@@ -2176,7 +2200,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (present at the start of llmMessages above) and by the prior
     // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
-      messages: cleaned.map(m => ({ participant: m.participant, content: m.content })),
+      // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
+      // message left with no content. An empty-content turn (e.g. a silent/skip
+      // turn that produced no text) otherwise reaches the API as an empty text
+      // block → 400 "text content blocks must be non-empty", which throws in the
+      // speculative drain and stalls ALL compression. (Twin of the empty-summary
+      // recall-header guard — together they cover every source of the 400.)
+      messages: cleaned
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .filter(m => m.content.length > 0),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
         // Generous output ceiling so a memory-write is never truncated mid-thought:
