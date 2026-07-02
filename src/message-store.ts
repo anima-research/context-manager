@@ -551,8 +551,16 @@ export class MessageStore {
     // session, each full `getStateJson` materialization cost ~15ms, and
     // per-entry get() loops turned renders into minutes (observed on
     // Lena, 2026-07-02, /debug/context at 51–108s).
-    const item = this.store.getStateItemJson(this.stateId, index);
-    return (item as StoredMessageInternal | null) ?? null;
+    //
+    // Feature-detect: getStateItemJson landed in chronicle 0.2.2; boxes
+    // still on <= 0.2.1 (npm copies) fall back to the full-materialization
+    // path so a routine `git pull` of this package can never crash them.
+    if (typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function') {
+      const item = this.store.getStateItemJson(this.stateId, index);
+      return (item as StoredMessageInternal | null) ?? null;
+    }
+    const all = this.getAllInternal();
+    return all[index] ?? null;
   }
 
   private internalToStored(

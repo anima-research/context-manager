@@ -326,8 +326,16 @@ export class ContextLog {
     // Point lookup through chronicle's per-item cache — O(item size).
     // See MessageStore.getInternal for why this must never fetch the
     // full state per index.
-    const item = this.store.getStateItemJson(this.stateId, index);
-    return (item as ContextEntryInternal | null) ?? null;
+    //
+    // Feature-detect: getStateItemJson landed in chronicle 0.2.2; boxes
+    // still on <= 0.2.1 (npm copies) fall back to the full-materialization
+    // path so a routine `git pull` of this package can never crash them.
+    if (typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function') {
+      const item = this.store.getStateItemJson(this.stateId, index);
+      return (item as ContextEntryInternal | null) ?? null;
+    }
+    const all = this.getAllInternal();
+    return all[index] ?? null;
   }
 
   private internalToEntry(internal: ContextEntryInternal): ContextEntry {
