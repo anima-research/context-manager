@@ -559,9 +559,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Drop empty-content summaries (bugged/empty generations from before the
     // production guards). Recalling or merging one yields an empty text block →
     // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
-    this.summaries = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
-    const droppedEmpty = loaded.length - this.summaries.length;
+    const nonEmpty = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
+    const droppedEmpty = loaded.length - nonEmpty.length;
     if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
+    // Dedupe by id, keeping the copy with mergedInto set (position of first
+    // occurrence preserved). Duplicate-id copies with diverging merge state
+    // exist in stores touched by the pre-fix setMergedInto index-desync bug;
+    // without dedupe, the plain copy stays on the unmerged frontier and its
+    // content renders twice (once itself, once via its parent's merge).
+    const byId = new Map<string, SummaryEntry>();
+    for (const s of nonEmpty) {
+      const prev = byId.get(s.id);
+      if (!prev) byId.set(s.id, s);
+      else if (!prev.mergedInto && s.mergedInto) byId.set(s.id, s);
+    }
+    const dupes = nonEmpty.length - byId.size;
+    if (dupes > 0) console.warn(`[autobiographical] deduped ${dupes} duplicate summary id(s) on load`);
+    this.summaries = [...byId.values()];
 
     const counter = this.store.getStateJson(this.counterStateId);
     this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
@@ -884,13 +898,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
     entry.mergedInto = mergedIntoId;
     if (!this.store) return;
-    const index = this.summaries.indexOf(entry);
-    if (index < 0) return;
-    this.store.editStateItem(
-      this.summariesStateId,
-      index,
-      Buffer.from(JSON.stringify(entry)),
-    );
+    // Resolve the log position by ID against the PERSISTED array — never by
+    // in-memory index. `loadPersistedState` filters empty-content summaries
+    // out of `this.summaries` while they remain in the log, so after a reload
+    // the in-memory index is shifted relative to the log slot. Editing by
+    // in-memory index wrote merge-updates onto NEIGHBORING entries, silently
+    // clobbering them (4 summaries lost in the 2026-07 Lena incident, leaving
+    // duplicate-id copies with diverging mergedInto). Update every stored
+    // copy with this id so past duplicates converge too.
+    const stored = this.store.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) return;
+    let found = false;
+    const payload = Buffer.from(JSON.stringify(entry));
+    for (let i = 0; i < stored.length; i++) {
+      const item = stored[i] as SummaryEntry | null;
+      if (item && item.id === entry.id) {
+        this.store.editStateItem(this.summariesStateId, i, payload);
+        found = true;
+      }
+    }
+    if (!found) {
+      console.warn(
+        `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
+      );
+    }
   }
 
   /**
