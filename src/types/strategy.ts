@@ -388,6 +388,20 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * Minimum substantive text (non-whitespace chars across a chunk's
+   * messages) below which L1 compression skips the LLM call and stores a
+   * mechanical stub summary instead (default: 200).
+   *
+   * A chunk of silent/skip turns and bare system traffic gives the
+   * summarizer nothing to remember; asked anyway, it confabulates —
+   * it reaches for the nearest salient content (head window, prior
+   * recall pairs) and narrates it as if it just happened (the
+   * "68 initiations" incident). Chunks containing any non-text blocks
+   * (tool cycles, images) are never stubbed. Set to 0 to disable.
+   */
+  minChunkCharsForLLM?: number;
+
+  /**
    * When true (default), each selected summary emits as its own positioned
    * Q/A recall pair, sorted chronologically by source range. When false,
    * all selected summaries are concatenated into one Q/A pair between head

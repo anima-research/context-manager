@@ -87,7 +87,12 @@ function formatInstruction(targetTokens: number): string {
     'Preserve concrete details — file paths, exact values, decisions, ' +
     `unresolved questions, the user\'s active asks. Target ~${targetTokens} ` +
     'tokens. Output only the memory body — no preamble, no section headers ' +
-    'unless they help preservation, no meta-commentary about summarizing.'
+    'unless they help preservation, no meta-commentary about summarizing. ' +
+    'Memorize only what actually happened in that slice: if it holds little ' +
+    'beyond routine system traffic (heartbeats, empty turns, failure ' +
+    'notices), a short memory saying so is correct — do not pad it by ' +
+    're-narrating events you already remember from earlier as if they had ' +
+    'just happened again.'
   );
 }
 
@@ -1533,27 +1538,122 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
+    // ---- 0. Thin-chunk guard ----
+    // A chunk of silent/skip turns and bare system traffic gives the
+    // summarizer nothing to remember. Asked anyway, it confabulates: it
+    // reaches for the nearest salient content (head window, prior recall
+    // pairs) and narrates it as if it just happened — each such L1 then
+    // compounds through merges (the "68 initiations" incident). Store a
+    // mechanical stub without an LLM call instead. Chunks with any
+    // non-text blocks (tool cycles, images) are never stubbed.
+    const minChunkChars = this.config.minChunkCharsForLLM ?? 200;
+    if (minChunkChars > 0) {
+      let substantiveChars = 0;
+      let hasNonText = false;
+      for (const m of chunk.messages) {
+        for (const b of m.content) {
+          if (b.type === 'text') substantiveChars += b.text.trim().length;
+          else hasNonText = true;
+        }
+      }
+      if (!hasNonText && substantiveChars < minChunkChars) {
+        const messageIds = chunk.messages.map(m => m.id);
+        const stub: SummaryEntry = {
+          id: `L1-${this.nextSummaryIdCounter()}`,
+          level: 1,
+          content:
+            `(A quiet stretch: ${chunk.messages.length} messages of routine ` +
+            `system traffic — heartbeats, empty turns, notices. Nothing ` +
+            `happened worth remembering.)`,
+          tokens: 40,
+          sourceLevel: 0,
+          sourceIds: messageIds,
+          sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
+          created: Date.now(),
+          phaseType: chunk.phaseType,
+        };
+        this.pushSummary(stub);
+        chunk.compressed = true;
+        chunk.summaryId = stub.id;
+        this._compressionCount++;
+        logCompressionCall({
+          operation: 'compress_l1',
+          system: null,
+          messages: [],
+          metadata: {
+            stub: true,
+            chunk_message_ids: messageIds,
+            chunk_size: chunk.messages.length,
+            substantive_chars: substantiveChars,
+            min_chunk_chars: minChunkChars,
+            summary_id: stub.id,
+          },
+          response: stub.content,
+        });
+        this.checkMergeThreshold();
+        return;
+      }
+    }
+
     // Build the KV-preserving prompt per hermes-autobio spec:
     //
-    //   1. Prior summaries — narrativized as CM-asks / agent-recalls
+    //   1. Head — the raw chronicle opening (identity anchor), FIRST,
+    //      exactly where the original instance saw it. It MUST precede
+    //      the recall pairs: when it followed them (pre-2026-07 order),
+    //      it read as the most recent live conversation, and for thin
+    //      chunks the summarizer narrated the head as fresh events
+    //      ("Antra came to me to explore the transformation story
+    //      again…"), compounding across merges into runaway false
+    //      memories (the "68 initiations" incident). Chronological
+    //      order is also the KV-stable order — the head never changes.
+    //      (executeMerge always had head-first; this site was the odd
+    //      one out.)
+    //   2. Prior summaries — narrativized as CM-asks / agent-recalls
     //      pairs, in source order. The unmerged frontier of the
     //      summary forest: any summary that has not yet been merged
     //      into a higher level. After merges run, the L_{k+1} replaces
     //      its L_k children — using the children plus their parent
     //      doubles the prompt size unboundedly.
-    //   2. Head — raw messages before the chunk that aren't already
-    //      represented by a prior summary.
-    //   3. Marker — in-band signal that a memory is about to form.
-    //   4. Chunk — raw messages being compressed, as the agent
+    //   3. Raw middle — messages between head and chunk not covered by
+    //      any summary (usually empty).
+    //   4. Marker — in-band signal that a memory is about to form.
+    //   5. Chunk — raw messages being compressed, as the agent
     //      experienced them.
-    //   5. Instruction — doc-aware if the chunk is part of a bodyGroup.
+    //   6. Instruction — doc-aware if the chunk is part of a bodyGroup.
     //
     // There is intentionally NO tail_after_chunk: that would leak
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // ---- 1. Prior recall pairs ----
+    // ---- 1. Head window (raw, ALWAYS present, FIRST) ----
+    //
+    // The head is the foundational identity anchor: the actual opening
+    // of the chronicle (the user's first message, the agent's first
+    // reply, the system context if any). It establishes WHO is speaking
+    // to WHOM. Without it, when the chunk content is heavily first-person
+    // from someone other than the agent (e.g., a user-shared document),
+    // the agent loses its first-person grounding and drifts into the
+    // content author's voice.
+    //
+    // The head is the configured head window — not "everything before
+    // the chunk." For doc-heavy chronicles, "everything before" would
+    // be hundreds of thousands of tokens; the recall pairs below
+    // represent that intermediate content. The head is just the
+    // permanent prefix that the original instance always saw.
+    //
+    // Head messages are excluded from compression by `getCompressibleMessages`
+    // (they're outside the chunking range), so they won't appear in
+    // any L1's sourceIds — no overlap with the recall pairs below.
+    const allMessages = ctx.messageStore.getAll();
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      llmMessages.push({ participant: m.participant, content: m.content });
+    }
+
+    // ---- 2. Prior recall pairs ----
     // Filter to the unmerged frontier: any summary whose `mergedInto`
     // is unset. After merge, the children's mergedInto points at the
     // parent and the parent stands alone with that source range. The
@@ -1603,33 +1703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // ---- 2. Head window (raw, ALWAYS present) ----
-    //
-    // The head is the foundational identity anchor: the actual opening
-    // of the chronicle (the user's first message, the agent's first
-    // reply, the system context if any). It establishes WHO is speaking
-    // to WHOM. Without it, when the chunk content is heavily first-person
-    // from someone other than the agent (e.g., a user-shared document),
-    // the agent loses its first-person grounding and drifts into the
-    // content author's voice.
-    //
-    // The head is the configured head window — not "everything before
-    // the chunk." For doc-heavy chronicles, "everything before" would
-    // be hundreds of thousands of tokens; the recall pairs already
-    // represent that intermediate content. The head is just the
-    // permanent prefix that the original instance always saw.
-    //
-    // Head messages are excluded from compression by `getCompressibleMessages`
-    // (they're outside the chunking range), so they won't appear in
-    // any L1's sourceIds — no overlap with the recall pairs above.
-    const allMessages = ctx.messageStore.getAll();
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
-      const m = allMessages[i];
-      llmMessages.push({ participant: m.participant, content: m.content });
-    }
-
+    // ---- 3. Raw middle ----
     // Any raw messages between the head and the chunk that aren't yet
     // represented by any summary — usually empty in adaptive-resolution
     // mode, since chunking proceeds contiguously and summaries cover
@@ -1661,18 +1735,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // ---- 3. In-band marker ----
+    // ---- 4. In-band marker ----
     llmMessages.push({
       participant: 'Context Manager',
       content: [{ type: 'text', text: COMPRESSION_MARKER }],
     });
 
-    // ---- 4. Chunk messages raw ----
+    // ---- 5. Chunk messages raw ----
     for (const m of chunk.messages) {
       llmMessages.push({ participant: m.participant, content: m.content });
     }
 
-    // ---- 5. Instruction (reading-mode aware) ----
+    // ---- 6. Instruction (reading-mode aware) ----
     //
     // When the chunk is a portion of a substantially larger sharded message
     // (≥ 2× chunk size), use the reading-mode instruction. It avoids the
@@ -2832,12 +2906,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     if (entries.length === 0) return entries;
 
-    // Look up bodyGroupId by sourceMessageId via the message store.
-    const groupOf = (sourceMessageId?: string): string | undefined => {
+    // Look up bodyGroup metadata by sourceMessageId, memoized for the
+    // duration of this pass. Entries reference the same messages repeatedly
+    // (run-extension checks + the shardIndex sort comparator below), and
+    // store.get() also resolves blobs — fetch each message at most once.
+    const shardMeta = new Map<string, { groupId?: string; shardIndex?: number }>();
+    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined => {
       if (!sourceMessageId) return undefined;
-      const m = store.get(sourceMessageId);
-      return m?.bodyGroupId;
+      let meta = shardMeta.get(sourceMessageId);
+      if (!meta) {
+        const m = store.get(sourceMessageId);
+        meta = { groupId: m?.bodyGroupId, shardIndex: m?.shardIndex };
+        shardMeta.set(sourceMessageId, meta);
+      }
+      return meta;
     };
+    const groupOf = (sourceMessageId?: string): string | undefined =>
+      metaOf(sourceMessageId)?.groupId;
 
     const out: ContextEntry[] = [];
     let i = 0;
@@ -2869,9 +2954,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // ordering. (Head/tail emission keeps chronological order, but defending
       // against reorderings is cheap.)
       const sortedRun = [...run].sort((a, b) => {
-        const ma = a.sourceMessageId ? store.get(a.sourceMessageId) : null;
-        const mb = b.sourceMessageId ? store.get(b.sourceMessageId) : null;
-        return (ma?.shardIndex ?? 0) - (mb?.shardIndex ?? 0);
+        const sa = metaOf(a.sourceMessageId)?.shardIndex ?? 0;
+        const sb = metaOf(b.sourceMessageId)?.shardIndex ?? 0;
+        return sa - sb;
       });
       // Build merged text content. Non-text blocks (rare in shards) are
       // preserved on the first shard's entry only.
