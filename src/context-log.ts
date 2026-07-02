@@ -323,8 +323,11 @@ export class ContextLog {
   }
 
   private getInternal(index: number): ContextEntryInternal | null {
-    const all = this.getAllInternal();
-    return all[index] ?? null;
+    // Point lookup through chronicle's per-item cache — O(item size).
+    // See MessageStore.getInternal for why this must never fetch the
+    // full state per index.
+    const item = this.store.getStateItemJson(this.stateId, index);
+    return (item as ContextEntryInternal | null) ?? null;
   }
 
   private internalToEntry(internal: ContextEntryInternal): ContextEntry {

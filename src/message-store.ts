@@ -546,8 +546,13 @@ export class MessageStore {
   }
 
   private getInternal(index: number): StoredMessageInternal | null {
-    const all = this.getAllInternal();
-    return all[index] ?? null;
+    // Point lookup through chronicle's per-item cache — O(item size).
+    // Never fetch the full state for a single index: with a 4.6k-message
+    // session, each full `getStateJson` materialization cost ~15ms, and
+    // per-entry get() loops turned renders into minutes (observed on
+    // Lena, 2026-07-02, /debug/context at 51–108s).
+    const item = this.store.getStateItemJson(this.stateId, index);
+    return (item as StoredMessageInternal | null) ?? null;
   }
 
   private internalToStored(
