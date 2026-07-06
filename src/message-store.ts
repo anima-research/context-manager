@@ -29,6 +29,39 @@ export type MessageStoreEvent =
 export type MessageStoreListener = (event: MessageStoreEvent) => void;
 
 /**
+ * Options for windowed message reads.
+ */
+export interface MessageWindowOptions {
+  /**
+   * Re-inline blob media (images/documents) into content blocks, matching
+   * the behavior of get()/getAll(). Default true. Viewers that only need
+   * text/thinking/tool blocks should pass false to avoid inflating large
+   * base64 payloads.
+   */
+  resolveBlobs?: boolean;
+  /**
+   * Extend the window edges outward so that no bodyGroup (shard run of a
+   * single large message) is split across the window boundary. Default
+   * false (exact offset/limit semantics).
+   */
+  alignToBodyGroups?: boolean;
+}
+
+/**
+ * A window of messages plus enough metadata to page through the store.
+ */
+export interface MessageWindow {
+  messages: StoredMessage[];
+  /**
+   * Actual first slot index of the returned window. May be lower than the
+   * requested offset when alignToBodyGroups extended the window backward.
+   */
+  startIndex: number;
+  /** Total number of messages in the store at read time. */
+  totalCount: number;
+}
+
+/**
  * Options for token estimation.
  */
 export interface TokenEstimatorOptions {
@@ -359,18 +392,71 @@ export class MessageStore {
   }
 
   /**
+   * Get a window of messages by slot index — O(window), not O(all).
+   *
+   * Backed by chronicle's `getStateSlice` (0.2.2+) with a
+   * full-materialization fallback for older chronicle copies, mirroring
+   * the feature-detect in getInternal().
+   */
+  getWindow(offset: number, limit: number, opts: MessageWindowOptions = {}): MessageWindow {
+    const totalCount = this.length();
+    let start = Math.max(0, Math.min(offset, totalCount));
+    let end = Math.min(start + Math.max(0, limit), totalCount);
+
+    if (start >= end) {
+      return { messages: [], startIndex: Math.min(start, totalCount), totalCount };
+    }
+
+    if (opts.alignToBodyGroups) {
+      // Shards of a bodyGroup are contiguous by construction (removeRange
+      // refuses to bisect a group). Walk edges outward with O(item) point
+      // lookups until the group boundary.
+      const first = this.getInternal(start);
+      if (first?.bodyGroupId !== undefined) {
+        while (start > 0) {
+          const prev = this.getInternal(start - 1);
+          if (prev?.bodyGroupId !== first.bodyGroupId) break;
+          start--;
+        }
+      }
+      const last = this.getInternal(end - 1);
+      if (last?.bodyGroupId !== undefined) {
+        while (end < totalCount) {
+          const next = this.getInternal(end);
+          if (next?.bodyGroupId !== last.bodyGroupId) break;
+          end++;
+        }
+      }
+    }
+
+    const internals = this.getSliceInternal(start, end - start);
+    const resolveBlobs = opts.resolveBlobs !== false;
+    return {
+      messages: internals.map((internal, i) =>
+        this.internalToStored(internal, internal.id, start + i, resolveBlobs)
+      ),
+      startIndex: start,
+      totalCount,
+    };
+  }
+
+  /**
    * Get messages from a specific index.
+   * Negative indices count from the end, matching Array.prototype.slice.
    */
   getFrom(index: number): StoredMessage[] {
-    return this.getAll().slice(index);
+    const len = this.length();
+    const start = index < 0 ? Math.max(0, len + index) : Math.min(index, len);
+    return this.getWindow(start, len - start).messages;
   }
 
   /**
    * Get the last N messages.
    */
   getTail(count: number): StoredMessage[] {
-    const all = this.getAll();
-    return all.slice(Math.max(0, all.length - count));
+    const len = this.length();
+    const n = Math.max(0, Math.min(count, len));
+    return this.getWindow(len - n, n).messages;
   }
 
   /**
@@ -545,6 +631,21 @@ export class MessageStore {
     return state as StoredMessageInternal[];
   }
 
+  private getSliceInternal(offset: number, limit: number): StoredMessageInternal[] {
+    // Windowed read — O(window) JSON conversion instead of materializing
+    // the entire state slot. getStateSlice landed in chronicle 0.2.2 and
+    // returns the window as a JSON-array Buffer; feature-detect so boxes
+    // on <= 0.2.1 fall back to full materialization (same pattern as
+    // getInternal below).
+    const s = this.store as { getStateSlice?: (id: string, offset: number, limit: number) => Buffer | null };
+    if (typeof s.getStateSlice === 'function') {
+      const buf = s.getStateSlice(this.stateId, offset, limit);
+      if (!buf) return [];
+      return JSON.parse(buf.toString('utf-8')) as StoredMessageInternal[];
+    }
+    return this.getAllInternal().slice(offset, offset + limit);
+  }
+
   private getInternal(index: number): StoredMessageInternal | null {
     // Point lookup through chronicle's per-item cache — O(item size).
     // Never fetch the full state for a single index: with a 4.6k-message
@@ -567,6 +668,7 @@ export class MessageStore {
     internal: StoredMessageInternal,
     id: MessageId,
     _index: number,
+    resolveBlobs: boolean = true,
   ): StoredMessage {
     const stored: StoredMessage = {
       id,
@@ -583,7 +685,12 @@ export class MessageStore {
       // so /undo of a 800-message conversation forked ~400 messages back.
       sequence: internal.sequence,
       participant: internal.participant,
-      content: this.blobManager.resolveBlobs(internal.content),
+      // When resolveBlobs is false, blob_ref placeholder blocks are passed
+      // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
+      // ContentBlock for viewer purposes).
+      content: resolveBlobs
+        ? this.blobManager.resolveBlobs(internal.content)
+        : (internal.content as unknown as ContentBlock[]),
       metadata: internal.metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,

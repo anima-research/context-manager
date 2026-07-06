@@ -7,7 +7,8 @@ export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-cha
 
 // Storage
 export { MessageStore } from './message-store.js';
-export type { MessageStoreEvent, MessageStoreListener } from './message-store.js';
+export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
+export { concatBodyGroups } from './adaptive/render.js';
 export { ContextLog } from './context-log.js';
 export { BlobManager } from './blob-manager.js';
 

@@ -23,7 +23,7 @@ import type {
 } from './types/index.js';
 import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy, isRenderStatsCapable } from './types/index.js';
 import type { RenderStats } from './types/index.js';
-import { MessageStore, MessageStoreEvent } from './message-store.js';
+import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -299,6 +299,31 @@ export class ContextManager {
    */
   getAllMessages(): StoredMessage[] {
     return this.messageStore.getAll();
+  }
+
+  /**
+   * Get the total number of messages — O(1).
+   */
+  getMessageCount(): number {
+    return this.messageStore.length();
+  }
+
+  /**
+   * Get a window of messages by slot index — O(window), not O(all).
+   * See MessageStore.getWindow for options (blob resolution, bodyGroup
+   * alignment). Intended for viewers/paginated UIs.
+   */
+  getMessageWindow(offset: number, limit: number, opts?: MessageWindowOptions): MessageWindow {
+    return this.messageStore.getWindow(offset, limit, opts);
+  }
+
+  /**
+   * Subscribe to message-store mutations (add/edit/remove/removeRange).
+   * Returns a detacher. Unlike trace events, this fires for ALL stored
+   * messages including assistant turns and tool results.
+   */
+  onMessage(listener: MessageStoreListener): () => void {
+    return this.messageStore.addListener(listener);
   }
 
   /**
