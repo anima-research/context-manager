@@ -154,4 +154,101 @@ describe('Anti-redundancy vs budget cap (memory-hole repair)', () => {
 
     await manager.close();
   });
+
+  it('bounds coverage repairs by a per-level allowance and warns on a corrupted store', async () => {
+    cleanup();
+    const strategy = new KnowledgeStrategy({
+      targetChunkTokens: 20,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      l1BudgetTokens: 1000,
+      l2BudgetTokens: 0, // zero level budget → repair falls back to the floor
+      l3BudgetTokens: 0,
+      researchL1BudgetCap: 0.3, // drops most L1s → every covering L2 is a repair candidate
+    });
+
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    for (let k = 0; k < 10; k++) {
+      manager.addMessage('Claude', [
+        { type: 'tool_use', id: `tu-${k}`, name: 'mcpl:search', input: { q: 'x'.repeat(120) } },
+      ] as ContentBlock[]);
+      manager.addMessage('User', [
+        { type: 'tool_result', toolUseId: `tu-${k}`, content: 'r'.repeat(120) },
+      ] as ContentBlock[]);
+    }
+
+    const s = strategy as unknown as {
+      chunks: Array<{ messages: Array<{ id: string }> }>;
+      summaries: SummaryEntry[];
+      rebuildChunks: (store: unknown) => void;
+    };
+    const internals = manager as unknown as {
+      messageStore: { createView(): unknown };
+      contextLog: { createView(): unknown };
+    };
+    s.rebuildChunks(internals.messageStore);
+
+    const l1Ids: string[] = [];
+    const allMsgIds: string[] = [];
+    s.chunks.forEach((chunk, i) => {
+      const msgIds = chunk.messages.map(m => m.id);
+      allMsgIds.push(...msgIds);
+      const id = `L1-${i}`;
+      l1Ids.push(id);
+      s.summaries.push({
+        id, level: 1, content: `[[R${i}]] research memory ${i}`, tokens: 100,
+        sourceLevel: 0, sourceIds: msgIds,
+        sourceRange: { first: msgIds[0], last: msgIds[msgIds.length - 1] },
+        created: Date.now(), phaseType: 'research',
+      });
+    });
+
+    // Simulate a store damaged mid-merge: MANY excluded L2s, each covering all
+    // L1s (so each is individually a repair candidate once the cap drops L1s).
+    const L2_COUNT = 6;
+    for (let j = 0; j < L2_COUNT; j++) {
+      s.summaries.push({
+        id: `L2-${j}`, level: 2, content: `[[L2-${j}]] consolidated research ${j}`, tokens: 150,
+        sourceLevel: 1, sourceIds: l1Ids,
+        sourceRange: { first: allMsgIds[0], last: allMsgIds[allMsgIds.length - 1] },
+        created: Date.now(),
+      });
+    }
+
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    let entries: ContextEntry[];
+    try {
+      // Small overall budget → floor allowance (0.05 * maxTokens) is small, so
+      // only a couple of the six covering L2s can be re-included.
+      entries = strategy.select(
+        internals.messageStore.createView() as never,
+        internals.contextLog.createView() as never,
+        { maxTokens: 8000, reserveForResponse: 0 },
+      ) as ContextEntry[];
+    } finally {
+      console.warn = origWarn;
+    }
+
+    const renderedText = entries
+      .map(e => e.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n'))
+      .join('\n');
+    const l2ShownCount = Array.from({ length: L2_COUNT }, (_, j) => j)
+      .filter(j => renderedText.includes(`[[L2-${j}]]`)).length;
+
+    assert.ok(l2ShownCount >= 1, 'at least one covering L2 should still be repaired');
+    assert.ok(l2ShownCount < L2_COUNT, `repair allowance must cap re-inclusion, but all ${L2_COUNT} L2s rendered`);
+    assert.ok(
+      warnings.some(w => w.includes('coverage-repair allowance exceeded')),
+      'a corrupted store exceeding the repair allowance must warn',
+    );
+
+    await manager.close();
+  });
 });

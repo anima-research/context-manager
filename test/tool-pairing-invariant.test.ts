@@ -12,11 +12,13 @@
  * (stub tool_result) over dropping content.
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { AutobiographicalStrategy } from '../src/index.js';
+import { rmSync, existsSync } from 'node:fs';
+import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextEntry } from '../src/types/index.js';
+import type { MessageStoreView } from '../src/types/index.js';
 
 // ---------------------------------------------------------------------------
 // Invariant checker (mirrors the Anthropic API's structural rules)
@@ -152,6 +154,17 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
     ];
     runEnforce(entries);
     assertPaired(entries);
+    // Look-ahead relocation: the REAL result payload must be preserved, not
+    // dropped in favour of a stub (roast finding #2).
+    const preserved = entries.some((e) =>
+      e.content.some(
+        (b) =>
+          b.type === 'tool_result' &&
+          (b as { toolUseId: string }).toolUseId === 'A' &&
+          (b as { content: unknown }).content === 'the real result, now orphaned',
+      ),
+    );
+    assert.ok(preserved, 'the genuine tool result must be relocated, not replaced by a stub');
   });
 
   it('handles consecutive tool_use entries (double budget cut)', () => {
@@ -200,5 +213,81 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
     for (let i = 0; i < entries.length; i++) {
       assert.strictEqual(entries[i].index, i, `entry ${i} has stale index ${entries[i].index}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: the guard must run on the ADAPTIVE render path too. FKM defaults
+// autobiographical strategies onto `selectAdaptive` (adaptiveResolution=true),
+// which has the same mid-list orphan producers as the hierarchical path but
+// only received `trimOrphanedToolUse` before this fix. See roast finding #1.
+// ---------------------------------------------------------------------------
+
+describe('enforceToolPairing — wired into the adaptive render path (FKM default)', () => {
+  const STORE = './test-tool-pairing-adaptive';
+  const clean = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
+  before(clean);
+  after(clean);
+
+  it('repairs a mid-list orphan produced on the adaptive path', async () => {
+    clean();
+
+    // Inject a mid-list orphan tool_use into the merged entries at the exact
+    // point `selectAdaptive` hands off to the final structural passes — the
+    // shape a budget break or recall-pair interleave produces. It is spliced
+    // NOT at the tail, so `trimOrphanedToolUse` (trailing-only) cannot remove
+    // it; only `enforceToolPairing` can. If the guard is not wired into
+    // `selectAdaptive`, the orphan survives and `assertPaired` fails.
+    class InjectingStrategy extends AutobiographicalStrategy {
+      protected mergeAdjacentBodyGroupRaw(
+        entries: ContextEntry[],
+        store: MessageStoreView,
+      ): ContextEntry[] {
+        const merged = super.mergeAdjacentBodyGroupRaw(entries, store);
+        if (merged.length >= 2) {
+          merged.splice(1, 0, {
+            index: 1,
+            participant: 'Claude',
+            content: [use('MIDLIST_ORPHAN')],
+          });
+          merged.forEach((e, i) => { e.index = i; });
+        }
+        return merged;
+      }
+    }
+
+    const strategy = new InjectingStrategy({ adaptiveResolution: true });
+    const manager = await ContextManager.open({
+      path: STORE,
+      strategy,
+      membrane: { complete: async () => ({ content: [{ type: 'text', text: 's' }] }) } as never,
+    });
+
+    for (let i = 0; i < 5; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [
+        { type: 'text', text: `message number ${i}` },
+      ]);
+    }
+
+    const internals = manager as unknown as {
+      messageStore: { createView(): MessageStoreView };
+      contextLog: { createView(): unknown };
+    };
+    const entries = strategy.select(
+      internals.messageStore.createView(),
+      internals.contextLog.createView() as never,
+      { maxTokens: 100000, reserveForResponse: 4000 },
+    );
+
+    // Sanity: the override ran and the injected use was not trimmed as a tail.
+    const orphanPreserved = entries.some(e =>
+      e.content.some(b => b.type === 'tool_use' && (b as { id: string }).id === 'MIDLIST_ORPHAN'),
+    );
+    assert.ok(orphanPreserved, 'setup: injected mid-list tool_use should survive to the pairing pass');
+
+    // The guard must have stubbed the orphan — output is API-valid.
+    assertPaired(entries);
+
+    await manager.close();
   });
 });
