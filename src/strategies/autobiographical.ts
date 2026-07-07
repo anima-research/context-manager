@@ -236,6 +236,36 @@ export interface Chunk {
   summaryId?: string;
   /** Phase type tag (set by KnowledgeStrategy for semantic chunking) */
   phaseType?: string;
+  /** ID of the persisted ChunkRecord backing this chunk (chunk persistence). */
+  recordId?: string;
+}
+
+/**
+ * Persisted chunk boundary, one per CLOSED chunk, stored in the
+ * `autobio:chunks` chronicle state slot (append_log, branch-aware).
+ *
+ * Records OWN the past: once a chunk closes, its membership is a persisted
+ * fact — rebuilds and restarts materialize chunks from records instead of
+ * recomputing boundaries from the running token sum. This is the fix for the
+ * 2026-07 re-consolidation storms: boundary inputs (config knobs, head
+ * window, token estimates, message mutations) could shift across restarts,
+ * the old exact-sourceIds-match recovery then failed, and whole stretches of
+ * already-summarized history were re-compressed into duplicate L1s.
+ *
+ * Membership is by message ID (never index), so edits/redactions degrade a
+ * record gracefully instead of re-keying its neighbors.
+ */
+export interface ChunkRecord {
+  /** Stable record id ("c-<n>"). */
+  id: string;
+  /** Exact message IDs of the closed chunk, in order. */
+  sourceIds: string[];
+  /** Whether the chunk's L1 summary has been produced. */
+  compressed: boolean;
+  /** ID of the L1 SummaryEntry, once compressed. */
+  summaryId?: string;
+  /** Phase type tag (KnowledgeStrategy semantic chunking). */
+  phaseType?: string;
 }
 
 /**
@@ -318,6 +348,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected _drainProgress = 0;
 
+  /**
+   * In-memory mirror of the persisted chunk records (autobio:chunks slot).
+   * Loaded in `loadPersistedState`, appended to when a chunk closes,
+   * updated by ID when its L1 lands.
+   */
+  protected chunkRecords: ChunkRecord[] = [];
+  protected chunkIdCounter = 0;
+  /**
+   * Fail-closed latch: set when most persisted records resolve to zero live
+   * messages (the messages-chain-break signature). While set, NO compression
+   * runs — duplicate memories are strictly worse than delayed compression.
+   */
+  protected chunkRecordsOrphaned = false;
+  private _orphanWarned = false;
+  /** Record ids whose compression was refused by the L1 overlap guard. */
+  private _overlapBlocked = new Set<string>();
+
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
@@ -334,6 +381,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Namespace for state-id scoping. Set in `initialize()`. */
   protected ns: string = '';
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
+  protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
@@ -486,7 +534,108 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         break;
       }
     }
+    // Legacy stores (pre chunk-persistence) have L1 summaries but no chunk
+    // records — synthesize records from L1 sourceIds before the first
+    // rebuild, so covered ground is owned and never re-compressed.
+    this.migrateChunkRecords(ctx.messageStore);
     this.rebuildChunks(ctx.messageStore);
+  }
+
+  /**
+   * Whether chunk boundaries are persisted to the `autobio:chunks` slot and
+   * own the past. Subclasses with their own chunking (KnowledgeStrategy's
+   * semantic phases) opt out and keep the legacy recompute-every-rebuild
+   * behavior.
+   */
+  protected get chunkPersistenceEnabled(): boolean {
+    return true;
+  }
+
+  /**
+   * One-time lazy migration: a store with L1 summaries but an empty chunks
+   * slot predates chunk persistence. Each L1's sourceIds ARE the historical
+   * chunk boundary — synthesize a compressed record per L1, in message
+   * order. Stale generations from the old partial-tail compression bug
+   * (an L1 whose messages are ALL already covered by records synthesized so
+   * far — prefix families, same-range duplicates) get NO record; coverage is
+   * what blocks re-compression, and the repair tooling prunes their content
+   * separately.
+   */
+  protected migrateChunkRecords(store: MessageStoreView): void {
+    if (!this.chunkPersistenceEnabled || !this.store) return;
+    if (this.chunkRecords.length > 0) return;
+    const l1s = this.summaries.filter(s => s.level === 1 && Array.isArray(s.sourceIds) && s.sourceIds.length > 0);
+    if (l1s.length === 0) return;
+
+    const msgIndex = new Map<string, number>();
+    store.getAll().forEach((m, i) => msgIndex.set(m.id, i));
+
+    // Sort by (start position asc, span length desc) so at each starting
+    // point the LONGEST generation claims the ground first.
+    const sorted = [...l1s].sort((a, b) => {
+      const sa = msgIndex.get(a.sourceIds[0]) ?? Number.MAX_SAFE_INTEGER;
+      const sb = msgIndex.get(b.sourceIds[0]) ?? Number.MAX_SAFE_INTEGER;
+      return sa - sb || b.sourceIds.length - a.sourceIds.length;
+    });
+
+    const covered = new Set<string>();
+    let skippedStale = 0;
+    let skippedGhost = 0;
+    for (const s of sorted) {
+      // An L1 none of whose messages exist anymore can't own live ground.
+      if (!s.sourceIds.some(id => msgIndex.has(id))) { skippedGhost++; continue; }
+      // Fully-covered = stale generation / contained duplicate.
+      if (s.sourceIds.every(id => covered.has(id))) { skippedStale++; continue; }
+      for (const id of s.sourceIds) covered.add(id);
+      this.appendChunkRecord({
+        id: `c-${this.chunkIdCounter++}`,
+        sourceIds: [...s.sourceIds],
+        compressed: true,
+        summaryId: s.id,
+        ...(s.phaseType ? { phaseType: s.phaseType } : {}),
+      });
+    }
+    console.warn(
+      `[autobiographical] chunk-persistence migration: ${l1s.length} L1s → ` +
+      `${this.chunkRecords.length} records (${skippedStale} stale generations, ` +
+      `${skippedGhost} fully-orphaned L1s skipped)`,
+    );
+  }
+
+  /** Append a record to the chunks slot + in-memory mirror. */
+  protected appendChunkRecord(record: ChunkRecord): void {
+    this.chunkRecords.push(record);
+    this.store?.appendToStateJson(this.chunksStateId, record);
+  }
+
+  /**
+   * Mark a chunk's record compressed, linking its L1. Resolves the log slot
+   * by ID against the persisted array — never by in-memory index (see
+   * setMergedInto for the clobber this avoids).
+   */
+  protected markChunkRecordCompressed(recordId: string | undefined, summaryId: string): void {
+    if (!this.chunkPersistenceEnabled || !recordId) return;
+    const rec = this.chunkRecords.find(r => r.id === recordId);
+    if (!rec) return;
+    rec.compressed = true;
+    rec.summaryId = summaryId;
+    if (!this.store) return;
+    const stored = this.store.getStateJson(this.chunksStateId);
+    if (!Array.isArray(stored)) return;
+    const payload = Buffer.from(JSON.stringify(rec));
+    let found = false;
+    for (let i = 0; i < stored.length; i++) {
+      const item = stored[i] as ChunkRecord | null;
+      if (item && item.id === recordId) {
+        this.store.editStateItem(this.chunksStateId, i, payload);
+        found = true;
+      }
+    }
+    if (!found) {
+      console.warn(
+        `[autobiographical] markChunkRecordCompressed: ${recordId} not found in persisted chunk log`,
+      );
+    }
   }
 
   /**
@@ -504,6 +653,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         fullSnapshotEvery: 10,
       });
     } catch { /* already registered */ }
+    if (this.chunkPersistenceEnabled) {
+      try {
+        this.store.registerState({
+          id: this.chunksStateId,
+          strategy: 'append_log',
+          deltaSnapshotEvery: 50,
+          fullSnapshotEvery: 10,
+        });
+      } catch { /* already registered */ }
+    }
     try {
       this.store.registerState({
         id: this.counterStateId,
@@ -552,7 +711,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.mergeQueue = [];
       this.pins = [];
       this.pinIdCounter = 0;
+      this.chunkRecords = [];
+      this.chunkIdCounter = 0;
       return;
+    }
+
+    if (this.chunkPersistenceEnabled) {
+      const records = this.store.getStateJson(this.chunksStateId);
+      this.chunkRecords = (Array.isArray(records) ? (records as ChunkRecord[]) : [])
+        .filter(r => r && typeof r.id === 'string' && Array.isArray(r.sourceIds) && r.sourceIds.length > 0);
+      this.chunkIdCounter = this.chunkRecords.reduce((max, r) => {
+        const n = Number(r.id.replace(/^c-/, ''));
+        return Number.isFinite(n) && n >= max ? n + 1 : max;
+      }, 0);
+      this.chunkRecordsOrphaned = false;
+      this._orphanWarned = false;
+      this._overlapBlocked.clear();
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
@@ -1566,6 +1740,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('No membrane instance for compression');
     }
 
+    // ---- Overlap guard (strict) ----
+    // With close-then-compress there is NO legitimate way for a chunk to
+    // overlap an existing L1's span. If it happens anyway (bookkeeping bug,
+    // store surgery gone wrong), refuse to produce: a warning in the log is
+    // strictly better than a duplicate memory in an agent's head.
+    const coveredByL1 = new Set<string>();
+    for (const s of this.summaries) {
+      if (s.level === 1 && Array.isArray(s.sourceIds)) {
+        for (const id of s.sourceIds) coveredByL1.add(id);
+      }
+    }
+    const overlapIds = chunk.messages.filter(m => coveredByL1.has(m.id)).map(m => m.id);
+    if (overlapIds.length > 0) {
+      const key = chunk.recordId ?? this.chunkKey(chunk);
+      if (!this._overlapBlocked.has(key)) {
+        this._overlapBlocked.add(key);
+        console.error(
+          `[autobiographical] OVERLAP GUARD: refusing to compress chunk ` +
+          `${chunk.recordId ?? `#${chunk.index}`} — ${overlapIds.length}/${chunk.messages.length} ` +
+          `of its messages are already covered by existing L1 summaries ` +
+          `(first: ${overlapIds[0]}). Duplicate-memory formation blocked; ` +
+          `investigate before resuming this span.`,
+        );
+      }
+      return;
+    }
+
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
@@ -1606,6 +1807,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.pushSummary(stub);
         chunk.compressed = true;
         chunk.summaryId = stub.id;
+        this.markChunkRecordCompressed(chunk.recordId, stub.id);
         this._compressionCount++;
         logCompressionCall({
           operation: 'compress_l1',
@@ -1884,6 +2086,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pushSummary(entry);
       chunk.compressed = true;
       chunk.summaryId = entry.id;
+      this.markChunkRecordCompressed(chunk.recordId, entry.id);
       this._compressionCount++;
       logSummaryId = entry.id;
 
@@ -3709,27 +3912,83 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Rebuild chunk boundaries based on current messages.
+   * Rebuild the chunk list: persisted records own the past; the running-sum
+   * chunker only extends at the frontier, and a chunk is only ever created
+   * once it CLOSES (reaches targetChunkTokens). The trailing partial chunk
+   * is never created and never compressed — eager partial-tail compression
+   * minted a new near-duplicate L1 per rebuild while the tail grew (the
+   * prefix-generation families found fleet-wide in the 2026-07 audit).
    */
   protected rebuildChunks(store: MessageStoreView): void {
-    const messagesToChunk = this.getCompressibleMessages(store);
-
-    // Preserve existing compressed chunks (legacy) and summary linkage (hierarchical)
-    const existingCompressed = new Map<string, Chunk>();
-    for (const chunk of this.chunks) {
-      if (chunk.compressed) {
-        const key = this.chunkKey(chunk);
-        existingCompressed.set(key, chunk);
-      }
-    }
-
-    // Rebuild chunks
     this.chunks = [];
     this.compressionQueue = [];
 
+    // ---- 1. Materialize persisted records (they OWN their messages). ----
+    const byId = new Map<string, StoredMessage>();
+    for (const m of store.getAll()) byId.set(m.id, m);
+
+    const consumed = new Set<string>();
+    let orphaned = 0;
+    for (const rec of this.chunkRecords) {
+      const msgs: StoredMessage[] = [];
+      for (const id of rec.sourceIds) {
+        const m = byId.get(id);
+        if (m) msgs.push(m);
+      }
+      if (msgs.length === 0) { orphaned++; continue; }
+      for (const m of msgs) consumed.add(m.id);
+      const chunk: Chunk = {
+        index: this.chunks.length,
+        startIndex: -1, // record-derived; filtered-array indices are not meaningful
+        endIndex: -1,
+        messages: msgs,
+        tokens: msgs.reduce((sum, m) => sum + (this.config.attachmentsIgnoreSize
+          ? this.estimateTextOnlyTokens(m)
+          : store.estimateTokens(m)), 0),
+        compressed: rec.compressed,
+        summaryId: rec.summaryId,
+        phaseType: rec.phaseType,
+        recordId: rec.id,
+      };
+      this.chunks.push(chunk);
+    }
+
+    // ---- 2. Fail closed on the chain-break signature. ----
+    // Most records resolving to zero live messages means message identity
+    // has been rebuilt/renumbered underneath us. Chunking "fresh" ground now
+    // would re-compress already-lived history into duplicate memories.
+    // Halt ALL compression until an operator reconciles the store.
+    if (this.chunkPersistenceEnabled && this.chunkRecords.length >= 3 &&
+        orphaned / this.chunkRecords.length > 0.5) {
+      this.chunkRecordsOrphaned = true;
+      this.compressionQueue = [];
+      if (!this._orphanWarned) {
+        this._orphanWarned = true;
+        console.error(
+          `[autobiographical] FAIL-CLOSED: ${orphaned}/${this.chunkRecords.length} chunk ` +
+          `records resolve to zero live messages (messages chain break / store ` +
+          `reconciliation signature). Compression halted to prevent duplicate ` +
+          `memory formation — reconcile the store before resuming.`,
+        );
+      }
+      return;
+    }
+    this.chunkRecordsOrphaned = false;
+
+    // Queue uncompressed record-backed chunks (crash-recovery: record was
+    // appended but the process died before its L1 landed).
+    for (const chunk of this.chunks) {
+      if (!chunk.compressed && !(chunk.recordId && this._overlapBlocked.has(chunk.recordId))) {
+        this.compressionQueue.push(chunk.index);
+      }
+    }
+
+    // ---- 3. Chunk the frontier: compressible messages not owned by any record. ----
+    const messagesToChunk = this.getCompressibleMessages(store)
+      .filter(m => !consumed.has(m.id));
+
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
-    // Track start position in the filtered array for chunk boundary metadata
     let chunkFilteredStart = 0;
 
     for (let i = 0; i < messagesToChunk.length; i++) {
@@ -3759,19 +4018,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
 
       if (shouldClose) {
-        const chunk = this.createChunk(
-          this.chunks.length,
-          chunkFilteredStart,
-          i + 1,
-          currentChunk,
-          currentTokens,
-          existingCompressed
-        );
-        this.chunks.push(chunk);
-
-        if (!chunk.compressed) {
-          this.compressionQueue.push(chunk.index);
+        const chunk: Chunk = {
+          index: this.chunks.length,
+          startIndex: chunkFilteredStart,
+          endIndex: i + 1,
+          messages: [...currentChunk],
+          tokens: currentTokens,
+          compressed: false,
+        };
+        // Persist the boundary the moment it closes — from here on this
+        // span is owned and never re-keyed by config drift or restarts.
+        if (this.chunkPersistenceEnabled) {
+          const record: ChunkRecord = {
+            id: `c-${this.chunkIdCounter++}`,
+            sourceIds: chunk.messages.map(m => m.id),
+            compressed: false,
+          };
+          this.appendChunkRecord(record);
+          chunk.recordId = record.id;
         }
+        this.chunks.push(chunk);
+        this.compressionQueue.push(chunk.index);
 
         currentChunk = [];
         currentTokens = 0;
@@ -3779,21 +4046,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    if (currentChunk.length >= 4) {
-      const chunk = this.createChunk(
-        this.chunks.length,
-        chunkFilteredStart,
-        messagesToChunk.length,
-        currentChunk,
-        currentTokens,
-        existingCompressed
-      );
-      this.chunks.push(chunk);
-
-      if (!chunk.compressed) {
-        this.compressionQueue.push(chunk.index);
-      }
-    }
+    // NOTE: no trailing-partial chunk. An unclosed chunk is not a chunk —
+    // it compresses only after the running sum closes it.
   }
 
   /**
