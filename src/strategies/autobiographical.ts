@@ -539,6 +539,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // rebuild, so covered ground is owned and never re-compressed.
     this.migrateChunkRecords(ctx.messageStore);
     this.rebuildChunks(ctx.messageStore);
+    // Kick the merge ladder for pre-existing unmerged summaries. Normally a
+    // compression/merge completion does this, but a store that boots with a
+    // backlog above threshold and an empty queue (e.g. after a pyramid
+    // repair pruned duplicates and un-merged survivors) would otherwise
+    // never start consolidating. Idempotent: already-queued/merged sources
+    // are skipped.
+    if (this.config.hierarchical && !this.chunkRecordsOrphaned) {
+      this.checkMergeThreshold();
+    }
   }
 
   /**
