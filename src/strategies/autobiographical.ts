@@ -1566,6 +1566,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('No membrane instance for compression');
     }
 
+    // ---- Stale-chunk dedup guard (bug 6.10) ----
+    // rebuildChunks (fired by onNewMessage / select) rebuilds `this.chunks`
+    // and resets `compressionQueue` while a slow compression may still be in
+    // flight against an OLD chunk object. The rebuilt chunk for the same
+    // messages is created BEFORE that compression's summary exists, so it is
+    // re-queued as uncompressed; when the in-flight call completes it marks
+    // only the stale object. Without this guard the next tick compresses the
+    // same messages again → a duplicate L1 over identical history. Check the
+    // summary archive by content identity (sourceIds), not object identity:
+    //   1. exact match → adopt the existing summary, skip the LLM call;
+    //   2. every message already covered by some L1 (boundaries shifted
+    //      across a rebuild) → drop the chunk rather than duplicate history.
+    // Residual risk (documented): a rebuilt chunk PARTIALLY overlapping an
+    // existing L1 (old messages + new ones) still compresses, duplicating
+    // the overlap inside two summaries. That is redundancy, not corruption —
+    // anti-redundancy selection and merges absorb it.
+    const chunkIdKey = this.chunkKey(chunk);
+    const exactExisting = this.summaries.find(
+      s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
+    );
+    if (exactExisting) {
+      chunk.compressed = true;
+      chunk.summaryId = exactExisting.id;
+      return;
+    }
+    if (chunk.messages.length > 0) {
+      const coveredIds = new Set<string>();
+      for (const s of this.summaries) {
+        if (s.level !== 1) continue;
+        for (const id of s.sourceIds) coveredIds.add(id);
+      }
+      if (chunk.messages.every(m => coveredIds.has(m.id))) {
+        chunk.compressed = true;
+        return;
+      }
+    }
+
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
@@ -1862,6 +1899,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Leave the chunk raw rather than poisoning memory with an empty summary.
       if (!summaryText.trim()) {
         console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — skipping (chunk left raw)`);
+        return;
+      }
+
+      // Re-check the dedup guard AFTER the await: summary state may have
+      // changed while the LLM call was in flight (persisted-state reload,
+      // or any future concurrent producer). Discarding a paid-for result
+      // is cheaper than storing a duplicate L1 over the same messages.
+      const postExisting = this.summaries.find(
+        s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
+      );
+      if (postExisting) {
+        chunk.compressed = true;
+        chunk.summaryId = postExisting.id;
         return;
       }
 
@@ -3205,6 +3255,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     selectedSummaries.push(...l1Selected);
     totalSummaryTokens += l1Used;
 
+    // Phase 3b: coverage repair (bug 6.9). getAntiRedundantSummaries excluded
+    // an L2 (or L3) when ALL of its children were in the CANDIDATE shown-set —
+    // computed before budget selection. If the budget then dropped some of
+    // those children (e.g. KnowledgeStrategy's research L1 cap), the covered
+    // history appears at NEITHER level: a silent memory hole. Re-include any
+    // excluded L2/L3 whose children did not all make the final selection.
+    // Some overlap with the children that DID survive is accepted — coverage
+    // beats perfect dedup here. Repairs are bounded by the overall context
+    // budget (per-level budgets already spent their allocation above).
+    {
+      const selectedIds = new Set(selectedSummaries.map(s => s.id));
+      const shownL2Ids = new Set(shownL2.map(s => s.id));
+      const shownL3Ids = new Set(shownL3.map(s => s.id));
+      // L2s excluded by anti-redundancy: unmerged, not in shownL2.
+      for (const s of this.summaries) {
+        if (s.level !== 2 || s.mergedInto || shownL2Ids.has(s.id)) continue;
+        if (s.sourceIds.every(id => selectedIds.has(id))) continue; // truly redundant
+        if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
+        selectedSummaries.push(s);
+        totalSummaryTokens += s.tokens;
+        selectedIds.add(s.id);
+      }
+      // L3s excluded by anti-redundancy — after L2 repair, so a repaired L2
+      // counts as selected coverage for its parent L3.
+      for (const s of this.summaries) {
+        if (s.level !== 3 || s.mergedInto || shownL3Ids.has(s.id)) continue;
+        if (s.sourceIds.every(id => selectedIds.has(id))) continue;
+        if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
+        selectedSummaries.push(s);
+        totalSummaryTokens += s.tokens;
+        selectedIds.add(s.id);
+      }
+    }
+
     // Emit summaries + pinned messages between head and recent windows.
     //
     // Default (positionedRecallPairs=true): one Q/A pair per summary,
@@ -3397,6 +3481,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     this.trimOrphanedToolUse(entries);
+    // Full pairing invariant over the final rendered context — catches the
+    // mid-list orphans the trailing/leading trims can't (bug 6.7).
+    this.enforceToolPairing(entries);
     this.pruneToolEntries(entries);
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
@@ -4034,6 +4121,126 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         break;
       }
     }
+  }
+
+  /** Placeholder body for a stub tool_result inserted by enforceToolPairing. */
+  private static readonly STUB_TOOL_RESULT_TEXT =
+    '[tool result unavailable — omitted during context compression]';
+
+  /**
+   * Final post-selection tool-pairing validator (bug 6.7).
+   *
+   * The Anthropic API requires every `tool_use` block to be answered by a
+   * matching `tool_result` in the immediately-following message, and every
+   * `tool_result` to answer a `tool_use` in the immediately-preceding
+   * message. Selection can violate this mid-list in ways the trailing
+   * (`trimOrphanedToolUse`) and leading orphan trims don't catch:
+   *
+   *   - a budget `break` cutting between a raw pin pair's two messages;
+   *   - the uncompressed-chunk fallback emitting a raw tool_result whose
+   *     tool_use chunk already compressed (or vice versa);
+   *   - a recall pair or pin interleaving between a tool_use and its result.
+   *
+   * Repair policy is conservative — prefer preserving content over dropping:
+   *
+   *   - a tool_use whose result is missing from the next entry gets a STUB
+   *     tool_result (either merged into the next entry when that entry
+   *     already carries results for this cycle, or as a new user entry);
+   *   - a tool_result whose tool_use is not in the immediately-preceding
+   *     entry is dropped (there is no safe way to stub a tool_use — the
+   *     result's information content survives only if its use is adjacent);
+   *     an entry left empty is replaced with a placeholder text block.
+   *
+   * Runs as the last structural pass over the rendered context in
+   * `selectHierarchical`, downstream of `selectL1Summaries` — so subclass
+   * overrides (KnowledgeStrategy) are covered too. It's a no-op on
+   * already-valid output.
+   */
+  protected enforceToolPairing(entries: ContextEntry[]): void {
+    let prevUseIds = new Set<string>();
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+
+      // --- Rule A: every tool_result must answer a tool_use in the
+      // immediately-preceding entry (and only once). Drop orphans/dupes. ---
+      if (entry.content.some(b => b.type === 'tool_result')) {
+        const seen = new Set<string>();
+        const filtered = entry.content.filter(b => {
+          if (b.type !== 'tool_result') return true;
+          if (!prevUseIds.has(b.toolUseId) || seen.has(b.toolUseId)) return false;
+          seen.add(b.toolUseId);
+          return true;
+        });
+        if (filtered.length !== entry.content.length) {
+          entry.content = filtered.length > 0
+            ? filtered
+            : [{ type: 'text', text: '[tool call omitted]' }];
+        }
+      }
+
+      // --- Rule B: every tool_use in the PREVIOUS entry must be answered
+      // by this entry. Stub any that aren't. ---
+      if (prevUseIds.size > 0) {
+        const answered = new Set<string>();
+        for (const b of entry.content) {
+          if (b.type === 'tool_result') answered.add(b.toolUseId);
+        }
+        const missing = [...prevUseIds].filter(id => !answered.has(id));
+        if (missing.length > 0) {
+          const stubs: ContentBlock[] = missing.map(id => ({
+            type: 'tool_result',
+            toolUseId: id,
+            content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
+          }));
+          if (answered.size > 0) {
+            // This entry already carries results for the cycle — prepend the
+            // stubs so all results for the preceding tool_use sit together
+            // (the API wants tool_result blocks at the head of the message).
+            entry.content = [...stubs, ...entry.content];
+          } else {
+            // Not a results entry at all — insert a synthetic user entry
+            // between the tool_use entry and this one.
+            entries.splice(i, 0, {
+              index: i,
+              participant: 'user',
+              sourceRelation: 'derived',
+              content: stubs,
+            });
+            // The stub entry (no tool_use blocks) is now at index i; the
+            // current entry moved to i+1 and is re-processed next iteration
+            // with an empty prevUseIds (its orphan results, if any, were
+            // already filtered above and none survived — Rule A matched
+            // against the same prevUseIds and answered.size === 0).
+            prevUseIds = new Set();
+            continue;
+          }
+        }
+      }
+
+      prevUseIds = new Set();
+      for (const b of entry.content) {
+        if (b.type === 'tool_use') prevUseIds.add(b.id);
+      }
+    }
+
+    // Tail: an entry that mixes tool_use with other blocks can survive
+    // trimOrphanedToolUse (which only pops pure use-without-result tails).
+    if (prevUseIds.size > 0) {
+      entries.push({
+        index: entries.length,
+        participant: 'user',
+        sourceRelation: 'derived',
+        content: [...prevUseIds].map(id => ({
+          type: 'tool_result' as const,
+          toolUseId: id,
+          content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
+        })),
+      });
+    }
+
+    // Reindex after any splices/appends.
+    for (let i = 0; i < entries.length; i++) entries[i].index = i;
   }
 
   /**

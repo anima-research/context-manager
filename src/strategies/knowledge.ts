@@ -81,7 +81,20 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const phaseChanged = currentPhase !== null && phase !== currentPhase;
       const maxTokens = this.getMaxChunkTokens(currentPhase ?? phase);
       const sizeExceeded = currentTokens >= maxTokens;
-      const shouldClose = currentChunk.length >= 2 && (phaseChanged || sizeExceeded);
+      // Same tool-pair boundary guard as the base chunker (rebuildChunks in
+      // AutobiographicalStrategy): never close a chunk whose LAST message
+      // contains a tool_use block — its matching tool_result lives in the
+      // immediately-following message (the one about to be pushed). Closing
+      // here would split the pair across chunks; when the earlier chunk
+      // compresses first, the raw orphan tool_result renders unpaired and
+      // the Anthropic API rejects the request. Deferring the close by one
+      // iteration pulls the tool_result into the same chunk. (Phase never
+      // changes between a tool_use and its tool_result — the result inherits
+      // lastToolPhase — so this defers sizeExceeded closes in practice.)
+      const shouldClose =
+        currentChunk.length >= 2 &&
+        (phaseChanged || sizeExceeded) &&
+        !this.lastMessageContainsToolUse(currentChunk);
 
       if (shouldClose) {
         const chunk = this.createChunk(
