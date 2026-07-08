@@ -59,9 +59,19 @@ interface ChunkRecord {
 
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
+/**
+ * --frontier-only: the zero-LLM micro-repair. Prunes ONLY stale L1
+ * generations that are still UNMERGED (on the frontier) — the ones future
+ * merges would consume, writing fresh duplicated prose into new L2s.
+ * Already-merged stale L1s and the contaminated L2/L3 prose they produced
+ * are left untouched (no wipe, no unmerge, no drain needed afterwards).
+ * Stops the propagation of existing duplicates at merge time; the full
+ * repair remains available per-store where the baked echoes matter.
+ */
+const frontierOnly = args.includes('--frontier-only');
 const [storePath, namespace] = args.filter(a => !a.startsWith('--'));
 if (!storePath || !namespace) {
-  console.error('usage: repair-pyramid <store-path> <namespace> [--apply]');
+  console.error('usage: repair-pyramid <store-path> <namespace> [--apply] [--frontier-only]');
   process.exit(2);
 }
 
@@ -128,6 +138,15 @@ const prunedL1 = new Set(l1s.filter(s => !keepers.has(s.id)).map(s => s.id));
 // Ghost L1s (no live sourceIds, not keepers) are pruned too.
 for (const s of summaries.filter(x => x.level === 1 && !keepers.has(x.id))) prunedL1.add(s.id);
 
+// Frontier-only mode: restrict the prune set to UNMERGED stale L1s and skip
+// all wiping — merged stale L1s and their L2/L3 prose stay as they are.
+if (frontierOnly) {
+  for (const id of [...prunedL1]) {
+    const s = byId.get(id);
+    if (s?.mergedInto) prunedL1.delete(id);
+  }
+}
+
 const children = new Map<string, SummaryEntry[]>();
 for (const s of summaries) {
   if (s.mergedInto) {
@@ -138,13 +157,15 @@ for (const s of summaries) {
 }
 
 const wiped = new Set<string>();
-for (const l2 of summaries.filter(s => s.level === 2)) {
-  const kids = children.get(l2.id) ?? [];
-  if (kids.some(k => prunedL1.has(k.id))) wiped.add(l2.id);
-}
-for (const l3 of summaries.filter(s => s.level === 3)) {
-  const kids = children.get(l3.id) ?? [];
-  if (kids.some(k => wiped.has(k.id) || prunedL1.has(k.id))) wiped.add(l3.id);
+if (!frontierOnly) {
+  for (const l2 of summaries.filter(s => s.level === 2)) {
+    const kids = children.get(l2.id) ?? [];
+    if (kids.some(k => prunedL1.has(k.id))) wiped.add(l2.id);
+  }
+  for (const l3 of summaries.filter(s => s.level === 3)) {
+    const kids = children.get(l3.id) ?? [];
+    if (kids.some(k => wiped.has(k.id) || prunedL1.has(k.id))) wiped.add(l3.id);
+  }
 }
 // Cascade upward defensively for any deeper levels.
 let grew = true;
@@ -181,6 +202,7 @@ const count = (lvl: number, set: Set<string>) =>
   summaries.filter(s => s.level === lvl && set.has(s.id)).length;
 console.log(`store:        ${storePath}`);
 console.log(`namespace:    ${namespace}`);
+console.log(`mode:         ${frontierOnly ? 'FRONTIER-ONLY (unmerged stale L1s only, no wipes)' : 'full repair'}`);
 console.log(`keepers from: ${keeperSource}`);
 console.log(`summaries:    ${summaries.length} loaded (${loaded.length - summaries.length} duplicate-id copies collapsed)`);
 console.log(`L1: ${l1s.length} total → keep ${keepers.size}, prune ${prunedL1.size}`);
