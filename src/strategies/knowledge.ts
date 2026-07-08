@@ -41,6 +41,17 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   // Override: Semantic chunking
   // ============================================================================
 
+  /**
+   * KnowledgeStrategy keeps the legacy recompute-every-rebuild chunker:
+   * its chunk boundaries are semantic (phase transitions), recomputed from
+   * message content, and its stores are offline mining artifacts — the
+   * restart-duplication failure mode that chunk persistence fixes does not
+   * apply, and persisted token-sum records would fight the phase chunker.
+   */
+  protected get chunkPersistenceEnabled(): boolean {
+    return false;
+  }
+
   protected rebuildChunks(store: MessageStoreView): void {
     const messagesToChunk = this.getCompressibleMessages(store);
 
