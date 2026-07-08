@@ -1521,6 +1521,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // snapshot, so it reflects what the last compile actually rendered rather than
   // re-deriving the full pyramid (which, under adaptive resolution, bears little
   // resemblance to the folded output).
+  //
+  // CAVEAT: the final structural passes (`trimOrphanedToolUse`,
+  // `enforceToolPairing`) run AFTER the per-entry tallies and BEFORE `rsEnd()`,
+  // and are NOT reflected in the snapshot. Trims only remove entries (total
+  // over-counts by at most the trimmed tail); the pairing validator can also
+  // ADD stub tool_result entries (total then under-counts by those stubs).
+  // Both deltas are a handful of tokens — the stats describe the selection, not
+  // the byte-exact wire payload. Do not treat `total` as an exact wire count.
   // ===========================================================================
   private _rs: RenderStats | null = null;
   private _lastRenderStats: RenderStats | null = null;
@@ -1749,20 +1757,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('No membrane instance for compression');
     }
 
-    // ---- Overlap guard (strict) ----
-    // With close-then-compress there is NO legitimate way for a chunk to
-    // overlap an existing L1's span. If it happens anyway (bookkeeping bug,
-    // store surgery gone wrong), refuse to produce: a warning in the log is
-    // strictly better than a duplicate memory in an agent's head.
+    // ---- Duplicate-formation guards (layered) ----
+    // Merged from two independent fixes for the same disease:
+    //
+    // 1. EXACT MATCH → adopt (bug 6.10, Tengro). rebuildChunks (fired by
+    //    onNewMessage / select) can re-queue a span whose compression already
+    //    completed against a stale chunk object — or, under chunk
+    //    persistence, a crash between the L1 append and the record edit
+    //    leaves a record uncompressed with its summary already in the log.
+    //    Adopt the existing summary, skip the LLM call, and heal the record.
+    const chunkIdKey = this.chunkKey(chunk);
+    const exactExisting = this.summaries.find(
+      s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
+    );
+    if (exactExisting) {
+      chunk.compressed = true;
+      chunk.summaryId = exactExisting.id;
+      this.markChunkRecordCompressed(chunk.recordId, exactExisting.id);
+      return;
+    }
+
     const coveredByL1 = new Set<string>();
     for (const s of this.summaries) {
       if (s.level === 1 && Array.isArray(s.sourceIds)) {
         for (const id of s.sourceIds) coveredByL1.add(id);
       }
     }
+
+    // 2. FULLY COVERED (non-exact) → drop rather than duplicate history
+    //    (bug 6.10, Tengro): boundaries shifted across a rebuild and every
+    //    message is already inside some L1. Marking compressed WITHOUT a
+    //    summaryId means the uncompressed-middle fallback skips these
+    //    messages — they render only via the covering L1s. Safe while
+    //    `recentStart` advances monotonically (a fully-covered OLD chunk
+    //    can't intersect the recent-exclusion window); if that assumption is
+    //    ever weakened, reinstate a raw fallback (chunk-level `coveredBy`)
+    //    rather than dropping. The chunk record (if any) is deliberately
+    //    left uncompressed as an operator breadcrumb.
+    if (chunk.messages.length > 0 && chunk.messages.every(m => coveredByL1.has(m.id))) {
+      console.warn(
+        `[autobiographical] dedup guard: chunk ${chunk.recordId ?? `#${chunk.index}`} ` +
+        `is fully covered by existing L1s under different boundaries — dropped, not re-compressed.`,
+      );
+      chunk.compressed = true;
+      return;
+    }
+
+    // 3. PARTIAL OVERLAP → refuse (strict; chunk persistence). With
+    //    close-then-compress there is NO legitimate way for a chunk to
+    //    partially overlap an existing L1's span. If it happens anyway
+    //    (bookkeeping bug, store surgery gone wrong), refuse to produce:
+    //    a warning in the log is strictly better than a duplicate memory
+    //    in an agent's head.
     const overlapIds = chunk.messages.filter(m => coveredByL1.has(m.id)).map(m => m.id);
     if (overlapIds.length > 0) {
-      const key = chunk.recordId ?? this.chunkKey(chunk);
+      const key = chunk.recordId ?? chunkIdKey;
       if (!this._overlapBlocked.has(key)) {
         this._overlapBlocked.add(key);
         console.error(
@@ -2073,6 +2122,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Leave the chunk raw rather than poisoning memory with an empty summary.
       if (!summaryText.trim()) {
         console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — skipping (chunk left raw)`);
+        return;
+      }
+
+      // Re-check the dedup guard AFTER the await: summary state may have
+      // changed while the LLM call was in flight (persisted-state reload,
+      // or any future concurrent producer). Discarding a paid-for result
+      // is cheaper than storing a duplicate L1 over the same messages.
+      const postExisting = this.summaries.find(
+        s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
+      );
+      if (postExisting) {
+        chunk.compressed = true;
+        chunk.summaryId = postExisting.id;
         return;
       }
 
@@ -3083,6 +3145,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     this.pruneToolEntries(merged);
     this.trimOrphanedToolUse(merged);
+    // Full pairing invariant over the final rendered context — catches the
+    // mid-list orphans the trailing/leading trims can't (bug 6.7). The adaptive
+    // path has the same mid-list orphan producers as hierarchical (budget
+    // `break`s between pair members, raw emission interleaved with recall
+    // pairs), and FKM defaults autobiographical strategies onto this path — so
+    // the guard has to run here too. It's a no-op on already-valid output.
+    this.enforceToolPairing(merged);
     // Strip stale images BEFORE placing markers and committing stats, so both
     // describe the post-strip context the agent actually receives.
     this.applyImageStripping(merged, store);
@@ -3417,6 +3486,76 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     selectedSummaries.push(...l1Selected);
     totalSummaryTokens += l1Used;
 
+    // Phase 3b: coverage repair (bug 6.9). getAntiRedundantSummaries excluded
+    // an L2 (or L3) when ALL of its children were in the CANDIDATE shown-set —
+    // computed before budget selection. If the budget then dropped some of
+    // those children (e.g. KnowledgeStrategy's research L1 cap), the covered
+    // history appears at NEITHER level: a silent memory hole. Re-include any
+    // excluded L2/L3 whose children did not all make the final selection.
+    // Some overlap with the children that DID survive is accepted — coverage
+    // beats perfect dedup here.
+    //
+    // Repairs are additionally bounded by a per-level ALLOWANCE (a fraction of
+    // that level's budget), not just the overall context budget. The
+    // excluded-with-partially-dropped-children state only arises from a store
+    // damaged mid-merge (the crash window at compressChunkHierarchical, or the
+    // legacy setMergedInto index-desync). On such a store MANY L2s can be in
+    // this state at once; without a cap, re-including all of them at full size
+    // would starve the recent window via Phase 4's newest-first eviction. When
+    // repairs exceed the allowance we stop re-including and warn — a corrupted
+    // store announces itself instead of silently trading recent messages for
+    // redundant summaries.
+    {
+      // Allowance = a fraction of the level budget, with a floor tied to the
+      // overall budget so a strategy that zeroes a level budget (e.g.
+      // KnowledgeStrategy prioritising L1) can still repair a handful of
+      // covering summaries, while a corrupted store with dozens of them stays
+      // bounded well short of the recent window.
+      const REPAIR_ALLOWANCE_FRACTION = 0.25;
+      const REPAIR_FLOOR_FRACTION = 0.05;
+      const repairFloor = maxTokens * REPAIR_FLOOR_FRACTION;
+      const l2RepairAllowance = Math.max(l2Budget * REPAIR_ALLOWANCE_FRACTION, repairFloor);
+      const l3RepairAllowance = Math.max(l3Budget * REPAIR_ALLOWANCE_FRACTION, repairFloor);
+      const selectedIds = new Set(selectedSummaries.map(s => s.id));
+      const shownL2Ids = new Set(shownL2.map(s => s.id));
+      const shownL3Ids = new Set(shownL3.map(s => s.id));
+      let l2RepairTokens = 0;
+      let l3RepairTokens = 0;
+      let l2RepairsSkipped = 0;
+      let l3RepairsSkipped = 0;
+      // L2s excluded by anti-redundancy: unmerged, not in shownL2.
+      for (const s of this.summaries) {
+        if (s.level !== 2 || s.mergedInto || shownL2Ids.has(s.id)) continue;
+        if (s.sourceIds.every(id => selectedIds.has(id))) continue; // truly redundant
+        if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
+        if (l2RepairTokens + s.tokens > l2RepairAllowance) { l2RepairsSkipped++; continue; }
+        selectedSummaries.push(s);
+        totalSummaryTokens += s.tokens;
+        l2RepairTokens += s.tokens;
+        selectedIds.add(s.id);
+      }
+      // L3s excluded by anti-redundancy — after L2 repair, so a repaired L2
+      // counts as selected coverage for its parent L3.
+      for (const s of this.summaries) {
+        if (s.level !== 3 || s.mergedInto || shownL3Ids.has(s.id)) continue;
+        if (s.sourceIds.every(id => selectedIds.has(id))) continue;
+        if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
+        if (l3RepairTokens + s.tokens > l3RepairAllowance) { l3RepairsSkipped++; continue; }
+        selectedSummaries.push(s);
+        totalSummaryTokens += s.tokens;
+        l3RepairTokens += s.tokens;
+        selectedIds.add(s.id);
+      }
+      if (l2RepairsSkipped > 0 || l3RepairsSkipped > 0) {
+        console.warn(
+          `[AutobiographicalStrategy] coverage-repair allowance exceeded — ` +
+          `skipped ${l2RepairsSkipped} L2 and ${l3RepairsSkipped} L3 re-inclusions ` +
+          `(store likely corrupted mid-merge). Some covered history may render at ` +
+          `no summary level this pass.`,
+        );
+      }
+    }
+
     // Emit summaries + pinned messages between head and recent windows.
     //
     // Default (positionedRecallPairs=true): one Q/A pair per summary,
@@ -3609,6 +3748,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     this.trimOrphanedToolUse(entries);
+    // Full pairing invariant over the final rendered context — catches the
+    // mid-list orphans the trailing/leading trims can't (bug 6.7).
+    this.enforceToolPairing(entries);
     this.pruneToolEntries(entries);
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
@@ -4297,6 +4439,180 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         break;
       }
     }
+  }
+
+  /** Placeholder body for a stub tool_result inserted by enforceToolPairing. */
+  private static readonly STUB_TOOL_RESULT_TEXT =
+    '[tool result unavailable — omitted during context compression]';
+
+  /**
+   * Final post-selection tool-pairing validator (bug 6.7).
+   *
+   * The Anthropic API requires every `tool_use` block to be answered by a
+   * matching `tool_result` in the immediately-following message, and every
+   * `tool_result` to answer a `tool_use` in the immediately-preceding
+   * message. Selection can violate this mid-list in ways the trailing
+   * (`trimOrphanedToolUse`) and leading orphan trims don't catch:
+   *
+   *   - a budget `break` cutting between a raw pin pair's two messages;
+   *   - the uncompressed-chunk fallback emitting a raw tool_result whose
+   *     tool_use chunk already compressed (or vice versa);
+   *   - a recall pair or pin interleaving between a tool_use and its result.
+   *
+   * Repair policy prefers preserving content over dropping:
+   *
+   *   - a tool_use whose result is missing from the next entry first triggers
+   *     a short look-ahead: if the genuine (displaced) result is a few entries
+   *     down it is MOVED up into position (see
+   *     {@link relocateOrDropMissingResults}); only when no real result exists
+   *     is a STUB tool_result emitted. Either way the result block is merged
+   *     into the next entry when that entry already carries results for this
+   *     cycle, or inserted as a new user entry;
+   *   - a tool_result whose tool_use is not in the immediately-preceding
+   *     entry (and was not relocated) is dropped — there is no safe way to
+   *     stub a tool_use, so the result's information content survives only if
+   *     its use is adjacent; an entry left empty is replaced with a
+   *     placeholder text block.
+   *
+   * Runs as a structural pass over the rendered context in BOTH render
+   * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
+   * subclass overrides like KnowledgeStrategy are covered) and
+   * `selectAdaptive` (the path FKM defaults onto). It's a no-op on
+   * already-valid output.
+   */
+  protected enforceToolPairing(entries: ContextEntry[]): void {
+    let prevUseIds = new Set<string>();
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+
+      // --- Rule A: every tool_result must answer a tool_use in the
+      // immediately-preceding entry (and only once). Drop orphans/dupes. ---
+      if (entry.content.some(b => b.type === 'tool_result')) {
+        const seen = new Set<string>();
+        const filtered = entry.content.filter(b => {
+          if (b.type !== 'tool_result') return true;
+          if (!prevUseIds.has(b.toolUseId) || seen.has(b.toolUseId)) return false;
+          seen.add(b.toolUseId);
+          return true;
+        });
+        if (filtered.length !== entry.content.length) {
+          entry.content = filtered.length > 0
+            ? filtered
+            : [{ type: 'text', text: '[tool call omitted]' }];
+        }
+      }
+
+      // --- Rule B: every tool_use in the PREVIOUS entry must be answered
+      // by this entry. Stub any that aren't. ---
+      if (prevUseIds.size > 0) {
+        const answered = new Set<string>();
+        for (const b of entry.content) {
+          if (b.type === 'tool_result') answered.add(b.toolUseId);
+        }
+        const missing = [...prevUseIds].filter(id => !answered.has(id));
+        if (missing.length > 0) {
+          // Look-ahead relocation: the genuine result for a "missing" id is
+          // often sitting a few entries down, displaced by an interleaved
+          // recall pair / pin (it will otherwise be dropped as an orphan by
+          // Rule A when we reach it). Move the real block up into position and
+          // only stub the ids for which no real result exists — so tool output
+          // is preserved, not silently replaced by a placeholder.
+          const results = this.relocateOrDropMissingResults(entries, i, missing);
+          if (answered.size > 0) {
+            // This entry already carries results for the cycle — prepend the
+            // relocated/stub results so all results for the preceding tool_use
+            // sit together (the API wants tool_result blocks at the head of
+            // the message).
+            entry.content = [...results, ...entry.content];
+          } else {
+            // Not a results entry at all — insert a synthetic user entry
+            // between the tool_use entry and this one.
+            entries.splice(i, 0, {
+              index: i,
+              participant: 'user',
+              sourceRelation: 'derived',
+              content: results,
+            });
+            // The stub entry (no tool_use blocks) is now at index i; the
+            // current entry moved to i+1 and is re-processed next iteration
+            // with an empty prevUseIds (its orphan results, if any, were
+            // already filtered above and none survived — Rule A matched
+            // against the same prevUseIds and answered.size === 0).
+            prevUseIds = new Set();
+            continue;
+          }
+        }
+      }
+
+      prevUseIds = new Set();
+      for (const b of entry.content) {
+        if (b.type === 'tool_use') prevUseIds.add(b.id);
+      }
+    }
+
+    // Tail: an entry that mixes tool_use with other blocks can survive
+    // trimOrphanedToolUse (which only pops pure use-without-result tails).
+    if (prevUseIds.size > 0) {
+      entries.push({
+        index: entries.length,
+        participant: 'user',
+        sourceRelation: 'derived',
+        content: [...prevUseIds].map(id => ({
+          type: 'tool_result' as const,
+          toolUseId: id,
+          content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
+        })),
+      });
+    }
+
+    // Reindex after any splices/appends.
+    for (let i = 0; i < entries.length; i++) entries[i].index = i;
+  }
+
+  /**
+   * For each `missing` tool_use id (a use in the preceding entry with no
+   * adjacent result), return the result block to place next to it:
+   *
+   *   - if the genuine result exists within a short look-ahead window after
+   *     `afterIndex`, MOVE it up into position (removing it from its source
+   *     entry — replacing a now-empty entry with a placeholder) so the real
+   *     tool output survives the repair;
+   *   - otherwise emit a stub.
+   *
+   * tool_use ids are unique, so the single result carrying a given id is
+   * unambiguously the answer to that use — relocating it cannot break any
+   * other pairing. Results for `missing` ids never sit at or before
+   * `afterIndex` (that entry's results are already matched), so the search
+   * starts at `afterIndex + 1`.
+   */
+  private relocateOrDropMissingResults(
+    entries: ContextEntry[],
+    afterIndex: number,
+    missing: string[],
+  ): ContentBlock[] {
+    const LOOKAHEAD = 6;
+    const end = Math.min(entries.length, afterIndex + 1 + LOOKAHEAD);
+    return missing.map(id => {
+      for (let j = afterIndex + 1; j < end; j++) {
+        const src = entries[j];
+        const bi = src.content.findIndex(
+          b => b.type === 'tool_result' && b.toolUseId === id,
+        );
+        if (bi === -1) continue;
+        const real = src.content[bi];
+        const rest = src.content.filter((_, k) => k !== bi);
+        src.content = rest.length > 0
+          ? rest
+          : [{ type: 'text', text: '[tool call omitted]' }];
+        return real;
+      }
+      return {
+        type: 'tool_result',
+        toolUseId: id,
+        content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
+      } as ContentBlock;
+    });
   }
 
   /**
