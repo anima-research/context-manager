@@ -1,5 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, NormalizedMessage, ContentBlock } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,
@@ -794,7 +794,22 @@ export class ContextManager {
     }
   }
 
+  /**
+   * Live tool definitions for the owning agent, refreshed by the host on
+   * every activation (Agent.buildActivationRequest in agent-framework).
+   * Threaded into StrategyContext so compression/summarizer LLM calls can
+   * declare the same tools as the live instance — required to avoid
+   * reasoning_extraction refusals on transcripts containing tool blocks.
+   */
+  private toolDefinitions?: ToolDefinition[];
+
+  /** Host hook: record the agent's current tool definitions (see above). */
+  setToolDefinitions(tools: ToolDefinition[] | undefined): void {
+    if (tools && tools.length > 0) this.toolDefinitions = tools;
+  }
+
   private createStrategyContext(): StrategyContext {
+    const self = this;
     return {
       messageStore: this.messageStore.createView(),
       contextLog: this.contextLog.createView(),
@@ -802,6 +817,12 @@ export class ContextManager {
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,
+      // Live getter, not a snapshot: strategies capture a ctx object once and
+      // reuse it across a long-running drain (driveSpeculativeDrain recurses
+      // with the same ctx). A snapshot taken before the session's first
+      // activation would freeze `tools` as undefined for the drain's entire
+      // lifetime — the getter always reflects the latest activation.
+      get tools() { return self.toolDefinitions; },
     };
   }
 

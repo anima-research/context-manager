@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
 
@@ -43,6 +43,16 @@ export interface ContextLogView {
 export interface StrategyContext {
   /** Read-only view of message store */
   messageStore: MessageStoreView;
+  /**
+   * The agent's live tool definitions, as last supplied by the host (set on
+   * every activation via ContextManager.setToolDefinitions). Summarizer /
+   * compression requests MUST declare these: replaying a transcript full of
+   * tool_use/tool_result blocks with no `tools` param trips Anthropic's
+   * reasoning_extraction classifier (looks like a foreign agent trace being
+   * duplicated) and the whole compression pass gets deterministically
+   * refused. Optional because ticks can fire before the first activation.
+   */
+  tools?: ToolDefinition[];
   /** Read-only view of context log */
   contextLog: ContextLogView;
   /** Membrane instance for LLM calls (compression) */

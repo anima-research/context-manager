@@ -2089,6 +2089,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // by its tool_result, and any tool_result that doesn't follow a use.
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
+    // Without the agent's live tool definitions, a request that replays
+    // tool-block-bearing history is deterministically refused
+    // (reasoning_extraction -- see the `tools` comment below). Tools are
+    // pushed by the host on every activation; before the first activation
+    // of a session, defer rather than burn a doomed full-window call.
+    const chunkHasToolBlocks = cleaned.some(m =>
+      m.content.some((b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'));
+    if (chunkHasToolBlocks && !(ctx.tools && ctx.tools.length > 0)) {
+      console.warn('[autobiographical] deferring chunk compression: history contains tool blocks but host has not provided tool definitions yet (ctx.tools empty) — will retry after next activation');
+      return;
+    }
+
     // NO system prompt. The agent's identity is established by the head
     // (the actual conversation opening — user message + agent reply that
     // grounded the original instance). A system prompt would (a) add a
@@ -2115,6 +2127,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // off rich memories (stop=max_tokens).
         maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
       },
+      // Declare the agent's live tools. A summarizer request that replays
+      // tool_use/tool_result history with NO tools param reads to Anthropic's
+      // safety classifier as a foreign agent trace being duplicated ->
+      // deterministic reasoning_extraction refusal of every memory-write
+      // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
+      // tools the live instance runs with is also strictly MORE faithful to
+      // the original context, so it is the KV-honest choice, not a
+      // workaround. Undefined before the first activation of a session --
+      // acceptable: those chunks stay raw and are retried after the agent's
+      // first turn (see the defer guard in compressChunkHierarchical).
+      tools: ctx.tools,
     };
 
     const callStart = Date.now();
@@ -2614,6 +2637,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // off rich memories (stop=max_tokens).
         maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
       },
+      // Declare the agent's live tools. A summarizer request that replays
+      // tool_use/tool_result history with NO tools param reads to Anthropic's
+      // safety classifier as a foreign agent trace being duplicated ->
+      // deterministic reasoning_extraction refusal of every memory-write
+      // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
+      // tools the live instance runs with is also strictly MORE faithful to
+      // the original context, so it is the KV-honest choice, not a
+      // workaround. Undefined before the first activation of a session --
+      // acceptable: those chunks stay raw and are retried after the agent's
+      // first turn (see the defer guard in compressChunkHierarchical).
+      tools: ctx.tools,
     };
 
     const callStart = Date.now();
