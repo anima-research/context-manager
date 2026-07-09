@@ -321,6 +321,24 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
+ * Strip `thinking` / `redacted_thinking` blocks from compression INPUT.
+ *
+ * The summarizer must never be handed the agent's own reasoning:
+ *  (a) signed thinking is only valid verbatim in the turn that produced it —
+ *      replaying it into a rewritten summarize request corrupts the signature;
+ *  (b) asking the model to summarize its own reasoning reads as reproducing /
+ *      duplicating model output → `reasoning_extraction` refusal, which returns
+ *      empty (→ "empty L1 summary, chunk left raw") or, worse, produces a
+ *      summary that reproduces the reasoning as text — which then trips the
+ *      SAME classifier on the MAIN thread once that summary is rendered.
+ * Thinking is scratch work, not history (the same rationale already applied to
+ * the summarizer's OUTPUT). Drop it from the input too.
+ */
+function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
+  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -2087,7 +2105,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // speculative drain and stalls ALL compression. (Twin of the empty-summary
       // recall-header guard — together they cover every source of the 400.)
       messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
         .filter(m => m.content.length > 0),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
@@ -2586,7 +2604,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // speculative drain and stalls ALL compression. (Twin of the empty-summary
       // recall-header guard — together they cover every source of the 400.)
       messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
         .filter(m => m.content.length > 0),
       config: {
         model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',

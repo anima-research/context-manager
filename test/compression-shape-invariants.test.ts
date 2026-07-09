@@ -170,6 +170,48 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
+  it('L1 compression: strips thinking/redacted_thinking from the summarizer input', async () => {
+    cleanup();
+    const { membrane, calls } = createValidatingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+    const th = (s: string): ContentBlock =>
+      ({ type: 'thinking', thinking: s, signature: 'sig-' + s.slice(0, 6) } as unknown as ContentBlock);
+    const small = (n: number) => 'word '.repeat(n);
+    // Agent turns carry SIGNED thinking blocks alongside text + a tool cycle —
+    // the shape that was leaking the agent's reasoning into the summarizer and
+    // tripping reasoning_extraction.
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage('user', [t(small(8))]);
+      manager.addMessage('agent', [th(`private chain-of-thought ${i} ` + small(20)), t(small(10)), u(`A${i}`)]);
+      manager.addMessage('user', [r(`A${i}`)]);
+      manager.addMessage('agent', [t(small(10))]);
+    }
+    await drain(manager);
+    assert.ok(calls.length > 0, 'expected at least one L1 compression call');
+    // The summarizer must NEVER receive the agent's own thinking.
+    for (const call of calls) {
+      for (const m of call.messages) {
+        for (const b of m.content) {
+          assert.ok(
+            b.type !== 'thinking' && b.type !== 'redacted_thinking',
+            `thinking block leaked into compression input (participant=${m.participant})`,
+          );
+        }
+      }
+    }
+    await manager.close();
+  });
+
   it('L2/L3 merge cascade preserves shape across hundreds of summaries', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
