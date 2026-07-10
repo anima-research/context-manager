@@ -532,6 +532,19 @@ export interface AutobiographicalConfig {
    * (no picker request needed). Default true when adaptiveResolution is on.
    */
   speculativeProduction?: boolean;
+
+  /**
+   * Standing production target (tokens): keep the summary forest deep enough
+   * that a compile would fit under THIS budget, even while the live compile
+   * budget is higher. Enables lowering the live budget at any later moment
+   * with zero fold-storm and a single KV invalidation ("produce first, fold
+   * once"), and makes an OverBudget hard-fail on the way down structurally
+   * unreachable: by the time the budget drops, every fold the picker will ask
+   * for already exists. Produced-but-unused summaries are cheap storage;
+   * production LLM calls run through the normal drain queues and are visible
+   * in the usual logs. No effect unless lower than the live compile budget.
+   */
+  productionBudgetTokens?: number;
 }
 
 /**

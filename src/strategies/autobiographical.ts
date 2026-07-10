@@ -2956,6 +2956,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.handleProducedOps(result.produced);
     }
 
+    // Standing production target (productionBudgetTokens): run a SHADOW pick
+    // against the production budget on copies of the same inputs. Pure CPU,
+    // no LLM, no state commit - only its produce ops are enqueued, so the
+    // drain keeps the forest deep enough to lower the live budget to this
+    // level at any time without a fold-storm or an OverBudget dead end.
+    const prodBudget = this.config.productionBudgetTokens;
+    if (prodBudget !== undefined && prodBudget < totalBudget) {
+      try {
+        const shadowInputs: PickerInputs = {
+          ...pickerInputs,
+          chunks: pickerChunks.map((c) => ({ ...c })),
+        };
+        const shadowResult = this.buildPicker(shadowInputs).run(shadowInputs, {
+          totalBudget: prodBudget,
+          targetBudget: prodBudget * (1 - slack),
+          slack,
+        });
+        if (shadowResult.produced.length > 0) {
+          this.handleProducedOps(shadowResult.produced);
+        }
+      } catch (err) {
+        // A failing shadow pick (incl. its own OverBudget) must never break
+        // the live compile; production simply has not converged yet.
+        if (!(err instanceof OverBudgetError)) {
+          console.warn("autobio: shadow production pick failed:", err);
+        }
+      }
+    }
+
     // Hard-fail check: if the picker exhausted itself but the final render
     // would still exceed the HARD budget (not just the soft target), surface
     // an OverBudgetError to the host rather than silently dropping entries.
