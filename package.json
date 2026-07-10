@@ -44,5 +44,13 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/context-manager.git"
+  },
+  "homepage": "https://github.com/anima-research/context-manager#readme",
+  "bugs": {
+    "url": "https://github.com/anima-research/context-manager/issues"
   }
 }
