@@ -344,9 +344,9 @@ export interface AutobiographicalConfig {
 
   /**
    * Fractional grace above the configured hard context budget before an
-   * exhausted adaptive picker rejects the compile. The solver still targets
-   * the original budget; this only absorbs coarse fold quanta and indivisible
-   * head/tail boundary overshoot. Default 0 (strict budget enforcement).
+   * adaptive plan rejects the compile. The solver still targets the original
+   * budget; this only absorbs coarse fold quanta and indivisible raw-window
+   * overshoot. Default 0 (strict budget enforcement).
    */
   overBudgetGraceRatio?: number;
 

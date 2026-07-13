@@ -79,6 +79,97 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
     manager.close();
   });
 
+  it('does not let a pending produce op bypass the hard budget', async () => {
+    class PendingProduceStrategy extends AutobiographicalStrategy {
+      protected buildPicker(): any {
+        return {
+          run: () => ({
+            finalResolutions: new Map(),
+            applied: [],
+            produced: [{
+              kind: 'produce',
+              level: 1,
+              range: { firstChunkId: 'missing-first', lastChunkId: 'missing-last' },
+            }],
+            finalTokens: 10_000,
+            budgetMet: false,
+            // This was the loophole: Picker reports false while production is
+            // pending even though the current plan is not renderable.
+            exhausted: false,
+            iterations: 1,
+          }),
+        };
+      }
+
+      protected handleProducedOps(): void {}
+    }
+
+    const strategy = new PendingProduceStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 50,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    manager.addMessage('User', [{ type: 'text', text: 'triggering turn' }]);
+
+    await assert.rejects(
+      () => manager.compile({ maxTokens: 500, reserveForResponse: 100 }),
+      OverBudgetError,
+    );
+    manager.close();
+  });
+
+  it('reserves the complete recent tail before emitting older raw history', async () => {
+    class RawPlanStrategy extends AutobiographicalStrategy {
+      protected buildPicker(): any {
+        return {
+          run: (inputs: any) => ({
+            finalResolutions: new Map(inputs.chunks.map((chunk: any) => [chunk.id, 0])),
+            applied: [],
+            produced: [],
+            finalTokens: 1,
+            budgetMet: true,
+            exhausted: false,
+            iterations: 0,
+          }),
+        };
+      }
+    }
+
+    const strategy = new RawPlanStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 40,
+      maxMessageTokens: 0,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    for (let i = 0; i < 8; i++) {
+      manager.addMessage('User', [{
+        type: 'text',
+        text: `history-${i} ${'.'.repeat(80)}`,
+      }]);
+    }
+    manager.addMessage('User', [{
+      type: 'text',
+      text: `TRIGGERING-TURN ${'.'.repeat(80)}`,
+    }]);
+
+    const compiled = await manager.compile({ maxTokens: 80, reserveForResponse: 0 });
+    const text = compiled.messages
+      .flatMap(message => message.content)
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map(block => block.text)
+      .join('\n');
+    assert.match(text, /TRIGGERING-TURN/);
+    manager.close();
+  });
+
   it('does NOT throw when picker can fold its way under budget', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({

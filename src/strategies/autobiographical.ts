@@ -2914,7 +2914,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // this method prices a message the way the stripped render will cost it.
     const pse = this.postStripEstimates(store);
 
-    // ----- 1. Build head/tail sets and emit head entries -----
+    // ----- 1. Build head/tail sets and reserve the tail before emitting -----
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
@@ -2924,14 +2924,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let headTokens = 0;
     let tailTokens = 0;
 
+    // Compute the fixed raw windows first. They are hard reservations, not
+    // best-effort phases: foldable history may use only the space left after
+    // every head and tail message has been accounted for.
+    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      headMessageIds.add(msg.id);
+      headTokens += tokens;
+    }
+    const effectiveRecentStart = Math.max(recentStart, headEnd);
+    for (let i = effectiveRecentStart; i < messages.length; i++) {
+      const msg = messages[i];
+      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      tailMessageIds.add(msg.id);
+      tailTokens += tokens;
+    }
+
+    if (headTokens + tailTokens > rejectionBudget) {
+      throw new OverBudgetError({
+        budget: rejectionBudget,
+        actual: headTokens + tailTokens,
+        diagnostics: {
+          headTokens,
+          tailTokens,
+          middleTokens: 0,
+          middleChunkCount: Math.max(0, effectiveRecentStart - headEnd),
+          deepestLevel: 0,
+        },
+      });
+    }
+
+    const prefixBudget = rejectionBudget - tailTokens;
     let totalTokens = 0;
 
-    // Emit head entries verbatim
+    // Emit the already-reserved head entries verbatim.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-      if (totalTokens + tokens > rejectionBudget) break;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -2940,22 +2971,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content,
       });
       totalTokens += tokens;
-      headMessageIds.add(msg.id);
-      headTokens += tokens;
       this.rsRaw('head', tokens);
     }
     // (Cache breakpoints are placed in one pass over the FINAL ordered entries
     // below — see placeCacheMarkers — capturing the stable folded prefix, not
     // just the head boundary.)
-
-    // Compute tail message IDs (will be emitted at end)
-    const effectiveRecentStart = Math.max(recentStart, headEnd);
-    for (let i = effectiveRecentStart; i < messages.length; i++) {
-      const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-      tailMessageIds.add(msg.id);
-      tailTokens += tokens;
-    }
 
     // ----- 2. Build PickerChunks for messages in the middle -----
     // For each compressible (non-head, non-tail) message we create one
@@ -3125,12 +3145,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.handleProducedOps(result.produced);
     }
 
-    // Hard-fail check: if the picker exhausted itself but the final render
-    // would still exceed the HARD budget (not just the soft target), surface
-    // an OverBudgetError to the host rather than silently dropping entries.
-    // The strategy has done all it can; the application has to decide what
-    // to do next (raise budget, switch model, drop windows, etc.).
-    if (result.exhausted && result.finalTokens > rejectionBudget) {
+    // Hard-fail whenever the picker's current plan exceeds the hard budget.
+    // A `produce` op only schedules a missing summary; it does not make the
+    // current raw plan feasible and must never authorize an inference.
+    if (result.finalTokens > rejectionBudget) {
       throw new OverBudgetError({
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -3204,7 +3222,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // (`maxMessageTokens` is for per-message caps on chat / tool
             // results, not for sharded bodyGroup composites.)
             const tokens = this.estimateTokens(content);
-            if (totalTokens + tokens > rejectionBudget) {
+            if (totalTokens + tokens > prefixBudget) {
               currentRun = null;
               return false;
             }
@@ -3236,7 +3254,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 sourceRelation: 'derived',
               };
               const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
-              if (totalTokens + pairTokens > rejectionBudget) {
+              if (totalTokens + pairTokens > prefixBudget) {
                 currentRun = null;
                 return false;
               }
@@ -3295,7 +3313,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
         const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-        if (totalTokens + tokens > rejectionBudget) break;
+        if (totalTokens + tokens > prefixBudget) break;
         entries.push({
           index: entries.length,
           sourceMessageId: msg.id,
@@ -3311,7 +3329,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-          if (totalTokens + tokens > rejectionBudget) break;
+          if (totalTokens + tokens > prefixBudget) break;
           entries.push({
             index: entries.length,
             sourceMessageId: msg.id,
@@ -3343,7 +3361,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceRelation: 'derived',
         };
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
-        if (totalTokens + pairTokens > rejectionBudget) break;
+        if (totalTokens + pairTokens > prefixBudget) break;
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
@@ -3352,8 +3370,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
+    // ----- 6. Emit the fully-reserved tail -----
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, rejectionBudget, totalTokens, pse);
+    if (tailStats.messages !== messages.length - effectiveRecentStart) {
+      throw new OverBudgetError({
+        budget: rejectionBudget,
+        actual: totalTokens + tailTokens,
+        diagnostics: {
+          headTokens,
+          tailTokens,
+          middleTokens: totalTokens - headTokens,
+          middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
+          deepestLevel,
+        },
+      });
+    }
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
@@ -3376,6 +3407,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Strip stale images BEFORE placing markers and committing stats, so both
     // describe the post-strip context the agent actually receives.
     this.applyImageStripping(merged, store);
+
+    // The newest stored message is the triggering turn for this compile. A
+    // structural repair may rewrite tool blocks, but it must never erase that
+    // turn. Body-group shards merge under the first shard's source id, so any
+    // surviving member of the same group proves the newest shard is present.
+    const newest = messages[messages.length - 1];
+    if (newest) {
+      const newestGroupIds = newest.bodyGroupId
+        ? new Set(messages.filter(m => m.bodyGroupId === newest.bodyGroupId).map(m => m.id))
+        : new Set([newest.id]);
+      const newestRetained = merged.some(
+        entry => entry.sourceMessageId && newestGroupIds.has(entry.sourceMessageId),
+      );
+      if (!newestRetained) {
+        throw new OverBudgetError({
+          budget: rejectionBudget,
+          actual: totalTokens + tailTokens,
+          diagnostics: {
+            headTokens,
+            tailTokens,
+            middleTokens: totalTokens - headTokens,
+            middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
+            deepestLevel,
+          },
+        });
+      }
+    }
     // Place ≤4 cache breakpoints across the FINAL ordered entries so the
     // provider can reuse the stable folded prefix — not just the head. With a
     // single head marker the cache hit is ~2%; well-placed breakpoints take the
