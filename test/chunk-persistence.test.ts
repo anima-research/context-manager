@@ -172,6 +172,7 @@ describe('Chunk persistence: close-then-compress', () => {
       headWindowTokens: 0,
       recentWindowTokens: 0,
       hierarchical: true,
+      l1HoldbackChunks: 0, // this test asserts EVERY record compresses after drain
     });
     const manager = await ContextManager.open({ path, strategy, membrane });
     for (let i = 0; i < 40; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);

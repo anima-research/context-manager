@@ -101,6 +101,7 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       recentWindowTokens: 5,
       targetChunkTokens: 20,
       autoTickOnNewMessage: true,
+      l1HoldbackChunks: 0, // this suite tests cap/preflight gating at chunk close
     });
     const manager = await setupWithQueuedChunk(strategy);
 
@@ -115,6 +116,7 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       recentWindowTokens: 5,
       targetChunkTokens: 20,
       autoTickOnNewMessage: true,
+      l1HoldbackChunks: 0, // this suite tests cap/preflight gating at chunk close
       maxSpeculativeL1s: 2,
     });
     const manager = await ContextManager.open({
@@ -148,6 +150,7 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       recentWindowTokens: 5,
       targetChunkTokens: 20,
       autoTickOnNewMessage: true,
+      l1HoldbackChunks: 0, // this suite tests cap/preflight gating at chunk close
       maxSpeculativeL1s: 5,
     });
     const manager = await ContextManager.open({
@@ -177,6 +180,7 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       recentWindowTokens: 5,
       targetChunkTokens: 20,
       autoTickOnNewMessage: true,
+      l1HoldbackChunks: 0, // this suite tests cap/preflight gating at chunk close
     });
     const manager = await setupWithQueuedChunk(strategy);
 

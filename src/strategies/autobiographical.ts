@@ -367,6 +367,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected _drainProgress = 0;
 
   /**
+   * Chunks (keyed by their LAST message id — chunk membership is immutable
+   * once closed) whose L1 was explicitly demanded by a picker `produce` op.
+   * Demanded chunks bypass the `l1HoldbackChunks` window in `rebuildChunks`:
+   * speculation waits, demand doesn't. Entries become inert once the chunk
+   * compresses (compressed chunks are never re-queued), so no cleanup needed.
+   */
+  protected _demandedL1Chunks = new Set<MessageId>();
+
+  /**
    * In-memory mirror of the persisted chunk records (autobio:chunks slot).
    * Loaded in `loadPersistedState`, appended to when a chunk closes,
    * updated by ID when its L1 lands.
@@ -1225,6 +1234,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (const chunk of candidates) {
       if (chunk.compressed) continue;
+      // Demand path: mark the chunk so the l1HoldbackChunks window in
+      // rebuildChunks never filters it back out of the queue.
+      const lastId = chunk.messages[chunk.messages.length - 1]?.id;
+      if (lastId !== undefined) this._demandedL1Chunks.add(lastId);
       if (this.compressionQueue.includes(chunk.index)) continue;
       this.compressionQueue.push(chunk.index);
     }
@@ -4530,6 +4543,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // NOTE: no trailing-partial chunk. An unclosed chunk is not a chunk —
     // it compresses only after the running sum closes it.
+
+    // ---- 4. L1 holdback: keep the newest X closed chunks out of the
+    // speculative queue (default 1). The chunk at the live edge is the one
+    // most likely to still be in motion (edits, tool-result landings, the
+    // episode it belongs to still resolving); summarize it once a newer chunk
+    // has closed behind it. The queue is rebuilt on every message, so a
+    // held-back chunk is released automatically the moment it ages out of the
+    // window. Demand overrides: a picker `produce` op (enqueueL1ForRange)
+    // marks the chunk demanded, and demanded chunks are never held back —
+    // when folding actually NEEDS the L1, production must not be blocked.
+    const holdback = this.config.l1HoldbackChunks ?? 1;
+    if (holdback > 0 && this.chunks.length > 0) {
+      const cutoff = this.chunks.length - holdback;
+      this.compressionQueue = this.compressionQueue.filter((idx) => {
+        if (idx < cutoff) return true;
+        const ch = this.chunks[idx];
+        const lastId = ch?.messages[ch.messages.length - 1]?.id;
+        return lastId !== undefined && this._demandedL1Chunks.has(lastId);
+      });
+    }
   }
 
   /**

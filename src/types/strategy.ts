@@ -389,6 +389,16 @@ export interface AutobiographicalConfig {
    */
   mergeMaxSourceSpanMessages?: number;
 
+  /**
+   * L1 production holdback: keep the newest N closed chunks out of the
+   * speculative compression queue (default 1). The chunk at the live edge is
+   * the one most likely to still be in motion — summarize it only once a
+   * newer chunk has closed behind it. Speculative production of everything
+   * older proceeds ahead of need as usual. A picker `produce` op (real fold
+   * demand) bypasses the holdback. 0 = compress at close (old behavior).
+   */
+  l1HoldbackChunks?: number;
+
   // Legacy aliases (deprecated, use summary* instead)
   /** @deprecated Use summarySystemPrompt */
   diarySystemPrompt?: string;
