@@ -55,7 +55,7 @@ test('contiguous run merges; a cross-era candidate is left out', () => {
   assert.deepEqual(run!.map((s) => s.id).sort(), ['a','b','c','d','e','f'], 'contiguous six, no bridge');
 });
 
-test('small holes bridge; cross-era gaps break the run', () => {
+test('small holes bridge; interior runs consolidate early; the newest run waits', () => {
   const p = probe();
   const unmerged = [
     summary('a', 0, 50), summary('b', 120, 200),   // 70-message hole: fine
@@ -63,8 +63,16 @@ test('small holes bridge; cross-era gaps break the run', () => {
     summary('e', 401, 500),
     summary('f', 3000, 3100),                       // 2500-message gap: breaks
   ];
-  assert.equal(p.pick(unmerged, 6), null, 'five contiguous + one distant ≠ a run of six');
+  // The a–e run is INTERIOR (f's run is newer). Summaries are only produced
+  // at the live end, so a stranded interior run can never reach threshold —
+  // it consolidates as soon as it has 2 members (2026-07-12 starvation fix;
+  // mythos froze on exactly this shape after poison-node surgery).
+  const interior = p.pick(unmerged, 6);
+  assert.ok(interior, 'interior run consolidates without reaching threshold');
+  assert.deepEqual(interior!.map((s) => s.id).sort(), ['a', 'b', 'c', 'd', 'e'], 'the stranded five, not f');
   assert.ok(p.pick(unmerged, 5), 'the contiguous five qualify at threshold 5');
+  // The NEWEST run can still grow — below threshold it waits.
+  assert.equal(p.pick(unmerged.slice(0, 5), 6), null, 'newest run below threshold waits');
 });
 
 test('wide-span (replay-era) candidates are quarantined from any run', () => {

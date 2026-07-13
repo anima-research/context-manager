@@ -383,6 +383,14 @@ export interface AutobiographicalConfig {
   maxLiveImageBytes?: number;
 
   /**
+   * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the
+   * live window's: the prompt also carries the head, the recall frontier and
+   * the raw chunk. Newest-first; older images become loud placeholders.
+   * Default 12MB of base64.
+   */
+  maxCompressionImageBytes?: number;
+
+  /**
    * Merge grouping: exclude candidates whose OWN source span exceeds this
    * many messages (replay-era summaries can span the entire chronicle and
    * would bridge any run they join). They stay on the frontier. Default 1500.

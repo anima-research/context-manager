@@ -2131,6 +2131,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (b) provide an alternative identity source that competes with the
     // structural one carried by the conversation itself. Anchoring
     // identity by the chronicle's actual head is more honest.
+    // Own the byte wall here rather than delegating to membrane's shed: cap
+    // the prompt's inline image bytes newest-first before the request is built.
+    // A tighter budget than the live window's: a compression prompt also
+    // carries the head, the whole recall frontier and the raw chunk, so the
+    // image share must leave room for all of it under the API's 32MB cap.
+    this.capCompressionImageBytes(
+      llmMessages as Array<{ content: ContentBlock[] }>,
+      this.config.maxCompressionImageBytes ??
+        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    );
+
     const request: NormalizedRequest = {
       // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
       // raw history that can carry more inline image bytes than the API's
@@ -2326,19 +2337,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
     }
     withPos.sort((a, b) => a.first - b.first);
+
+    // Split into contiguous runs (a gap larger than `gapLimit` starts a new one).
+    const runs: Array<typeof withPos> = [];
     let run: typeof withPos = [];
     let runEnd = -Infinity;
     for (const x of withPos) {
       if (run.length > 0 && x.first - runEnd > gapLimit) {
-        if (run.length >= threshold) break; // oldest qualifying run wins
+        runs.push(run);
         run = [];
         runEnd = -Infinity;
       }
       run.push(x);
       runEnd = Math.max(runEnd, x.last);
     }
-    if (run.length < threshold) return null;
-    return run.slice(0, threshold).map((x) => x.s);
+    if (run.length > 0) runs.push(run);
+    if (runs.length === 0) return null;
+
+    // ONLY THE NEWEST RUN CAN GROW (2026-07-12 starvation fix). Summaries are
+    // always produced at the live end, so any INTERIOR run is stranded: it can
+    // never reach `threshold` members, and waiting for it froze the whole
+    // pyramid (mythos: L1 frontier [913-981]x5 + [4039-4131]x5 separated by a
+    // 3058-message hole from the poison-node surgery — 10 unmerged L1s, 8
+    // unmerged L2s, merge queue empty, fold floor climbing to 117k until the
+    // picker died). Interior runs consolidate as soon as they have 2 members;
+    // only the newest run waits for the full threshold.
+    for (let i = 0; i < runs.length; i++) {
+      const r = runs[i];
+      const isNewest = i === runs.length - 1;
+      if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
+      if (!isNewest && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
+    }
+    return null;
   }
 
   protected checkMergeThreshold(): void {
@@ -2708,6 +2738,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const split = splitMixedToolMessages(llmMessages);
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
+
+    // Byte wall on the MERGE prompt too (2026-07-12). A merge expands its
+    // sources ONE LEVEL DEEPER — an L2 merge therefore replays the RAW
+    // messages under its L1s, images and all (including screenshots nested in
+    // tool_results). This is the path that kept tripping membrane's transport
+    // shed at 27MB after the L1 site was already capped. Own it here.
+    this.capCompressionImageBytes(
+      cleaned as Array<{ content: ContentBlock[] }>,
+      this.config.maxCompressionImageBytes ??
+        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    );
 
     // NO system prompt — identity is established by the head window
     // (present at the start of llmMessages above) and by the prior
@@ -4768,10 +4809,66 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
+  /** Compression prompts carry head + recall frontier + raw chunk alongside
+   *  their images, so they get a tighter image budget than the live window. */
+  protected static readonly DEFAULT_MAX_COMPRESSION_IMAGE_BYTES = 12 * 1024 * 1024;
+
   /** Base64 payload size of an image block (0 for non-base64 sources). */
   protected static imageBlockBytes(b: unknown): number {
     const src = (b as { source?: { data?: string } }).source;
     return typeof src?.data === 'string' ? src.data.length : 0;
+  }
+
+  /**
+   * Cap inline image bytes in a COMPRESSION prompt (2026-07-12). The main
+   * window enforces `maxLiveImageBytes` through the strip policy; the
+   * summarizer's raw-chunk replay had no such wall and leaned on membrane's
+   * byte shed instead — which is a transport backstop, not a policy owner
+   * (it fired at 27MB on a live merge). Keep images newest-first within the
+   * budget; older ones become the same loud placeholder the window uses, so
+   * the summarizer is told plainly that it is not seeing them.
+   * Returns the number of images replaced.
+   */
+  protected capCompressionImageBytes(
+    messages: Array<{ content: ContentBlock[] }>,
+    capBytes: number,
+  ): number {
+    if (capBytes <= 0) return 0;
+    let kept = 0;
+    let dropped = 0;
+    // Recurse into tool_result content: an agent that drives a shell/plotter/
+    // browser carries most of its image bytes NESTED in tool results, not as
+    // top-level blocks. Capping only the top level left those untouched and
+    // membrane's transport shed kept firing at 27MB (2026-07-12).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
+      blocks.map((b) => {
+        if (b.type === 'image') {
+          const bytes = AutobiographicalStrategy.imageBlockBytes(b);
+          if (kept + bytes <= capBytes) {
+            kept += bytes;
+            return b;
+          }
+          dropped++;
+          return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
+        }
+        const nested = (b as { type: string; content?: unknown }).content;
+        if (b.type === 'tool_result' && Array.isArray(nested)) {
+          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+        }
+        return b;
+      });
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!Array.isArray(m.content)) continue;
+      m.content = capBlocks(m.content);
+    }
+    if (dropped > 0) {
+      console.error(
+        `[autobiographical] compression prompt: replaced ${dropped} older image(s) with placeholders ` +
+          `to stay under the ${Math.round(capBytes / 1e6)}MB image-byte budget (kept ${Math.round(kept / 1e6)}MB, newest-first)`,
+      );
+    }
+    return dropped;
   }
 
   protected getRecentWindowStart(store: MessageStoreView): number {
