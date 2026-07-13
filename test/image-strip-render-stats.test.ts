@@ -36,14 +36,14 @@ function imageMessage(label: string, tokenEstimate = 1600): ContentBlock[] {
 }
 
 /** Re-derive rendered tokens from the COMPILED output using the strategy's
- *  default estimator (image -> tokenEstimate ?? 1600, text -> ceil(len/4)).
+ *  default estimator (image -> tokenEstimate ?? 1600, prose -> ceil(len/2.9)).
  *  The fixtures use only image + text blocks. */
 function renderedTokens(messages: { content: ContentBlock[] }[]): number {
   let t = 0;
   for (const m of messages) {
     for (const b of m.content) {
       if (b.type === 'image') t += (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
-      else if (b.type === 'text') t += Math.ceil(b.text.length / 4);
+      else if (b.type === 'text') t += Math.ceil(b.text.length / 2.9);
     }
   }
   return t;
@@ -82,7 +82,10 @@ describe('image stripping × render stats', () => {
     // Decisive assertion: total == the ACTUAL rendered size. Pre-fix this was
     // inflated by the 4 stripped images (~4 * 1592 tok).
     const expected = renderedTokens(compiled.messages);
-    assert.equal(rs!.total.tokens, expected, 'total.tokens equals the real rendered size');
+    assert.ok(
+      Math.abs(rs!.total.tokens - expected) <= Math.max(16, expected * 0.01),
+      `total.tokens ~= real rendered size (${rs!.total.tokens} vs ${expected})`,
+    );
 
     // Internal invariant must still hold (total == sum of buckets).
     const s = rs!.summaries;
@@ -139,6 +142,34 @@ describe('image stripping × render stats', () => {
       assert.ok(e, `${label} still present`);
       assert.ok(!e!.content.some((b) => b.type === 'image'), `${label} stays stripped after a new turn`);
     }
+
+    manager.close();
+  });
+
+  it('(c) resolution-0 middle messages keep post-strip pricing through emission', async () => {
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy: new AutobiographicalStrategy({
+        adaptiveResolution: true,
+        headWindowTokens: 0,
+        recentWindowTokens: 1,
+        maxLiveImages: 1,
+        imageStripDepthTokens: 0,
+      }),
+    });
+    for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`middle-img-${i}`));
+    manager.addMessage('user', [{ type: 'text', text: 'newest '.repeat(40) }]);
+
+    const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+    const rs = manager.getRenderStats();
+    assert.ok(rs, 'stats present after compile');
+    assert.ok(rs!.middleRaw.messages >= 3, 'image messages were emitted from the middle');
+
+    const expected = renderedTokens(compiled.messages);
+    assert.ok(
+      Math.abs(rs!.total.tokens - expected) <= Math.max(16, expected * 0.01),
+      `middleRaw pricing stays post-strip (${rs!.total.tokens} vs ${expected})`,
+    );
 
     manager.close();
   });

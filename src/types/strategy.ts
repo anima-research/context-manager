@@ -19,6 +19,9 @@ export interface MessageStoreView {
   length(): number;
   /** Estimate tokens for a message */
   estimateTokens(message: StoredMessage): number;
+  /** Closed-loop estimator calibration (optional — MessageStore provides it). */
+  setTokenCalibration?(factor: number): void;
+  getTokenCalibration?(): number;
 }
 
 /**
@@ -339,6 +342,14 @@ export interface AutobiographicalConfig {
    *  this limit have their text/tool_result content truncated. 0 = no limit. */
   maxMessageTokens: number;
 
+  /**
+   * Fractional grace above the configured hard context budget before an
+   * exhausted adaptive picker rejects the compile. The solver still targets
+   * the original budget; this only absorbs coarse fold quanta and indivisible
+   * head/tail boundary overshoot. Default 0 (strict budget enforcement).
+   */
+  overBudgetGraceRatio?: number;
+
   // --- Live image policy ---
 
   /** Maximum number of images kept "live" (sent as real image blocks) in the
@@ -351,6 +362,32 @@ export interface AutobiographicalConfig {
    *  the same way as recentWindowTokens (cumulative tokens walked from the tail).
    *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
   imageStripDepthTokens?: number;
+
+  /**
+   * Merge grouping (2026-07-12 contiguity fix): break a merge run when the
+   * positional gap between consecutive unmerged candidates exceeds this many
+   * messages. Small holes (wiped/pruned nodes) bridge fine; cross-era gaps
+   * must not — a merge group spanning already-merged history can straddle
+   * the recent window and block its whole lineage from folding. Default 300.
+   */
+  mergeContiguityGapLimit?: number;
+
+  /**
+   * Byte wall for live images (2026-07-12): keep inline images newest-first
+   * only while their cumulative base64 size stays under this budget — on top
+   * of `maxLiveImages` / `imageStripDepthTokens`. Guarantees the compiled
+   * window fits the API's total request size cap (413 request_too_large), so
+   * membrane's oversize check is a true invariant, never a silent editor.
+   * Default 20MB (of base64; the API cap is 32MB total).
+   */
+  maxLiveImageBytes?: number;
+
+  /**
+   * Merge grouping: exclude candidates whose OWN source span exceeds this
+   * many messages (replay-era summaries can span the entire chronicle and
+   * would bridge any run they join). They stay on the frontier. Default 1500.
+   */
+  mergeMaxSourceSpanMessages?: number;
 
   // Legacy aliases (deprecated, use summary* instead)
   /** @deprecated Use summarySystemPrompt */
@@ -511,12 +548,25 @@ export interface AutobiographicalConfig {
   foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
 
   /**
-   * Per-turn divergence reach (tokens) for `foldingStrategy: 'kv-stable'` — the
-   * structural KV-perturbation cap P. Smaller = gentler per-turn cache churn but
-   * less efficient compression; exceeded only to stay under the hard budget.
-   * Default: unbounded within the budget.
+   * Trust region P (tokens) for `foldingStrategy: 'kv-stable'` — bounds how
+   * much prefix re-read (exact kvCost) an ordinary turn may take; the solver
+   * adopts the relevance-ideal cut within it, amortizes bigger repairs across
+   * turns (suffix adoption), and exceeds it only with a recorded override
+   * (bootstrap / infeasible / quality-gap — logged as `[kv-escalation]`).
+   * See docs/adaptive-resolution-design.md §13. Default: the hard budget
+   * (a rendered layout never exceeds it, so the default never binds).
    */
   kvStableReachTokens?: number;
+
+  /**
+   * Quality-gap override threshold for `foldingStrategy: 'kv-stable'`
+   * (design §13.4): a plan within the trust region is rejected — and the
+   * relevance-ideal cut adopted, paying the perturbation — when its
+   * salience-weighted misallocation loss exceeds the ideal's by more than
+   * this fraction of the ideal's. Also bounds how misallocated a dead-band
+   * hold may be before the solver self-heals. Default 0.35.
+   */
+  kvStableQualityGapRatio?: number;
 
   /**
    * Slack ratio (hysteresis) for the picker. The picker folds until total

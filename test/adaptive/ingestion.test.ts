@@ -162,7 +162,9 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
       await manager.tick();
     }
 
-    const compiled = await manager.compile({ maxTokens: 5000, reserveForResponse: 500 });
+    // Scaled 2026-07-12 with the content-class estimator rates (was 5000 at
+    // flat chars/4) — same relative pressure on the fixture.
+    const compiled = await manager.compile({ maxTokens: 7500, reserveForResponse: 500 });
 
     // Find the entry that came from the bigBody shards. The middle path
     // should have produced ONE combined entry (sourceRelation: 'copy' from

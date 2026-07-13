@@ -126,6 +126,31 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
     manager.close();
   });
 
+  it('allows an exhausted compile within the configured grace ratio', async () => {
+    const mock = makeMockMembrane();
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 200,
+      recentWindowTokens: 100_000,
+      overBudgetGraceRatio: 0.25,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: mock as any,
+    });
+
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage('User', [{ type: 'text', text: `Msg ${i}. ` + 'word '.repeat(20) }]);
+    }
+
+    // The tail is indivisible and slightly over the strict 400-token context
+    // budget, but remains below its 500-token grace ceiling.
+    const compiled = await manager.compile({ maxTokens: 500, reserveForResponse: 100 });
+    assert.ok(compiled.messages.length > 0);
+    manager.close();
+  });
+
   it('error diagnostics include useful state info', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({

@@ -1,22 +1,31 @@
 /**
- * KV-stable context controller (see `docs/kv-stable-context-control.md`).
+ * KV-stable context controller — the rev 5.0 single-path solve
+ * (see `docs/adaptive-resolution-design.md` §13; supersedes the two-path
+ * fold-within-reach + emergency design of §12, and the older prose in
+ * `docs/kv-stable-context-control.md` where they conflict).
  *
- * A receding-horizon policy that replaces the `value − λ·KVcost` solve. One
- * objective — minimize real billed recompute — under a constraint hierarchy with
- * a single hard wall (the physical window W) and shaped soft constraints
- * (flat zone, perturbation cap, pins/saliency, operating budget). State (the
- * carried frontier + the persistent cache) makes it a controller, not a
- * per-turn solve.
+ * One algorithm per turn, one hard constraint:
  *
- * This prototype uses a hysteresis band [LW, HW] as the controllable operating
- * point on the cost↔continuity frontier:
- *   - append every turn; if rendered tokens exceed HW, shed down to ≤ LW;
- *     otherwise do nothing (pure append → zero perturbation, full cache hit);
- *   - shed oldest-first, leveled (L1 groups, then L2, then L3), each chunk
- *     capped by the saliency field (log-age + flat zone + pins) — base-k
- *     grouping driven by budget, not a fixed clock;
- *   - W is the only hard wall; if folding everything to its cap can't fit under
- *     W, escalate (don't thrash).
+ *   minimize    relevance_loss(F) + perturbation(F, F_prev)   [lexicographic]
+ *   subject to  render(F) ≤ W            — the only physics
+ *               perturbation(F, F_prev) ≤ P   — trust region; overridable
+ *
+ * - The IDEAL CUT is built from scratch each turn by pure relevance: fold in
+ *   salience-then-age priority order, level by level, under the soft shape
+ *   prior (`foldDepthCap`), past it if W demands, never past the hard
+ *   protections (flat zone / pins / locked); then pack youngest-first back
+ *   toward the target. Age/salience-monotone by construction.
+ * - PERTURBATION is exact, not modeled: `kvCost` — the tokens the provider
+ *   will re-read from the earliest layout divergence to the end.
+ * - P (`reachTokens`, re-priced) is a TRUST REGION on per-turn divergence,
+ *   not a spatial eligibility gate. Within it the solver adopts the ideal;
+ *   beyond it it adopts the ideal's newest changes only (suffix adoption —
+ *   perturbation is prefix-based, so partial adoption is exactly a suffix
+ *   cut) and converges over turns, receding-horizon style.
+ * - OVERRIDES (same code path, recorded on the plan, logged by the caller):
+ *   'bootstrap' (no carried frontier — nothing to preserve), 'infeasible'
+ *   (nothing within P fits under W), 'quality-gap' (the best plan within P
+ *   is certifiably bad vs the ideal). There is no emergency path.
  *
  * Pure and deterministic.
  */
@@ -25,7 +34,7 @@ import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs, PickerChunk } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
 import { SummaryTree } from './summary-tree.js';
-import { renderLayout, type RenderLayout, type Frontier } from './render-offsets.js';
+import { renderLayout, kvCost, type RenderLayout, type Frontier } from './render-offsets.js';
 import { placeMarkers, CacheStore } from './kv-cache-sim.js';
 
 /** Provider price multipliers relative to base input tokens (Anthropic-ish). */
@@ -130,157 +139,306 @@ function maxAvailableLevel(tree: SummaryTree): number {
   return m;
 }
 
+/** Per-chunk salience: the coefficient on information loss (design §13.3).
+ *  Defaults to 1. Lower = folds earlier and costs less when folded (code-heavy /
+ *  tool-output / externalized content). Never overrides hard protections. */
+function salienceOf(c: PickerChunk): number {
+  const s = c.salience;
+  if (s === undefined || !Number.isFinite(s)) return 1;
+  return Math.min(1, Math.max(0, s));
+}
+
 /**
- * Deepen `frontier` in place to bring rendered tokens ≤ `target`, leveled
- * (L1 groups, then L2, then L3) and oldest-first *within the reach window*. A
- * chunk is editable this turn only if the raw tokens newer than it are <
- * `reachTokens` — this bounds the divergence depth (and thus the per-turn KV
- * perturbation) to ≈ reach. Each chunk is bounded by its saliency cap;
- * flat-zone/pinned chunks (cap 0) are never touched.
- *
- * `reachTokens` is the soft cap P; `windowTokens` is the hard wall W. If folding
- * within reach can't fit under W, reach is lifted (emergency) and folding
- * continues to caps — yielding P minimally to keep W. Returns final tokens.
+ * Salience-weighted MISALLOCATION loss of a frontier: Σ salience(c) ·
+ * max(0, level(c) − shapeCap(c)) over foldable chunks — the excess fold depth
+ * beyond what the relevance shape prior (log-age band) would assign. Zero for
+ * any cut that folds nothing deeper than its prior; positive exactly where
+ * fidelity is spent in the wrong place. Recency-aware by construction (the
+ * cap grows with age), so an INVERTED profile — recent content deep, ancient
+ * content fine — scores high even when a naive Σ level would tie it with the
+ * correct gradient. Used only to compare cuts of the same tree (quality-gap
+ * tests, §13.4).
  */
-function shedToTarget(
-  frontier: Map<ChunkId, number>,
+function relevanceLoss(
+  F: ReadonlyMap<ChunkId, number>,
+  ordered: PickerChunk[],
+  rawZone: ReadonlySet<ChunkId>,
+  caps: ReadonlyMap<ChunkId, number>,
+): number {
+  let loss = 0;
+  for (const c of ordered) {
+    if (rawZone.has(c.id)) continue;
+    const lvl = F.get(c.id) ?? 0;
+    if (lvl <= 0) continue;
+    const cap = Math.max(0, caps.get(c.id) ?? 0);
+    if (lvl > cap) loss += salienceOf(c) * (lvl - cap);
+  }
+  return loss;
+}
+
+/**
+ * Incremental token accounting for whole-group fold/unfold moves.
+ *
+ * `renderLayout` is O(n); calling it per accepted fold makes the ideal-cut
+ * construction O(n·folds) ≈ O(n²) — seconds on a 4k-chunk store, paid on
+ * EVERY compile under the single-path solve. The ledger tracks rendered units
+ * (raw shards / recall pairs) as a multiset keyed exactly like renderLayout's
+ * units, so a group fold/unfold is O(group) and `tokens` stays equal to
+ * `renderLayout(...).totalTokens` for the same frontier (both share the
+ * "missing ancestor → raw" fallback; siblings share one recall unit).
+ */
+class TokenLedger {
+  private readonly unitTokens = new Map<string, number>(); // unitKey → tokens
+  private readonly unitRefs = new Map<string, number>(); // unitKey → leaf count
+  tokens = 0;
+
+  constructor(
+    private readonly tree: SummaryTree,
+    private readonly inputs: PickerInputs,
+    ordered: PickerChunk[],
+    F: ReadonlyMap<ChunkId, number>,
+  ) {
+    this.tokens = inputs.headTokens + inputs.tailTokens;
+    for (const c of ordered) {
+      if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id)) continue;
+      const { key, tokens } = this.unitFor(c, F.get(c.id) ?? 0);
+      this.addRef(key, tokens);
+    }
+  }
+
+  /** Unit identity + cost for a leaf at a level — mirrors renderLayout. */
+  private unitFor(c: PickerChunk, level: number): { key: string; tokens: number } {
+    const effective = c.pinned ? 0 : level;
+    if (effective > 0) {
+      const ancestor = this.tree.ancestorAt(c.id, effective);
+      if (ancestor) return { key: `recall:${ancestor.id}`, tokens: ancestor.recallTokens };
+    }
+    return { key: `raw:${c.id}`, tokens: c.rawTokens };
+  }
+
+  private addRef(key: string, tokens: number): void {
+    const refs = this.unitRefs.get(key) ?? 0;
+    if (refs === 0) {
+      this.unitTokens.set(key, tokens);
+      this.tokens += tokens;
+    }
+    this.unitRefs.set(key, refs + 1);
+  }
+
+  private dropRef(key: string): void {
+    const refs = this.unitRefs.get(key) ?? 0;
+    if (refs <= 1) {
+      this.unitRefs.delete(key);
+      this.tokens -= this.unitTokens.get(key) ?? 0;
+      this.unitTokens.delete(key);
+    } else {
+      this.unitRefs.set(key, refs - 1);
+    }
+  }
+
+  /** Move one leaf from `fromLevel` to `toLevel`. Callers move whole groups
+   *  (every leaf of the target node), which keeps units exact. */
+  move(c: PickerChunk, byId: ReadonlyMap<ChunkId, PickerChunk>, fromLevel: number, toLevel: number): void {
+    if (this.inputs.headChunkIds.has(c.id) || this.inputs.tailChunkIds.has(c.id)) return;
+    void byId;
+    this.dropRef(this.unitFor(c, fromLevel).key);
+    const next = this.unitFor(c, toLevel);
+    this.addRef(next.key, next.tokens);
+  }
+}
+
+/**
+ * Build the IDEAL CUT from scratch — pure relevance, no P anywhere (§13.4).
+ *
+ * Fold order is (salience ascending, then oldest-first), level by level, so the
+ * profile is salience/age-monotone by construction: with uniform salience it
+ * reduces to the classic oldest-first shed. Two phases against the shape prior:
+ *   A. fold under the soft `caps` (log-age shape + pin caps) until ≤ target;
+ *   B. if still over W, keep folding past the shape caps (never past the
+ *      hard-protected −1 sentinel or a pin cap) — the prior is a relevance
+ *      shaper, never a feasibility wall;
+ *   C. pack: un-fold youngest-first back toward `target` (accept-if-fit), so
+ *      headroom is spent on the most recent foldable content.
+ * Ends projected to a valid group-consistent tree cut.
+ */
+function relevanceCut(
   inputs: PickerInputs,
   tree: SummaryTree,
   ordered: PickerChunk[],
-  caps: Map<ChunkId, number>,
+  base: ReadonlyMap<ChunkId, number>,
+  caps: ReadonlyMap<ChunkId, number>,
+  pinCaps: ReadonlyMap<ChunkId, number>,
+  rawZone: ReadonlySet<ChunkId>,
+  immovable: ReadonlySet<ChunkId>,
+  frozen: ReadonlySet<ChunkId>,
+  fixedLevels: ReadonlyMap<ChunkId, number>,
   target: number,
-  reachTokens: number,
   windowTokens: number,
   maxFoldLevel: number,
-  pinCaps: ReadonlyMap<ChunkId, number>,
-): number {
-  // Raw tokens strictly newer than each chunk (its distance from the live end).
-  const newerTokens = new Map<ChunkId, number>();
-  let acc = 0;
-  for (let i = ordered.length - 1; i >= 0; i--) {
-    newerTokens.set(ordered[i].id, acc);
-    acc += ordered[i].rawTokens;
-  }
+): { F: Map<ChunkId, number>; tokens: number } {
+  const F = new Map(base);
+  const byId = new Map(ordered.map((c) => [c.id, c] as const));
+  // Fold priority: cheapest information first — ascending salience, then oldest.
+  const priority = [...ordered].sort((a, b) => {
+    const sa = salienceOf(a);
+    const sb = salienceOf(b);
+    if (sa !== sb) return sa - sb;
+    return a.sequence - b.sequence;
+  });
 
-  const foldWithinReach = (reach: number, ignoreCaps = false): boolean => {
+  // Incremental accounting: O(group) per move instead of O(n) renderLayout.
+  const _tl = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
+  const ledger = new TokenLedger(tree, inputs, ordered, F);
+  if (_tl) console.error(`[kv-timing] ledger-init ${Date.now() - _tl}ms tokens=${ledger.tokens}`);
+
+  const foldPass = (ignoreShapeCaps: boolean, stopAt: number): boolean => {
     for (let level = 1; level <= maxFoldLevel; level++) {
-      for (const c of ordered) {
-        // oldest-first within reach
-        if ((newerTokens.get(c.id) ?? 0) >= reach) continue;
-        if ((frontier.get(c.id) ?? 0) >= level) continue;
+      for (const c of priority) {
+        if (ledger.tokens <= stopAt) return true;
+        if ((F.get(c.id) ?? 0) >= level) continue;
         const ancestor = tree.ancestorAt(c.id, level);
         if (!ancestor) continue; // summary not produced yet → can't fold here
-        // Group-consistency + reach: fold the WHOLE group to `level` only if
-        // every covered leaf permits it (within the saliency cap unless
-        // `ignoreCaps`, and within reach). The picker raises whole groups, so a
-        // partially-eligible group would be an unreachable target (it
-        // oscillates). A uniform fold keeps the frontier group-consistent and
-        // the picker convergent. `rawZone`/`frozen` always block (their cap is 0
-        // and stays 0 even under ignoreCaps).
+        // Group-atomicity: fold the WHOLE group to `level` only if every
+        // covered leaf permits it. Hard protections (−1 sentinel: flat zone /
+        // pins / locked) always block; pin-max-level always blocks past its
+        // bound; the soft shape cap blocks only in phase A.
         let eligible = true;
         for (const leafId of ancestor.leafChunkIds) {
           const cap = caps.get(leafId) ?? 0;
-          // A V2 pin-max-level is a HARD cap: never fold a pinned chunk deeper
-          // than its bound, even in the W emergency (pins are hard-protected).
           const pinCap = pinCaps.get(leafId);
-          if (pinCap !== undefined && level > pinCap) {
-            eligible = false;
-            break;
-          }
-          // Normal: respect the saliency depth cap. Emergency (ignoreCaps): only
-          // the hard-protected set (cap = −1: flat zone / pins / locked) blocks;
-          // the age-extended-raw band (cap 0) and shallower-than-cap content all
-          // become foldable to fit under W.
-          const capBlocks = ignoreCaps ? cap < 0 : cap < level;
-          if (capBlocks || (newerTokens.get(leafId) ?? 0) >= reach) {
-            eligible = false;
-            break;
-          }
+          if (pinCap !== undefined && level > pinCap) { eligible = false; break; }
+          if (ignoreShapeCaps ? cap < 0 : cap < level) { eligible = false; break; }
         }
         if (!eligible) continue;
         for (const leafId of ancestor.leafChunkIds) {
-          if ((frontier.get(leafId) ?? 0) < level) frontier.set(leafId, level);
+          const leaf = byId.get(leafId);
+          const from = F.get(leafId) ?? 0;
+          if (from < level) {
+            if (leaf) ledger.move(leaf, byId, from, level);
+            F.set(leafId, level);
+          }
         }
-        if (renderLayout(inputs, tree, frontier).totalTokens <= target) return true;
+        if (ledger.tokens <= stopAt) return true;
       }
     }
     return false;
   };
 
-  foldWithinReach(reachTokens);
-  let tokens = renderLayout(inputs, tree, frontier).totalTokens;
-  // Hard wall: W is the only hard constraint. If folding within reach + caps
-  // still exceeds W, the emergency lifts BOTH the reach cap (P) AND the saliency
-  // depth cap — the cap is a soft *relevance* shaper, never a feasibility wall.
-  // It still never folds rawZone/frozen (their cap stays 0). (docs
-  // adaptive-resolution-design.md §12.4: fixes OverBudgetError-at-L2 when deeper
-  // summaries exist and would fit.)
-  if (tokens > windowTokens) {
-    foldWithinReach(Infinity, /* ignoreCaps */ true);
-    tokens = renderLayout(inputs, tree, frontier).totalTokens;
+  // Phase A: fold under the shape prior toward the target.
+  if (ledger.tokens > target) foldPass(false, target);
+  // Phase B: the prior yields to W (only hard protections stand).
+  if (ledger.tokens > windowTokens) foldPass(true, target);
+
+  // Phase C: pack youngest-first back toward the target (skip if infeasible).
+  if (ledger.tokens <= windowTokens && ledger.tokens < target) {
+    for (let level = maxFoldLevel; level >= 1 && ledger.tokens < target; level--) {
+      for (let oi = ordered.length - 1; oi >= 0; oi--) {
+        if (ledger.tokens >= target) break;
+        const c = ordered[oi]; // youngest-first
+        if ((F.get(c.id) ?? 0) !== level) continue;
+        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
+        const node = tree.ancestorAt(c.id, level);
+        if (!node) continue;
+        let eligible = true;
+        for (const leafId of node.leafChunkIds) {
+          if ((F.get(leafId) ?? 0) !== level || rawZone.has(leafId) || immovable.has(leafId)) {
+            eligible = false;
+            break;
+          }
+        }
+        if (!eligible) continue;
+        const before = ledger.tokens;
+        for (const leafId of node.leafChunkIds) {
+          const leaf = byId.get(leafId);
+          if (leaf) ledger.move(leaf, byId, level, level - 1);
+          F.set(leafId, level - 1);
+        }
+        // Accept an un-fold that lands PAST the target when it still gets
+        // CLOSER to it (and stays under W). Merge groups are coarse quanta
+        // (8-15k on production trees); accept-only-if-under-target strands
+        // real headroom un-spent whenever every remaining quantum overshoots
+        // (mythos 2026-07-12: 134k rendered of a 183.6k hard budget). The
+        // target stays the attractor — W stays the only wall (§13.2).
+        const nt = ledger.tokens;
+        const accept = nt <= windowTokens && Math.abs(nt - target) < Math.abs(before - target);
+        if (!accept) {
+          // moves away from the target (or breaches W) → revert
+          for (const leafId of node.leafChunkIds) {
+            const leaf = byId.get(leafId);
+            if (leaf) ledger.move(leaf, byId, level - 1, level);
+            F.set(leafId, level);
+          }
+        }
+      }
+    }
   }
-  return tokens;
+
+  const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
+  projectToValidCut(F, tree, ordered, frozen, fixedLevels);
+  if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
+  // One authoritative render at the end (the ledger tracks it exactly, but the
+  // projection may have moved leaves — recompute once, not per move).
+  const tokens = renderLayout(inputs, tree, F).totalTokens;
+  return { F, tokens };
 }
 
 /**
- * Raise `frontier` resolution in place (UN-fold toward raw) to fill up to
- * `target`, leveled (L3→L2, L2→L1, L1→raw) and **youngest-first within the reach
- * window** — the mirror image of `shedToTarget`. Un-folding is a prefix
- * perturbation too, so it obeys the same reach cap (bounded divergence) and only
- * lowers whole groups (group-consistent → the picker reaches it via `lower`
- * ops). Youngest-first spends the budget on the most recent foldable content
- * (highest value, shallowest divergence). Stops before exceeding `target`.
- * rawZone/frozen chunks are never touched. Returns final tokens.
+ * Partial adoption of the ideal under the trust region (§13.4): keep `prev`
+ * before a boundary sequence, take `ideal` at and after it. Perturbation is
+ * prefix-based, so the cheapest partial plans are exactly the suffix cuts;
+ * binary-search the oldest boundary whose perturbation stays ≤ P (perturbation
+ * is monotone non-increasing as the boundary moves newer). Each candidate is
+ * projected to a valid cut before costing (mixing two cuts can bisect a group).
  */
-function expandToTarget(
-  frontier: Map<ChunkId, number>,
+function suffixAdopt(
   inputs: PickerInputs,
   tree: SummaryTree,
   ordered: PickerChunk[],
-  target: number,
-  reachTokens: number,
-  rawZone: ReadonlySet<ChunkId>,
-  immovable: ReadonlySet<ChunkId>,
-  maxFoldLevel: number,
-): number {
-  const newerTokens = new Map<ChunkId, number>();
-  let acc = 0;
-  for (let i = ordered.length - 1; i >= 0; i--) {
-    newerTokens.set(ordered[i].id, acc);
-    acc += ordered[i].rawTokens;
+  prev: ReadonlyMap<ChunkId, number>,
+  prevLayout: RenderLayout,
+  ideal: ReadonlyMap<ChunkId, number>,
+  frozen: ReadonlySet<ChunkId>,
+  fixedLevels: ReadonlyMap<ChunkId, number>,
+  P: number,
+): { F: Map<ChunkId, number>; tokens: number; perturbation: number } {
+  const changedSeqs: number[] = [];
+  for (const c of ordered) {
+    if ((prev.get(c.id) ?? 0) !== (ideal.get(c.id) ?? 0)) changedSeqs.push(c.sequence);
   }
 
-  let tokens = renderLayout(inputs, tree, frontier).totalTokens;
-  for (let level = maxFoldLevel; level >= 1 && tokens < target; level--) {
-    for (let oi = ordered.length - 1; oi >= 0; oi--) {
-      if (tokens >= target) break;
-      const c = ordered[oi]; // youngest-first
-      if ((frontier.get(c.id) ?? 0) !== level) continue;
-      if (rawZone.has(c.id) || immovable.has(c.id)) continue;
-      if ((newerTokens.get(c.id) ?? 0) >= reachTokens) continue;
-      const node = tree.ancestorAt(c.id, level);
-      if (!node) continue;
-      // Lower the WHOLE group to level-1 only if every covered leaf is at this
-      // level and within reach (group-consistent + reach-bounded).
-      let eligible = true;
-      for (const leafId of node.leafChunkIds) {
-        if (
-          (frontier.get(leafId) ?? 0) !== level ||
-          rawZone.has(leafId) || immovable.has(leafId) ||
-          (newerTokens.get(leafId) ?? 0) >= reachTokens
-        ) {
-          eligible = false;
-          break;
-        }
-      }
-      if (!eligible) continue;
-      for (const leafId of node.leafChunkIds) frontier.set(leafId, level - 1);
-      const nt = renderLayout(inputs, tree, frontier).totalTokens;
-      if (nt <= target) tokens = nt; // accept the un-fold
-      else for (const leafId of node.leafChunkIds) frontier.set(leafId, level); // overshoot → revert
+  const build = (boundary: number): { F: Map<ChunkId, number>; layout: RenderLayout; pert: number } => {
+    const F = new Map(prev);
+    for (const c of ordered) {
+      if (c.sequence >= boundary) F.set(c.id, ideal.get(c.id) ?? 0);
+    }
+    projectToValidCut(F, tree, ordered, frozen, fixedLevels);
+    const layout = renderLayout(inputs, tree, F);
+    return { F, layout, pert: kvCost(prevLayout, layout) };
+  };
+
+  if (changedSeqs.length === 0) {
+    const layout = renderLayout(inputs, tree, new Map(prev));
+    return { F: new Map(prev), tokens: layout.totalTokens, perturbation: 0 };
+  }
+
+  // Binary search: smallest index (oldest boundary) with perturbation ≤ P.
+  let lo = 0;
+  let hi = changedSeqs.length; // hi = adopt nothing (pert 0, always feasible)
+  let best = build(Number.MAX_SAFE_INTEGER);
+  let bestIdx = hi;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const cand = build(changedSeqs[mid]);
+    if (cand.pert <= P) {
+      best = cand;
+      bestIdx = mid;
+      hi = mid;
+    } else {
+      lo = mid + 1;
     }
   }
-  return tokens;
+  void bestIdx;
+  return { F: best.F, tokens: best.layout.totalTokens, perturbation: best.pert };
 }
 
 /**
@@ -388,11 +546,21 @@ export interface ControlPlanParams {
   expandAtTokens?: number;
   /** The attractor both fold and un-fold aim for (soft target). */
   targetTokens: number;
-  /** Hard wall W — fold past the reach cap only to keep under this. */
+  /** Hard wall W — the only hard constraint (§13.2). */
   windowTokens: number;
-  /** Per-turn divergence reach (perturbation cap P) — bounds BOTH fold and
-   *  un-fold divergence. Default = windowTokens. */
+  /** Trust region P on per-turn perturbation, in tokens the provider would
+   *  re-read (exact `kvCost`, not a spatial gate). Within P the solver adopts
+   *  the ideal cut outright; beyond it it adopts the ideal's newest changes
+   *  only (suffix adoption) unless an override fires (§13.4). Default =
+   *  windowTokens (a rendered layout never exceeds W, so the default trust
+   *  region never binds). */
   reachTokens?: number;
+  /** Quality-gap override threshold (§13.4): a plan within P is rejected — and
+   *  the ideal adopted, paying the perturbation — when its relevance loss
+   *  exceeds the ideal's by more than this fraction of the ideal's loss.
+   *  Also bounds how misallocated a dead-band hold may be before the solver
+   *  self-heals. Default 0.35. */
+  qualityGapRatio?: number;
   /** Chunks forced to raw and never folded (flat zone / head / tail / pinned). */
   rawZone: ReadonlySet<ChunkId>;
   /** Chunks kept at their carried resolution and never touched (locked). */
@@ -424,21 +592,36 @@ export interface ControlPlan {
   folded: boolean;
   /** An un-fold (raise toward raw, to use budget headroom) happened this turn. */
   expanded: boolean;
-  /** Even full folding under caps could not fit under W (terminal). */
+  /** Even full folding could not fit under W (terminal — production problem). */
   escalated: boolean;
+  /** Exact prefix-invalidation cost of this plan vs the carried frontier:
+   *  tokens the provider will re-read (0 on a hold/pure-append turn). */
+  perturbation: number;
+  /** Set when the trust region P did not bind normally (§13.4). Callers should
+   *  log these loudly (`[kv-escalation]`):
+   *  - 'bootstrap': no carried frontier — pure relevance solve, P not applicable;
+   *  - 'infeasible': nothing within P fits under W — feasibility beats P;
+   *  - 'quality-gap': the best plan within P was certifiably bad vs the ideal. */
+  override?: 'bootstrap' | 'infeasible' | 'quality-gap';
 }
 
 /**
- * Plan one turn's frontier under the controller policy — shared by the replay
- * harness (`replayControlled`) and `KvStableStrategy`. Carries F_prev forward,
- * holds the raw zone raw and the frozen set fixed, then drives the rendered size
- * toward `targetTokens` from EITHER side, both bounded by the `reachTokens`
- * divergence cap (KV-continuity preserving in both directions):
- *   - over `foldAtTokens`  → deepen, oldest-first, under the log-age saliency
- *     caps, yielding the reach cap only as needed to stay under the hard wall W;
- *   - under `expandAtTokens` → un-fold, youngest-first, to use budget headroom.
- * The [expandAt, foldAt] dead band leaves F_prev untouched (zero perturbation)
- * when already in range. Pure and deterministic.
+ * Plan one turn's frontier — the rev 5.0 single-path solve (§13.4), shared by
+ * the replay harness (`replayControlled`) and `KvStableStrategy`.
+ *
+ *   1. Build the IDEAL CUT from scratch (pure relevance; W the only wall).
+ *   2. No carried frontier → adopt it (bootstrap; P not applicable).
+ *   3. Carried frontier in the [expandAt, foldAt] dead band with a small
+ *      quality gap → hold it (zero perturbation). A LARGE gap falls through:
+ *      a stuck misallocated profile self-heals instead of fossilizing.
+ *   4. Ideal within the trust region P (exact kvCost) → adopt it.
+ *   5. Otherwise adopt the ideal's newest changes only (suffix adoption) if
+ *      that fits W and is not certifiably bad; else adopt the ideal and record
+ *      the override ('infeasible' / 'quality-gap').
+ *
+ * There is no emergency path and no spatial eligibility gate: cache continuity
+ * is priced (and bounded by P) — never a reason a chunk can't move.
+ * Pure and deterministic.
  */
 export function planControlledFrontier(
   inputs: PickerInputs,
@@ -450,78 +633,152 @@ export function planControlledFrontier(
   const fixedLevels = p.fixedLevels ?? EMPTY_LEVEL_MAP;
   const pinCaps = p.pinCaps ?? EMPTY_LEVEL_MAP;
   const mergeThreshold = p.mergeThreshold ?? 6;
-  const reach = p.reachTokens ?? p.windowTokens;
+  const P = p.reachTokens ?? p.windowTokens;
   const expandAt = p.expandAtTokens ?? p.targetTokens;
+  const gapRatio = p.qualityGapRatio ?? 0.35;
   // Fold as deep as the tree actually goes (L4/L5… when produced), not a constant.
   const maxFoldLevel = maxAvailableLevel(tree);
 
-  // Immovable = never folded OR un-folded by the shed/expand passes: the locked
-  // (frozen) set plus V2 pin-at-level-k chunks (held at their fixed level).
+  // Immovable = never folded OR un-folded by the solve: the locked (frozen)
+  // set plus V2 pin-at-level-k chunks (held at their fixed level).
   const immovable = new Set<ChunkId>(frozen);
   for (const id of fixedLevels.keys()) immovable.add(id);
 
-  const F = new Map<ChunkId, number>();
+  // Base = the non-negotiable part of every cut: raw zone raw, pins at their
+  // level, frozen at their carried resolution. Everything else starts raw here;
+  // the carried frontier and the ideal cut both build on this base.
+  const base = new Map<ChunkId, number>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id)) {
-      F.set(c.id, 0);
+      base.set(c.id, 0);
     } else if (fixedLevels.has(c.id)) {
       // Pin-at-k: fix to exactly k, clamped to the deepest produced level for
       // this chunk (can't render at a level whose summary doesn't exist yet).
       const k = Math.max(0, fixedLevels.get(c.id)!);
-      F.set(c.id, k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id)));
+      base.set(c.id, k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id)));
     } else if (frozen.has(c.id)) {
-      F.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
+      base.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
     } else {
-      // Carry F_prev, but enforce a pin-max-level immediately: un-fold anything
-      // carried deeper than its cap down to the cap (shallower summaries — its
-      // ancestors — are guaranteed to exist). This is the intended divergence
-      // cost of adding/tightening a pin (design §7).
-      let lvl = p.previous.get(c.id) ?? 0;
-      const cap = pinCaps.get(c.id);
-      if (cap !== undefined && lvl > cap) lvl = Math.max(0, cap);
-      F.set(c.id, lvl);
+      base.set(c.id, 0);
     }
   }
 
-  let tokens = renderLayout(inputs, tree, F).totalTokens;
-  const before = tokens;
-  let folded = false;
-  let expanded = false;
-  let escalated = false;
-  if (tokens > p.foldAtTokens) {
-    const flatZoneChunks = p.rawZone.size;
-    const caps = new Map<ChunkId, number>();
+  // Carried frontier (F_prev with the base enforced): what is actually
+  // rendered right now, and the reference for perturbation.
+  const carried = new Map(base);
+  let carriedNonEmpty = false;
+  for (const c of ordered) {
+    if (p.rawZone.has(c.id) || fixedLevels.has(c.id) || frozen.has(c.id)) continue;
+    // Enforce a pin-max-level immediately: un-fold anything carried deeper than
+    // its cap down to the cap (shallower summaries — its ancestors — are
+    // guaranteed to exist). The intended divergence cost of tightening a pin.
+    let lvl = p.previous.get(c.id) ?? 0;
+    const cap = pinCaps.get(c.id);
+    if (cap !== undefined && lvl > cap) lvl = Math.max(0, cap);
+    carried.set(c.id, lvl);
+  }
+  for (const v of p.previous.values()) {
+    if (v !== 0) { carriedNonEmpty = true; break; }
+  }
+  projectToValidCut(carried, tree, ordered, frozen, fixedLevels);
+  const carriedLayout = renderLayout(inputs, tree, carried);
+  const carriedTokens = carriedLayout.totalTokens;
+
+  // Shape prior: soft per-chunk depth caps (log-age band + pin caps), with the
+  // −1 sentinel marking the hard-protected set (never folded by anything).
+  const flatZoneChunks = p.rawZone.size;
+  const caps = new Map<ChunkId, number>();
+  for (const c of ordered) {
+    let cap: number;
+    if (p.rawZone.has(c.id) || immovable.has(c.id)) {
+      cap = -1; // hard-protected sentinel: never folded, W notwithstanding
+    } else {
+      cap = foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold, maxFoldLevel);
+      const pinCap = pinCaps.get(c.id);
+      if (pinCap !== undefined) cap = Math.min(cap, Math.max(0, pinCap));
+    }
+    caps.set(c.id, cap);
+  }
+
+  // 1. The ideal cut — pure relevance, no P anywhere.
+  const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
+  const ideal = relevanceCut(
+    inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+    p.targetTokens, p.windowTokens, maxFoldLevel,
+  );
+  if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
+  const idealLayout = renderLayout(inputs, tree, ideal.F);
+  const idealLoss = relevanceLoss(ideal.F, ordered, p.rawZone, caps);
+  const gapCeiling = gapRatio * Math.max(1, idealLoss);
+
+  const flags = (F: ReadonlyMap<ChunkId, number>): { folded: boolean; expanded: boolean } => {
+    let folded = false;
+    let expanded = false;
     for (const c of ordered) {
-      let cap: number;
-      if (p.rawZone.has(c.id) || immovable.has(c.id)) {
-        cap = -1; // hard-protected sentinel: never fold, even in the W emergency
-      } else {
-        cap = foldDepthCap(c, p.now, p.rawZone, flatZoneChunks, mergeThreshold, maxFoldLevel);
-        const pinCap = pinCaps.get(c.id);
-        if (pinCap !== undefined) cap = Math.min(cap, Math.max(0, pinCap));
-      }
-      caps.set(c.id, cap);
+      const prev = carried.get(c.id) ?? 0;
+      const next = F.get(c.id) ?? 0;
+      if (next > prev) folded = true;
+      else if (next < prev) expanded = true;
+      if (folded && expanded) break;
     }
-    tokens = shedToTarget(F, inputs, tree, ordered, caps, p.targetTokens, reach, p.windowTokens, maxFoldLevel, pinCaps);
-    folded = tokens !== before; // a real fold only if it actually changed the render
-    if (tokens > p.windowTokens) escalated = true;
-  } else if (tokens < expandAt) {
-    tokens = expandToTarget(F, inputs, tree, ordered, p.targetTokens, reach, p.rawZone, immovable, maxFoldLevel);
-    expanded = tokens !== before; // a real un-fold only if it actually changed
+    return { folded, expanded };
+  };
+
+  const adoptIdeal = (override?: ControlPlan['override']): ControlPlan => ({
+    resolutions: ideal.F,
+    tokens: ideal.tokens,
+    ...flags(ideal.F),
+    escalated: ideal.tokens > p.windowTokens,
+    perturbation: kvCost(carriedLayout, idealLayout),
+    ...(override ? { override } : {}),
+  });
+
+  // 2. Bootstrap: nothing carried → nothing to preserve; pure relevance solve.
+  if (!carriedNonEmpty && p.previous.size === 0) return adoptIdeal('bootstrap');
+
+  // 3. Dead band with self-heal: hold the carried frontier only when it is
+  //    feasible, in band, AND not certifiably misallocated.
+  const carriedLoss = relevanceLoss(carried, ordered, p.rawZone, caps);
+  const inBand = carriedTokens <= p.foldAtTokens && carriedTokens >= expandAt;
+  if (inBand && carriedTokens <= p.windowTokens && carriedLoss - idealLoss <= gapCeiling) {
+    return {
+      resolutions: carried,
+      tokens: carriedTokens,
+      ...flags(carried), // vs itself → both false unless projection moved it
+      escalated: false,
+      perturbation: 0,
+    };
   }
 
-  // Group-consistency (must be the LAST word on F): shed/expand can leave a
-  // summary node partially folded — some leaves at the node's level, others raw
-  // — when only part of the group is affordable/eligible or the tail/reach
-  // boundary bisects it (observed: expand un-folds just the newest leaves of an
-  // L2 node). Such a cut is unrenderable and makes the group-atomic picker
-  // oscillate raise↔lower forever (the wedge). Project onto the nearest valid
-  // tree cut, shallowest-first — un-fold mixed groups toward raw, which preserves
-  // continuity and matches expand's intent to spend headroom on raw.
-  projectToValidCut(F, tree, ordered, frozen, fixedLevels);
-  tokens = renderLayout(inputs, tree, F).totalTokens;
+  // 4. Within the trust region → adopt the ideal outright.
+  const idealPert = kvCost(carriedLayout, idealLayout);
+  if (idealPert <= P) return adoptIdeal();
 
-  return { resolutions: F, tokens, folded, expanded, escalated };
+  // 5. Suffix adoption: the ideal's newest changes only, within P.
+  const partial = suffixAdopt(
+    inputs, tree, ordered, carried, carriedLayout, ideal.F, frozen, fixedLevels, P,
+  );
+  const partialLoss = relevanceLoss(partial.F, ordered, p.rawZone, caps);
+  // Progress guard: when a shed is REQUIRED (carried over foldAt), a partial
+  // plan that neither reaches the band nor moves at all is not acceptable —
+  // an under-folded profile scores zero misallocation loss, so the quality
+  // gap alone cannot reject "do nothing forever". (P below the physical floor
+  // — the tail that any fold must invalidate — lands here and overrides.)
+  const mustShed = carriedTokens > p.foldAtTokens;
+  const madeProgress =
+    !mustShed || partial.tokens <= p.foldAtTokens || partial.perturbation > 0;
+  if (partial.tokens <= p.windowTokens && partialLoss - idealLoss <= gapCeiling && madeProgress) {
+    return {
+      resolutions: partial.F,
+      tokens: partial.tokens,
+      ...flags(partial.F),
+      escalated: false,
+      perturbation: partial.perturbation,
+    };
+  }
+
+  // Trust region priced out: feasibility or quality demands the ideal.
+  return adoptIdeal(partial.tokens > p.windowTokens ? 'infeasible' : 'quality-gap');
 }
 
 /**

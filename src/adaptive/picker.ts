@@ -99,6 +99,14 @@ export interface PickerChunk {
    * by walking parentId pointers in the summary tree.
    */
   l1Id?: SummaryId;
+  /**
+   * Salience ∈ [0,1] — the coefficient on this chunk's information loss
+   * (design §13.3). Lower = folds earlier and costs less when folded:
+   * content whose payload is externalized (code on disk, tool output,
+   * images, link drops) vs conversation that exists nowhere else. Default 1.
+   * Honored by the kv-stable controller; never overrides hard protections.
+   */
+  salience?: number;
 }
 
 export interface PickerInputs {

@@ -477,21 +477,62 @@ export class MessageStore {
     return tokens;
   }
 
+  /**
+   * Closed-loop calibration multiplier applied to every estimate (default 1).
+   * Owned by the strategy: it compares real `usage` totals against the
+   * compile-time estimate and feeds the EMA back here, so the store's
+   * numbers track the live model/content mix instead of a fixed heuristic.
+   */
+  private tokenCalibration = 1;
+
+  setTokenCalibration(factor: number): void {
+    if (Number.isFinite(factor) && factor > 0.25 && factor < 4) this.tokenCalibration = factor;
+  }
+
+  getTokenCalibration(): number {
+    return this.tokenCalibration;
+  }
+
+  /**
+   * Hidden-CoT price for a signed thinking block whose text was summarized/
+   * redacted away (2026-07-12): the block estimates as EMPTY client-side, but
+   * signed replay bills the FULL original chain of thought. Measured on
+   * mythos production turns: median ~608 tokens/block, mean ~590, p90 ~1210.
+   * A per-block `tokenEstimate` stamped at creation (from usage residuals)
+   * takes precedence; this constant is the fallback for unstamped history.
+   */
+  static readonly HIDDEN_THINKING_TOKENS_DEFAULT = 600;
+
   private estimateBlockTokens(block: ContentBlock): number {
+    return Math.round(this.estimateBlockTokensRaw(block) * this.tokenCalibration);
+  }
+
+  private estimateBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
-      case 'thinking':
+      case 'thinking': {
+        // Stamped price wins; a signed-but-empty block is a HIDDEN full CoT
+        // (never "no thinking") — price it at the measured default.
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const hasSignature =
+          typeof (block as { signature?: string }).signature === 'string' &&
+          ((block as { signature?: string }).signature as string).length > 0;
+        if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
+          return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        }
         return this.tokenEstimator(block.thinking);
+      }
       case 'tool_use':
-        return this.tokenEstimator(JSON.stringify(block.input)) + 20; // overhead for name, id
+        return jsonTokenEstimator(JSON.stringify(block.input)) + 20; // overhead for name, id
       case 'tool_result':
         if (!block.content) return 0;
         if (typeof block.content === 'string') {
-          return this.tokenEstimator(block.content);
+          return jsonTokenEstimator(block.content);
         }
         if (Array.isArray(block.content)) {
-          return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
+          return block.content.reduce((sum, b) => sum + this.estimateBlockTokensRaw(b), 0);
         }
         return 0;
       case 'image':
@@ -515,6 +556,8 @@ export class MessageStore {
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
+      setTokenCalibration: (f: number) => this.setTokenCalibration(f),
+      getTokenCalibration: () => this.getTokenCalibration(),
       estimateTokens: (msg) => this.estimateTokens(msg),
     };
   }
@@ -707,6 +750,36 @@ export class MessageStore {
 /**
  * Default token estimator: chars / 4
  */
+/**
+ * Content-class token rates (2026-07-12, measured on mythos production
+ * requests by reconciling real `usage` against per-class char counts):
+ *   - prose (Discord multiparty, markdown, emoji)  ≈ 2.9 chars/token
+ *   - JSON / tool i/o / code                        ≈ 2.3 chars/token
+ * The old flat chars/4 under-priced real windows by ~1.7-1.9x (a 183.6k
+ * "hard budget" compiled to a 344k request — straight into the refusal
+ * band). Rates are deliberately slightly conservative; the closed-loop
+ * calibration multiplier trims the residual per agent.
+ */
+const PROSE_CHARS_PER_TOKEN = 2.9;
+const DENSE_CHARS_PER_TOKEN = 2.3;
+
 function defaultTokenEstimator(text: string): number {
-  return Math.ceil(text.length / 4);
+  if (!text) return 0;
+  // Cheap density probe: JSON/code punctuation and non-ASCII share.
+  let dense = 0;
+  const n = Math.min(text.length, 2000);
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 126) { dense++; continue; } // non-ASCII (emoji, accents, CJK)
+    const ch = text[i];
+    if (ch === '{' || ch === '}' || ch === '[' || ch === ']' || ch === '"' || ch === ':' || ch === '_' || ch === '/' || ch === '=' || ch === '`') dense++;
+  }
+  const rate = dense / n > 0.12 ? DENSE_CHARS_PER_TOKEN : PROSE_CHARS_PER_TOKEN;
+  return Math.ceil(text.length / rate);
+}
+
+/** JSON-ish payloads (tool inputs/results) always use the dense rate. */
+function jsonTokenEstimator(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / DENSE_CHARS_PER_TOKEN);
 }

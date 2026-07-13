@@ -405,6 +405,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
+  protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
@@ -705,6 +706,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       this.store.registerState({
         id: this.pinsStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.calibrationStateId,
         strategy: 'snapshot',
       });
     } catch { /* already registered */ }
@@ -1680,16 +1687,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     msgCap: number,
     maxTokens: number,
     totalTokensBefore: number,
+    // Post-strip per-message estimates (2026-07-12): eviction must price a
+    // message the way the stripped render will. Raw pricing counted every
+    // stripped image at full cost and evicted most of an image-era tail the
+    // recent-window walk had correctly admitted (mythos: 601-message tail
+    // admitted, 228 survived eviction, 45k rendered of a 120k window).
+    pse?: number[],
   ): { messages: number; tokens: number } {
     if (recentStart >= messages.length) return { messages: 0, tokens: 0 };
 
+    const est = (i: number): number => pse?.[i] ?? store.estimateTokens(messages[i]);
     const accepted: number[] = [];
     let acceptedTokens = 0;
     for (let i = messages.length - 1; i >= recentStart; i--) {
-      const msg = messages[i];
-      const tokens = msgCap > 0
-        ? Math.min(store.estimateTokens(msg), msgCap + 50)
-        : store.estimateTokens(msg);
+      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
       if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) break;
       accepted.push(i);
       acceptedTokens += tokens;
@@ -1709,9 +1720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const i of accepted) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0
-        ? Math.min(store.estimateTokens(msg), msgCap + 50)
-        : store.estimateTokens(msg);
+      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -2110,6 +2119,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural one carried by the conversation itself. Anchoring
     // identity by the chronicle's actual head is more honest.
     const request: NormalizedRequest = {
+      // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
+      // raw history that can carry more inline image bytes than the API's
+      // request cap. Dropping the OLDEST images from the summarizer's view is
+      // acceptable policy here — the summary describes the span, it does not
+      // preserve pixels — and membrane error-logs every exercised shed. All
+      // other callers fail loudly instead (no silent transport mutation).
+      shedOversizeImages: true,
       // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
       // message left with no content. An empty-content turn (e.g. a silent/skip
       // turn that produced no text) otherwise reaches the API as an empty text
@@ -2184,7 +2200,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         id: `L1-${this.nextSummaryIdCounter()}`,
         level: 1,
         content: summaryText,
-        tokens: Math.ceil(summaryText.length / 4),
+        // Exact when available (2026-07-12): the compression response's own
+        // usage.outputTokens IS the true token count of the text it just
+        // wrote — the single most-reused number in the pyramid (fold floor,
+        // middle budget, recall caps). Estimate only as fallback.
+        tokens:
+          response.usage?.outputTokens &&
+          response.usage.outputTokens > 0 &&
+          // outputTokens includes scratch thinking when present — only exact
+          // when the whole response is the summary text itself.
+          !response.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking')
+            ? response.usage.outputTokens
+            : Math.ceil(summaryText.length / 3),
         sourceLevel: 0,
         sourceIds: messageIds,
         sourceRange: {
@@ -2248,6 +2275,59 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * already-eligible siblings, producing N near-identical higher-level
    * summaries when the queue eventually drains.
    */
+  /**
+   * Pick merge sources as the oldest CONTIGUOUS run (2026-07-12 fix).
+   *
+   * The old rule merged "whatever N are unmerged" in creation order. On a
+   * store whose frontier held both June L2s and a July L2, that minted an
+   * L3 spanning months of already-merged history (mythos L3-415, 0-3853 of
+   * 3995 messages) — a group whose range straddles the recent window can
+   * never fold (group-atomicity vs the raw zone), so the whole deep lineage
+   * above it went unusable and the fold floor stopped fitting the budget.
+   *
+   * Rules: order candidates by live source position; break runs where the
+   * positional gap exceeds `mergeContiguityGapLimit` (holes from wiped/
+   * pruned nodes are fine, cross-era bridges are not); exclude candidates
+   * whose OWN span exceeds `mergeMaxSourceSpanMessages` (replay-era wide-
+   * span summaries would bridge anything they join); merge the oldest run
+   * that still has `threshold` members.
+   */
+  protected contiguousMergeCandidates(
+    unmerged: SummaryEntry[],
+    threshold: number,
+  ): SummaryEntry[] | null {
+    if (unmerged.length < threshold) return null;
+    const messageOrder = new Map<MessageId, number>();
+    let seq = 0;
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) messageOrder.set(m.id, seq++);
+    }
+    const gapLimit = this.config.mergeContiguityGapLimit ?? 300;
+    const spanLimit = this.config.mergeMaxSourceSpanMessages ?? 1500;
+    const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
+    for (const s of unmerged) {
+      const first = messageOrder.get(s.sourceRange.first);
+      const last = messageOrder.get(s.sourceRange.last);
+      if (first === undefined || last === undefined) continue;
+      if (Math.abs(last - first) > spanLimit) continue; // wide-span quarantine
+      withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
+    }
+    withPos.sort((a, b) => a.first - b.first);
+    let run: typeof withPos = [];
+    let runEnd = -Infinity;
+    for (const x of withPos) {
+      if (run.length > 0 && x.first - runEnd > gapLimit) {
+        if (run.length >= threshold) break; // oldest qualifying run wins
+        run = [];
+        runEnd = -Infinity;
+      }
+      run.push(x);
+      runEnd = Math.max(runEnd, x.last);
+    }
+    if (run.length < threshold) return null;
+    return run.slice(0, threshold).map((x) => x.s);
+  }
+
   protected checkMergeThreshold(): void {
     phaseChannel.report('merge-threshold'); // liveness-watchdog phase
     if (this.config.speculativeProduction) {
@@ -2270,11 +2350,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unmergedL1 = this.summaries.filter(
       s => s.level === 1 && !s.mergedInto && !queuedL1.has(s.id),
     );
-    if (unmergedL1.length >= threshold) {
-      const toMerge = unmergedL1.slice(0, threshold);
+    const l1Run = this.contiguousMergeCandidates(unmergedL1, threshold);
+    if (l1Run) {
       this.enqueueMerge({
         level: 2,
-        sourceIds: toMerge.map(s => s.id),
+        sourceIds: l1Run.map(s => s.id),
       });
     }
 
@@ -2282,11 +2362,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unmergedL2 = this.summaries.filter(
       s => s.level === 2 && !s.mergedInto && !queuedL2.has(s.id),
     );
-    if (unmergedL2.length >= threshold) {
-      const toMerge = unmergedL2.slice(0, threshold);
+    const l2Run = this.contiguousMergeCandidates(unmergedL2, threshold);
+    if (l2Run) {
       this.enqueueMerge({
         level: 3,
-        sourceIds: toMerge.map(s => s.id),
+        sourceIds: l2Run.map(s => s.id),
       });
     }
   }
@@ -2330,11 +2410,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const unmerged = this.summaries.filter(
         s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
       );
-      if (unmerged.length >= threshold) {
-        const toMerge = unmerged.slice(0, threshold);
+      const run = this.contiguousMergeCandidates(unmerged, threshold);
+      if (run) {
         this.enqueueMerge({
           level: level + 1,
-          sourceIds: toMerge.map(s => s.id),
+          sourceIds: run.map(s => s.id),
         });
       }
     }
@@ -2620,6 +2700,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (present at the start of llmMessages above) and by the prior
     // recall pairs. Same rationale as compressChunkHierarchical.
     const request: NormalizedRequest = {
+      // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
+      // raw history that can carry more inline image bytes than the API's
+      // request cap. Dropping the OLDEST images from the summarizer's view is
+      // acceptable policy here — the summary describes the span, it does not
+      // preserve pixels — and membrane error-logs every exercised shed. All
+      // other callers fail loudly instead (no silent transport mutation).
+      shedOversizeImages: true,
       // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
       // message left with no content. An empty-content turn (e.g. a silent/skip
       // turn that produced no text) otherwise reaches the API as an empty text
@@ -2683,7 +2770,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         id: `L${targetLevel}-${this.nextSummaryIdCounter()}`,
         level: targetLevel,
         content: mergedText,
-        tokens: Math.ceil(mergedText.length / 4),
+        // Exact when available — see the L1 site.
+        tokens:
+          response.usage?.outputTokens &&
+          response.usage.outputTokens > 0 &&
+          // outputTokens includes scratch thinking when present — only exact
+          // when the whole response is the summary text itself.
+          !response.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking')
+            ? response.usage.outputTokens
+            : Math.ceil(mergedText.length / 3),
         sourceLevel,
         sourceIds,
         sourceRange,
@@ -2754,8 +2849,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.rsBegin();
     const entries: ContextEntry[] = [];
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
+    const rejectionBudget = Math.floor(maxTokens * (1 + overBudgetGraceRatio));
+    // Closed-loop calibration: apply the persisted multiplier BEFORE any
+    // estimate is taken this compile.
+    this.loadCalibration(store);
     const messages = store.getAll();
     const msgCap = this.config.maxMessageTokens;
+    // Post-strip estimates (see postStripEstimates): every budgeting site in
+    // this method prices a message the way the stripped render will cost it.
+    const pse = this.postStripEstimates(store);
 
     // ----- 1. Build head/tail sets and emit head entries -----
     const headStart = this.getHeadWindowStartIndex(store);
@@ -2773,8 +2876,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      if (totalTokens + tokens > maxTokens) break;
+      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      if (totalTokens + tokens > rejectionBudget) break;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -2795,7 +2898,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const effectiveRecentStart = Math.max(recentStart, headEnd);
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
+      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
       tailMessageIds.add(msg.id);
       tailTokens += tokens;
     }
@@ -2830,8 +2933,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const ch = chunksByMessageId.get(msg.id);
       const tokens = msgCap > 0
-        ? Math.min(store.estimateTokens(msg), msgCap + 50)
-        : store.estimateTokens(msg);
+        ? Math.min(pse[i], msgCap + 50)
+        : pse[i];
       const bound = pinBounds.get(i);
       pickerChunks.push({
         id: msg.id,
@@ -2845,6 +2948,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId,
+        salience: AutobiographicalStrategy.staticSalience(msg),
       });
     }
 
@@ -2853,8 +2957,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const tokens = msgCap > 0
-        ? Math.min(store.estimateTokens(msg), msgCap + 50)
-        : store.estimateTokens(msg);
+        ? Math.min(pse[i], msgCap + 50)
+        : pse[i];
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -2868,8 +2972,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
       const tokens = msgCap > 0
-        ? Math.min(store.estimateTokens(msg), msgCap + 50)
-        : store.estimateTokens(msg);
+        ? Math.min(pse[i], msgCap + 50)
+        : pse[i];
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -2921,6 +3025,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const picker = this.buildPicker(pickerInputs);
     const result = picker.run(pickerInputs, foldingBudget);
 
+    // Every trust-region override is loud (design §13.4) — silence was half
+    // of the 2026-07-12 incident.
+    const plan = this._lastKvStable?.lastPlan();
+    if (plan?.override) {
+      console.error(
+        `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
+          ` tokens=${plan.tokens} budget=${foldingBudget.totalBudget}` +
+          ` (see adaptive-resolution-design.md §13.4)`,
+      );
+    }
+
     // Commit the new resolutions back to strategy state for next compile.
     // Persist to chronicle only if anything actually changed — avoids
     // unnecessary state-slot writes on no-op compiles (which is the common
@@ -2961,9 +3076,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // an OverBudgetError to the host rather than silently dropping entries.
     // The strategy has done all it can; the application has to decide what
     // to do next (raise budget, switch model, drop windows, etc.).
-    if (result.exhausted && result.finalTokens > totalBudget) {
+    if (result.exhausted && result.finalTokens > rejectionBudget) {
       throw new OverBudgetError({
-        budget: totalBudget,
+        budget: rejectionBudget,
         actual: result.finalTokens,
         diagnostics: {
           headTokens,
@@ -3035,7 +3150,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // (`maxMessageTokens` is for per-message caps on chat / tool
             // results, not for sharded bodyGroup composites.)
             const tokens = this.estimateTokens(content);
-            if (totalTokens + tokens > maxTokens) {
+            if (totalTokens + tokens > rejectionBudget) {
               currentRun = null;
               return false;
             }
@@ -3067,7 +3182,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 sourceRelation: 'derived',
               };
               const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
-              if (totalTokens + pairTokens > maxTokens) {
+              if (totalTokens + pairTokens > rejectionBudget) {
                 currentRun = null;
                 return false;
               }
@@ -3125,8 +3240,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const resolution = result.finalResolutions.get(msg.id) ?? 0;
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-        const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-        if (totalTokens + tokens > maxTokens) break;
+        const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+        if (totalTokens + tokens > rejectionBudget) break;
         entries.push({
           index: entries.length,
           sourceMessageId: msg.id,
@@ -3141,8 +3256,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById);
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-          if (totalTokens + tokens > maxTokens) break;
+          const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+          if (totalTokens + tokens > rejectionBudget) break;
           entries.push({
             index: entries.length,
             sourceMessageId: msg.id,
@@ -3174,7 +3289,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceRelation: 'derived',
         };
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
-        if (totalTokens + pairTokens > maxTokens) break;
+        if (totalTokens + pairTokens > rejectionBudget) break;
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
@@ -3184,7 +3299,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 6. Emit tail entries newest-first eviction (matches existing behavior) -----
-    const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
+    const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, rejectionBudget, totalTokens, pse);
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
@@ -3214,7 +3329,98 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     this.rsEnd();
+    // Closed-loop calibration bookkeeping: the committed render stats total
+    // (in CURRENT calibrated units) is what this compile claims the request
+    // will cost — reportRealInputTokens compares provider usage against it.
+    this._storeView = store;
+    const rs = this.getRenderStats(store);
+    this._lastCompileEstimate =
+      rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
+      rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
+    this._calibrationArmed = true; // exactly one sample per compile
     return merged;
+  }
+
+  private _lastCompileEstimate = 0;
+  private _storeView: MessageStoreView | null = null;
+
+  /**
+   * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
+   * for a request built from the latest compile (fresh + cache_read +
+   * cache_creation, minus non-window overhead the caller knows about, e.g.
+   * tool schemas). Maintains an EMA of real/estimated and applies it as the
+   * store's global multiplier, persisted across restarts. The per-class rates
+   * carry the shape; this carries the residual level.
+   */
+  reportRealInputTokens(realTotal: number): void {
+    if (!Number.isFinite(realTotal) || realTotal <= 0) return;
+    const est = this._lastCompileEstimate;
+    if (!est || est <= 0) return;
+
+    // ARM-ONCE-PER-COMPILE (2026-07-12 regression fix). A turn makes MANY API
+    // calls — tool-use rounds and max_tokens continuations each append to the
+    // request — so only the FIRST completion after a compile was built from
+    // the window this estimate describes. Feeding later calls compares a grown
+    // request against the original estimate: ratios of 2.0-2.3 (est=224k
+    // real=504k) drove the multiplier 1.0 -> 2.37 in minutes, inflating every
+    // estimate (the fold floor went 62k -> 108k on unchanged content) and
+    // exhausting the picker on every wake. One sample per compile, always.
+    if (!this._calibrationArmed) return;
+    this._calibrationArmed = false;
+
+    const ratio = realTotal / est;
+    // SANITY BAND: a representative sample sits near 1. Anything wilder is a
+    // structural mismatch (a request we didn't compile, a partial compile, a
+    // provider quirk) — never evidence about chars-per-token. Log, don't learn.
+    if (ratio < 0.6 || ratio > 1.8) {
+      console.error(
+        `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
+          `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
+          `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}`,
+      );
+      return;
+    }
+
+    const current = this._calibration;
+    const observed = ratio * current; // back out the multiplier already applied
+    const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
+    const next = current + alpha * (observed - current);
+    const clamped = Math.min(1.8, Math.max(0.6, next));
+    if (Math.abs(clamped - current) / current > 0.02) {
+      console.error(
+        `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
+          `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+      );
+    }
+    this._calibration = clamped;
+    this.applyCalibration();
+    try {
+      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+    } catch { /* persistence is best-effort */ }
+  }
+
+  private _calibrationArmed = false;
+
+  private _calibration = 1;
+  private _calibrationLoaded = false;
+
+  protected applyCalibration(): void {
+    this._storeView?.setTokenCalibration?.(this._calibration);
+  }
+
+  /** Load the persisted multiplier once and push it into the store view. */
+  protected loadCalibration(store: MessageStoreView): void {
+    this._storeView = store;
+    if (!this._calibrationLoaded) {
+      this._calibrationLoaded = true;
+      try {
+        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        if (saved && Number.isFinite(saved.multiplier)) {
+          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+        }
+      } catch { /* absent slot is fine */ }
+    }
+    this.applyCalibration();
   }
 
   /**
@@ -3366,14 +3572,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected buildPicker(inputs: PickerInputs): Picker {
     if (this.config.foldingStrategy === 'kv-stable') {
-      return new Picker(
-        new KvStableStrategy(inputs, {
-          reachTokens: this.config.kvStableReachTokens,
-          mergeThreshold: this.config.mergeThreshold,
-        }),
-      );
+      const strategy = new KvStableStrategy(inputs, {
+        reachTokens: this.config.kvStableReachTokens,
+        qualityGapRatio: this.config.kvStableQualityGapRatio,
+        mergeThreshold: this.config.mergeThreshold,
+      });
+      this._lastKvStable = strategy;
+      return new Picker(strategy);
     }
+    this._lastKvStable = null;
     return this.getAdaptivePicker();
+  }
+
+  /** The kv-stable strategy instance behind the most recent compile — kept for
+   *  `[kv-escalation]` observability (design §13.4: every override is loud). */
+  private _lastKvStable: KvStableStrategy | null = null;
+
+  /**
+   * Static salience prior (design §13.3) — "is the window the only copy?".
+   * Content whose payload is externalized folds cheap: tool blocks
+   * (re-derivable), fenced code (usually written to disk), images (the file/
+   * CDN keeps them), bare link drops. Conversation exists nowhere but the
+   * chronicle, so it stays at 1. Returns a value in [0.2, 1]; cheap,
+   * deterministic, computed per message at picker-input construction.
+   */
+  protected static staticSalience(msg: StoredMessage): number {
+    let totalChars = 0;
+    let externalChars = 0;
+    for (const block of msg.content) {
+      const b = block as {
+        type?: string;
+        text?: string;
+        input?: unknown;
+        content?: unknown;
+      };
+      switch (b.type) {
+        case 'text': {
+          const t = b.text ?? '';
+          totalChars += t.length;
+          // Fenced code blocks.
+          const fences = t.split('```');
+          for (let i = 1; i < fences.length; i += 2) externalChars += fences[i].length;
+          // Bare link-drop lines (the URL is the payload).
+          for (const line of t.split('\n')) {
+            const trimmed = line.trim();
+            if (/^https?:\/\/\S+$/.test(trimmed)) externalChars += trimmed.length;
+          }
+          break;
+        }
+        case 'tool_use': {
+          const n = JSON.stringify(b.input ?? {}).length;
+          totalChars += n;
+          externalChars += n;
+          break;
+        }
+        case 'tool_result': {
+          const n =
+            typeof b.content === 'string'
+              ? b.content.length
+              : JSON.stringify(b.content ?? '').length;
+          totalChars += n;
+          externalChars += n;
+          break;
+        }
+        case 'image': {
+          // Estimate parity with the renderer's flat image cost; the payload
+          // lives in the file/CDN, so it is fully externalized.
+          totalChars += 6400; // ≈1600 tokens × 4 chars
+          externalChars += 6400;
+          break;
+        }
+        default: {
+          const t = (b as { text?: string }).text ?? '';
+          totalChars += t.length;
+        }
+      }
+    }
+    if (totalChars <= 0) return 1;
+    const externalized = Math.min(1, externalChars / totalChars);
+    // Fully-externalized content bottoms out at 0.2 — cheap, never free
+    // (hard protections, not salience, are what make content unfoldable).
+    return Math.max(0.2, 1 - 0.8 * externalized);
   }
 
   /**
@@ -4347,7 +4626,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
-    if (maxLive === 0 && depthTokens === 0) return;             // policy disabled
+    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // policy disabled
 
     const messages = store.getAll();
     const posById = new Map<string, number>();
@@ -4378,34 +4658,96 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .sort((a, b) => b.pos - a.pos);
 
     let keptImages = 0;
+    let keptImageBytes = 0;
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
       const bucket = bucketAt(pos);
       entry.content = entry.content.map((block) => {
         if (block.type !== 'image') return block;
+        const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
-        if (tooDeep || overCount) {
-          // The renderer estimates an image at `tokenEstimate ?? 1600` (see
-          // message-store/context-log). Hand that back to the bucket, less the
-          // placeholder text that replaces it, so the stats match the output.
-          const reclaimed =
-            ((block as { tokenEstimate?: number }).tokenEstimate ?? 1600) - placeholderTokens;
-          if (this._rs && reclaimed > 0) this._rs[bucket].tokens -= reclaimed;
+        const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
+        if (tooDeep || overCount || overBytes) {
+          // Stats-neutral (2026-07-12): every budgeting site now tallies at
+          // POST-STRIP prices (see postStripEstimates), so the bucket never
+          // charged this image at full weight — reclaiming here would
+          // double-decrement. The strip pass only swaps the block.
+          void bucket;
+          void placeholderTokens;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         keptImages++;
+        keptImageBytes += blockBytes;
         return block;
       });
     }
   }
 
+  /**
+   * Post-strip token estimate per message index (2026-07-12 tail-starvation
+   * fix). Mirrors `applyImageStripping`: an image beyond the `maxLiveImages`
+   * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
+   * raw estimate from the live end renders as a placeholder — so every place
+   * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
+   * chunk sizes) must cost it as one. Pricing stripped images at their full
+   * estimate collapsed an image-dense tail to a fraction of its configured
+   * size (42k rendered of a 120k window), and pricing them post-strip in the
+   * walk-back alone made the picker's raw-priced tail overflow the budget
+   * (318k) — the estimate must be consistent EVERYWHERE.
+   */
+  protected postStripEstimates(store: MessageStoreView): number[] {
+    const messages = store.getAll();
+    const out = new Array<number>(messages.length);
+    const stripDepth = this.config.imageStripDepthTokens ?? 0;
+    const maxLive = this.config.maxLiveImages ?? 0;
+    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
+    const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
+    let liveImagesSeen = 0;
+    let liveImageBytes = 0;
+    let rawDepth = 0; // raw-estimate depth from the newest message (mirrors getImageStripStart)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const raw = store.estimateTokens(messages[i]);
+      let est = raw;
+      if (stripActive) {
+        for (const b of messages[i].content) {
+          if (b.type !== 'image') continue;
+          const bytes = AutobiographicalStrategy.imageBlockBytes(b);
+          const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
+          const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
+          const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
+          if (beyondDepth || beyondCount || beyondBytes) {
+            const imgEst = (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
+            est -= Math.max(0, imgEst - placeholderTokens);
+          } else {
+            liveImagesSeen++;
+            liveImageBytes += bytes;
+          }
+        }
+      }
+      rawDepth += raw;
+      out[i] = est;
+    }
+    return out;
+  }
+
+  /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
+  protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+  /** Base64 payload size of an image block (0 for non-base64 sources). */
+  protected static imageBlockBytes(b: unknown): number {
+    const src = (b as { source?: { data?: string } }).source;
+    return typeof src?.data === 'string' ? src.data.length : 0;
+  }
+
   protected getRecentWindowStart(store: MessageStoreView): number {
     const messages = store.getAll();
+    const pse = this.postStripEstimates(store);
     let tokens = 0;
 
     for (let i = messages.length - 1; i >= 0; i--) {
-      tokens += store.estimateTokens(messages[i]);
+      tokens += pse[i];
       if (tokens > this.config.recentWindowTokens) {
         let boundary = i + 1;
         // Don't split a tool_use/tool_result pair: if the message at the boundary

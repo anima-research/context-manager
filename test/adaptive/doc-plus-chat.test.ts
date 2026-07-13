@@ -53,7 +53,10 @@ describe('AutobiographicalStrategy — doc + chat workload (Lena-like)', () => {
 
   it('500K-equivalent doc + 50 chat turns: budget honored throughout', async () => {
     const mock = makeMockMembrane();
-    const BUDGET = 30000;
+    // 2026-07-12: scaled from 30000 with the content-class estimator rates
+    // (prose 2.9 / dense 2.3 vs the old flat chars/4) — same folding pressure
+    // relative to the fixture's content, honest units.
+    const BUDGET = 45000;
     const strategy = new AutobiographicalStrategy({
       adaptiveResolution: true,
       targetChunkTokens: 1000, // ~4K chars per shard
@@ -161,8 +164,9 @@ describe('AutobiographicalStrategy — doc + chat workload (Lena-like)', () => {
     while (!manager.isReady()) {
       await manager.tick();
     }
-    // Tight compile
-    const compiled = await manager.compile({ maxTokens: 3500, reserveForResponse: 500 });
+    // Tight compile (scaled 2026-07-12 with the content-class estimator rates;
+    // same relative pressure as the old 3500 at flat chars/4)
+    const compiled = await manager.compile({ maxTokens: 5000, reserveForResponse: 500 });
 
     // The locked shard's resolution should remain 0 in strategy.resolutions
     const resolutions = (strategy as any).resolutions as Map<string, number>;

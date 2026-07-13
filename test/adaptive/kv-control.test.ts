@@ -86,25 +86,28 @@ test('W is the only hard wall: escalates instead of exceeding it', () => {
   assert.ok(r.escalations > 0, 'unfoldable content over W must escalate, not silently overflow');
 });
 
-test('reach cap is the cost↔continuity knob: tighter reach = gentler + less recompute', () => {
+test('trust region P never distorts the outcome — only the payment schedule (§13)', () => {
+  // Rev 5.0 retires the old premise (tighter reach → gentler): the old
+  // controller achieved gentleness by folding the WRONG (recent) content —
+  // the mechanism behind the 2026-07-12 inversion incident. Under the
+  // single-path solve, P bounds per-turn perturbation when the relevance-
+  // correct repair can be amortized (suffix adoption), and is overridden when
+  // it can't — so WHAT the profile converges to is P-invariant.
   const inputs = session();
-  // Small reach bounds per-turn divergence (gentle KV) but compresses less
-  // efficiently; large reach reaches deep. The robust signals are average
-  // per-turn perturbation (RMS) and total recompute. (Worst-case maxPert and
-  // fold *frequency* are noisy — a too-tight reach can trip an emergency deep
-  // fold to stay under W.)
   const shallow = replayControlled(inputs, { ...BASE, reachTokens: 8_000 });
   const deep = replayControlled(inputs, { ...BASE, reachTokens: 60_000 });
 
-  assert.equal(shallow.escalations, 0, 'tight reach stays feasible here');
-  assert.equal(deep.escalations, 0, 'wide reach stays feasible here');
-  assert.ok(
-    shallow.rmsPerturbation < deep.rmsPerturbation,
-    `tighter reach → lower average per-turn perturbation (${shallow.rmsPerturbation.toFixed(0)} < ${deep.rmsPerturbation.toFixed(0)})`,
-  );
-  assert.ok(
-    shallow.totalRecomputed <= deep.totalRecomputed,
-    `tighter reach → no more total recompute (${shallow.totalRecomputed} ≤ ${deep.totalRecomputed})`,
+  assert.equal(shallow.escalations, 0, 'tight P stays feasible');
+  assert.equal(deep.escalations, 0, 'wide P stays feasible');
+  const lastS = shallow.steps[shallow.steps.length - 1];
+  const lastD = deep.steps[deep.steps.length - 1];
+  assert.equal(lastS.renderedTokens, lastD.renderedTokens, 'same final render size');
+  assert.equal(lastS.deepestLevel, lastD.deepestLevel, 'same final fold depth');
+  // The relevance-correct shed folds at the prefix start, which cannot be
+  // amortized below the invalidation floor — so a tight P pays the same bill.
+  assert.equal(
+    shallow.totalRecomputed, deep.totalRecomputed,
+    'P does not change what gets folded at these settings',
   );
 });
 
@@ -150,7 +153,7 @@ test('foldDepthCap is monotone non-decreasing in age and capped', () => {
   let prev = -1;
   for (let age = 0; age <= 5000; age += 50) {
     const cap = foldDepthCap(mk(0), age, new Set(), 10, 6);
-    assert.ok(cap >= 0 && cap <= 3, 'cap in [0,3]');
+    assert.ok(cap >= 0 && cap <= 8, 'cap in [0, MAX_FOLD_LEVEL]');
     assert.ok(cap >= prev, 'non-decreasing in age');
     prev = cap;
   }

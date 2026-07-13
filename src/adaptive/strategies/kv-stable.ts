@@ -30,14 +30,16 @@ import type {
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
-import { planControlledFrontier } from '../kv-control.js';
+import { planControlledFrontier, type ControlPlan } from '../kv-control.js';
 
 export interface KvStableOptions {
-  /** Per-turn divergence reach — the structural perturbation cap P, in tokens.
-   *  Smaller = gentler per-turn KV churn (shallow divergence) but less efficient
-   *  compression. Exceeded only to stay under the hard wall. Default: the hard
-   *  budget (effectively unbounded within the window). */
+  /** Trust region P on per-turn perturbation, in tokens the provider would
+   *  re-read (exact kvCost — see design §13.4). Within it the solver adopts
+   *  the relevance-ideal cut; beyond it it amortizes via suffix adoption or
+   *  overrides with cause. Default: the hard budget (never binds). */
   reachTokens?: number;
+  /** Quality-gap override threshold (design §13.4). Default 0.35. */
+  qualityGapRatio?: number;
   /** Base-k summary grouping (matches the strategy's mergeThreshold). Default 6. */
   mergeThreshold?: number;
 }
@@ -49,6 +51,7 @@ export class KvStableStrategy implements FoldingStrategy {
   private readonly opts: KvStableOptions;
   private readonly fPrev: Map<ChunkId, number>;
   private target: Map<ChunkId, number> | null = null;
+  private _lastPlan: ControlPlan | null = null;
 
   constructor(inputs: PickerInputs, opts: KvStableOptions = {}) {
     this.inputs = inputs;
@@ -64,6 +67,13 @@ export class KvStableStrategy implements FoldingStrategy {
   /** Target frontier this run is walking toward (null before the first call). */
   targetFrontier(): ReadonlyMap<ChunkId, number> | null {
     return this.target;
+  }
+
+  /** The full control plan behind the target (perturbation, override) — for
+   *  observability at the call site (`[kv-escalation]` logging). Null before
+   *  the first `selectNextFold`. */
+  lastPlan(): ControlPlan | null {
+    return this._lastPlan;
   }
 
   private solve(budget: FoldingBudget): Map<ChunkId, number> {
@@ -119,23 +129,25 @@ export class KvStableStrategy implements FoldingStrategy {
       }
     }
 
-    return planControlledFrontier(this.inputs, tree, {
+    const plan = planControlledFrontier(this.inputs, tree, {
       previous: this.fPrev,
-      // Bidirectional within the slack band: fold when over the hard budget,
-      // un-fold to use headroom when under the soft target. Both reach-bounded;
-      // [targetBudget, totalBudget] is the quiet dead band.
+      // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
+      // is the quiet dead band; the trust region and overrides do the rest.
       foldAtTokens: budget.totalBudget,
       expandAtTokens: budget.targetBudget,
       targetTokens: budget.targetBudget,
       windowTokens: budget.totalBudget,
       reachTokens: this.opts.reachTokens,
+      qualityGapRatio: this.opts.qualityGapRatio,
       rawZone,
       frozen,
       fixedLevels,
       pinCaps,
       now,
       mergeThreshold: this.opts.mergeThreshold,
-    }).resolutions;
+    });
+    this._lastPlan = plan;
+    return plan.resolutions;
   }
 
   /** Emit one op moving the live state toward the target frontier. */
