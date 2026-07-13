@@ -77,6 +77,10 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.enqueueMerge({ level, sourceIds });
   }
 
+  persistRawSummaries(entries: SummaryEntry[]): void {
+    this.store?.setStateJson(this.summariesStateId, entries);
+  }
+
   // Read-only views for assertions
   getSummariesView(): SummaryEntry[] { return [...this.summaries]; }
   getCounter(): number { return this.summaryIdCounter; }
@@ -169,6 +173,57 @@ describe('AutobiographicalStrategy — persistence', () => {
       assert.equal(summaries[0].mergedInto, 'L2-2', 'L1 mergedInto must persist');
       assert.equal(summaries[1].mergedInto, 'L2-2');
       assert.equal(summaries[2].mergedInto, undefined);
+
+      manager.close();
+    }
+  });
+
+  it('rejects empty summaries at the persistence boundary', async () => {
+    const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    assert.throws(
+      () => strategy.seedL1('   ', ['m1']),
+      /refusing to persist empty summary L1-0 at L1/,
+    );
+    assert.equal(strategy.getSummariesView().length, 0);
+
+    manager.close();
+  });
+
+  it('removes empty legacy parents and clears their child pointers on load', async () => {
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy,
+      });
+
+      const a = strategy.seedL1('summary a', ['m1']);
+      const b = strategy.seedL1('summary b', ['m2']);
+      const parent = strategy.seedL2([a.id, b.id], 'valid before legacy corruption');
+      const corrupted = strategy.getSummariesView().map((summary) =>
+        summary.id === parent.id ? { ...summary, content: '', tokens: 0 } : summary,
+      );
+      strategy.persistRawSummaries(corrupted);
+      manager.sync();
+      manager.close();
+    }
+
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy,
+      });
+
+      const summaries = strategy.getSummariesView();
+      assert.equal(summaries.length, 2, 'empty parent should be removed');
+      assert.ok(summaries.every(summary => summary.content.trim().length > 0));
+      assert.ok(summaries.every(summary => summary.mergedInto === undefined));
 
       manager.close();
     }

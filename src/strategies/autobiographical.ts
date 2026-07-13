@@ -778,6 +778,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
     const nonEmpty = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
     const droppedEmpty = loaded.length - nonEmpty.length;
+    const removedEmptyIds = new Set(
+      loaded
+        .filter(s => s && (typeof s.content !== 'string' || s.content.trim().length === 0))
+        .map(s => s.id),
+    );
     if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
     // Dedupe by id, keeping the copy with mergedInto set (position of first
     // occurrence preserved). Duplicate-id copies with diverging merge state
@@ -792,7 +797,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const dupes = nonEmpty.length - byId.size;
     if (dupes > 0) console.warn(`[autobiographical] deduped ${dupes} duplicate summary id(s) on load`);
-    this.summaries = [...byId.values()];
+    // Dropping an invalid parent is only half the repair. Its children may
+    // still carry `mergedInto: <dropped-id>`, which makes them simultaneously
+    // unavailable to the picker (no parent to render) and ineligible for a
+    // replacement merge (they still look merged). Clear every dangling edge
+    // and persist the canonicalized array so the poison does not return on
+    // every restart.
+    let danglingParents = 0;
+    this.summaries = [...byId.values()].map((summary) => {
+      if (!summary.mergedInto || byId.has(summary.mergedInto)) return summary;
+      danglingParents++;
+      const { mergedInto: _dropped, ...repaired } = summary;
+      return repaired as SummaryEntry;
+    });
+    if (droppedEmpty > 0 || dupes > 0 || danglingParents > 0) {
+      this.store.setStateJson(this.summariesStateId, this.summaries);
+      console.warn(
+        `[autobiographical] repaired summary state: removed ${droppedEmpty} empty, ` +
+          `deduped ${dupes}, cleared ${danglingParents} dangling parent pointer(s)`,
+      );
+    }
+
+    // An invalid L1 may also be referenced by a persisted chunk record. Make
+    // that chunk compressible again instead of leaving it permanently marked
+    // complete with no summary behind it.
+    if (this.chunkPersistenceEnabled && this.chunkRecords.length > 0) {
+      const validL1Ids = new Set(this.summaries.filter(s => s.level === 1).map(s => s.id));
+      let repairedChunkRecords = 0;
+      this.chunkRecords = this.chunkRecords.map((record) => {
+        if (!record.compressed || (record.summaryId && validL1Ids.has(record.summaryId))) {
+          return record;
+        }
+        repairedChunkRecords++;
+        const { summaryId: _dropped, ...rest } = record;
+        return { ...rest, compressed: false };
+      });
+      if (repairedChunkRecords > 0) {
+        this.store.setStateJson(this.chunksStateId, this.chunkRecords);
+        console.warn(
+          `[autobiographical] repaired ${repairedChunkRecords} chunk record(s) with missing L1 summaries`,
+        );
+      }
+    }
 
     const counter = this.store.getStateJson(this.counterStateId);
     this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
@@ -801,6 +847,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQueue = Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[] }>)
       : [];
+    const validMergeQueue = this.mergeQueue.filter(
+      merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
+    );
+    if (validMergeQueue.length !== this.mergeQueue.length) {
+      const removed = this.mergeQueue.length - validMergeQueue.length;
+      this.mergeQueue = validMergeQueue;
+      this.store.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing sources`);
+    }
 
     const pinsState = this.store.getStateJson(this.pinsStateId);
     if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
@@ -1071,6 +1126,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Single point so subclasses inherit persistence.
    */
   protected pushSummary(entry: SummaryEntry): void {
+    if (typeof entry.content !== 'string' || entry.content.trim().length === 0) {
+      throw new Error(
+        `[autobiographical] refusing to persist empty summary ${entry.id} at L${entry.level}`,
+      );
+    }
     this.summaries.push(entry);
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }

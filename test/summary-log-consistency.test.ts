@@ -2,12 +2,11 @@
  * Regression tests for the setMergedInto index-desync clobber
  * (Lena chronicle, 2026-07: 4 summaries silently overwritten).
  *
- * `loadPersistedState` filters empty-content summaries out of the
- * in-memory array while they remain in the persisted log. The old
- * `setMergedInto` edited the log by IN-MEMORY index, so with any empty
- * entry in the log every merge-update landed one slot early —
- * overwriting a neighboring summary and leaving the intended entry as
- * a duplicate-id pair with diverging mergedInto.
+ * `loadPersistedState` historically filtered empty-content summaries out of
+ * memory while leaving them in the persisted log. The old `setMergedInto`
+ * edited the log by IN-MEMORY index, so every merge-update after an empty
+ * entry landed one slot early. Load now canonicalizes the persisted state,
+ * but ID-based edits remain the required defense in depth.
  *
  * Invariants pinned here:
  *   1. setMergedInto edits the log slot with the matching ID, never a
@@ -62,7 +61,8 @@ describe('Summary log consistency (clobber regression)', () => {
       await manager.close();
     }
 
-    // Reopen: in-memory summaries = [L1-1, L1-2]; log = [L1-0, L1-1, L1-2].
+    // Reopen: both memory and the persisted log are canonicalized to the two
+    // valid entries before any merge edit is attempted.
     const strategy = new AutobiographicalStrategy({ recentWindowTokens: 1000 });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     const s = strategy as any;
@@ -73,8 +73,8 @@ describe('Summary log consistency (clobber regression)', () => {
 
     const stored = manager.getStore().getStateJson(SLOT) as any[];
     const byId = new Map(stored.map((x) => [x.id, x]));
-    assert.strictEqual(stored.length, 3, 'no entries added or lost');
-    assert.strictEqual(byId.get('L1-0')?.content, '', 'empty neighbor NOT clobbered');
+    assert.strictEqual(stored.length, 2, 'empty entry removed durably');
+    assert.strictEqual(byId.has('L1-0'), false, 'empty entry must not remain materialized');
     assert.strictEqual(byId.get('L1-1')?.mergedInto, 'L2-99', 'merge update landed on the right entry');
     assert.strictEqual(byId.get('L1-2')?.mergedInto, undefined, 'other neighbor untouched');
     await manager.close();
@@ -91,6 +91,11 @@ describe('Summary log consistency (clobber regression)', () => {
       store.appendToStateJson(SLOT, entry('L1-5', 'the memory', { mergedInto: 'L2-7' }));
       store.appendToStateJson(SLOT, entry('L1-5', 'the memory'));
       store.appendToStateJson(SLOT, entry('L1-6', 'another memory'));
+      store.appendToStateJson(SLOT, entry('L2-7', 'valid parent', {
+        level: 2,
+        sourceLevel: 1,
+        sourceIds: ['L1-5'],
+      }));
       manager.sync();
       await manager.close();
     }
@@ -101,7 +106,7 @@ describe('Summary log consistency (clobber regression)', () => {
     const copies = s.summaries.filter((x: any) => x.id === 'L1-5');
     assert.strictEqual(copies.length, 1, 'duplicate id deduped on load');
     assert.strictEqual(copies[0].mergedInto, 'L2-7', 'merged copy preferred — plain dupe must not resurrect on the unmerged frontier');
-    assert.strictEqual(s.summaries.length, 2);
+    assert.strictEqual(s.summaries.length, 3);
     await manager.close();
   });
 });
