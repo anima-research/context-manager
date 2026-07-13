@@ -4,6 +4,8 @@
 
 ## Changelog
 
+- **rev 5.0 (2026-07-12)**: The kv-stable controller is redesigned as a **single-path solve** — the emergency path, the reach *eligibility gate*, and the fold/expand pass pair are removed. One algorithm per turn: build the salience-weighted **ideal cut** (relevance only, W the sole hard wall), then reconcile it against the carried frontier under a **perturbation trust region** (P, the re-priced `reachTokens`) via suffix adoption, with a **quality-gap override** allowed to exceed P. Salience becomes a per-chunk *coefficient on information loss* (fold-cheap content: externalized code / tool output / images) rather than an eligibility rule. Motivated by the 2026-07-12 production incident (mythos): the emergency path + a reach-gated from-scratch pick manufactured an **inverted resolution profile** (oldest history at L1, the most recent days at L3) which the reach gate then made permanently unrepairable. See **section 13**, which supersedes 12.2 / 12.4 where they conflict.
+
 - **rev 4.0 (2026-06-22)**: Reconciliation against the post-PR #19 solver evolution (shipped on `main`, `context-manager` >= 0.5.3). Three changes reshaped the picker and are documented in the new **section 12**, which is the current source of truth where it conflicts with sections 3.5/3.7/3.9/5: (a) a `best-fit` sequence-DP strategy was added and the earlier **half-life / value-minus-lambda-KVcost solver was removed** (`ea198a1`) -- flat-profile is the baseline, not a lambda solve; (b) a **`kv-stable`** controller (`kv-control.ts`) landed as the production default -- a receding-horizon policy under a constraint hierarchy that **replaces cache-as-a-cost-term with cache-as-a-structural-constraint** (the reach cap); (c) kv-stable is **bidirectional** (it un-folds to use budget headroom), so the "V1 ships only monotonic strategies" claim in section 3.9 no longer holds. A production limitation surfaced (opus4): the `foldDepthCap` saliency geometry is a hard per-chunk ceiling that mis-scales to the token wall -- see section 12.4.
 
 - **rev 3.0 (2026-05-15)**: Reconciliation pass against the implementation that landed in PR #19. The architectural shape from rev 2.3 stood; this revision corrects the spots where the implementation diverged from or extended the doc — per-chunk state lives in dedicated state slots rather than on `MessageEntry` records, `mergedInto` is retained as a read-compat alias for `parentId` rather than removed, `FoldingState` is methods-not-fields, the picker returns `produced` ops for the strategy to route (not the picker itself), and the scope grew ~3× over the rev-2 estimate. Lock API simplified to strategy methods only.
@@ -649,3 +651,169 @@ Surfaced in production (opus4, ~600-message conversation against opus-4's 200k w
 
 Still open -- a normal-path **fidelity calibration**, no longer a crash: the cap's *steepness* couples the fade rate to `mergeThreshold`, so L3 needs ~`k^2` = 36 flat-zones of history and the gradient floors at L2 under the *soft* target even when L3 would pack more fidelity per token. Option (a) -- make the steepness budget-driven (solve the slope so "fold to shape" meets the soft target by construction; likely also fixes the non-convergence seen when the fixed base was naively lowered) -- remains the principled refinement. Option (b), dropping the ceiling, is now effectively what the *emergency* path does.
 
+
+
+## 13. Rev 5.0: the single-path solve (supersedes 12.2 / 12.4 where they conflict)
+
+### 13.1 The incident that forced this (mythos, 2026-07-12)
+
+A day-long image-heavy session pushed compression-merge requests over the API's
+32MB byte cap; every L2 merge 413'd for ~7 hours, summary production stalled
+while ingest continued, and the fully-folded floor of the middle grew past the
+hard budget — `OverBudgetError` on every wake. Recovery involved a summary-tree
+repair and a **resolution-state reset**. The first pick after the reset ran with
+an empty carried frontier:
+
+1. Everything started raw — far over W.
+2. The polite pass folded **only inside the reach band** (the newest ~400k raw
+   tokens), crushing the most recent days to L3 while forbidden from touching
+   anything older.
+3. Still over W → the **emergency** lifted reach and folded the *old* history
+   oldest-first, level-by-level, **returning at first fit** — old content
+   reached only L1.
+
+Result: an **inverted resolution profile** — June at L1 (dozens of fine recall
+slices, many of them low-value duplication-era fossils), the most recent and
+most relevant days collapsed into four L3 mega-summaries directly behind the
+raw tail. The profile then froze: the dead band meant the expander never ran,
+and the reach gate made the L3 groups (whose oldest leaves lie beyond reach)
+categorically ineligible for un-folding. A misallocated frontier with no path
+back — while ~60k of window paid for fine-grained ancient history.
+
+Two design errors compound here, and both are *structural*, not tuning:
+
+- **Cache-protection expressed as eligibility.** The reach cap is an
+  *incremental-turn* concept. Applied to a from-scratch pick (no cache exists)
+  or inside the emergency (cache already forfeited by the reach lift itself),
+  it only distorts the outcome — there is nothing left to protect.
+- **A second solver for the hard case.** The emergency is a different algorithm
+  with different semantics that runs precisely when the stakes are highest, and
+  it optimizes for a cache it has already destroyed (first-fit, inherited
+  pre-pass wreckage).
+
+### 13.2 The model
+
+One solve, every turn. One hard constraint. Cache is a *priced quantity*, never
+an eligibility rule.
+
+```
+minimize    relevance_loss(F) + λ·perturbation(F, F_prev)
+subject to  render(F) ≤ W                 -- the only physics
+            perturbation(F, F_prev) ≤ P   -- trust region: soft, default-on,
+                                          -- overridable with cause
+```
+
+- `relevance_loss(F) = Σ_chunks salience(c, t) · infoLoss(level_F(c))` — see 13.3.
+- `perturbation(F, F_prev)` — exact, not modeled: rendered tokens from the
+  earliest position where `F`'s layout diverges from `F_prev`'s to the end
+  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read.
+- `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
+  not a spatial eligibility gate. It bounds how much perturbation an ordinary
+  turn may take; it never determines *which* chunks may move.
+- `W` — unchanged: the physical wall. Infeasibility at max fold is a loud
+  failure (`OverBudgetError`), correctly pointing at summary *production*, not
+  allocation.
+
+**Override rule (what replaces the emergency).** The trust region may be
+exceeded, same algorithm, same code path, when either:
+
+1. **Infeasible within P** — no frontier within P of `F_prev` fits under W.
+   Mandatory and automatic: feasibility beats continuity, always.
+2. **Quality gap** — the best frontier within P is certifiably bad:
+   `relevance_loss(best_within_P) − relevance_loss(ideal)` exceeds a
+   configured fraction of `relevance_loss(ideal)`. The solver takes the ideal
+   and pays the perturbation. This is the self-healing property: a stuck
+   misallocated profile *is* a persistent quality gap, so it repairs itself
+   instead of fossilizing.
+3. **Bootstrap** — `F_prev` is empty (reset, first run): perturbation is
+   undefined, P never enters; pure relevance solve.
+
+Every override is loud: the plan reports `override: 'infeasible' | 'quality-gap'
+| 'bootstrap'` plus the exact perturbation, and the strategy layer logs a
+`[kv-escalation]` line. Silence was half of the incident.
+
+### 13.3 Salience as a coefficient (not a cap)
+
+`foldDepthCap`'s log-age banding survives only as the *shape prior* inside the
+ideal cut. The load-bearing relevance signal is per-chunk **salience** — the
+weight on that chunk's information loss:
+
+- **Static prior — "is the window the only copy?"** Content whose payload is
+  externalized folds cheap: code that lives on disk/git, tool_results
+  (re-derivable), logs, URL link-drops, images (the file/CDN retains them).
+  Conversation exists nowhere but the chronicle — folding it destroys the only
+  copy — so it stays expensive. Computable at chunk creation from composition
+  (fraction of tool blocks / code fences / images / bare links).
+- **Dynamic modulation (v2)** — a multiplier over the static prior: chunks
+  coupled to the *current* activity (same files, same locus, same task; recent
+  recall hits) are boosted above their prior; the boost decays when the
+  activity closes. "While coding, recent code is hot; once done, it folds
+  soon" — implemented as decay plus the λ term (a refold happens when the
+  relevance gain covers its perturbation bill), not as a state machine.
+- **v2 source upgrade**: the summarizer already reads every chunk at
+  compression time — it can emit a salience annotation and "payload
+  externalized to <path>" flags as metadata, riding a call we already pay for.
+- The image-strip post-pass (`imageStripDepthTokens` / `maxLiveImages`) is a
+  hardcoded special case of this coefficient (images = maximal static
+  cheapness, fastest decay) and should eventually dissolve into it — fixing,
+  in passing, its known tail-starvation bug (the recent-window boundary is
+  computed pre-strip and never refilled after stripping).
+
+Hard protections are unchanged and are the only remaining eligibility rules:
+flat zone / head / tail raw, pins (classic, pin-at-level-k, pin-max-level),
+locked chunks. Salience never overrides a pin.
+
+### 13.4 The per-turn algorithm
+
+```
+solve(tree, F_prev, W, P):
+  ideal = relevanceCut(tree, target, W)
+      -- from scratch, no P anywhere:
+      -- fold in salience-then-age priority order, level-by-level, respecting
+      --   the shape prior; continue past the prior (never past hard
+      --   protections) if still over W; then pack youngest-first back toward
+      --   the target; project to a valid group-consistent cut
+      -- floor > W → infeasible → OverBudgetError (loud)
+
+  if F_prev empty → ideal                          (bootstrap)
+
+  Δ = perturbation(ideal, F_prev)                  (exact, kvCost)
+  in dead band and quality gap small → F_prev      (quiet turn, zero cost)
+  Δ ≤ P → ideal                                    (ordinary turn)
+
+  partial = suffixAdopt(ideal, F_prev, P)
+      -- adopt ideal's changes newest-first only: keep F_prev before boundary
+      -- B, take ideal after it; slide B oldest-ward until P is spent.
+      -- Perturbation is prefix-based, so partial adoption is exactly a
+      -- suffix cut — no combinatorial search.
+  partial fits W and gap(partial, ideal) ≤ threshold → partial
+      -- receding-horizon repair: the next turns keep adopting, P at a time
+
+  otherwise → ideal, override recorded             (infeasible / quality-gap)
+```
+
+Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally
+small, and the solve is indistinguishable from the old polite pass — nothing
+is legislated. The old behaviors (dead band, reach, emergency) are all regions
+of one parameter space instead of three code paths. A from-scratch solve is
+age/salience-monotone **by construction** (fold order = priority order), so
+the inversion class of bug cannot be produced.
+
+**Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
+vs amortize" explicit; a future refinement schedules big adoptions onto turns
+whose cache is already cold (restart, config change, model swap — visible as
+`cache_creation >> cache_read` on the previous call), making restoration free.
+
+### 13.5 What §12 language this retires
+
+- "Emergency", "reach is lifted", `foldWithinReach(Infinity, ignoreCaps)` —
+  gone; overrides are the same algorithm with the trust region priced out.
+- Reach as "how far back a fold may edit" — reach (`reachTokens`) is now P,
+  a perturbation trust region in tokens re-read, direction-free.
+- The §12.4 "Option (a) budget-driven steepness" calibration question is
+  absorbed: the ideal cut folds by priority until the target is met, so the
+  gradient's depth is budget-driven by construction and `mergeThreshold`
+  no longer bounds the achievable depth.
+- The fold/expand watermark pair remains only as the dead-band boundary of
+  the trust-region logic (`foldAtTokens` / `expandAtTokens` keep their config
+  meaning).

@@ -1,5 +1,13 @@
 # KV-stable context control
 
+> **Rev 5.0 note (2026-07-12):** the two-pass fold-within-reach + emergency
+> controller described below was replaced by the single-path solve — one
+> algorithm, W the only hard wall, reach re-priced as a perturbation trust
+> region with recorded overrides, salience as a coefficient. See
+> `adaptive-resolution-design.md` §13, which supersedes this document where
+> they conflict. The measurement harness (sim/replay) described here is
+> unchanged.
+
 Status: implemented. `KvStableStrategy` is selectable via
 `config.foldingStrategy: 'kv-stable'`; the controller core (`kv-control.ts`) is
 measured via `kv-replay` and the real-`ContextManager` harness
