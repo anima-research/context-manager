@@ -2,6 +2,7 @@ import type {
   StoredMessage,
   MessageStoreView,
   KnowledgeConfig,
+  KnowledgeOptions,
   SummaryEntry,
   SummaryLevel,
   PhaseType,
@@ -29,7 +30,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
 
   private knowledgeConfig: KnowledgeConfig;
 
-  constructor(config: Partial<KnowledgeConfig> = {}) {
+  constructor(config: KnowledgeOptions = {}) {
     // Force hierarchical mode
     super({ ...config, hierarchical: true });
     // Merge knowledge-specific fields onto the base config so all KnowledgeConfig

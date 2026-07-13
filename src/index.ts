@@ -47,10 +47,12 @@ export type {
   ReadinessState,
   ContextStrategy,
   AutobiographicalConfig,
+  AutobiographicalOptions,
   SummaryLevel,
   SummaryEntry,
   PhaseType,
   KnowledgeConfig,
+  KnowledgeOptions,
   ResettableStrategy,
 } from './types/index.js';
 

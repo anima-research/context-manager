@@ -13,6 +13,7 @@ import type {
   ContextEntry,
   StoredMessage,
   AutobiographicalConfig,
+  AutobiographicalOptions,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -442,7 +443,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Lazy picker instance, built from config.foldingStrategy. */
   private _adaptivePicker: Picker | null = null;
 
-  constructor(config: Partial<AutobiographicalConfig> = {}) {
+  constructor(config: AutobiographicalOptions = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
     // Hierarchical is on by default; set hierarchical: false to use legacy single-level
     this.config.hierarchical ??= true;
