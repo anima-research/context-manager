@@ -23,6 +23,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-head-window-order';
+const TEST_COMPRESSION_MODEL = 'test-compression-model';
 
 function cleanup() {
   if (existsSync(TEST_STORE_PATH)) {
@@ -73,6 +74,7 @@ describe('Compression prompt ordering (confabulation regression)', () => {
     cleanup();
     const { membrane, calls } = createCapturingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 80,
       headWindowTokens: 60, // covers the two sentinel opening messages
       recentWindowTokens: 0,
@@ -122,6 +124,7 @@ describe('Compression prompt ordering (confabulation regression)', () => {
     cleanup();
     const { membrane, calls } = createCapturingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 40,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -163,6 +166,7 @@ describe('Compression prompt ordering (confabulation regression)', () => {
     cleanup();
     const { membrane, calls } = createCapturingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 60,
       headWindowTokens: 0,
       recentWindowTokens: 0,

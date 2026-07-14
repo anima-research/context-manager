@@ -46,6 +46,7 @@ function cleanup() {
 
 const SUMS = 'default/autobio:summaries';
 const CHUNKS = 'default/autobio:chunks';
+const TEST_COMPRESSION_MODEL = 'test-compression-model';
 
 interface ApiMessage { participant: string; content: ContentBlock[] }
 
@@ -112,6 +113,7 @@ describe('Chunk persistence: close-then-compress', () => {
     const path = freshPath();
     const { membrane, calls } = mockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 1000, // far above what 6 tiny messages reach
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -135,6 +137,7 @@ describe('Chunk persistence: close-then-compress', () => {
     const path = freshPath();
     const { membrane } = mockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 120,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -168,6 +171,7 @@ describe('Chunk persistence: close-then-compress', () => {
     const path = freshPath();
     const { membrane } = mockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 100,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -196,6 +200,7 @@ describe('Chunk persistence: close-then-compress', () => {
     const { membrane } = mockMembrane();
     {
       const strategy = new AutobiographicalStrategy({
+        compressionModel: TEST_COMPRESSION_MODEL,
         targetChunkTokens: 100,
         headWindowTokens: 0,
         recentWindowTokens: 0,
@@ -212,6 +217,7 @@ describe('Chunk persistence: close-then-compress', () => {
     // chunk (exact sourceIds match fails) and re-compresses all of history.
     const fresh = mockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 170, // drifted
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -240,7 +246,10 @@ describe('Chunk persistence: close-then-compress', () => {
     // Seed: chunk records referencing message ids that do NOT exist (as after
     // a messages chain break / renumbering), while live messages are present.
     {
-      const strategy = new AutobiographicalStrategy({ recentWindowTokens: 1000 });
+      const strategy = new AutobiographicalStrategy({
+        compressionModel: TEST_COMPRESSION_MODEL,
+        recentWindowTokens: 1000,
+      });
       const manager = await ContextManager.open({ path, strategy, membrane });
       const store = manager.getStore();
       try {
@@ -259,6 +268,7 @@ describe('Chunk persistence: close-then-compress', () => {
     }
 
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 100,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -283,7 +293,10 @@ describe('Chunk persistence: close-then-compress', () => {
     // Seed a LEGACY store: messages + L1 summaries, NO chunks slot.
     // Includes a prefix family (L1-1 ⊂ L1-2) from the old partial-tail bug.
     {
-      const strategy = new AutobiographicalStrategy({ recentWindowTokens: 100000 });
+      const strategy = new AutobiographicalStrategy({
+        compressionModel: TEST_COMPRESSION_MODEL,
+        recentWindowTokens: 100000,
+      });
       const manager = await ContextManager.open({ path, strategy, membrane });
       const store = manager.getStore();
       const ids: string[] = [];
@@ -310,6 +323,7 @@ describe('Chunk persistence: close-then-compress', () => {
     }
 
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 100,
       headWindowTokens: 0,
       recentWindowTokens: 0,

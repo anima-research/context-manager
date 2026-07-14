@@ -26,6 +26,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-compression-shape';
+const TEST_COMPRESSION_MODEL = 'test-compression-model';
 
 function cleanup() {
   if (existsSync(TEST_STORE_PATH)) {
@@ -136,6 +137,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 80,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -174,6 +176,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 80,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -216,6 +219,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 50,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -256,6 +260,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 40,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -314,6 +319,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 60,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -347,6 +353,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 50,
       headWindowTokens: 0,
       recentWindowTokens: 0,
@@ -376,6 +383,7 @@ describe('Compression pipeline: API shape invariants', () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 50,
       headWindowTokens: 0,
       recentWindowTokens: 0,

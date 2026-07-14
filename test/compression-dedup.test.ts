@@ -24,6 +24,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { SummaryEntry } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-compression-dedup';
+const TEST_COMPRESSION_MODEL = 'test-compression-model';
 
 function cleanup() {
   if (existsSync(TEST_STORE_PATH)) {
@@ -48,6 +49,7 @@ describe('Concurrent compression: stale chunk identity', () => {
     };
 
     const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 50,
       headWindowTokens: 0,
       recentWindowTokens: 0,
