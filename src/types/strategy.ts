@@ -603,6 +603,14 @@ export interface AutobiographicalConfig {
 }
 
 /**
+ * Constructor options for AutobiographicalStrategy. Every field is optional;
+ * omitted fields fall back to DEFAULT_AUTOBIOGRAPHICAL_CONFIG. Exported so
+ * downstream hosts can type their option plumbing against the strategy's
+ * actual contract instead of an untyped bag.
+ */
+export type AutobiographicalOptions = Partial<AutobiographicalConfig>;
+
+/**
  * Compression level in the hierarchical pyramid.
  *
  * Historically constrained to 1 | 2 | 3. As of the adaptive-resolution design
@@ -756,6 +764,12 @@ export interface KnowledgeConfig extends AutobiographicalConfig {
    *  Prevents synthesis from starving lessons/subagent/research phases. */
   synthesisL1BudgetCap?: number;
 }
+
+/**
+ * Constructor options for KnowledgeStrategy. Every field is optional;
+ * omitted fields fall back to the strategy's defaults.
+ */
+export type KnowledgeOptions = Partial<KnowledgeConfig>;
 
 /**
  * Default configuration for Autobiographical strategy.
