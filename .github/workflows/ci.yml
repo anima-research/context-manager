@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Both platforms: a package-lock.json regenerated over an existing
+      # node_modules tree records only that machine's native binaries, so a
+      # lock made on macOS breaks Linux installs and vice versa. Each runner
+      # catches the lock the other's platform produced. Tests run on ubuntu.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # npm ci installs the lock verbatim: npm >= 11 'npm install' silently
+      # re-resolves platform packages missing from the lock, so only npm ci
+      # fails loudly on a broken or out-of-sync lockfile.
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        if: matrix.os == 'ubuntu-latest'
+        run: npm test
