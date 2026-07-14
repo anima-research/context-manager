@@ -411,6 +411,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected ns: string = '';
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
+  /** Memories are identity-bearing: a substitute model writing summaries in
+   *  the agent's voice corrupts the record. If the configured model is
+   *  missing, refuse LOUDLY instead of silently substituting a default -
+   *  everyone must know that memory formation is halted. */
+  protected requireCompressionModel(): string {
+    const m = this.config.compressionModel;
+    if (!m) {
+      const msg = "autobio: compressionModel is NOT configured - refusing to write "
+        + "memories with a substitute model. Memory formation is halted until the "
+        + "recipe names the model whose voice these memories are.";
+      console.error(msg);
+      logCompressionCall({ event: "no-compression-model", fatal: true });
+      throw new Error(msg);
+    }
+    return m;
+  }
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
@@ -2210,7 +2226,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
         .filter(m => m.content.length > 0),
       config: {
-        model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+        model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
@@ -2330,7 +2346,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
-          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          model: this.requireCompressionModel(),
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
         },
@@ -2821,7 +2837,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
         .filter(m => m.content.length > 0),
       config: {
-        model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+        model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
@@ -2924,7 +2940,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           source_level: sources[0]?.level ?? null,
           source_level_shown: sourceLevelShown,
           target_tokens: targetTokens,
-          model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+          model: this.requireCompressionModel(),
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
         },
@@ -4497,7 +4513,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       messages: [{ participant: 'Context Manager', content: [{ type: 'text', text: instruction }] }],
       system: 'You are forming a transition summary between conversation topics. Write concisely.',
       config: {
-        model: this.config.compressionModel ?? 'claude-sonnet-4-20250514',
+        model: this.requireCompressionModel(),
         maxTokens: 1500,
       },
     };
