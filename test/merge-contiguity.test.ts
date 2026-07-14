@@ -37,7 +37,7 @@ function summary(id: string, first: number, last: number): SummaryEntry {
 
 function probe(): Probe {
   const p = new Probe({ adaptiveResolution: true, autoTickOnNewMessage: false });
-  p.setChunks(Array.from({ length: 4000 }, (_, i) => `m-${i}`));
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
   return p;
 }
 
@@ -70,6 +70,7 @@ test('small holes bridge; interior runs consolidate early; the newest run waits'
   const interior = p.pick(unmerged, 6);
   assert.ok(interior, 'interior run consolidates without reaching threshold');
   assert.deepEqual(interior!.map((s) => s.id).sort(), ['a', 'b', 'c', 'd', 'e'], 'the stranded five, not f');
+  assert.ok(!interior!.some((x) => x.id === 'f'), 'the distant candidate is never bridged in');
   assert.ok(p.pick(unmerged, 5), 'the contiguous five qualify at threshold 5');
   // The NEWEST run can still grow — below threshold it waits.
   assert.equal(p.pick(unmerged.slice(0, 5), 6), null, 'newest run below threshold waits');
@@ -87,4 +88,27 @@ test('wide-span (replay-era) candidates are quarantined from any run', () => {
   assert.equal(p.pick(unmerged, 6), null, 'wide-span candidate cannot complete a run');
   const five = p.pick(unmerged, 5);
   assert.ok(five && !five.some((s) => s.id === 'replay'), 'replay stays on the frontier');
+});
+
+test('stranded interior runs merge at >=2; only the newest run waits for the threshold', () => {
+  const p = probe();
+  const msgs = (a: number, b: number) => Array.from({ length: b - a + 1 }, (_, i) => `m-${a + i}`);
+  void msgs;
+  // The mythos starvation shape: two runs, both BELOW threshold, separated by a
+  // huge hole. Old code: no run reaches 6 → nothing ever merges → the pyramid
+  // freezes and the fold floor grows without bound.
+  const unmerged = [
+    summary('a', 913, 922), summary('b', 923, 938), summary('c', 939, 957),
+    summary('d', 958, 963), summary('e', 964, 981),        // interior run (5)
+    summary('f', 4039, 4065), summary('g', 4066, 4083),
+    summary('h', 4084, 4094), summary('i', 4095, 4105),
+    summary('j', 4106, 4131),                              // newest run (5)
+  ];
+  const run = p.pick(unmerged, 6);
+  assert.ok(run, 'the stranded interior run merges rather than waiting forever');
+  assert.deepEqual(run!.map((s) => s.id), ['a','b','c','d','e'], 'oldest stranded run, all 5');
+
+  // The newest run alone (nothing stranded) still waits for the full threshold.
+  const onlyNewest = unmerged.slice(5);
+  assert.equal(p.pick(onlyNewest, 6), null, 'the growable run waits for 6');
 });

@@ -23,6 +23,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
+import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -607,23 +608,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const msgIndex = new Map<string, number>();
     store.getAll().forEach((m, i) => msgIndex.set(m.id, i));
 
-    // Sort by (start position asc, span length desc) so at each starting
-    // point the LONGEST generation claims the ground first.
-    const sorted = [...l1s].sort((a, b) => {
-      const sa = msgIndex.get(a.sourceIds[0]) ?? Number.MAX_SAFE_INTEGER;
-      const sb = msgIndex.get(b.sourceIds[0]) ?? Number.MAX_SAFE_INTEGER;
-      return sa - sb || b.sourceIds.length - a.sourceIds.length;
-    });
-
-    const covered = new Set<string>();
-    let skippedStale = 0;
-    let skippedGhost = 0;
-    for (const s of sorted) {
-      // An L1 none of whose messages exist anymore can't own live ground.
-      if (!s.sourceIds.some(id => msgIndex.has(id))) { skippedGhost++; continue; }
-      // Fully-covered = stale generation / contained duplicate.
-      if (s.sourceIds.every(id => covered.has(id))) { skippedStale++; continue; }
-      for (const id of s.sourceIds) covered.add(id);
+    // Coverage sweep (start asc, span desc; longest generation per start
+    // wins; fully-covered generations are stale) — shared with the pyramid
+    // repair script, see keeper-selection.ts.
+    const { keepers, skippedStale, skippedGhost } = selectKeeperL1s(l1s, msgIndex);
+    for (const s of keepers) {
       this.appendChunkRecord({
         id: `c-${this.chunkIdCounter++}`,
         sourceIds: [...s.sourceIds],
