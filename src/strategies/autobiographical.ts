@@ -290,14 +290,25 @@ interface CompressionRefusalVariantRecord {
  */
 interface CompressionRefusalQuarantineRecord {
   key: string;
+  familyKey: string;
   model: string;
   chunkSourceHash: string;
   frontierHash: string;
   canonicalRequestHash: string;
+  accountingSource: string;
+  canonicalRequestBoundTokens: number;
+  canonicalProviderInputTokens?: number;
+  normalizedConfig: CompressionRefusalNormalizedConfig;
   fallbackLimit: number;
   contextBudgetTokens: number;
   plan: CompressionRefusalPlanRecord[];
   created: number;
+}
+
+interface CompressionRefusalNormalizedConfig {
+  fallbackLimit: number;
+  contextBudgetTokens: number;
+  requestConfig: NormalizedRequest['config'];
 }
 
 type CompressionAttemptOutcome =
@@ -318,6 +329,14 @@ interface CompressionRefusalOutcomeRecord {
 
 interface CompressionRefusalPlanRecord extends CompressionRefusalVariantRecord {
   curveLabel: string;
+  accountingSource:
+    | 'complete_normalized_request_bound'
+    | 'canonical_provider_usage_plus_expansion';
+  canonicalRequestBoundTokens: number;
+  deterministicInputBoundTokens: number;
+  expansionDeltaTokens: number;
+  boundedInputTokens: number;
+  outputReserveTokens: number;
   admittedTokens: number;
   budgetTokens: number;
   disposition: 'provider_attempt' | 'admission_rejected';
@@ -402,7 +421,7 @@ interface RecallCurveVariant {
   leafCoverageHash: string;
   request: NormalizedRequest;
   requestHash: string;
-  renderedInputBytes: number;
+  deterministicInputBoundTokens: number;
 }
 
 interface CompressionAttemptTrace {
@@ -438,6 +457,8 @@ function sha256Json(value: unknown): string {
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
+const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
+  'max(canonical_provider_input+positive_expansion,complete_normalized_request_utf8_bound)+output_reserve';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
 const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
@@ -907,23 +928,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.ns = ctx.namespace;
     this.compressionBranchGeneration++;
     observeStoreBranch(ctx.store);
+    const sourceBranch = this.captureCompressionBranch();
+
+    // Initialization has one asynchronous boundary (pending alert delivery).
+    // Treat each synchronous section around it as a branch-generation guarded
+    // critical section: a manager sharing this store may switch the Chronicle
+    // branch while this initializer is suspended.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.registerStates();
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.loadPersistedState();
-    await this.deliverPendingCompressionQuarantineAlerts(this.captureCompressionBranch());
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+    await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
 
     // Restore headWindowStartId from last topic transition message
     const messages = ctx.messageStore.getAll();
-    this.headWindowStartId = null;
+    let headWindowStartId: string | null = null;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (this.isTopicTransitionMessage(messages[i])) {
-        this.headWindowStartId = messages[i].id;
+        headWindowStartId = messages[i].id;
         break;
       }
     }
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+    this.headWindowStartId = headWindowStartId;
     // Legacy stores (pre chunk-persistence) have L1 summaries but no chunk
     // records — synthesize records from L1 sourceIds before the first
     // rebuild, so covered ground is owned and never re-compressed.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.migrateChunkRecords(ctx.messageStore);
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.rebuildChunks(ctx.messageStore);
     // Kick the merge ladder for pre-existing unmerged summaries. Normally a
     // compression/merge completion does this, but a store that boots with a
@@ -931,6 +966,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // repair pruned duplicates and un-merged survivors) would otherwise
     // never start consolidating. Idempotent: already-queued/merged sources
     // are skipped.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     if (this.config.hierarchical && !this.chunkRecordsOrphaned) {
       this.checkMergeThreshold();
     }
@@ -1584,24 +1620,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Math.ceil(JSON.stringify(request).length / 4);
   }
 
-  private compressionRequestInputBytes(request: NormalizedRequest): number {
-    // Independent from stored token metadata and chars/4 estimation. The
-    // normalized request contains every input-bearing field (messages, tools,
-    // system/provider params); UTF-8 bytes are an upper bound on additional
-    // byte-token vocabulary consumption when used for expansion deltas.
-    const input = {
-      messages: request.messages,
-      system: request.system,
-      tools: request.tools,
-      toolMode: request.toolMode,
-      stopSequences: request.stopSequences,
-      promptCaching: request.promptCaching,
-      cacheTtl: request.cacheTtl,
-      contextPrefix: request.contextPrefix,
-      prefillUserMessage: request.prefillUserMessage,
-      providerParams: request.providerParams,
-    };
-    return Buffer.byteLength(JSON.stringify(input), 'utf8');
+  private compressionRequestInputBoundTokens(request: NormalizedRequest): number {
+    // Serialize the COMPLETE normalized request rather than maintaining a
+    // hand-picked field list that can silently fall behind Membrane's request
+    // type. Every enumerable field actually dispatched is therefore counted,
+    // including generation config, participant/streaming controls, tools,
+    // provider params, raw blocks, and future normalized fields. UTF-8 bytes
+    // conservatively dominate ordinary tokenizer vocabulary pieces. The fixed
+    // and per-message reserve covers formatter/provider role envelopes and
+    // special tokens that are not represented by normalized JSON itself.
+    const serialized = JSON.stringify(request);
+    if (typeof serialized !== 'string') {
+      throw new Error('Compression request is not serializable');
+    }
+    return Buffer.byteLength(serialized, 'utf8') + 512 + request.messages.length * 128;
   }
 
   private refusalCategory(response: NormalizedResponse): string | undefined {
@@ -1911,7 +1943,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           leafCoverageHash,
           request,
           requestHash: sha256Json(request),
-          renderedInputBytes: this.compressionRequestInputBytes(request),
+          deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(request),
         });
       } catch {
         // One malformed/unsupported variant cannot suppress later candidates.
@@ -1932,21 +1964,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Freeze the exact deterministic fallback/admission plan before canonical
-   * inference. Admission is based on the complete normalized variant input,
-   * not optional provider usage metadata, so the durable family key is stable
-   * across restarts and includes tools/head/raw/provider fields.
+   * Freeze the exact fallback/admission plan. Before canonical inference this
+   * supplies a deterministic family identity; after a refusal it is rebuilt
+   * with authoritative canonical provider usage. Every admission still has a
+   * complete normalized-request floor, so tools/head/raw/config/provider fields
+   * cannot disappear when usage is absent or unexpectedly small.
    */
-  private compressionRefusalPlan(variants: RecallCurveVariant[]): CompressionRefusalPlanRecord[] {
+  private compressionRefusalPlan(
+    canonicalRequest: NormalizedRequest,
+    variants: RecallCurveVariant[],
+    canonicalProviderInputTokens?: number,
+  ): CompressionRefusalPlanRecord[] {
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     if (fallbackLimit === 0) return [];
     const budgetTokens = this.normalizedCompressionContextBudget();
+    const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
     const plan: CompressionRefusalPlanRecord[] = [];
     let providerAttempts = 0;
     for (const variant of variants) {
       if (providerAttempts >= fallbackLimit) break;
-      const admittedTokens = variant.renderedInputBytes +
-        variant.request.messages.length * 128 + variant.request.config.maxTokens;
+      // A recall-curve variant is an expansion of the canonical prompt. When
+      // the provider reports canonical input usage, it is authoritative and
+      // must dominate admission even if our serialization happens to be
+      // smaller. The positive delta prevents a nominally smaller/identical
+      // serialization from treating an expansion as free.
+      const expansionDeltaTokens = Math.max(
+        1,
+        variant.deterministicInputBoundTokens - canonicalRequestBoundTokens,
+      );
+      const providerExpandedInputTokens = canonicalProviderInputTokens === undefined
+        ? undefined
+        : canonicalProviderInputTokens + expansionDeltaTokens;
+      const boundedInputTokens = Math.max(
+        variant.deterministicInputBoundTokens,
+        providerExpandedInputTokens ?? 0,
+      );
+      const accountingSource = providerExpandedInputTokens !== undefined &&
+          providerExpandedInputTokens >= variant.deterministicInputBoundTokens
+        ? 'canonical_provider_usage_plus_expansion' as const
+        : 'complete_normalized_request_bound' as const;
+      const outputReserveTokens = Math.max(0, Math.ceil(variant.request.config.maxTokens));
+      const admittedTokens = boundedInputTokens + outputReserveTokens;
       const disposition = admittedTokens > budgetTokens
         ? 'admission_rejected' as const
         : 'provider_attempt' as const;
@@ -1955,6 +2013,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         parentId: variant.parent.id,
         childIds: variant.children.map((child) => child.id),
         requestHash: variant.requestHash,
+        accountingSource,
+        canonicalRequestBoundTokens,
+        deterministicInputBoundTokens: variant.deterministicInputBoundTokens,
+        expansionDeltaTokens,
+        boundedInputTokens,
+        outputReserveTokens,
         admittedTokens,
         budgetTokens,
         disposition,
@@ -2160,6 +2224,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(source)) return;
       const projection = this.readCompressionQuarantineProjection();
       for (const active of projection.values()) {
+        if (!this.isCompressionBranchCurrent(source)) return;
         const pending = active.pendingAlert;
         if (!pending || active.sentAlertKeys.has(pending.alertKey)) {
           continue;
@@ -2182,6 +2247,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
           continue;
         }
+        if (!this.isCompressionBranchCurrent(source)) return;
         this.appendCompressionQuarantineEvent({
           kind: 'alert_sent',
           key: active.record.key,
@@ -2191,6 +2257,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           created: Date.now(),
         });
       }
+      if (!this.isCompressionBranchCurrent(source)) return;
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(source);
     });
@@ -2233,8 +2300,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     chunk: Chunk,
     model: string,
     canonicalRequestHash: string,
+    canonicalRequest: NormalizedRequest,
     keptSummaries: SummaryEntry[],
+    variants: RecallCurveVariant[],
     plan: CompressionRefusalPlanRecord[],
+    canonicalProviderInputTokens?: number,
   ): CompressionRefusalQuarantineRecord {
     const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
     const frontierHash = sha256Json(
@@ -2242,21 +2312,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
-    const key = sha256Json({
-      model,
+    const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
+    const normalizedConfig: CompressionRefusalNormalizedConfig = {
       fallbackLimit,
       contextBudgetTokens,
+      requestConfig: canonicalRequest.config,
+    };
+    const familyKey = sha256Json({
+      model,
       chunkSourceHash,
       frontierHash,
       canonicalRequestHash,
+      accountingSource: COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
+      normalizedConfig,
+      variants: variants.map((variant) => ({
+        parentId: variant.parent.id,
+        childIds: variant.children.map((child) => child.id),
+        requestHash: variant.requestHash,
+      })),
+    });
+    const key = sha256Json({
+      familyKey,
+      model,
+      chunkSourceHash,
+      frontierHash,
+      canonicalRequestHash,
+      accountingSource: COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
+      canonicalRequestBoundTokens,
+      canonicalProviderInputTokens,
+      normalizedConfig,
       plan,
     });
     return {
       key,
+      familyKey,
       model,
       chunkSourceHash,
       frontierHash,
       canonicalRequestHash,
+      accountingSource: COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
+      canonicalRequestBoundTokens,
+      ...(canonicalProviderInputTokens !== undefined ? { canonicalProviderInputTokens } : {}),
+      normalizedConfig,
       fallbackLimit,
       contextBudgetTokens,
       plan,
@@ -3340,23 +3437,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries,
       allMessages,
     );
-    const fallbackPlan = this.compressionRefusalPlan(variants);
+    let fallbackPlan = this.compressionRefusalPlan(request, variants);
     const model = this.requireCompressionModel();
-    const quarantineRecord = this.compressionRefusalQuarantineRecord(
+    let quarantineRecord = this.compressionRefusalQuarantineRecord(
       chunk,
       model,
       canonicalRequestHash,
+      request,
       keptSummaries,
+      variants,
       fallbackPlan,
     );
     const durableQuarantine = this.readCompressionQuarantineProjection();
-    if (durableQuarantine.has(quarantineRecord.key)) {
+    const durableActive = durableQuarantine.get(quarantineRecord.key) ??
+      [...durableQuarantine.values()].find(
+        (active) => active.record.familyKey === quarantineRecord.familyKey,
+      );
+    if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       logCompressionCall({
         event: 'compression:quarantine-skipped',
         operation: 'compress_l1',
         metadata: {
-          quarantine_key: quarantineRecord.key,
+          quarantine_key: durableActive.record.key,
           model,
           chunk_message_ids: chunk.messages.map((message) => message.id),
           canonical_request_hash: canonicalRequestHash,
@@ -3365,15 +3468,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // Same-process duplicate work is ephemeral and branch-keyed. Chronicle
-    // itself admits one writer process per store; separate JsStore instances
-    // cannot share this registry and are outside that single-writer boundary.
+    // Same-process duplicate work is ephemeral and scoped to the complete
+    // persistence identity. The WeakMap supplies store identity; the key adds
+    // namespace/state identity and the observed branch generation so neither
+    // cross-namespace writers nor stale branch work can coalesce.
     let inFlight = compressionInFlight.get(this.store!);
     if (!inFlight) {
       inFlight = new Map();
       compressionInFlight.set(this.store!, inFlight);
     }
-    const inFlightKey = `${sourceBranch.name}\u0000${quarantineRecord.key}`;
+    const inFlightKey = [
+      this.ns,
+      this.compressionRefusalQuarantineLedgerStateId,
+      sourceBranch.name,
+      sourceBranch.generation,
+      quarantineRecord.familyKey,
+    ].join('\u0000');
     const existingInFlight = inFlight.get(inFlightKey);
     if (existingInFlight) {
       const result = await existingInFlight;
@@ -3382,11 +3492,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
       if (result.error) throw result.error;
+      // The producer may belong to a different strategy instance. Reload the
+      // same namespace's durable result so a successful waiter gets its L1 and
+      // an exhausted waiter gets the quarantine projection rather than merely
+      // returning after somebody else's work.
+      this.loadPersistedState();
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
         chunk.compressed = true;
         chunk.summaryId = coalescedSummary.id;
-        this.markChunkRecordCompressed(chunk.recordId, coalescedSummary.id);
       }
       return;
     }
@@ -3464,6 +3579,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       successfulTrace = attemptTraces[attemptTraces.length - 1];
 
       if (this.compressionResponseStopReason(response) === 'refusal') {
+        const canonicalProviderInputTokens = this.compressionResponseInputTokens(response);
+        fallbackPlan = this.compressionRefusalPlan(
+          request,
+          variants,
+          canonicalProviderInputTokens,
+        );
+        quarantineRecord = this.compressionRefusalQuarantineRecord(
+          chunk,
+          model,
+          canonicalRequestHash,
+          request,
+          keptSummaries,
+          variants,
+          fallbackPlan,
+          canonicalProviderInputTokens,
+        );
         const outcomes: CompressionRefusalOutcomeRecord[] = [{
           curveLabel: 'canonical',
           requestHash: canonicalRequestHash,
