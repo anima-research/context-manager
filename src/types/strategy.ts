@@ -512,10 +512,10 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Admission starts from the provider's
-   * measured canonical input usage when available, then applies a
-   * byte-conservative bound to the rendered variant delta (including tools
-   * and formatter envelopes). Default: 200000.
+   * only fallback variants are gated. Admission uses a deterministic,
+   * byte-conservative bound over the complete normalized variant input
+   * (including tools and formatter envelopes), independent of optional
+   * provider usage metadata. Default: 200000.
    */
   compressionContextBudgetTokens?: number;
 
