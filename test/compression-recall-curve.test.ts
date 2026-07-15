@@ -91,8 +91,15 @@ function flexibleMembrane(handlers: AttemptHandler[]) {
 }
 
 function quarantineEvents(manager: ContextManager): Array<Record<string, unknown>> {
+  return quarantineEventsFor(manager, 'default');
+}
+
+function quarantineEventsFor(
+  manager: ContextManager,
+  namespace: string,
+): Array<Record<string, unknown>> {
   const value = manager.getStore().getStateJson(
-    'default/autobio:compression-refusal-quarantine-events',
+    `${namespace}/autobio:compression-refusal-quarantine-events`,
   );
   return Array.isArray(value) ? value as Array<Record<string, unknown>> : [];
 }
@@ -143,6 +150,21 @@ class ProbeStrategy extends AutobiographicalStrategy {
 
   mergeQueueView(): Array<{ level: number; sourceIds: string[] }> {
     return this.mergeQueue.map((item) => ({ level: item.level, sourceIds: [...item.sourceIds] }));
+  }
+
+  enqueueMergeForStress(level: number, sourceIds: string[]): void {
+    this.enqueueMerge({ level, sourceIds });
+  }
+
+  appendChunkRecordForStress(record: import('../src/strategies/autobiographical.js').ChunkRecord): void {
+    this.appendChunkRecord(record);
+  }
+
+  quarantineKeysView(): string[] {
+    const projection = (this as unknown as {
+      compressionRefusalQuarantine: Map<string, unknown>;
+    }).compressionRefusalQuarantine;
+    return [...projection.keys()].sort();
   }
 
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
@@ -260,6 +282,23 @@ function recallIds(request: NormalizedRequest): string[] {
     const match = /^\[CM\] Recall memory (.+)\.$/.exec(block.text);
     return match ? [match[1]!] : [];
   }));
+}
+
+function seedEquivalentRecallTree(strategy: ProbeStrategy, fx: Fixture): void {
+  const children = fx.children.map((entry) => {
+    const copy = structuredClone(entry);
+    delete copy.mergedInto;
+    strategy.seed(copy);
+    return copy;
+  });
+  const parents = fx.parents.map((entry) => {
+    const copy = structuredClone(entry);
+    delete copy.mergedInto;
+    strategy.seed(copy);
+    return copy;
+  });
+  for (const child of children.slice(0, 2)) strategy.linkChild(child, parents[0]!.id);
+  for (const child of children.slice(2)) strategy.linkChild(child, parents[1]!.id);
 }
 
 function removeRecallPairs(request: NormalizedRequest, ids: Set<string>): NormalizedRequest['messages'] {
@@ -710,6 +749,93 @@ describe('compression refusal recall curves', () => {
     assert.equal(mock.calls.length, 2, 'oversized newest variant is never sent');
     assert.deepEqual(recallIds(mock.calls[1]!.request), ['L1-100', 'L1-101', 'L2-201']);
     assert.equal(fx.target.compressed, true, 'later bounded candidate still succeeds');
+    fx.manager.close();
+  });
+
+  it('authoritative canonical input usage dominates the estimate and blocks every fallback', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 90_000 },
+      { stop: 'end_turn', text: 'must never be called' },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 50_000,
+      compressionRefusalCurveFallbacks: 3,
+    });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'canonical usage over budget suppresses provider fallbacks');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 90_000);
+    assert.match(String(record.accountingSource), /canonical_provider_input/);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
+    assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
+    assert.ok(plan.every((item) => Number(item.boundedInputTokens) > 90_000));
+    fx.manager.close();
+  });
+
+  it('usage absence counts complete huge tools, head, raw input, and normalized config', async () => {
+    const mock = flexibleMembrane([{ stop: 'refusal', omitUsage: true }]);
+    const hugeModel = `same-model-${'config'.repeat(4_000)}`;
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 60_000,
+      compressionRefusalCurveFallbacks: 3,
+      headWindowTokens: 100_000,
+    });
+    fx.strategy.setCompressionModel(hugeModel);
+    fx.manager.setToolDefinitions([{
+      name: 'complete_bound_tool',
+      description: 'tool-description '.repeat(1_500),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          payload: { type: 'string', description: 'schema-description '.repeat(1_500) },
+        },
+      },
+    }]);
+    fx.target.messages = fx.target.messages.map((message) => ({
+      ...message,
+      content: [text('huge raw request field '.repeat(1_000))],
+    }));
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'complete deterministic request bound rejects every variant');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, undefined);
+    assert.deepEqual(
+      (record.normalizedConfig as Record<string, unknown>).requestConfig,
+      mock.calls[0]!.request.config,
+    );
+    const canonicalSerializedBytes = Buffer.byteLength(JSON.stringify(mock.calls[0]!.request), 'utf8');
+    assert.ok(Number(record.canonicalRequestBoundTokens) > canonicalSerializedBytes);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.accountingSource === 'complete_normalized_request_bound'));
+    assert.ok(plan.every((item) => item.boundedInputTokens === item.deterministicInputBoundTokens));
+    assert.ok(plan.every((item) => Number(item.outputReserveTokens) === 16_000));
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
+    fx.manager.close();
+  });
+
+  it('stale child token metadata is irrelevant to the exact bounded plan and key', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const first = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    await fx.strategy.clearCompressionRefusalQuarantine(String(first.key));
+    for (const child of fx.children) child.tokens = 9_999_999;
+    fx.strategy.flushSummaries();
+
+    await fx.strategy.run({ ...fx.target, compressed: false }, managerContext(fx.manager));
+    const exhaustions = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
+    const second = exhaustions[1]!.record as Record<string, unknown>;
+    assert.equal(second.key, first.key);
+    assert.deepEqual(second.plan, first.plan);
+    assert.equal(mock.calls.length, 6);
     fx.manager.close();
   });
 
@@ -1257,6 +1383,10 @@ describe('compression refusal recall curves', () => {
       (entry: SummaryEntry) => entry.level === 1 && entry.sourceIds.join(':') === targetKey,
     );
     assert.equal(matching.length, 1);
+    assert.ok(second.summariesView().some(
+      (entry) => entry.level === 1 && entry.sourceIds.join(':') === targetKey,
+    ), 'same-namespace waiter reloads the durable summary into its own strategy');
+    assert.equal(secondChunk.compressed, true);
     secondManager.close();
     first.manager.close();
   });
@@ -1294,6 +1424,106 @@ describe('compression refusal recall curves', () => {
     assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
     assert.equal(events.filter((event) => event.kind === 'alert_pending').length, 1);
     assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
+    assert.equal(second.quarantineKeysView().length, 1,
+      'same-namespace waiter reloads the durable quarantine outcome');
+    secondManager.close();
+    first.manager.close();
+  });
+
+  it('distinct namespaces run concurrent success independently and persist both L1s', async () => {
+    const calls: RecordedCall[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push({ request: structuredClone(request) });
+        await gate;
+        return response('end_turn', `namespace success ${calls.length}`);
+      },
+    } as never;
+    const first = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({
+      store: first.manager.getStore(), strategy: second, membrane, namespace: 'beta',
+    });
+    seedEquivalentRecallTree(second, first);
+    const secondCtx = managerContext(secondManager);
+    const secondChunk = {
+      ...first.target,
+      messages: first.target.messages.map((message) => secondCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+
+    const runs = Promise.all([
+      first.strategy.run(first.target, managerContext(first.manager)),
+      second.run(secondChunk, secondCtx),
+    ]);
+    setTimeout(release, 20);
+    await runs;
+    assert.equal(calls.length, 2, 'namespace state identities cannot coalesce');
+    const targetKey = first.target.messages.map((message) => message.id).join(':');
+    for (const namespace of ['default', 'beta']) {
+      const persisted = first.manager.getStore().getStateJson(`${namespace}/autobio:summaries`);
+      assert.equal((Array.isArray(persisted) ? persisted as SummaryEntry[] : []).filter(
+        (entry) => entry.level === 1 && entry.sourceIds.join(':') === targetKey,
+      ).length, 1, `${namespace} owns one durable L1`);
+    }
+    assert.equal(first.target.compressed, true);
+    assert.equal(secondChunk.compressed, true);
+    secondManager.close();
+    first.manager.close();
+  });
+
+  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async () => {
+    const calls: RecordedCall[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push({ request: structuredClone(request) });
+        await Promise.resolve();
+        return response('refusal');
+      },
+    } as never;
+    const first = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({
+      store: first.manager.getStore(), strategy: second, membrane, namespace: 'beta',
+    });
+    seedEquivalentRecallTree(second, first);
+    const secondCtx = managerContext(secondManager);
+    const secondChunk = {
+      ...first.target,
+      messages: first.target.messages.map((message) => secondCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+
+    await Promise.all([
+      first.strategy.run(first.target, managerContext(first.manager)),
+      second.run(secondChunk, secondCtx),
+    ]);
+    assert.equal(calls.length, 2);
+    for (const namespace of ['default', 'beta']) {
+      const events = quarantineEventsFor(first.manager, namespace);
+      assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
+      assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
+    }
+    assert.equal(first.strategy.quarantineKeysView().length, 1);
+    assert.equal(second.quarantineKeysView().length, 1);
     secondManager.close();
     first.manager.close();
   });
@@ -1597,6 +1827,123 @@ describe('compression refusal recall curves', () => {
     assert.equal(fx.strategy.summariesView().some(
       (entry) => entry.sourceIds.join(':') === sourceIds.join(':'),
     ), false, 'retry summary remains branch-local');
+    fx.manager.close();
+  });
+
+  it('aborts gated initialization after another manager switches either shared-store branch', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, {
+      compressionRefusalCurveFallbacks: 0,
+      mergeThreshold: 99,
+    });
+    const store = fx.manager.getStore();
+    const main = fx.manager.currentBranch().name;
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    fx.strategy.pinRange(fx.ids[0]!, fx.ids[1]!, { name: 'main-pin' });
+    fx.strategy.enqueueMergeForStress(2, ['main-queued-source']);
+    const fork = store.createBranchAt(
+      'initialize-race-fork', main, store.currentSequence(),
+    ).name;
+
+    await fx.manager.switchBranch(fork);
+    fx.strategy.seed(summary(
+      'L1-fork-only', 1, [fx.ids[8]!], fx.ids[8]!, fx.ids[8]!, 7, 'fork-only summary',
+    ));
+    fx.strategy.pinRange(fx.ids[2]!, fx.ids[3]!, { name: 'fork-pin' });
+    fx.strategy.enqueueMergeForStress(2, ['fork-queued-source']);
+    fx.strategy.appendChunkRecordForStress({
+      id: 'c-9999', sourceIds: [fx.ids[13]!], compressed: false,
+    });
+    const forkCtx = managerContext(fx.manager);
+    await fx.strategy.run({
+      ...fx.target,
+      index: 10_001,
+      messages: [forkCtx.messageStore.get(fx.ids[12]!)!, forkCtx.messageStore.get(fx.ids[13]!)!],
+      compressed: false,
+    }, forkCtx);
+
+    const stateIds = [
+      'summaries', 'chunks', 'counter', 'mergeQueue', 'pins',
+      'compression-refusal-quarantine-events',
+    ];
+    const snapshot = (): Record<string, unknown> => Object.fromEntries(stateIds.map((suffix) => [
+      suffix,
+      structuredClone(store.getStateJson(`default/autobio:${suffix}`)),
+    ]));
+    const derived = (strategy: ProbeStrategy) => ({
+      summaries: strategy.summariesView(),
+      chunks: strategy.chunksView().map((chunk) => ({
+        recordId: chunk.recordId,
+        sourceIds: chunk.messages.map((message) => message.id),
+        compressed: chunk.compressed,
+        summaryId: chunk.summaryId,
+      })),
+      queue: strategy.mergeQueueView(),
+      pins: strategy.listPins(),
+      quarantine: strategy.quarantineKeysView(),
+    });
+
+    // Stabilize each branch once before recording its expected durable and
+    // derived state. Subsequent changes are therefore evidence of the race,
+    // not ordinary migration/rebuild work.
+    await fx.manager.switchBranch(main);
+    const mainState = snapshot();
+    const mainDerived = structuredClone(derived(fx.strategy));
+    await fx.manager.switchBranch(fork);
+    const forkState = snapshot();
+    const forkDerived = structuredClone(derived(fx.strategy));
+
+    const other = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const otherManager = await ContextManager.open({
+      store, strategy: other, membrane: mock.membrane,
+    });
+
+    const gateNextAlertDelivery = (strategy: ProbeStrategy) => {
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const target = strategy as unknown as {
+        deliverPendingCompressionQuarantineAlerts: (source: unknown) => Promise<void>;
+      };
+      const original = target.deliverPendingCompressionQuarantineAlerts.bind(strategy);
+      target.deliverPendingCompressionQuarantineAlerts = async (source: unknown) => {
+        entered();
+        await gate;
+        await original(source);
+      };
+      return { release, started };
+    };
+
+    // Stale main initializer must not install or persist over fork.
+    let gated = gateNextAlertDelivery(fx.strategy);
+    const staleMain = fx.manager.switchBranch(main);
+    await gated.started;
+    await otherManager.switchBranch(fork);
+    gated.release();
+    await staleMain;
+    assert.deepEqual(snapshot(), forkState);
+    assert.deepEqual(derived(other), forkDerived);
+
+    // Reverse the race: stale fork initializer must not touch main.
+    gated = gateNextAlertDelivery(fx.strategy);
+    const staleFork = fx.manager.switchBranch(fork);
+    await gated.started;
+    await otherManager.switchBranch(main);
+    gated.release();
+    await staleFork;
+    assert.deepEqual(snapshot(), mainState);
+    assert.deepEqual(derived(other), mainDerived);
+
+    otherManager.close();
     fx.manager.close();
   });
 
