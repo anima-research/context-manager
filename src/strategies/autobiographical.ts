@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, NormalizedRequest, ContentBlock, CompleteOptions } from '@animalabs/membrane';
+import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
 import { phaseChannel } from '../phase-channel.js';
 import type {
@@ -31,6 +31,7 @@ import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-to
 import { MessageStore } from '../message-store.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
@@ -273,6 +274,58 @@ export interface ChunkRecord {
   phaseType?: string;
 }
 
+/** One request-shape expansion retained in a durable refusal record. */
+interface CompressionRefusalVariantRecord {
+  parentId: string;
+  childIds: string[];
+  requestHash: string;
+}
+
+/**
+ * Durable circuit-breaker for a fully refused L1 request family. The key is
+ * over the complete as-of state that is allowed to affect a retry: model/config
+ * (inside canonicalRequestHash), target chunk, canonical frontier, and the
+ * exact bounded set of variants that was attempted.
+ */
+interface CompressionRefusalQuarantineRecord {
+  key: string;
+  model: string;
+  chunkSourceHash: string;
+  frontierHash: string;
+  canonicalRequestHash: string;
+  variants: CompressionRefusalVariantRecord[];
+  created: number;
+}
+
+interface RecallCurveVariant {
+  parent: SummaryEntry;
+  children: SummaryEntry[];
+  leafCoverageHash: string;
+  request: NormalizedRequest;
+  requestHash: string;
+}
+
+interface CompressionAttemptTrace {
+  curveLabel: string;
+  recallIds: string[];
+  recallLevels: number[];
+  expandedParentId?: string;
+  expandedChildIds?: string[];
+  leafCoverageHash: string;
+  requestHash: string;
+  messageCount: number;
+  estimatedTokens: number;
+  renderedTokens?: number;
+  stopReason?: string;
+  refusalCategory?: string;
+  latencyMs: number;
+  persisted: boolean;
+}
+
+function sha256Json(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
 /**
  * Point-in-time snapshot of compression progress, returned from
  * `AutobiographicalStrategy.getProgressSnapshot()`. External observers
@@ -465,6 +518,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get compressionRefusalQuarantineStateId(): string {
+    return `${this.ns}/autobio:compression-refusal-quarantine`;
+  }
+
+  /** Durable refusal circuit-breakers, mirrored from Chronicle on initialize. */
+  private compressionRefusalQuarantine = new Map<string, CompressionRefusalQuarantineRecord>();
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
@@ -516,6 +575,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.compressionSlackRatio ??= 0.1;
       this.config.speculativeProduction ??= true;
     }
+  }
+
+  /**
+   * Explicit operator escape hatch. A retry remains canonical-first; clearing
+   * this state only permits the same as-of request family to be issued again.
+   */
+  clearCompressionRefusalQuarantine(key?: string): void {
+    if (key === undefined) this.compressionRefusalQuarantine.clear();
+    else this.compressionRefusalQuarantine.delete(key);
+    this.persistCompressionRefusalQuarantine();
   }
 
   getHotContextSettings(): HotContextSettingsStatus {
@@ -823,6 +892,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strategy: 'snapshot',
       });
     } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.compressionRefusalQuarantineStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
@@ -855,6 +930,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pinIdCounter = 0;
       this.chunkRecords = [];
       this.chunkIdCounter = 0;
+      this.compressionRefusalQuarantine.clear();
       return;
     }
 
@@ -955,6 +1031,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.store.setStateJson(this.mergeQueueStateId, this.mergeQueue);
       console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing sources`);
     }
+
+    const quarantine = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
+    const quarantineRecords = Array.isArray(quarantine)
+      ? (quarantine as CompressionRefusalQuarantineRecord[])
+      : [];
+    this.compressionRefusalQuarantine = new Map(
+      quarantineRecords
+        .filter((record) => record && typeof record.key === 'string')
+        .map((record) => [record.key, record]),
+    );
 
     const pinsState = this.store.getStateJson(this.pinsStateId);
     if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
@@ -1234,6 +1320,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }
 
+  /** Read the durable log as well as the local mirror for cross-instance L1 races. */
+  private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
+    const local = this.summaries.find(
+      (summary) => summary.level === 1 && summary.sourceIds.join(':') === chunkIdKey,
+    );
+    if (local) return local;
+    const persisted = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(persisted)) return undefined;
+    const found = (persisted as SummaryEntry[]).find(
+      (summary) => summary?.level === 1 && summary.sourceIds?.join(':') === chunkIdKey,
+    );
+    if (found && !this.summaries.some((summary) => summary.id === found.id)) {
+      this.summaries.push(found);
+    }
+    return found;
+  }
+
   /**
    * Mark a summary as merged into a higher-level summary, updating the
    * chronicle copy at the same index. Index is the position in `this.summaries`.
@@ -1269,6 +1372,254 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     kept.reverse();
     return { kept, keptTokens: total };
+  }
+
+  private recallPairTokens(summary: SummaryEntry): number {
+    return (summary.tokens || Math.ceil(summary.content.length / 4)) + 50;
+  }
+
+  private persistedSummariesById(): Map<string, SummaryEntry> {
+    const stored = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) return new Map();
+    return new Map(
+      (stored as SummaryEntry[])
+        .filter((summary) => summary && typeof summary.id === 'string')
+        .map((summary) => [summary.id, summary]),
+    );
+  }
+
+  private estimateCompressionRequestTokens(request: NormalizedRequest): number {
+    // Metadata-only observability and a conservative budget check. The ordinary
+    // formatter/provider remains authoritative for rendered token accounting.
+    return Math.ceil(JSON.stringify(request).length / 4);
+  }
+
+  private refusalCategory(response: NormalizedResponse): string | undefined {
+    const raw = response.raw?.response as {
+      stop_details?: { category?: unknown } | null;
+    } | undefined;
+    const category = raw?.stop_details?.category;
+    return typeof category === 'string' ? category : undefined;
+  }
+
+  /**
+   * Recursively resolve an authored node to its raw leaf message IDs. This is
+   * deliberately asemantic: only persisted source edges are traversed, and no
+   * content is inspected or rewritten beyond the nonempty-node validity check.
+   */
+  private recallCurveLeafIds(
+    summary: SummaryEntry,
+    byId: ReadonlyMap<string, SummaryEntry>,
+    visiting: Set<string> = new Set(),
+  ): string[] | null {
+    if (visiting.has(summary.id) || !summary.sourceIds.length) return null;
+    if (summary.level === 1) return [...summary.sourceIds];
+
+    visiting.add(summary.id);
+    const leaves: string[] = [];
+    for (const childId of summary.sourceIds) {
+      const child = byId.get(childId);
+      if (!child || !child.content || !child.content.trim()) {
+        visiting.delete(summary.id);
+        return null;
+      }
+      const childLeaves = this.recallCurveLeafIds(child, byId, visiting);
+      if (!childLeaves) {
+        visiting.delete(summary.id);
+        return null;
+      }
+      leaves.push(...childLeaves);
+    }
+    visiting.delete(summary.id);
+    return leaves;
+  }
+
+  private validateRecallCurveRequest(request: NormalizedRequest): boolean {
+    for (let i = 0; i < request.messages.length; i++) {
+      const message = request.messages[i]!;
+      if (!message.content.length) return false;
+      for (const block of message.content) {
+        if (block.type === 'text' && !block.text.trim()) return false;
+        if (block.type === 'tool_use') {
+          const next = request.messages[i + 1];
+          if (!next?.content.some(
+            (candidate) => candidate.type === 'tool_result' && candidate.toolUseId === block.id,
+          )) return false;
+        }
+        if (block.type === 'tool_result') {
+          const previous = request.messages[i - 1];
+          if (!previous?.content.some(
+            (candidate) => candidate.type === 'tool_use' && candidate.id === block.toolUseId,
+          )) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Construct bounded single-node recall expansions from the retained
+   * canonical request. Every non-replaced request field and message is reused
+   * untouched. Children are ordered by raw source position, never by the
+   * parent's sourceIds ordering, and their recursively expanded leaf set must
+   * exactly equal the parent's set before the variant is eligible.
+   */
+  private buildRecallCurveVariants(
+    canonicalRequest: NormalizedRequest,
+    keptSummaries: SummaryEntry[],
+    recallTokens: number,
+    allMessages: StoredMessage[],
+  ): RecallCurveVariant[] {
+    const configuredMax = this.config.compressionRefusalCurveFallbacks ?? 3;
+    const maxVariants = Number.isSafeInteger(configuredMax)
+      ? Math.max(0, configuredMax)
+      : 3;
+    if (maxVariants === 0) return [];
+
+    // Alternate curves are allowed to use persisted authored nodes only. Do
+    // not trust a merely in-memory node, even though production pushSummary()
+    // normally appends synchronously before it enters the local mirror.
+    const byId = this.persistedSummariesById();
+    const position = new Map(allMessages.map((message, index) => [message.id, index]));
+    const orderedParents = keptSummaries
+      .filter((summary) => summary.level > 1)
+      .sort((a, b) => {
+        const aNewest = position.get(a.sourceRange.last) ?? -1;
+        const bNewest = position.get(b.sourceRange.last) ?? -1;
+        if (aNewest !== bNewest) return bNewest - aNewest;
+        if (a.level !== b.level) return b.level - a.level;
+        return a.id.localeCompare(b.id);
+      });
+
+    const variants: RecallCurveVariant[] = [];
+    for (const parent of orderedParents) {
+      const directChildren = parent.sourceIds.map((id) => byId.get(id));
+      if (directChildren.some((child) => !child || !child.content || !child.content.trim())) continue;
+      if (directChildren.some((child) => child!.level !== parent.sourceLevel)) continue;
+      const children = (directChildren as SummaryEntry[]).sort((a, b) => {
+        const aFirst = position.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+        const bFirst = position.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+        if (aFirst !== bFirst) return aFirst - bFirst;
+        const aLast = position.get(a.sourceRange.last) ?? Number.MAX_SAFE_INTEGER;
+        const bLast = position.get(b.sourceRange.last) ?? Number.MAX_SAFE_INTEGER;
+        if (aLast !== bLast) return aLast - bLast;
+        return a.id.localeCompare(b.id);
+      });
+
+      const parentLeaves = this.recallCurveLeafIds(parent, byId);
+      const childLeaves = children.flatMap((child) => this.recallCurveLeafIds(child, byId) ?? []);
+      if (!parentLeaves || parentLeaves.length !== childLeaves.length) continue;
+      if (new Set(parentLeaves).size !== parentLeaves.length) continue;
+      if (new Set(childLeaves).size !== childLeaves.length) continue;
+      const parentCoverage = [...parentLeaves].sort();
+      const childCoverage = [...childLeaves].sort();
+      if (parentCoverage.some((id, index) => id !== childCoverage[index])) continue;
+
+      // Exact leaf coverage is not enough: the replacement itself must be a
+      // chronological rendering of that coverage at the same as-of boundary.
+      const leafPositions = childLeaves.map((id) => position.get(id));
+      if (leafPositions.some((index) => index === undefined)) continue;
+      if (leafPositions.some((index, i) => i > 0 && index! <= leafPositions[i - 1]!)) continue;
+      if (
+        childLeaves[0] !== parent.sourceRange.first ||
+        childLeaves[childLeaves.length - 1] !== parent.sourceRange.last
+      ) continue;
+
+      const parentHeader = `[CM] Recall memory ${parent.id}.`;
+      const pairIndexes: number[] = [];
+      for (let i = 0; i < canonicalRequest.messages.length - 1; i++) {
+        const header = canonicalRequest.messages[i]!;
+        const body = canonicalRequest.messages[i + 1]!;
+        if (
+          header.participant === 'Context Manager' &&
+          header.content.length === 1 &&
+          header.content[0]?.type === 'text' &&
+          header.content[0].text === parentHeader &&
+          body.content.length === 1 &&
+          body.content[0]?.type === 'text' &&
+          body.content[0].text === parent.content
+        ) pairIndexes.push(i);
+      }
+      if (pairIndexes.length !== 1) continue;
+
+      const variantRecallTokens = recallTokens - this.recallPairTokens(parent)
+        + children.reduce((total, child) => total + this.recallPairTokens(child), 0);
+      const recallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+      if (variantRecallTokens > recallBudget) continue;
+
+      const replacement = children.flatMap((child) => [
+        {
+          participant: 'Context Manager',
+          content: [{ type: 'text' as const, text: `[CM] Recall memory ${child.id}.` }],
+        },
+        {
+          participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
+          content: [{ type: 'text' as const, text: child.content }],
+        },
+      ]);
+      const pairIndex = pairIndexes[0]!;
+      const request: NormalizedRequest = {
+        ...canonicalRequest,
+        messages: [
+          ...canonicalRequest.messages.slice(0, pairIndex),
+          ...replacement,
+          ...canonicalRequest.messages.slice(pairIndex + 2),
+        ],
+      };
+      if (!this.validateRecallCurveRequest(request)) continue;
+
+      const leafCoverageHash = sha256Json(childLeaves);
+      variants.push({
+        parent,
+        children,
+        leafCoverageHash,
+        request,
+        requestHash: sha256Json(request),
+      });
+      if (variants.length >= maxVariants) break;
+    }
+    return variants;
+  }
+
+  private persistCompressionRefusalQuarantine(): void {
+    this.store?.setStateJson(
+      this.compressionRefusalQuarantineStateId,
+      [...this.compressionRefusalQuarantine.values()],
+    );
+  }
+
+  private compressionRefusalQuarantineRecord(
+    chunk: Chunk,
+    model: string,
+    canonicalRequestHash: string,
+    keptSummaries: SummaryEntry[],
+    variants: RecallCurveVariant[],
+  ): CompressionRefusalQuarantineRecord {
+    const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
+    const frontierHash = sha256Json(
+      keptSummaries.map((summary) => ({ id: summary.id, level: summary.level })),
+    );
+    const variantRecords = variants.map((variant) => ({
+      parentId: variant.parent.id,
+      childIds: variant.children.map((child) => child.id),
+      requestHash: variant.requestHash,
+    }));
+    const key = sha256Json({
+      model,
+      chunkSourceHash,
+      frontierHash,
+      canonicalRequestHash,
+      variants: variantRecords,
+    });
+    return {
+      key,
+      model,
+      chunkSourceHash,
+      frontierHash,
+      canonicalRequestHash,
+      variants: variantRecords,
+      created: Date.now(),
+    };
   }
 
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
@@ -1966,9 +2317,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //    leaves a record uncompressed with its summary already in the log.
     //    Adopt the existing summary, skip the LLM call, and heal the record.
     const chunkIdKey = this.chunkKey(chunk);
-    const exactExisting = this.summaries.find(
-      s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
-    );
+    const exactExisting = this.findExactL1(chunkIdKey);
     if (exactExisting) {
       chunk.compressed = true;
       chunk.summaryId = exactExisting.id;
@@ -2339,13 +2688,156 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    // Retain the exact normalized canonical request and frontier. Variants are
+    // derived solely by replacing one isolated recall pair; the canonical call
+    // below is always issued first and is never rebuilt through fallback code.
+    const canonicalRequestHash = sha256Json(request);
+    const variants = this.buildRecallCurveVariants(
+      request,
+      keptSummaries,
+      recallTokens,
+      allMessages,
+    );
+    const model = this.requireCompressionModel();
+    const quarantineRecord = this.compressionRefusalQuarantineRecord(
+      chunk,
+      model,
+      canonicalRequestHash,
+      keptSummaries,
+      variants,
+    );
+    if (this.compressionRefusalQuarantine.has(quarantineRecord.key)) {
+      logCompressionCall({
+        event: 'compression:quarantine-skipped',
+        operation: 'compress_l1',
+        metadata: {
+          quarantine_key: quarantineRecord.key,
+          model,
+          chunk_message_ids: chunk.messages.map((message) => message.id),
+          canonical_request_hash: canonicalRequestHash,
+        },
+      });
+      return;
+    }
+
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logSummaryId: string | undefined;
+    const attemptTraces: CompressionAttemptTrace[] = [];
+    let successfulTrace: CompressionAttemptTrace | undefined;
 
     try {
-      const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+      const runAttempt = async (
+        attemptRequest: NormalizedRequest,
+        curveLabel: string,
+        recallIds: string[],
+        recallLevels: number[],
+        leafCoverageHash: string,
+        expandedParentId?: string,
+        expandedChildIds?: string[],
+      ): Promise<NormalizedResponse> => {
+        const started = Date.now();
+        const response = await ctx.membrane!.complete(
+          attemptRequest,
+          { formatter: this.nativeFormatter },
+        );
+        const trace: CompressionAttemptTrace = {
+          curveLabel,
+          recallIds,
+          recallLevels,
+          ...(expandedParentId ? { expandedParentId } : {}),
+          ...(expandedChildIds ? { expandedChildIds } : {}),
+          leafCoverageHash,
+          requestHash: sha256Json(attemptRequest),
+          messageCount: attemptRequest.messages.length,
+          estimatedTokens: this.estimateCompressionRequestTokens(attemptRequest),
+          renderedTokens: response.usage?.inputTokens,
+          stopReason: response.stopReason,
+          refusalCategory: this.refusalCategory(response),
+          latencyMs: Date.now() - started,
+          persisted: false,
+        };
+        attemptTraces.push(trace);
+        return response;
+      };
+
+      const summariesById = new Map(this.summaries.map((summary) => [summary.id, summary]));
+      const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
+      const canonicalLeafIds = keptSummaries.flatMap(
+        (summary) => this.recallCurveLeafIds(summary, summariesById) ?? [],
+      ).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
+      const canonicalCoverageHash = sha256Json(canonicalLeafIds);
+      let response = await runAttempt(
+        request,
+        'canonical',
+        keptSummaries.map((summary) => summary.id),
+        keptSummaries.map((summary) => summary.level),
+        canonicalCoverageHash,
+      );
+      successfulTrace = attemptTraces[attemptTraces.length - 1];
+
+      if (response.stopReason === 'refusal') {
+        successfulTrace = undefined;
+        logCompressionCall({
+          event: 'compression:canonical-refused',
+          operation: 'compress_l1',
+          metadata: attemptTraces[0],
+        });
+        for (let i = 0; i < variants.length; i++) {
+          const variant = variants[i]!;
+          const parentIndex = keptSummaries.findIndex(
+            (summary) => summary.id === variant.parent.id,
+          );
+          const variantFrontier = [
+            ...keptSummaries.slice(0, parentIndex),
+            ...variant.children,
+            ...keptSummaries.slice(parentIndex + 1),
+          ];
+          response = await runAttempt(
+            variant.request,
+            `expand:${variant.parent.id}`,
+            variantFrontier.map((summary) => summary.id),
+            variantFrontier.map((summary) => summary.level),
+            variant.leafCoverageHash,
+            variant.parent.id,
+            variant.children.map((child) => child.id),
+          );
+          const trace = attemptTraces[attemptTraces.length - 1]!;
+          logCompressionCall({
+            event: 'compression:curve-attempt',
+            operation: 'compress_l1',
+            metadata: trace,
+          });
+          if (response.stopReason !== 'refusal') {
+            successfulTrace = trace;
+            break;
+          }
+        }
+
+        if (response.stopReason === 'refusal') {
+          this.compressionRefusalQuarantine.set(quarantineRecord.key, quarantineRecord);
+          this.persistCompressionRefusalQuarantine();
+          console.error(
+            `[autobiographical] compression refusal curves exhausted for chunk ` +
+            `${chunk.recordId ?? `#${chunk.index}`} (key ${quarantineRecord.key}); ` +
+            `the chunk remains raw and unchanged requests are quarantined.`,
+          );
+          logCompressionCall({
+            event: 'compression:curve-exhausted',
+            operation: 'compress_l1',
+            metadata: {
+              quarantine_key: quarantineRecord.key,
+              model,
+              chunk_message_ids: chunk.messages.map((message) => message.id),
+              canonical_request_hash: canonicalRequestHash,
+              variants: quarantineRecord.variants,
+            },
+          });
+          return;
+        }
+      }
+
       // `content` stays text-only (merge inputs, grep, viewers), but the
       // verbatim response blocks — including signed thinking — are captured
       // on the entry: Fable-5/Sonnet-5-class models require the encrypted
@@ -2371,9 +2863,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
       // is cheaper than storing a duplicate L1 over the same messages.
-      const postExisting = this.summaries.find(
-        s => s.level === 1 && s.sourceIds.join(':') === chunkIdKey
-      );
+      const postExisting = this.findExactL1(chunkIdKey);
       if (postExisting) {
         chunk.compressed = true;
         chunk.summaryId = postExisting.id;
@@ -2413,6 +2903,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.markChunkRecordCompressed(chunk.recordId, entry.id);
       this._compressionCount++;
       logSummaryId = entry.id;
+      if (successfulTrace) successfulTrace.persisted = true;
+      if (successfulTrace?.expandedParentId) {
+        logCompressionCall({
+          event: 'compression:curve-succeeded',
+          operation: 'compress_l1',
+          metadata: successfulTrace,
+        });
+      }
 
       this.checkMergeThreshold();
     } catch (error) {
@@ -2420,6 +2918,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
+      for (const trace of attemptTraces) {
+        logCompressionCall({
+          event: 'compression:attempt',
+          operation: 'compress_l1',
+          metadata: {
+            chunk_message_ids: chunk.messages.map((message) => message.id),
+            chunk_hash: quarantineRecord.chunkSourceHash,
+            model,
+            ...trace,
+          },
+        });
+      }
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
@@ -2441,7 +2951,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
-          model: this.requireCompressionModel(),
+          model,
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
         },
