@@ -509,6 +509,17 @@ export interface AutobiographicalConfig {
   compressionRefusalCurveFallbacks?: number;
 
   /**
+   * Total model context budget used to admit refusal-curve compression
+   * requests, including the request input and the configured output reserve.
+   * The canonical request remains unchanged and is always attempted first;
+   * only fallback variants are gated. Admission starts from the provider's
+   * measured canonical input usage when available, then applies a
+   * byte-conservative bound to the rendered variant delta (including tools
+   * and formatter envelopes). Default: 200000.
+   */
+  compressionContextBudgetTokens?: number;
+
+  /**
    * Minimum substantive text (non-whitespace chars across a chunk's
    * messages) below which L1 compression skips the LLM call and stores a
    * mechanical stub summary instead (default: 200).
@@ -872,4 +883,5 @@ Write naturally, as recollection of what you experienced.`,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,
+  compressionContextBudgetTokens: 200000,
 };

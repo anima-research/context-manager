@@ -28,7 +28,7 @@ interface RecordedCall {
   request: NormalizedRequest;
 }
 
-function response(stopReason: 'refusal' | 'end_turn', text = '') {
+function response(stopReason: 'refusal' | 'end_turn' | 'max_tokens', text = '') {
   return {
     content: text ? [{ type: 'text', text }] : [],
     stopReason,
@@ -43,7 +43,7 @@ function response(stopReason: 'refusal' | 'end_turn', text = '') {
   };
 }
 
-function scriptedMembrane(stops: Array<'refusal' | 'end_turn'>) {
+function scriptedMembrane(stops: Array<'refusal' | 'end_turn' | 'max_tokens'>) {
   const calls: RecordedCall[] = [];
   return {
     calls,
@@ -58,6 +58,34 @@ function scriptedMembrane(stops: Array<'refusal' | 'end_turn'>) {
       },
     } as never,
   };
+}
+
+type AttemptHandler =
+  | { stop: 'refusal' | 'end_turn' | 'max_tokens'; text?: string; inputTokens?: number }
+  | { error: Error & { type?: string } };
+
+function flexibleMembrane(handlers: AttemptHandler[]) {
+  const calls: RecordedCall[] = [];
+  return {
+    calls,
+    membrane: {
+      complete: async (request: NormalizedRequest) => {
+        const handler = handlers[calls.length] ?? handlers[handlers.length - 1]!;
+        calls.push({ request: structuredClone(request) });
+        if ('error' in handler) throw handler.error;
+        const result = response(handler.stop, handler.text ?? '');
+        if (handler.inputTokens !== undefined) result.usage.inputTokens = handler.inputTokens;
+        return result;
+      },
+    } as never,
+  };
+}
+
+function quarantineEvents(manager: ContextManager): Array<Record<string, unknown>> {
+  const value = manager.getStore().getStateJson(
+    'default/autobio:compression-refusal-quarantine-events',
+  );
+  return Array.isArray(value) ? value as Array<Record<string, unknown>> : [];
 }
 
 class ProbeStrategy extends AutobiographicalStrategy {
@@ -89,6 +117,10 @@ class ProbeStrategy extends AutobiographicalStrategy {
     for (const chunk of this.chunks) chunk.compressed = chunk.index !== chunkIndex;
     this.compressionQueue = [chunkIndex];
     this.mergeQueue = [];
+  }
+
+  mergeQueueView(): Array<{ level: number; sourceIds: string[] }> {
+    return this.mergeQueue.map((item) => ({ level: item.level, sourceIds: [...item.sourceIds] }));
   }
 
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
@@ -236,6 +268,11 @@ describe('compression refusal recall curves', () => {
     await fx.strategy.run(fx.target, managerContext(fx.manager));
 
     assert.equal(mock.calls.length, 1);
+    const golden = JSON.parse(readFileSync(
+      'test/fixtures/compression-canonical-request.json', 'utf8',
+    )) as NormalizedRequest;
+    golden.tools = undefined;
+    assert.deepEqual(mock.calls[0]!.request, golden, 'pre-change canonical request remains byte-shaped');
     assert.deepEqual(recallIds(mock.calls[0]!.request), ['L2-200', 'L2-201']);
     assert.equal(fx.strategy.summariesView().filter((entry) => entry.level === 1).length, 5);
     assert.equal(fx.target.compressed, true);
@@ -260,6 +297,80 @@ describe('compression refusal recall curves', () => {
     assert.equal(produced.length, 1);
     assert.equal(produced[0]!.content, 'successful memory from attempt 1');
     fx.manager.close();
+  });
+
+  it('expands the newest Mythos-shaped L3 parent into six L2 children with deeper exact leaves', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const strategy = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 3,
+    });
+    const manager = await ContextManager.open({
+      path: freshPath(), strategy, membrane: mock.membrane,
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`mythos-raw-${i}`)]));
+    }
+    const topParents: SummaryEntry[] = [];
+    for (let family = 0; family < 2; family++) {
+      const l2s: SummaryEntry[] = [];
+      for (let childIndex = 0; childIndex < 6; childIndex++) {
+        const rawIndex = family * 12 + childIndex * 2;
+        const l1 = summary(
+          `L1-${400 + family * 10 + childIndex}`,
+          1,
+          [ids[rawIndex]!, ids[rawIndex + 1]!],
+          ids[rawIndex]!,
+          ids[rawIndex + 1]!,
+        );
+        const l2 = summary(
+          `L2-${500 + family * 10 + childIndex}`,
+          2,
+          [l1.id],
+          ids[rawIndex]!,
+          ids[rawIndex + 1]!,
+        );
+        strategy.seed(l1);
+        strategy.seed(l2);
+        strategy.linkChild(l1, l2.id);
+        l2s.push(l2);
+      }
+      const top = summary(
+        `L3-${600 + family}`,
+        3,
+        l2s.map((child) => child.id),
+        ids[family * 12]!,
+        ids[family * 12 + 11]!,
+      );
+      strategy.seed(top);
+      for (const child of l2s) strategy.linkChild(child, top.id);
+      topParents.push(top);
+    }
+    const all = managerContext(manager).messageStore.getAll();
+    const target: Chunk = {
+      index: 1000,
+      startIndex: 26,
+      endIndex: 28,
+      messages: all.slice(26, 28),
+      tokens: 20,
+      compressed: false,
+    };
+
+    await strategy.run(target, managerContext(manager));
+    assert.deepEqual(recallIds(mock.calls[0]!.request), topParents.map((parent) => parent.id));
+    assert.deepEqual(
+      recallIds(mock.calls[1]!.request),
+      ['L3-600', 'L2-510', 'L2-511', 'L2-512', 'L2-513', 'L2-514', 'L2-515'],
+    );
+    assert.equal(target.compressed, true);
+    manager.close();
   });
 
   it('first curve refusal then second success stores only the second output', async () => {
@@ -329,7 +440,43 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('rejects missing/empty child, duplicate-leaf, and over-budget candidates without provider calls', async () => {
+  it('uses the canonical authored node when historical duplicate IDs diverge in content and merge state', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane);
+    const duplicate = {
+      ...structuredClone(fx.children[2]!),
+      content: 'corrupt historical alternate content',
+      mergedInto: undefined,
+    };
+    fx.manager.getStore().appendToStateJson('default/autobio:summaries', duplicate);
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    const variant = mock.calls[1]!.request;
+    assert.match(JSON.stringify(variant), /authored L1-102/);
+    assert.doesNotMatch(JSON.stringify(variant), /corrupt historical alternate content/);
+    assert.deepEqual(recallIds(variant), ['L2-200', 'L1-102', 'L1-103']);
+    fx.manager.close();
+  });
+
+  it('rejects malformed levels on a deeper recursive edge', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane);
+    const top = summary(
+      'L3-300', 3, fx.parents.map((parent) => parent.id), fx.ids[0]!, fx.ids[7]!,
+    );
+    for (const parent of fx.parents) fx.strategy.linkChild(parent, top.id);
+    fx.strategy.seed(top);
+    fx.children[0]!.sourceLevel = 7;
+    fx.strategy.flushSummaries();
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'invalid L3 -> L2 -> L1 edge prevents expansion');
+    assert.deepEqual(recallIds(mock.calls[0]!.request), ['L3-300']);
+    fx.manager.close();
+  });
+
+  it('rejects missing/empty child and duplicate-leaf candidates without fallback provider calls', async () => {
     {
       const mock = scriptedMembrane(['refusal']);
       const fx = await fixture(mock.membrane);
@@ -350,14 +497,121 @@ describe('compression refusal recall curves', () => {
       assert.equal(mock.calls.length, 1, 'duplicate recursive leaves fail exact coverage proof');
       fx.manager.close();
     }
+  });
+
+  it('admits the full rendered family, not stale recall token metadata, and continues after overflow', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 12_000 },
+      { stop: 'end_turn', text: 'older bounded curve succeeded', inputTokens: 13_000 },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 30_000,
+      headWindowTokens: 100_000,
+    });
+    for (const child of fx.children) child.tokens = 1;
+    fx.children[2]!.content = 'large newest child '.repeat(900);
+    fx.children[3]!.content = 'large newest child '.repeat(900);
+    fx.strategy.flushSummaries();
+    fx.manager.setToolDefinitions([{
+      name: 'large_inventory_tool',
+      description: 'schema inventory '.repeat(300),
+      inputSchema: {
+        type: 'object',
+        properties: { payload: { type: 'string', description: 'large field '.repeat(300) } },
+      },
+    }]);
+    fx.target.messages = fx.target.messages.map((message) => ({
+      ...message,
+      content: [text('large raw chunk '.repeat(300))],
+    }));
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'oversized newest variant is never sent');
+    assert.deepEqual(recallIds(mock.calls[1]!.request), ['L1-100', 'L1-101', 'L2-201']);
+    assert.equal(fx.target.compressed, true, 'later bounded candidate still succeeds');
+    fx.manager.close();
+  });
+
+  it('continues across empty output and provider error, then accepts persistable max_tokens text', async () => {
+    const providerError = Object.assign(new Error('synthetic variant failure'), { type: 'invalid_request' });
+    const mock = flexibleMembrane([
+      { stop: 'refusal' },
+      { stop: 'end_turn', text: '' },
+      { error: providerError },
+      { stop: 'max_tokens', text: 'persistable truncated memory' },
+    ]);
+    const fx = await fixture(mock.membrane);
+    const extraChildren = [
+      summary('L1-104', 1, [fx.ids[8]!], fx.ids[8]!, fx.ids[8]!),
+      summary('L1-105', 1, [fx.ids[9]!], fx.ids[9]!, fx.ids[9]!),
+    ];
+    const newest = summary(
+      'L2-202', 2, extraChildren.map((child) => child.id), fx.ids[8]!, fx.ids[9]!,
+    );
+    for (const child of extraChildren) {
+      fx.strategy.seed(child);
+      fx.strategy.linkChild(child, newest.id);
+    }
+    fx.strategy.seed(newest);
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 4);
+    assert.deepEqual(
+      recallIds(mock.calls[1]!.request).filter((id) => id === 'L1-104' || id === 'L1-105'),
+      ['L1-104', 'L1-105'],
+    );
+    assert.equal(fx.target.compressed, true);
+    const produced = fx.strategy.summariesView().find(
+      (entry) => entry.sourceIds.join(':') === fx.target.messages.map((message) => message.id).join(':'),
+    );
+    assert.equal(produced?.content, 'persistable truncated memory');
+    assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
+    fx.manager.close();
+  });
+
+  it('quarantines a refused family when every fallback is empty or errors', async () => {
+    const providerError = Object.assign(new Error('synthetic size rejection'), { type: 'context_length' });
+    const mock = flexibleMembrane([
+      { stop: 'refusal' },
+      { stop: 'end_turn', text: '' },
+      { error: providerError },
+    ]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.target.compressed, false);
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted');
+    assert.ok(exhausted);
+    assert.deepEqual(
+      (exhausted.outcomes as Array<{ outcome: string }>).map((outcome) => outcome.outcome),
+      ['refusal', 'unusable_empty', 'provider_error'],
+    );
+    await fx.strategy.run({ ...fx.target, compressed: false }, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'durable active family suppresses retries');
+    fx.manager.close();
+  });
+
+  it('preserves canonical non-refusal empty, max_tokens, and error behavior', async () => {
     {
-      const mock = scriptedMembrane(['refusal']);
-      const fx = await fixture(mock.membrane, { compressionRecallBudgetTokens: 200 });
-      for (const parent of fx.parents) parent.tokens = 20;
-      for (const child of fx.children) child.tokens = 100;
-      fx.strategy.flushSummaries();
+      const mock = flexibleMembrane([{ stop: 'end_turn', text: '' }]);
+      const fx = await fixture(mock.membrane);
       await fx.strategy.run(fx.target, managerContext(fx.manager));
-      assert.equal(mock.calls.length, 1, 'over-budget expansions are skipped');
+      assert.equal(fx.target.compressed, false);
+      assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
+      fx.manager.close();
+    }
+    {
+      const mock = flexibleMembrane([{ stop: 'max_tokens', text: 'canonical partial memory' }]);
+      const fx = await fixture(mock.membrane);
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(fx.target.compressed, true);
+      fx.manager.close();
+    }
+    {
+      const mock = flexibleMembrane([{ error: new Error('canonical transport failure') }]);
+      const fx = await fixture(mock.membrane);
+      await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
+      await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
+      assert.equal(mock.calls.length, 2, 'canonical errors remain retryable and are not quarantined');
       fx.manager.close();
     }
   });
@@ -375,10 +629,11 @@ describe('compression refusal recall curves', () => {
       0,
     );
     const quarantine = first.manager.getStore().getStateJson(
-      'default/autobio:compression-refusal-quarantine',
+      'default/autobio:compression-refusal-quarantine-events',
     );
-    assert.equal(Array.isArray(quarantine) ? quarantine.length : 0, 1);
-    const record = (quarantine as Array<Record<string, unknown>>)[0]!;
+    const events = quarantine as Array<Record<string, unknown>>;
+    const record = events.find((event) => event.kind === 'claim')?.record as Record<string, unknown>;
+    assert.ok(record);
     assert.equal(record.model, MODEL);
     assert.match(String(record.key), /^[a-f0-9]{64}$/);
     assert.match(String(record.chunkSourceHash), /^[a-f0-9]{64}$/);
@@ -447,7 +702,7 @@ describe('compression refusal recall curves', () => {
     await fx.strategy.run({ ...fx.target, compressed: false }, ctx);
     assert.equal(mock.calls.length, 1, 'unchanged exhausted key is suppressed');
 
-    fx.strategy.clearCompressionRefusalQuarantine();
+    await fx.strategy.clearCompressionRefusalQuarantine();
     await fx.strategy.run({ ...fx.target, compressed: false }, ctx);
     assert.equal(mock.calls.length, 2, 'clear permits exactly a new canonical attempt');
     assert.deepEqual(recallIds(mock.calls[1]!.request), ['L2-200', 'L2-201']);
@@ -470,6 +725,26 @@ describe('compression refusal recall curves', () => {
       (entry) => entry.level === 1 && entry.sourceIds.join(':') === actual.messages.map((m) => m.id).join(':'),
     ).length, 1);
     assert.equal(fx.manager.isReady(), true, 'compression queue converges');
+    fx.manager.close();
+  });
+
+  it('a curve-produced L1 still feeds the ordinary merge queue exactly once', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { mergeThreshold: 2 });
+    const spare = summary(
+      'L1-spare', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!,
+    );
+    fx.strategy.seed(spare);
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const produced = fx.strategy.summariesView().find(
+      (entry) => entry.sourceIds.join(':') === fx.target.messages.map((message) => message.id).join(':'),
+    );
+    assert.ok(produced);
+    const matching = fx.strategy.mergeQueueView().filter(
+      (item) => item.level === 2 && item.sourceIds.includes(spare.id) && item.sourceIds.includes(produced.id),
+    );
+    assert.equal(matching.length, 1);
     fx.manager.close();
   });
 
@@ -507,7 +782,8 @@ describe('compression refusal recall curves', () => {
 
   it('concurrent producers consult durable summaries and persist only one L1', async () => {
     const mock = scriptedMembrane(['end_turn', 'end_turn']);
-    // Delay both calls until they are simultaneously in flight.
+    // The durable claim suppresses the second same-key producer before it
+    // reaches Membrane; hold the first briefly so the race is real.
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let entered = 0;
@@ -515,7 +791,6 @@ describe('compression refusal recall curves', () => {
       complete: async (request: NormalizedRequest) => {
         mock.calls.push({ request: structuredClone(request) });
         entered++;
-        if (entered === 2) release();
         await gate;
         return response('end_turn', 'one durable result');
       },
@@ -542,10 +817,13 @@ describe('compression refusal recall curves', () => {
     ).filter(Boolean) as StoredMessage[];
     const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
 
-    await Promise.all([
+    const runs = Promise.all([
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
     ]);
+    setTimeout(release, 20);
+    await runs;
+    assert.equal(mock.calls.length, 1, 'same-key claim permits only one provider call');
     const persisted = first.manager.getStore().getStateJson('default/autobio:summaries');
     const targetKey = first.target.messages.map((message) => message.id).join(':');
     const matching = (Array.isArray(persisted) ? persisted : []).filter(
@@ -554,5 +832,190 @@ describe('compression refusal recall curves', () => {
     assert.equal(matching.length, 1);
     secondManager.close();
     first.manager.close();
+  });
+
+  it('same-key concurrent exhaustion makes one provider call and one keyed alert attempt', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const path = freshPath();
+    const first = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({
+      store: first.manager.getStore(), strategy: second, membrane: mock.membrane,
+    });
+    const secondCtx = managerContext(secondManager);
+    const secondChunk = {
+      ...first.target,
+      messages: first.target.messages.map((message) => secondCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+
+    await Promise.all([
+      first.strategy.run(first.target, managerContext(first.manager)),
+      second.run(secondChunk, secondCtx),
+    ]);
+    const events = quarantineEvents(first.manager);
+    assert.equal(mock.calls.length, 1);
+    assert.equal(events.filter((event) => event.kind === 'claim').length, 1);
+    assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
+    assert.equal(events.filter((event) => event.kind === 'alert_pending').length, 1);
+    assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
+    secondManager.close();
+    first.manager.close();
+  });
+
+  it('different-key concurrent exhaustion preserves both durable records and alerts', async () => {
+    const calls: RecordedCall[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push({ request: structuredClone(request) });
+        if (calls.length === 2) release();
+        await gate;
+        return response('refusal');
+      },
+    } as never;
+    const first = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({
+      store: first.manager.getStore(), strategy: second, membrane,
+    });
+    const secondCtx = managerContext(secondManager);
+    const otherMessages = first.ids.slice(12, 14)
+      .map((id) => secondCtx.messageStore.get(id)).filter(Boolean) as StoredMessage[];
+    const otherChunk: Chunk = {
+      ...first.target,
+      index: 1001,
+      startIndex: 12,
+      endIndex: 14,
+      messages: otherMessages,
+      compressed: false,
+    };
+
+    await Promise.all([
+      first.strategy.run(first.target, managerContext(first.manager)),
+      second.run(otherChunk, secondCtx),
+    ]);
+    const events = quarantineEvents(first.manager);
+    assert.equal(calls.length, 2);
+    assert.equal(events.filter((event) => event.kind === 'claim').length, 2);
+    assert.equal(events.filter((event) => event.kind === 'exhausted').length, 2);
+    assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 2);
+    secondManager.close();
+    first.manager.close();
+  });
+
+  it('a stale tombstone cannot clear a newer same-key quarantine generation', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    const ctx = managerContext(fx.manager);
+    await fx.strategy.run(fx.target, ctx);
+    const firstClaim = quarantineEvents(fx.manager).find((event) => event.kind === 'claim')!;
+    const key = String((firstClaim.record as Record<string, unknown>).key);
+    await fx.strategy.clearCompressionRefusalQuarantine(key);
+    await fx.strategy.run({ ...fx.target, compressed: false }, ctx);
+    const claims = quarantineEvents(fx.manager).filter((event) => event.kind === 'claim');
+    assert.equal(claims.length, 2);
+    fx.manager.getStore().appendToStateJson(
+      'default/autobio:compression-refusal-quarantine-events',
+      {
+        kind: 'clear',
+        key,
+        targetClaimId: firstClaim.eventId,
+        created: Date.now(),
+      },
+    );
+
+    const restarted = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const restartedManager = await ContextManager.open({
+      store: fx.manager.getStore(), strategy: restarted, membrane: mock.membrane,
+    });
+    const restartedCtx = managerContext(restartedManager);
+    const restartedChunk = {
+      ...fx.target,
+      messages: fx.target.messages.map((message) => restartedCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+    await restarted.run(restartedChunk, restartedCtx);
+    assert.equal(mock.calls.length, 2, 'new claim survives stale clear event');
+    restartedManager.close();
+    fx.manager.close();
+  });
+
+  it('reloads branch-scoped quarantine projection on every branch switch', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    const main = fx.manager.currentBranch().name;
+    const fork = fx.manager.getStore().createBranchAt(
+      'quarantine-fork', main, fx.manager.getStore().currentSequence(),
+    ).name;
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1);
+
+    await fx.manager.switchBranch(fork);
+    const forkCtx = managerContext(fx.manager);
+    const forkChunk = {
+      ...fx.target,
+      messages: fx.target.messages.map((message) => forkCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+    await fx.strategy.run(forkChunk, forkCtx);
+    assert.equal(mock.calls.length, 2, 'fork inherited pre-quarantine state and may attempt');
+
+    await fx.manager.switchBranch(main);
+    const mainCtx = managerContext(fx.manager);
+    const mainChunk = {
+      ...fx.target,
+      messages: fx.target.messages.map((message) => mainCtx.messageStore.get(message.id)!),
+      compressed: false,
+    };
+    await fx.strategy.run(mainChunk, mainCtx);
+    assert.equal(mock.calls.length, 2, 'main branch reloads and suppresses its active key');
+    fx.manager.close();
+  });
+
+  it('replays a durable pending alert with the same key after the crash gap', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const events = quarantineEvents(fx.manager);
+    const pending = events.find((event) => event.kind === 'alert_pending')!;
+    const key = String(pending.key);
+    const main = fx.manager.currentBranch().name;
+    const crashBranch = fx.manager.getStore().createBranchAt(
+      'alert-crash-gap', main, Number(pending.sequence),
+    ).name;
+
+    await fx.manager.switchBranch(crashBranch);
+    const replayed = quarantineEvents(fx.manager);
+    const sent = replayed.filter(
+      (event) => event.kind === 'alert_sent' && event.alertKey === key,
+    );
+    assert.equal(sent.length, 1, 'initialization retries the pending keyed alert attempt');
+    fx.manager.close();
   });
 });
