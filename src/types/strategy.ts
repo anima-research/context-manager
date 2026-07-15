@@ -158,6 +158,54 @@ export interface ContextStrategy {
 }
 
 /**
+ * The small, explicitly hot-reloadable part of a context strategy.
+ *
+ * `preparedWindowTokens` is deliberately separate from the hard TokenBudget
+ * passed to select(): a strategy may prepare a smaller frontier gradually
+ * while the caller continues to compile against the current (larger) window.
+ */
+export interface HotContextSettings {
+  /** Recent raw tail retained verbatim. */
+  tailTokens: number;
+  /** Per-compile KV perturbation/re-read allowance used during transitions. */
+  transitionPaceTokens?: number;
+  /** Future usable context window being prepared, excluding response reserve. */
+  preparedWindowTokens?: number;
+}
+
+export interface HotContextSettingsUpdate {
+  tailTokens?: number;
+  /** `null` restores the strategy's implicit/default pace. */
+  transitionPaceTokens?: number | null;
+  /** `null` cancels a prepared-window transition. */
+  preparedWindowTokens?: number | null;
+}
+
+export interface HotContextSettingsStatus extends HotContextSettings {
+  /** Tokens in the most recently selected adaptive frontier, when available. */
+  currentFrontierTokens?: number;
+  /** True once the selected frontier fits the prepared window. */
+  prepared: boolean;
+  /** The requested pace is below the smallest realizable frontier change. */
+  blocked?: 'transition-pace-floor' | 'prepared-window-floor';
+}
+
+/** Strategy capability for the allowlisted settings that are safe to change live. */
+export interface HotConfigurableStrategy extends ContextStrategy {
+  getHotContextSettings(): HotContextSettingsStatus;
+  updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus;
+}
+
+export function isHotConfigurableStrategy(s: ContextStrategy): s is HotConfigurableStrategy {
+  return (
+    'getHotContextSettings' in s &&
+    typeof (s as HotConfigurableStrategy).getHotContextSettings === 'function' &&
+    'updateHotContextSettings' in s &&
+    typeof (s as HotConfigurableStrategy).updateHotContextSettings === 'function'
+  );
+}
+
+/**
  * Result of a strategy's ingestion-time chunking decision.
  */
 export interface IngressChunkResult {

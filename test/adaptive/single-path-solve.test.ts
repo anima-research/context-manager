@@ -213,6 +213,48 @@ test('P below the physical floor cannot stall: no-progress partial is overridden
   assert.ok(plan.tokens <= 30_000, `sheds to the band anyway (${plan.tokens})`);
 });
 
+test('strict transition pace below the physical floor blocks instead of jumping', () => {
+  const { inputs, tree } = session();
+  const rawZone = tailZone(inputs, 12);
+  const carried = new Map<ChunkId, number>(inputs.chunks.map((c) => [c.id, 0]));
+  const plan = planControlledFrontier(inputs, tree, {
+    previous: carried,
+    foldAtTokens: 30_000,
+    expandAtTokens: 24_000,
+    targetTokens: 24_000,
+    windowTokens: 200_000,
+    reachTokens: 2_000,
+    strictReach: true,
+    rawZone,
+    now: 89,
+    mergeThreshold: 6,
+  });
+  assert.equal(plan.override, undefined, 'strict transition never overrides for quality');
+  assert.equal(plan.blocked, 'reach-floor');
+  assert.equal(plan.perturbation, 0);
+  assert.equal(plan.tokens, 90_000, 'keeps the currently valid live frontier');
+});
+
+test('strict transition reports when the protected raw floor exceeds the target window', () => {
+  const { inputs, tree } = session();
+  const rawZone = tailZone(inputs, 12); // protected floor is 12k
+  const carried = new Map<ChunkId, number>(inputs.chunks.map((c) => [c.id, 0]));
+  const plan = planControlledFrontier(inputs, tree, {
+    previous: carried,
+    foldAtTokens: 10_000,
+    expandAtTokens: 9_000,
+    targetTokens: 9_000,
+    windowTokens: 200_000,
+    reachTokens: 200_000,
+    strictReach: true,
+    rawZone,
+    now: 89,
+    mergeThreshold: 6,
+  });
+  assert.equal(plan.blocked, 'target-floor');
+  assert.ok(plan.tokens > 10_000);
+});
+
 test('infeasible within P → override, feasibility beats the trust region', () => {
   const { inputs, tree } = session();
   const rawZone = tailZone(inputs, 6);

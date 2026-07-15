@@ -21,6 +21,8 @@ import type {
   SearchQuery,
   SearchResult,
   RenderStats,
+  HotContextSettingsUpdate,
+  HotContextSettingsStatus,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -460,6 +462,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Lazy picker instance, built from config.foldingStrategy. */
   private _adaptivePicker: Picker | null = null;
 
+  /** A future usable window the KV-stable controller is preparing while the
+   * caller keeps compiling against its current hard window. */
+  private preparedWindowTokens: number | undefined;
+  private lastFrontierTokens: number | undefined;
+  private transitionBlocked: HotContextSettingsStatus['blocked'] | undefined;
+  private runtimeTransitionPaceTokens: number | undefined;
+
   constructor(config: AutobiographicalOptions = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
     // Hierarchical is on by default; set hierarchical: false to use legacy single-level
@@ -477,6 +486,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.compressionSlackRatio ??= 0.1;
       this.config.speculativeProduction ??= true;
     }
+  }
+
+  getHotContextSettings(): HotContextSettingsStatus {
+    return {
+      tailTokens: this.config.recentWindowTokens,
+      ...((this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens) !== undefined
+        ? { transitionPaceTokens: this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens }
+        : {}),
+      ...(this.preparedWindowTokens !== undefined
+        ? { preparedWindowTokens: this.preparedWindowTokens }
+        : {}),
+      ...(this.lastFrontierTokens !== undefined
+        ? { currentFrontierTokens: this.lastFrontierTokens }
+        : {}),
+      prepared:
+        this.preparedWindowTokens === undefined ||
+        (this.lastFrontierTokens !== undefined &&
+          this.lastFrontierTokens <= this.preparedWindowTokens),
+      ...(this.transitionBlocked ? { blocked: this.transitionBlocked } : {}),
+    };
+  }
+
+  updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    if (update.tailTokens !== undefined) {
+      if (!Number.isSafeInteger(update.tailTokens) || update.tailTokens < 0) {
+        throw new Error('tailTokens must be a non-negative safe integer');
+      }
+    }
+    if (update.transitionPaceTokens !== undefined && update.transitionPaceTokens !== null) {
+      if (!Number.isSafeInteger(update.transitionPaceTokens) || update.transitionPaceTokens <= 0) {
+        throw new Error('transitionPaceTokens must be a positive safe integer');
+      }
+    }
+    if (update.preparedWindowTokens !== undefined) {
+      if (update.preparedWindowTokens !== null) {
+        if (!this.config.adaptiveResolution || this.config.foldingStrategy !== 'kv-stable') {
+          throw new Error(
+            'Gradual context-window transitions require adaptiveResolution with foldingStrategy "kv-stable"',
+          );
+        }
+        if (!Number.isSafeInteger(update.preparedWindowTokens) || update.preparedWindowTokens <= 0) {
+          throw new Error('preparedWindowTokens must be a positive safe integer');
+        }
+      }
+    }
+    if (update.tailTokens !== undefined) this.config.recentWindowTokens = update.tailTokens;
+    if (update.transitionPaceTokens !== undefined) {
+      this.runtimeTransitionPaceTokens = update.transitionPaceTokens ?? undefined;
+    }
+    if (update.preparedWindowTokens !== undefined) {
+      this.preparedWindowTokens = update.preparedWindowTokens ?? undefined;
+      this.transitionBlocked = undefined;
+    }
+    return this.getHotContextSettings();
   }
 
   /**
@@ -3162,12 +3225,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headTokens,
       tailTokens,
     };
-    const picker = this.buildPicker(pickerInputs);
+    const preparedTotal = this.preparedWindowTokens === undefined
+      ? undefined
+      : Math.min(totalBudget, this.preparedWindowTokens);
+    const picker = this.buildPicker(
+      pickerInputs,
+      preparedTotal === undefined
+        ? undefined
+        : {
+            totalBudget: preparedTotal,
+            targetBudget: preparedTotal * (1 - slack),
+          },
+    );
     const result = picker.run(pickerInputs, foldingBudget);
+    this.lastFrontierTokens = result.finalTokens;
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.
     const plan = this._lastKvStable?.lastPlan();
+    this.transitionBlocked = plan?.blocked === 'reach-floor'
+      ? 'transition-pace-floor'
+      : plan?.blocked === 'target-floor'
+        ? 'prepared-window-floor'
+        : undefined;
     if (plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
@@ -3748,12 +3828,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * need the per-compile `PickerInputs` at construction, so they're built fresh
    * here; stateless ones (flat-profile / oldest-first) reuse the memoized picker.
    */
-  protected buildPicker(inputs: PickerInputs): Picker {
+  protected buildPicker(
+    inputs: PickerInputs,
+    preparedBudget?: { totalBudget: number; targetBudget: number },
+  ): Picker {
     if (this.config.foldingStrategy === 'kv-stable') {
       const strategy = new KvStableStrategy(inputs, {
-        reachTokens: this.config.kvStableReachTokens,
+        reachTokens: preparedBudget === undefined
+          ? this.config.kvStableReachTokens
+          : this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens,
         qualityGapRatio: this.config.kvStableQualityGapRatio,
         mergeThreshold: this.config.mergeThreshold,
+        goalTotalTokens: preparedBudget?.totalBudget,
+        goalTargetTokens: preparedBudget?.targetBudget,
+        strictReach: preparedBudget !== undefined,
       });
       this._lastKvStable = strategy;
       return new Picker(strategy);

@@ -555,6 +555,9 @@ export interface ControlPlanParams {
    *  windowTokens (a rendered layout never exceeds W, so the default trust
    *  region never binds). */
   reachTokens?: number;
+  /** Never override P for quality while preparing a future window. If the
+   * smallest realizable change exceeds P, hold and report a pace floor. */
+  strictReach?: boolean;
   /** Quality-gap override threshold (§13.4): a plan within P is rejected — and
    *  the ideal adopted, paying the perturbation — when its relevance loss
    *  exceeds the ideal's by more than this fraction of the ideal's loss.
@@ -603,6 +606,8 @@ export interface ControlPlan {
    *  - 'infeasible': nothing within P fits under W — feasibility beats P;
    *  - 'quality-gap': the best plan within P was certifiably bad vs the ideal. */
   override?: 'bootstrap' | 'infeasible' | 'quality-gap';
+  /** No realizable progress fits inside a strict trust region. */
+  blocked?: 'reach-floor' | 'target-floor';
 }
 
 /**
@@ -636,6 +641,7 @@ export function planControlledFrontier(
   const P = p.reachTokens ?? p.windowTokens;
   const expandAt = p.expandAtTokens ?? p.targetTokens;
   const gapRatio = p.qualityGapRatio ?? 0.35;
+  const strictReach = p.strictReach ?? false;
   // Fold as deep as the tree actually goes (L4/L5… when produced), not a constant.
   const maxFoldLevel = maxAvailableLevel(tree);
 
@@ -709,7 +715,7 @@ export function planControlledFrontier(
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
   const idealLoss = relevanceLoss(ideal.F, ordered, p.rawZone, caps);
-  const gapCeiling = gapRatio * Math.max(1, idealLoss);
+  const gapCeiling = (strictReach ? Number.POSITIVE_INFINITY : gapRatio) * Math.max(1, idealLoss);
 
   const flags = (F: ReadonlyMap<ChunkId, number>): { folded: boolean; expanded: boolean } => {
     let folded = false;
@@ -731,6 +737,9 @@ export function planControlledFrontier(
     escalated: ideal.tokens > p.windowTokens,
     perturbation: kvCost(carriedLayout, idealLayout),
     ...(override ? { override } : {}),
+    ...(strictReach && ideal.tokens > p.foldAtTokens
+      ? { blocked: 'target-floor' as const }
+      : {}),
   });
 
   // 2. Bootstrap: nothing carried → nothing to preserve; pure relevance solve.
@@ -774,6 +783,17 @@ export function planControlledFrontier(
       ...flags(partial.F),
       escalated: false,
       perturbation: partial.perturbation,
+    };
+  }
+
+  if (strictReach && carriedTokens <= p.windowTokens) {
+    return {
+      resolutions: carried,
+      tokens: carriedTokens,
+      ...flags(carried),
+      escalated: false,
+      perturbation: 0,
+      blocked: 'reach-floor',
     };
   }
 

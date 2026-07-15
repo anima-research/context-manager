@@ -31,6 +31,10 @@ export type {
   StrategyContext,
   ReadinessState,
   ContextStrategy,
+  HotContextSettings,
+  HotContextSettingsUpdate,
+  HotContextSettingsStatus,
+  HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
   SummaryLevel,
@@ -55,4 +59,5 @@ export {
   isPinnableStrategy,
   isSearchableStrategy,
   isRenderStatsCapable,
+  isHotConfigurableStrategy,
 } from './strategy.js';

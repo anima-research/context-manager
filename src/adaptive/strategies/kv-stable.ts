@@ -42,6 +42,12 @@ export interface KvStableOptions {
   qualityGapRatio?: number;
   /** Base-k summary grouping (matches the strategy's mergeThreshold). Default 6. */
   mergeThreshold?: number;
+  /** Future high/low watermark pair. The live FoldingBudget remains the hard
+   * wall while the controller walks toward these smaller values. */
+  goalTotalTokens?: number;
+  goalTargetTokens?: number;
+  /** Enforce reach as a hard transition pace instead of allowing quality overrides. */
+  strictReach?: boolean;
 }
 
 export class KvStableStrategy implements FoldingStrategy {
@@ -133,11 +139,12 @@ export class KvStableStrategy implements FoldingStrategy {
       previous: this.fPrev,
       // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
       // is the quiet dead band; the trust region and overrides do the rest.
-      foldAtTokens: budget.totalBudget,
-      expandAtTokens: budget.targetBudget,
-      targetTokens: budget.targetBudget,
+      foldAtTokens: this.opts.goalTotalTokens ?? budget.totalBudget,
+      expandAtTokens: this.opts.goalTargetTokens ?? budget.targetBudget,
+      targetTokens: this.opts.goalTargetTokens ?? budget.targetBudget,
       windowTokens: budget.totalBudget,
       reachTokens: this.opts.reachTokens,
+      strictReach: this.opts.strictReach,
       qualityGapRatio: this.opts.qualityGapRatio,
       rawZone,
       frozen,

@@ -46,6 +46,10 @@ export type {
   StrategyContext,
   ReadinessState,
   ContextStrategy,
+  HotContextSettings,
+  HotContextSettingsUpdate,
+  HotContextSettingsStatus,
+  HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
   SummaryLevel,
@@ -56,4 +60,8 @@ export type {
   ResettableStrategy,
 } from './types/index.js';
 
-export { DEFAULT_AUTOBIOGRAPHICAL_CONFIG, isResettableStrategy } from './types/index.js';
+export {
+  DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
+  isResettableStrategy,
+  isHotConfigurableStrategy,
+} from './types/index.js';

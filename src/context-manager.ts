@@ -20,8 +20,16 @@ import type {
   SearchQuery,
   SearchResult,
   SummaryEntry,
+  HotContextSettingsUpdate,
+  HotContextSettingsStatus,
 } from './types/index.js';
-import { isResettableStrategy, isPinnableStrategy, isSearchableStrategy, isRenderStatsCapable } from './types/index.js';
+import {
+  isResettableStrategy,
+  isPinnableStrategy,
+  isSearchableStrategy,
+  isRenderStatsCapable,
+  isHotConfigurableStrategy,
+} from './types/index.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -654,6 +662,20 @@ export class ContextManager {
    */
   getStrategy(): ContextStrategy {
     return this.strategy;
+  }
+
+  /** Read the active strategy's allowlisted live settings, if supported. */
+  getHotContextSettings(): HotContextSettingsStatus | null {
+    if (!isHotConfigurableStrategy(this.strategy)) return null;
+    return this.strategy.getHotContextSettings();
+  }
+
+  /** Update only settings the active strategy explicitly declares hot-safe. */
+  updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    if (!isHotConfigurableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support live context settings');
+    }
+    return this.strategy.updateHotContextSettings(update);
   }
 
   // ==========================================================================
