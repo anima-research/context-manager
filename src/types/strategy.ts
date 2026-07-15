@@ -501,6 +501,14 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * Maximum number of same-model recall-curve variants attempted after an L1
+   * canonical request is explicitly refused. Each variant expands exactly one
+   * already-authored frontier summary into its persisted direct children.
+   * Default: 3. Set to 0 to disable fallback (canonical is still attempted).
+   */
+  compressionRefusalCurveFallbacks?: number;
+
+  /**
    * Minimum substantive text (non-whitespace chars across a chunk's
    * messages) below which L1 compression skips the LLM call and stores a
    * mechanical stub summary instead (default: 200).
@@ -847,4 +855,5 @@ Write naturally, as recollection of what you experienced.`,
   imageStripDepthTokens: 30000,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
+  compressionRefusalCurveFallbacks: 3,
 };
