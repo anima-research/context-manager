@@ -35,6 +35,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
+import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 
 /**
  * Base configuration for ContextManager.
@@ -209,6 +210,7 @@ export class ContextManager {
     );
 
     // Initialize strategy
+    observeStoreBranch(store);
     await manager.initializeStrategy();
     manager.initialized = true;
 
@@ -409,6 +411,7 @@ export class ContextManager {
    */
   async switchBranch(branchId: string): Promise<void> {
     this.store.switchBranch(branchId);
+    markStoreBranchSwitch(this.store);
     await this.initializeStrategy();
   }
 

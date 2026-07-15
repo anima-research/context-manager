@@ -99,13 +99,14 @@ Default maximum: 3 fallback variants. Make configurable, e.g.:
 Fallback admission uses `compressionContextBudgetTokens` (default `200000`),
 the combined model context budget for request input plus the configured
 `maxTokens` output reserve. The canonical request is still issued unchanged.
-Its provider-reported input usage is the authoritative full-request baseline
-(head, recall, raw middle, chunk, tools, instruction, and formatter envelopes).
-Each variant adds a UTF-8-byte upper bound for its complete replacement pairs
-without subtracting the removed parent. If canonical usage is unavailable, the
-normalized canonical input byte size is used conservatively. Stored
-`SummaryEntry.tokens` is never an admission authority. An over-budget variant
-is recorded and skipped without preventing a later eligible variant.
+Admission is deterministic before inference: it uses a UTF-8-byte upper bound
+over every input-bearing field of the complete normalized variant (head,
+recall, raw middle, chunk, tools, instruction, system/provider fields), a
+per-message formatter-envelope allowance, and the output reserve. Optional
+provider usage and stored `SummaryEntry.tokens` are never admission authority.
+The ordered plan records every rejection and at most the normalized positive
+fallback limit of provider attempts. An over-budget variant is recorded and
+skipped without preventing a later eligible variant.
 
 Stop at the first non-refusal response containing persistable nonempty memory
 text. A refused, empty, or provider-error variant is recorded and the bounded
@@ -132,7 +133,9 @@ admission, throws a provider/validation error, or returns no persistable text:
   - chunk source-ID hash;
   - canonical recall-frontier ID/level hash;
   - canonical normalized request hash;
-  - attempted variant IDs and hashes.
+  - normalized fallback limit and context budget;
+  - the exact ordered bounded attempt/admission plan (IDs, hashes, bounds, and
+    dispositions).
 - suppress additional provider calls while the key is unchanged;
 - retry only when:
   - recall frontier changes;
@@ -149,21 +152,38 @@ is the read-only compatibility snapshot from the first implementation, while
 
 `<namespace>/autobio:compression-refusal-quarantine-events`
 
-is the append-only Chronicle ledger. Events claim a request family before its
-canonical call, mark exhaustion, tombstone an exact claim generation, and
-account for keyed alert delivery. Same-process strategy instances serialize the
-short replay/mutate/append sequence per store, branch, and state. Different keys
-cannot overwrite one another, and a stale tombstone cannot erase a newer claim.
-The branch-scoped projection is replayed on every strategy initialization.
+is the Chronicle exhaustion ledger. Normal work writes nothing to it: there is
+no durable in-flight claim. Only genuine exhaustion, exact-generation clear,
+alert accounting, and periodic checkpoints append events. Same-process strategy
+instances use a module-level `JsStore + branch name + family key` in-flight
+registry to coalesce provider work, and serialize short durable mutations per
+store/branch/state. The operation also captures per-store and per-strategy
+branch generations (including same-name switch round trips); after every
+provider await and before summary/quarantine/alert mutation, a branch-name/
+generation mismatch discards the result without writing either branch.
+Different keys cannot overwrite one another, and a stale
+tombstone cannot erase a newer exhaustion. The branch-scoped projection is
+replayed on every strategy initialization.
 
 Alert delivery is at-least-once and keyed, not exactly-once: `alert_pending` is
 durable before the structured external attempt and `alert_sent` follows it. A
 crash between those events can replay the same alert key after restart, which a
-downstream sink must deduplicate. Chronicle exposes no cross-process
-compare-and-swap transaction, so the no-duplicate-provider-call guarantee is
-limited to strategy instances sharing the same `JsStore` object in one process.
-A crash while a claim is in flight leaves a fail-closed active claim requiring
-explicit operator clear; it does not silently retry an unchanged request.
+downstream sink must deduplicate. Chronicle is the single-writer store boundary;
+the in-flight registry itself is process-local, so it does not promise
+cross-process coalescing if that boundary is bypassed. A process crash before
+exhaustion leaves no durable claim and therefore cannot suppress the family
+forever.
+
+The logical ledger is finitely retained. At 256 events, mutation under the same
+branch-pinned lock appends an active-projection checkpoint first, then redacts
+the preceding event range and asks Chronicle to compact the state. The
+append-first order makes both crash gaps replay-equivalent and avoids an unsafe
+read/replace whole-array snapshot. A checkpoint retains the newest 1,024 active
+exhausted families; older families expire and may make a new canonical-first
+attempt. Between checkpoints at most 128 two-event exhaustion/pending-alert
+groups can accumulate, so both active state and event history have a finite
+bound. Within that window, a family remains until its key changes or an
+exact-generation operator clear.
 
 ## Observability
 
@@ -191,6 +211,7 @@ Suggested trace events:
 - `compression:curve-succeeded`
 - `compression:curve-exhausted`
 - `compression:quarantine-skipped`
+- `compression:branch-result-discarded`
 
 ## Tests
 
