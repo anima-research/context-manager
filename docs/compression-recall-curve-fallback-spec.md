@@ -96,7 +96,20 @@ Default maximum: 3 fallback variants. Make configurable, e.g.:
 
 `compressionRefusalCurveFallbacks?: number` (default `3`; `0` disables).
 
-Stop at first non-refusal response.
+Fallback admission uses `compressionContextBudgetTokens` (default `200000`),
+the combined model context budget for request input plus the configured
+`maxTokens` output reserve. The canonical request is still issued unchanged.
+Its provider-reported input usage is the authoritative full-request baseline
+(head, recall, raw middle, chunk, tools, instruction, and formatter envelopes).
+Each variant adds a UTF-8-byte upper bound for its complete replacement pairs
+without subtracting the removed parent. If canonical usage is unavailable, the
+normalized canonical input byte size is used conservatively. Stored
+`SummaryEntry.tokens` is never an admission authority. An over-budget variant
+is recorded and skipped without preventing a later eligible variant.
+
+Stop at the first non-refusal response containing persistable nonempty memory
+text. A refused, empty, or provider-error variant is recorded and the bounded
+curve continues. Canonical non-refusal behavior remains unchanged.
 
 ### Optional later variants
 
@@ -109,7 +122,8 @@ Do not include these in v1 unless single-node expansion proves insufficient acro
 
 ## Durable refusal quarantine
 
-If canonical and every allowed variant refuse:
+If canonical refuses and every allowed variant refuses, is rejected by
+admission, throws a provider/validation error, or returns no persistable text:
 
 - leave the chunk raw;
 - do not store an empty summary;
@@ -127,11 +141,29 @@ If canonical and every allowed variant refuse:
   - operator explicitly clears/retries the record.
 - emit one ops alert for the exhausted key, not one per maintenance tick.
 
-Suggested state ID:
+State IDs:
 
 `<namespace>/autobio:compression-refusal-quarantine`
 
-A process-local set is insufficient because restart would resume hammering.
+is the read-only compatibility snapshot from the first implementation, while
+
+`<namespace>/autobio:compression-refusal-quarantine-events`
+
+is the append-only Chronicle ledger. Events claim a request family before its
+canonical call, mark exhaustion, tombstone an exact claim generation, and
+account for keyed alert delivery. Same-process strategy instances serialize the
+short replay/mutate/append sequence per store, branch, and state. Different keys
+cannot overwrite one another, and a stale tombstone cannot erase a newer claim.
+The branch-scoped projection is replayed on every strategy initialization.
+
+Alert delivery is at-least-once and keyed, not exactly-once: `alert_pending` is
+durable before the structured external attempt and `alert_sent` follows it. A
+crash between those events can replay the same alert key after restart, which a
+downstream sink must deduplicate. Chronicle exposes no cross-process
+compare-and-swap transaction, so the no-duplicate-provider-call guarantee is
+limited to strategy instances sharing the same `JsStore` object in one process.
+A crash while a claim is in flight leaves a fail-closed active claim requiring
+explicit operator clear; it does not silently retry an unchanged request.
 
 ## Observability
 

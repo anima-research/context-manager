@@ -296,12 +296,78 @@ interface CompressionRefusalQuarantineRecord {
   created: number;
 }
 
+type CompressionAttemptOutcome =
+  | 'refusal'
+  | 'unusable_empty'
+  | 'provider_error'
+  | 'admission_rejected';
+
+interface CompressionRefusalOutcomeRecord {
+  curveLabel: string;
+  requestHash: string;
+  outcome: CompressionAttemptOutcome;
+  stopReason?: string;
+  errorType?: string;
+  admittedTokens?: number;
+  budgetTokens?: number;
+}
+
+interface CompressionQuarantineEventBase {
+  eventId?: string;
+  sequence?: number;
+  key: string;
+  created: number;
+}
+
+type CompressionQuarantineEvent =
+  | (CompressionQuarantineEventBase & {
+      kind: 'claim';
+      record: CompressionRefusalQuarantineRecord;
+    })
+  | (CompressionQuarantineEventBase & {
+      kind: 'clear';
+      targetClaimId: string;
+    })
+  | (CompressionQuarantineEventBase & {
+      kind: 'exhausted';
+      targetClaimId: string;
+      outcomes: CompressionRefusalOutcomeRecord[];
+    })
+  | (CompressionQuarantineEventBase & {
+      kind: 'alert_pending';
+      targetClaimId: string;
+      alertKey: string;
+    })
+  | (CompressionQuarantineEventBase & {
+      kind: 'alert_sent';
+      targetClaimId: string;
+      alertKey: string;
+      pendingEventId: string;
+    });
+
+type NewCompressionQuarantineEvent = CompressionQuarantineEvent extends infer Event
+  ? Event extends CompressionQuarantineEvent
+    ? Omit<Event, 'eventId' | 'sequence'>
+    : never
+  : never;
+
+interface ActiveCompressionQuarantine {
+  claimId: string;
+  record: CompressionRefusalQuarantineRecord;
+  status: 'claimed' | 'exhausted';
+  outcomes: CompressionRefusalOutcomeRecord[];
+  pendingAlert?: { eventId: string; alertKey: string };
+  sentAlertKeys: Set<string>;
+}
+
 interface RecallCurveVariant {
   parent: SummaryEntry;
   children: SummaryEntry[];
   leafCoverageHash: string;
   request: NormalizedRequest;
   requestHash: string;
+  renderedInputBytes: number;
+  admissionExpansionBytes: number;
 }
 
 interface CompressionAttemptTrace {
@@ -319,10 +385,47 @@ interface CompressionAttemptTrace {
   refusalCategory?: string;
   latencyMs: number;
   persisted: boolean;
+  outcome?: CompressionAttemptOutcome | 'success';
+  errorType?: string;
+  admittedTokens?: number;
+  budgetTokens?: number;
 }
 
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+/**
+ * Chronicle state mutation is synchronous but not transactional across a
+ * read/project/append sequence. Serialize those short sequences for strategy
+ * instances sharing one JsStore in this process. Branch is part of the key so
+ * branch-scoped projections never block or overwrite one another.
+ */
+const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
+
+async function withCompressionStateLock<T>(
+  store: JsStore,
+  stateId: string,
+  work: () => T | Promise<T>,
+): Promise<T> {
+  let locks = compressionStateLocks.get(store);
+  if (!locks) {
+    locks = new Map();
+    compressionStateLocks.set(store, locks);
+  }
+  const lockKey = `${store.currentBranch().name}\u0000${stateId}`;
+  const previous = locks.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  locks.set(lockKey, tail);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (locks.get(lockKey) === tail) locks.delete(lockKey);
+  }
 }
 
 /**
@@ -488,12 +591,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  /** Legacy snapshot used by the unapproved first implementation. Read-only. */
   protected get compressionRefusalQuarantineStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine`;
   }
+  protected get compressionRefusalQuarantineLedgerStateId(): string {
+    return `${this.ns}/autobio:compression-refusal-quarantine-events`;
+  }
 
-  /** Durable refusal circuit-breakers, mirrored from Chronicle on initialize. */
-  private compressionRefusalQuarantine = new Map<string, CompressionRefusalQuarantineRecord>();
+  /** Branch-scoped projection of the append-only quarantine event ledger. */
+  private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
@@ -551,10 +658,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Explicit operator escape hatch. A retry remains canonical-first; clearing
    * this state only permits the same as-of request family to be issued again.
    */
-  clearCompressionRefusalQuarantine(key?: string): void {
-    if (key === undefined) this.compressionRefusalQuarantine.clear();
-    else this.compressionRefusalQuarantine.delete(key);
-    this.persistCompressionRefusalQuarantine();
+  async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
+    if (!this.store) return;
+    // Capture claim identities at invocation. A delayed clear can tombstone
+    // only those exact generations; it cannot erase a newer same-key claim.
+    const observed = this.readCompressionQuarantineProjection();
+    const targets = key === undefined
+      ? [...observed.values()].map((active) => ({ key: active.record.key, claimId: active.claimId }))
+      : observed.has(key)
+        ? [{ key, claimId: observed.get(key)!.claimId }]
+        : [];
+    await withCompressionStateLock(this.store, this.compressionRefusalQuarantineLedgerStateId, () => {
+      const current = this.readCompressionQuarantineProjection();
+      for (const target of targets) {
+        if (current.get(target.key)?.claimId !== target.claimId) continue;
+        this.appendCompressionQuarantineEvent({
+          kind: 'clear',
+          key: target.key,
+          targetClaimId: target.claimId,
+          created: Date.now(),
+        });
+      }
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    });
   }
 
   getHotContextSettings(): HotContextSettingsStatus {
@@ -702,6 +828,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.ns = ctx.namespace;
     this.registerStates();
     this.loadPersistedState();
+    await this.deliverPendingCompressionQuarantineAlerts();
 
     // Restore headWindowStartId from last topic transition message
     const messages = ctx.messageStore.getAll();
@@ -864,8 +991,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch { /* already registered */ }
     try {
       this.store.registerState({
-        id: this.compressionRefusalQuarantineStateId,
-        strategy: 'snapshot',
+        id: this.compressionRefusalQuarantineLedgerStateId,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 50,
+        fullSnapshotEvery: 10,
       });
     } catch { /* already registered */ }
     // Adaptive-resolution state slots — only registered when the flag is on
@@ -1002,15 +1131,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing sources`);
     }
 
-    const quarantine = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
-    const quarantineRecords = Array.isArray(quarantine)
-      ? (quarantine as CompressionRefusalQuarantineRecord[])
-      : [];
-    this.compressionRefusalQuarantine = new Map(
-      quarantineRecords
-        .filter((record) => record && typeof record.key === 'string')
-        .map((record) => [record.key, record]),
-    );
+    this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
 
     const pinsState = this.store.getStateJson(this.pinsStateId);
     if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
@@ -1344,24 +1465,62 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { kept, keptTokens: total };
   }
 
-  private recallPairTokens(summary: SummaryEntry): number {
-    return (summary.tokens || Math.ceil(summary.content.length / 4)) + 50;
+  private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
+    return a.id === b.id &&
+      a.level === b.level &&
+      a.sourceLevel === b.sourceLevel &&
+      a.content === b.content &&
+      a.sourceRange?.first === b.sourceRange?.first &&
+      a.sourceRange?.last === b.sourceRange?.last &&
+      Array.isArray(a.sourceIds) && Array.isArray(b.sourceIds) &&
+      a.sourceIds.length === b.sourceIds.length &&
+      a.sourceIds.every((id, index) => id === b.sourceIds[index]);
   }
 
-  private persistedSummariesById(): Map<string, SummaryEntry> {
+  /**
+   * Resolve IDs through loadPersistedState's canonical projection, never an
+   * arbitrary historical duplicate. Each projected authored node must still
+   * have a byte-identical authored copy in Chronicle; mergedInto is excluded
+   * because it is mutable graph state, not authored node identity.
+   */
+  private persistedCanonicalSummariesById(): Map<string, SummaryEntry> {
     const stored = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(stored)) return new Map();
-    return new Map(
-      (stored as SummaryEntry[])
-        .filter((summary) => summary && typeof summary.id === 'string')
-        .map((summary) => [summary.id, summary]),
-    );
+    const historical = stored as SummaryEntry[];
+    const canonical = new Map<string, SummaryEntry>();
+    for (const summary of this.summaries) {
+      if (!summary || typeof summary.id !== 'string') continue;
+      if (historical.some((alternate) => alternate && this.sameAuthoredSummary(summary, alternate))) {
+        canonical.set(summary.id, summary);
+      }
+    }
+    return canonical;
   }
 
   private estimateCompressionRequestTokens(request: NormalizedRequest): number {
     // Metadata-only observability and a conservative budget check. The ordinary
     // formatter/provider remains authoritative for rendered token accounting.
     return Math.ceil(JSON.stringify(request).length / 4);
+  }
+
+  private compressionRequestInputBytes(request: NormalizedRequest): number {
+    // Independent from stored token metadata and chars/4 estimation. The
+    // normalized request contains every input-bearing field (messages, tools,
+    // system/provider params); UTF-8 bytes are an upper bound on additional
+    // byte-token vocabulary consumption when used for expansion deltas.
+    const input = {
+      messages: request.messages,
+      system: request.system,
+      tools: request.tools,
+      toolMode: request.toolMode,
+      stopSequences: request.stopSequences,
+      promptCaching: request.promptCaching,
+      cacheTtl: request.cacheTtl,
+      contextPrefix: request.contextPrefix,
+      prefillUserMessage: request.prefillUserMessage,
+      providerParams: request.providerParams,
+    };
+    return Buffer.byteLength(JSON.stringify(input), 'utf8');
   }
 
   private refusalCategory(response: NormalizedResponse): string | undefined {
@@ -1380,20 +1539,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private recallCurveLeafIds(
     summary: SummaryEntry,
     byId: ReadonlyMap<string, SummaryEntry>,
+    position: ReadonlyMap<string, number>,
     visiting: Set<string> = new Set(),
   ): string[] | null {
-    if (visiting.has(summary.id) || !summary.sourceIds.length) return null;
-    if (summary.level === 1) return [...summary.sourceIds];
+    if (
+      visiting.has(summary.id) ||
+      !summary.content?.trim() ||
+      !Number.isSafeInteger(summary.level) ||
+      summary.level < 1 ||
+      summary.sourceLevel !== summary.level - 1 ||
+      !Array.isArray(summary.sourceIds) ||
+      summary.sourceIds.length === 0
+    ) return null;
+    if (summary.level === 1) {
+      const leafPositions = summary.sourceIds.map((id) => position.get(id));
+      if (leafPositions.some((index) => index === undefined)) return null;
+      if (leafPositions.some((index, i) => i > 0 && index! <= leafPositions[i - 1]!)) return null;
+      if (new Set(summary.sourceIds).size !== summary.sourceIds.length) return null;
+      if (
+        summary.sourceRange.first !== summary.sourceIds[0] ||
+        summary.sourceRange.last !== summary.sourceIds[summary.sourceIds.length - 1]
+      ) return null;
+      return [...summary.sourceIds];
+    }
 
     visiting.add(summary.id);
-    const leaves: string[] = [];
+    const children: SummaryEntry[] = [];
     for (const childId of summary.sourceIds) {
       const child = byId.get(childId);
-      if (!child || !child.content || !child.content.trim()) {
+      if (!child || child.level !== summary.sourceLevel) {
         visiting.delete(summary.id);
         return null;
       }
-      const childLeaves = this.recallCurveLeafIds(child, byId, visiting);
+      children.push(child);
+    }
+    children.sort((a, b) => {
+      const first = (position.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER) -
+        (position.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER);
+      return first || a.id.localeCompare(b.id);
+    });
+    const leaves: string[] = [];
+    for (const child of children) {
+      const childLeaves = this.recallCurveLeafIds(child, byId, position, visiting);
       if (!childLeaves) {
         visiting.delete(summary.id);
         return null;
@@ -1401,6 +1588,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       leaves.push(...childLeaves);
     }
     visiting.delete(summary.id);
+    if (new Set(leaves).size !== leaves.length) return null;
+    const leafPositions = leaves.map((id) => position.get(id));
+    if (leafPositions.some((index) => index === undefined)) return null;
+    if (leafPositions.some((index, i) => i > 0 && index! <= leafPositions[i - 1]!)) return null;
+    if (summary.sourceRange.first !== leaves[0] || summary.sourceRange.last !== leaves[leaves.length - 1]) {
+      return null;
+    }
     return leaves;
   }
 
@@ -1437,7 +1631,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private buildRecallCurveVariants(
     canonicalRequest: NormalizedRequest,
     keptSummaries: SummaryEntry[],
-    recallTokens: number,
     allMessages: StoredMessage[],
   ): RecallCurveVariant[] {
     const configuredMax = this.config.compressionRefusalCurveFallbacks ?? 3;
@@ -1449,10 +1642,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Alternate curves are allowed to use persisted authored nodes only. Do
     // not trust a merely in-memory node, even though production pushSummary()
     // normally appends synchronously before it enters the local mirror.
-    const byId = this.persistedSummariesById();
+    const byId = this.persistedCanonicalSummariesById();
     const position = new Map(allMessages.map((message, index) => [message.id, index]));
     const orderedParents = keptSummaries
-      .filter((summary) => summary.level > 1)
+      .map((summary) => byId.get(summary.id))
+      .filter((summary): summary is SummaryEntry => !!summary && summary.level > 1)
       .sort((a, b) => {
         const aNewest = position.get(a.sourceRange.last) ?? -1;
         const bNewest = position.get(b.sourceRange.last) ?? -1;
@@ -1476,14 +1670,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return a.id.localeCompare(b.id);
       });
 
-      const parentLeaves = this.recallCurveLeafIds(parent, byId);
-      const childLeaves = children.flatMap((child) => this.recallCurveLeafIds(child, byId) ?? []);
+      const parentLeaves = this.recallCurveLeafIds(parent, byId, position);
+      const childCoverage = children.map((child) => this.recallCurveLeafIds(child, byId, position));
+      if (childCoverage.some((leaves) => !leaves)) continue;
+      const childLeaves = childCoverage.flatMap((leaves) => leaves!);
       if (!parentLeaves || parentLeaves.length !== childLeaves.length) continue;
       if (new Set(parentLeaves).size !== parentLeaves.length) continue;
       if (new Set(childLeaves).size !== childLeaves.length) continue;
-      const parentCoverage = [...parentLeaves].sort();
-      const childCoverage = [...childLeaves].sort();
-      if (parentCoverage.some((id, index) => id !== childCoverage[index])) continue;
+      const sortedParentCoverage = [...parentLeaves].sort();
+      const sortedChildCoverage = [...childLeaves].sort();
+      if (sortedParentCoverage.some((id, index) => id !== sortedChildCoverage[index])) continue;
 
       // Exact leaf coverage is not enough: the replacement itself must be a
       // chronological rendering of that coverage at the same as-of boundary.
@@ -1512,11 +1708,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (pairIndexes.length !== 1) continue;
 
-      const variantRecallTokens = recallTokens - this.recallPairTokens(parent)
-        + children.reduce((total, child) => total + this.recallPairTokens(child), 0);
-      const recallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
-      if (variantRecallTokens > recallBudget) continue;
-
       const replacement = children.flatMap((child) => [
         {
           participant: 'Context Manager',
@@ -1539,23 +1730,223 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.validateRecallCurveRequest(request)) continue;
 
       const leafCoverageHash = sha256Json(childLeaves);
-      variants.push({
-        parent,
-        children,
-        leafCoverageHash,
-        request,
-        requestHash: sha256Json(request),
-      });
-      if (variants.length >= maxVariants) break;
+      try {
+        variants.push({
+          parent,
+          children,
+          leafCoverageHash,
+          request,
+          requestHash: sha256Json(request),
+          renderedInputBytes: this.compressionRequestInputBytes(request),
+          // Do not subtract the removed parent. Canonical measured usage plus
+          // the entire replacement byte cost is a conservative upper bound on
+          // variant input even when token density changes completely.
+          admissionExpansionBytes:
+            Buffer.byteLength(JSON.stringify(replacement), 'utf8') + replacement.length * 128,
+        });
+      } catch {
+        // One malformed/unsupported variant cannot suppress later candidates.
+        continue;
+      }
     }
     return variants;
   }
 
-  private persistCompressionRefusalQuarantine(): void {
-    this.store?.setStateJson(
-      this.compressionRefusalQuarantineStateId,
-      [...this.compressionRefusalQuarantine.values()],
+  private projectCompressionQuarantineEvents(
+    events: CompressionQuarantineEvent[],
+    legacyRecords: CompressionRefusalQuarantineRecord[] = [],
+  ): Map<string, ActiveCompressionQuarantine> {
+    const active = new Map<string, ActiveCompressionQuarantine>();
+    for (const record of legacyRecords) {
+      if (!record || typeof record.key !== 'string') continue;
+      active.set(record.key, {
+        claimId: `legacy:${record.key}`,
+        record,
+        status: 'exhausted',
+        outcomes: [],
+        // The legacy implementation emitted its alert immediately after the
+        // snapshot write. Treat it as accounted to avoid surprise replay.
+        sentAlertKeys: new Set([record.key]),
+      });
+    }
+    for (const event of events) {
+      if (!event || typeof event.key !== 'string') continue;
+      if (event.kind === 'claim') {
+        const claimId = event.eventId;
+        if (!claimId || active.has(event.key)) continue;
+        active.set(event.key, {
+          claimId,
+          record: event.record,
+          status: 'claimed',
+          outcomes: [],
+          sentAlertKeys: new Set(),
+        });
+        continue;
+      }
+      const current = active.get(event.key);
+      if (!current || current.claimId !== event.targetClaimId) continue;
+      if (event.kind === 'clear') {
+        active.delete(event.key);
+      } else if (event.kind === 'exhausted') {
+        current.status = 'exhausted';
+        current.outcomes = event.outcomes;
+      } else if (event.kind === 'alert_pending' && event.eventId) {
+        current.pendingAlert = { eventId: event.eventId, alertKey: event.alertKey };
+      } else if (event.kind === 'alert_sent') {
+        current.sentAlertKeys.add(event.alertKey);
+        if (current.pendingAlert?.eventId === event.pendingEventId) current.pendingAlert = undefined;
+      }
+    }
+    return active;
+  }
+
+  private readCompressionQuarantineProjection(): Map<string, ActiveCompressionQuarantine> {
+    if (!this.store) return new Map();
+    const ledger = this.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
+    const legacy = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
+    return this.projectCompressionQuarantineEvents(
+      Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
+      Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
     );
+  }
+
+  private appendCompressionQuarantineEvent(
+    event: NewCompressionQuarantineEvent,
+  ): CompressionQuarantineEvent {
+    if (!this.store) throw new Error('Compression quarantine store is not initialized');
+    const stored = this.store.appendToStateJsonWithIdentity(
+      this.compressionRefusalQuarantineLedgerStateId,
+      event,
+      'eventId',
+      'sequence',
+    );
+    return { ...event, eventId: stored.id, sequence: stored.sequence } as CompressionQuarantineEvent;
+  }
+
+  private async claimCompressionRequestFamily(
+    record: CompressionRefusalQuarantineRecord,
+  ): Promise<ActiveCompressionQuarantine | null> {
+    if (!this.store) return null;
+    return withCompressionStateLock(this.store, this.compressionRefusalQuarantineLedgerStateId, () => {
+      const current = this.readCompressionQuarantineProjection();
+      if (current.has(record.key)) {
+        this.compressionRefusalQuarantine = current;
+        return null;
+      }
+      const claim = this.appendCompressionQuarantineEvent({
+        kind: 'claim',
+        key: record.key,
+        record,
+        created: Date.now(),
+      });
+      const active: ActiveCompressionQuarantine = {
+        claimId: claim.eventId!,
+        record,
+        status: 'claimed',
+        outcomes: [],
+        sentAlertKeys: new Set(),
+      };
+      current.set(record.key, active);
+      this.compressionRefusalQuarantine = current;
+      return active;
+    });
+  }
+
+  private async releaseCompressionRequestFamily(
+    key: string,
+    claimId: string,
+  ): Promise<void> {
+    if (!this.store) return;
+    await withCompressionStateLock(this.store, this.compressionRefusalQuarantineLedgerStateId, () => {
+      const current = this.readCompressionQuarantineProjection();
+      if (current.get(key)?.claimId === claimId) {
+        this.appendCompressionQuarantineEvent({
+          kind: 'clear', key, targetClaimId: claimId, created: Date.now(),
+        });
+      }
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    });
+  }
+
+  private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
+    const payload = {
+      event: 'compression:quarantine-alert',
+      operation: 'compress_l1',
+      quarantine_key: active.record.key,
+      alert_key: active.record.key,
+      claim_id: active.claimId,
+      model: active.record.model,
+      chunk_hash: active.record.chunkSourceHash,
+      outcomes: active.outcomes,
+    };
+    // Structured and keyed only: no summary/chunk plaintext is emitted.
+    console.error(JSON.stringify(payload));
+    logCompressionCall(payload);
+  }
+
+  private async deliverPendingCompressionQuarantineAlerts(): Promise<void> {
+    if (!this.store) return;
+    await withCompressionStateLock(this.store, this.compressionRefusalQuarantineLedgerStateId, () => {
+      const projection = this.readCompressionQuarantineProjection();
+      for (const active of projection.values()) {
+        const pending = active.pendingAlert;
+        if (active.status !== 'exhausted' || !pending || active.sentAlertKeys.has(pending.alertKey)) {
+          continue;
+        }
+        // Pending is durable before the external attempt. If the process dies
+        // after emission but before alert_sent, restart retries with the same
+        // alert key; downstream idempotency can collapse the duplicate.
+        try {
+          this.emitCompressionQuarantineAlert(active);
+        } catch (error) {
+          logCompressionCall({
+            event: 'compression:quarantine-alert-attempt-failed',
+            operation: 'compress_l1',
+            metadata: {
+              quarantine_key: active.record.key,
+              alert_key: pending.alertKey,
+              claim_id: active.claimId,
+              error_type: error instanceof Error ? error.name : typeof error,
+            },
+          });
+          continue;
+        }
+        this.appendCompressionQuarantineEvent({
+          kind: 'alert_sent',
+          key: active.record.key,
+          targetClaimId: active.claimId,
+          alertKey: pending.alertKey,
+          pendingEventId: pending.eventId,
+          created: Date.now(),
+        });
+      }
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    });
+  }
+
+  private async exhaustCompressionRequestFamily(
+    key: string,
+    claimId: string,
+    outcomes: CompressionRefusalOutcomeRecord[],
+  ): Promise<void> {
+    if (!this.store) return;
+    await withCompressionStateLock(this.store, this.compressionRefusalQuarantineLedgerStateId, () => {
+      const current = this.readCompressionQuarantineProjection();
+      const active = current.get(key);
+      if (!active || active.claimId !== claimId || active.status === 'exhausted') return;
+      this.appendCompressionQuarantineEvent({
+        kind: 'exhausted', key, targetClaimId: claimId, outcomes, created: Date.now(),
+      });
+      this.appendCompressionQuarantineEvent({
+        kind: 'alert_pending',
+        key,
+        targetClaimId: claimId,
+        alertKey: key,
+        created: Date.now(),
+      });
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    });
+    await this.deliverPendingCompressionQuarantineAlerts();
   }
 
   private compressionRefusalQuarantineRecord(
@@ -1576,6 +1967,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }));
     const key = sha256Json({
       model,
+      compressionContextBudgetTokens: this.config.compressionContextBudgetTokens ?? 200_000,
       chunkSourceHash,
       frontierHash,
       canonicalRequestHash,
@@ -2665,7 +3057,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const variants = this.buildRecallCurveVariants(
       request,
       keptSummaries,
-      recallTokens,
       allMessages,
     );
     const model = this.requireCompressionModel();
@@ -2676,7 +3067,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries,
       variants,
     );
-    if (this.compressionRefusalQuarantine.has(quarantineRecord.key)) {
+    const claim = await this.claimCompressionRequestFamily(quarantineRecord);
+    if (!claim) {
       logCompressionCall({
         event: 'compression:quarantine-skipped',
         operation: 'compress_l1',
@@ -2696,6 +3088,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
+    let retainClaim = false;
 
     try {
       const runAttempt = async (
@@ -2732,10 +3125,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return response;
       };
 
-      const summariesById = new Map(this.summaries.map((summary) => [summary.id, summary]));
+      const summariesById = this.persistedCanonicalSummariesById();
       const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
       const canonicalLeafIds = keptSummaries.flatMap(
-        (summary) => this.recallCurveLeafIds(summary, summariesById) ?? [],
+        (summary) => this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [],
       ).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
       const canonicalCoverageHash = sha256Json(canonicalLeafIds);
       let response = await runAttempt(
@@ -2748,12 +3141,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       successfulTrace = attemptTraces[attemptTraces.length - 1];
 
       if (response.stopReason === 'refusal') {
+        const outcomes: CompressionRefusalOutcomeRecord[] = [{
+          curveLabel: 'canonical',
+          requestHash: canonicalRequestHash,
+          outcome: 'refusal',
+          stopReason: response.stopReason,
+        }];
+        attemptTraces[0]!.outcome = 'refusal';
         successfulTrace = undefined;
         logCompressionCall({
           event: 'compression:canonical-refused',
           operation: 'compress_l1',
           metadata: attemptTraces[0],
         });
+        const canonicalMeasuredInput = response.usage?.inputTokens && response.usage.inputTokens > 0
+          ? response.usage.inputTokens
+          : this.compressionRequestInputBytes(request);
+        const configuredBudget = this.config.compressionContextBudgetTokens ?? 200_000;
+        const contextBudget = Number.isFinite(configuredBudget) && configuredBudget > 0
+          ? configuredBudget
+          : 200_000;
+        const configuredFallbacks = this.config.compressionRefusalCurveFallbacks ?? 3;
+        const maxProviderFallbacks = Number.isSafeInteger(configuredFallbacks)
+          ? Math.max(0, configuredFallbacks)
+          : 3;
+        let providerFallbacks = 0;
+        let fallbackResponse: NormalizedResponse | undefined;
         for (let i = 0; i < variants.length; i++) {
           const variant = variants[i]!;
           const parentIndex = keptSummaries.findIndex(
@@ -2764,44 +3177,144 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             ...variant.children,
             ...keptSummaries.slice(parentIndex + 1),
           ];
-          response = await runAttempt(
-            variant.request,
-            `expand:${variant.parent.id}`,
-            variantFrontier.map((summary) => summary.id),
-            variantFrontier.map((summary) => summary.level),
-            variant.leafCoverageHash,
-            variant.parent.id,
-            variant.children.map((child) => child.id),
-          );
+          const curveLabel = `expand:${variant.parent.id}`;
+          const admittedTokens = canonicalMeasuredInput + variant.admissionExpansionBytes +
+            variant.request.config.maxTokens;
+          if (admittedTokens > contextBudget) {
+            const trace: CompressionAttemptTrace = {
+              curveLabel,
+              recallIds: variantFrontier.map((summary) => summary.id),
+              recallLevels: variantFrontier.map((summary) => summary.level),
+              expandedParentId: variant.parent.id,
+              expandedChildIds: variant.children.map((child) => child.id),
+              leafCoverageHash: variant.leafCoverageHash,
+              requestHash: variant.requestHash,
+              messageCount: variant.request.messages.length,
+              estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
+              latencyMs: 0,
+              persisted: false,
+              outcome: 'admission_rejected',
+              admittedTokens,
+              budgetTokens: contextBudget,
+            };
+            attemptTraces.push(trace);
+            outcomes.push({
+              curveLabel,
+              requestHash: variant.requestHash,
+              outcome: 'admission_rejected',
+              admittedTokens,
+              budgetTokens: contextBudget,
+            });
+            logCompressionCall({
+              event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
+            });
+            continue;
+          }
+          if (providerFallbacks >= maxProviderFallbacks) break;
+          providerFallbacks++;
+          let variantResponse: NormalizedResponse;
+          try {
+            variantResponse = await runAttempt(
+              variant.request,
+              curveLabel,
+              variantFrontier.map((summary) => summary.id),
+              variantFrontier.map((summary) => summary.level),
+              variant.leafCoverageHash,
+              variant.parent.id,
+              variant.children.map((child) => child.id),
+            );
+          } catch (error) {
+            const errorType = error && typeof error === 'object' && 'type' in error
+              ? String((error as { type: unknown }).type)
+              : error instanceof Error ? error.name : typeof error;
+            const trace: CompressionAttemptTrace = {
+              curveLabel,
+              recallIds: variantFrontier.map((summary) => summary.id),
+              recallLevels: variantFrontier.map((summary) => summary.level),
+              expandedParentId: variant.parent.id,
+              expandedChildIds: variant.children.map((child) => child.id),
+              leafCoverageHash: variant.leafCoverageHash,
+              requestHash: variant.requestHash,
+              messageCount: variant.request.messages.length,
+              estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
+              latencyMs: 0,
+              persisted: false,
+              outcome: 'provider_error',
+              errorType,
+              admittedTokens,
+              budgetTokens: contextBudget,
+            };
+            attemptTraces.push(trace);
+            outcomes.push({
+              curveLabel,
+              requestHash: variant.requestHash,
+              outcome: 'provider_error',
+              errorType,
+              admittedTokens,
+              budgetTokens: contextBudget,
+            });
+            logCompressionCall({
+              event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
+            });
+            continue;
+          }
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          trace.admittedTokens = admittedTokens;
+          trace.budgetTokens = contextBudget;
           logCompressionCall({
             event: 'compression:curve-attempt',
             operation: 'compress_l1',
             metadata: trace,
           });
-          if (response.stopReason !== 'refusal') {
-            successfulTrace = trace;
-            break;
+          if (variantResponse.stopReason === 'refusal') {
+            trace.outcome = 'refusal';
+            outcomes.push({
+              curveLabel,
+              requestHash: variant.requestHash,
+              outcome: 'refusal',
+              stopReason: variantResponse.stopReason,
+              admittedTokens,
+              budgetTokens: contextBudget,
+            });
+            continue;
           }
+          const variantText = variantResponse.content
+            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .map((b) => b.text)
+            .join('\n');
+          if (!variantText.trim()) {
+            trace.outcome = 'unusable_empty';
+            outcomes.push({
+              curveLabel,
+              requestHash: variant.requestHash,
+              outcome: 'unusable_empty',
+              stopReason: variantResponse.stopReason,
+              admittedTokens,
+              budgetTokens: contextBudget,
+            });
+            continue;
+          }
+          trace.outcome = 'success';
+          fallbackResponse = variantResponse;
+          response = variantResponse;
+          successfulTrace = trace;
+          break;
         }
 
-        if (response.stopReason === 'refusal') {
-          this.compressionRefusalQuarantine.set(quarantineRecord.key, quarantineRecord);
-          this.persistCompressionRefusalQuarantine();
-          console.error(
-            `[autobiographical] compression refusal curves exhausted for chunk ` +
-            `${chunk.recordId ?? `#${chunk.index}`} (key ${quarantineRecord.key}); ` +
-            `the chunk remains raw and unchanged requests are quarantined.`,
-          );
+        if (!fallbackResponse) {
+          retainClaim = true;
+          await this.exhaustCompressionRequestFamily(quarantineRecord.key, claim.claimId, outcomes);
           logCompressionCall({
             event: 'compression:curve-exhausted',
             operation: 'compress_l1',
             metadata: {
               quarantine_key: quarantineRecord.key,
+              claim_id: claim.claimId,
               model,
               chunk_message_ids: chunk.messages.map((message) => message.id),
               canonical_request_hash: canonicalRequestHash,
               variants: quarantineRecord.variants,
+              outcomes,
             },
           });
           return;
@@ -2886,6 +3399,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
+      if (!retainClaim) {
+        await this.releaseCompressionRequestFamily(quarantineRecord.key, claim.claimId);
+      }
       for (const trace of attemptTraces) {
         logCompressionCall({
           event: 'compression:attempt',
