@@ -2434,11 +2434,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * enough — alarms sound every interval for as long as the quarantine is
    * non-empty. Set `quarantineAlarmIntervalMs: 0` to disable (tests only).
    */
-  private soundQuarantineAlarmIfNeeded(): void {
+  private async soundQuarantineAlarmIfNeeded(): Promise<void> {
     const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
     if (interval <= 0) return;
     const now = Date.now();
     if (now - this.quarantineAlarmLastAt < interval) return;
+    // Sweep BEFORE reading status: the klaxon must reflect real debt only.
+    await this.sweepPaidOffQuarantineRecords();
     const status = this.getCompressionQuarantineStatus();
     if (status.count === 0) return;
     this.quarantineAlarmLastAt = now;
@@ -2452,6 +2454,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.onQuarantineAlarm?.(status);
     } catch (error) {
       console.error('[compression-quarantine] alarm handler failed:', error);
+    }
+  }
+
+  /**
+   * Sweep quarantine records whose debt is already paid, so the klaxon only
+   * ever sounds on REAL debt. Two ways a record goes stale (both observed
+   * live, mythos 2026-07-16 — three records klaxoning on spans compressed
+   * hours earlier as L1-625):
+   *  - chunk-boundary drift: rebuildChunks re-cut the compressible zone, the
+   *    successor chunk (different id-list → different chunkSourceHash)
+   *    compressed normally, and the old record matches nothing retryable;
+   *  - same-boundary success that predates the success-clear hook.
+   * Judged against the PERSISTED chunk records (autobio:chunks):
+   *  - matching record, compressed  → covered, clear;
+   *  - matching record, raw        → live debt, keep;
+   *  - no matching record          → orphaned by drift (can never be
+   *    retried NOR success-cleared), clear.
+   */
+  private async sweepPaidOffQuarantineRecords(): Promise<void> {
+    if (!this.store) return;
+    try {
+      const projection = this.readCompressionQuarantineProjection();
+      if (projection.size === 0) return;
+      const records = this.store.getStateJson(this.chunksStateId);
+      const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
+      if (chunkRecords.length === 0) return; // transient/no data — never sweep blind
+      const byHash = new Map<string, ChunkRecord>();
+      for (const r of chunkRecords) {
+        if (r && Array.isArray(r.sourceIds)) byHash.set(sha256Json(r.sourceIds), r);
+      }
+      for (const [key, active] of projection) {
+        const match = byHash.get(active.record.chunkSourceHash);
+        if (match && !match.compressed) continue; // live debt — keep, klaxon
+        const reason = match
+          ? `span already compressed (${match.summaryId ?? 'summary'})`
+          : 'orphaned by chunk-boundary drift (no matching chunk record)';
+        await this.clearCompressionRefusalQuarantine(key);
+        console.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
+      }
+    } catch (error) {
+      console.warn('[compression-quarantine] paid-off sweep failed (records remain, klaxon persists):', error);
     }
   }
 
@@ -2972,8 +3015,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Quarantine is deferred debt, never a resting state: every quarantined
     // chunk keeps its span raw, the fold floor creeps, and the picker
     // eventually cannot fit the window — a guaranteed future outage. Sound
-    // the alarm on every interval for as long as ANY chunk is quarantined.
-    this.soundQuarantineAlarmIfNeeded();
+    // the alarm on every interval for as long as ANY chunk is quarantined
+    // (after sweeping records whose debt is already paid).
+    await this.soundQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
     if (!ctx.membrane) {
