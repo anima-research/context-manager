@@ -2455,6 +2455,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
+  /**
+   * A successful compression (or adoption of an existing exact L1) pays off
+   * any quarantine debt recorded against the same chunk under earlier
+   * request shapes — e.g. a chunk quarantined on text-only requests that
+   * later compresses once recall pairs carry reasoning. Matching is by
+   * chunkSourceHash (the chunk's message-id list), so only records for THIS
+   * span are cleared. Failures are logged, never thrown: clearing is
+   * hygiene, not a correctness dependency.
+   */
+  private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
+    if (!this.store) return;
+    try {
+      const hash = sha256Json(chunk.messages.map((message) => message.id));
+      const projection = this.readCompressionQuarantineProjection();
+      for (const [key, active] of projection) {
+        if (active.record.chunkSourceHash !== hash) continue;
+        await this.clearCompressionRefusalQuarantine(key);
+        console.error(
+          `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
+            `successfully under a newer request shape`,
+        );
+      }
+    } catch (error) {
+      console.warn('[compression-quarantine] success-clear failed (records remain, klaxon persists):', error);
+    }
+  }
+
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
     const payload = {
       event: 'compression:quarantine-alert',
@@ -4127,6 +4154,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (postExisting) {
         chunk.compressed = true;
         chunk.summaryId = postExisting.id;
+        // Adoption covers the span just as a fresh summary does — pay off
+        // any quarantine debt (see the success path below).
+        await this.clearQuarantineForCompressedChunk(chunk);
         return;
       }
 
@@ -4163,6 +4193,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.markChunkRecordCompressed(chunk.recordId, entry.id);
       this._compressionCount++;
       logSummaryId = entry.id;
+      // Success pays off quarantine debt recorded against this chunk under
+      // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
+      // klaxon must go quiet the moment the span is actually covered, or
+      // stale records alarm forever and bury the real alarms.
+      await this.clearQuarantineForCompressedChunk(chunk);
       if (successfulTrace) successfulTrace.persisted = true;
       if (successfulTrace?.expandedParentId) {
         logCompressionCall({
