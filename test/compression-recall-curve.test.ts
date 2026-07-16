@@ -152,6 +152,10 @@ class ProbeStrategy extends AutobiographicalStrategy {
     return this.mergeQueue.map((item) => ({ level: item.level, sourceIds: [...item.sourceIds] }));
   }
 
+  pinsView(): ReadonlyArray<import('../src/types/index.js').ProtectedRange> {
+    return this.pins;
+  }
+
   enqueueMergeForStress(level: number, sourceIds: string[]): void {
     this.enqueueMerge({ level, sourceIds });
   }
@@ -1879,9 +1883,33 @@ describe('compression refusal recall curves', () => {
         summaryId: chunk.summaryId,
       })),
       queue: strategy.mergeQueueView(),
-      pins: strategy.listPins(),
+      pins: strategy.pinsView(),
       quarantine: strategy.quarantineKeysView(),
     });
+
+    const emptyDerived = {
+      summaries: [], chunks: [], queue: [], pins: [], quarantine: [],
+    };
+    const assertStaleEntrypointsFailClosed = async (
+      expectedState: Record<string, unknown>,
+    ) => {
+      assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale mirrors are cleared');
+      await assert.rejects(
+        fx.manager.tick(),
+        /requires reinitialization for the current branch generation/,
+      );
+      const currentCtx = managerContext(fx.manager);
+      await assert.rejects(
+        fx.strategy.onNewMessage(currentCtx.messageStore.get(fx.ids[0]!)!, currentCtx),
+        /requires reinitialization for the current branch generation/,
+      );
+      await assert.rejects(
+        fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }),
+        /requires reinitialization for the current branch generation/,
+      );
+      assert.deepEqual(snapshot(), expectedState, 'stale entrypoints write no durable state');
+      assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale entrypoints rebuild no mirrors');
+    };
 
     // Stabilize each branch once before recording its expected durable and
     // derived state. Subsequent changes are therefore evidence of the race,
@@ -1929,9 +1957,10 @@ describe('compression refusal recall curves', () => {
     await gated.started;
     await otherManager.switchBranch(fork);
     gated.release();
-    await staleMain;
+    await assert.rejects(staleMain, /Branch changed during strategy initialization/);
     assert.deepEqual(snapshot(), forkState);
     assert.deepEqual(derived(other), forkDerived);
+    await assertStaleEntrypointsFailClosed(forkState);
 
     // Reverse the race: stale fork initializer must not touch main.
     gated = gateNextAlertDelivery(fx.strategy);
@@ -1939,9 +1968,24 @@ describe('compression refusal recall curves', () => {
     await gated.started;
     await otherManager.switchBranch(main);
     gated.release();
-    await staleFork;
+    await assert.rejects(staleFork, /Branch changed during strategy initialization/);
     assert.deepEqual(snapshot(), mainState);
     assert.deepEqual(derived(other), mainDerived);
+    await assertStaleEntrypointsFailClosed(mainState);
+
+    // Branch name equality is insufficient: an away-and-back round trip while
+    // initialization is gated must invalidate the requested generation too.
+    gated = gateNextAlertDelivery(fx.strategy);
+    const staleRoundTrip = fx.manager.switchBranch(main);
+    await gated.started;
+    await otherManager.switchBranch(fork);
+    await otherManager.switchBranch(main);
+    gated.release();
+    await assert.rejects(staleRoundTrip, /Branch changed during strategy initialization/);
+    assert.equal(fx.manager.currentBranch().name, main);
+    assert.deepEqual(snapshot(), mainState);
+    assert.deepEqual(derived(other), mainDerived);
+    await assertStaleEntrypointsFailClosed(mainState);
 
     otherManager.close();
     fx.manager.close();
