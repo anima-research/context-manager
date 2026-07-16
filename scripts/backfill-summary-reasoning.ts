@@ -54,6 +54,14 @@ interface ReasoningBlock {
   signature?: string;
   data?: string;
   text?: string;
+  /**
+   * Exact replay price stamped from the logged usage (thinking token
+   * count). Signature-only blocks otherwise price at the hidden-CoT
+   * default (600) — measured production blocks run 112–394, so stamping
+   * keeps fold/recall budget estimates honest. Honored by both
+   * message-store and AutobiographicalStrategy.estimateTokens.
+   */
+  tokenEstimate?: number;
 }
 
 interface SummaryEntry {
@@ -113,6 +121,25 @@ function extractContent(rec: Record<string, unknown>): unknown[] | null {
   return null;
 }
 
+/** Thinking-token count from the record's usage, wherever it lives. */
+function extractThinkingTokens(rec: Record<string, unknown>): number | undefined {
+  const usages = [
+    (rec as { rawResponse?: { usage?: unknown } }).rawResponse?.usage,
+    (rec as { rawResponse?: { response?: { usage?: unknown } } }).rawResponse?.response?.usage,
+    (rec as { response?: { usage?: unknown } }).response?.usage,
+  ];
+  for (const u of usages) {
+    if (!u || typeof u !== 'object') continue;
+    const usage = u as Record<string, unknown>;
+    const cand =
+      usage.thinking_tokens ??
+      usage.thinkingTokens ??
+      (usage.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens;
+    if (typeof cand === 'number' && cand > 0) return cand;
+  }
+  return undefined;
+}
+
 /** Normalize provider raw blocks to membrane-shaped reasoning/text blocks. */
 function normalizeBlocks(blocks: unknown[]): ReasoningBlock[] | null {
   const out: ReasoningBlock[] = [];
@@ -161,6 +188,15 @@ function indexRecord(line: string): void {
   const blocks = normalizeBlocks(content);
   if (!blocks) return;
   reasoningRecords++;
+  // Stamp exact replay prices onto signature-only thinking blocks from the
+  // logged usage (split evenly across blocks when there are several).
+  const thinkingTokens = extractThinkingTokens(rec);
+  if (thinkingTokens) {
+    const hidden = blocks.filter(
+      b => b.type === 'thinking' && (!b.thinking || b.thinking.length === 0) && b.signature,
+    );
+    for (const b of hidden) b.tokenEstimate = Math.ceil(thinkingTokens / hidden.length);
+  }
   const text = joinedText(blocks);
   if (!text.trim()) return;
   const existing = byText.get(text);
