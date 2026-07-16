@@ -2415,6 +2415,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private quarantineAlarmLastAt = 0;
+  /** True while an alarm episode is open (alarmed and not yet all-cleared). */
+  private quarantineAlarmActive = false;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
 
   /**
@@ -2422,6 +2424,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (failures.log + ops:alert trace + webhook). The strategy still emits a
    * loud stderr line on every alarm even when no handler is set, so an
    * unwired deployment cannot fail silently.
+   *
+   * Called with `count > 0` for each repeating alarm, and ONCE with
+   * `count === 0` when an alarm episode ends (all debt paid) — hosts should
+   * route the all-clear under a DISTINCT alert kind so a same-kind cooldown
+   * cannot swallow it.
    */
   setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
     this.onQuarantineAlarm = fn;
@@ -2438,11 +2445,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
     if (interval <= 0) return;
     const now = Date.now();
-    if (now - this.quarantineAlarmLastAt < interval) return;
+    // Idle path: nothing alarmed and not yet due for a check. (Entry into
+    // quarantine still gets its immediate one-shot alert from
+    // emitCompressionQuarantineAlert; the klaxon picks it up within one
+    // interval and then sustains it.)
+    if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
     await this.sweepPaidOffQuarantineRecords();
     const status = this.getCompressionQuarantineStatus();
-    if (status.count === 0) return;
+    if (status.count === 0) {
+      // All-clear must travel the SAME channel the alarm did — after an
+      // alarm, silence is ambiguous (debt paid? alarm path dead?). Fires
+      // once per episode, immediately on the emptying tick.
+      if (this.quarantineAlarmActive) {
+        this.quarantineAlarmActive = false;
+        this.quarantineAlarmLastAt = 0;
+        console.error(
+          '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
+        );
+        try {
+          this.onQuarantineAlarm?.(status);
+        } catch (error) {
+          console.error('[compression-quarantine] all-clear handler failed:', error);
+        }
+      }
+      return;
+    }
+    if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
+    this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
     console.error(
       `[compression-quarantine] ⚠️ ${status.count} chunk(s) in compression quarantine — ` +
