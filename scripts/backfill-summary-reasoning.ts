@@ -43,8 +43,8 @@
  */
 
 import { JsStore } from '@animalabs/chronicle';
-import { readFileSync, readdirSync, statSync, writeFileSync, createReadStream } from 'node:fs';
-import { gunzipSync } from 'node:zlib';
+import { readdirSync, statSync, writeFileSync, createReadStream } from 'node:fs';
+import { createGunzip } from 'node:zlib';
 import { join, basename } from 'node:path';
 import { createInterface } from 'node:readline';
 
@@ -210,13 +210,10 @@ function indexRecord(line: string): void {
 }
 
 async function indexFile(path: string): Promise<void> {
-  if (path.endsWith('.gz')) {
-    const buf = gunzipSync(readFileSync(path));
-    for (const line of buf.toString('utf8').split('\n')) indexRecord(line);
-    return;
-  }
-  // Plain files can be tens of GB — stream, never slurp.
-  const rl = createInterface({ input: createReadStream(path, { encoding: 'utf8' }) });
+  // Files can be multi-GB (compressed or not) — always stream, never slurp.
+  const raw = createReadStream(path);
+  const input = path.endsWith('.gz') ? raw.pipe(createGunzip()) : raw;
+  const rl = createInterface({ input });
   for await (const line of rl) indexRecord(line);
 }
 
