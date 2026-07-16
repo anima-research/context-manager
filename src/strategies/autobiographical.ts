@@ -28,6 +28,7 @@ import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { MessageStore } from '../message-store.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Picker, OverBudgetError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
@@ -340,6 +341,35 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+}
+
+/**
+ * Capture the summarizer's verbatim response blocks for storage on the
+ * SummaryEntry — but only when the response carried reasoning blocks.
+ *
+ * Fable-5/Sonnet-5-class models require encrypted reasoning tokens
+ * (signed `thinking` / `redacted_thinking` blocks) to be supplied back
+ * alongside the generated text whenever that text is replayed as an
+ * assistant turn. Summaries are replayed in the agent's own voice, so
+ * dropping the reasoning here breaks every later fold/recall emission.
+ * Blocks are kept in provider order and must never be mutated —
+ * signatures cover block content verbatim.
+ *
+ * Returns undefined for reasoning-free responses (non-thinking models):
+ * plain text turns need no accompaniment, and we avoid duplicating the
+ * text into the store for nothing.
+ */
+function captureResponseContent(content: ContentBlock[]): ContentBlock[] | undefined {
+  const hasReasoning = content.some(
+    (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
+  );
+  if (!hasReasoning) return undefined;
+  // Reasoning + text only: a one-shot summarize response should never
+  // contain tool_use etc., but drop anything else defensively — it has
+  // no place in a replayed summary turn.
+  return content.filter(
+    (b) => b.type === 'thinking' || b.type === 'redacted_thinking' || b.type === 'text',
+  );
 }
 
 /**
@@ -2316,14 +2346,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
-      // Text-only on purpose: this is the SUMMARIZER's one-shot response —
-      // its thinking/redacted_thinking blocks are scratch work, not part of
-      // the agent's history, and signed thinking is never valid inside a
-      // rewritten summary anyway.
+      // `content` stays text-only (merge inputs, grep, viewers), but the
+      // verbatim response blocks — including signed thinking — are captured
+      // on the entry: Fable-5/Sonnet-5-class models require the encrypted
+      // reasoning returned alongside generated text, and summaries are
+      // replayed in the agent's own voice (see captureResponseContent).
       const summaryText = response.content
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      const responseContent = captureResponseContent(response.content);
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -2354,15 +2386,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         level: 1,
         content: summaryText,
         // Exact when available (2026-07-12): the compression response's own
-        // usage.outputTokens IS the true token count of the text it just
-        // wrote — the single most-reused number in the pyramid (fold floor,
-        // middle budget, recall caps). Estimate only as fallback.
+        // usage.outputTokens IS the true token count of what it just wrote —
+        // the single most-reused number in the pyramid (fold floor, middle
+        // budget, recall caps). Estimate only as fallback. Since 2026-07-15
+        // reasoning blocks are REPLAYED with the summary (responseContent),
+        // so outputTokens — which includes thinking — is the right emission
+        // cost with or without reasoning present.
         tokens:
-          response.usage?.outputTokens &&
-          response.usage.outputTokens > 0 &&
-          // outputTokens includes scratch thinking when present — only exact
-          // when the whole response is the summary text itself.
-          !response.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking')
+          response.usage?.outputTokens && response.usage.outputTokens > 0
             ? response.usage.outputTokens
             : Math.ceil(summaryText.length / 3),
         sourceLevel: 0,
@@ -2373,6 +2404,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         created: Date.now(),
         phaseType: chunk.phaseType,
+        ...(responseContent ? { responseContent } : {}),
       };
 
       this.pushSummary(entry);
@@ -2927,11 +2959,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     try {
       const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
-      // Text-only on purpose: summarizer scratch thinking is not agent history
+      // `content` stays text-only; verbatim blocks (incl. signed thinking)
+      // are captured for replay — see the L1 site / captureResponseContent.
       const mergedText = response.content
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('\n');
+      const responseContent = captureResponseContent(response.content);
       logResponse = mergedText;
 
       // Empty merged generation: skip the merge entirely (do NOT push or mark
@@ -2953,19 +2987,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         id: `L${targetLevel}-${this.nextSummaryIdCounter()}`,
         level: targetLevel,
         content: mergedText,
-        // Exact when available — see the L1 site.
+        // Exact when available — see the L1 site (reasoning is replayed, so
+        // outputTokens is the right emission cost either way).
         tokens:
-          response.usage?.outputTokens &&
-          response.usage.outputTokens > 0 &&
-          // outputTokens includes scratch thinking when present — only exact
-          // when the whole response is the summary text itself.
-          !response.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking')
+          response.usage?.outputTokens && response.usage.outputTokens > 0
             ? response.usage.outputTokens
             : Math.ceil(mergedText.length / 3),
         sourceLevel,
         sourceIds,
         sourceRange,
         created: Date.now(),
+        ...(responseContent ? { responseContent } : {}),
       };
       logNewSummaryId = newEntry.id;
 
@@ -3392,7 +3424,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 content: [{ type: 'text', text: summaryLabel }],
                 sourceRelation: 'derived',
               };
-              const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+              const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
               const answerEntry: ContextEntry = {
                 index: entries.length + 1,
                 participant: summaryParticipant,
@@ -3499,7 +3531,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content: [{ type: 'text', text: summaryLabel }],
           sourceRelation: 'derived',
         };
-        const answerContent: ContentBlock[] = [{ type: 'text', text: ancestor.content }];
+        const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
           participant: summaryParticipant,
@@ -4247,7 +4279,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content: [{ type: 'text', text: headerText }],
               sourceRelation: 'derived',
             };
-            const answerContent: ContentBlock[] = [{ type: 'text', text: summary.content }];
+            const answerContent: ContentBlock[] = this.summaryAnswerContent(summary);
             const answerEntry: ContextEntry = {
               index: entries.length + 1,
               participant: summaryParticipant,
@@ -4285,7 +4317,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // their positions after the combined pair.
         if (selectedSummaries.length > 0) {
           const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-          const combinedText = selectedSummaries.map(s => s.content).join('\n\n---\n\n');
 
           const questionEntry: ContextEntry = {
             index: entries.length,
@@ -4297,7 +4328,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // budgets defaulting to 30k each, an unconstrained concatenation can push
           // a single assistant turn past 90k tokens, eating the inference budget
           // and starving recent messages (postmortem 2026-05-04, bug B).
-          const answerContent: ContentBlock[] = [{ type: 'text', text: combinedText }];
+          //
+          // Per-summary blocks (verbatim reasoning + text when captured) are
+          // concatenated with the legacy '---' separators as interstitial
+          // text blocks — signed thinking must ride along here too.
+          const answerContent: ContentBlock[] = [];
+          selectedSummaries.forEach((s, idx) => {
+            if (idx > 0) answerContent.push({ type: 'text', text: '\n\n---\n\n' });
+            answerContent.push(...this.summaryAnswerContent(s));
+          });
           const answerEntry: ContextEntry = {
             index: entries.length + 1,
             participant: summaryParticipant,
@@ -5513,6 +5552,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const block of content) {
       if (block.type === 'text') {
         tokens += Math.ceil(block.text.length / 4);
+      } else if (block.type === 'thinking') {
+        // Replayed summary reasoning (responseContent) must be priced or
+        // fold/recall budgets silently overrun. Mirrors message-store: a
+        // stamped estimate wins; a signed-but-empty block is a hidden full
+        // CoT priced at the measured default; else price the visible text.
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') {
+          tokens += stamped;
+        } else {
+          const sig = (block as { signature?: string }).signature;
+          const hasSignature = typeof sig === 'string' && sig.length > 0;
+          if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
+            tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+          } else {
+            tokens += Math.ceil((block.thinking ?? '').length / 4);
+          }
+        }
+      } else if (block.type === 'redacted_thinking') {
+        // Encrypted payload: client-side length is meaningless — price it
+        // as a hidden full CoT.
+        tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
       }
     }
     return tokens;
@@ -5521,6 +5581,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Truncate a message's content blocks to fit within maxMessageTokens.
    */
+  /**
+   * Build the assistant-turn content for a replayed summary. When the
+   * entry carries verbatim `responseContent` (signed thinking /
+   * redacted_thinking + text in provider order), replay it unmutated —
+   * Fable-5/Sonnet-5-class models require the encrypted reasoning back
+   * alongside their generated text, and the signatures only verify on
+   * byte-identical blocks. Fallback for legacy/stub entries: a plain
+   * text block from `content`.
+   *
+   * Returns a fresh array so callers can never mutate the stored entry.
+   */
+  protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
+    if (summary.responseContent && summary.responseContent.length > 0) {
+      return [...summary.responseContent];
+    }
+    return [{ type: 'text', text: summary.content }];
+  }
+
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);

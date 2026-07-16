@@ -713,6 +713,22 @@ export interface SummaryEntry {
   created: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
+  /**
+   * Verbatim summarizer response blocks in provider order (thinking /
+   * redacted_thinking / text), captured when the compression response
+   * carried reasoning blocks. Fable-5/Sonnet-5-class models require the
+   * encrypted reasoning tokens to be supplied back alongside any
+   * model-generated assistant text, so summaries — which are emitted in
+   * the agent's own voice — must replay these blocks verbatim, never
+   * mutated or reordered (signatures cover the block content).
+   *
+   * `content` remains the joined text for all text consumers (merge
+   * inputs, grep, token fallbacks, viewers). When this field is present,
+   * emission sites MUST use it instead of reconstructing from `content`.
+   * Absent on: stubs, transition summaries, and legacy entries created
+   * before this field existed (backfillable from llm-calls logs).
+   */
+  responseContent?: ContentBlock[];
 }
 
 /**
