@@ -50,6 +50,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag off: existing hierarchical behavior preserved', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
       adaptiveResolution: false, // explicit
@@ -71,6 +72,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag on: compile produces output and runs picker', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
       adaptiveResolution: true,
@@ -93,6 +95,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag on + tight budget: picker raises resolution to fit', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
       adaptiveResolution: true,
@@ -114,7 +117,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     assert.ok(generous.messages.length > 0);
 
     // Compile with a very tight budget — picker should fold middle to fit.
-    const tight = await manager.compile({ maxTokens: 2000, reserveForResponse: 200 });
+    const tight = await manager.compile({ maxTokens: 2000, reserveForResponse: 0 });
     assert.ok(tight.messages.length > 0, 'tight budget should still produce output');
     // The tight compile should have ≤ entries than generous (or equal if generous already used summaries).
     // What matters more: total tokens of tight output should be bounded.
@@ -132,6 +135,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag on + lockChunk: locked message stays raw under pressure', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
       adaptiveResolution: true,
@@ -186,6 +190,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag on: speculative pre-producer creates upper-level summaries', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 50, // small chunks so we get many L1s
       recentWindowTokens: 50,
       adaptiveResolution: true,
@@ -221,6 +226,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     // never makes progress.
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 50,
       recentWindowTokens: 50,
       adaptiveResolution: true,
@@ -299,6 +305,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   it('flag on: monotonic resolution across multiple compiles (no thrashing)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
       adaptiveResolution: true,

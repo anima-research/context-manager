@@ -36,6 +36,7 @@ import { ContextLog } from './context-log.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
+import type { StoreBranchGeneration } from './branch-generation.js';
 
 /**
  * Base configuration for ContextManager.
@@ -210,8 +211,8 @@ export class ContextManager {
     );
 
     // Initialize strategy
-    observeStoreBranch(store);
-    await manager.initializeStrategy();
+    const openingBranch = observeStoreBranch(store);
+    await manager.initializeStrategy(openingBranch);
     manager.initialized = true;
 
     return manager;
@@ -411,8 +412,8 @@ export class ContextManager {
    */
   async switchBranch(branchId: string): Promise<void> {
     this.store.switchBranch(branchId);
-    markStoreBranchSwitch(this.store);
-    await this.initializeStrategy();
+    const requested = markStoreBranchSwitch(this.store);
+    await this.initializeStrategy(requested);
   }
 
   /**
@@ -813,10 +814,26 @@ export class ContextManager {
   // Internal
   // ==========================================================================
 
-  private async initializeStrategy(): Promise<void> {
+  private async initializeStrategy(
+    expectedBranch: StoreBranchGeneration = observeStoreBranch(this.store),
+  ): Promise<void> {
+    this.initialized = false;
     if (this.strategy.initialize) {
       await this.strategy.initialize(this.createStrategyContext());
     }
+    const current = observeStoreBranch(this.store);
+    if (
+      current.name !== expectedBranch.name ||
+      current.generation !== expectedBranch.generation ||
+      this.store.currentBranch().name !== expectedBranch.name
+    ) {
+      throw new Error(
+        `Branch changed during strategy initialization: requested ${expectedBranch.name} ` +
+        `(generation ${expectedBranch.generation}), now ${current.name} ` +
+        `(generation ${current.generation})`,
+      );
+    }
+    this.initialized = true;
   }
 
   /**

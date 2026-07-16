@@ -102,8 +102,11 @@ the combined model context budget for request input plus the configured
 Admission is deterministic before inference: it uses a UTF-8-byte upper bound
 over every input-bearing field of the complete normalized variant (head,
 recall, raw middle, chunk, tools, instruction, system/provider fields), a
-per-message formatter-envelope allowance, and the output reserve. Optional
-provider usage and stored `SummaryEntry.tokens` are never admission authority.
+per-message formatter-envelope allowance, and the output reserve. After the
+canonical refusal reports provider input usage, each variant is admitted as
+`max(complete deterministic variant bound, canonical provider input usage +
+positive expansion delta) + output reserve`. Stored `SummaryEntry.tokens` are
+never admission authority.
 The ordered plan records every rejection and at most the normalized positive
 fallback limit of provider attempts. An over-budget variant is recorded and
 skipped without preventing a later eligible variant.
