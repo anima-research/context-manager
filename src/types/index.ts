@@ -37,6 +37,7 @@ export type {
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  CompressionQuarantineStatus,
   SummaryLevel,
   SummaryEntry,
   PhaseType,

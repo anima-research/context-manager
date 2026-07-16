@@ -360,7 +360,22 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
 /**
  * Configuration for the Autobiographical strategy.
  */
+/**
+ * Public quarantine status shape (health surfaces + the repeating alarm).
+ */
+export interface CompressionQuarantineStatus {
+  count: number;
+  keys: string[];
+}
+
 export interface AutobiographicalConfig {
+  /**
+   * Interval for the repeating compression-quarantine alarm (stderr +
+   * registered handler) while ANY chunk is quarantined. Quarantined chunks
+   * are a guaranteed eventual outage — the alarm repeats until the
+   * quarantine empties. Default 15 min; 0 disables (tests only).
+   */
+  quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */
   targetChunkTokens: number;
   /** Recent tokens to keep uncompressed (~30000) */

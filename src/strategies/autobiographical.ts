@@ -14,6 +14,7 @@ import type {
   StoredMessage,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  CompressionQuarantineStatus,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -587,6 +588,39 @@ function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
  * plain text turns need no accompaniment, and we avoid duplicating the
  * text into the store for nothing.
  */
+/**
+ * Carrier transport fallback (2026-07-16): carriers-in-summarizer-requests is
+ * the DEFAULT (validated: text-only recall pairs deterministically refused
+ * where carrier-bearing ones pass). Text-only is the DEGRADED mode, entered
+ * only when the transport itself rejects the carrier blocks — an
+ * invalid_request 400 about thinking blocks (e.g. the "cannot be modified"
+ * class), never a policy refusal. Retry once, stripped, loudly.
+ */
+function isCarrierTransportRejection(error: unknown): boolean {
+  const e = error as { httpStatus?: number; type?: string; message?: string };
+  const msg = (e?.message ?? '').toLowerCase();
+  const badRequest =
+    e?.httpStatus === 400 ||
+    (typeof e?.type === 'string' && e.type.toLowerCase().includes('invalid')) ||
+    msg.includes('invalid_request');
+  return badRequest && (msg.includes('thinking') || msg.includes('reasoning'));
+}
+
+function requestCarriesReasoning(request: NormalizedRequest): boolean {
+  return request.messages.some(m =>
+    m.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking'),
+  );
+}
+
+function stripReasoningFromRequest(request: NormalizedRequest): NormalizedRequest {
+  return {
+    ...request,
+    messages: request.messages
+      .map(m => ({ ...m, content: stripThinkingBlocks(m.content) }))
+      .filter(m => m.content.length > 0),
+  };
+}
+
 function captureResponseContent(content: ContentBlock[]): ContentBlock[] | undefined {
   const hasReasoning = content.some(
     (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
@@ -2364,6 +2398,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
   }
 
+  /**
+   * Public quarantine status for health surfaces (/healthz, fleet-watch,
+   * connectome-doctor) and the repeating alarm below.
+   */
+  getCompressionQuarantineStatus(): CompressionQuarantineStatus {
+    if (!this.store) return { count: 0, keys: [] };
+    try {
+      const projection = this.readCompressionQuarantineProjection();
+      return { count: projection.size, keys: [...projection.keys()] };
+    } catch {
+      // Health reads must never throw — a broken projection is itself a
+      // problem, but not one to surface by crashing the caller.
+      return { count: 0, keys: [] };
+    }
+  }
+
+  private quarantineAlarmLastAt = 0;
+  private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
+
+  /**
+   * Host wiring point: the framework maps this to its ops-alert channel
+   * (failures.log + ops:alert trace + webhook). The strategy still emits a
+   * loud stderr line on every alarm even when no handler is set, so an
+   * unwired deployment cannot fail silently.
+   */
+  setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
+    this.onQuarantineAlarm = fn;
+  }
+
+  /**
+   * Repeating klaxon (2026-07-16, operator requirement): quarantined chunks
+   * are a guaranteed eventual outage (raw spans accumulate until the picker
+   * cannot fit the window), so a one-shot alert at quarantine time is not
+   * enough — alarms sound every interval for as long as the quarantine is
+   * non-empty. Set `quarantineAlarmIntervalMs: 0` to disable (tests only).
+   */
+  private soundQuarantineAlarmIfNeeded(): void {
+    const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
+    if (interval <= 0) return;
+    const now = Date.now();
+    if (now - this.quarantineAlarmLastAt < interval) return;
+    const status = this.getCompressionQuarantineStatus();
+    if (status.count === 0) return;
+    this.quarantineAlarmLastAt = now;
+    console.error(
+      `[compression-quarantine] ⚠️ ${status.count} chunk(s) in compression quarantine — ` +
+        `their spans stay raw and WILL eventually exhaust the context budget. ` +
+        `Operator action required (inspect refusing content; branch, pin, or clear). ` +
+        `keys=${status.keys.map(k => k.slice(0, 12)).join(',')}`,
+    );
+    try {
+      this.onQuarantineAlarm?.(status);
+    } catch (error) {
+      console.error('[compression-quarantine] alarm handler failed:', error);
+    }
+  }
+
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
     const payload = {
       event: 'compression:quarantine-alert',
@@ -2851,6 +2942,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   async tick(ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('tick');
     phaseChannel.report('compress-tick'); // liveness-watchdog phase
+    // Quarantine is deferred debt, never a resting state: every quarantined
+    // chunk keeps its span raw, the fold floor creeps, and the picker
+    // eventually cannot fit the window — a guaranteed future outage. Sound
+    // the alarm on every interval for as long as ANY chunk is quarantined.
+    this.soundQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
     if (!ctx.membrane) {
@@ -3727,10 +3823,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedChildIds?: string[],
       ): Promise<unknown> => {
         const started = Date.now();
-        const response = await ctx.membrane!.complete(
-          attemptRequest,
-          { formatter: this.nativeFormatter },
-        );
+        let response: unknown;
+        try {
+          response = await ctx.membrane!.complete(
+            attemptRequest,
+            { formatter: this.nativeFormatter },
+          );
+        } catch (error) {
+          // Degraded mode: the transport rejected the carrier blocks
+          // themselves (invalid_request about thinking — never a refusal).
+          // Retry this attempt once with text-only recall pairs, loudly.
+          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
+            throw error;
+          }
+          console.error(
+            `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
+              `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
+          );
+          logCompressionCall({
+            event: 'compression:carrier-transport-fallback',
+            operation: 'compress_l1',
+            metadata: { curveLabel, error: String(error).slice(0, 300) },
+          });
+          response = await ctx.membrane!.complete(
+            stripReasoningFromRequest(attemptRequest),
+            { formatter: this.nativeFormatter },
+          );
+        }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
@@ -4626,7 +4745,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logNewSummaryId: string | undefined;
 
     try {
-      const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+      let response: NormalizedResponse;
+      try {
+        response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+      } catch (error) {
+        // Same degraded-mode fallback as the L1 ladder: transport rejected
+        // the carrier blocks → retry once text-only, loudly.
+        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(request)) throw error;
+        console.error(
+          `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
+            `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
+        );
+        logCompressionCall({
+          event: 'compression:carrier-transport-fallback',
+          operation: `merge_l${targetLevel}`,
+          metadata: { error: String(error).slice(0, 300) },
+        });
+        response = await ctx.membrane.complete(stripReasoningFromRequest(request), { formatter: this.nativeFormatter });
+      }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
       // are captured for replay — see the L1 site / captureResponseContent.
