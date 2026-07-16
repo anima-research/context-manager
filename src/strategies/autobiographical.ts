@@ -546,18 +546,26 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
- * Strip `thinking` / `redacted_thinking` blocks from compression INPUT.
+ * Strip `thinking` / `redacted_thinking` blocks from RAW messages entering
+ * compression input.
  *
- * The summarizer must never be handed the agent's own reasoning:
- *  (a) signed thinking is only valid verbatim in the turn that produced it —
- *      replaying it into a rewritten summarize request corrupts the signature;
- *  (b) asking the model to summarize its own reasoning reads as reproducing /
- *      duplicating model output → `reasoning_extraction` refusal, which returns
- *      empty (→ "empty L1 summary, chunk left raw") or, worse, produces a
- *      summary that reproduces the reasoning as text — which then trips the
- *      SAME classifier on the MAIN thread once that summary is rendered.
- * Thinking is scratch work, not history (the same rationale already applied to
- * the summarizer's OUTPUT). Drop it from the input too.
+ * REVISED POLICY (2026-07-16). The June rationale ("signed thinking is only
+ * valid verbatim in the turn that produced it") is DISPROVEN for verbatim
+ * carriers: the June graft experiment showed signatures verify re-assembled
+ * in a different context, and the 2026-07-16 replay experiment showed a
+ * deterministically-refusing compress request PASSES once recall pairs carry
+ * their summaries' signed reasoning (text-only recall = reasoning_extraction;
+ * with carriers = end_turn). Recall-pair answers therefore now DO carry
+ * reasoning (summaryAnswerContent) and the request-final map no longer strips
+ * thinking.
+ *
+ * RAW message thinking is still stripped here, at insertion, for a narrower,
+ * validated reason: the compression pipeline rewrites raw turns
+ * (splitMixedToolMessages / collapse / truncation), and the API rejects
+ * thinking blocks whose turn shape differs from the original response
+ * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
+ * `full` replay arm). Passing raw thinking through requires keeping those
+ * turns byte-identical — a follow-up experiment, not a blanket strip removal.
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
@@ -2011,6 +2019,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ) continue;
 
       const parentHeader = `[CM] Recall memory ${parent.id}.`;
+      // The canonical pair body is whatever summaryAnswerContent produced —
+      // a single text block for legacy entries, or verbatim reasoning
+      // carriers + text for entries with responseContent. Match by exact
+      // JSON equality against that same construction.
+      const expectedBody = JSON.stringify(this.summaryAnswerContent(parent));
       const pairIndexes: number[] = [];
       for (let i = 0; i < canonicalRequest.messages.length - 1; i++) {
         const header = canonicalRequest.messages[i]!;
@@ -2020,9 +2033,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           header.content.length === 1 &&
           header.content[0]?.type === 'text' &&
           header.content[0].text === parentHeader &&
-          body.content.length === 1 &&
-          body.content[0]?.type === 'text' &&
-          body.content[0].text === parent.content
+          JSON.stringify(body.content) === expectedBody
         ) pairIndexes.push(i);
       }
       if (pairIndexes.length !== 1) continue;
@@ -2034,7 +2045,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         {
           participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
-          content: [{ type: 'text' as const, text: child.content }],
+          content: this.summaryAnswerContent(child),
         },
       ]);
       const pairIndex = pairIndexes[0]!;
@@ -3402,7 +3413,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
     for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
-      llmMessages.push({ participant: m.participant, content: m.content });
+      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
 
     // ---- 2. Prior recall pairs ----
@@ -3449,9 +3460,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
+      // Recall answers carry the summary's verbatim reasoning carriers
+      // (signed thinking) when captured — validated 2026-07-16 on a
+      // deterministically-refusing mythos compress request: text-only →
+      // reasoning_extraction refusal; with carriers → end_turn. Replaying
+      // the model's own text WITH its encrypted reasoning reads as its own
+      // history rather than harvested output, the same KV-honesty argument
+      // as declaring tools. Raw message thinking is still stripped at
+      // insertion (unvalidated: the API rejects thinking blocks whose turn
+      // shape was modified, and split/collapse rewrites raw turns).
       llmMessages.push({
         participant: agentParticipant,
-        content: [{ type: 'text', text: s.content }],
+        content: this.summaryAnswerContent(s),
       });
     }
 
@@ -3483,7 +3503,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: m.content });
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
       }
     }
 
@@ -3495,7 +3515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 5. Chunk messages raw ----
     for (const m of chunk.messages) {
-      llmMessages.push({ participant: m.participant, content: m.content });
+      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
 
     // ---- 6. Instruction (reading-mode aware) ----
@@ -3577,8 +3597,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // block → 400 "text content blocks must be non-empty", which throws in the
       // speculative drain and stalls ALL compression. (Twin of the empty-summary
       // recall-header guard — together they cover every source of the 400.)
+      // NOTE (2026-07-16): thinking is stripped from RAW messages at their
+      // llmMessages insertion sites, not here — a blanket strip would also
+      // remove the recall-pair reasoning carriers, which must reach the API
+      // verbatim (see the recall-pair sites).
       messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
         .filter(m => m.content.length > 0),
       config: {
         model: this.requireCompressionModel(),
@@ -4363,7 +4387,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
     for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
-      llmMessages.push({ participant: m.participant, content: m.content });
+      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
 
     // ---- 1b. PRIOR RECALL PAIRS (chronologically before merge range) ----
@@ -4435,9 +4459,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
+      // Carriers ride merge recall pairs too — see the L1 site rationale.
       llmMessages.push({
         participant,
-        content: [{ type: 'text', text: s.content }],
+        content: this.summaryAnswerContent(s),
       });
     }
 
@@ -4449,7 +4474,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: m.content });
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
       }
     }
 
@@ -4463,7 +4488,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
           if (m) {
-            llmMessages.push({ participant: m.participant, content: m.content });
+            llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
           }
         }
       } else {
@@ -4476,9 +4501,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             participant: 'Context Manager',
             content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
           });
+          // Carriers ride merge source expansions too — see the L1 site.
           llmMessages.push({
             participant,
-            content: [{ type: 'text', text: child.content }],
+            content: this.summaryAnswerContent(child),
           });
         }
       }
@@ -4566,8 +4592,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // block → 400 "text content blocks must be non-empty", which throws in the
       // speculative drain and stalls ALL compression. (Twin of the empty-summary
       // recall-header guard — together they cover every source of the 400.)
+      // NOTE (2026-07-16): thinking is stripped from RAW messages at their
+      // llmMessages insertion sites, not here — a blanket strip would also
+      // remove the recall-pair reasoning carriers, which must reach the API
+      // verbatim (see the recall-pair sites).
       messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripThinkingBlocks(stripEmptyTextBlocks(m.content)) }))
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
         .filter(m => m.content.length > 0),
       config: {
         model: this.requireCompressionModel(),

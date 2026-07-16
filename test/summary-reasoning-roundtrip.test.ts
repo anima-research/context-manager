@@ -185,6 +185,79 @@ describe('Summary reasoning round-trip (Fable-5 signed thinking)', () => {
     await manager.close();
   });
 
+  it('compression recall pairs carry reasoning; raw input stays thinking-stripped', async () => {
+    cleanup();
+
+    // Membrane stub: thinking responses + captures every request it receives.
+    let calls = 0;
+    const requests: Array<{ messages: Array<{ participant: string; content: Array<Record<string, unknown>> }> }> = [];
+    const membrane = {
+      complete: async (req: (typeof requests)[number]) => {
+        calls++;
+        requests.push(JSON.parse(JSON.stringify(req)));
+        return {
+          content: [
+            { type: 'thinking', thinking: '', signature: `sig-${calls}` },
+            { type: 'text', text: `Summary #${calls}: notable things occurred.` },
+          ],
+          usage: { inputTokens: 500, outputTokens: 100 },
+        };
+      },
+    };
+    const strategy = new AutobiographicalStrategy(strategyConfig());
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as never,
+    });
+
+    // First chunk: agent turns include (fake-signed) thinking blocks that must
+    // NOT reach the summarizer input.
+    for (let i = 0; i < 8; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [
+        ...(i % 2 === 1 ? [{ type: 'thinking' as const, thinking: '', signature: `raw-sig-${i}` }] : []),
+        { type: 'text', text: filler(30) },
+      ]);
+    }
+    await manager.compile();
+    await manager.tick();
+    const s = strategy as unknown as { summaries: SummaryEntry[] };
+    assert.ok(s.summaries.some(e => e.level === 1 && e.responseContent), 'setup: first L1 with carriers exists');
+
+    // Second chunk: its compression request should recall the first summary
+    // WITH carriers.
+    for (let i = 0; i < 8; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [
+        { type: 'text', text: filler(30) },
+      ]);
+    }
+    await manager.compile();
+    await manager.tick();
+
+    const later = requests.slice(1);
+    assert.ok(later.length >= 1, 'setup: a second compression request was issued');
+    const withRecall = later.find(r =>
+      r.messages.some(m =>
+        m.participant === 'Context Manager' &&
+        m.content.some(b => typeof b.text === 'string' && (b.text as string).includes('Recall memory')),
+      ),
+    );
+    assert.ok(withRecall, 'second compression request contains a recall pair');
+    // The recall ANSWER carries the stored carriers…
+    const recallAnswer = withRecall!.messages.find(m =>
+      m.participant === 'Claude' &&
+      m.content.some(b => b.type === 'thinking' && b.signature === 'sig-1'),
+    );
+    assert.ok(recallAnswer, 'recall answer carries the summary reasoning carrier verbatim');
+    // …while RAW chunk turns stay thinking-stripped.
+    const rawSigLeak = withRecall!.messages.some(m =>
+      m.content.some(b => b.type === 'thinking' && typeof b.signature === 'string' && (b.signature as string).startsWith('raw-sig-')),
+    );
+    assert.strictEqual(rawSigLeak, false, 'raw message thinking never reaches the summarizer');
+
+    await manager.close();
+  });
+
   it('leaves responseContent absent for reasoning-free responses (non-thinking models)', async () => {
     cleanup();
 
