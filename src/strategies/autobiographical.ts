@@ -476,7 +476,6 @@ interface PrimarySummaryQuarantineRecord {
   summary: PrimarySummaryIdentity;
   created: number;
 }
-
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
@@ -644,6 +643,33 @@ function stripReasoningFromRequest(request: NormalizedRequest): NormalizedReques
     messages: request.messages
       .map(m => ({ ...m, content: stripThinkingBlocks(m.content) }))
       .filter(m => m.content.length > 0),
+  };
+}
+
+function summarizeTelemetryMessages(
+  messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>,
+): Array<{
+  participant: string;
+  blockCount: number;
+  blockTypes: string[];
+  textChars: number;
+}> {
+  return messages.map((message) => ({
+    participant: message.participant,
+    blockCount: message.content.length,
+    blockTypes: message.content.map((block) => block.type),
+    textChars: message.content
+      .filter((block): block is ContentBlock & { type: 'text'; text: string } => block.type === 'text')
+      .reduce((total, block) => total + block.text.length, 0),
+  }));
+}
+
+function summarizeTelemetryText(
+  text: string | undefined,
+): { present: boolean; textChars: number } {
+  return {
+    present: !!text && text.length > 0,
+    textChars: text?.length ?? 0,
   };
 }
 
@@ -1230,7 +1256,6 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
       },
     );
   }
-
   /**
    * Explicit operator escape hatch. A retry remains canonical-first; clearing
    * this state only permits the same as-of request family to be issued again.
@@ -3020,7 +3045,6 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
       console.warn('[compression-quarantine] success-clear failed (records remain, klaxon persists):', error);
     }
   }
-
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
     const payload = {
       event: 'compression:quarantine-alert',
@@ -3602,11 +3626,11 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
   select(
     store: MessageStoreView,
     log: ContextLogView,
-    budget: TokenBudget
-  ): ContextEntry[] {
-    this.requireLoadedBranch('select');
-    this.beginPrimaryProjectionCapture(store);
-    this.rebuildChunks(store);
+      budget: TokenBudget
+    ): ContextEntry[] {
+      this.requireLoadedBranch('select');
+      this.beginPrimaryProjectionCapture(store);
+      this.rebuildChunks(store);
 
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
@@ -4015,7 +4039,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
             min_chunk_chars: minChunkChars,
             summary_id: stub.id,
           },
-          response: stub.content,
+          response: summarizeTelemetryText(stub.content),
         });
         this.checkMergeThreshold();
         return;
@@ -4777,15 +4801,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
-        messages: cleaned.map((m) => ({
-          participant: m.participant,
-          // Flatten content for logging — store text only; binary content
-          // would bloat the log and isn't typical in compression input.
-          text: m.content
-            .filter((b: ContentBlock) => b.type === 'text')
-            .map((b: any) => b.text)
-            .join(''),
-        })),
+        messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
           chunk_size: chunk.messages.length,
@@ -4799,7 +4815,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
         },
-        response: logResponse,
+        response: summarizeTelemetryText(logResponse),
         error: logError,
       });
     }
@@ -5403,13 +5419,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
         system: null,
-        messages: cleaned.map((m) => ({
-          participant: m.participant,
-          text: m.content
-            .filter((b: ContentBlock) => b.type === 'text')
-            .map((b: any) => b.text)
-            .join(''),
-        })),
+        messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           target_level: targetLevel,
           source_ids: sourceIds,
@@ -5420,7 +5430,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
         },
-        response: logResponse,
+        response: summarizeTelemetryText(logResponse),
         error: logError,
       });
     }

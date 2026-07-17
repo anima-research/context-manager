@@ -4,7 +4,8 @@ import { existsSync, rmSync } from 'node:fs';
 
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { PrimarySummaryContract, PrimarySummaryIdentity, SummaryEntry } from '../src/types/index.js';
+import type { Chunk } from '../src/strategies/autobiographical.js';
+import type { PrimarySummaryContract, PrimarySummaryIdentity, StrategyContext, SummaryEntry } from '../src/types/index.js';
 
 const BASE = './test-primary-summary-fallback';
 let sequence = 0;
@@ -26,9 +27,20 @@ class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {
     this.pushSummary(entry);
   }
+
+  run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
+    return this.compressChunkHierarchical(chunk, ctx);
+  }
 }
 
-function summary(id: string, sourceIds: string[], first: string, last: string, content = `authored ${id}`): SummaryEntry {
+function summary(
+  id: string,
+  sourceIds: string[],
+  first: string,
+  last: string,
+  content = `authored ${id}`,
+  responseContent?: ContentBlock[],
+): SummaryEntry {
   return {
     id,
     level: 1,
@@ -38,7 +50,25 @@ function summary(id: string, sourceIds: string[], first: string, last: string, c
     sourceIds,
     sourceRange: { first, last },
     created: 1,
+    ...(responseContent ? { responseContent } : {}),
   };
+}
+
+function carrierBlocks(tag: string, text: string): ContentBlock[] {
+  return [
+    { type: 'thinking', thinking: `private-${tag}`, signature: `sig-${tag}` } as ContentBlock,
+    { type: 'redacted_thinking', data: `enc-${tag}` } as ContentBlock,
+    { type: 'text', text },
+  ];
+}
+
+function managerContext(manager: ContextManager): StrategyContext {
+  return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
+}
+
+function compressionQuarantineEvents(manager: ContextManager): Array<Record<string, unknown>> {
+  const value = manager.getStore().getStateJson('default/autobio:compression-refusal-quarantine-events');
+  return Array.isArray(value) ? value as Array<Record<string, unknown>> : [];
 }
 
 async function createFixture(path = freshPath()) {
@@ -153,6 +183,57 @@ describe('primary summary fallback substrate', () => {
     }
   });
 
+  it('carrier-bearing summaries survive primary projection selection and raw expansion', async () => {
+    const path = freshPath();
+    const strategy = new ProbeStrategy({
+      compressionModel: 'same-model',
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+    });
+    const manager = await ContextManager.open({ path, strategy, membrane: {} as never });
+    try {
+      const ids: string[] = [];
+      ids.push(manager.addMessage('User', [{ type: 'text', text: 'raw-0 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('Claude', [{ type: 'text', text: 'raw-1 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('User', [{ type: 'text', text: 'raw-2 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('Claude', [{ type: 'text', text: 'raw-3 substantive '.repeat(10) }]));
+      strategy.seed(summary(
+        'L1-carrier',
+        [ids[0]!, ids[1]!, ids[2]!, ids[3]!],
+        ids[0]!,
+        ids[3]!,
+        'authored carrier summary',
+        carrierBlocks('primary', 'authored carrier summary'),
+      ));
+
+      const compiled = await manager.compile({ maxTokens: 4000, reserveForResponse: 256 });
+      const selection = compiled.primarySummaryProjection!.selectedSummaries[0]!;
+      const pairAnswer = compiled.messages[selection.pairRange!.end]!;
+      assert.deepEqual(
+        pairAnswer.content.map((block) => block.type),
+        ['thinking', 'redacted_thinking', 'text'],
+      );
+      assert.equal((pairAnswer.content[0] as { signature: string }).signature, 'sig-primary');
+
+      const expanded = manager.expandPrimarySummaryProjectionRaw(compiled, [selection.identity]);
+      assert.equal(expanded.messages.some((message) =>
+        message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'),
+      ), false);
+      assert.equal(expanded.messages[0]!.participant, 'User');
+      assert.equal(expanded.messages[1]!.participant, 'Claude');
+      assert.equal(
+        expanded.primarySummaryProjection!.selectedSummaries[0]!.renderedAs,
+        'raw_expansion',
+      );
+    } finally {
+      await manager.close();
+    }
+  });
+
   it('quarantine matching includes the system hash and survives restart', async () => {
     const path = freshPath();
     const first = await createFixture(path);
@@ -226,6 +307,83 @@ describe('primary summary fallback substrate', () => {
           contract('branch'),
         ),
         [],
+      );
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('auxiliary compression quarantine cannot affect primary-lane quarantine, or vice versa', async () => {
+    const path = freshPath();
+    const refusalMembrane = {
+      complete: async () => ({
+        content: [],
+        stopReason: 'refusal',
+        usage: { inputTokens: 100, outputTokens: 0 },
+        raw: { response: { stop_details: { category: 'reasoning_extraction' } } },
+      }),
+    };
+    const strategy = new ProbeStrategy({
+      compressionModel: 'same-model',
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy, membrane: refusalMembrane as never });
+    try {
+      const ids: string[] = [];
+      ids.push(manager.addMessage('User', [{ type: 'text', text: 'raw-0 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('Claude', [{ type: 'text', text: 'raw-1 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('User', [{ type: 'text', text: 'raw-2 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('Claude', [{ type: 'text', text: 'raw-3 substantive '.repeat(10) }]));
+      ids.push(manager.addMessage('User', [{ type: 'text', text: 'raw-4 substantive '.repeat(10) }]));
+      const seeded = summary(
+        'L1-primary',
+        [ids[0]!, ids[1]!, ids[2]!, ids[3]!],
+        ids[0]!,
+        ids[3]!,
+        'authored primary summary',
+        carrierBlocks('lane', 'authored primary summary'),
+      );
+      strategy.seed(seeded);
+
+      const compiled = await manager.compile({ maxTokens: 4000, reserveForResponse: 256 });
+      const selection = compiled.primarySummaryProjection!.selectedSummaries[0]!;
+      await manager.quarantinePrimarySummaryForPrimaryLane(contract('iso'), [selection.identity]);
+      assert.deepEqual(
+        manager.matchingPrimarySummaryQuarantine(compiled.primarySummaryProjection!, contract('iso'))
+          .map((item) => item.id),
+        ['L1-primary'],
+      );
+      assert.equal(compressionQuarantineEvents(manager).length, 0);
+
+      const allMessages = managerContext(manager).messageStore.getAll();
+      const targetMessage = allMessages[4]!;
+      const target: Chunk = {
+        index: 4,
+        startIndex: 4,
+        endIndex: 5,
+        messages: [targetMessage],
+        tokens: 32,
+        compressed: false,
+      };
+      await strategy.run(target, managerContext(manager));
+      assert.equal(compressionQuarantineEvents(manager).some((event) => event.kind === 'exhausted'), true);
+      assert.deepEqual(
+        manager.matchingPrimarySummaryQuarantine(compiled.primarySummaryProjection!, contract('iso'))
+          .map((item) => item.id),
+        ['L1-primary'],
+      );
+
+      await strategy.run({ ...target, compressed: false }, managerContext(manager));
+      assert.equal(
+        compressionQuarantineEvents(manager).filter((event) => event.kind === 'exhausted').length,
+        1,
+        'primary-lane quarantine must not bypass auxiliary durable quarantine suppression',
       );
     } finally {
       await manager.close();

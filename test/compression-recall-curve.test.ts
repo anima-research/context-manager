@@ -184,6 +184,14 @@ function text(text: string): ContentBlock {
   return { type: 'text', text };
 }
 
+function carrierBlocks(tag: string, text: string): ContentBlock[] {
+  return [
+    { type: 'thinking', thinking: `private-${tag}`, signature: `sig-${tag}` } as ContentBlock,
+    { type: 'redacted_thinking', data: `enc-${tag}` } as ContentBlock,
+    { type: 'text', text },
+  ];
+}
+
 function summary(
   id: string,
   level: number,
@@ -1305,6 +1313,57 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('authored recall-curve expansion preserves carrier-bearing summary bodies verbatim', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane);
+    const carrierById = new Map<string, ContentBlock[]>();
+    for (const entry of fx.strategy.summariesView()) {
+      const blocks = carrierBlocks(entry.id, entry.content);
+      entry.responseContent = blocks;
+      carrierById.set(entry.id, blocks);
+    }
+    fx.strategy.flushSummaries();
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+
+    const canonical = mock.calls[0]!.request;
+    const canonicalParentHeader = canonical.messages.findIndex((message) =>
+      message.participant === 'Context Manager' &&
+      message.content[0]?.type === 'text' &&
+      message.content[0].text === '[CM] Recall memory L2-200.',
+    );
+    assert.ok(canonicalParentHeader >= 0);
+    assert.deepEqual(
+      canonical.messages[canonicalParentHeader + 1]!.content,
+      carrierById.get('L2-200'),
+    );
+
+    const variant = mock.calls[1]!.request;
+    assert.equal(
+      variant.messages.some((message) =>
+        message.participant === 'Context Manager' &&
+        message.content[0]?.type === 'text' &&
+        message.content[0].text === '[CM] Recall memory L2-201.',
+      ),
+      false,
+    );
+    for (const id of ['L1-102', 'L1-103']) {
+      const headerIndex = variant.messages.findIndex((message) =>
+        message.participant === 'Context Manager' &&
+        message.content[0]?.type === 'text' &&
+        message.content[0].text === `[CM] Recall memory ${id}.`,
+      );
+      assert.ok(headerIndex >= 0, `${id} should appear in the fallback expansion`);
+      assert.deepEqual(
+        variant.messages[headerIndex + 1]!.content,
+        carrierById.get(id),
+      );
+    }
+    assert.equal(quarantineEvents(fx.manager).length, 0);
+    fx.manager.close();
+  });
+
   it('emits metadata traces for refusal, curve attempt, success, and persistence', async () => {
     const logPath = `${freshPath()}-trace.jsonl`;
     paths.push(logPath);
@@ -1313,10 +1372,15 @@ describe('compression refusal recall curves', () => {
     try {
       const mock = scriptedMembrane(['refusal', 'end_turn']);
       const fx = await fixture(mock.membrane);
+      for (const entry of fx.strategy.summariesView()) {
+        entry.responseContent = carrierBlocks(entry.id, entry.content);
+      }
+      fx.strategy.flushSummaries();
       await fx.strategy.run(fx.target, managerContext(fx.manager));
       fx.manager.close();
 
-      const entries = readFileSync(logPath, 'utf8').trim().split('\n').map(
+      const rawLog = readFileSync(logPath, 'utf8');
+      const entries = rawLog.trim().split('\n').map(
         (line) => JSON.parse(line) as { event?: string; metadata?: Record<string, unknown> },
       );
       const events = entries.map((entry) => entry.event).filter(Boolean);
@@ -1331,6 +1395,10 @@ describe('compression refusal recall curves', () => {
       assert.match(String(attempts[1]!.metadata?.requestHash), /^[a-f0-9]{64}$/);
       assert.match(String(attempts[1]!.metadata?.leafCoverageHash), /^[a-f0-9]{64}$/);
       assert.equal(attempts[1]!.metadata?.refusalCategory, undefined);
+      assert.equal(rawLog.includes('substantive'), false, 'raw source text must not enter telemetry');
+      assert.equal(rawLog.includes('successful memory from attempt 1'), false, 'summary body must not enter telemetry');
+      assert.equal(rawLog.includes('private-L2-200'), false, 'reasoning text must not enter telemetry');
+      assert.equal(rawLog.includes('enc-L2-200'), false, 'redacted reasoning payload must not enter telemetry');
     } finally {
       if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
       else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
