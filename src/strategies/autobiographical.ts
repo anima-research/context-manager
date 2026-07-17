@@ -470,6 +470,7 @@ interface PendingPrimarySummaryProjectionSelection {
 interface PrimarySummaryQuarantineRecord {
   branchId: string;
   branchGeneration: number;
+  systemHash: string;
   modelConfigHash: string;
   toolContractHash: string;
   summary: PrimarySummaryIdentity;
@@ -865,6 +866,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
   private primarySummaryQuarantineKey(record: {
     branchId: string;
     branchGeneration: number;
+    systemHash: string;
     modelConfigHash: string;
     toolContractHash: string;
     summary: PrimarySummaryIdentity;
@@ -872,6 +874,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
     return [
       record.branchId,
       String(record.branchGeneration),
+      record.systemHash,
       record.modelConfigHash,
       record.toolContractHash,
       this.primarySummaryIdentityKey(record.summary),
@@ -915,19 +918,15 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
     answerParticipant: string,
     store: MessageStoreView,
   ): void {
-    try {
-      const identity = this.summaryIdentity(summary, store);
-      this.lastPrimaryProjectionSelections.push({
-        identity,
-        level: summary.level,
-        orderedSourceIds: [...summary.sourceIds],
-        headerText,
-        answerParticipant,
-        answerContentJson: JSON.stringify(this.summaryAnswerContent(summary)),
-      });
-    } catch {
-      // A malformed/corrupt summary must not break ordinary compilation.
-    }
+    const identity = this.summaryIdentity(summary, store);
+    this.lastPrimaryProjectionSelections.push({
+      identity,
+      level: summary.level,
+      orderedSourceIds: [...summary.sourceIds],
+      headerText,
+      answerParticipant,
+      answerContentJson: JSON.stringify(this.summaryAnswerContent(summary)),
+    });
   }
 
   capturePrimarySummaryProjection(
@@ -985,6 +984,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
       .filter((identity) => this.primarySummaryQuarantine.has(this.primarySummaryQuarantineKey({
         branchId: branch.id,
         branchGeneration: branch.generation,
+        systemHash: contract.systemHash,
         modelConfigHash: contract.modelConfigHash,
         toolContractHash: contract.toolContractHash,
         summary: identity,
@@ -1217,6 +1217,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
           const record: PrimarySummaryQuarantineRecord = {
             branchId: branch.id,
             branchGeneration: branch.generation,
+            systemHash: contract.systemHash,
             modelConfigHash: contract.modelConfigHash,
             toolContractHash: contract.toolContractHash,
             summary,
@@ -1834,6 +1835,7 @@ export class AutobiographicalStrategy implements ResettableStrategy, PrimarySumm
           entry &&
           typeof entry.branchId === 'string' &&
           typeof entry.branchGeneration === 'number' &&
+          typeof entry.systemHash === 'string' &&
           typeof entry.modelConfigHash === 'string' &&
           typeof entry.toolContractHash === 'string' &&
           entry.summary &&

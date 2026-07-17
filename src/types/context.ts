@@ -136,6 +136,7 @@ export interface PrimarySummaryIdentity {
 
 /** Active provider contract used for primary-lane raw-expansion quarantine. */
 export interface PrimarySummaryContract {
+  systemHash: string;
   modelConfigHash: string;
   toolContractHash: string;
 }
