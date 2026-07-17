@@ -1,7 +1,16 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
-import type { ContextEntry, TokenBudget, PendingWork } from './context.js';
+import type {
+  BranchGenerationInfo,
+  CompileResult,
+  ContextEntry,
+  PrimarySummaryContract,
+  PrimarySummaryIdentity,
+  PrimarySummaryProjection,
+  TokenBudget,
+  PendingWork,
+} from './context.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -78,6 +87,12 @@ export interface StrategyContext {
    * exists, so strategies never need to handle the unscoped case.
    */
   namespace: string;
+  /**
+   * Active primary-lane provider contract, set by the host immediately before
+   * a primary request compile. Strategies may use this for branch-local raw
+   * expansion policy such as durable summary quarantine.
+   */
+  primaryLaneContract?: PrimarySummaryContract;
 }
 
 /**
@@ -354,6 +369,45 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
   return (
     'getRenderStats' in s &&
     typeof (s as RenderStatsCapableStrategy).getRenderStats === 'function'
+  );
+}
+
+/**
+ * Strategy capability for primary-lane summary-refusal raw-expansion fallback.
+ * Implemented by AutobiographicalStrategy.
+ */
+export interface PrimarySummaryFallbackCapableStrategy extends ContextStrategy {
+  capturePrimarySummaryProjection(
+    compiledMessages: ReadonlyArray<NormalizedMessage>,
+  ): PrimarySummaryProjection | null;
+  matchPrimarySummaryQuarantine(
+    projection: PrimarySummaryProjection,
+    branch: BranchGenerationInfo,
+    contract: PrimarySummaryContract,
+  ): PrimarySummaryIdentity[];
+  expandPrimarySummaryProjectionRaw(
+    compiled: CompileResult,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): CompileResult;
+  quarantinePrimarySummaryForPrimaryLane(
+    branch: BranchGenerationInfo,
+    contract: PrimarySummaryContract,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): Promise<void>;
+}
+
+export function isPrimarySummaryFallbackCapable(
+  s: ContextStrategy,
+): s is PrimarySummaryFallbackCapableStrategy {
+  return (
+    'capturePrimarySummaryProjection' in s &&
+    typeof (s as PrimarySummaryFallbackCapableStrategy).capturePrimarySummaryProjection === 'function' &&
+    'matchPrimarySummaryQuarantine' in s &&
+    typeof (s as PrimarySummaryFallbackCapableStrategy).matchPrimarySummaryQuarantine === 'function' &&
+    'expandPrimarySummaryProjectionRaw' in s &&
+    typeof (s as PrimarySummaryFallbackCapableStrategy).expandPrimarySummaryProjectionRaw === 'function' &&
+    'quarantinePrimarySummaryForPrimaryLane' in s &&
+    typeof (s as PrimarySummaryFallbackCapableStrategy).quarantinePrimarySummaryForPrimaryLane === 'function'
   );
 }
 

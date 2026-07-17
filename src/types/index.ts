@@ -20,8 +20,13 @@ export type {
   TokenBudget,
   PendingWork,
   BranchInfo,
+  BranchGenerationInfo,
   ContextInjection,
   CompileResult,
+  PrimarySummaryIdentity,
+  PrimarySummaryContract,
+  PrimarySummaryProjectionSelection,
+  PrimarySummaryProjection,
 } from './context.js';
 
 // Strategy types
@@ -52,6 +57,7 @@ export type {
   PinnableStrategy,
   RenderStats,
   RenderStatsCapableStrategy,
+  PrimarySummaryFallbackCapableStrategy,
 } from './strategy.js';
 
 export {
@@ -61,4 +67,5 @@ export {
   isSearchableStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
+  isPrimarySummaryFallbackCapable,
 } from './strategy.js';

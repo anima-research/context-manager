@@ -9,12 +9,15 @@ import type {
   TokenBudget,
   PendingWork,
   BranchInfo,
+  BranchGenerationInfo,
   ContextStrategy,
   StrategyContext,
   MessageQuery,
   MessageQueryResult,
   ContextInjection,
   CompileResult,
+  PrimarySummaryContract,
+  PrimarySummaryIdentity,
   ProtectedRange,
   PinLevelOptions,
   SearchQuery,
@@ -29,6 +32,7 @@ import {
   isSearchableStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
+  isPrimarySummaryFallbackCapable,
 } from './types/index.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
@@ -454,6 +458,13 @@ export class ContextManager {
     };
   }
 
+  /** Current branch metadata plus the Chronicle generation counter. */
+  currentBranchGeneration(): BranchGenerationInfo {
+    const branch = this.currentBranch();
+    const observed = observeStoreBranch(this.store);
+    return { ...branch, generation: observed.generation };
+  }
+
   /**
    * List all branches.
    */
@@ -559,7 +570,11 @@ export class ContextManager {
 
     // If no injections, log and return early
     if (!injections || injections.length === 0) {
-      const result = { messages, systemInjections: [] };
+      const result: CompileResult = { messages, systemInjections: [] };
+      if (isPrimarySummaryFallbackCapable(this.strategy)) {
+        const projection = this.strategy.capturePrimarySummaryProjection(messages);
+        if (projection) result.primarySummaryProjection = projection;
+      }
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
     }
@@ -613,7 +628,11 @@ export class ContextManager {
       messages.splice(insertIdx, 0, ...injectedMessages);
     }
 
-    const result = { messages, systemInjections };
+    const result: CompileResult = { messages, systemInjections };
+    if (isPrimarySummaryFallbackCapable(this.strategy)) {
+      const projection = this.strategy.capturePrimarySummaryProjection(messages);
+      if (projection) result.primarySummaryProjection = projection;
+    }
     if (this.debugLogContext) this.logCompiledContext(result);
     return result;
   }
@@ -844,10 +863,57 @@ export class ContextManager {
    * reasoning_extraction refusals on transcripts containing tool blocks.
    */
   private toolDefinitions?: ToolDefinition[];
+  private primaryLaneContract?: PrimarySummaryContract;
 
   /** Host hook: record the agent's current tool definitions (see above). */
   setToolDefinitions(tools: ToolDefinition[] | undefined): void {
     if (tools && tools.length > 0) this.toolDefinitions = tools;
+  }
+
+  /** Host hook: record the active primary-lane provider contract. */
+  setPrimaryLaneContract(contract: PrimarySummaryContract | undefined): void {
+    this.primaryLaneContract = contract;
+  }
+
+  /** Expand specific rendered autobiographical summaries back to raw source. */
+  expandPrimarySummaryProjectionRaw(
+    compiled: CompileResult,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): CompileResult {
+    if (!isPrimarySummaryFallbackCapable(this.strategy)) {
+      throw new Error('Active strategy does not support primary summary raw expansion');
+    }
+    return this.strategy.expandPrimarySummaryProjectionRaw(compiled, summaries);
+  }
+
+  /** Selected summaries quarantined for the current branch generation + contract. */
+  matchingPrimarySummaryQuarantine(
+    projection: NonNullable<CompileResult['primarySummaryProjection']>,
+    contract?: PrimarySummaryContract,
+  ): PrimarySummaryIdentity[] {
+    if (!isPrimarySummaryFallbackCapable(this.strategy)) return [];
+    const effectiveContract = contract ?? this.primaryLaneContract;
+    if (!effectiveContract) return [];
+    return this.strategy.matchPrimarySummaryQuarantine(
+      projection,
+      this.currentBranchGeneration(),
+      effectiveContract,
+    );
+  }
+
+  /** Persist durable primary-lane raw-expansion quarantine for selected summaries. */
+  async quarantinePrimarySummaryForPrimaryLane(
+    contract: PrimarySummaryContract,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): Promise<void> {
+    if (!isPrimarySummaryFallbackCapable(this.strategy)) {
+      throw new Error('Active strategy does not support primary summary quarantine');
+    }
+    await this.strategy.quarantinePrimarySummaryForPrimaryLane(
+      this.currentBranchGeneration(),
+      contract,
+      summaries,
+    );
   }
 
   private createStrategyContext(): StrategyContext {
@@ -859,6 +925,7 @@ export class ContextManager {
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,
+      get primaryLaneContract() { return self.primaryLaneContract; },
       // Live getter, not a snapshot: strategies capture a ctx object once and
       // reuse it across a long-running drain (driveSpeculativeDrain recurses
       // with the same ctx). A snapshot taken before the session's first
