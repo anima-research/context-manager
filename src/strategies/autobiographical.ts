@@ -1,8 +1,10 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
 import { phaseChannel } from '../phase-channel.js';
 import type {
+  BranchGenerationInfo,
+  CompileResult,
   ContextStrategy,
   ResettableStrategy,
   StrategyContext,
@@ -24,6 +26,11 @@ import type {
   RenderStats,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
+  PrimarySummaryContract,
+  PrimarySummaryIdentity,
+  PrimarySummaryProjection,
+  PrimarySummaryProjectionSelection,
+  PrimarySummaryFallbackCapableStrategy,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -451,6 +458,25 @@ interface CompressionAttemptTrace {
   budgetTokens?: number;
 }
 
+interface PendingPrimarySummaryProjectionSelection {
+  identity: PrimarySummaryIdentity;
+  level: number;
+  orderedSourceIds: string[];
+  headerText: string;
+  answerParticipant: string;
+  answerContentJson: string;
+}
+
+interface PrimarySummaryQuarantineRecord {
+  branchId: string;
+  branchGeneration: number;
+  systemHash: string;
+  modelConfigHash: string;
+  toolContractHash: string;
+  summary: PrimarySummaryIdentity;
+  created: number;
+}
+
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
@@ -643,7 +669,7 @@ function captureResponseContent(content: ContentBlock[]): ContentBlock[] | undef
  * L1 (raw→summary) → L2 (merge N L1s) → L3 (merge N L2s)
  * with anti-redundancy filtering and budget carryover.
  */
-export class AutobiographicalStrategy implements ResettableStrategy {
+export class AutobiographicalStrategy implements ResettableStrategy, PrimarySummaryFallbackCapableStrategy {
   readonly name: string = 'autobiographical';
 
   get maxMessageTokens(): number { return this.config.maxMessageTokens; }
@@ -734,6 +760,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get compressionRefusalQuarantineLedgerStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine-events`;
   }
+  protected get primarySummaryQuarantineStateId(): string {
+    return `${this.ns}/autobio:primary-summary-quarantine`;
+  }
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -780,6 +809,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private lastFrontierTokens: number | undefined;
   private transitionBlocked: HotContextSettingsStatus['blocked'] | undefined;
   private runtimeTransitionPaceTokens: number | undefined;
+  private primarySummaryQuarantine = new Map<string, PrimarySummaryQuarantineRecord>();
+  private lastPrimaryProjectionBranch: BranchGenerationInfo | null = null;
+  private lastPrimaryProjectionSelections: PendingPrimarySummaryProjectionSelection[] = [];
+  private liveMessageStoreView: MessageStoreView | null = null;
 
   constructor(config: AutobiographicalOptions = {}) {
     this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
@@ -798,6 +831,404 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.compressionSlackRatio ??= 0.1;
       this.config.speculativeProduction ??= true;
     }
+  }
+
+  private currentPrimaryProjectionBranch(): BranchGenerationInfo {
+    if (!this.store) throw new Error('Primary summary projection requires an initialized store');
+    const branch = this.store.currentBranch();
+    const observed = observeStoreBranch(this.store);
+    return {
+      id: branch.id,
+      name: branch.name,
+      head: branch.head,
+      parentId: branch.parentId ?? undefined,
+      branchPoint: branch.branchPoint ?? undefined,
+      created: new Date(branch.created),
+      generation: observed.generation,
+    };
+  }
+
+  private beginPrimaryProjectionCapture(store: MessageStoreView): void {
+    this.liveMessageStoreView = store;
+    this.lastPrimaryProjectionBranch = this.currentPrimaryProjectionBranch();
+    this.lastPrimaryProjectionSelections = [];
+  }
+
+  private primarySummaryIdentityKey(identity: PrimarySummaryIdentity): string {
+    return [
+      identity.id,
+      identity.contentHash,
+      identity.carrierHash,
+      identity.sourceLeafHash,
+    ].join('\u0000');
+  }
+
+  private primarySummaryQuarantineKey(record: {
+    branchId: string;
+    branchGeneration: number;
+    systemHash: string;
+    modelConfigHash: string;
+    toolContractHash: string;
+    summary: PrimarySummaryIdentity;
+  }): string {
+    return [
+      record.branchId,
+      String(record.branchGeneration),
+      record.systemHash,
+      record.modelConfigHash,
+      record.toolContractHash,
+      this.primarySummaryIdentityKey(record.summary),
+    ].join('\u0000');
+  }
+
+  private summaryLeafIds(summary: SummaryEntry, store: MessageStoreView): string[] {
+    const summariesById = new Map<string, SummaryEntry>(this.summaries.map((entry) => [entry.id, entry]));
+    const position = new Map<string, number>();
+    const messages = store.getAll();
+    for (let i = 0; i < messages.length; i++) position.set(messages[i]!.id, i);
+    const leaves = this.recallCurveLeafIds(summary, summariesById, position);
+    if (!leaves) throw new Error(`Summary ${summary.id} has invalid leaf coverage`);
+    return leaves;
+  }
+
+  private summaryIdentity(summary: SummaryEntry, store: MessageStoreView): PrimarySummaryIdentity {
+    const leaves = this.summaryLeafIds(summary, store);
+    const leafPayload = leaves.map((id) => {
+      const message = store.get(id);
+      if (!message) throw new Error(`Summary ${summary.id} references missing source message ${id}`);
+      return {
+        id: message.id,
+        participant: message.participant,
+        bodyGroupId: message.bodyGroupId ?? null,
+        shardIndex: message.shardIndex ?? null,
+        content: stripThinkingBlocks(message.content),
+      };
+    });
+    return {
+      id: summary.id,
+      contentHash: sha256Json(summary.content),
+      carrierHash: sha256Json(this.summaryAnswerContent(summary)),
+      sourceLeafHash: sha256Json(leafPayload),
+    };
+  }
+
+  private recordPrimaryProjectionSelection(
+    summary: SummaryEntry,
+    headerText: string,
+    answerParticipant: string,
+    store: MessageStoreView,
+  ): void {
+    const identity = this.summaryIdentity(summary, store);
+    this.lastPrimaryProjectionSelections.push({
+      identity,
+      level: summary.level,
+      orderedSourceIds: [...summary.sourceIds],
+      headerText,
+      answerParticipant,
+      answerContentJson: JSON.stringify(this.summaryAnswerContent(summary)),
+    });
+  }
+
+  capturePrimarySummaryProjection(
+    compiledMessages: ReadonlyArray<NormalizedMessage>,
+  ): PrimarySummaryProjection | null {
+    const branch = this.lastPrimaryProjectionBranch;
+    if (!branch) return null;
+    const selections: PrimarySummaryProjectionSelection[] = [];
+    let searchFrom = 0;
+    for (const selection of this.lastPrimaryProjectionSelections) {
+      let pairStart = -1;
+      for (let i = searchFrom; i < compiledMessages.length - 1; i++) {
+        const question = compiledMessages[i]!;
+        const answer = compiledMessages[i + 1]!;
+        if (
+          question.participant === 'Context Manager' &&
+          question.content.length === 1 &&
+          question.content[0]?.type === 'text' &&
+          question.content[0].text === selection.headerText &&
+          answer.participant === selection.answerParticipant &&
+          JSON.stringify(answer.content) === selection.answerContentJson
+        ) {
+          pairStart = i;
+          break;
+        }
+      }
+      if (pairStart < 0) return null;
+      selections.push({
+        identity: selection.identity,
+        level: selection.level,
+        orderedSourceIds: [...selection.orderedSourceIds],
+        renderedAs: 'summary_pair',
+        pairRange: { start: pairStart, end: pairStart + 1 },
+      });
+      searchFrom = pairStart + 2;
+    }
+    return {
+      namespace: this.ns,
+      branch: {
+        id: branch.id,
+        name: branch.name,
+        generation: branch.generation,
+      },
+      selectedSummaries: selections,
+    };
+  }
+
+  matchPrimarySummaryQuarantine(
+    projection: PrimarySummaryProjection,
+    branch: BranchGenerationInfo,
+    contract: PrimarySummaryContract,
+  ): PrimarySummaryIdentity[] {
+    return projection.selectedSummaries
+      .map((selection) => selection.identity)
+      .filter((identity) => this.primarySummaryQuarantine.has(this.primarySummaryQuarantineKey({
+        branchId: branch.id,
+        branchGeneration: branch.generation,
+        systemHash: contract.systemHash,
+        modelConfigHash: contract.modelConfigHash,
+        toolContractHash: contract.toolContractHash,
+        summary: identity,
+      })));
+  }
+
+  private findSummaryByIdentity(identity: PrimarySummaryIdentity, store: MessageStoreView): SummaryEntry | null {
+    const matches = this.summaries.filter((summary) => summary.id === identity.id);
+    for (const summary of matches) {
+      try {
+        const computed = this.summaryIdentity(summary, store);
+        if (
+          computed.contentHash === identity.contentHash &&
+          computed.carrierHash === identity.carrierHash &&
+          computed.sourceLeafHash === identity.sourceLeafHash
+        ) return summary;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private validatePrimarySummarySourceMessages(messages: StoredMessage[]): void {
+    const seenBodyGroups = new Set<string>();
+    let currentBodyGroup: string | undefined;
+    let previousShardIndex: number | undefined;
+    for (const message of messages) {
+      const groupId = message.bodyGroupId;
+      if (!groupId) {
+        currentBodyGroup = undefined;
+        previousShardIndex = undefined;
+        continue;
+      }
+      if (groupId !== currentBodyGroup) {
+        if (seenBodyGroups.has(groupId)) {
+          throw new Error(`Body-group ${groupId} is non-contiguous in raw expansion`);
+        }
+        seenBodyGroups.add(groupId);
+        currentBodyGroup = groupId;
+        previousShardIndex = undefined;
+      }
+      if (typeof message.shardIndex === 'number') {
+        if (previousShardIndex !== undefined && message.shardIndex <= previousShardIndex) {
+          throw new Error(`Body-group ${groupId} has non-monotonic shard order`);
+        }
+        previousShardIndex = message.shardIndex;
+      }
+    }
+  }
+
+  private validateImmediateToolPairing(messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>): void {
+    let pendingToolUses = new Set<string>();
+    for (const message of messages) {
+      const results = message.content.filter(
+        (block): block is ContentBlock & { type: 'tool_result'; toolUseId: string } => block.type === 'tool_result',
+      );
+      const toolUses = message.content.filter(
+        (block): block is ContentBlock & { type: 'tool_use'; id: string } => block.type === 'tool_use',
+      );
+      if (results.length > 0) {
+        const resultIds = new Set<string>();
+        for (const result of results) {
+          if (message.participant.toLowerCase() !== 'user') {
+            throw new Error('tool_result must appear in the user turn after raw normalization');
+          }
+          if (!pendingToolUses.has(result.toolUseId) || resultIds.has(result.toolUseId)) {
+            throw new Error(`Invalid tool_result pairing for ${result.toolUseId}`);
+          }
+          resultIds.add(result.toolUseId);
+        }
+        if (resultIds.size !== pendingToolUses.size) {
+          throw new Error('Raw expansion omitted one or more matching tool_result blocks');
+        }
+      } else if (pendingToolUses.size > 0) {
+        throw new Error('tool_use was not immediately followed by tool_result in raw expansion');
+      }
+      pendingToolUses = new Set(toolUses.map((toolUse) => toolUse.id));
+    }
+    if (pendingToolUses.size > 0) {
+      throw new Error('Raw expansion ended with unmatched tool_use');
+    }
+  }
+
+  private rawNormalizedMessagesForSummary(
+    summary: SummaryEntry,
+    store: MessageStoreView,
+  ): { normalized: Array<{ participant: string; content: ContentBlock[] }>; orderedSourceIds: string[] } {
+    const leafIds = this.summaryLeafIds(summary, store);
+    const sourceMessages = leafIds.map((id) => {
+      const message = store.get(id);
+      if (!message) throw new Error(`Summary ${summary.id} references missing source message ${id}`);
+      return message;
+    });
+    this.validatePrimarySummarySourceMessages(sourceMessages);
+    const entries: ContextEntry[] = sourceMessages.map((message, index) => ({
+      index,
+      sourceMessageId: message.id,
+      sourceRelation: 'copy',
+      participant: message.participant,
+      content: stripThinkingBlocks(message.content),
+    }));
+    const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
+    const normalized = merged.flatMap((entry) =>
+      splitMixedToolMessages([{ participant: entry.participant, content: entry.content }]),
+    );
+    this.validateImmediateToolPairing(normalized);
+    return { normalized, orderedSourceIds: [...summary.sourceIds] };
+  }
+
+  private remapPrimarySummaryCacheBreakpoints(
+    original: ReadonlyArray<{ cacheBreakpoint?: boolean }>,
+    replacementSpans: Array<{ start: number; end: number; inserted: number }>,
+    messages: Array<{ cacheBreakpoint?: boolean }>,
+  ): void {
+    for (const message of messages) delete message.cacheBreakpoint;
+    const marks = original.flatMap((message, index) => (message.cacheBreakpoint ? [index] : []));
+    const mapped = new Set<number>();
+    for (const mark of marks) {
+      let delta = 0;
+      let target = mark;
+      for (const span of replacementSpans) {
+        if (mark < span.start) break;
+        if (mark > span.end) {
+          delta += span.inserted - (span.end - span.start + 1);
+          target = mark + delta;
+          continue;
+        }
+        target = span.start + delta + span.inserted - 1;
+        delta = 0;
+        break;
+      }
+      if (target >= 0 && target < messages.length) mapped.add(target);
+    }
+    for (const index of mapped) messages[index]!.cacheBreakpoint = true;
+  }
+
+  expandPrimarySummaryProjectionRaw(
+    compiled: CompileResult,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): CompileResult {
+    this.requireLoadedBranch('expandPrimarySummaryProjectionRaw');
+    const projection = compiled.primarySummaryProjection;
+    if (!projection) throw new Error('Primary summary projection is unavailable for raw expansion');
+    const store = this.liveMessageStoreView;
+    if (!store) throw new Error('Primary summary raw expansion requires a live message store view');
+    if (
+      projection.branch.id !== this.currentPrimaryProjectionBranch().id ||
+      projection.branch.generation !== this.currentPrimaryProjectionBranch().generation
+    ) {
+      throw new Error('Primary summary projection crossed a branch generation; recompile before expanding');
+    }
+    if (summaries.length === 0) return compiled;
+
+    const requested = new Map(summaries.map((identity) => [this.primarySummaryIdentityKey(identity), identity]));
+    const replacementSpans: Array<{ start: number; end: number; inserted: number }> = [];
+    const updatedSelections: PrimarySummaryProjectionSelection[] = [];
+    const replacementByStart = new Map<number, Array<{ participant: string; content: ContentBlock[] }>>();
+    for (const selection of projection.selectedSummaries) {
+      const key = this.primarySummaryIdentityKey(selection.identity);
+      if (!requested.has(key)) {
+        updatedSelections.push(selection);
+        continue;
+      }
+      if (selection.renderedAs !== 'summary_pair' || !selection.pairRange) {
+        throw new Error(`Summary ${selection.identity.id} is not available as a rendered recall pair`);
+      }
+      const summary = this.findSummaryByIdentity(selection.identity, store);
+      if (!summary) throw new Error(`Summary ${selection.identity.id} no longer matches the captured identity`);
+      if (JSON.stringify(summary.sourceIds) !== JSON.stringify(selection.orderedSourceIds)) {
+        throw new Error(`Summary ${selection.identity.id} source coverage changed since the captured projection`);
+      }
+      const replacement = this.rawNormalizedMessagesForSummary(summary, store);
+      replacementByStart.set(selection.pairRange.start, replacement.normalized);
+      replacementSpans.push({
+        start: selection.pairRange.start,
+        end: selection.pairRange.end,
+        inserted: replacement.normalized.length,
+      });
+      updatedSelections.push({
+        ...selection,
+        renderedAs: 'raw_expansion',
+        pairRange: undefined,
+      });
+    }
+
+    if (replacementSpans.length === 0) return compiled;
+    replacementSpans.sort((a, b) => a.start - b.start);
+
+    const nextMessages: Array<{ participant: string; content: ContentBlock[]; cacheBreakpoint?: boolean }> = [];
+    let cursor = 0;
+    for (const span of replacementSpans) {
+      nextMessages.push(...compiled.messages.slice(cursor, span.start));
+      nextMessages.push(...(replacementByStart.get(span.start) ?? []));
+      cursor = span.end + 1;
+    }
+    nextMessages.push(...compiled.messages.slice(cursor));
+    this.remapPrimarySummaryCacheBreakpoints(compiled.messages, replacementSpans, nextMessages);
+
+    return {
+      ...compiled,
+      messages: nextMessages,
+      primarySummaryProjection: {
+        ...projection,
+        selectedSummaries: updatedSelections,
+      },
+    };
+  }
+
+  async quarantinePrimarySummaryForPrimaryLane(
+    branch: BranchGenerationInfo,
+    contract: PrimarySummaryContract,
+    summaries: ReadonlyArray<PrimarySummaryIdentity>,
+  ): Promise<void> {
+    this.requireLoadedBranch('quarantinePrimarySummaryForPrimaryLane');
+    if (!this.store || summaries.length === 0) return;
+    const branchNow = this.currentPrimaryProjectionBranch();
+    if (branchNow.id !== branch.id || branchNow.generation !== branch.generation) {
+      throw new Error('Primary summary quarantine crossed a branch generation; recompile before mutating');
+    }
+    await withCompressionStateLock(
+      this.store,
+      branch.name,
+      this.primarySummaryQuarantineStateId,
+      () => {
+        const current = this.currentPrimaryProjectionBranch();
+        if (current.id !== branch.id || current.generation !== branch.generation) return;
+        const next = new Map(this.primarySummaryQuarantine);
+        for (const summary of summaries) {
+          const record: PrimarySummaryQuarantineRecord = {
+            branchId: branch.id,
+            branchGeneration: branch.generation,
+            systemHash: contract.systemHash,
+            modelConfigHash: contract.modelConfigHash,
+            toolContractHash: contract.toolContractHash,
+            summary,
+            created: Date.now(),
+          };
+          next.set(this.primarySummaryQuarantineKey(record), record);
+        }
+        this.primarySummaryQuarantine = next;
+        this.store!.setStateJson(this.primarySummaryQuarantineStateId, [...next.values()]);
+      },
+    );
   }
 
   /**
@@ -1259,6 +1690,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         fullSnapshotEvery: 10,
       });
     } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.primarySummaryQuarantineStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
@@ -1292,6 +1729,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecords = [];
       this.chunkIdCounter = 0;
       this.compressionRefusalQuarantine.clear();
+      this.primarySummaryQuarantine.clear();
+      this.lastPrimaryProjectionBranch = null;
+      this.lastPrimaryProjectionSelections = [];
+      this.liveMessageStoreView = null;
       return;
     }
 
@@ -1383,6 +1824,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQueue = Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[] }>)
       : [];
+
+    const rawPrimaryQuarantine = this.store.getStateJson(this.primarySummaryQuarantineStateId);
+    const primaryQuarantine = Array.isArray(rawPrimaryQuarantine)
+      ? rawPrimaryQuarantine as PrimarySummaryQuarantineRecord[]
+      : [];
+    this.primarySummaryQuarantine = new Map(
+      primaryQuarantine
+        .filter((entry) =>
+          entry &&
+          typeof entry.branchId === 'string' &&
+          typeof entry.branchGeneration === 'number' &&
+          typeof entry.systemHash === 'string' &&
+          typeof entry.modelConfigHash === 'string' &&
+          typeof entry.toolContractHash === 'string' &&
+          entry.summary &&
+          typeof entry.summary.id === 'string' &&
+          typeof entry.summary.contentHash === 'string' &&
+          typeof entry.summary.carrierHash === 'string' &&
+          typeof entry.summary.sourceLeafHash === 'string',
+        )
+        .map((entry) => [this.primarySummaryQuarantineKey(entry), entry]),
+    );
+    this.lastPrimaryProjectionBranch = null;
+    this.lastPrimaryProjectionSelections = [];
+    this.liveMessageStoreView = null;
     const validMergeQueue = this.mergeQueue.filter(
       merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
     );
@@ -3139,6 +3605,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     budget: TokenBudget
   ): ContextEntry[] {
     this.requireLoadedBranch('select');
+    this.beginPrimaryProjectionCapture(store);
     this.rebuildChunks(store);
 
     // Image stripping runs inside each select path (before stats commit / cache
@@ -5350,6 +5817,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 currentRun = null;
                 return false;
               }
+              this.recordPrimaryProjectionSelection(ancestor, summaryLabel, summaryParticipant, store);
               entries.push(questionEntry);
               entries.push(answerEntry);
               totalTokens += pairTokens;
@@ -5454,6 +5922,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
         if (totalTokens + pairTokens > prefixBudget) break;
+        this.recordPrimaryProjectionSelection(ancestor, summaryLabel, summaryParticipant, store);
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
@@ -6205,6 +6674,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               this.estimateTokens(questionEntry.content) +
               this.estimateTokens(answerEntry.content);
             if (this.isOverBudget(totalTokens + pairTokens, maxTokens)) break;
+            this.recordPrimaryProjectionSelection(summary, headerText, summaryParticipant, store);
             entries.push(questionEntry);
             entries.push(answerEntry);
             totalTokens += pairTokens;

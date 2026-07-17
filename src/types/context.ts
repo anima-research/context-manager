@@ -98,6 +98,9 @@ export interface CompileResult {
    * Separated because the system prompt is outside context-manager's scope.
    */
   systemInjections: ContentBlock[];
+
+  /** Optional privacy-minimal summary projection for primary-lane fallbacks. */
+  primarySummaryProjection?: PrimarySummaryProjection;
 }
 
 /**
@@ -116,4 +119,44 @@ export interface BranchInfo {
   branchPoint?: number;
   /** Creation timestamp */
   created: Date;
+}
+
+/** Branch info plus the current Chronicle branch generation. */
+export interface BranchGenerationInfo extends BranchInfo {
+  generation: number;
+}
+
+/** Privacy-minimal identity for a rendered autobiographical summary. */
+export interface PrimarySummaryIdentity {
+  id: string;
+  contentHash: string;
+  carrierHash: string;
+  sourceLeafHash: string;
+}
+
+/** Active provider contract used for primary-lane raw-expansion quarantine. */
+export interface PrimarySummaryContract {
+  systemHash: string;
+  modelConfigHash: string;
+  toolContractHash: string;
+}
+
+/** One selected autobiographical summary rendered into a primary request. */
+export interface PrimarySummaryProjectionSelection {
+  identity: PrimarySummaryIdentity;
+  level: number;
+  orderedSourceIds: string[];
+  renderedAs: 'summary_pair' | 'raw_expansion';
+  pairRange?: { start: number; end: number };
+}
+
+/** Privacy-minimal summary projection captured for a compiled primary request. */
+export interface PrimarySummaryProjection {
+  namespace: string;
+  branch: {
+    id: string;
+    name: string;
+    generation: number;
+  };
+  selectedSummaries: PrimarySummaryProjectionSelection[];
 }

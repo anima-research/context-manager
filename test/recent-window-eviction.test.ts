@@ -172,7 +172,7 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
     const MSG_CAP = 200; // tokens
     const strategy = new SeedableStrategy({
       headWindowTokens: 0,
-      recentWindowTokens: 1000,
+      recentWindowTokens: 8,
       maxMessageTokens: MSG_CAP,
       hierarchical: true,
       // Generous summary budgets so the strategy WANTS to emit lots of summary text.
@@ -186,15 +186,15 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
       strategy,
     });
 
-    // A few recent messages so the compile is non-trivial.
-    manager.addMessage('user', textBlock('hello'));
-    manager.addMessage('assistant', textBlock('hi back'));
+    // Keep the summary sources outside the recent window so the recall pair is
+    // eligible and validated against real message leaves.
+    const first = manager.addMessage('user', textBlock('hello'));
+    const second = manager.addMessage('assistant', textBlock('hi back'));
+    manager.addMessage('user', textBlock('latest ' + 'Y'.repeat(400)));
 
     // Seed an oversized summary that would otherwise blow past msgCap.
-    // sourceIds are synthetic so they don't intersect head/recent message IDs
-    // and trigger the anti-redundancy filter.
     const bigContent = 'X'.repeat(20_000); // ≈ 5000 tokens of text
-    strategy.seedL1Summary(bigContent, ['synthetic-old-1', 'synthetic-old-2']);
+    strategy.seedL1Summary(bigContent, [first, second]);
 
     const compiled = await manager.compile({
       maxTokens: 200_000,
@@ -236,7 +236,7 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
 
     const strategy = new SeedableStrategy({
       headWindowTokens: 0,
-      recentWindowTokens: 1000,
+      recentWindowTokens: 8,
       maxMessageTokens: 5000,
       hierarchical: true,
     });
@@ -246,9 +246,10 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
       strategy,
     });
 
-    manager.addMessage('user', textBlock('hello'));
+    const earlier = manager.addMessage('user', textBlock('hello'));
+    manager.addMessage('user', textBlock('latest ' + 'Y'.repeat(400)));
     const small = 'a small honest summary of earlier conversation';
-    strategy.seedL1Summary(small, ['synthetic-old-1']);
+    strategy.seedL1Summary(small, [earlier]);
 
     const compiled = await manager.compile({
       maxTokens: 200_000,
