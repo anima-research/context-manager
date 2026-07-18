@@ -166,13 +166,51 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
   before(() => cleanup());
   after(() => cleanup());
 
+  it('renders authored summaries without requiring raw-expandable source provenance', async () => {
+    cleanup();
+
+    const strategy = new SeedableStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 1000,
+      maxMessageTokens: 5000,
+      hierarchical: true,
+    });
+
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    manager.addMessage('user', textBlock('hello'));
+    manager.addMessage('assistant', textBlock('hi back'));
+    strategy.seedL1Summary('historical authored summary', ['synthetic-old-1', 'synthetic-old-2']);
+
+    const compiled = await manager.compile({
+      maxTokens: 200_000,
+      reserveForResponse: 4000,
+    });
+
+    const answerEntry = compiled.messages.find((message) =>
+      message.participant === 'Claude' &&
+      message.content.some((block) => block.type === 'text' && (block as { text: string }).text.includes('historical authored summary')),
+    );
+    assert.ok(answerEntry, 'historical authored summary should render canonically');
+    assert.equal(
+      Reflect.has(compiled as object, 'primarySummaryProjection'),
+      false,
+      'canonical compile result must not carry a primary summary projection artifact',
+    );
+
+    manager.close();
+  });
+
   it('truncates a bloated combined-summaries answer entry to the configured cap', async () => {
     cleanup();
 
     const MSG_CAP = 200; // tokens
     const strategy = new SeedableStrategy({
       headWindowTokens: 0,
-      recentWindowTokens: 8,
+      recentWindowTokens: 1000,
       maxMessageTokens: MSG_CAP,
       hierarchical: true,
       // Generous summary budgets so the strategy WANTS to emit lots of summary text.
@@ -186,15 +224,15 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
       strategy,
     });
 
-    // Keep the summary sources outside the recent window so the recall pair is
-    // eligible and validated against real message leaves.
-    const first = manager.addMessage('user', textBlock('hello'));
-    const second = manager.addMessage('assistant', textBlock('hi back'));
-    manager.addMessage('user', textBlock('latest ' + 'Y'.repeat(400)));
+    // A few recent messages so the compile is non-trivial.
+    manager.addMessage('user', textBlock('hello'));
+    manager.addMessage('assistant', textBlock('hi back'));
 
     // Seed an oversized summary that would otherwise blow past msgCap.
+    // sourceIds are synthetic so they don't intersect head/recent message IDs
+    // and trigger the anti-redundancy filter.
     const bigContent = 'X'.repeat(20_000); // ≈ 5000 tokens of text
-    strategy.seedL1Summary(bigContent, [first, second]);
+    strategy.seedL1Summary(bigContent, ['synthetic-old-1', 'synthetic-old-2']);
 
     const compiled = await manager.compile({
       maxTokens: 200_000,
@@ -236,7 +274,7 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
 
     const strategy = new SeedableStrategy({
       headWindowTokens: 0,
-      recentWindowTokens: 8,
+      recentWindowTokens: 1000,
       maxMessageTokens: 5000,
       hierarchical: true,
     });
@@ -246,10 +284,9 @@ describe('Synthesised summary turn respects maxMessageTokens (postmortem bug B)'
       strategy,
     });
 
-    const earlier = manager.addMessage('user', textBlock('hello'));
-    manager.addMessage('user', textBlock('latest ' + 'Y'.repeat(400)));
+    manager.addMessage('user', textBlock('hello'));
     const small = 'a small honest summary of earlier conversation';
-    strategy.seedL1Summary(small, [earlier]);
+    strategy.seedL1Summary(small, ['synthetic-old-1']);
 
     const compiled = await manager.compile({
       maxTokens: 200_000,

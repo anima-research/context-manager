@@ -38,13 +38,8 @@ export type {
   TokenBudget,
   PendingWork,
   BranchInfo,
-  BranchGenerationInfo,
   ContextInjection,
   CompileResult,
-  PrimarySummaryIdentity,
-  PrimarySummaryContract,
-  PrimarySummaryProjectionSelection,
-  PrimarySummaryProjection,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -63,12 +58,10 @@ export type {
   KnowledgeConfig,
   KnowledgeOptions,
   ResettableStrategy,
-  PrimarySummaryFallbackCapableStrategy,
 } from './types/index.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
   isResettableStrategy,
   isHotConfigurableStrategy,
-  isPrimarySummaryFallbackCapable,
 } from './types/index.js';

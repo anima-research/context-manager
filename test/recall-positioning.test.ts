@@ -35,14 +35,13 @@ function textBlock(text: string): ContentBlock[] {
 class TestableStrategy extends AutobiographicalStrategy {
   /** Seed an L1 against a specific source-message id. */
   seedL1Against(content: string, firstMsgId: string, lastMsgId: string): SummaryEntry {
-    const sourceIds = firstMsgId === lastMsgId ? [firstMsgId] : [firstMsgId, lastMsgId];
     const entry: SummaryEntry = {
       id: `L1-${this.nextSummaryIdCounter()}`,
       level: 1,
       content,
       tokens: Math.ceil(content.length / 4),
       sourceLevel: 0,
-      sourceIds,
+      sourceIds: [firstMsgId, lastMsgId],
       sourceRange: { first: firstMsgId, last: lastMsgId },
       created: Date.now(),
     };
