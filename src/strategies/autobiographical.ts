@@ -7501,9 +7501,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
       } else if (block.type === 'redacted_thinking') {
-        // Encrypted payload: client-side length is meaningless — price it
-        // as a hidden full CoT.
-        tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        // Encrypted reasoning carrier: stamped estimate wins, else price the
+        // ciphertext at the measured carrier rate (matches the store
+        // estimator — see ENCRYPTED_CARRIER_CHARS_PER_TOKEN).
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        const data = (block as { data?: string }).data;
+        if (typeof stamped === 'number') {
+          tokens += stamped;
+        } else if (typeof data === 'string' && data.length > 0) {
+          tokens += Math.round(data.length / MessageStore.ENCRYPTED_CARRIER_CHARS_PER_TOKEN);
+        } else {
+          tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        }
       }
     }
     return tokens;

@@ -503,6 +503,20 @@ export class MessageStore {
    */
   static readonly HIDDEN_THINKING_TOKENS_DEFAULT = 600;
 
+  /**
+   * Billed-token rate for encrypted reasoning carriers (`redacted_thinking`
+   * blocks round-tripped to OpenAI Responses as `reasoning.encrypted_content`).
+   * The ciphertext is base64 over an encrypted serialization of the CoT, so
+   * blob length tracks billed tokens at a higher chars/token rate than prose.
+   * Measured on Sol (gpt-5.6, 2026-07-18) by regressing real `input_tokens`
+   * against request content across 12 production calls: residual attributable
+   * to carriers = blob_chars / 5.4..8.6, median ~6. With this rate the total
+   * estimate lands within ±5% of billed input on every sampled call; with the
+   * previous behavior (carriers priced at 0) estimates missed by 23k-75k
+   * tokens per call and drove the calibration EMA into a 0.7↔1.5 limit cycle.
+   */
+  static readonly ENCRYPTED_CARRIER_CHARS_PER_TOKEN = 6;
+
   private estimateBlockTokens(block: ContentBlock): number {
     return Math.round(this.estimateBlockTokensRaw(block) * this.tokenCalibration);
   }
@@ -523,6 +537,20 @@ export class MessageStore {
           return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
         }
         return this.tokenEstimator(block.thinking);
+      }
+      case 'redacted_thinking': {
+        // Encrypted reasoning carrier: billed in full when replayed. A per-
+        // block `tokenEstimate` stamped from usage residuals wins; otherwise
+        // price the ciphertext at the measured carrier rate. NEVER 0 — an
+        // unpriced carrier population made real/est bimodal and see-sawed the
+        // calibration multiplier (see ENCRYPTED_CARRIER_CHARS_PER_TOKEN).
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const data = (block as { data?: string }).data;
+        if (typeof data === 'string' && data.length > 0) {
+          return Math.round(data.length / MessageStore.ENCRYPTED_CARRIER_CHARS_PER_TOKEN);
+        }
+        return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
       }
       case 'tool_use':
         return jsonTokenEstimator(JSON.stringify(block.input)) + 20; // overhead for name, id
