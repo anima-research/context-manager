@@ -135,6 +135,38 @@ export class MessageStore {
   }
 
   /**
+   * Memo of the fully-materialized internal state (2026-07-18, sonn5 OOM /
+   * CPU-churn class, companion to the BlobManager resolve cache).
+   *
+   * `getAllInternal()` is a full chronicle `getStateJson` — serde
+   * serialize + JS parse of the ENTIRE message state. Compile calls it
+   * ~6× per pass (postStripEstimates, getRecentWindowStart,
+   * getHeadWindowEnd, getCompressibleMessages, selectAdaptive,
+   * rebuildChunks), and compression catch-up repeats those passes
+   * continuously: on a 19.5k-message store, perf showed the agent pinning
+   * a full core in serde_json between LLM calls.
+   *
+   * Freshness token: chronicle is append-only, so EVERY mutation — this
+   * instance's, another MessageStore instance sharing the JsStore
+   * (multi-agent shared messages), any state's write — advances
+   * `currentSequence()`. Key the memo on (branch name, head sequence) and
+   * it can never serve stale data; unrelated-state writes merely cost one
+   * extra parse. (An instance-local version counter was tried first and
+   * broke multi-instance sharing — integration.test.ts Multi-Agent
+   * Namespacing.)
+   *
+   * The cached array and its objects MUST be treated as immutable by all
+   * callers. Strategy code copies before mutating (verified 2026-07-18:
+   * window entries own their `content` pointers; collapseConsecutive
+   * spreads; image cap/strip replace blocks rather than mutating).
+   */
+  private allCache: {
+    branch: string;
+    sequence: number;
+    internals: StoredMessageInternal[];
+  } | null = null;
+
+  /**
    * Optional extra fields for `append`, used by callers that need to set
    * adaptive-resolution metadata (bodyGroupId for shards, initial
    * resolution state, etc.) at ingestion time.
@@ -695,11 +727,20 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const state = this.store.getStateJson(this.stateId);
-    if (!state || !Array.isArray(state)) {
-      return [];
+    const branch = this.store.currentBranch().name;
+    const sequence = this.store.currentSequence();
+    if (
+      this.allCache &&
+      this.allCache.sequence === sequence &&
+      this.allCache.branch === branch
+    ) {
+      return this.allCache.internals;
     }
-    return state as StoredMessageInternal[];
+    const state = this.store.getStateJson(this.stateId);
+    const internals =
+      !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
+    this.allCache = { branch, sequence, internals };
+    return internals;
   }
 
   private getSliceInternal(offset: number, limit: number): StoredMessageInternal[] {
