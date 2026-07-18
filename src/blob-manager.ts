@@ -18,6 +18,62 @@ export class BlobManager {
   constructor(private store: JsStore) {}
 
   /**
+   * Content-addressed resolve cache (2026-07-18, sonn5 OOM class).
+   *
+   * Blobs are immutable and keyed by hash, so the two expensive parts of
+   * resolution — the native `getBlob` buffer copy and the base64 encode —
+   * are pure functions of the hash. Without this cache, every
+   * `MessageStore.getAll()` re-fetched and re-encoded EVERY media blob in
+   * history: on a 19.5k-message witness store with ~1.3G of blobs, each of
+   * the ~6 full materializations per compile carried its own ~1.7G of
+   * base64 strings (~12G transient, ~6.5G retained via chunk references)
+   * → global OOM on a 22G box. JS strings are immutable and shared by
+   * reference, so caching the encoded string collapses all copies onto
+   * one allocation.
+   *
+   * LRU by insertion order (Map re-insert on hit), capped by decoded-ish
+   * byte weight (string length ≈ bytes; base64 overhead makes this a
+   * conservative overestimate of binary size). Override with
+   * CONTEXT_MANAGER_BLOB_CACHE_BYTES; 0 disables.
+   */
+  private static readonly DEFAULT_RESOLVE_CACHE_BYTES = 3 * 1024 * 1024 * 1024;
+  private readonly resolveCacheMaxBytes = (() => {
+    const env = Number(process.env.CONTEXT_MANAGER_BLOB_CACHE_BYTES);
+    return Number.isFinite(env) && env >= 0
+      ? env
+      : BlobManager.DEFAULT_RESOLVE_CACHE_BYTES;
+  })();
+  private resolveCache = new Map<string, string>();
+  private resolveCacheBytes = 0;
+
+  private cachedBlobBase64(hash: string): string | null {
+    const hit = this.resolveCache.get(hash);
+    if (hit !== undefined) {
+      // LRU touch: re-insert so iteration order tracks recency.
+      this.resolveCache.delete(hash);
+      this.resolveCache.set(hash, hit);
+      return hit;
+    }
+    const buffer = this.store.getBlob(hash);
+    if (!buffer) return null;
+    const data = buffer.toString('base64');
+    if (this.resolveCacheMaxBytes > 0) {
+      this.resolveCache.set(hash, data);
+      this.resolveCacheBytes += data.length;
+      while (
+        this.resolveCacheBytes > this.resolveCacheMaxBytes &&
+        this.resolveCache.size > 1
+      ) {
+        const oldest = this.resolveCache.keys().next().value as string;
+        const evicted = this.resolveCache.get(oldest)!;
+        this.resolveCache.delete(oldest);
+        this.resolveCacheBytes -= evicted.length;
+      }
+    }
+    return data;
+  }
+
+  /**
    * Extract blobs from content blocks and return references.
    * Replaces inline base64 data with blob references.
    */
@@ -93,13 +149,12 @@ export class BlobManager {
     }
 
     const { ref } = block;
-    const buffer = this.store.getBlob(ref.hash);
+    const data = this.cachedBlobBase64(ref.hash);
 
-    if (!buffer) {
+    if (data === null) {
       throw new Error(`Blob not found: ${ref.hash}`);
     }
 
-    const data = buffer.toString('base64');
     const source: Base64Source = {
       type: 'base64',
       data,
