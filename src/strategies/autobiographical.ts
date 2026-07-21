@@ -3611,7 +3611,49 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // as-of framing of memory formation.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    // ---- 1. Head window (raw, ALWAYS present, FIRST) ----
+    const allMessages = ctx.messageStore.getAll();
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+
+    // ---- Prior recall set (the unmerged frontier) ----
+    // Computed BEFORE the head emission because the head loop needs the
+    // leaf coverage of live summaries (one-to-one rule below).
+    //
+    // Filter to the unmerged frontier: any summary whose `mergedInto`
+    // is unset. After merge, the children's mergedInto points at the
+    // parent and the parent stands alone with that source range. The
+    // original "ALL L1s regardless of merge state" rule was a fidelity
+    // optimization that scales catastrophically: a 4000-message import
+    // converged to ~500 L1s that never aged out, blowing the 200k
+    // window around chunk 118.
+    const priorSummaries = this.summaries
+      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
+      // recall pair triggers Anthropic 400 "text content blocks must be
+      // non-empty", which stalls ALL compression (mirrors the render-path guard
+      // + load-drop). A single empty summary otherwise poisons every compression.
+      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
+      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+
+    // Leaf message coverage of every live summary — the rendering
+    // authority for the one-to-one invariant: a message covered by a
+    // live summary is represented by its recall pair, never raw. Uses
+    // the FULL priorSummaries set (not the budget-capped keptSummaries):
+    // a budget-dropped summary doesn't make its raw messages reappear.
+    // Expand summary sourceIds down to leaf message IDs — an L2's
+    // sourceIds are L1 IDs, not message IDs; a flat walk would miss
+    // every message it transitively covers (Bug 10). Also expand merged
+    // L1s as defense in depth.
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const priorSummaryMessageIds = new Set<MessageId>();
+    for (const s of this.summaries) {
+      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
+    for (const s of priorSummaries) {
+      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
+
+    // ---- 1. Head window (raw, FIRST, ownership-capped) ----
     //
     // The head is the foundational identity anchor: the actual opening
     // of the chronicle (the user's first message, the agent's first
@@ -3627,32 +3669,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // represent that intermediate content. The head is just the
     // permanent prefix that the original instance always saw.
     //
-    // Head messages are excluded from compression by `getCompressibleMessages`
-    // (they're outside the chunking range), so they won't appear in
-    // any L1's sourceIds — no overlap with the recall pairs below.
-    const allMessages = ctx.messageStore.getAll();
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
+    // are the persistent authority over how a message is represented.
+    // The token-derived head boundary is only chunking *policy* — it is
+    // recomputed from the live estimator on every call and is NOT stable
+    // (estimator changes move it; transient headWindowTokens<=0 states
+    // let sweeps take ownership of head messages; store surgery can do
+    // the same — all observed in production, see issue #42). When the
+    // two authorities disagree, ownership wins: a head-range message
+    // covered by a live summary renders via its recall pair below, not
+    // raw. Rendering it both ways duplicated the seed in every payload.
+    let headCoveredSkipped = 0;
     for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
+      if (priorSummaryMessageIds.has(m.id)) {
+        headCoveredSkipped++;
+        continue;
+      }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
+    if (headCoveredSkipped > 0) {
+      console.warn(
+        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
+          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
+          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
+      );
+      logCompressionCall({
+        event: 'head-ownership-overlap',
+        site: 'compression',
+        skipped: headCoveredSkipped,
+        headStartIdx,
+        headEndIdx,
+      });
+    }
 
-    // ---- 2. Prior recall pairs ----
-    // Filter to the unmerged frontier: any summary whose `mergedInto`
-    // is unset. After merge, the children's mergedInto points at the
-    // parent and the parent stands alone with that source range. The
-    // original "ALL L1s regardless of merge state" rule was a fidelity
-    // optimization that scales catastrophically: a 4000-message import
-    // converged to ~500 L1s that never aged out, blowing the 200k
-    // window around chunk 118.
-    const priorSummaries = this.summaries
-      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
-      // recall pair triggers Anthropic 400 "text content blocks must be
-      // non-empty", which stalls ALL compression (mirrors the render-path guard
-      // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
-      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+    // ---- 2. Prior recall pairs (budget-capped) ----
 
     // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
     // merged exclusion the unmerged frontier can be large at extreme scale.
@@ -3701,26 +3752,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Any raw messages between the head and the chunk that aren't yet
     // represented by any summary — usually empty in adaptive-resolution
     // mode, since chunking proceeds contiguously and summaries cover
-    // everything up to the chunk being processed. Uses the full
-    // priorSummaries set (not the budget-capped keptSummaries) because
-    // the dedup question is "is this raw message covered by *any* live
-    // summary?" — a budget-dropped summary doesn't make the underlying
-    // raw messages reappear.
+    // everything up to the chunk being processed. Same one-to-one rule
+    // as the head: coverage is judged against `priorSummaryMessageIds`
+    // (all live summaries, not the budget-capped keptSummaries).
     const chunkFirstId = chunk.messages[0]?.id;
     if (chunkFirstId) {
-      // Expand summary sourceIds down to leaf message IDs. An L2 in
-      // `priorSummaries` has L1 IDs in its sourceIds, not message IDs;
-      // a flat walk would miss every message it transitively covers.
-      // (Bug 10 — same shape as executeMerge.)
-      const summariesById = new Map<string, SummaryEntry>();
-      for (const s of this.summaries) summariesById.set(s.id, s);
-      const priorSummaryMessageIds = new Set<MessageId>();
-      for (const s of this.summaries) {
-        if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-      }
-      for (const s of priorSummaries) {
-        this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-      }
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
         const m = allMessages[i];
@@ -4621,21 +4657,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mergeFirstMsgId = sources[0].sourceRange.first;
     const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
 
-    // ---- 1a. HEAD WINDOW (raw, ALWAYS present) ----
+    // ---- 1a. PRIOR RECALL SET (chronologically before merge range) ----
+    // Computed BEFORE the head emission because the head loop needs the
+    // leaf coverage of live summaries (one-to-one rule, see the L1 site).
     //
-    // The head window is the foundational identity anchor — the actual
-    // opening of the chronicle. It establishes who is speaking to whom.
-    // Without it, when the merge target's content is heavily first-person
-    // from someone other than the agent, the agent loses its first-person
-    // grounding and drifts into the content author's voice.
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
-      const m = allMessages[i];
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
-
-    // ---- 1b. PRIOR RECALL PAIRS (chronologically before merge range) ----
     // The unmerged frontier of summaries whose source range is before the
     // merge range and which aren't part of the merge tree. Originally this
     // was filtered to `level === 1` (the "L1 fidelity for prior content"
@@ -4659,6 +4684,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return ai - bi;
       });
 
+    // Leaf coverage of every live summary — the rendering authority
+    // (one-to-one invariant; see compressChunkHierarchical). Uses the
+    // full frontier, not the budget-capped set: a budget-dropped recall
+    // pair doesn't make its underlying raw messages reappear.
+    //
+    // Critical: `sourceIds` on an L2+ summary points at L1 IDs, not raw
+    // message IDs. The dedup happens against raw message IDs, so we must
+    // recursively expand each summary down to its leaf message IDs.
+    // Without this, every message under any L2 leaks back in as raw text
+    // (Bug 10: 525-message merge requests on a 4234-msg conversation).
+    // Also expand merged L1s as defense in depth.
+    const priorSummaryMessageIds = new Set<MessageId>();
+    for (const s of this.summaries) {
+      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
+    for (const s of priorSummariesAll) {
+      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+    }
+
+    // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
+    //
+    // The head window is the foundational identity anchor — the actual
+    // opening of the chronicle. It establishes who is speaking to whom.
+    // Without it, when the merge target's content is heavily first-person
+    // from someone other than the agent, the agent loses its first-person
+    // grounding and drifts into the content author's voice.
+    //
+    // ONE-TO-ONE INVARIANT (see compressChunkHierarchical): ownership
+    // wins over the token-derived head boundary. A head-range message
+    // covered by a live summary renders via its recall pair; one inside
+    // the merge tree renders in the TARGET expansion. Never raw here too.
+    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
+    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    let headCoveredSkipped = 0;
+    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+      const m = allMessages[i];
+      if (priorSummaryMessageIds.has(m.id) || sourceLeafIds.has(m.id)) {
+        headCoveredSkipped++;
+        continue;
+      }
+      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+    }
+    if (headCoveredSkipped > 0) {
+      console.warn(
+        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries or ` +
+          `the merge tree; rendering them via recall pairs / target expansion (ownership wins).`,
+      );
+      logCompressionCall({
+        event: 'head-ownership-overlap',
+        site: 'merge',
+        targetLevel,
+        skipped: headCoveredSkipped,
+        headStartIdx,
+        headEndIdx,
+      });
+    }
+
     const mergeRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
     const { kept: keptPriorSummaries, keptTokens: mergeRecallTokens } = this.capRecallPairs(
       priorSummariesAll,
@@ -4681,23 +4763,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // The full unmerged-frontier set covers what's "compressed somewhere"
-    // for the raw-middle dedup below — a budget-dropped recall pair
-    // doesn't make its underlying raw messages reappear.
-    //
-    // Critical: `sourceIds` on an L2+ summary points at L1 IDs, not raw
-    // message IDs. The dedup happens against raw message IDs, so we must
-    // recursively expand each summary down to its leaf message IDs.
-    // Without this, every message under any L2 leaks back in as raw text
-    // (Bug 10: 525-message merge requests on a 4234-msg conversation).
-    // Also expand merged L1s as defense in depth.
-    const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
-    for (const s of priorSummariesAll) {
-      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
+    // (Leaf coverage `priorSummaryMessageIds` is computed above, before
+    // the head emission — shared by the head loop and the raw middle.)
 
     for (const s of keptPriorSummaries) {
       llmMessages.push({
