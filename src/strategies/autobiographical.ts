@@ -2826,12 +2826,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * keeps the next-compile picker loop convergent even when the same
    * produce op gets re-emitted before the work completes.
    */
-  protected handleProducedOps(ops: readonly FoldOp[]): void {
+  protected handleProducedOps(
+    ops: readonly FoldOp[],
+    opts?: { speculative?: boolean },
+  ): void {
     this.requireBranchMutation('handleProducedOps');
     for (const op of ops) {
       if (op.kind !== 'produce') continue;
       if (op.level === 1) {
-        this.enqueueL1ForRange(op.range.firstChunkId, op.range.lastChunkId);
+        this.enqueueL1ForRange(op.range.firstChunkId, op.range.lastChunkId, opts);
       } else if (op.level >= 2) {
         this.enqueueMergeForRange(
           op.level,
@@ -2847,7 +2850,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * are queued for L1 compression. No-op if the matching chunk is already
    * compressed or already in the queue.
    */
-  protected enqueueL1ForRange(firstMsgId: MessageId, lastMsgId: MessageId): void {
+  protected enqueueL1ForRange(
+    firstMsgId: MessageId,
+    lastMsgId: MessageId,
+    opts?: { speculative?: boolean },
+  ): void {
     this.requireBranchMutation('enqueueL1ForRange');
     const messageIdToChunk = new Map<MessageId, Chunk>();
     for (const ch of this.chunks) {
@@ -2871,12 +2878,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (ch) candidates.add(ch);
       }
     }
+    const holdback = this.config.l1HoldbackChunks ?? 1;
+    const holdbackCutoff = this.chunks.length - holdback;
     for (const chunk of candidates) {
       if (chunk.compressed) continue;
-      // Demand path: mark the chunk so the l1HoldbackChunks window in
-      // rebuildChunks never filters it back out of the queue.
       const lastId = chunk.messages[chunk.messages.length - 1]?.id;
-      if (lastId !== undefined) this._demandedL1Chunks.add(lastId);
+      if (opts?.speculative) {
+        // Speculative demand (shadow production pick) is not live demand: the
+        // live budget may not need this fold for days. It must not mark the
+        // chunk demanded, and it must not punch through the holdback window
+        // that protects the newest closed chunks while they're in motion.
+        if (
+          holdback > 0 &&
+          chunk.index >= holdbackCutoff &&
+          !(lastId !== undefined && this._demandedL1Chunks.has(lastId))
+        ) {
+          continue;
+        }
+      } else {
+        // Demand path: mark the chunk so the l1HoldbackChunks window in
+        // rebuildChunks never filters it back out of the queue.
+        if (lastId !== undefined) this._demandedL1Chunks.add(lastId);
+      }
       if (this.compressionQueue.includes(chunk.index)) continue;
       this.compressionQueue.push(chunk.index);
     }
@@ -5313,6 +5336,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // `onNewMessage`). This call only enqueues; it does not await.
     if (result.produced.length > 0) {
       this.handleProducedOps(result.produced);
+    }
+
+    // Standing production target (productionBudgetTokens): run a SHADOW pick
+    // against the production budget on the same inputs. Pure CPU — no LLM
+    // call, no state commit; only its produce ops are enqueued, speculatively,
+    // so the drain keeps the forest deep enough to lower the live budget to
+    // this level at any time without a fold-storm or an OverBudget dead end.
+    // The guarantee holds only while the target is reachable at all — the
+    // exhausted branch below is the standing check for that.
+    const prodBudget = this.config.productionBudgetTokens;
+    if (prodBudget !== undefined && prodBudget > 0 && prodBudget < totalBudget) {
+      const liveKvStable = this._lastKvStable;
+      try {
+        const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
+          totalBudget: prodBudget,
+          targetBudget: prodBudget * (1 - slack),
+          slack,
+        });
+        if (shadowResult.produced.length > 0) {
+          this.handleProducedOps(shadowResult.produced, { speculative: true });
+        } else if (shadowResult.exhausted) {
+          console.warn(
+            `autobio: production target ${prodBudget} unreachable even fully folded ` +
+              `(${shadowResult.finalTokens} tokens); lowering the live budget to it ` +
+              `would hard-fail with OverBudgetError`,
+          );
+        }
+      } catch (err) {
+        // A failing shadow pick must never break the live compile.
+        console.warn('autobio: shadow production pick failed:', err);
+      } finally {
+        // The shadow pick is not a compile — keep §13.4 observability pointed
+        // at the strategy instance behind the live pick.
+        this._lastKvStable = liveKvStable;
+      }
     }
 
     // Hard-fail whenever the picker's current plan exceeds the hard budget.

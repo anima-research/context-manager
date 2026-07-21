@@ -687,6 +687,22 @@ export interface AutobiographicalConfig {
    * (no picker request needed). Default true when adaptiveResolution is on.
    */
   speculativeProduction?: boolean;
+
+  /**
+   * Standing production target (tokens): keep the summary forest deep enough
+   * that a compile would fit under THIS budget, even while the live compile
+   * budget is higher. Each adaptive compile runs an extra shadow pick against
+   * this budget — pure CPU, no LLM call, no state commit — and enqueues the
+   * folds it demands through the normal drain queues. Once the forest has
+   * converged, the live budget can be lowered to the target in one move: no
+   * fold-storm, a single KV invalidation ("produce first, fold once").
+   * If the target is unreachable even fully folded (head + tail + max-depth
+   * summaries still exceed it), every compile warns loudly — a descent to
+   * that budget would hard-fail with OverBudgetError. Shadow demand is
+   * speculative and never bypasses the `l1HoldbackChunks` window. Must be
+   * positive; no effect unless lower than the live compile budget.
+   */
+  productionBudgetTokens?: number;
 }
 
 /**
