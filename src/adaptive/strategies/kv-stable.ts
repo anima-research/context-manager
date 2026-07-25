@@ -58,6 +58,9 @@ export class KvStableStrategy implements FoldingStrategy {
   private readonly fPrev: Map<ChunkId, number>;
   private target: Map<ChunkId, number> | null = null;
   private _lastPlan: ControlPlan | null = null;
+  /** Cycle guard (2026-07-25): counts per emitted op key — see nextOp. */
+  private readonly opEmits = new Map<string, number>();
+  private cycleWarned = false;
 
   constructor(inputs: PickerInputs, opts: KvStableOptions = {}) {
     this.inputs = inputs;
@@ -166,14 +169,44 @@ export class KvStableStrategy implements FoldingStrategy {
       const tgt = target.get(c.id) ?? 0;
       if (cur === tgt) continue;
 
+      let op: FoldOp;
       if (cur < tgt) {
         const summary = c.ancestorAt(tgt);
         if (!summary) continue; // unrealizable target (summary not produced) — skip
-        return { kind: 'raise', groupRoot: summary.id };
+        op = { kind: 'raise', groupRoot: summary.id };
+      } else {
+        const summary = c.ancestorAt(cur);
+        if (!summary) continue;
+        op = { kind: 'lower', groupRoot: summary.id };
       }
-      const summary = c.ancestorAt(cur);
-      if (!summary) continue;
-      return { kind: 'lower', groupRoot: summary.id };
+
+      // Cycle guard (2026-07-25, mythos wedge): raise/lower act on a whole
+      // GROUP root while targets are per-chunk. When a group's leaves carry
+      // mixed targets — possible when chunk ownership and the summary tree
+      // disagree after store surgery ("head boundary disagrees with chunk
+      // ownership") — the walk oscillates on the same root forever: raising
+      // for one leaf overshoots its siblings, lowering for a sibling undoes
+      // the raise. The picker's iteration bound is 10×chunks with O(chunks)
+      // per step, so a live agent burns hours of CPU per compile. Emitting
+      // the same op more than 8 times means we are cycling, not walking:
+      // treat the chunk as unrealizable, warn once, and move on. The
+      // frontier stays renderable — merely at the nearest realizable cut.
+      const key = `${op.kind}:${String(op.groupRoot)}`;
+      const n = (this.opEmits.get(key) ?? 0) + 1;
+      if (n > 8) {
+        if (!this.cycleWarned) {
+          this.cycleWarned = true;
+          console.error(
+            `[kv-stable] non-converging fold walk: op ${key} emitted >8 times — ` +
+              `target frontier cuts through a group (ownership drift after store ` +
+              `surgery?). Skipping oscillating chunks; window renders at the ` +
+              `nearest realizable frontier.`,
+          );
+        }
+        continue;
+      }
+      this.opEmits.set(key, n);
+      return op;
     }
     return null;
   }
