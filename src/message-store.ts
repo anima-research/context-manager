@@ -228,6 +228,35 @@ export class MessageStore {
       ...(extra ?? {}),
     };
 
+    // Write-through: keep the materialized cache hot across appends.
+    // Ingest-time rebuilds (rebuildChunks in the autobiographical strategy)
+    // call getAll() on every new message; without write-through each append
+    // invalidates the cache and forces a full state-slot re-materialization
+    // — quadratic ingest (2026-07-25 mythos "wedge": ~10s/message at 13.5k
+    // messages, event loop starved for hours by ambient traffic + backfill).
+    //
+    // The cached entry MUST be the chronicle round-trip (serde) form, not a
+    // hand-built object: serde reorders keys and drops undefined fields, and
+    // downstream request hashing stringifies message content — a shape that
+    // differs between a warm cache and a fresh rebuild breaks hash-keyed
+    // dedup (compression in-flight registry, quarantine keys). Fetch the
+    // just-written record back through the point lookup; on chronicle
+    // versions without it, fall back to plain invalidation (old behavior).
+    const canPointLookup =
+      typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function';
+    const canonical = canPointLookup ? this.getInternal(index) : null;
+    if (
+      canonical &&
+      this.allCache &&
+      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.internals.length === index
+    ) {
+      this.allCache.internals.push(canonical);
+      this.allCache.sequence = this.store.currentSequence();
+    } else {
+      this.allCache = null;
+    }
+
     this.idToIndex.set(message.id, index);
     this.emit({ type: 'add', message });
     return message;
@@ -270,6 +299,24 @@ export class MessageStore {
 
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
+    // Write-through the materialized cache (see append — the cached entry
+    // must be the chronicle round-trip form, so re-fetch it canonically).
+    const canonicalEdit =
+      typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function'
+        ? this.getInternal(index)
+        : null;
+    if (
+      canonicalEdit &&
+      this.allCache &&
+      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.internals[index]
+    ) {
+      this.allCache.internals[index] = canonicalEdit;
+      this.allCache.sequence = this.store.currentSequence();
+    } else {
+      this.allCache = null;
+    }
+
     this.emit({ type: 'edit', messageId, oldContent, newContent });
   }
 
@@ -296,6 +343,18 @@ export class MessageStore {
     }
 
     this.store.redactStateItems(this.stateId, index, index + 1);
+    // Write-through the materialized cache (see append); fall back to
+    // invalidation if the cache wasn't current.
+    if (
+      this.allCache &&
+      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.internals.length === this.length() + 1
+    ) {
+      this.allCache.internals.splice(index, 1);
+      this.allCache.sequence = this.store.currentSequence();
+    } else {
+      this.allCache = null;
+    }
     this.rebuildIndex();
 
     this.emit({ type: 'remove', messageId });
@@ -316,6 +375,7 @@ export class MessageStore {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
       this.store.redactStateItems(this.stateId, index, index + 1);
+      this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
       return;
@@ -332,6 +392,7 @@ export class MessageStore {
     const firstId = all[from].id;
     const lastId = all[to].id;
     this.store.redactStateItems(this.stateId, from, to + 1);
+    this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
     this.emit({ type: 'removeRange', fromId: firstId, toId: lastId });
   }
@@ -370,6 +431,7 @@ export class MessageStore {
     }
 
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
+    this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
 
     this.emit({ type: 'removeRange', fromId, toId });
@@ -729,12 +791,42 @@ export class MessageStore {
   private getAllInternal(): StoredMessageInternal[] {
     const branch = this.store.currentBranch().name;
     const sequence = this.store.currentSequence();
-    if (
-      this.allCache &&
-      this.allCache.sequence === sequence &&
-      this.allCache.branch === branch
-    ) {
-      return this.allCache.internals;
+    if (this.allCache && this.allCache.branch === branch) {
+      if (this.allCache.sequence === sequence) {
+        return this.allCache.internals;
+      }
+      // The store-global sequence moved, but that may be writes to OTHER
+      // state slots (summaries, autobio resolutions, framework/state, …).
+      // All in-process mutations of THIS state flow through the mutators
+      // above, which write through or invalidate the cache explicitly — so
+      // if the messages slot still has the same item count and the same
+      // last record id, the cached array is current: re-stamp, don't
+      // re-materialize. (A full re-materialization here on every foreign
+      // append made ingest quadratic — 2026-07-25 mythos wedge.)
+      // Feature-detect getStateItemJson (chronicle >= 0.2.2): the fallback
+      // inside getInternal() is getAllInternal() itself — calling it here
+      // on an older chronicle would recurse. No point lookup → no cheap
+      // revalidation → keep the old full-rebuild behavior.
+      const canPointLookup =
+        typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function';
+      const count = canPointLookup ? this.length() : -1;
+      if (count === this.allCache.internals.length) {
+        if (count === 0) {
+          this.allCache.sequence = sequence;
+          return this.allCache.internals;
+        }
+        const lastCached = this.allCache.internals[count - 1];
+        const lastLive = this.getInternal(count - 1);
+        if (
+          lastCached &&
+          lastLive &&
+          lastLive.id === lastCached.id &&
+          lastLive.sequence === lastCached.sequence
+        ) {
+          this.allCache.sequence = sequence;
+          return this.allCache.internals;
+        }
+      }
     }
     const state = this.store.getStateJson(this.stateId);
     const internals =
