@@ -878,6 +878,34 @@ describe('ContextManager', () => {
   });
 
   describe('Multi-Agent Namespacing', () => {
+    it('sibling instance edits of EARLIER messages are visible (write-version revalidation)', async () => {
+      cleanup();
+      const storePath = './test-multi-agent-editfresh';
+      if (existsSync(storePath)) {
+        rmSync(storePath, { recursive: true, force: true });
+      }
+      const store = JsStore.openOrCreate({ path: storePath });
+      const a = await ContextManager.open({ store, namespace: 'alpha', strategy: new PassthroughStrategy() });
+      const b = await ContextManager.open({ store, namespace: 'alpha', strategy: new PassthroughStrategy() });
+
+      // Appends through B (the editing instance), reads through A — the
+      // reviewer's exact shape: A caches [first, tail], B edits first.
+      const firstId = b.addMessage('User', [{ type: 'text', text: 'original-first' }]);
+      b.addMessage('User', [{ type: 'text', text: 'tail' }]);
+
+      // Warm A's cache, then edit the EARLIER message through B: item count
+      // and tail identity are unchanged, so count+tail revalidation alone
+      // would serve A the stale content (2026-07-25 review finding).
+      assert.strictEqual((a.getAllMessages()[0].content[0] as { text: string }).text, 'original-first');
+      b.editMessage(firstId, [{ type: 'text', text: 'edited-by-sibling' }]);
+
+      const fresh = a.getAllMessages();
+      assert.strictEqual(fresh.length, 2);
+      assert.strictEqual((fresh[0].content[0] as { text: string }).text, 'edited-by-sibling');
+
+      rmSync(storePath, { recursive: true, force: true });
+    });
+
     it('should support multiple agents sharing messages with separate context logs', async () => {
       cleanup();
       const storePath = './test-multi-agent';

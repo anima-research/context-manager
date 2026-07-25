@@ -15,6 +15,35 @@ import { BlobManager } from './blob-manager.js';
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
 /**
+ * Cross-instance write versions, keyed by the shared JsStore object and
+ * state id. Multiple MessageStore instances can share one JsStore (same
+ * process only — the store LOCK forbids cross-process sharing), and the
+ * cheap `getAllInternal` revalidation (item count + tail identity) cannot
+ * see an EDIT of an earlier item made through a sibling instance: count
+ * and tail are unchanged, so the first instance would serve stale content
+ * (2026-07-25 review finding on the mythos-wedge ingest fix). Every
+ * mutator bumps the shared version; the cache stores the version it was
+ * built at and revalidates against it — O(1), and the quadratic-ingest fix
+ * stays intact. WeakMap so stores never leak.
+ */
+const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
+
+function bumpWriteVersion(store: object, stateId: string): number {
+  let m = sharedWriteVersions.get(store);
+  if (!m) {
+    m = new Map();
+    sharedWriteVersions.set(store, m);
+  }
+  const next = (m.get(stateId) ?? 0) + 1;
+  m.set(stateId, next);
+  return next;
+}
+
+function currentWriteVersion(store: object, stateId: string): number {
+  return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
+}
+
+/**
  * Event emitted when the message store changes.
  */
 export type MessageStoreEvent =
@@ -126,7 +155,28 @@ export class MessageStore {
     }
   }
 
+
+  private indexWriteVersion = -1;
+
+  /**
+   * Id→index lookup that survives sibling-instance writes. Same-instance
+   * mutators maintain the index themselves and stamp indexWriteVersion at
+   * their bump; a version the stamp hasn't seen means a SIBLING
+   * MessageStore on this JsStore wrote (append shifts nothing, but
+   * removals shift indices and new ids are unknown) — rebuild once, then
+   * resolve. O(1) on every same-instance path (2026-07-25 review class:
+   * stale sibling index previously threw "Message not found" or, after
+   * shifts, would have mutated the wrong item).
+   */
+  private lookupIndex(messageId: MessageId): number | undefined {
+    if (this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)) {
+      this.rebuildIndex();
+    }
+    return this.idToIndex.get(messageId);
+  }
+
   private rebuildIndex(): void {
+    this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
     for (let i = 0; i < messages.length; i++) {
@@ -146,14 +196,14 @@ export class MessageStore {
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
-   * Freshness token: chronicle is append-only, so EVERY mutation — this
-   * instance's, another MessageStore instance sharing the JsStore
-   * (multi-agent shared messages), any state's write — advances
-   * `currentSequence()`. Key the memo on (branch name, head sequence) and
-   * it can never serve stale data; unrelated-state writes merely cost one
-   * extra parse. (An instance-local version counter was tried first and
-   * broke multi-instance sharing — integration.test.ts Multi-Agent
-   * Namespacing.)
+   * Freshness tokens: (branch, head sequence) — with a cheap same-slot
+   * revalidation for foreign-state writes — PLUS the process-wide
+   * per-(store, stateId) write version (sharedWriteVersions above), which
+   * makes edits/removals through SIBLING MessageStore instances visible:
+   * count+tail revalidation alone cannot see an in-place edit of an
+   * earlier item. (An instance-local counter was tried first and broke
+   * multi-instance sharing — integration.test.ts Multi-Agent Namespacing;
+   * the shared-map version is cross-instance by construction.)
    *
    * The cached array and its objects MUST be treated as immutable by all
    * callers. Strategy code copies before mutating (verified 2026-07-18:
@@ -164,6 +214,7 @@ export class MessageStore {
     branch: string;
     sequence: number;
     internals: StoredMessageInternal[];
+    writeVersion: number;
   } | null = null;
 
   /**
@@ -209,6 +260,7 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -253,6 +305,11 @@ export class MessageStore {
     ) {
       this.allCache.internals.push(canonical);
       this.allCache.sequence = this.store.currentSequence();
+      // Stamp the post-append write version: this instance made the write,
+      // and the cache now reflects it. Without this, the next getAllInternal
+      // sees a version mismatch and full-rebuilds on EVERY append — the
+      // quadratic ingest this write-through exists to prevent.
+      this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
     } else {
       this.allCache = null;
     }
@@ -271,7 +328,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -297,6 +354,7 @@ export class MessageStore {
       content: storedContent,
     };
 
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
     // Write-through the materialized cache (see append — the cached entry
@@ -329,7 +387,7 @@ export class MessageStore {
    * `removeBodyGroup(id)` for that case.
    */
   remove(messageId: MessageId): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -342,6 +400,7 @@ export class MessageStore {
       );
     }
 
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
@@ -366,7 +425,7 @@ export class MessageStore {
    * remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -374,7 +433,8 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.store.redactStateItems(this.stateId, index, index + 1);
+      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
@@ -391,6 +451,7 @@ export class MessageStore {
     while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
     const firstId = all[from].id;
     const lastId = all[to].id;
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -405,8 +466,8 @@ export class MessageStore {
    * to remove an entire group, then call `removeRange` over plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
-    const fromIndex = this.idToIndex.get(fromId);
-    const toIndex = this.idToIndex.get(toId);
+    const fromIndex = this.lookupIndex(fromId);
+    const toIndex = this.lookupIndex(toId);
 
     if (fromIndex === undefined) {
       throw new Error(`Message not found: ${fromId}`);
@@ -430,6 +491,7 @@ export class MessageStore {
       );
     }
 
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -441,7 +503,7 @@ export class MessageStore {
    * Get a message by ID.
    */
   get(messageId: MessageId): StoredMessage | null {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       return null;
     }
@@ -791,7 +853,8 @@ export class MessageStore {
   private getAllInternal(): StoredMessageInternal[] {
     const branch = this.store.currentBranch().name;
     const sequence = this.store.currentSequence();
-    if (this.allCache && this.allCache.branch === branch) {
+    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    if (this.allCache && this.allCache.branch === branch && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
         return this.allCache.internals;
       }
@@ -831,7 +894,7 @@ export class MessageStore {
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branch, sequence, internals };
+    this.allCache = { branch, sequence, internals, writeVersion };
     return internals;
   }
 
