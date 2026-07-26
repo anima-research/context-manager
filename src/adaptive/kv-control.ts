@@ -478,7 +478,16 @@ function projectToValidCut(
   let pass = 0;
   while (changed && pass++ < maxPasses) {
     changed = false;
-    for (const c of ordered) {
+    // DEEPEST-first within each pass: lower the deeper disagreeing leaves
+    // toward their shallower group-mates before judging the shallow ones.
+    // Shallowest-first overshot: a leaf un-folded to its pin cap (L1) among
+    // still-deeper siblings (L2) was pushed past the cap to raw in pass 1,
+    // before the siblings descended to meet it — the group then converged at
+    // raw instead of at the cap. Still monotone (only lowers) → terminates.
+    const byDepth = [...ordered].sort(
+      (a, b) => (F.get(b.id) ?? 0) - (F.get(a.id) ?? 0),
+    );
+    for (const c of byDepth) {
       const lvl = F.get(c.id) ?? 0;
       if (lvl <= 0) continue;
       if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
@@ -489,7 +498,7 @@ function projectToValidCut(
           if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
         }
       }
-      if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level (shallowest-first)
+      if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level
     }
   }
 }
