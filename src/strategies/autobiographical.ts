@@ -3213,10 +3213,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // (empty queues, at-cap with no merges, no membrane) doesn't advance
         // the counter, so this still stops cleanly (no runaway recursion).
         if (this._drainProgress === progressBefore) return;
-        // Recurse to drain more. queueMicrotask defers until the current
-        // task is done, letting other code (the agent's stream consumer)
-        // interleave.
-        queueMicrotask(() => this.driveSpeculativeDrain(ctx));
+        // Recurse to drain more — via the MACROTASK queue (setTimeout 0),
+        // never queueMicrotask. Microtasks run before the event loop returns
+        // to I/O, so a microtask-chained drain strings its ticks' synchronous
+        // compression-context compiles (~2s each on a large store) back to
+        // back and STARVES inbound events: a live wake sits in the host queue
+        // for the whole backlog (mythos 2026-07-26: 21s from DM delivery to
+        // turn start while a post-restart drain ground ~10 compiles). A
+        // macrotask hop lets pending sockets/timers run between ticks,
+        // capping the added wake latency at ~one tick's compile.
+        setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
       })
       .catch((err) => {
         console.error('AutobiographicalStrategy: speculative-drain error:', err);
