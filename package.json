@@ -21,7 +21,7 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/test/*.test.js",
+    "test": "node --test dist/test/*.test.js dist/test/adaptive/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
