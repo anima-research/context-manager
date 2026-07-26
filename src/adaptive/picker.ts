@@ -53,9 +53,13 @@ export class OverBudgetError extends Error {
     budget: number;
     actual: number;
     diagnostics: OverBudgetError['diagnostics'];
+    /** Which stage refused — defaults to the plan-stage wording. Emission
+     *  sites pass their own so a planner/emitter drift refusal doesn't
+     *  masquerade as picker exhaustion (it cost a debugging session once). */
+    stage?: string;
   }) {
     super(
-      `Adaptive picker exhausted but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
+      `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
         ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} chunks,` +
         ` deepest fold level=L${opts.diagnostics.deepestLevel})`
