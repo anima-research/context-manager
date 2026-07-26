@@ -105,9 +105,9 @@ test('integration: 200-turn conversation growth — picker fires only as needed 
       BUDGET(BUDGET_TOTAL)
     );
 
-    if (result.applied.length > 0) {
+    if (result.moves > 0) {
       pickerFiredTurns++;
-      totalRaises += result.applied.length;
+      totalRaises += result.moves;
     }
     chronicle.applyResolutions(result.finalResolutions);
 
@@ -293,7 +293,7 @@ test('integration: stress — 1000 chunks, deep recursion via preProduceUpperLev
   const elapsed = Date.now() - start;
 
   assert.ok(elapsed < 5000, `picker took ${elapsed}ms on 1000 chunks; should be < 5s`);
-  assert.ok(result.iterations < 1000, `should converge in fewer than 1000 iterations, got ${result.iterations}`);
+  assert.ok(result.moves <= 1000, `applied frontier changes at most one move per chunk, got ${result.moves}`);
   // Budget should be met or production requested
   assert.ok(result.budgetMet || result.produced.length > 0);
 });

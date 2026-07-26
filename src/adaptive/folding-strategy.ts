@@ -1,16 +1,25 @@
 /**
- * Pluggable folding strategy interface for the adaptive-resolution picker.
+ * Folding solver protocol for the adaptive-resolution picker.
  *
- * The picker is a generic orchestrator; the policy (which group to raise next,
- * whether to lower, whether to request a missing summary) lives in a strategy
- * object. V1 ships `FlatProfileStrategy` (default, level-equalizing) and
- * `OldestFirstStrategy` (chronological, matches the rev-1 design).
+ * A folding strategy is a SOLVER: one call produces the complete per-chunk
+ * target frontier (plus any requests for summaries that don't exist yet).
+ * The picker validates and applies that frontier — there is no op walk.
  *
- * See `docs/adaptive-resolution-design.md` §3.5.
+ * History: through 2026-07 this was an op-walk protocol (`selectNextFold`
+ * returning one group-atomic 'raise'/'lower' per call, applied by the picker
+ * until convergence). Group-atomic ops cannot express a frontier that
+ * legitimately cuts through a summary group — which V2 leveled pins produce
+ * by design — so the walk oscillated (raise for one leaf dragging pinned
+ * siblings, their lower dragging it back; the 2026-07-25 Mythos outage and
+ * the `raise:L4-936` wedge). The walk was also the third place a frontier
+ * was derived, silently diverging from the solve it was supposed to realize.
+ * It was removed deliberately and is not coming back: solvers own the
+ * frontier; the picker owns validation, application, and accounting.
+ *
+ * See `docs/adaptive-resolution-design.md` §3.5, §13.
  */
 
 import type { MessageId } from '../types/message.js';
-import type { SummaryEntry } from '../types/strategy.js';
 
 /** Identifier of a summary in the archive (e.g., "L2-15"). */
 export type SummaryId = string;
@@ -18,112 +27,79 @@ export type SummaryId = string;
 /** Identifier of a chunk — for now equivalent to a MessageId. */
 export type ChunkId = MessageId;
 
-/** Half-open range of chunks, identified by message IDs. */
+/** Inclusive range of chunks, identified by message IDs. */
 export interface ChunkRange {
   firstChunkId: ChunkId;
   lastChunkId: ChunkId;
 }
 
 /**
- * A view of a single chunk for strategy decisions.
- *
- * Strategies should treat ChunkView as read-only. Use the picker's
- * apply() to commit fold operations rather than mutating fields directly.
+ * Request to build a summary that does not exist yet. The picker returns
+ * these to the caller (which enqueues compression/merge work); the next
+ * compile re-solves with the new summary available.
  */
-export interface ChunkView {
-  id: ChunkId;
-  /** Position in source order (lower = older). */
-  sequence: number;
-  /** Approximate tokens of raw content. */
-  rawTokens: number;
-  /** Current display resolution. 0 = raw, k>0 = L_k summary. */
-  currentResolution: number;
-  /** Whether the picker is forbidden from changing currentResolution. */
-  lockedByAgent: boolean;
-  /** If this chunk is a shard of a larger logical message, the group id. */
-  bodyGroupId?: string;
-  /** True if this chunk is in the head window (kept raw). */
-  inHead: boolean;
-  /** True if this chunk is in the tail window (kept raw). */
-  inTail: boolean;
-  /** True if this chunk is pinned. */
-  pinned: boolean;
-  /**
-   * The chunk's ancestor at level k in the summary tree, if one exists.
-   * Returns null if the level has not been produced for this chunk's range.
-   */
-  ancestorAt(level: number): SummaryEntry | null;
-  /** The highest level k for which a summary exists covering this chunk. */
-  maxAvailableLevel(): number;
+export interface ProduceRequest {
+  /** Level to produce (e.g., 2 for L2). */
+  level: number;
+  /** Range of chunks the produced summary should cover. */
+  range: ChunkRange;
 }
 
 /**
- * Read-only view passed to a FoldingStrategy.
- */
-export interface FoldingState {
-  /** All chunks in source order. */
-  chunks(): readonly ChunkView[];
-  /** Chunks that are foldable — not in head/tail, not pinned, not locked. */
-  foldableMiddle(): readonly ChunkView[];
-  /** Look up a summary by id. */
-  getSummary(id: SummaryId): SummaryEntry | null;
-  /** All leaf chunks under a given summary (recursively walks the tree). */
-  leavesUnder(groupRoot: SummaryId): readonly ChunkView[];
-  /**
-   * Estimate of total tokens that would be rendered with the current
-   * per-chunk resolutions. Cached; recompute via recomputeTokens() after
-   * applying a fold op.
-   */
-  tokenCount(): number;
-}
-
-/** A fold operation returned by FoldingStrategy.selectNextFold. */
-export type FoldOp =
-  | {
-      kind: 'raise';
-      /** L_{k+1} summary id that becomes the new visible level for the group. */
-      groupRoot: SummaryId;
-    }
-  | {
-      kind: 'lower';
-      /** L_k summary id whose group is being lowered to (k-1). V2 only. */
-      groupRoot: SummaryId;
-    }
-  | {
-      kind: 'produce';
-      /** Level to produce (e.g., 2 for L2). */
-      level: number;
-      /** Range of chunks the produced summary should cover. */
-      range: ChunkRange;
-    };
-
-/**
- * Budget context for the strategy.
+ * Budget context for the solver.
  */
 export interface FoldingBudget {
   /** Hard maximum tokens (model context - response reserve). */
   totalBudget: number;
-  /** Soft target tokens (totalBudget * (1 - slack)). Strategies fold until at or below. */
+  /** Soft target tokens (totalBudget * (1 - slack)). Solvers fold until at or below. */
   targetBudget: number;
   /** Slack ratio (e.g., 0.1 for 10%). */
   slack: number;
 }
 
+/** The complete result of one solve. */
+export interface FoldingSolution {
+  /**
+   * Target resolution per chunk (0 = raw, k = L_k). Chunks absent from the
+   * map are treated as 0. The frontier must be REALIZABLE: every targeted
+   * level's ancestor summary exists. The picker verifies this and treats a
+   * violation as a loud solver bug (clamped to raw for accounting, never
+   * silently absorbed).
+   */
+  frontier: ReadonlyMap<ChunkId, number>;
+  /** Summaries the solver wanted but that don't exist yet. */
+  produced: ProduceRequest[];
+  /**
+   * Solver-owned exhaustion semantics: true when the solver has no further
+   * way to shrink the plan and the result is genuinely problematic.
+   *
+   * The two shipped semantics differ deliberately:
+   *  - greedy solvers: above the SOFT target with nothing left to fold or
+   *    produce (they fold until they reach the target or run out of moves,
+   *    so "still above target" means capacity is exhausted);
+   *  - kv-stable: even FULL folding exceeds the HARD wall W
+   *    (`ControlPlan.escalated`). Sitting above the soft target inside the
+   *    [target, W] dead band is kv-stable's designed resting state — zero
+   *    perturbation beats chasing the attractor — and must NOT read as
+   *    exhaustion (pre-2026-07 the generic formula flagged every healthy
+   *    dead-band hold, so `exhausted=true` was chronic on healthy agents
+   *    and indistinguishable from the real over-the-wall state).
+   *
+   * Optional for stub/test solvers: when absent the picker falls back to
+   * the greedy formula over the APPLIED frontier's tokens.
+   */
+  exhausted?: boolean;
+}
+
 /**
- * Pluggable strategy interface.
+ * Pluggable folding solver.
  *
- * The picker calls selectNextFold() repeatedly until it returns null. On
- * each call, the strategy inspects current state and returns one operation:
- *  - 'raise' — fold a group up one level (the picker applies it and re-asks)
- *  - 'lower' — refold down one level (V2; default V1 strategies don't emit this)
- *  - 'produce' — request lazy summary production (the picker enqueues it
- *    and stops; the next compile will retry)
- *
- * A strategy MUST converge: it must either eventually return null, or emit
- * a 'produce' op that doesn't loop indefinitely. The picker has its own
- * loop-bound safeguard, but well-behaved strategies make it unnecessary.
+ * `solve` is called once per compile with the full inputs and must return a
+ * complete frontier deterministically. Solvers that iterate internally
+ * (greedy strategies) do so on their own state — the picker never sees
+ * intermediate steps.
  */
-export interface FoldingStrategy {
+export interface FoldingSolver {
   readonly name: string;
-  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null;
+  solve(inputs: import('./picker.js').PickerInputs, budget: FoldingBudget): FoldingSolution;
 }

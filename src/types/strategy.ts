@@ -209,8 +209,8 @@ export interface PreviewResult {
   deepestLevel: number;
   /** Fold level per chunk the layout would settle on. */
   resolutions: Record<string, number>;
-  /** Folds that would be applied, and summaries that must be produced first. */
-  appliedCount: number;
+  /** Chunks whose resolution this layout would change vs the carried state. */
+  moves: number;
   /** Summaries the layout needs that do not exist yet — real LLM work. */
   producedCount: number;
   /**
@@ -423,7 +423,7 @@ export interface RenderStats {
     delta: number;
     budgetMet: boolean;
     exhausted: boolean;
-    iterations: number;
+    moves: number;
   };
 }
 

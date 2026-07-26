@@ -29,8 +29,7 @@ test('picker: under budget — no folds', () => {
     },
     BUDGET(100_000)
   );
-  assert.equal(result.applied.length, 0);
-  assert.equal(result.iterations, 0);
+  assert.equal(result.moves, 0);
   assert.equal(result.budgetMet, true);
 });
 
@@ -54,9 +53,13 @@ test('picker: over budget — flat-profile raises oldest group at L0', () => {
     },
     BUDGET(700)
   );
-  assert.ok(result.applied.length > 0, 'should have applied at least one fold');
-  for (const op of result.applied) {
-    assert.equal(op.kind, 'raise');
+  assert.ok(result.moves > 0, 'should have applied at least one fold');
+  // Greedy solvers are monotonic: nothing may end shallower than it started.
+  for (const c of chronicle.chunks) {
+    assert.ok(
+      (result.finalResolutions.get(c.id) ?? 0) >= c.currentResolution,
+      `chunk ${c.id} was lowered by a monotonic solver`,
+    );
   }
   assert.equal(result.budgetMet, true);
 });
@@ -81,12 +84,9 @@ test('picker: over budget without L2 available — emits produce op', () => {
     BUDGET(400)
   );
   // Should have applied L1 folds AND requested L2 production.
-  assert.ok(result.applied.length > 0);
-  assert.ok(result.produced.length > 0, 'should have emitted produce op for L2');
-  const produceOp = result.produced[0];
-  if (produceOp.kind === 'produce') {
-    assert.equal(produceOp.level, 2);
-  }
+  assert.ok(result.moves > 0);
+  assert.ok(result.produced.length > 0, 'should have emitted produce request for L2');
+  assert.equal(result.produced[0].level, 2);
 });
 
 test('picker: group-fold semantics — raising one chunk to L1 raises all siblings under same L1', () => {
@@ -140,14 +140,15 @@ test('picker: oldest-first strategy raises chronologically', () => {
     },
     BUDGET(900)
   );
-  // First raise should target the oldest chunks (c-0000…c-0005)
-  if (result.applied.length > 0) {
-    const firstOp = result.applied[0];
-    assert.equal(firstOp.kind, 'raise');
-    // The groupRoot is an L1, and its source range should start at c-0000.
-    if (firstOp.kind === 'raise') {
-      const summary = chronicle.summaries.get(firstOp.groupRoot)!;
-      assert.equal(summary.sourceRange.first, 'c-0000');
+  // Folding proceeds chronologically: the oldest chunk folds first, and no
+  // younger chunk may sit deeper than an older one.
+  if (result.moves > 0) {
+    assert.ok((result.finalResolutions.get('c-0000') ?? 0) >= 1, 'oldest chunk should fold first');
+    let prev = Number.POSITIVE_INFINITY;
+    for (const c of chronicle.chunks) {
+      const lvl = result.finalResolutions.get(c.id) ?? 0;
+      assert.ok(lvl <= prev, `chunk ${c.id} deeper than an older chunk`);
+      prev = lvl;
     }
   }
 });
@@ -184,7 +185,7 @@ test('picker: monotonicity — re-running with same state does not lower anythin
     },
     BUDGET(800)
   );
-  assert.equal(r2.applied.length, 0, 'second run with no pressure change should not apply folds');
+  assert.equal(r2.moves, 0, 'second run with no pressure change should not apply folds');
   // All chunks' resolutions stable
   for (const c of chronicle.chunks) {
     const r1Val = r1.finalResolutions.get(c.id);
@@ -300,11 +301,7 @@ test('picker: produce op emitted when L_{k+1} missing', () => {
   );
   // The picker should ask for an L2 to be produced.
   assert.ok(result.produced.length > 0, 'should have requested L2 production');
-  const produceOp = result.produced[0];
-  assert.equal(produceOp.kind, 'produce');
-  if (produceOp.kind === 'produce') {
-    assert.equal(produceOp.level, 2);
-  }
+  assert.equal(result.produced[0].level, 2);
 });
 
 test('picker: head and tail chunks are never folded', () => {

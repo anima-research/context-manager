@@ -55,7 +55,7 @@ test('render-offsets: totalTokens matches the picker computeTokens model (parity
   });
   const inputs = inputsOf(ch);
   const result = new Picker(new FlatProfileStrategy()).run(inputs, BUDGET(10_000));
-  assert.ok(result.applied.length > 0, 'expected the picker to fold something');
+  assert.ok(result.moves > 0, 'expected the picker to fold something');
 
   const tree = new SummaryTree(inputs);
   const layout = renderLayout(inputs, tree, result.finalResolutions);
