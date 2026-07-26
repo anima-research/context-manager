@@ -22,6 +22,13 @@ export interface ContextEntry {
   index: number;
   /** Source message ID (if derived from message store) */
   sourceMessageId?: MessageId;
+  /**
+   * FULL provenance when this entry stands for more than one message — e.g. a
+   * composite produced by merging adjacent body-group shards. `sourceMessageId`
+   * names only the first, which made merged shards look unrepresented to the
+   * coverage invariant. Populate this wherever N entries collapse into one.
+   */
+  sourceMessageIds?: MessageId[];
   /** How this entry relates to its source */
   sourceRelation?: SourceRelation;
   /** Participant name */

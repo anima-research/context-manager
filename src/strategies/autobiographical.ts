@@ -3359,11 +3359,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * remove content to satisfy API shape rules, which is a structural edit
    * rather than budget-driven loss, and is out of scope for this invariant.
    */
-  protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[]): void {
+  protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[], regions?: { headEnd: number; recentStart: number }): void {
     const covered = new Set<string>();
     for (const e of entries) {
-      const id = (e as { sourceMessageId?: string }).sourceMessageId;
-      if (id) covered.add(id);
+      const one = (e as { sourceMessageId?: string }).sourceMessageId;
+      if (one) covered.add(one);
+      // Composites (merged body-group shards) stand for several messages.
+      const many = (e as { sourceMessageIds?: string[] }).sourceMessageIds;
+      if (many) for (const id of many) covered.add(id);
     }
 
     // Expand emitted summaries down to the message ids they stand for.
@@ -3393,7 +3396,82 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : { budget: 0, totalTokens: 0 };
     // A preview answers "what would happen at these settings" — including
     // settings that lose content. Report there; refuse only a committing pass.
-    void diagnostics;
+    // CLASSIFY every missing id rather than counting them. A false positive is
+    // the checker being lied to about what the renderer produced, so each
+    // category is either given provenance or explicitly declared
+    // unrepresentable-by-design. The invariant goes fatal only when
+    // `unclassified` is empty — fatal-with-unknown-categories turns every
+    // unenumerated case into a refused turn on a live agent.
+    const byCategory = new Map<string, string[]>();
+    const classify = (id: string): string => {
+      const m = messages.find(x => x.id === id);
+      if (!m) return 'not-in-window';
+      const blocks = Array.isArray(m.content) ? m.content : [];
+      const text = blocks
+        .map(b => (b as { text?: string }).text ?? '')
+        .join('')
+        .trim();
+      const nonText = blocks.some(b => (b as { type?: string }).type !== 'text');
+      if (blocks.length === 0 || (text === '' && !nonText)) return 'empty-content';
+      if ((m as { bodyGroupId?: string }).bodyGroupId) return 'body-group-shard';
+      // Does ANY summary claim this message, transitively — emitted or not?
+      // If one does, the message is representable and the renderer chose not
+      // to render its representation: a different defect from "no summary
+      // exists at all", so the two must not share a bucket.
+      const claims = (sumId: string, seenIds: Set<string>): boolean => {
+        if (seenIds.has(sumId)) return false;
+        seenIds.add(sumId);
+        const sum = this.summaries.find(x => x.id === sumId);
+        if (!sum) return false;
+        if (sum.sourceLevel === 0) return sum.sourceIds.includes(id);
+        return sum.sourceIds.some(child => claims(child, seenIds));
+      };
+      const claimedBy = this.summaries.find(sum => claims(sum.id, new Set()));
+      if (claimedBy) {
+        return this._emittedSummaryIds.has(claimedBy.id)
+          ? 'in-emitted-summary-but-uncounted'
+          : 'covered-by-unemitted-summary';
+      }
+      const chunk = this.chunks.find(c => c.messages?.some((cm: { id: string }) => cm.id === id));
+      if (chunk) return chunk.compressed ? 'in-compressed-chunk-no-summary' : 'in-uncompressed-chunk';
+      // Is the summary GRAPH broken? A parent whose sourceIds name a child that
+      // no longer exists standalone (merged away) leaves a hole: the walk down
+      // from the parent can never reach the messages underneath, so they look
+      // unclaimed even though a rendered ancestor represents them.
+      const known = new Set(this.summaries.map(x => x.id));
+      const dangling = this.summaries.some(
+        sum => sum.sourceLevel > 0 && sum.sourceIds.some(child => !known.has(child)),
+      );
+      if (dangling) return 'dangling-summary-chain';
+      // Does a summary's sourceRange span this message even though sourceIds
+      // does not name it? That is provenance recorded at range granularity.
+      const spanned = this.summaries.some(sum => {
+        const r = (sum as { sourceRange?: { first?: string; last?: string } }).sourceRange;
+        return !!r && (r.first === id || r.last === id);
+      });
+      if (spanned) return 'named-only-in-sourceRange';
+      // Where does this message sit relative to the three regions the renderer
+      // actually emits? If it is in none of them, the regions do not partition
+      // the window and the gap itself is the bug.
+      if (regions) {
+        const pos = messages.findIndex(x => x.id === id);
+        if (pos < 0) return 'not-in-window';
+        if (pos < regions.headEnd) return 'in-head-not-rendered';
+        if (pos >= regions.recentStart) return 'in-tail-not-rendered';
+        return 'in-middle-not-rendered';
+      }
+      return 'unclassified-no-regions';
+    };
+    for (const id of missing) {
+      const c = classify(id);
+      const list = byCategory.get(c) ?? [];
+      list.push(id);
+      byCategory.set(c, list);
+    }
+    const summary = [...byCategory.entries()]
+      .map(([c, ids]) => `${c}=${ids.length}`)
+      .join(' ');
+    const unclassified = byCategory.get('unclassified') ?? [];
     // NOT fatal yet — BLOCKED on entry provenance. `ContextEntry` carries a
     // single `sourceMessageId`, but `mergeAdjacentBodyGroupRaw` collapses
     // several raw entries (body-group shards) into one composite, so the ids
@@ -3403,11 +3481,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // MessageId[]` on ContextEntry (or provenance recorded at emission), after
     // which this check subsumes and replaces the per-site trackers — and
     // `/debug/context/coverage` finally means something.
-    console.warn(
-      `[autobiographical] coverage: ${missing.length} message(s) not attributable to ` +
-      `a rendered entry or summary (site=${site}). NOTE: composite body-group ` +
-      `entries under-report provenance, so this count may include false positives.`,
-    );
+    // FATAL. Enumeration on 2026-07-26 drove `unclassified` to zero: every
+    // residual category (in-head-not-rendered, in-middle-not-rendered,
+    // in-uncompressed-chunk, covered-by-unemitted-summary) is content the
+    // renderer was handed and did not represent. There is no legitimately
+    // unrepresentable category left, so this refuses the turn rather than
+    // shipping a context with holes in it.
+    throw new UncoveredDropError({
+      droppedIds: missing,
+      site: `${site} [${summary}]`,
+      diagnostics,
+    });
   }
 
   /** Begin a render-stats accumulation for one select() pass. */
@@ -6162,6 +6246,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       out.push({
         index: out.length,
         sourceMessageId: sortedRun[0].sourceMessageId,
+        // Keep every shard's id: this composite represents all of them, and
+        // the coverage invariant reads provenance, not just the first source.
+        sourceMessageIds: sortedRun
+          .map(e => e.sourceMessageId)
+          .filter((id): id is string => !!id),
         sourceRelation: 'copy',
         participant: sortedRun[0].participant,
         content: mergedContent,
@@ -6723,7 +6812,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
-    this.assertFullCoverage(entries, messages);
+    this.assertFullCoverage(entries, messages, { headEnd, recentStart });
     this.assertMiddleCoverage();
     this.trimOrphanedToolUse(entries);
     // Full pairing invariant over the final rendered context — catches the
