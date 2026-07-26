@@ -897,6 +897,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
+    opts?: { render?: boolean },
   ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
@@ -914,6 +915,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const savedFrontier = this.lastFrontierTokens;
     const savedBlocked = this.transitionBlocked;
     const savedKvStable = this._lastKvStable;
+    // select() calls rsBegin(), which RESETS the render-stats family. Those feed
+    // getRenderStats() -> /debug/context/makeup and the Context panel, so a dry
+    // run would leave the operator's live segment breakdown showing numbers from
+    // a hypothetical compile until the next real one. Save and restore them:
+    // "commits nothing" has to include in-memory observability, not just
+    // Chronicle.
+    // `_lastRenderStats` is the one that matters: select() ends with
+    // `_lastRenderStats = r; _rs = null`, and getRenderStats() reads
+    // _lastRenderStats. Guarding only _rs (null by then) protected nothing.
+    const savedRs = this._rs;
+    const savedLastRs = this._lastRenderStats;
+    const savedDrops = this._uncoveredDrops;
+    const savedEmitted = this._emittedSummaryIds;
+    const savedPlannedTokens = this._plannedTokens;
+    const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
       if (overrides && Object.keys(overrides).length > 0) {
@@ -923,8 +939,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this._adaptivePicker = null;
         this._cachedHeadStartIndex = null;
       }
+      let rendered: ContextEntry[] | undefined;
       try {
-        this.select(store, log, budget, { dryRun: true });
+        const out = this.select(store, log, budget, { dryRun: true });
+        // Only retained on request: these are full rendered entries and can be
+        // megabytes on a large store.
+        if (opts?.render) rendered = out;
       } catch (err) {
         if (!(err instanceof OverBudgetError)) throw err;
         // Read through a cast: control-flow narrowing still has this pinned to
@@ -951,14 +971,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           producedCount: partial?.producedCount ?? 0,
         };
       }
-      const preview = this._lastPreview;
+      // Cast on read: control-flow narrowing still has this pinned to
+      // `undefined` from the reset above, but selectAdaptive fills it in.
+      const preview = this._lastPreview as PreviewResult | undefined;
       if (!preview) {
         // selectHierarchical path: no picker, so no fold plan to preview.
         throw new Error(
           'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
         );
       }
-      return preview;
+      // Segment breakdown for the hypothetical compile, captured BEFORE the
+      // finally block restores the live one. Lets a caller show the previewed
+      // head/middle/tail split without re-deriving it.
+      return {
+        ...preview,
+        // Read _lastRenderStats, not _rs: select() has already committed and
+        // nulled _rs by this point.
+        ...(opts?.render
+          ? { entries: rendered, stats: this._lastRenderStats ?? undefined }
+          : {}),
+      };
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
@@ -966,6 +998,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.lastFrontierTokens = savedFrontier;
       this.transitionBlocked = savedBlocked;
       this._lastKvStable = savedKvStable;
+      this._rs = savedRs;
+      this._lastRenderStats = savedLastRs;
+      this._uncoveredDrops = savedDrops;
+      this._emittedSummaryIds = savedEmitted;
+      this._plannedTokens = savedPlannedTokens;
+      this._plannedMeta = savedPlannedMeta;
       this._lastPreview = undefined;
       this._previewInFlight = false;
     }

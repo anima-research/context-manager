@@ -213,6 +213,18 @@ export interface PreviewResult {
   appliedCount: number;
   /** Summaries the layout needs that do not exist yet — real LLM work. */
   producedCount: number;
+  /**
+   * The rendered context this layout would produce. Only present when the
+   * caller asked for it (`{render:true}`) — on a large store these entries are
+   * megabytes, so they are opt-in rather than always returned.
+   */
+  entries?: ContextEntry[];
+  /**
+   * Segment breakdown (head / middle / tail / summaries-by-level) for the
+   * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
+   * `getRenderStats()`, which continues to describe the live context.
+   */
+  stats?: RenderStats;
 }
 
 /**

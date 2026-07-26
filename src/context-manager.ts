@@ -691,13 +691,18 @@ export class ContextManager {
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
    * Returns null when the active strategy has no fold plan to preview.
    */
-  previewContext(budget: TokenBudget, overrides?: Record<string, unknown>): PreviewResult | null {
+  previewContext(
+    budget: TokenBudget,
+    overrides?: Record<string, unknown>,
+    opts?: { render?: boolean },
+  ): PreviewResult | null {
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
+        opts?: { render?: boolean },
       ) => PreviewResult;
     };
     if (typeof s.previewContext !== 'function') return null;
@@ -706,6 +711,7 @@ export class ContextManager {
       this.contextLog.createView(),
       budget,
       overrides,
+      opts,
     );
   }
 

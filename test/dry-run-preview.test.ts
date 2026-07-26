@@ -180,6 +180,64 @@ describe('AutobiographicalStrategy — dry-run preview', () => {
     );
   });
 
+  it('leaves the LIVE render stats untouched — /makeup must not show previewed numbers', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 40);
+
+    // Establish live stats from a real compile at a generous budget.
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const liveBefore = JSON.stringify(manager.getRenderStats());
+    assert.ok(liveBefore && liveBefore !== 'null', 'live compile must produce render stats');
+
+    // Preview at a much tighter budget — a very different segment breakdown.
+    // Ask for the previewed stats so the test can prove they DIFFER from live;
+    // otherwise an identical snapshot would let a clobber pass unnoticed (which
+    // is exactly how the first version of this test false-passed).
+    // Force a genuinely different breakdown via a tail override — on a small
+    // store, budget pressure alone yields the identical plan at 20k and 100k,
+    // which would let a clobber pass unnoticed. A wider tail reliably moves the
+    // head/tail split (see the tail-override test above). Budget stays feasible
+    // so this renders rather than taking the OverBudgetError path.
+    const p = manager.previewContext(
+      { maxTokens: 100_000, reserveForResponse: 200 },
+      { recentWindowTokens: 5_000 },
+      { render: true },
+    );
+    assert.ok(p, 'preview must return');
+    assert.ok(p!.stats, 'previewed stats must be present with render:true');
+    assert.notStrictEqual(
+      JSON.stringify(p!.stats),
+      liveBefore,
+      'the previewed breakdown must actually differ from live, or this test proves nothing',
+    );
+
+    assert.strictEqual(
+      JSON.stringify(manager.getRenderStats()),
+      liveBefore,
+      'render stats must still describe the LIVE context, not the previewed one',
+    );
+  });
+
+  it('returns rendered entries and previewed stats only when asked', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+
+    const budget = { maxTokens: 60_000, reserveForResponse: 200 };
+    const plain = manager.previewContext(budget)!;
+    assert.strictEqual(plain.entries, undefined, 'entries are opt-in (they can be megabytes)');
+    assert.strictEqual(plain.stats, undefined, 'previewed stats are opt-in too');
+
+    const withRender = manager.previewContext(budget, undefined, { render: true })!;
+    assert.ok(Array.isArray(withRender.entries), 'render:true must return the rendered entries');
+    assert.ok(withRender.entries!.length > 0, 'rendered context must be non-empty');
+    assert.ok(withRender.stats, 'render:true must return the previewed segment stats');
+    // Same plan either way — rendering must not change the outcome.
+    assert.strictEqual(withRender.finalTokens, plain.finalTokens, 'render must not alter the plan');
+  });
+
   it('a real compile after a preview still commits normally', async () => {
     const strategy = makeStrategy();
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
