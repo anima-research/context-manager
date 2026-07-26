@@ -219,7 +219,16 @@ export class SummaryTree {
   /** Walk down to leaf chunk ids; sourceLevel 0 => sourceIds are leaves.
    *  Deduplicates leaves and guards against revisiting a summary, so a chunk
    *  reachable via multiple branches is counted once (real chronicles can have
-   *  such overlap; double-counting breaks range/contiguity and value math). */
+   *  such overlap; double-counting breaks range/contiguity and value math).
+   *
+   *  DEAD IDS ARE DROPPED: sourceIds can reference chunks removed by store
+   *  surgery (redaction / excision). A ghost member must not appear in
+   *  leafChunkIds — downstream, groupEligible() reads a missing leaf as
+   *  cap 0 and the whole group becomes permanently unraisable (one ghost
+   *  vetoed 3,637 live members on mythos; specimen
+   *  keep:~/specimens/mythos-inverted-curve-20260726). A summary's effective
+   *  coverage is its LIVE sources — `children()` already applies the same
+   *  filter. */
   private collectLeafIds(summary: SummaryEntry): ChunkId[] {
     const out: ChunkId[] = [];
     const seenLeaves = new Set<ChunkId>();
@@ -229,6 +238,7 @@ export class SummaryTree {
       seenSummaries.add(s.id);
       if (s.sourceLevel === 0) {
         for (const mid of s.sourceIds) {
+          if (!this.leafSeq.has(mid)) continue; // ghost of a surgically removed chunk
           if (!seenLeaves.has(mid)) {
             seenLeaves.add(mid);
             out.push(mid);
