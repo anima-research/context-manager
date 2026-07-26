@@ -544,6 +544,24 @@ function rawTailSet(ordered: PickerChunk[], tailTokens: number): Set<ChunkId> {
 const EMPTY_SET: ReadonlySet<ChunkId> = new Set();
 const EMPTY_LEVEL_MAP: ReadonlyMap<ChunkId, number> = new Map();
 
+/** KV_DIAG_GROUP=<summaryId>: log that group's leaf-level histogram at each
+ *  solve stage + the branch taken — for diagnosing cut-through-group targets. */
+const DIAG_GROUP = typeof process !== 'undefined' ? process.env?.KV_DIAG_GROUP : undefined;
+function diagHist(label: string, F: ReadonlyMap<ChunkId, number>, tree: SummaryTree): void {
+  if (!DIAG_GROUP) return;
+  const node = tree.summary(DIAG_GROUP);
+  if (!node) return;
+  const hist = new Map<number, number>();
+  for (const id of node.leafChunkIds) {
+    const l = F.get(id) ?? 0;
+    hist.set(l, (hist.get(l) ?? 0) + 1);
+  }
+  console.error(`[kv-diag] ${label}: levels ${JSON.stringify([...hist.entries()].sort((a, b) => a[0] - b[0]))}`);
+}
+function diagBranch(label: string): void {
+  if (DIAG_GROUP) console.error(`[kv-diag] branch: ${label}`);
+}
+
 export interface ControlPlanParams {
   /** Carried frontier (F_prev). */
   previous: ReadonlyMap<ChunkId, number>;
@@ -695,7 +713,9 @@ export function planControlledFrontier(
   for (const v of p.previous.values()) {
     if (v !== 0) { carriedNonEmpty = true; break; }
   }
+  diagHist('carried(pre-projection)', carried, tree);
   projectToValidCut(carried, tree, ordered, frozen, fixedLevels);
+  diagHist('carried(projected)', carried, tree);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
 
@@ -722,6 +742,7 @@ export function planControlledFrontier(
     p.targetTokens, p.windowTokens, maxFoldLevel,
   );
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
+  diagHist('ideal', ideal.F, tree);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
   const idealLoss = relevanceLoss(ideal.F, ordered, p.rawZone, caps);
   const gapCeiling = (strictReach ? Number.POSITIVE_INFINITY : gapRatio) * Math.max(1, idealLoss);
@@ -752,13 +773,14 @@ export function planControlledFrontier(
   });
 
   // 2. Bootstrap: nothing carried → nothing to preserve; pure relevance solve.
-  if (!carriedNonEmpty && p.previous.size === 0) return adoptIdeal('bootstrap');
+  if (!carriedNonEmpty && p.previous.size === 0) { diagBranch('bootstrap'); return adoptIdeal('bootstrap'); }
 
   // 3. Dead band with self-heal: hold the carried frontier only when it is
   //    feasible, in band, AND not certifiably misallocated.
   const carriedLoss = relevanceLoss(carried, ordered, p.rawZone, caps);
   const inBand = carriedTokens <= p.foldAtTokens && carriedTokens >= expandAt;
   if (inBand && carriedTokens <= p.windowTokens && carriedLoss - idealLoss <= gapCeiling) {
+    diagBranch(`hold (carried=${carriedTokens} band=[${expandAt},${p.foldAtTokens}])`);
     return {
       resolutions: carried,
       tokens: carriedTokens,
@@ -770,7 +792,7 @@ export function planControlledFrontier(
 
   // 4. Within the trust region → adopt the ideal outright.
   const idealPert = kvCost(carriedLayout, idealLayout);
-  if (idealPert <= P) return adoptIdeal();
+  if (idealPert <= P) { diagBranch(`adopt-ideal (pert=${idealPert} <= P=${P})`); return adoptIdeal(); }
 
   // 5. Suffix adoption: the ideal's newest changes only, within P.
   const partial = suffixAdopt(
@@ -786,6 +808,8 @@ export function planControlledFrontier(
   const madeProgress =
     !mustShed || partial.tokens <= p.foldAtTokens || partial.perturbation > 0;
   if (partial.tokens <= p.windowTokens && partialLoss - idealLoss <= gapCeiling && madeProgress) {
+    diagBranch(`suffix-adopt (pert=${partial.perturbation} tokens=${partial.tokens})`);
+    diagHist('partial', partial.F, tree);
     return {
       resolutions: partial.F,
       tokens: partial.tokens,
@@ -807,6 +831,7 @@ export function planControlledFrontier(
   }
 
   // Trust region priced out: feasibility or quality demands the ideal.
+  diagBranch(partial.tokens > p.windowTokens ? 'override:infeasible' : 'override:quality-gap');
   return adoptIdeal(partial.tokens > p.windowTokens ? 'infeasible' : 'quality-gap');
 }
 

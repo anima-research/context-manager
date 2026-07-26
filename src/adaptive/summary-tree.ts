@@ -12,7 +12,7 @@
  *    otherwise they are child summary ids.
  *  - A folded node's token cost is its recall-pair size
  *    (`recallPairTokens` ?? `SummaryEntry.tokens`) — matching
- *    `MutableFoldingState.computeTokens`.
+ *    the picker's `accountFrontier`.
  *
  * This is the substrate for the V2 best-fit tree-knapsack DP. See
  * `docs/best-fit-frontier-resolution.md` §3, §6, §11.
@@ -138,7 +138,7 @@ export class SummaryTree {
 
   /**
    * The L_level ancestor summary of a chunk, or null if not present. Matches
-   * `MutableFoldingState.ancestorAt` (walks the parentId chain from l1Id).
+   * the picker's `accountFrontier` ancestor walk (parentId chain from l1Id).
    */
   ancestorAt(chunkId: ChunkId, level: number): SummaryNode | null {
     if (level <= 0) return null;

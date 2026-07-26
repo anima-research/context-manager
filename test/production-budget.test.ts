@@ -24,7 +24,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { Picker, PickerInputs } from '../src/adaptive/picker.js';
-import type { FoldOp, FoldingBudget } from '../src/adaptive/folding-strategy.js';
+import type { ProduceRequest, FoldingBudget } from '../src/adaptive/folding-strategy.js';
 
 const TEST_STORE_PATH = './test-production-budget';
 
@@ -64,7 +64,7 @@ class SpyStrategy extends AutobiographicalStrategy {
   }
 
   protected handleProducedOps(
-    ops: readonly FoldOp[],
+    ops: readonly ProduceRequest[],
     opts?: { speculative?: boolean },
   ): void {
     this.producedCalls.push({ ops: ops.length, speculative: opts?.speculative === true });

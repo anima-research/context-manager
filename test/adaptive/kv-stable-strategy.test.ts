@@ -53,7 +53,7 @@ test('kv-stable strategy: picker walks to exactly the planned frontier and fits 
     targetTokens: budget.targetBudget, windowTokens: budget.totalBudget, rawZone: new Set(), now, mergeThreshold: 6,
   });
 
-  const strategy = new KvStableStrategy(inputs, {});
+  const strategy = new KvStableStrategy({});
   const result = new Picker(strategy).run(inputs, budget);
 
   assert.ok(sameMap(result.finalResolutions, plan.resolutions), 'picker reaches the planned frontier');
@@ -64,7 +64,7 @@ test('kv-stable strategy: picker walks to exactly the planned frontier and fits 
 test('kv-stable strategy: converges to null and leaves a small budget untouched', () => {
   const ch = buildChronicleWithChain({ chunkCount: 8, tokensPerChunk: 500, mergeThreshold: 6, recallPairTokens: 200 });
   const inputs = inputsOf(ch); // 4k raw
-  const result = new Picker(new KvStableStrategy(inputs, {})).run(inputs, BUDGET(100_000));
+  const result = new Picker(new KvStableStrategy({})).run(inputs, BUDGET(100_000));
   for (const c of inputs.chunks) {
     assert.equal(result.finalResolutions.get(c.id), 0, 'nothing folded under a generous budget');
   }
@@ -75,7 +75,7 @@ test('kv-stable strategy: pinned chunks stay raw, locked chunks keep their resol
   ch.chunks[2].pinned = true;                                   // old → would otherwise fold
   ch.chunks[5].lockedByAgent = true; ch.chunks[5].currentResolution = 1; // frozen at L1
   const inputs = inputsOf(ch);
-  const result = new Picker(new KvStableStrategy(inputs, {})).run(inputs, BUDGET(15_000));
+  const result = new Picker(new KvStableStrategy({})).run(inputs, BUDGET(15_000));
 
   assert.equal(result.finalResolutions.get(ch.chunks[2].id), 0, 'pinned chunk stays raw');
   assert.equal(result.finalResolutions.get(ch.chunks[5].id), 1, 'locked chunk keeps its resolution');
@@ -86,8 +86,8 @@ test('kv-stable strategy: a tighter reach cap holds the deep prefix raw (shallow
   const inputs = inputsOf(ch);
   const budget = BUDGET(20_000);
 
-  const tight = new Picker(new KvStableStrategy(inputs, { reachTokens: 8_000 })).run(inputs, budget);
-  const wide = new Picker(new KvStableStrategy(inputs, { reachTokens: 60_000 })).run(inputs, budget);
+  const tight = new Picker(new KvStableStrategy({ reachTokens: 8_000 })).run(inputs, budget);
+  const wide = new Picker(new KvStableStrategy({ reachTokens: 60_000 })).run(inputs, budget);
 
   // Deepest level among the oldest third of chunks: a tight reach can't fold
   // that far back, so the deep prefix stays shallower (more raw) than with wide.

@@ -142,27 +142,15 @@ exists so a chronicle written by the pre-adaptive code path continues to
 load and read correctly, with the picker treating it as a from-scratch
 fresh chronicle for resolution purposes (see §6.1).
 
-### 3.5 Pluggable folding strategy
+### 3.5 Pluggable folding solver
 
-The picker is a generic orchestrator. Decisions are delegated to a `FoldingStrategy`:
+The picker is a thin validator/applier. Policy is delegated to a `FoldingSolver`,
+which returns the COMPLETE target frontier in one call:
 
 ```typescript
-type FoldOp =
-  | { kind: 'raise'; groupRoot: SummaryId }       // group-fold up one level
-  | { kind: 'lower'; groupRoot: SummaryId }       // refold down (non-monotonic)
-  | { kind: 'produce'; level: number; range: ChunkRange };  // lazy production
-
-interface FoldingState {
-  /** All chunks in source order (oldest first). */
-  chunks(): readonly ChunkView[];
-  /** Foldable chunks — middle of the chronicle, not pinned, not locked. */
-  foldableMiddle(): readonly ChunkView[];
-  /** Archive lookup by summary id. */
-  getSummary(id: SummaryId): SummaryEntry | null;
-  /** All leaf chunks under a given summary (recursive walk). */
-  leavesUnder(groupRoot: SummaryId): readonly ChunkView[];
-  /** Total tokens that would render under the current per-chunk resolutions. */
-  tokenCount(): number;
+interface ProduceRequest {
+  level: number;        // summary level to produce (e.g., 2 for L2)
+  range: ChunkRange;    // chunks the produced summary should cover
 }
 
 interface FoldingBudget {
@@ -171,43 +159,43 @@ interface FoldingBudget {
   slack: number;
 }
 
-interface FoldingStrategy {
+interface FoldingSolution {
+  /** Target resolution per chunk (0 = raw, k = L_k). Must be REALIZABLE:
+   *  every targeted level's ancestor summary exists. The picker verifies
+   *  this and treats a violation as a loud solver bug. */
+  frontier: ReadonlyMap<ChunkId, number>;
+  /** Summaries the solver wanted but that don't exist yet. */
+  produced: ProduceRequest[];
+}
+
+interface FoldingSolver {
   readonly name: string;
-  /** Return the next fold operation, or null if no more folds needed. */
-  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null;
+  solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution;
 }
 ```
 
-`FoldingState` is methods-not-fields: head/tail/pinned/locked filtering is
-internalized in `foldableMiddle()` so strategies don't need to re-derive
-the eligibility set. The picker's `MutableFoldingState` is the
-implementation; strategies see a read-only view.
-
-The picker's loop, simplified:
-
-```
-applied = []; produced = []
-loop:
-  op = strategy.selectNextFold(state, budget)
-  if not op: break
-  if op.kind in {'raise','lower'}: apply(op); applied.push(op); continue
-  if op.kind == 'produce':         produced.push(op); break   // defer to caller
-return { finalResolutions, applied, produced, exhausted, ... }
-```
+> **History — the op walk (removed 2026-07-26).** Through 2026-07 this was an
+> op protocol: `selectNextFold(state, budget)` returned one group-atomic
+> `raise`/`lower`/`produce` op per call, and the picker looped, applying ops
+> until convergence under an iteration bound. Group-atomic ops cannot express
+> a frontier that cuts through a summary group — which V2 leveled pins
+> (`ProtectedRange.level`) produce by design — so the walk oscillated on such
+> targets (the 2026-07-25 Mythos outage; the `raise:L4-936` wedge), and its
+> "nearest realizable" degradation silently diverged from the solve while
+> plan-vs-actual metrics, anchored on the walked state, reported zero drift.
+> The walk was removed deliberately and durably: solvers own the frontier;
+> the picker owns validation, application, and accounting. Greedy policies
+> iterate INSIDE their solve (`src/adaptive/greedy-fold.ts`) — the iteration
+> is an implementation detail, never a protocol.
 
 `produced` is returned to the caller (the strategy) rather than acted on
 inside the picker — see §3.8 and §5.
 
-Strategies shipped in V1:
+Solvers shipped:
 
-- **`FlatProfileStrategy`** (default). Aims for roughly-equal counts of *visible items* at each non-trivial level. Monotonic (only emits `raise`). See §3.7.
-- **`OldestFirstStrategy`**. The behavior originally proposed in this doc's rev 1. Monotonic. Kept for comparison and as a fallback during early rollout.
-
-Strategies envisioned for later (not V1 scope, but the interface accommodates them):
-
-- `AgentDirectedStrategy` (V2) — honors `unfold`/`refold` operations from the agent; emits compensation `raise`/`lower` ops to keep within budget.
-- `ContentImportanceStrategy` — uses content scoring (embeddings, heuristics) to prefer folding low-importance regions.
-- `TopicCoherentStrategy` — folds contiguous regions of related content together.
+- **`KvStableStrategy`** (`foldingStrategy: 'kv-stable'`, the fleet default in practice). Closed-form bidirectional solve via `planControlledFrontier` — see §13.
+- **`FlatProfileStrategy`** (default when no `foldingStrategy` is configured). Aims for roughly-equal counts of *visible items* at each non-trivial level. Greedy, monotonic. See §3.7.
+- **`OldestFirstStrategy`**. The behavior originally proposed in this doc's rev 1. Greedy, monotonic. Kept for comparison.
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
@@ -436,19 +424,21 @@ Given:
 
 - `totalBudget` = `TokenBudget.maxTokens - reserveForResponse - headTokens`
 - `slack` = `compressionSlackRatio` (default 0.1)
-- `strategy` = configured `FoldingStrategy` instance
+- `solver` = configured `FoldingSolver` instance
 - Chunk store, summary tree, head/tail sets
 
 ```
 [picker.run]
-1. Build MutableFoldingState (mutable internal view over chunks + summaries).
-2. op = strategy.selectNextFold(state, budget)
-3. While op AND iterations < bound:
-   - if op.kind == 'raise':   applyRaise; applied.push(op); continue
-   - if op.kind == 'lower':   (V2) applyLower; applied.push(op); continue
-   - if op.kind == 'produce': produced.push(op); break
-4. Return { finalResolutions, applied, produced, finalTokens,
-            budgetMet, exhausted, iterations }.
+1. { frontier, produced } = solver.solve(inputs, budget)
+2. APPLY: per live chunk, final[id] = frontier[id] ?? 0 (clamped ≥ 0).
+   Frontier entries for ids with no live chunk (store-surgery residue) are
+   dropped and counted (deadFrontierIds) — never persisted.
+3. ACCOUNT + VALIDATE: rendered-token total via the renderer's unit model
+   (accountFrontier). A chunk targeting a level whose ancestor summary does
+   not exist is a SOLVER BUG: accounted as raw, counted (unrealizable), and
+   reported loudly ([picker-unrealizable]) — never silently skipped.
+4. Return { finalResolutions, produced, finalTokens,
+            budgetMet, exhausted, moves, deadFrontierIds, unrealizable }.
 
 [selectAdaptive — strategy side, after picker.run]
 5. Commit finalResolutions to strategy state; persist if changed.
@@ -459,9 +449,9 @@ Given:
    shards via the rendering algorithm in §3.6.1.
 ```
 
-The iteration bound is `max(1000, chunks.length * 10)` — scales with
-chronicle size so non-convergence detection doesn't trip on large stores
-that legitimately need more ops than a fixed ceiling allows.
+`moves` is the number of chunks whose resolution changed vs the carried
+state (it replaced the op walk's `iterations` in `PlanVsActual` and the
+preview surfaces when the walk was retired — see §3.5 history note).
 
 Token counting: each chunk's `rawTokens` is computed at picker-input
 construction time (delegated to `MessageStoreView.estimateTokens`); each

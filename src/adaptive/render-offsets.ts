@@ -10,7 +10,7 @@
  *
  * `renderLayout` produces the ordered sequence of rendered units (head,
  * per-chunk raw/recall in source order, tail) with cumulative token offsets,
- * matching `MutableFoldingState.computeTokens` exactly:
+ * matching the picker's `accountFrontier` exactly:
  *  - head/tail are fixed blocks;
  *  - pinned chunks render raw (L0) regardless of resolution;
  *  - a folded chunk emits its L_k ancestor's recall pair, once per distinct
@@ -47,7 +47,7 @@ export interface RenderLayout {
 
 /**
  * Build the ordered rendered-unit layout for a frontier. `totalTokens` equals
- * `MutableFoldingState.computeTokens` for the same resolutions.
+ * `accountFrontier` for the same resolutions.
  */
 export function renderLayout(
   inputs: PickerInputs,

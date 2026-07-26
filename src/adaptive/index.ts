@@ -18,13 +18,12 @@ export {
   type ShardingResult,
 } from './chunker.js';
 
-// Folding strategy interface
+// Folding solver interface
 export type {
-  FoldingStrategy,
-  FoldingState,
+  FoldingSolver,
+  FoldingSolution,
   FoldingBudget,
-  FoldOp,
-  ChunkView,
+  ProduceRequest,
   ChunkId,
   ChunkRange,
   SummaryId,
@@ -87,6 +86,7 @@ export {
   Picker,
   OverBudgetError,
   UncoveredDropError,
+  accountFrontier,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,

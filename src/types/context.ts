@@ -105,7 +105,9 @@ export interface PlanVsActual {
   delta: number;
   budgetMet: boolean;
   exhausted: boolean;
-  iterations: number;
+  /** Chunks whose resolution the applied frontier changed vs the carried
+   *  state. (Replaced the op-walk's `iterations` when the walk was retired.) */
+  moves: number;
 }
 
 export interface CompileResult {

@@ -23,7 +23,7 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { FoldOp } from '../src/adaptive/folding-strategy.js';
+import type { ProduceRequest } from '../src/adaptive/folding-strategy.js';
 
 const TEST_STORE_PATH = './test-dry-run-preview';
 
@@ -40,7 +40,7 @@ class SpyStrategy extends AutobiographicalStrategy {
   producedCalls = 0;
   persistCalls = 0;
 
-  protected handleProducedOps(ops: readonly FoldOp[], opts?: { speculative?: boolean }): void {
+  protected handleProducedOps(ops: readonly ProduceRequest[], opts?: { speculative?: boolean }): void {
     this.producedCalls++;
     super.handleProducedOps(ops, opts);
   }

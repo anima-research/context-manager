@@ -139,7 +139,7 @@ test('KvStableStrategy walks the picker to a pin-at-level-k target', () => {
   target.pinLevel = 2;
   target.currentResolution = 0; // starts raw → must be raised to L2
 
-  const picker = new Picker(new KvStableStrategy(inputs));
+  const picker = new Picker(new KvStableStrategy());
   const result = picker.run(inputs, { totalBudget: 12_000, targetBudget: 10_000, slack: 0 });
   assert.equal(result.finalResolutions.get('c-0000'), 2, 'picker walked the pinned chunk to exactly L2');
 });

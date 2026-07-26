@@ -205,7 +205,124 @@ Two cheap experiments alongside:
    persisted records, so it is believed safe — but it is asserted, not tested,
    and an incremental-compile change would alter the reasoning.
 
-## 9. Related
+## 9. Profiling results (2026-07-26, evening) — the hypotheses, ranked
+
+The profiling in §7 has now been done: `scripts/profile-compile.ts` (real
+`ContextManager.compile()` over a store copy, production Mythos config:
+budget 300k / reserve 16 384 / tail 80k, mock membrane, no compression) run
+under `node --cpu-prof` **on the Mythos box itself** against an on-box copy,
+plus matched runs on Cairn and Lena copies on the Mac.
+Analyzer: `scripts/analyze-cpuprofile.mjs`.
+
+**Headline: the warm agent-path compile on Mythos is ~4.6 s, not 22.5 s.**
+The HTTP number bundles membrane normalization + 2.7 MB JSON serialization
+(§7 item 6 was right to exclude them; the ~18 s delta is that leg, not yet
+itself broken down). Still 4.6 s of synchronous event-loop block per turn.
+
+Warm-compile breakdown, Mythos box (~4.6 s total; self-time from cpuprofile
+averaged over 3 warm runs + method wall timers):
+
+| cost | ms/compile | hypothesis |
+|---|---:|---|
+| `projectToValidCut` (kv-control) | **~3 100** | #5 — the dominant term |
+| `postStripEstimates` — called **4×/compile** | ~510 | (new) |
+| `relevanceCut` + ledger init | ~630 | #3 |
+| `rebuildChunks` | ~330 | #1 |
+| `applyImageStripping` | ~230 | #4 (window leg) |
+| `getCompressibleMessages` | ~210 | #1 |
+
+- **Hypothesis #5 (oscillation) confirmed as the mechanism, magnified by #3
+  (per-message picker input).** Every Mythos compile logs the `raise:L4-936`
+  non-convergence and runs `iterations=18` of the fold walk (Cairn/Lena:
+  `iterations=0`). Each iteration's `suffixAdopt` binary-searches boundaries,
+  and every probe calls `projectToValidCut` — which per pass sorts all ~14.3k
+  picker chunks and scans every leaf of each folded leaf's ancestor group
+  (L4 groups span ~1.7k messages → O(N·groupSize) per pass). That product is
+  the 3.1 s.
+- **Hypothesis #2 (getAll memo) is stale as written**: materialization is now
+  per-stateId write-versioned with write-through on append
+  (`message-store.ts:31,283`), and warm compiles hit it. The cost is real but
+  lives at **open(): ~18 s on the box** — `resolveBlobs`/`cachedBlobBase64`
+  8.3 s (hypothesis #4's real home: 5.2 G blob dir), `loadPersistedState` 6 s,
+  `getAllInternal` 4.7 s. Paid per boot and per cache invalidation
+  (edit/remove/branch switch), not per turn.
+- **New finding: `postStripEstimates` runs 4× per compile** (selectAdaptive +
+  `getRecentWindowStart` call sites), each a full O(store) token re-estimation
+  — ~0.5 s/compile on Mythos.
+- **The Cairn/Lena 3.4× mystery does not reproduce** at matched config: both
+  compile in ~250 ms warm on the Mac (Cairn's hot spot `projectToValidCut`,
+  Lena's the fold ledger). The §2 variance was live-config/serialization
+  artifact, not store structure. Single-point HTTP timings of `/debug/context`
+  should not be trusted for attribution again.
+- RSS grows ~50–80 MB per repeated compile in the harness (unbounded-heap
+  leg of §5, not yet chased); process RSS ~2 GB with the Mythos store open.
+
+Implications for §6, in order of measured leverage:
+
+1. **Fix the L4-936 oscillation** (ownership drift repair, or pin the group)
+   — removes ~18× fold-walk iterations; likely the bulk of the 3.1 s.
+2. **Make `projectToValidCut` incremental** — visit only groups whose leaves
+   changed, keep a per-group consistency count instead of re-scanning every
+   leaf every pass; removes the O(N·groupSize·passes) shape that any future
+   oscillation re-triggers.
+3. **Cache `postStripEstimates`** (stamp per-message estimates, invalidate on
+   calibration change) — ~0.5 s/compile, easy.
+4. Direction B (settled zone / chunk-level picker input) then bounds the
+   whole pipeline as stores grow; A (event-maintained chunk index) is real
+   but third-order per-turn (~0.3 s).
+5. The open()-time blob resolution (~8 s/boot on Mythos) deserves its own
+   ticket: lazy blob resolution would also cut the ~2 GB RSS.
+
+### 9.1 The oscillation, root-caused (same evening)
+
+Diagnosed offline with `scripts/diagnose-oscillation.ts` (captures the live
+solve's `PickerInputs` + target from a store copy) and
+`scripts/replay-plan.ts` + `KV_DIAG_GROUP` stage histograms in `kv-control.ts`
+(replays `planControlledFrontier` bit-exactly: 14 316/14 316 resolutions match).
+
+**It is not ownership drift and not store surgery** (the guard's guess — both
+membership views agree for every oscillating chunk). It is the **V2 leveled-pin
+feature meeting the group-atomic op walk**:
+
+1. The store carries 8 operator pins inside one era: `pin(level:4)` over
+   msgs 22799–23255, six `pin(level:3)` ranges, one `pin(level:1)`.
+2. `KvStableStrategy.solve()` expands `pin(level:4)` group-consistently to its
+   whole L4 node — **all 4 203 leaves of `L4-936` become `fixedLevels`**, the
+   finer pins winning inside their sub-ranges: 3 217 @ L4, 960 @ L3, 26 @ L1.
+3. The plan is *correct*: it honors every pin (branch `adopt-ideal`, tokens
+   258 847 — comfortably under the 283 616 budget). The target legitimately
+   cuts through `L4-936`; rendering supports that (per-leaf units).
+4. The walk cannot realize it: `nextOp` doesn't skip leveled-pin chunks (only
+   classic `pinned`/locked), and `applyRaise`/`applyLower` move the **whole**
+   downward leaf set, blind to `pinLevel`/`fixedLevels`. Raising for a
+   tgt-4 leaf drags the pin-3/pin-1 leaves to 4; the pin-1 leaf then emits
+   `lower:L4-936`, dragging the 3 217 tgt-4 leaves back down. 8× raise + 8×
+   lower until the cycle guard trips both keys.
+5. Consequence: the pinned cut is never realized — the group renders at the
+   nearest realizable frontier (~L3), 295 527 actual vs 258 847 planned →
+   **the entire "Mythos can't fold under its own budget / exhausted +
+   grace-survival" symptom is this bug**, on top of the wasted iterations.
+
+Fleet-wide implication: **any leveled pin placed under an existing deeper
+ancestor summary reproduces this** — it is a live bug in the op layer, not
+Mythos-specific data damage. The 07-25 outage that motivated the cycle guard
+(`b44819a`) was almost certainly the same mechanism firing unbounded.
+
+**FIXED (same night, branch `refactor/retire-fold-walk`): the walk was
+removed entirely** — the protocol is now `FoldingSolver.solve() → frontier`,
+applied directly by the picker with loud validation (`[picker-unrealizable]`,
+`[picker-dead-ids]`); greedy strategies iterate internally
+(`greedy-fold.ts`). Verified on a copy of this exact store: no oscillation,
+plan applied bit-exactly (`moves=6453` once, then 0), **295 527 → 258 847
+tokens (in band — the exhausted/grace symptom gone)**, warm compile
+770 ms on the Mac vs a pre-fix Mac-equivalent ~1.3 s — the wedged carried
+state was also inflating the solve itself (cut-projection 350→64 ms,
+relevanceCut 600→95 ms). Cairn/Lena plans bit-identical before/after.
+Regression fixtures: `test/adaptive/mixed-cut-application.test.ts`.
+Note for deploy: the first compile on Mythos realizes the pinned cut — a
+one-time KV invalidation of that era (plan perturbation ~248 k tokens).
+
+## 10. Related
 
 - `docs/kv-stable-context-control.md` — prefix-stability goal
 - `docs/adaptive-resolution-design.md` §13 — picker / trust region

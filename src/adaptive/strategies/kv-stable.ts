@@ -1,31 +1,35 @@
 /**
- * KvStableStrategy — the KV-stable context controller plugged into the existing
- * picker (see `docs/kv-stable-context-control.md`).
+ * KvStableStrategy — the KV-stable context controller as a folding SOLVER
+ * (see `docs/kv-stable-context-control.md`).
  *
- * Same "solve-once-then-walk" bridge as `BestFitStrategy`: on the first
- * `selectNextFold` it computes a target frontier with `planControlledFrontier`
- * (the *same* policy the replay harness measures), memoizes it, then emits one
- * `raise`/`lower` op per call to walk the live state toward it, returning `null`
- * once reached. The picker already applies raise/lower — no picker change.
+ * One `solve` call computes the complete target frontier with
+ * `planControlledFrontier` (the *same* policy the replay harness measures)
+ * and returns it for the picker to apply directly.
  *
- * Unlike `BestFitStrategy` (which maximizes value − λ·KVcost over a half-life
- * recency model), this minimizes real prefix churn directly: it holds the flat
- * zone (head/tail/pinned) raw, never folds locked chunks, and sheds the foldable
- * middle oldest-first/leveled under a per-turn divergence **reach cap** (the
- * perturbation cap P), bounded by per-chunk log-age saliency caps, yielding the
- * reach cap only as far as needed to stay under the hard wall (`totalBudget`).
- * No λ, no recency half-life.
+ * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
+ * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
+ * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and sheds the
+ * foldable middle oldest-first/leveled under a per-turn divergence **reach
+ * cap** (the perturbation cap P), yielding the reach cap only as far as
+ * needed to stay under the hard wall (`totalBudget`).
  *
- * Like `BestFitStrategy`, it does not emit `produce` ops — deeper folding than
- * has been produced is the speculative pre-producer's job; the controller only
- * targets levels whose summaries already exist. Deterministic.
+ * It does not emit produce requests — deeper folding than has been produced
+ * is the speculative pre-producer's job; the controller only targets levels
+ * whose summaries already exist. Deterministic.
+ *
+ * History: this used to walk the plan into the picker one group-atomic
+ * raise/lower op at a time. Group ops cannot express a frontier that cuts
+ * through a group — which leveled pins legitimately require — so the walk
+ * oscillated (the 2026-07-25 Mythos outage; the `raise:L4-936` wedge) and
+ * silently rendered "nearest realizable" frontiers that diverged from the
+ * plan while plan-vs-actual reported zero drift. The walk is gone; the plan
+ * IS the frontier.
  */
 
 import type {
-  FoldingStrategy,
-  FoldingState,
+  FoldingSolver,
+  FoldingSolution,
   FoldingBudget,
-  FoldOp,
   ChunkId,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
@@ -50,46 +54,35 @@ export interface KvStableOptions {
   strictReach?: boolean;
 }
 
-export class KvStableStrategy implements FoldingStrategy {
+export class KvStableStrategy implements FoldingSolver {
   readonly name = 'kv-stable';
 
-  private readonly inputs: PickerInputs;
   private readonly opts: KvStableOptions;
-  private readonly fPrev: Map<ChunkId, number>;
-  private target: Map<ChunkId, number> | null = null;
   private _lastPlan: ControlPlan | null = null;
-  /** Cycle guard (2026-07-25): counts per emitted op key — see nextOp. */
-  private readonly opEmits = new Map<string, number>();
-  private cycleWarned = false;
+  private _lastTarget: Map<ChunkId, number> | null = null;
 
-  constructor(inputs: PickerInputs, opts: KvStableOptions = {}) {
-    this.inputs = inputs;
+  constructor(opts: KvStableOptions = {}) {
     this.opts = opts;
-    this.fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
   }
 
-  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null {
-    if (!this.target) this.target = this.solve(budget);
-    return this.nextOp(state);
-  }
-
-  /** Target frontier this run is walking toward (null before the first call). */
+  /** Target frontier of the most recent solve (null before the first). */
   targetFrontier(): ReadonlyMap<ChunkId, number> | null {
-    return this.target;
+    return this._lastTarget;
   }
 
   /** The full control plan behind the target (perturbation, override) — for
    *  observability at the call site (`[kv-escalation]` logging). Null before
-   *  the first `selectNextFold`. */
+   *  the first `solve`. */
   lastPlan(): ControlPlan | null {
     return this._lastPlan;
   }
 
-  private solve(budget: FoldingBudget): Map<ChunkId, number> {
-    const tree = new SummaryTree(this.inputs);
+  solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
+    const tree = new SummaryTree(inputs);
+    const fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
 
     // Flat zone (forced raw, never folded): head, tail, classic pins. Frozen
-    // (kept at their carried resolution, never folded): locked. V2 dynamic pins
+    // (kept at their carried resolution, never touched): locked. V2 dynamic pins
     // (`pinLevel` / `pinMaxLevel`) are honored as a fixed level or a hard fold-
     // depth cap — see `planControlledFrontier`.
     const rawZone = new Set<ChunkId>();
@@ -98,9 +91,9 @@ export class KvStableStrategy implements FoldingStrategy {
     const pinCaps = new Map<ChunkId, number>();
     const fixedPins: Array<{ id: ChunkId; level: number }> = [];
     let now = 0;
-    for (const c of this.inputs.chunks) {
+    for (const c of inputs.chunks) {
       if (c.sequence > now) now = c.sequence;
-      if (this.inputs.headChunkIds.has(c.id) || this.inputs.tailChunkIds.has(c.id) || c.pinned) {
+      if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id) || c.pinned) {
         rawZone.add(c.id);
       } else if (c.pinLevel !== undefined) {
         // Pin-at-level-k: fix exactly at k (0 = raw). k=0 is equivalent to a
@@ -121,10 +114,10 @@ export class KvStableStrategy implements FoldingStrategy {
     // Group-consistency for pin-at-level-k: an L_k recall pair is atomic over
     // its whole covered range, so "cut through the L_k node" (design §7) fixes
     // EVERY leaf under that node at k — not just the addressed chunk. Fixing a
-    // single sub-chunk while its siblings render raw is an unrenderable (and
-    // non-converging) frontier. Clamp k to the deepest produced level for the
-    // chunk; if none exists, fall back to fixing just the chunk (the controller
-    // clamps it further). Skip leaves already forced raw (head/tail/classic pin).
+    // single sub-chunk while its siblings render raw is an unrenderable
+    // frontier. Clamp k to the deepest produced level for the chunk; if none
+    // exists, fall back to fixing just the chunk (the controller clamps it
+    // further). Skip leaves already forced raw (head/tail/classic pin).
     for (const { id, level } of fixedPins) {
       const eff = Math.min(level, tree.maxLevel(id));
       if (eff <= 0) { rawZone.add(id); continue; }
@@ -138,8 +131,8 @@ export class KvStableStrategy implements FoldingStrategy {
       }
     }
 
-    const plan = planControlledFrontier(this.inputs, tree, {
-      previous: this.fPrev,
+    const plan = planControlledFrontier(inputs, tree, {
+      previous: fPrev,
       // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
       // is the quiet dead band; the trust region and overrides do the rest.
       foldAtTokens: this.opts.goalTotalTokens ?? budget.totalBudget,
@@ -157,57 +150,7 @@ export class KvStableStrategy implements FoldingStrategy {
       mergeThreshold: this.opts.mergeThreshold,
     });
     this._lastPlan = plan;
-    return plan.resolutions;
-  }
-
-  /** Emit one op moving the live state toward the target frontier. */
-  private nextOp(state: FoldingState): FoldOp | null {
-    const target = this.target!;
-    for (const c of state.chunks()) {
-      if (c.inHead || c.inTail || c.pinned || c.lockedByAgent) continue;
-      const cur = c.currentResolution;
-      const tgt = target.get(c.id) ?? 0;
-      if (cur === tgt) continue;
-
-      let op: FoldOp;
-      if (cur < tgt) {
-        const summary = c.ancestorAt(tgt);
-        if (!summary) continue; // unrealizable target (summary not produced) — skip
-        op = { kind: 'raise', groupRoot: summary.id };
-      } else {
-        const summary = c.ancestorAt(cur);
-        if (!summary) continue;
-        op = { kind: 'lower', groupRoot: summary.id };
-      }
-
-      // Cycle guard (2026-07-25, mythos wedge): raise/lower act on a whole
-      // GROUP root while targets are per-chunk. When a group's leaves carry
-      // mixed targets — possible when chunk ownership and the summary tree
-      // disagree after store surgery ("head boundary disagrees with chunk
-      // ownership") — the walk oscillates on the same root forever: raising
-      // for one leaf overshoots its siblings, lowering for a sibling undoes
-      // the raise. The picker's iteration bound is 10×chunks with O(chunks)
-      // per step, so a live agent burns hours of CPU per compile. Emitting
-      // the same op more than 8 times means we are cycling, not walking:
-      // treat the chunk as unrealizable, warn once, and move on. The
-      // frontier stays renderable — merely at the nearest realizable cut.
-      const key = `${op.kind}:${String(op.groupRoot)}`;
-      const n = (this.opEmits.get(key) ?? 0) + 1;
-      if (n > 8) {
-        if (!this.cycleWarned) {
-          this.cycleWarned = true;
-          console.error(
-            `[kv-stable] non-converging fold walk: op ${key} emitted >8 times — ` +
-              `target frontier cuts through a group (ownership drift after store ` +
-              `surgery?). Skipping oscillating chunks; window renders at the ` +
-              `nearest realizable frontier.`,
-          );
-        }
-        continue;
-      }
-      this.opEmits.set(key, n);
-      return op;
-    }
-    return null;
+    this._lastTarget = plan.resolutions;
+    return { frontier: plan.resolutions, produced: [] };
   }
 }

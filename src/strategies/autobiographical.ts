@@ -40,9 +40,9 @@ import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
-  FoldingStrategy,
+  FoldingSolver,
   FoldingBudget,
-  FoldOp,
+  ProduceRequest,
   ChunkId,
   SummaryId,
 } from '../adaptive/folding-strategy.js';
@@ -990,7 +990,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // An early throw means no fold plan was computed at all; a late one
           // means we have it.
           resolutions: partial?.resolutions ?? {},
-          appliedCount: partial?.appliedCount ?? 0,
+          moves: partial?.moves ?? 0,
           producedCount: partial?.producedCount ?? 0,
         };
       }
@@ -2994,12 +2994,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * produce op gets re-emitted before the work completes.
    */
   protected handleProducedOps(
-    ops: readonly FoldOp[],
+    ops: readonly ProduceRequest[],
     opts?: { speculative?: boolean },
   ): void {
     this.requireBranchMutation('handleProducedOps');
     for (const op of ops) {
-      if (op.kind !== 'produce') continue;
       if (op.level === 1) {
         this.enqueueL1ForRange(op.range.firstChunkId, op.range.lastChunkId, opts);
       } else if (op.level >= 2) {
@@ -3715,7 +3714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _emittedSummaryIds: Set<string> = new Set();
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
-  private _plannedMeta: { budgetMet: boolean; exhausted: boolean; iterations: number } | null = null;
+  private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number } | null = null;
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -3760,7 +3759,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         delta,
         budgetMet: m?.budgetMet ?? false,
         exhausted: m?.exhausted ?? false,
-        iterations: m?.iterations ?? 0,
+        moves: m?.moves ?? 0,
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -3768,7 +3767,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const line =
         `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
-        ` iterations=${m?.iterations}`;
+        ` moves=${m?.moves}`;
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
@@ -5572,7 +5571,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Select context entries using the adaptive-resolution picker.
    *
    * Builds per-message PickerChunks from compressible messages, runs the
-   * configured FoldingStrategy under token-budget pressure, and emits the
+   * configured FoldingSolver under token-budget pressure, and emits the
    * resulting per-message resolutions as ContextEntry[]. Adjacent messages
    * sharing the same L_k ancestor emit the recall pair once.
    *
@@ -5829,7 +5828,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._plannedMeta = {
       budgetMet: result.budgetMet,
       exhausted: result.exhausted,
-      iterations: result.iterations,
+      moves: result.moves,
     };
 
     // Every trust-region override is loud (design §13.4) — silence was half
@@ -5941,7 +5940,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
         deepestLevel,
         resolutions: Object.fromEntries(result.finalResolutions),
-        appliedCount: result.applied.length,
+        moves: result.moves,
         producedCount: result.produced.length,
       };
     }
@@ -6516,7 +6515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Get (lazily constructing) the configured picker instance. */
   protected getAdaptivePicker(): Picker {
     if (this._adaptivePicker) return this._adaptivePicker;
-    const strategy: FoldingStrategy =
+    const strategy: FoldingSolver =
       this.config.foldingStrategy === 'oldest-first'
         ? new OldestFirstStrategy()
         : new FlatProfileStrategy();
@@ -6534,7 +6533,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     preparedBudget?: { totalBudget: number; targetBudget: number },
   ): Picker {
     if (this.config.foldingStrategy === 'kv-stable') {
-      const strategy = new KvStableStrategy(inputs, {
+      const strategy = new KvStableStrategy({
         reachTokens: preparedBudget === undefined
           ? this.config.kvStableReachTokens
           : this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens,
