@@ -36,11 +36,24 @@ function bumpWriteVersion(store: object, stateId: string): number {
   }
   const next = (m.get(stateId) ?? 0) + 1;
   m.set(stateId, next);
+  if (typeof process !== 'undefined' && process.env?.CM_CACHE_DIAG) {
+    const site = (new Error().stack ?? '').split('\n')[2]?.trim();
+    console.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
+  }
   return next;
 }
 
 function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
+}
+
+/** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
+ *  cost, every invalidating mutation, and every write-through fallback. The
+ *  full rebuild is ~20s of CPU on a large store on production hardware —
+ *  a silent cache miss IS the latency incident (mythos, 2026-07-26). */
+const CACHE_DIAG = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+function cacheDiag(msg: string): void {
+  if (CACHE_DIAG) console.error(`[cm-cache] ${msg}`);
 }
 
 /**
@@ -311,6 +324,11 @@ export class MessageStore {
       // quadratic ingest this write-through exists to prevent.
       this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
     } else {
+      if (this.allCache) {
+        cacheDiag(
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branch !== this.store.currentBranch().name ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+        );
+      }
       this.allCache = null;
     }
 
@@ -854,6 +872,15 @@ export class MessageStore {
     const branch = this.store.currentBranch().name;
     const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
+    let missReason = 'no-cache';
+    if (this.allCache) {
+      missReason =
+        this.allCache.branch !== branch
+          ? `branch ${this.allCache.branch}→${branch}`
+          : this.allCache.writeVersion !== writeVersion
+            ? `writeVersion ${this.allCache.writeVersion}→${writeVersion}`
+            : 'revalidate-fail';
+    }
     if (this.allCache && this.allCache.branch === branch && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
         return this.allCache.internals;
@@ -889,12 +916,17 @@ export class MessageStore {
           this.allCache.sequence = sequence;
           return this.allCache.internals;
         }
+        missReason = `revalidate-fail last-item (cached ${lastCached?.id}/${lastCached?.sequence} live ${lastLive?.id}/${lastLive?.sequence})`;
+      } else {
+        missReason = `revalidate-fail count (cached ${this.allCache.internals.length} live ${count}${canPointLookup ? '' : ', no point lookup'})`;
       }
     }
+    const _t = CACHE_DIAG ? Date.now() : 0;
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
     this.allCache = { branch, sequence, internals, writeVersion };
+    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
     return internals;
   }
 
