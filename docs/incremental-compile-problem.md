@@ -322,6 +322,40 @@ Regression fixtures: `test/adaptive/mixed-cut-application.test.ts`.
 Note for deploy: the first compile on Mythos realizes the pinned cut — a
 one-time KV invalidation of that era (plan perturbation ~248 k tokens).
 
+### 9.2 Post-deploy measurements (2026-07-26 ~21:00Z, Mythos live)
+
+Deployed to Mythos (`9679e2d` on main; pull + tsc + idle restart 20:59Z).
+First live compile realized the pinned cut (`moves=3217`, one-time), then
+steady state: **`planned=actual=253766 budgetMet=true exhausted=false
+moves=0`** — the over-budget/grace wedge is gone on the live agent.
+
+Timing, same-day before/after on the live process:
+
+| instrument | pre-deploy | post-deploy |
+|---|---:|---:|
+| `/debug/context` warm | 26.9–28.2 s | 29–34 s (unchanged) |
+| `/debug/context/makeup` | — | 27–32 s (≈ same as full) |
+| dedicated-process warm compile (harness, on box) | 4.6 s | **3.8 s** |
+
+The endpoint timings did NOT improve because they never measured compile:
+log-growth polling during a timed probe shows the compile's own log lines
+landing at the very END of a ~32 s request — the ~30 s is spent BEFORE/
+inside `select()`, and `makeup` (no big JSON) costs the same as the full
+endpoint. Given the dedicated process pays 29 s at open() (blob resolution
++ materialization) and 3.8 s per warm compile, the live process is paying
+**cold materialization on every preview** — its `getAll()` cache is not
+staying warm between requests. This also explains why the original 22.5 s
+was "very repeatable," and it plausibly applies to real turns as well.
+
+**Next dominant target, in order:**
+1. Why the live process's message-materialization cache goes cold between
+   compiles (sibling-instance write-version bumps? a second MessageStore
+   over the same chronicle in-process? preview-specific view churn?) —
+   worth ~25 s/request on Mythos hardware.
+2. `postStripEstimates` ×4/compile (~0.5 s), `rebuildChunks` per
+   `onNewMessage` (§9), image-strip scans — the residual 3.8 s.
+3. Lazy blob resolution (open() 29 s, ~2 GB RSS).
+
 ## 10. Related
 
 - `docs/kv-stable-context-control.md` — prefix-stability goal
