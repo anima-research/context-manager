@@ -482,6 +482,26 @@ export interface AutobiographicalConfig {
   summarySystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
   summaryUserPrompt?: string;
+  /**
+   * As-of perspective pin for inherited history (e.g. a resident continued
+   * from a shared log they joined partway through). Chunks whose messages
+   * ALL have `sequence` strictly below this value are compressed with the
+   * witnessed-record instruction instead of the first-person one: events
+   * are attributed to the named participants, and the first person is
+   * reserved for the act of reading and carrying the record. Prevents the
+   * summarizer from claiming others' lived experience as the agent's own
+   * memories (observed 2026-07-26: an inheriting resident's L1s
+   * first-personing scenes from before his arrival). Chunks that straddle
+   * the boundary use the standard instruction — the agent's own turns are
+   * present in them.
+   */
+  witnessedBeforeSequence?: number;
+  /**
+   * Override wording for the witnessed-record compression instruction.
+   * `{targetTokens}` is substituted. Defaults to
+   * `formatWitnessedInstruction` in autobiographical.ts.
+   */
+  witnessedInstruction?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
   /** Participant name for the summary (defaults to "Summary") */
