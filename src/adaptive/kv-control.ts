@@ -30,7 +30,7 @@
  * Pure and deterministic.
  */
 
-import type { ChunkId } from './folding-strategy.js';
+import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs, PickerChunk } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
 import { SummaryTree } from './summary-tree.js';
@@ -291,6 +291,30 @@ function relevanceCut(
   const ledger = new TokenLedger(tree, inputs, ordered, F);
   if (_tl) console.error(`[kv-timing] ledger-init ${Date.now() - _tl}ms tokens=${ledger.tokens}`);
 
+  // Eligibility memo, keyed (node, level, phase). The verdict is a pure
+  // function of static inputs (caps / pinCaps) shared by every member chunk
+  // of the group, but the naive loop re-derived it per MEMBER — a group the
+  // head/tail boundary cuts through is permanently ineligible, and its
+  // ~1.7k members each re-scanned its ~1.7k leaves at every level:
+  // O(N·groupSize·levels) ≈ tens of millions of leaf checks per compile
+  // (mythos 2026-07-26: relevanceCut 0.5s → 16s the moment a 150k tail
+  // landed inside the L4 groups). One scan per group instead.
+  const eligibilityMemo = new Map<string, boolean>();
+  const groupEligible = (nodeId: SummaryId, leafIds: readonly ChunkId[], level: number, ignoreShapeCaps: boolean): boolean => {
+    const key = `${nodeId}:${level}:${ignoreShapeCaps ? 'B' : 'A'}`;
+    const hit = eligibilityMemo.get(key);
+    if (hit !== undefined) return hit;
+    let eligible = true;
+    for (const leafId of leafIds) {
+      const cap = caps.get(leafId) ?? 0;
+      const pinCap = pinCaps.get(leafId);
+      if (pinCap !== undefined && level > pinCap) { eligible = false; break; }
+      if (ignoreShapeCaps ? cap < 0 : cap < level) { eligible = false; break; }
+    }
+    eligibilityMemo.set(key, eligible);
+    return eligible;
+  };
+
   const foldPass = (ignoreShapeCaps: boolean, stopAt: number): boolean => {
     for (let level = 1; level <= maxFoldLevel; level++) {
       for (const c of priority) {
@@ -302,14 +326,7 @@ function relevanceCut(
         // covered leaf permits it. Hard protections (−1 sentinel: flat zone /
         // pins / locked) always block; pin-max-level always blocks past its
         // bound; the soft shape cap blocks only in phase A.
-        let eligible = true;
-        for (const leafId of ancestor.leafChunkIds) {
-          const cap = caps.get(leafId) ?? 0;
-          const pinCap = pinCaps.get(leafId);
-          if (pinCap !== undefined && level > pinCap) { eligible = false; break; }
-          if (ignoreShapeCaps ? cap < 0 : cap < level) { eligible = false; break; }
-        }
-        if (!eligible) continue;
+        if (!groupEligible(ancestor.id, ancestor.leafChunkIds, level, ignoreShapeCaps)) continue;
         for (const leafId of ancestor.leafChunkIds) {
           const leaf = byId.get(leafId);
           const from = F.get(leafId) ?? 0;
@@ -487,15 +504,29 @@ function projectToValidCut(
     const byDepth = [...ordered].sort(
       (a, b) => (F.get(b.id) ?? 0) - (F.get(a.id) ?? 0),
     );
+    // Unanimity memo per (node, level), reset each pass. Within a pass the
+    // verdict is stable: lowering a member leaf only makes the group MORE
+    // non-unanimous at that level, and a unanimous group lowers nobody. The
+    // naive per-leaf rescan was O(groupSize²) per disagreeing group per pass
+    // (each of an L4 group's ~1.7k members re-scanning ~1.7k leaves).
+    const unanimityMemo = new Map<string, boolean>();
     for (const c of byDepth) {
       const lvl = F.get(c.id) ?? 0;
       if (lvl <= 0) continue;
       if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
       const node = tree.ancestorAt(c.id, lvl);
-      let unanimous = node != null;
+      let unanimous = false;
       if (node) {
-        for (const leafId of node.leafChunkIds) {
-          if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
+        const key = `${node.id}:${lvl}`;
+        const hit = unanimityMemo.get(key);
+        if (hit !== undefined) {
+          unanimous = hit;
+        } else {
+          unanimous = true;
+          for (const leafId of node.leafChunkIds) {
+            if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
+          }
+          unanimityMemo.set(key, unanimous);
         }
       }
       if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level
