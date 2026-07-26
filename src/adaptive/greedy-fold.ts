@@ -77,7 +77,13 @@ export function runGreedy(
     engine.applyRaise(op.groupRoot);
   }
 
-  return { frontier: engine.snapshotResolutions(), produced };
+  return {
+    frontier: engine.snapshotResolutions(),
+    produced,
+    // Greedy exhaustion: folded until out of moves (and nothing to produce),
+    // yet still above the soft target — see FoldingSolution.exhausted.
+    exhausted: produced.length === 0 && engine.tokenCount() > budget.targetBudget,
+  };
 }
 
 class GreedyEngine implements GreedyState {

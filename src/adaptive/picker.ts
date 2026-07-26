@@ -198,8 +198,10 @@ export interface PickerResult {
   finalTokens: number;
   /** True if the applied frontier is at or below the soft target. */
   budgetMet: boolean;
-  /** True if nothing further can shrink the plan (no production pending)
-   *  and the applied frontier still exceeds the soft target. */
+  /** Solver-owned exhaustion (see FoldingSolution.exhausted): greedy =
+   *  above soft target with nothing left to fold/produce; kv-stable = even
+   *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
+   *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
   /** Number of chunks whose resolution changed vs the carried state. */
   moves: number;
@@ -265,7 +267,8 @@ export class Picker {
   constructor(private readonly solver: FoldingSolver) {}
 
   run(inputs: PickerInputs, budget: FoldingBudget): PickerResult {
-    const { frontier, produced } = this.solver.solve(inputs, budget);
+    const solution = this.solver.solve(inputs, budget);
+    const { frontier, produced } = solution;
 
     // Apply: the frontier is authoritative for live chunks. Entries for ids
     // with no live chunk (summaries whose sources were removed by surgery)
@@ -306,7 +309,7 @@ export class Picker {
       produced,
       finalTokens: tokens,
       budgetMet: tokens <= budget.targetBudget,
-      exhausted: produced.length === 0 && tokens > budget.targetBudget,
+      exhausted: solution.exhausted ?? (produced.length === 0 && tokens > budget.targetBudget),
       moves,
       deadFrontierIds,
       unrealizable: unrealizable.length,

@@ -69,6 +69,26 @@ export interface FoldingSolution {
   frontier: ReadonlyMap<ChunkId, number>;
   /** Summaries the solver wanted but that don't exist yet. */
   produced: ProduceRequest[];
+  /**
+   * Solver-owned exhaustion semantics: true when the solver has no further
+   * way to shrink the plan and the result is genuinely problematic.
+   *
+   * The two shipped semantics differ deliberately:
+   *  - greedy solvers: above the SOFT target with nothing left to fold or
+   *    produce (they fold until they reach the target or run out of moves,
+   *    so "still above target" means capacity is exhausted);
+   *  - kv-stable: even FULL folding exceeds the HARD wall W
+   *    (`ControlPlan.escalated`). Sitting above the soft target inside the
+   *    [target, W] dead band is kv-stable's designed resting state — zero
+   *    perturbation beats chasing the attractor — and must NOT read as
+   *    exhaustion (pre-2026-07 the generic formula flagged every healthy
+   *    dead-band hold, so `exhausted=true` was chronic on healthy agents
+   *    and indistinguishable from the real over-the-wall state).
+   *
+   * Optional for stub/test solvers: when absent the picker falls back to
+   * the greedy formula over the APPLIED frontier's tokens.
+   */
+  exhausted?: boolean;
 }
 
 /**

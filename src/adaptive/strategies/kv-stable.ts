@@ -151,6 +151,14 @@ export class KvStableStrategy implements FoldingSolver {
     });
     this._lastPlan = plan;
     this._lastTarget = plan.resolutions;
-    return { frontier: plan.resolutions, produced: [] };
+    return {
+      frontier: plan.resolutions,
+      produced: [],
+      // Kv-stable exhaustion is the ESCALATED state only: even full folding
+      // exceeds the hard wall W. A dead-band hold above the soft target is
+      // the designed steady state, not exhaustion — see
+      // FoldingSolution.exhausted for why the semantics are solver-owned.
+      exhausted: plan.escalated,
+    };
   }
 }
