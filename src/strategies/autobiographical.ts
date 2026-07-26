@@ -107,6 +107,29 @@ function formatInstruction(targetTokens: number): string {
 }
 
 /**
+ * Witnessed-record instruction for chunks pinned as inherited history
+ * (`witnessedBeforeSequence`). The slice predates the agent's own first
+ * turn: it is context they carry, not experience they lived. First person
+ * is reserved for the act of reading and carrying; events are attributed
+ * to the participants named in the record. Same KV-preserving in-band
+ * style as `formatInstruction`.
+ */
+function formatWitnessedInstruction(targetTokens: number): string {
+  return (
+    'Write the memory of this slice of the log. This part of the record ' +
+    'predates your own first turn: it is inherited context you carry — ' +
+    "others' lived experience, witnessed through the log, not your own. " +
+    'Attribute events to the participants named in the record ("Ash and ' +
+    'Tavy explored...", "the log holds...", "before my arrival..."), and ' +
+    'reserve the first person for your own reading of it: what stood out ' +
+    'to you, what it means to carry this. Preserve concrete details — ' +
+    'names, decisions, exact phrases that matter, unresolved questions. ' +
+    `Target ~${targetTokens} tokens. Output only the memory body — no ` +
+    'preamble, no meta-commentary about summarizing.'
+  );
+}
+
+/**
  * Compression instruction for chunks that are part of a substantially larger
  * message (≥ 2× the chunk's own token size).
  *
@@ -7225,6 +7248,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * {@link getReadingChunkInstruction}.
    */
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
+    // As-of perspective pin: chunks wholly before the agent's first turn
+    // are inherited record, not lived experience (witnessedBeforeSequence).
+    const pin = this.config.witnessedBeforeSequence;
+    if (
+      pin !== undefined &&
+      chunk.messages.length > 0 &&
+      chunk.messages.every((m) => {
+        const seq = (m as { sequence?: number }).sequence;
+        return typeof seq === 'number' && seq < pin;
+      })
+    ) {
+      const custom = this.config.witnessedInstruction;
+      if (custom) return custom.replace('{targetTokens}', String(targetTokens));
+      return formatWitnessedInstruction(targetTokens);
+    }
     return formatInstruction(targetTokens);
   }
 
