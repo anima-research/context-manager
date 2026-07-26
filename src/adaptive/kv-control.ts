@@ -348,6 +348,15 @@ function relevanceCut(
 
   // Phase C: pack youngest-first back toward the target (skip if infeasible).
   if (ledger.tokens <= windowTokens && ledger.tokens < target) {
+    // A group's un-fold verdict (eligibility + accept/revert) can only change
+    // after the ledger moves — i.e. after some OTHER group's un-fold is
+    // accepted. The naive loop re-attempted a just-reverted group for EVERY
+    // remaining member chunk at that level: for a ~1.7k-leaf group the tail
+    // boundary cuts through, that is ~1.7k attempts × 2×1.7k ledger moves
+    // (try + revert) — the dominant term of the mythos 30s/turn leak.
+    // `attempted` short-circuits repeats and is cleared whenever an accept
+    // changes the ledger, so the accept SEQUENCE is exactly the naive one.
+    const attempted = new Set<string>();
     for (let level = maxFoldLevel; level >= 1 && ledger.tokens < target; level--) {
       for (let oi = ordered.length - 1; oi >= 0; oi--) {
         if (ledger.tokens >= target) break;
@@ -356,6 +365,8 @@ function relevanceCut(
         if (rawZone.has(c.id) || immovable.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
+        const attemptKey = `${node.id}:${level}`;
+        if (attempted.has(attemptKey)) continue;
         let eligible = true;
         for (const leafId of node.leafChunkIds) {
           if ((F.get(leafId) ?? 0) !== level || rawZone.has(leafId) || immovable.has(leafId)) {
@@ -363,7 +374,7 @@ function relevanceCut(
             break;
           }
         }
-        if (!eligible) continue;
+        if (!eligible) { attempted.add(attemptKey); continue; }
         const before = ledger.tokens;
         for (const leafId of node.leafChunkIds) {
           const leaf = byId.get(leafId);
@@ -385,6 +396,12 @@ function relevanceCut(
             if (leaf) ledger.move(leaf, byId, level - 1, level);
             F.set(leafId, level);
           }
+          attempted.add(attemptKey);
+        } else {
+          // The ledger moved: previously reverted/ineligible groups may now
+          // verdict differently — exactly when the naive loop would have
+          // re-attempted them.
+          attempted.clear();
         }
       }
     }
