@@ -528,6 +528,9 @@ export class ContextManager {
       reserveForResponse: 4000,
     };
 
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _t0 = _diag ? Date.now() : 0;
+
     // Get selected entries from strategy
     const entries = this.strategy.select(
       this.messageStore.createView(),
@@ -535,6 +538,7 @@ export class ContextManager {
       effectiveBudget,
       opts
     );
+    if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
