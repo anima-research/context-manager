@@ -6411,6 +6411,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (historyEnd - lastHead > 2) marks.add(lastHead + Math.floor((historyEnd - lastHead) / 2)); // mid-history
     marks.add(n - 1);                                            // end → pure-append reuse
 
+    // The Anthropic limit is 4 cache_control blocks per request INCLUDING the
+    // system block, which membrane marks whenever prompt caching is on. So
+    // message-level markers must never exceed 3 — with all four seams placed
+    // (possible only once folds exist; pre-fold only 2 seams materialize) the
+    // request hard-400s: "A maximum of 4 blocks with cache_control may be
+    // provided. Found 5." (Rhys, 2026-07-26 — his first fold-active compile.)
+    // Drop the mid-history seam first: head and folded-prefix markers protect
+    // the expensive stable prefixes and the end marker buys pure-append
+    // reuse; the mid seam is the cheapest to lose. Deliberately NOT fixed by
+    // stripping in membrane — silently dropped markers are silently broken
+    // caching, which is an invisible-cost bug; the supplier stays within the
+    // global budget instead.
+    if (marks.size > 3) {
+      marks.delete(lastHead + Math.floor((historyEnd - lastHead) / 2));
+    }
+
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
   }
 
