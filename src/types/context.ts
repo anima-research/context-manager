@@ -88,6 +88,19 @@ export interface ContextInjection {
  * Result of context compilation.
  * Separates system-position injections from message-level content.
  */
+/** Planner/emitter reconciliation for one compile (see rsEnd). */
+export interface PlanVsActual {
+  /** Picker's projected total after folding. */
+  planned: number;
+  /** Tokens the emitter actually committed. */
+  actual: number;
+  /** actual - planned; positive means the emitter overran the plan. */
+  delta: number;
+  budgetMet: boolean;
+  exhausted: boolean;
+  iterations: number;
+}
+
 export interface CompileResult {
   /** Compiled messages (includes beforeUser/afterUser injections merged in) */
   messages: NormalizedMessage[];

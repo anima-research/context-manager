@@ -86,6 +86,7 @@ export {
 export {
   Picker,
   OverBudgetError,
+  UncoveredDropError,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,

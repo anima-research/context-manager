@@ -33,7 +33,7 @@ import { MessageStore } from '../message-store.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
@@ -3248,8 +3248,174 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _rs: RenderStats | null = null;
   private _lastRenderStats: RenderStats | null = null;
 
+  // ===========================================================================
+  // Coverage invariant: every middle-region message must be rendered raw OR
+  // covered by an emitted summary. The raw-middle paths below are a fallback
+  // for chunks that have not been compressed yet, so when one of them drops a
+  // message under budget pressure there is nothing left to represent it. That
+  // used to happen silently — the select returned a plausible window and the
+  // agent was simply missing a stretch of its own history (Rhys, 2026-07-26:
+  // 126 turns absent, no error, no warning, no stat). Drops are recorded here
+  // and asserted before entries are returned.
+  // ===========================================================================
+  private _uncoveredDrops: string[] = [];
+  private _uncoveredSite = '';
+  private _uncoveredDiag: { budget: number; totalTokens: number } = { budget: 0, totalTokens: 0 };
+
+  /** Record middle-region messages dropped with no summary covering them. */
+  protected recordUncoveredDrops(
+    ids: string[],
+    site: string,
+    diagnostics: { budget: number; totalTokens: number },
+  ): void {
+    if (ids.length === 0) return;
+    for (const id of ids) this._uncoveredDrops.push(id);
+    this._uncoveredSite = site;
+    this._uncoveredDiag = diagnostics;
+  }
+
+  /**
+   * Fail loudly if this select dropped un-summarized middle content.
+   * Called at the end of every select path, immediately before the entries
+   * are returned — a refused turn is strictly better than an agent that
+   * quietly lost part of its past.
+   */
+  protected assertMiddleCoverage(): void {
+    if (this._uncoveredDrops.length === 0) return;
+    const droppedIds = this._uncoveredDrops;
+    const site = this._uncoveredSite;
+    const diagnostics = this._uncoveredDiag;
+    this._uncoveredDrops = [];
+    // A dry-run preview exists precisely to answer "what would happen at these
+    // settings" — including settings that would lose content. Report there,
+    // throw only on a committing select.
+    // Read defensively: this patch must also apply to trees without the
+    // dry-run preview feature (fleet clones on origin/main).
+    const inPreview = (this as unknown as { _previewInFlight?: boolean })._previewInFlight === true;
+    if (inPreview) {
+      console.warn(
+        `[autobiographical] preview: ${droppedIds.length} middle message(s) would be ` +
+        `dropped with no summary coverage (site=${site}, budget=${diagnostics.budget}).`,
+      );
+      return;
+    }
+    throw new UncoveredDropError({ droppedIds, site, diagnostics });
+  }
+
+  /**
+   * Of the middle messages left unrendered when a select loop broke, return
+   * only those with NO summary representation — resolution 0 (meant to render
+   * raw) or a resolution whose ancestor summary doesn't exist. Messages that
+   * still have a live summary ancestor are covered and must NOT be reported,
+   * or steady-state agents would throw on ordinary budget pressure.
+   */
+  protected uncoveredRemaining(
+    messages: StoredMessage[],
+    from: number,
+    to: number,
+    finalResolutions: ReadonlyMap<string, number>,
+    chunksByMessageId: Map<string, unknown>,
+    summariesById: Map<string, unknown>,
+  ): string[] {
+    const out: string[] = [];
+    for (let k = from; k < to && k < messages.length; k++) {
+      const m = messages[k];
+      if (!m) continue;
+      const res = finalResolutions.get(m.id) ?? 0;
+      if (res === 0) { out.push(m.id); continue; }
+      const ancestor = this.findAncestorAt(
+        m.id,
+        res,
+        chunksByMessageId as never,
+        summariesById as never,
+      );
+      if (!ancestor) out.push(m.id);
+    }
+    return out;
+  }
+
+  /**
+   * THE COVERAGE INVARIANT.
+   *
+   * Every message the selector was handed must leave the renderer either
+   * rendered raw, or represented by a summary that was ITSELF rendered —
+   * following the summary graph transitively, because a message is usually
+   * not covered by its own L1 but by an L2/L3 that subsumes it:
+   *
+   *     msg ──in──> L1 ──in──> L2 ──in──> L3      (only L3 emitted)
+   *
+   * A `SummaryEntry` says which kind of thing its `sourceIds` point at via
+   * `sourceLevel`: 0 means message ids, n>0 means summary ids one level down.
+   * So coverage is computed by expanding every emitted summary downward until
+   * level 0 and unioning the message ids found there.
+   *
+   * This replaces per-drop-site bookkeeping. Site trackers only catch the
+   * `break`s someone remembered to instrument — three were patched on
+   * 2026-07-26 and a fourth (recent-window eviction) was found only because
+   * Rhys's import tripped it. A check on the finished output does not care HOW
+   * something went missing, so paths that don't exist yet are covered too.
+   *
+   * Deliberately runs BEFORE the tool-pairing/orphan/image passes: those
+   * remove content to satisfy API shape rules, which is a structural edit
+   * rather than budget-driven loss, and is out of scope for this invariant.
+   */
+  protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[]): void {
+    const covered = new Set<string>();
+    for (const e of entries) {
+      const id = (e as { sourceMessageId?: string }).sourceMessageId;
+      if (id) covered.add(id);
+    }
+
+    // Expand emitted summaries down to the message ids they stand for.
+    const byId = new Map(this.summaries.map(x => [x.id, x]));
+    const seen = new Set<string>();
+    const stack: string[] = [...this._emittedSummaryIds];
+    while (stack.length > 0) {
+      const id = stack.pop();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const sum = byId.get(id);
+      if (!sum) continue;
+      if (sum.sourceLevel === 0) {
+        for (const mid of sum.sourceIds) covered.add(mid);
+      } else {
+        for (const child of sum.sourceIds) stack.push(child);
+      }
+    }
+
+    const missing: string[] = [];
+    for (const m of messages) if (!covered.has(m.id)) missing.push(m.id);
+    if (missing.length === 0) return;
+
+    const site = this._uncoveredSite || 'unknown-site';
+    const diagnostics = this._uncoveredDiag.budget > 0
+      ? this._uncoveredDiag
+      : { budget: 0, totalTokens: 0 };
+    // A preview answers "what would happen at these settings" — including
+    // settings that lose content. Report there; refuse only a committing pass.
+    void diagnostics;
+    // NOT fatal yet — BLOCKED on entry provenance. `ContextEntry` carries a
+    // single `sourceMessageId`, but `mergeAdjacentBodyGroupRaw` collapses
+    // several raw entries (body-group shards) into one composite, so the ids
+    // of the absorbed shards are absent from the output and read as "missing"
+    // here. Measured 2026-07-26: 22 suite failures, all of this shape (1-3
+    // ids, no drop site fired). Making this fatal requires `sourceMessageIds:
+    // MessageId[]` on ContextEntry (or provenance recorded at emission), after
+    // which this check subsumes and replaces the per-site trackers — and
+    // `/debug/context/coverage` finally means something.
+    console.warn(
+      `[autobiographical] coverage: ${missing.length} message(s) not attributable to ` +
+      `a rendered entry or summary (site=${site}). NOTE: composite body-group ` +
+      `entries under-report provenance, so this count may include false positives.`,
+    );
+  }
+
   /** Begin a render-stats accumulation for one select() pass. */
   protected rsBegin(): void {
+    this._uncoveredDrops = [];
+    this._emittedSummaryIds = new Set();
+    this._plannedTokens = null;
+    this._plannedMeta = null;
     this._rs = {
       head: { messages: 0, tokens: 0 },
       tail: { messages: 0, tokens: 0 },
@@ -3273,7 +3439,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Tally one emitted recall pair under its ancestor's level (>=3 folds into l3). */
-  protected rsSummary(level: number, tokens: number): void {
+  /** Ids of summaries actually emitted into the rendered context this pass.
+   *  Identity is what makes transitive coverage checkable — level+tokens alone
+   *  cannot tell you WHICH messages a rendered summary stands in for. */
+  private _emittedSummaryIds: Set<string> = new Set();
+  /** The picker's projected total for this compile (planner side). */
+  private _plannedTokens: number | null = null;
+  private _plannedMeta: { budgetMet: boolean; exhausted: boolean; iterations: number } | null = null;
+
+  protected rsSummary(level: number, tokens: number, id?: string): void {
+    if (id) this._emittedSummaryIds.add(id);
     const r = this._rs;
     if (!r) return;
     const k: 'l1' | 'l2' | 'l3' = level <= 1 ? 'l1' : level === 2 ? 'l2' : 'l3';
@@ -3297,6 +3472,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         r.head.tokens + r.tail.tokens + r.middleRaw.tokens +
         s.l1.tokens + s.l2.tokens + s.l3.tokens,
     };
+    // Planner vs emitter reconciliation. `planned` is what the picker
+    // projected after folding; `actual` is what the emitter committed. They
+    // should agree — a persistent gap means the plan is written in units the
+    // emitter doesn't spend in, and the difference is silently absorbed by
+    // whatever renders last (the recent window). Logged on every compile so
+    // the drift is observable before it becomes an eviction.
+    if (this._plannedTokens !== null) {
+      const actual = r.total.tokens;
+      const planned = this._plannedTokens;
+      const delta = actual - planned;
+      const pct = planned > 0 ? (delta / planned) * 100 : 0;
+      const m = this._plannedMeta;
+      r.planVsActual = {
+        planned,
+        actual,
+        delta,
+        budgetMet: m?.budgetMet ?? false,
+        exhausted: m?.exhausted ?? false,
+        iterations: m?.iterations ?? 0,
+      };
+      // Loud only when the emitter OVERRUNS the plan — that is the direction
+      // that costs the tail. Under-spend is harmless slack.
+      const loud = delta > 0 && Math.abs(pct) >= 2;
+      const line =
+        `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
+        ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
+        ` iterations=${m?.iterations}`;
+      if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
+      else console.error(line);
+    }
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -3392,7 +3597,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let acceptedTokens = 0;
     for (let i = messages.length - 1; i >= recentStart; i--) {
       const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
-      if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) break;
+      if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) {
+        // Newest-first eviction: everything from recentStart..i is being
+        // dropped. These live in the RECENT window, so by definition no
+        // summary covers them — the drop is unrepresented history, not a
+        // resolution downgrade. Record it so the select fails loudly rather
+        // than returning a window that silently begins mid-conversation.
+        const dropped: string[] = [];
+        for (let k = recentStart; k <= i; k++) {
+          const m = messages[k];
+          if (m) dropped.push(m.id);
+        }
+        // An event is never permitted to go unrepresented. The postmortem
+        // that produced the newest-first order (Triumvirate Conhost Silence,
+        // 2026-05-04) fixed WHICH end got cut after dropped messages made an
+        // agent go silent — it never sanctioned the cutting. Evicting from
+        // the recent window removes messages that no rendered summary covers,
+        // so it is loss, and loss refuses the turn rather than shipping a
+        // context that silently begins mid-conversation.
+        console.warn(
+          `[autobiographical] recent-window eviction dropped ${dropped.length} message(s) ` +
+          `(budget=${maxTokens}); ${this.summaries.length === 0
+            ? 'store has NO summaries — this is unrecoverable loss'
+            : 'older recent-window messages, expected to be summary-covered'}.`,
+        );
+        this.recordUncoveredDrops(dropped, 'emitRecentNewestFirst/eviction', {
+          budget: maxTokens,
+          totalTokens: totalTokensBefore + acceptedTokens,
+        });
+        break;
+      }
       accepted.push(i);
       acceptedTokens += tokens;
     }
@@ -5284,8 +5518,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             targetBudget: preparedTotal * (1 - slack),
           },
     );
+    // NOTE: a dry run also disturbs transition bookkeeping below
+    // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
+    // low-budget preview could make a converging transition look prepared and
+    // get it settled by the next real compile). That is restored by
+    // also restore it here, or the two owners will disagree.
     const result = picker.run(pickerInputs, foldingBudget);
     this.lastFrontierTokens = result.finalTokens;
+    // PLANNER/EMITTER RECONCILIATION (2026-07-26). The picker plans against
+    // estimates; the emitter then spends real tokens per entry. When the two
+    // disagree the emitter can overrun a plan that "fit", and the overrun is
+    // paid by whatever renders last — the recent window — which is how tail
+    // eviction becomes reachable at all. Eviction is therefore a symptom of
+    // plan drift, not of scarce foldable material: the picker either reaches
+    // its target or raises OverBudgetError. Record the plan so rsEnd() can
+    // compare it against what was actually committed.
+    this._plannedTokens = result.finalTokens;
+    this._plannedMeta = {
+      budgetMet: result.budgetMet,
+      exhausted: result.exhausted,
+      iterations: result.iterations,
+    };
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.
@@ -5489,7 +5742,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               entries.push(questionEntry);
               entries.push(answerEntry);
               totalTokens += pairTokens;
-              this.rsSummary(ancestor.level, pairTokens);
+              this.rsSummary(ancestor.level, pairTokens, ancestor.id);
             }
           }
           currentRun = null;
@@ -5532,7 +5785,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!budgetExhausted) {
           if (!flushRun()) budgetExhausted = true;
         }
-        if (budgetExhausted) break;
+        if (budgetExhausted) {
+          this.recordUncoveredDrops(
+            this.uncoveredRemaining(messages, i, effectiveRecentStart,
+              result.finalResolutions, chunksByMessageId, summariesById),
+            'selectAdaptive/shards', { budget: prefixBudget, totalTokens },
+          );
+          break;
+        }
         continue;
       }
 
@@ -5541,7 +5801,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
         const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-        if (totalTokens + tokens > prefixBudget) break;
+        if (totalTokens + tokens > prefixBudget) {
+          this.recordUncoveredDrops(
+            this.uncoveredRemaining(messages, i, effectiveRecentStart,
+              result.finalResolutions, chunksByMessageId, summariesById),
+            'selectAdaptive/raw', { budget: prefixBudget, totalTokens },
+          );
+          break;
+        }
         entries.push({
           index: entries.length,
           sourceMessageId: msg.id,
@@ -5557,7 +5824,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
-          if (totalTokens + tokens > prefixBudget) break;
+          if (totalTokens + tokens > prefixBudget) {
+            this.recordUncoveredDrops(
+              this.uncoveredRemaining(messages, i, effectiveRecentStart,
+                result.finalResolutions, chunksByMessageId, summariesById),
+              'selectAdaptive/no-ancestor', { budget: prefixBudget, totalTokens },
+            );
+            break;
+          }
           entries.push({
             index: entries.length,
             sourceMessageId: msg.id,
@@ -5593,7 +5867,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.push(questionEntry);
         entries.push(answerEntry);
         totalTokens += pairTokens;
-        this.rsSummary(ancestor.level, pairTokens);
+        this.rsSummary(ancestor.level, pairTokens, ancestor.id);
         i++;
       }
     }
@@ -5623,6 +5897,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it falls into (preserves KV cache through region transitions).
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store);
 
+    this.assertFullCoverage(merged, messages);
     this.pruneToolEntries(merged);
     this.trimOrphanedToolUse(merged);
     // Full pairing invariant over the final rendered context — catches the
@@ -5668,6 +5943,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    this.assertMiddleCoverage();
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
@@ -6344,7 +6620,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             entries.push(questionEntry);
             entries.push(answerEntry);
             totalTokens += pairTokens;
-            this.rsSummary(summary.level, pairTokens);
+            this.rsSummary(summary.level, pairTokens, summary.id);
           } else {
             const msg = item.msg;
             const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
@@ -6401,18 +6677,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           entries.push(questionEntry);
           entries.push(answerEntry);
           totalTokens += pairTokens;
-          for (const s of selectedSummaries) this.rsSummary(s.level, s.tokens);
+          for (const s of selectedSummaries) this.rsSummary(s.level, s.tokens, s.id);
         }
 
         // Sort by position so uncompressed-middle messages and pins both
         // appear in their chronological place after the combined recall pair.
         const middleRawSorted = [...middleRaw].sort((a, b) => a.position - b.position);
-        for (const { msg } of middleRawSorted) {
+        for (let mi = 0; mi < middleRawSorted.length; mi++) {
+          const { msg } = middleRawSorted[mi]!;
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0
             ? Math.min(store.estimateTokens(msg), msgCap + 50)
             : store.estimateTokens(msg);
-          if (this.isOverBudget(totalTokens + tokens, maxTokens)) break;
+          if (this.isOverBudget(totalTokens + tokens, maxTokens)) {
+            // These messages are the UNCOMPRESSED middle — no summary covers
+            // them (see the middleRaw construction above). Dropping them here
+            // removes them from the agent's context with no representation at
+            // all, so record every remaining id and fail loudly at the end of
+            // the select rather than returning a plausible-looking window.
+            this.recordUncoveredDrops(
+              middleRawSorted.slice(mi).map(x => x.msg.id),
+              'selectHierarchical/middleRaw',
+              { budget: maxTokens, totalTokens },
+            );
+            break;
+          }
           entries.push({
             index: entries.length,
             sourceMessageId: msg.id,
@@ -6434,6 +6723,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, maxTokens, totalTokens);
     this.rsRaw('tail', tailStats.tokens, tailStats.messages);
 
+    this.assertFullCoverage(entries, messages);
+    this.assertMiddleCoverage();
     this.trimOrphanedToolUse(entries);
     // Full pairing invariant over the final rendered context — catches the
     // mid-list orphans the trailing/leading trims can't (bug 6.7).

@@ -342,6 +342,23 @@ export interface RenderStats {
    * Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
+
+  /**
+   * Planner/emitter reconciliation for this compile. `planned` is the picker's
+   * projection after folding; `actual` is what the emitter committed. A
+   * persistent positive `delta` means the emitter spends in units the planner
+   * doesn't model, and the overrun lands on whatever renders last — the recent
+   * window — which is how tail eviction becomes reachable despite the picker
+   * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
+   */
+  planVsActual?: {
+    planned: number;
+    actual: number;
+    delta: number;
+    budgetMet: boolean;
+    exhausted: boolean;
+    iterations: number;
+  };
 }
 
 /**

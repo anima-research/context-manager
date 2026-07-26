@@ -70,6 +70,59 @@ export class OverBudgetError extends Error {
 }
 
 /**
+ * Error raised when the renderer dropped middle-region messages that NO
+ * emitted summary covers — i.e. content that exists in the store but would
+ * appear nowhere in the compiled context.
+ *
+ * This is the counterpart to `OverBudgetError` for the per-message path.
+ * `OverBudgetError` fires when the WHOLE window cannot be made to fit; this
+ * fires when the window "fit" only because raw middle messages were silently
+ * discarded. The distinction matters because the raw-middle path is a
+ * fallback for chunks that have not been compressed yet — when it drops, the
+ * messages have no summary to fall back to and are simply gone.
+ *
+ * Silent elision here is indistinguishable from a successful render, so the
+ * failure mode is an agent quietly missing a stretch of its own history. It
+ * shows up hardest on a FRESH IMPORT, where chunks exist but no summaries
+ * have been generated yet — every revived resident hits it on turn one.
+ * (First observed 2026-07-26: Rhys, a custody migration, lost 126 of his
+ * oldest turns from the window with no error of any kind.)
+ *
+ * Remediation is a config change, not a retry: raise `recentWindowTokens` so
+ * the raw tail covers the un-summarized span, raise `contextBudgetTokens`, or
+ * let compression run so the middle has summaries to render.
+ */
+export class UncoveredDropError extends Error {
+  /** Ids of middle-region messages dropped without summary coverage. */
+  readonly droppedIds: string[];
+  /** Where in the renderer the drop happened (selector + site). */
+  readonly site: string;
+  readonly diagnostics: { budget: number; totalTokens: number };
+
+  constructor(opts: {
+    droppedIds: string[];
+    site: string;
+    diagnostics: UncoveredDropError['diagnostics'];
+  }) {
+    const n = opts.droppedIds.length;
+    const sample = opts.droppedIds.slice(0, 3).join(', ');
+    super(
+      `Renderer dropped ${n} middle message(s) that no summary covers ` +
+        `(site=${opts.site}, budget=${opts.diagnostics.budget}, ` +
+        `rendered=${opts.diagnostics.totalTokens}). These messages would be ` +
+        `absent from the agent's context entirely. First ids: ${sample}` +
+        (n > 3 ? `, … (+${n - 3} more)` : '') +
+        `. Raise recentWindowTokens so the raw tail covers the un-summarized ` +
+        `span, raise contextBudgetTokens, or let compression produce summaries.`
+    );
+    this.name = 'UncoveredDropError';
+    this.droppedIds = opts.droppedIds;
+    this.site = opts.site;
+    this.diagnostics = opts.diagnostics;
+  }
+}
+
+/**
  * Minimal chunk representation used by the picker. Real callers will adapt
  * their `StoredMessage` instances to this shape.
  */
