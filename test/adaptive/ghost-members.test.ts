@@ -9,7 +9,7 @@
  * L3 forever; 19 ghosts across two groups inverted the whole compression
  * curve (older eras LESS folded than newer ones) and drove the solver to
  * `budgetMet=false exhausted moves=0` churn. Specimen preserved at
- * keep:~/specimens/mythos-inverted-curve-20260726.
+ * mythos box ~/specimens/mythos-inverted-curve-20260726.
  */
 
 import { test } from 'node:test';

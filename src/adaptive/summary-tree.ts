@@ -226,7 +226,7 @@ export class SummaryTree {
    *  leafChunkIds — downstream, groupEligible() reads a missing leaf as
    *  cap 0 and the whole group becomes permanently unraisable (one ghost
    *  vetoed 3,637 live members on mythos; specimen
-   *  keep:~/specimens/mythos-inverted-curve-20260726). A summary's effective
+   *  mythos box ~/specimens/mythos-inverted-curve-20260726). A summary's effective
    *  coverage is its LIVE sources — `children()` already applies the same
    *  filter. */
   private collectLeafIds(summary: SummaryEntry): ChunkId[] {
