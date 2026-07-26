@@ -44,7 +44,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
   it('throws OverBudgetError when tail alone exceeds budget', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
       // Large tail window: everything we add will be tail-resident, NOT
       // foldable. The picker has nothing to do with it.
@@ -160,20 +160,28 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
       text: `TRIGGERING-TURN ${'.'.repeat(80)}`,
     }]);
 
-    const compiled = await manager.compile({ maxTokens: 80, reserveForResponse: 0 });
-    const text = compiled.messages
-      .flatMap(message => message.content)
-      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-      .map(block => block.text)
-      .join('\n');
-    assert.match(text, /TRIGGERING-TURN/);
+    // The picker above LIES (finalTokens: 1) while planning everything raw.
+    // Pre-invariant, emission kept the reserved tail and silently dropped the
+    // older raw history to fit. Under the fatal coverage invariant (76e95a0)
+    // silent loss is forbidden: the select must refuse instead — and the
+    // refusal diagnostics must show the tail was reserved before any older
+    // raw history was considered (the property this test exists to pin).
+    await assert.rejects(
+      manager.compile({ maxTokens: 80, reserveForResponse: 0 }),
+      (err: unknown) => {
+        assert.ok(err instanceof OverBudgetError, `expected OverBudgetError, got ${String(err)}`);
+        assert.ok(err.diagnostics.tailTokens > 0, 'recent tail must be reserved in the failing plan');
+        assert.ok(err.actual > err.budget, 'reported overage must exceed the budget');
+        return true;
+      },
+    );
     manager.close();
   });
 
   it('does NOT throw when picker can fold its way under budget', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -199,7 +207,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
   it('does NOT throw under generous budget', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -220,7 +228,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
   it('allows an exhausted compile within the configured grace ratio', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
       recentWindowTokens: 100_000,
       overBudgetGraceRatio: 0.25,
@@ -245,7 +253,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
   it('error diagnostics include useful state info', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
       recentWindowTokens: 100_000,
     });

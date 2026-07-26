@@ -58,7 +58,7 @@ describe('AutobiographicalStrategy — doc + chat workload (Lena-like)', () => {
     // relative to the fixture's content, honest units.
     const BUDGET = 45000;
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 1000, // ~4K chars per shard
       recentWindowTokens: 2000,
       mergeThreshold: 6,
@@ -133,7 +133,7 @@ describe('AutobiographicalStrategy — doc + chat workload (Lena-like)', () => {
   it('agent can lock a critical doc section and it survives folding pressure', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 500,
       recentWindowTokens: 500,
     });
@@ -190,7 +190,7 @@ describe('AutobiographicalStrategy — doc + chat workload (Lena-like)', () => {
   it('doc + many turns: shards in different regions render correctly', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 400,
       recentWindowTokens: 800,
       mergeThreshold: 3,

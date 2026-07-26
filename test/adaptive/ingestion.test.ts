@@ -47,7 +47,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag off: large messages stay as one StoredMessage (no chunking)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: false,
+      compressionModel: 'mock',      adaptiveResolution: false,
       targetChunkTokens: 100,
     });
     const manager = await ContextManager.open({
@@ -68,7 +68,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: large messages are sharded into multiple StoredMessages', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 1000, // chunker threshold ~2x = 2000
       recentWindowTokens: 200,
     });
@@ -108,7 +108,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: compile renders bodyGroup as ONE entry with byte-faithful body (no folding)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 1000,
       recentWindowTokens: 50_000, // big enough that everything stays in tail (no folding)
     });
@@ -138,7 +138,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: compile renders bodyGroup as combined entry under folding pressure', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 1000,
       recentWindowTokens: 200, // small so most of the doc is in the foldable middle
     });
@@ -189,7 +189,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: small messages (under threshold) are NOT chunked', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 1000,
     });
     const manager = await ContextManager.open({
@@ -208,7 +208,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: folded shards within a bodyGroup emit separate Q+A recall pair messages', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 300,
       recentWindowTokens: 200, // small so the doc is in foldable middle
       summaryContextLabel: 'What do you remember from earlier?',
@@ -274,7 +274,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: tail-only bodyGroup renders as ONE composite User message (not N turns)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 300,
       recentWindowTokens: 100_000, // big tail so the doc fits entirely in tail
     });
@@ -328,7 +328,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
   it('flag on: non-text content (e.g., tool_use blocks) is preserved on first shard', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 500,
     });
     const manager = await ContextManager.open({

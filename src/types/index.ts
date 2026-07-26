@@ -34,6 +34,8 @@ export type {
   HotContextSettings,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
+  SelectOptions,
+  PreviewResult,
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,

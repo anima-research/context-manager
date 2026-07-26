@@ -21,6 +21,8 @@ import type {
   SearchResult,
   SummaryEntry,
   HotContextSettingsUpdate,
+  SelectOptions,
+  PreviewResult,
   HotContextSettingsStatus,
 } from './types/index.js';
 import {
@@ -507,7 +509,8 @@ export class ContextManager {
    */
   async compile(
     budget?: TokenBudget,
-    injections?: ContextInjection[]
+    injections?: ContextInjection[],
+    opts?: SelectOptions
   ): Promise<CompileResult> {
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -529,7 +532,8 @@ export class ContextManager {
     const entries = this.strategy.select(
       this.messageStore.createView(),
       this.contextLog.createView(),
-      effectiveBudget
+      effectiveBudget,
+      opts
     );
 
     // Convert to NormalizedMessage[]. We split each entry individually
@@ -680,6 +684,29 @@ export class ContextManager {
       throw new Error('Active strategy does not support live context settings');
     }
     return this.strategy.updateHotContextSettings(update);
+  }
+
+  /**
+   * Non-committing preview of the layout at a hypothetical budget and/or
+   * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
+   * Returns null when the active strategy has no fold plan to preview.
+   */
+  previewContext(budget: TokenBudget, overrides?: Record<string, unknown>): PreviewResult | null {
+    const s = this.strategy as unknown as {
+      previewContext?: (
+        store: ReturnType<MessageStore['createView']>,
+        log: ReturnType<ContextLog['createView']>,
+        budget: TokenBudget,
+        overrides?: Record<string, unknown>,
+      ) => PreviewResult;
+    };
+    if (typeof s.previewContext !== 'function') return null;
+    return s.previewContext(
+      this.messageStore.createView(),
+      this.contextLog.createView(),
+      budget,
+      overrides,
+    );
   }
 
   // ==========================================================================

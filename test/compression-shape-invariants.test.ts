@@ -120,6 +120,14 @@ const t = (s: string): ContentBlock => ({ type: 'text', text: s });
 const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
 const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'ok' });
 
+// Compression of tool-bearing history DEFERS until the host declares its tool
+// definitions (the 07-09 reasoning_extraction fix: a summarizer call replaying
+// tool blocks without a `tools` param gets refused). Fixtures that add tool
+// cycles must do what agent-framework does every activation.
+const TEST_TOOLS = [
+  { name: 'fn', description: 'test tool', inputSchema: { type: 'object' as const } },
+];
+
 async function drain(manager: ContextManager): Promise<void> {
   // Cap iterations so a regression that fails to converge can't hang CI.
   for (let i = 0; i < 500; i++) {
@@ -133,7 +141,7 @@ describe('Compression pipeline: API shape invariants', () => {
   before(() => cleanup());
   after(() => cleanup());
 
-  it('L1 compression: chunker close lands on a tool_use without fix — must not throw', { todo: 'KNOWN-OPEN pre-rev5 compression-shape bug (memory: project_kv_rev5 backlog) — do not let it block releases' }, async () => {
+  it('L1 compression: chunker close lands on a tool_use without fix — must not throw', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
@@ -148,6 +156,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     // Force the chunker to want to close on a tool_use-bearing message:
     //   - 3 small messages (length 3, tokens ~30)
@@ -172,7 +181,7 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
-  it('L1 compression: strips thinking/redacted_thinking from the summarizer input', { todo: 'KNOWN-OPEN pre-rev5 compression-shape bug (memory: project_kv_rev5 backlog) — do not let it block releases' }, async () => {
+  it('L1 compression: strips thinking/redacted_thinking from the summarizer input', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
@@ -187,6 +196,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
     const th = (s: string): ContentBlock =>
       ({ type: 'thinking', thinking: s, signature: 'sig-' + s.slice(0, 6) } as unknown as ContentBlock);
     const small = (n: number) => 'word '.repeat(n);
@@ -215,7 +225,7 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
-  it('L2/L3 merge cascade preserves shape across hundreds of summaries', { todo: 'KNOWN-OPEN pre-rev5 compression-shape bug (memory: project_kv_rev5 backlog) — do not let it block releases' }, async () => {
+  it('L2/L3 merge cascade preserves shape across hundreds of summaries', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
@@ -231,6 +241,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     const filler = (n: number) => 'word '.repeat(n);
     for (let i = 0; i < 80; i++) {
@@ -315,7 +326,7 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
-  it('runtime splitMixedToolMessages handles bundled cycles in source data', { todo: 'KNOWN-OPEN pre-rev5 compression-shape bug (memory: project_kv_rev5 backlog) — do not let it block releases' }, async () => {
+  it('runtime splitMixedToolMessages handles bundled cycles in source data', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
     const strategy = new AutobiographicalStrategy({
@@ -330,6 +341,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     // Pre-Bug-8 import shape: tool_use AND tool_result bundled into one
     // assistant message. The runtime split has to unpack these before the
