@@ -3354,7 +3354,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       opts?: SelectOptions
     ): ContextEntry[] {
       this.requireLoadedBranch('select');
+      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+      const _t0 = _diag ? Date.now() : 0;
       this.rebuildChunks(store);
+      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
 
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
@@ -5591,12 +5594,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const rejectionBudget = Math.floor(maxTokens * (1 + overBudgetGraceRatio));
     // Closed-loop calibration: apply the persisted multiplier BEFORE any
     // estimate is taken this compile.
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store);
     const messages = store.getAll();
+    if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
     const msgCap = this.config.maxMessageTokens;
     // Post-strip estimates (see postStripEstimates): every budgeting site in
     // this method prices a message the way the stripped render will cost it.
     const pse = this.postStripEstimates(store);
+    if (_diag) { console.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
     const headStart = this.getHeadWindowStartIndex(store);
@@ -5814,7 +5821,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // get it settled by the next real compile). That is restored by
     // previewContext's `finally`, which owns it for ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
+    if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
+    if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
     // PLANNER/EMITTER RECONCILIATION (2026-07-26). The picker plans against
     // estimates; the emitter then spends real tokens per entry. When the two
