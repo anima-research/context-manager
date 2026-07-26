@@ -43,7 +43,7 @@ describe('MessageStore — shard immutability', () => {
 
   it('editMessage on a shard throws', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
     });
     const manager = await ContextManager.open({
@@ -69,7 +69,7 @@ describe('MessageStore — shard immutability', () => {
 
   it('removeMessage on a single shard throws (must remove whole bodyGroup)', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
     });
     const manager = await ContextManager.open({
@@ -90,7 +90,7 @@ describe('MessageStore — shard immutability', () => {
 
   it('removeBodyGroup removes all shards atomically', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
     });
     const manager = await ContextManager.open({
@@ -126,7 +126,7 @@ describe('MessageStore — shard immutability', () => {
 
   it('removeRange that bisects a bodyGroup throws', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
     });
     const manager = await ContextManager.open({
@@ -148,7 +148,7 @@ describe('MessageStore — shard immutability', () => {
 
   it('removeRange aligned to bodyGroup boundaries is OK', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
     });
     const manager = await ContextManager.open({
@@ -185,7 +185,7 @@ describe('AutobiographicalStrategy — pin respected in adaptive path (Fix #1)',
 
   it('pinRange prevents the picker from folding the pinned messages', async () => {
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });

@@ -107,15 +107,29 @@ test('pin-max-level: a HARD fold-depth cap, enforced even under the W emergency'
 test('pin-max-level un-folds a carried resolution deeper than the cap (on pin-add)', () => {
   const { tree, inputs } = session();
   const capped = 'c-0006';
-  // F_prev has it deep at L2; adding maxLevel:1 must un-fold it to L1 immediately,
-  // even though the render is comfortably under budget (dead band).
+  // F_prev has the capped chunk's whole L2 node folded deep at L2 — a VALID
+  // tree cut (a lone leaf carried at L2 would be projected toward raw by the
+  // group-consistency pass from the 2026-07-25 oscillation fix, e82f284,
+  // because rendering a group's recall pair alongside raw siblings would
+  // double-represent them). Adding maxLevel:1 must un-fold the capped chunk
+  // to EXACTLY the cap immediately, even though the render is comfortably
+  // under budget (dead band) — the intended divergence cost of tightening
+  // a pin.
+  const node = tree.ancestorAt(capped, 2)!;
+  const previous = new Map(node.leafChunkIds.map((id) => [id, 2] as const));
   const r = planControlledFrontier(inputs, tree, {
-    previous: new Map([[capped, 2]]),
+    previous,
     foldAtTokens: 200_000, expandAtTokens: 0, targetTokens: 200_000,
     windowTokens: 200_000, rawZone: new Set(), pinCaps: new Map([[capped, 1]]),
     now: NOW, mergeThreshold: 6,
   });
   assert.equal(r.resolutions.get(capped), 1, 'carried L2 clamped down to the L1 cap at plan start');
+  // The clamp must never overshoot past the cap to raw, and the rest of the
+  // carried node must settle on a valid cut at or below its carried depth.
+  for (const id of node.leafChunkIds) {
+    const lvl = r.resolutions.get(id) ?? 0;
+    assert.ok(lvl >= 1 && lvl <= 2, `carried node leaf ${id} stays folded on a valid cut (got L${lvl})`);
+  }
 });
 
 test('KvStableStrategy walks the picker to a pin-at-level-k target', () => {

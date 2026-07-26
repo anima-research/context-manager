@@ -46,51 +46,65 @@ export class FlatProfileStrategy implements FoldingStrategy {
       }
     }
 
-    // Pick most-populous level; tiebreak: lower wins.
-    let bestLevel = -1;
-    let bestCount = 0;
-    for (const [level, items] of visibleAtLevel) {
-      const count = items.size;
-      if (count > bestCount || (count === bestCount && (bestLevel < 0 || level < bestLevel))) {
-        bestLevel = level;
-        bestCount = count;
-      }
-    }
-    if (bestLevel < 0) return null;
+    // Rank levels most-populous first; tiebreak: lower wins.
+    const rankedLevels = [...visibleAtLevel.entries()]
+      .sort(([la, a], [lb, b]) => (b.size - a.size) || (la - lb))
+      .map(([level]) => level);
 
-    // Find the oldest raisable group at bestLevel. A "group" at level k is
-    // the set of chunks sharing an L_{k+1} ancestor. We want to raise that
-    // group all the way to L_{k+1}.
+    // Prefer a RAISE at the best-ranked level that has one; fall back to the
+    // best-ranked PRODUCE only when no level offers a raise.
     //
-    // The oldest group is the one containing the oldest chunk at level k.
-    const oldestChunk = middle.find((c) => c.currentResolution === bestLevel);
-    if (!oldestChunk) return null;
-
-    const parentLevel = bestLevel + 1;
-    const parentSummary = oldestChunk.ancestorAt(parentLevel);
-    if (!parentSummary) {
-      // L_{k+1} not produced for this chunk's group yet — request it.
+    // A produce op stops the pick ("record and stop; caller enqueues, next
+    // compile retries" — single-path solve), so returning one while raisable
+    // groups exist elsewhere refuses a compile that could have fit by raising.
+    // Worse, a produce aimed at chunkless frontier messages (a chunk only
+    // closes at targetChunkTokens AND >= 4 messages, so the newest span may be
+    // permanently unchunked) can NEVER be satisfied: every compile re-demands
+    // it and refuses — a livelock (found via deep-levels #4, 2026-07-26).
+    // Produce is for building genuinely missing summaries when nothing else
+    // can shrink the plan, not the first resort.
+    let fallbackProduce: FoldOp | null = null;
+    for (const bestLevel of rankedLevels) {
+      // Find the oldest raisable group at this level. A "group" at level k is
+      // the set of chunks sharing an L_{k+1} ancestor. We want to raise that
+      // group all the way to L_{k+1}.
       //
-      // Range semantics differ by level:
-      //  - bestLevel === 0: the caller is asking for an L1 covering this
-      //    raw chunk. In the autobio chunker model the chunk-to-L1 mapping
-      //    is 1:1 — a chunk's message span IS the L1's source range — so
-      //    a single-chunk range is the correct request. (Strategies that
-      //    bundle N raw chunks into one L1 would override this.)
-      //  - bestLevel > 0: the caller is asking for an L_{k+1} merge. We
-      //    use the chunk's existing L_k ancestor's range as a request
-      //    hint; the consumer expands it to cover the full sibling set
-      //    at L_k that should consolidate into the missing L_{k+1}.
-      const lkAncestor = bestLevel === 0 ? null : oldestChunk.ancestorAt(bestLevel);
-      const range = lkAncestor
-        ? {
-            firstChunkId: lkAncestor.sourceRange.first,
-            lastChunkId: lkAncestor.sourceRange.last,
-          }
-        : { firstChunkId: oldestChunk.id, lastChunkId: oldestChunk.id };
-      return { kind: 'produce', level: parentLevel, range };
+      // The oldest group is the one containing the oldest chunk at level k.
+      const oldestChunk = middle.find((c) => c.currentResolution === bestLevel);
+      if (!oldestChunk) continue;
+
+      const parentLevel = bestLevel + 1;
+      const parentSummary = oldestChunk.ancestorAt(parentLevel);
+      if (!parentSummary) {
+        // L_{k+1} not produced for this chunk's group yet — request it, but
+        // only if no other level can raise.
+        //
+        // Range semantics differ by level:
+        //  - bestLevel === 0: the caller is asking for an L1 covering this
+        //    raw chunk. In the autobio chunker model the chunk-to-L1 mapping
+        //    is 1:1 — a chunk's message span IS the L1's source range — so
+        //    a single-chunk range is the correct request. (Strategies that
+        //    bundle N raw chunks into one L1 would override this.)
+        //  - bestLevel > 0: the caller is asking for an L_{k+1} merge. We
+        //    use the chunk's existing L_k ancestor's range as a request
+        //    hint; the consumer expands it to cover the full sibling set
+        //    at L_k that should consolidate into the missing L_{k+1}.
+        if (!fallbackProduce) {
+          const lkAncestor = bestLevel === 0 ? null : oldestChunk.ancestorAt(bestLevel);
+          const range = lkAncestor
+            ? {
+                firstChunkId: lkAncestor.sourceRange.first,
+                lastChunkId: lkAncestor.sourceRange.last,
+              }
+            : { firstChunkId: oldestChunk.id, lastChunkId: oldestChunk.id };
+          fallbackProduce = { kind: 'produce', level: parentLevel, range };
+        }
+        continue;
+      }
+
+      return { kind: 'raise', groupRoot: parentSummary.id };
     }
 
-    return { kind: 'raise', groupRoot: parentSummary.id };
+    return fallbackProduce;
   }
 }

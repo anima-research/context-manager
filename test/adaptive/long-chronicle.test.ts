@@ -62,7 +62,7 @@ describe('AutobiographicalStrategy — long chronicle stress', () => {
     const mock = makeMockMembrane();
     const BUDGET = 4000;
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 300,
       recentWindowTokens: 500,
       mergeThreshold: 3,
@@ -165,7 +165,7 @@ describe('AutobiographicalStrategy — long chronicle stress', () => {
     // Phase 1: build a 50-turn chronicle, drive folding
     const mock1 = makeMockMembrane();
     const strategy1 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
       recentWindowTokens: 400,
       mergeThreshold: 3,
@@ -190,7 +190,7 @@ describe('AutobiographicalStrategy — long chronicle stress', () => {
     // Phase 2: reopen, verify state matches
     const mock2 = makeMockMembrane();
     const strategy2 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 200,
       recentWindowTokens: 400,
       mergeThreshold: 3,

@@ -187,7 +187,11 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
     assert.match(pairs[0].a, /A\n\n---\n\nB\n\n---\n\nC/);
   });
 
-  it('stops emitting pairs when overall budget would be exceeded', async () => {
+  it('refuses (OverBudgetError) rather than dropping recall pairs the budget cannot hold', async () => {
+    // Pre-invariant this test asserted PARTIAL emission — some pairs silently
+    // dropped under pressure. Each pair is the only representation of its
+    // source message, so a dropped pair is a memory hole; the fatal coverage
+    // invariant (76e95a0) forbids it. The select refuses the turn instead.
     const strategy = new TestableStrategy({
       headWindowTokens: 0,
       recentWindowTokens: 8,
@@ -208,12 +212,40 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
     strategy.seedL1Against(big + ' second', m2, m2);
     strategy.seedL1Against(big + ' third', m3, m3);
 
+    await assert.rejects(
+      manager.compile({ maxTokens: 250, reserveForResponse: 0 }),
+      (err: unknown) => (err as Error).name === 'OverBudgetError',
+    );
+    manager.close();
+  });
+
+  it('emits every recall pair within the grace window instead of dropping', async () => {
+    cleanup();
+    const strategy = new TestableStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 8,
+      // Selection still targets maxTokens; emission may overshoot into the
+      // grace window rather than silently dropping covered history.
+      overBudgetGraceRatio: 1.0,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    const m1 = manager.addMessage('user', textBlock('a'));
+    const m2 = manager.addMessage('user', textBlock('b'));
+    const m3 = manager.addMessage('user', textBlock('c'));
+    manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
+
+    const big = 'X'.repeat(400);
+    strategy.seedL1Against(big + ' first', m1, m1);
+    strategy.seedL1Against(big + ' second', m2, m2);
+    strategy.seedL1Against(big + ' third', m3, m3);
+
     const compiled = await manager.compile({ maxTokens: 250, reserveForResponse: 0 });
     const pairs = recallEntries(compiled.messages);
-
-    assert.ok(
-      pairs.length > 0 && pairs.length < 3,
-      `expected partial recall emission under tight budget, got ${pairs.length}`,
-    );
+    assert.equal(pairs.length, 3, 'grace window must admit all covering pairs');
+    manager.close();
   });
 });

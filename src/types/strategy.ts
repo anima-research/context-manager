@@ -136,11 +136,19 @@ export interface ContextStrategy {
   /**
    * Select and order context entries for compilation.
    * This is the core method that determines what goes in the context window.
+   *
+   * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
+   * what a real compile at this budget would produce, but no fold resolutions
+   * are persisted, no compression/merge work is enqueued, and no transition
+   * bookkeeping is advanced. Implementations that cannot honour it must
+   * ignore it only if they are already side-effect-free (see
+   * `selectHierarchical`); any path that commits state MUST gate on it.
    */
   select(
     store: MessageStoreView,
     log: ContextLogView,
-    budget: TokenBudget
+    budget: TokenBudget,
+    opts?: SelectOptions
   ): ContextEntry[];
 
   /**
@@ -159,6 +167,52 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+}
+
+/**
+ * Per-call options for `select()` / `compile()`.
+ *
+ * `dryRun` exists because the adaptive path is NOT side-effect-free: it
+ * commits fold resolutions to Chronicle and enqueues real compression work.
+ * An operator UI that previews a hypothetical budget must not do either, or
+ * every slider drag would rewrite the fold plan and spend LLM tokens.
+ */
+export interface SelectOptions {
+  /**
+   * Compute the layout without committing anything: no resolution persistence,
+   * no produce/merge enqueue, no shadow production pick, and no transition
+   * bookkeeping. Over-budget becomes a reported condition rather than a throw.
+   */
+  dryRun?: boolean;
+}
+
+/**
+ * Outcome of a dry-run select, for callers that need the numbers rather than
+ * the rendered entries. Mirrors the diagnostics `OverBudgetError` would carry.
+ */
+export interface PreviewResult {
+  /** Rendered token total the layout would occupy. */
+  finalTokens: number;
+  /** Hard budget the preview ran against. */
+  budgetTokens: number;
+  /** True when the layout fits under the hard budget. */
+  fits: boolean;
+  /** True when the picker could not fold any further. */
+  exhausted: boolean;
+  /** Verbatim head / tail cost, and the foldable middle. */
+  headTokens: number;
+  tailTokens: number;
+  middleTokens: number;
+  /** Chunks in the foldable middle. */
+  middleChunkCount: number;
+  /** Deepest summary level the layout would require. */
+  deepestLevel: number;
+  /** Fold level per chunk the layout would settle on. */
+  resolutions: Record<string, number>;
+  /** Folds that would be applied, and summaries that must be produced first. */
+  appliedCount: number;
+  /** Summaries the layout needs that do not exist yet — real LLM work. */
+  producedCount: number;
 }
 
 /**
@@ -437,10 +491,17 @@ export interface AutobiographicalConfig {
   maxMessageTokens: number;
 
   /**
-   * Fractional grace above the configured hard context budget before an
-   * adaptive plan rejects the compile. The solver still targets the original
-   * budget; this only absorbs coarse fold quanta and indivisible raw-window
-   * overshoot. Default 0 (strict budget enforcement).
+   * Fractional grace above the configured hard context budget before a
+   * compile refuses (OverBudgetError). The solver still targets the original
+   * budget; this only absorbs coarse fold quanta, indivisible raw-window
+   * overshoot, and planner/emitter estimator drift (the plan prices a layout
+   * via picker estimates; emission prices it via post-strip render costs —
+   * the two legitimately disagree by a fraction of a percent).
+   *
+   * Default 0.02. Under the fatal coverage invariant nothing is ever silently
+   * dropped to fit, so a strict-0 grace turns ordinary sub-percent drift into
+   * refused turns (observed live: Mica's store wedged 15 tokens over a 304k
+   * budget, 2026-07-26). Set 0 explicitly for strict enforcement.
    */
   overBudgetGraceRatio?: number;
 
@@ -947,4 +1008,5 @@ Write naturally, as recollection of what you experienced.`,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,
   compressionContextBudgetTokens: 200000,
+  overBudgetGraceRatio: 0.02,
 };

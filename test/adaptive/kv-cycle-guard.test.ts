@@ -59,11 +59,16 @@ function strategyWithMixedTargetGroup(inputs: PickerInputs): {
   const tree = new SummaryTree(inputs);
   const strategy = new KvStableStrategy(inputs, {});
 
-  // Find an L1 summary with more than one leaf.
+  // Find a chunk whose level-1 group has more than one leaf.
+  //
+  // This used to walk `inputs.summaries` and index `summary.chunkIds`, a field
+  // SummaryEntry does not have — optional chaining hid that, so the lookup
+  // silently always fell back to `inputs.chunks[0].id`. Ask the tree directly
+  // instead: that is what the loop was actually trying to express, and it needs
+  // no summary-to-chunk mapping.
   let groupLeafIds: ChunkId[] | null = null;
-  for (const [, summary] of inputs.summaries) {
-    if (summary.level !== 1) continue;
-    const node = tree.ancestorAt(summary.chunkIds?.[0] ?? inputs.chunks[0].id, 1);
+  for (const chunk of inputs.chunks) {
+    const node = tree.ancestorAt(chunk.id, 1);
     if (node && node.leafChunkIds.length > 1) {
       groupLeafIds = [...node.leafChunkIds];
       break;
@@ -117,10 +122,14 @@ test('cycle guard: per-op emissions are bounded and the result stays renderable'
 
   const result = new Picker(strategy).run(inputs, BUDGET(100_000));
 
-  // No single (kind, groupRoot) op may exceed the guard threshold.
+  // No single (kind, target) op may exceed the guard threshold.
+  // `groupRoot` exists on raise/lower but not on produce (which carries a
+  // level + chunk range instead), so the key must narrow on kind.
   const emitted = new Map<string, number>();
   for (const op of result.applied) {
-    const key = `${op.kind}:${String(op.groupRoot)}`;
+    const key = op.kind === 'produce'
+      ? `produce:L${op.level}:${String(op.range.firstChunkId)}-${String(op.range.lastChunkId)}`
+      : `${op.kind}:${String(op.groupRoot)}`;
     emitted.set(key, (emitted.get(key) ?? 0) + 1);
   }
   for (const [key, n] of emitted) {
