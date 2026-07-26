@@ -356,6 +356,51 @@ was "very repeatable," and it plausibly applies to real turns as well.
    `onNewMessage` (§9), image-strip scans — the residual 3.8 s.
 3. Lazy blob resolution (open() 29 s, ~2 GB RSS).
 
+### 9.3 The "materialization leak", solved (same night, ~22:30Z) — it wasn't materialization
+
+§9.2's #1 guess was **wrong**, and the diagnosis chain is worth recording:
+`CM_CACHE_DIAG` (env-gated cache/phase diagnostics, now in message-store +
+compile + selectAdaptive) proved the internals cache was WARM on live
+probes (one boot-time miss, 3.8–4.3 s, then hits) — yet `select()` itself
+cost 20–31 s live, with `picker.run` = 31 s and everything else in
+milliseconds (pse 74 ms!). A dedicated process on a fresh copy of the same
+store solved in 3 s — until run with the agent's ACTUAL runtime settings
+(`tailTokens: 150000`, bumped from 80k at some point), which reproduced
+19 s exactly (`planned=253766`, 340 entries — the live plan).
+
+**Root cause: the 150k tail boundary lands INSIDE the ~1.7k-leaf L4 summary
+groups, and three solver loops were O(members × groupSize) on any group a
+boundary cuts through:**
+1. `foldPass` re-derived group ELIGIBILITY per member chunk per level
+   (verdict is static per (node, level, phase));
+2. `projectToValidCut` re-scanned group UNANIMITY per member per pass;
+3. Phase C pack re-ATTEMPTED a just-reverted un-fold for every remaining
+   member at that level — ~1.7k attempts × 3.4k ledger moves each; the
+   cpuprofile showed it plainly (TokenLedger add/drop/move 24.5 s +
+   relevanceCut self 13 s).
+
+Fixes (all bit-exact — plan identical before/after, 423/423 tests):
+memoize eligibility per (node, level, phase); memoize unanimity per
+(node, level) per pass; Phase C `attempted` set cleared on accept (a
+verdict can only change when the ledger moves). Measured:
+`relevanceCut` 16 s → 0.33 s; `picker.run` 18.5 s → 0.9 s; **live
+`/debug/context` 27–34 s → 1.5–1.9 s** (the §2 22.5 s instrument, ~18×).
+
+Morals: (a) the original §2 timings were dominated by this all along —
+the "hardware × store size" framing hid a settings-dependent O(N·G)
+cliff: any head/tail boundary inside a deep group triggered it, and
+deep groups grow with store age, so agents crossed the cliff as they
+aged; (b) eliminated hypotheses (JIT, GC, interpreter, blob thrash,
+cgroup reclaim, serialization) were each killed by one targeted
+measurement — /proc/PID/io + CPU ticks, JIT-off runs, perf — before the
+config-diff comparison found it; (c) always diff the LIVE runtime
+settings against the repro harness first.
+
+Remaining (re-ranked): pse ×4 + rebuildChunks-per-onNewMessage (~1 s of
+the residual 1.5–1.9 s live), lazy blob resolution (open 25–29 s/boot,
+~2 GB RSS), then the settled-zone architecture (§6) for true
+unbounded-growth safety.
+
 ## 10. Related
 
 - `docs/kv-stable-context-control.md` — prefix-stability goal
