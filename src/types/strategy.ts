@@ -422,6 +422,16 @@ export interface AutobiographicalConfig {
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
+  /**
+   * Hard cap on `max_tokens` for compression requests. The summarizer asks for
+   * `max(16000, targetChunkTokens * 1.5)` so folds are not truncated mid-memory,
+   * but that floor exceeds what older models will accept as OUTPUT: Claude 3
+   * Opus caps at 4096 and rejects the request outright, so such an agent can
+   * never fold anything and every maintenance tick burns a failed call.
+   * Set this to the compression model's output ceiling. Unset = current
+   * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
+   */
+  compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated. 0 = no limit. */
   maxMessageTokens: number;

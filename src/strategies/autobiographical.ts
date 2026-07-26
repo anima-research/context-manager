@@ -3410,6 +3410,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
   }
 
+  /**
+   * Clamp a compression `max_tokens` to the model's output ceiling when the
+   * recipe declares one. Without this an agent whose compression model caps
+   * below the 16k floor (Claude 3 Opus: 4096) fails every fold with a 400 and
+   * silently never compresses.
+   */
+  protected capCompressionTokens(requested: number): number {
+    const cap = this.config.compressionMaxTokens;
+    if (typeof cap === 'number' && cap > 0) return Math.min(requested, cap);
+    return requested;
+  }
+
   /** Begin a render-stats accumulation for one select() pass. */
   protected rsBegin(): void {
     this._uncoveredDrops = [];
@@ -4125,7 +4137,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
         // off rich memories (stop=max_tokens).
-        maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
+        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
       },
       // Declare the agent's live tools. A summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
@@ -5174,7 +5186,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
         // off rich memories (stop=max_tokens).
-        maxTokens: Math.max(16000, Math.round(targetTokens * 1.5)),
+        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
       },
       // Declare the agent's live tools. A summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
