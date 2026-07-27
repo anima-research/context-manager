@@ -73,11 +73,14 @@ export async function runScenario(
   const cache = new CacheState();
   for (let i = 0; i < harnessResult.perTurn.length; i++) {
     const turn = harnessResult.perTurn[i];
-    if (turn.rawRequest === null) {
-      // Compile threw on this turn (harness counted it) — no request went
-      // out, so there is nothing to feed the cache simulation. Skipping
-      // keeps the cache state honest: the next real request diffs against
-      // the last real one, exactly as the provider would see it.
+    if (turn.rawRequest === null || turn.compileError !== undefined) {
+      // No request reached the wire this turn: either compile() threw
+      // (rawRequest is null) or membrane.complete threw (rawRequest is the
+      // harness's best-effort reconstruction, which was never sent).
+      // Skipping BOTH keeps the cache state honest — ingesting the
+      // reconstruction would write cache entries for a request the
+      // provider never saw, inflating later hits. The next real request
+      // diffs against the last real one, exactly as the provider would see it.
       if (opts.verbose) {
         process.stderr.write(
           `  [${strategyName}] turn ${i + 1}/${harnessResult.perTurn.length}: ` +
@@ -164,8 +167,12 @@ export function summarize(result: BenchResult): ComparisonRow {
 
 export function formatComparison(results: BenchResult[]): string {
   const rows = results.map(summarize);
+  const strategyWidth = Math.max(
+    'strategy'.length,
+    ...rows.map((r) => r.strategy.length),
+  );
   const cols = [
-    { name: 'strategy', width: 22, align: 'left' as const },
+    { name: 'strategy', width: strategyWidth, align: 'left' as const },
     { name: 'cache hit %', width: 12, align: 'right' as const },
     { name: 'avg hit tok/turn', width: 18, align: 'right' as const },
     { name: 'busts', width: 6, align: 'right' as const },
@@ -182,7 +189,7 @@ export function formatComparison(results: BenchResult[]): string {
   for (const r of rows) {
     lines.push(
       [
-        fmt(r.strategy, 22, 'left'),
+        fmt(r.strategy, strategyWidth, 'left'),
         fmt(r.cacheHitPercent.toFixed(1), 12, 'right'),
         fmt(
           Math.round(r.avgHitTokensPerTurn).toLocaleString(),

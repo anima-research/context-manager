@@ -41,7 +41,9 @@ export interface CacheReport {
   cacheWriteTokens: number;
   /** Tokens charged at full input price (past the last breakpoint). */
   freshTokens: number;
-  /** Highest current-request breakpoint that matched the prior prefix. */
+  /** Last breakpoint position in the CURRENT request (unit index), or null
+   *  if the request carries no cache markers. Not match-dependent — see
+   *  `divergeAt` for where the cached prefix ended. */
   hitBreakpoint: number | null;
   /** First diverging unit index (or -1 if prefixes are identical). */
   divergeAt: number;

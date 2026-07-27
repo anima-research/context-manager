@@ -155,6 +155,16 @@ describe('AutobiographicalStrategy: long-context invariants', () => {
     const activeL1 = finalSnap.summaries.filter(
       (s) => s.level === 1 && !s.parentId,
     ).length;
+    // Compressions ran (asserted above) but the snapshot shows no active
+    // L1s → the harness's protected-field structural cast has drifted from
+    // the strategy's actual field names, and every per-turn invariant above
+    // was checked against empty state.
+    assert.ok(
+      activeL1 > 0,
+      'compressions ran but the final snapshot has no active L1 summaries — ' +
+        'the protected-field cast in test/_harness/strategy-runner.ts has ' +
+        'likely drifted from AutobiographicalStrategy internals',
+    );
     const ceiling = activeL1 * 2 + 4;
     assert.ok(
       result.totalCompressions <= ceiling,

@@ -84,9 +84,15 @@ export interface StrategySnapshot {
 
 export interface TurnRecord {
   turnIndex: number;
-  /** Raw provider request as observed via onRequest, or null on compile failure. */
+  /**
+   * Raw provider request as observed via onRequest. `null` when compile()
+   * itself threw (no request was even attempted). When membrane.complete
+   * threw instead, this holds a best-effort reconstruction of what would
+   * have been sent — check `compileError` to distinguish it from a request
+   * that actually went out.
+   */
   rawRequest: unknown | null;
-  /** Set when membrane.complete threw on compile — turn was best-effort fallback. */
+  /** Set when compile() or membrane.complete threw — no request reached the wire. */
   compileError?: string;
   /** Strategy state after the drain loop for this turn. */
   snapshot: StrategySnapshot;
@@ -102,6 +108,12 @@ export interface HarnessOptions {
    * controls cache-prefix divergence (only matters for cache-stat consumers).
    */
   compressor: (call: CompressionCallRecord) => string;
+  /**
+   * Custom system prompt for agent turns. The harness discriminates agent
+   * calls from compression calls by `AGENT_SENTINEL` in the system prompt,
+   * so the sentinel is prepended automatically if the given prompt lacks it
+   * — without it, every agent turn would be misrouted to `compressor`.
+   */
   agentSystemPrompt?: string;
   compileBudget?: { maxTokens: number; reserveForResponse: number };
   /** Tick-loop iterations per turn (drains queued compression). Default 10. */
@@ -239,7 +251,14 @@ export async function runStrategyOnWorkload(
     const budget =
       opts.compileBudget ?? { maxTokens: 100_000, reserveForResponse: 2000 };
     const maxTicks = opts.maxTicksPerTurn ?? 10;
-    const agentSystem = opts.agentSystemPrompt ?? AGENT_SYSTEM_PROMPT;
+    // Guarantee the sentinel: a custom prompt without it would make every
+    // agent turn look like a compression call to the discriminator above.
+    const agentSystem =
+      opts.agentSystemPrompt === undefined
+        ? AGENT_SYSTEM_PROMPT
+        : opts.agentSystemPrompt.includes(AGENT_SENTINEL)
+          ? opts.agentSystemPrompt
+          : `${AGENT_SENTINEL} ${opts.agentSystemPrompt}`;
 
     for (let i = 0; i < workload.length; i++) {
       currentTurn = i;
