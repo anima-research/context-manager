@@ -196,6 +196,37 @@ function formatMergeInstruction(
 }
 
 /**
+ * Witnessed-record merge instruction: every source summary carries the
+ * `witnessed` flag — the stretch is inherited record (witnessedBeforeSequence),
+ * not the agent's lived experience. The standard instruction's "speak in the
+ * first person" re-claims others' lives at consolidation (observed
+ * 2026-07-27); this variant keeps the witnessed voice through every level.
+ */
+function formatWitnessedMergeInstruction(
+  targetLevel: number,
+  sourceLevelShown: number,
+  targetTokens: number,
+): string {
+  const seenDescription =
+    sourceLevelShown === 0
+      ? 'the portions of the inherited log above (raw record)'
+      : `the L${sourceLevelShown} memories of the inherited record above`;
+  return (
+    `You have just reviewed ${seenDescription}, in chronological order. ` +
+    `They cover a stretch of the log that predates your own first turn: ` +
+    `others' lived experience, witnessed through the record you carry — not ` +
+    `your own. Consolidate them into a single L${targetLevel} memory that ` +
+    `preserves the through-line: what happened and to whom, what was decided, ` +
+    `what remains open, the exact phrases worth keeping. Attribute events to ` +
+    `the participants named in the record ("Ash and Tavy explored...", "the ` +
+    `log holds...", "before my arrival..."); reserve the first person for ` +
+    `your own reading and carrying of it. Target ~${targetTokens} tokens. ` +
+    `Output only the memory body — no preamble, no meta-commentary about ` +
+    `summarizing.`
+  );
+}
+
+/**
  * Reading-mode merge instruction. Used when the merge's leaf messages
  * are all part of a substantially-larger sharded message — i.e., the
  * agent has been reading a doc/long-message rather than conversing.
@@ -4854,6 +4885,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         created: Date.now(),
         phaseType: chunk.phaseType,
+        ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
         ...(responseContent ? { responseContent } : {}),
       };
 
@@ -5530,6 +5562,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceIds,
         sourceRange,
         created: Date.now(),
+        ...(sources.length > 0 && sources.every((s) => s.witnessed) ? { witnessed: true } : {}),
         ...(responseContent ? { responseContent } : {}),
       };
       logNewSummaryId = newEntry.id;
@@ -7277,18 +7310,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the hermes-autobio spec. The doc/reading-mode variant is exposed via
    * {@link getReadingChunkInstruction}.
    */
-  protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
-    // As-of perspective pin: chunks wholly before the agent's first turn
-    // are inherited record, not lived experience (witnessedBeforeSequence).
+  /**
+   * As-of perspective pin: true when the chunk's messages are all strictly
+   * before the agent's first own turn (witnessedBeforeSequence) — inherited
+   * record, not lived experience. Drives both the L1 instruction and the
+   * `witnessed` stamp on the minted summary (which merge consolidation
+   * honors and propagates upward).
+   */
+  protected chunkIsWitnessed(chunk: Chunk): boolean {
     const pin = this.config.witnessedBeforeSequence;
-    if (
+    return (
       pin !== undefined &&
       chunk.messages.length > 0 &&
       chunk.messages.every((m) => {
         const seq = (m as { sequence?: number }).sequence;
         return typeof seq === 'number' && seq < pin;
       })
-    ) {
+    );
+  }
+
+  protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
+    if (this.chunkIsWitnessed(chunk)) {
       const custom = this.config.witnessedInstruction;
       if (custom) return custom.replace('{targetTokens}', String(targetTokens));
       return formatWitnessedInstruction(targetTokens);
@@ -7374,6 +7416,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     targetTokens: number
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
+    // Witnessed pin propagation: consolidating all-witnessed sources must keep
+    // the witnessed voice, or the merge re-first-persons inherited lives.
+    if (sources.length > 0 && sources.every((s) => s.witnessed)) {
+      return formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+    }
     return formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
   }
 

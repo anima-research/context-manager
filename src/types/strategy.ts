@@ -879,6 +879,16 @@ export interface SummaryEntry {
    */
   parentId?: string;
   /**
+   * The slice this summarizes is inherited/witnessed record, not the agent's
+   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint;
+   * merges of all-witnessed sources keep the witnessed voice AND the flag —
+   * without propagation the consolidation instruction re-first-persons
+   * others' lives one level up (observed 2026-07-27: an L3 opening "I
+   * remember the full arc of my relationship with Tavy" — another
+   * resident's history, claimed).
+   */
+  witnessed?: boolean;
+  /**
    * @deprecated Renamed to `parentId` in the adaptive-resolution design.
    * Kept for read compatibility with chronicles produced by the old
    * threshold-driven path. New writes should set `parentId` only.
