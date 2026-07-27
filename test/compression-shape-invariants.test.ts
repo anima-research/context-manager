@@ -24,6 +24,7 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import { normalizeToolPairs } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-compression-shape';
 const TEST_COMPRESSION_MODEL = 'test-compression-model';
@@ -111,6 +112,42 @@ function createValidatingMembrane(compressionRatio = 5) {
           output_tokens: Math.ceil(summary.length / 4),
         },
       };
+    },
+  };
+  return { membrane, calls };
+}
+
+/**
+ * Wire-boundary variant: validates the shape a request would have AFTER
+ * Membrane's tool-pair normalizer — i.e. what actually goes to the API.
+ * `createValidatingMembrane` above holds CM to producing raw-valid shapes
+ * on its own; this one holds the CM+Membrane stack to shipping a valid
+ * payload. Use it for scenarios where the split responsibility is the
+ * point (either CM's splitMixedToolMessages or Membrane's normalizer must
+ * handle the shape — the API only sees their composition).
+ */
+function createWireValidatingMembrane(compressionRatio = 5) {
+  const { membrane: inner, calls } = createValidatingMembrane(compressionRatio);
+  const membrane = {
+    complete: async (request: {
+      messages: ApiMessage[];
+      config?: { maxTokens?: number };
+    }) => {
+      // Mirror Membrane's wire boundary: every message starts user-roled
+      // (the default assistantParticipant is 'Claude', which matches none
+      // of the participants used here), then the normalizer re-roles
+      // tool_use / thinking blocks onto assistant turns and enforces
+      // pairing. Validate the post-normalization shape.
+      const provider = request.messages.map((m) => ({
+        role: 'user' as const,
+        content: m.content as any,
+      }));
+      const normalized = normalizeToolPairs(provider);
+      const asApiShape = normalized.messages.map((m) => ({
+        participant: m.role,
+        content: m.content as ContentBlock[],
+      }));
+      return inner.complete({ ...request, messages: asApiShape });
     },
   };
   return { membrane, calls };
@@ -283,6 +320,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     // 100 messages → enough chunks to drive a multi-level merge cascade
     // (L1s → L2s → L3) so executeMerge runs with L2s in its prior
@@ -361,6 +399,54 @@ describe('Compression pipeline: API shape invariants', () => {
     await manager.close();
   });
 
+  it('postmortem 2026-05-22: user-roled bundled tool cycles compress to valid shape', async () => {
+    // Failure shape from `llm-calls.2026-05-22T10-38-41.487Z.jsonl` (miner
+    // stall postmortem): a single `user`-roled message carrying interleaved
+    // text + tool_use + tool_result blocks — the subagent-return envelope.
+    // Pre-fix, every compression call against history like this returned
+    // `tool_use blocks can only be in assistant messages` from the API.
+    // `splitMixedToolMessages` only handled the inverse (assistant-roled)
+    // direction at the time.
+    cleanup();
+    const { membrane, calls } = createWireValidatingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
+      targetChunkTokens: 60,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+    manager.setToolDefinitions(TEST_TOOLS);
+
+    // Each iteration mirrors one miner exchange: a user-roled envelope
+    // bundling text + two tool cycles, then a plain agent reply. The agent
+    // turn matters — an all-user monologue never crosses a chunk boundary,
+    // so nothing would ever be compressed and the test would pass vacuously.
+    for (let i = 0; i < 20; i++) {
+      manager.addMessage('user', [
+        t(`prompt-${i} ${'word '.repeat(20)}`),
+        u(`P${i}A`),
+        u(`P${i}B`),
+        r(`P${i}A`),
+        r(`P${i}B`),
+        t(`postscript-${i}`),
+      ]);
+      manager.addMessage('agent', [t(`ack-${i} ${'word '.repeat(10)}`)]);
+    }
+
+    await drain(manager);
+    assert.ok(calls.length > 0, 'expected at least one compression call to land');
+    // validateApiShape throwing inside the mock membrane is the failure
+    // mode — no throw means every request shipped was API-valid, i.e. the
+    // bundled cycles were split before reaching the membrane.
+    await manager.close();
+  });
+
   it('orphan tool_use at the very tail (no next message ever) does not crash', async () => {
     cleanup();
     const { membrane, calls } = createValidatingMembrane();
@@ -376,6 +462,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     // Build a sequence that ends on a tool_use with no following tool_result.
     // The chunker's defer rule can't help here (there's no next message);
@@ -407,6 +494,7 @@ describe('Compression pipeline: API shape invariants', () => {
       strategy,
       membrane: membrane as any,
     });
+    manager.setToolDefinitions(TEST_TOOLS);
 
     const filler = (n: number) => 'word '.repeat(n);
     for (let i = 0; i < 30; i++) {
