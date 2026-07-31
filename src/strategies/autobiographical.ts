@@ -6626,7 +6626,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * chronicle, so it stays at 1. Returns a value in [0.2, 1]; cheap,
    * deterministic, computed per message at picker-input construction.
    */
+  private static _salienceCache = new WeakMap<StoredMessage, number>();
+
   protected static staticSalience(msg: StoredMessage): number {
+    const cached = this._salienceCache.get(msg);
+    if (cached !== undefined) return cached;
+    const result = this.computeStaticSalience(msg);
+    this._salienceCache.set(msg, result);
+    return result;
+  }
+
+  /** Pure per-message salience, cached on the msg object (immutable content).
+   *  With getAll()'s view cache the same StoredMessage is reused across a
+   *  compile's passes and across compiles, so the per-message JSON.stringify of
+   *  tool payloads runs once instead of over every middle message every compile
+   *  (Sol, 2026-07-31). */
+  protected static computeStaticSalience(msg: StoredMessage): number {
     let totalChars = 0;
     let externalChars = 0;
     for (const block of msg.content) {

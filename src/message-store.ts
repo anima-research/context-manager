@@ -560,10 +560,42 @@ export class MessageStore {
    */
   getAll(): StoredMessage[] {
     const internals = this.getAllInternal();
-    return internals.map((internal, i) =>
+    // Reuse the mapped StoredMessage[] view when the store is unchanged. A
+    // compile calls getAll() ~10-14x with no writes in between; rebuilding the
+    // view (internalToStored + resolveBlobs + new Date() per message) each time
+    // dominated large moves:0 compiles (Sol, 2026-07-31). Key on the same
+    // freshness tokens as allCache: appends bump sequence, edits/redacts bump
+    // the shared writeVersion, branch switches change branch — any of which
+    // misses and rebuilds. The mapped array is immutable to callers, same as
+    // getAllInternal's contract.
+    const branch = this.store.currentBranch().name;
+    const sequence = this.store.currentSequence();
+    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const c = this.allStoredCache;
+    if (
+      c &&
+      c.branch === branch &&
+      c.sequence === sequence &&
+      c.writeVersion === writeVersion &&
+      c.stored.length === internals.length
+    ) {
+      return c.stored;
+    }
+    const stored = internals.map((internal, i) =>
       this.internalToStored(internal, internal.id, i)
     );
+    this.allStoredCache = { branch, sequence, writeVersion, stored };
+    return stored;
   }
+
+  /** Cached mapped view for getAll(), invalidated by the same freshness tokens
+   *  as allCache (see getAll). */
+  private allStoredCache: {
+    branch: string;
+    sequence: number;
+    writeVersion: number;
+    stored: StoredMessage[];
+  } | null = null;
 
   /**
    * Get a window of messages by slot index — O(window), not O(all).
@@ -691,11 +723,30 @@ export class MessageStore {
    */
   static readonly ENCRYPTED_CARRIER_CHARS_PER_TOKEN = 6;
 
+  /** Per-block cache of the raw (calibration-independent) estimate. */
+  private _rawBlockTokens = new WeakMap<ContentBlock, number>();
+
   private estimateBlockTokens(block: ContentBlock): number {
     return Math.round(this.estimateBlockTokensRaw(block) * this.tokenCalibration);
   }
 
+  /** Cached wrapper for the raw per-block estimate. Keyed on the block object:
+   *  blocks are immutable once stored (callers copy before mutating — see the
+   *  allCache immutability note), so the same block reused across a compile's
+   *  3-4 estimation passes is computed once; edits/redacts produce new block
+   *  objects, so the WeakMap auto-invalidates. Calibration is applied on top in
+   *  estimateBlockTokens, so cached raw values survive calibration changes.
+   *  Removes the repeated JSON.stringify(tool_use.input) / tool_result content
+   *  walks that dominated moves:0 compiles at scale (Sol, 2026-07-31). */
   private estimateBlockTokensRaw(block: ContentBlock): number {
+    const cached = this._rawBlockTokens.get(block);
+    if (cached !== undefined) return cached;
+    const raw = this.computeBlockTokensRaw(block);
+    this._rawBlockTokens.set(block, raw);
+    return raw;
+  }
+
+  private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
