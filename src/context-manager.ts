@@ -177,7 +177,23 @@ export class ContextManager {
     try {
       MessageStore.register(store, messageNamespace);
     } catch {
-      // State already registered
+      // State already registered. Registrations persist in the store, so
+      // on existing stores the snapshot cadence stays pinned to whatever
+      // the FIRST registration said — retune it to the current constants
+      // (chronicle >= 0.3.0; older builds lack the method, and for them
+      // the old pinned cadence simply remains, as before).
+      const upsert = (store as unknown as {
+        updateStateStrategy?: (r: ReturnType<typeof MessageStore.registrationFor>) => void;
+      }).updateStateStrategy;
+      if (upsert) {
+        try {
+          upsert.call(store, MessageStore.registrationFor(messageNamespace));
+        } catch (err) {
+          // Never fatal: a strategy-kind mismatch or transient store error
+          // must not block opening the context manager.
+          console.error('[message-store] snapshot-cadence retune failed:', err);
+        }
+      }
     }
 
     try {

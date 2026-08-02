@@ -145,13 +145,31 @@ export class MessageStore {
    * @param namespace Optional namespace for multi-agent support
    */
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/messages` : DEFAULT_MESSAGE_STATE_ID;
-    store.registerState({
-      id: stateId,
+    // fullSnapshotEvery counts DELTA snapshots, so a full snapshot fires
+    // every deltaSnapshotEvery x fullSnapshotEvery appends — and for an
+    // AppendLog it copies the ENTIRE history into the log. At the old
+    // 50x10=500 cadence, a long-lived store spends most of its disk on
+    // these copies (2026-08-01 Mythos: 5 full snapshots = 57% of the last
+    // GB, 114 MB each). 50x100=5000 keeps reconstruction bounded while
+    // cutting that dominant growth term 10x.
+    //
+    // NOTE: registrations persist in the store; changing these numbers
+    // does nothing for existing stores by itself. ContextManager.open
+    // catches the StateExists error and applies the same values via
+    // updateStateStrategy (using registrationFor below).
+    store.registerState(MessageStore.registrationFor(namespace));
+  }
+
+  /** Registration constants, shared with the update-on-existing-store path. */
+  static registrationFor(namespace?: string): {
+    id: string; strategy: 'append_log'; deltaSnapshotEvery: number; fullSnapshotEvery: number;
+  } {
+    return {
+      id: namespace ? `${namespace}/messages` : DEFAULT_MESSAGE_STATE_ID,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
-      fullSnapshotEvery: 10,
-    });
+      fullSnapshotEvery: 100,
+    };
   }
 
   /**
