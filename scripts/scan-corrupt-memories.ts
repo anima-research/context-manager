@@ -97,6 +97,8 @@ interface Signal {
     | 'trailing_comma'
     | 'trailing_hyphen'
     | 'trailing_opener'
+    | 'trailing_enumerator'
+    | 'runt'
     | 'no_terminal_punct';
   detail: string;
 }
@@ -168,7 +170,12 @@ function assess(content: string): { signals: Signal[]; confidence: 'high' | 'med
   const lastWordMatch = /([A-Za-z][A-Za-z'’-]*)$/.exec(trimmed);
   const lastWord = lastWordMatch?.[1]?.toLowerCase().replace(/’/g, "'");
 
-  if (lastChar === ',') {
+  if (/\(\d{1,3}\)\s*\S{0,3}$/.test(trimmed) || /\n\s*\d{1,3}[.)]\s*\S{0,2}$/.test(trimmed)) {
+    // An enumerated item that just started — "(8) S" — is a cut, not an end.
+    // Short numbers only: an 18-digit Discord id in parens ending a sentence
+    // is normal fleet diary style, not an enumerator.
+    signals.push({ kind: 'trailing_enumerator', detail: `...${trimmed.slice(-30)}` });
+  } else if (lastChar === ',') {
     signals.push({ kind: 'trailing_comma', detail: `...${trimmed.slice(-30)}` });
   } else if (lastChar === '-' || lastChar === '–') {
     // "mid-" — a hyphen at the very end is a mid-word cut. (Em-dash — is a
@@ -246,8 +253,32 @@ function main(): void {
   for (const stateId of summaryStates) {
     const value = store.getStateJson(stateId);
     if (!Array.isArray(value)) continue;
-    for (const raw of value as SummaryEntry[]) {
-      if (!raw || typeof raw.content !== 'string') continue;
+    const entries = (value as SummaryEntry[]).filter(
+      (raw) => raw && typeof raw.content === 'string',
+    );
+
+    // Per-level content-length medians (L2+): a merge product dramatically
+    // shorter than its level's norm is a RUNT — a cut can land right after
+    // a period (mythos L4-1197: 163 chars over six ~11k-char L3 children,
+    // cut at "Sonnets 3/3.5/3."), so tail heuristics alone cannot catch it.
+    const lengthsByLevel = new Map<number, number[]>();
+    for (const raw of entries) {
+      if (raw.level >= 2 && raw.content.trim()) {
+        if (!lengthsByLevel.has(raw.level)) lengthsByLevel.set(raw.level, []);
+        lengthsByLevel.get(raw.level)!.push(raw.content.length);
+      }
+    }
+    const medianByLevel = new Map<number, number>();
+    for (const [level, lengths] of lengthsByLevel) {
+      const sorted = [...lengths].sort((a, b) => a - b);
+      const mid = sorted.length >> 1;
+      medianByLevel.set(
+        level,
+        sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2,
+      );
+    }
+
+    for (const raw of entries) {
       if (!raw.content.trim()) {
         emptyOrStub++;
         continue;
@@ -259,7 +290,17 @@ function main(): void {
         continue;
       }
       const { signals, confidence } = assess(raw.content);
-      if (!confidence) continue;
+      let finalConfidence = confidence;
+      const median = raw.level >= 2 ? medianByLevel.get(raw.level) : undefined;
+      if (median !== undefined && median > 3000 &&
+          raw.content.length < Math.max(600, 0.15 * median)) {
+        signals.unshift({
+          kind: 'runt',
+          detail: `${raw.content.length} chars vs L${raw.level} median ${Math.round(median)}`,
+        });
+        finalConfidence = 'high';
+      }
+      if (!finalConfidence) continue;
       findings.push({
         stateId,
         id: raw.id,
@@ -271,7 +312,7 @@ function main(): void {
           ? { parentId: raw.parentId ?? raw.mergedInto }
           : {}),
         sourceIds: raw.sourceIds?.length ?? 0,
-        confidence,
+        confidence: finalConfidence,
         signals,
         head: raw.content.slice(0, 100).replace(/\s+/g, ' '),
         tail: raw.content.slice(-tailChars).replace(/\s+/g, ' '),
