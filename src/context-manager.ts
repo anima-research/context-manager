@@ -187,7 +187,14 @@ export class ContextManager {
       }).updateStateStrategy;
       if (upsert) {
         try {
-          upsert.call(store, MessageStore.registrationFor(messageNamespace));
+          const reg = MessageStore.registrationFor(messageNamespace);
+          upsert.call(store, reg);
+          // One line per boot — the rollout verification signal that the
+          // retune actually applied to this (pre-existing) store.
+          console.error(
+            `[message-store] snapshot cadence retuned: ${reg.id} -> ` +
+            `delta ${reg.deltaSnapshotEvery} x full ${reg.fullSnapshotEvery}`,
+          );
         } catch (err) {
           // Never fatal: a strategy-kind mismatch or transient store error
           // must not block opening the context manager.
