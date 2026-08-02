@@ -606,6 +606,16 @@ export interface AutobiographicalConfig {
   hierarchical?: boolean;
   /** Number of unmerged summaries before merging to the next level (default: 6) */
   mergeThreshold?: number;
+  /**
+   * Bounded retry policy for L_n merges whose LLM response was rejected by
+   * the terminal-disposition gate (refusal / max_tokens truncation /
+   * tool_use / abort / empty / malformed — anything that is not a complete
+   * `end_turn` + nonempty text). Each rejected attempt increments a
+   * persisted counter on the merge-queue entry; when the counter reaches
+   * this limit the merge is dequeued into the durable merge quarantine
+   * (never silently retried in a loop, never canonized). Default: 5.
+   */
+  mergeAttemptLimit?: number;
   /** Token target for each summary at any level (default: 2000) */
   summaryTargetTokens?: number;
   /** Token budget for L3 summaries in select() (default: 30000) */
@@ -914,6 +924,25 @@ export interface SummaryEntry {
    * before this field existed (backfillable from llm-calls logs).
    */
   responseContent?: ContentBlock[];
+  /**
+   * Authoring-call provenance: the terminal disposition and request
+   * identity of the LLM call that produced this summary. A summary may
+   * become canonical only after a complete accepted terminal disposition
+   * (`stopReason === 'end_turn'` + nonempty text) — this field records the
+   * evidence, so entries authored before the 2026-08-01 disposition gate
+   * (which could canonize refusals/truncations, e.g. the 163-char cyber
+   * refusal that became an L4 parent) are auditable: `provenance` absent →
+   * pre-gate entry, verify against llm-calls logs via content match;
+   * present → `requestHash` keys the exact request in the llm-calls log.
+   */
+  provenance?: {
+    /** Terminal stopReason of the accepted response (always 'end_turn' for post-gate entries). */
+    stopReason: string;
+    /** sha256 of the JSON-serialized membrane request that authored this summary. */
+    requestHash: string;
+    /** Compression model that authored this summary. */
+    model?: string;
+  };
 }
 
 /**

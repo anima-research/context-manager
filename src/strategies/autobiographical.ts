@@ -372,7 +372,68 @@ type CompressionAttemptOutcome =
   | 'refusal'
   | 'unusable_empty'
   | 'provider_error'
-  | 'admission_rejected';
+  | 'admission_rejected'
+  /**
+   * Response carried text but the terminal disposition was not a complete
+   * `end_turn` (max_tokens truncation, tool_use, abort, stop_sequence, or a
+   * missing stopReason). Never canonized: a truncated or interrupted
+   * generation must not become a permanent memory (2026-08-01 gate — a
+   * 163-char refusal preamble had been persisted as an L4 parent over six
+   * real L3 children because only text-nonemptiness was checked).
+   */
+  | 'incomplete';
+
+/**
+ * Typed rejection thrown by `executeMerge` when the merge response fails
+ * the terminal-disposition gate. `tick()` catches this specifically to run
+ * the bounded-retry/quarantine policy; any other executeMerge throw keeps
+ * the pre-existing transient semantics (entry stays queued, retried on the
+ * next tick with no attempt accounting).
+ */
+class MergeDispositionRejection extends Error {
+  readonly outcome: CompressionAttemptOutcome;
+  readonly stopReason?: string;
+  readonly errorType?: string;
+  readonly requestHash: string;
+
+  constructor(
+    targetLevel: number,
+    outcome: CompressionAttemptOutcome,
+    requestHash: string,
+    stopReason?: string,
+    errorType?: string,
+  ) {
+    super(
+      `L${targetLevel} merge response rejected by terminal-disposition gate: ` +
+        `${outcome}${stopReason ? ` (stop=${stopReason})` : ''}${errorType ? ` (${errorType})` : ''}`,
+    );
+    this.name = 'MergeDispositionRejection';
+    this.outcome = outcome;
+    this.requestHash = requestHash;
+    if (stopReason !== undefined) this.stopReason = stopReason;
+    if (errorType !== undefined) this.errorType = errorType;
+  }
+}
+
+/**
+ * Durable record of a merge dequeued after exhausting its bounded retry
+ * policy. Keyed by sha256 of the sourceIds list. While a record is live,
+ * `enqueueMerge` refuses to re-enqueue the same source set — the debt is
+ * surfaced by the merge-quarantine klaxon instead of being retried in a
+ * loop. Cleared by operator action (`clearMergeQuarantine`) or swept
+ * automatically once every source is covered by a parent or gone.
+ */
+interface MergeQuarantineRecord {
+  key: string;
+  level: SummaryLevel;
+  sourceIds: string[];
+  attempts: number;
+  lastOutcome: CompressionAttemptOutcome;
+  lastStopReason?: string;
+  lastErrorType?: string;
+  lastRequestHash?: string;
+  quarantinedAt: number;
+}
 
 interface CompressionRefusalOutcomeRecord {
   curveLabel: string;
@@ -774,7 +835,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[] }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number }> = [];
+
+  /**
+   * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
+   * the chronicle on (re)initialize; see MergeQuarantineRecord.
+   */
+  protected mergeQuarantine = new Map<string, MergeQuarantineRecord>();
+  private mergeQuarantineAlarmLastAt = 0;
+  private mergeQuarantineAlarmActive = false;
   protected nativeFormatter = new NativeFormatter();
 
   /** Message ID from which the head window starts. null = start from message 0. */
@@ -806,6 +875,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
   protected get counterStateId(): string { return `${this.ns}/autobio:counter`; }
   protected get mergeQueueStateId(): string { return `${this.ns}/autobio:mergeQueue`; }
+  protected get mergeQuarantineStateId(): string { return `${this.ns}/autobio:merge-quarantine`; }
   protected get pinsStateId(): string { return `${this.ns}/autobio:pins`; }
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
@@ -1319,6 +1389,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.summaries = [];
     this.summaryIdCounter = 0;
     this.mergeQueue = [];
+    this.mergeQuarantine.clear();
     this.headWindowStartId = null;
     this._cachedHeadStartIndex = null;
     this.compressionRefusalQuarantine.clear();
@@ -1465,6 +1536,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch { /* already registered */ }
     try {
       this.store.registerState({
+        id: this.mergeQuarantineStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
+    try {
+      this.store.registerState({
         id: this.pinsStateId,
         strategy: 'snapshot',
       });
@@ -1511,6 +1588,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.summaries = [];
       this.summaryIdCounter = 0;
       this.mergeQueue = [];
+      this.mergeQuarantine.clear();
       this.pins = [];
       this.pinIdCounter = 0;
       this.chunkRecords = [];
@@ -1605,8 +1683,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[] }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number }>)
       : [];
+    const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
+    this.mergeQuarantine = new Map(
+      (Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [])
+        .filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds))
+        .map((r) => [r.key, r]),
+    );
     const validMergeQueue = this.mergeQueue.filter(
       merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
     );
@@ -2090,10 +2174,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Strict validation used only inside bounded fallback attempts. */
+  /**
+   * Strict validation of a summarizer response before its text may become
+   * canonical memory. Used by the bounded L1 fallback attempts and by the
+   * L_n merge gate (`executeMerge`).
+   *
+   * Terminal-disposition invariant (2026-08-01): only a COMPLETE accepted
+   * disposition — `end_turn` with nonempty text — is `valid`. A refusal,
+   * truncation (`max_tokens`), tool call, abort, or malformed response is
+   * never persisted, however plausible its text looks.
+   */
   private assessFallbackCompressionResponse(response: unknown):
     | { outcome: 'valid'; response: NormalizedResponse; text: string }
     | { outcome: 'refusal'; stopReason: 'refusal' }
+    | { outcome: 'incomplete'; stopReason?: string }
     | { outcome: 'unusable_empty'; stopReason?: string }
     | { outcome: 'provider_error'; stopReason?: string; errorType: string } {
     const stopReason = this.compressionResponseStopReason(response);
@@ -2119,6 +2213,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (stopReason === 'refusal') return { outcome: 'refusal', stopReason };
     const text = textParts.join('\n');
     if (!text.trim()) return { outcome: 'unusable_empty', stopReason };
+    // Nonempty text under a non-end_turn disposition is an INCOMPLETE
+    // generation (max_tokens truncation, tool_use preamble, abort, stray
+    // stop_sequence) — never canonize it. Every membrane provider maps
+    // unknown finish reasons to 'end_turn', so this cannot reject a
+    // healthy provider leg.
+    if (stopReason !== 'end_turn') return { outcome: 'incomplete', stopReason };
     return { outcome: 'valid', response: response as NormalizedResponse, text };
   }
 
@@ -2985,9 +3085,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Push to the merge queue and persist the new queue snapshot.
+   *
+   * Quarantined source sets are refused: after a merge exhausts its bounded
+   * retry policy, `checkMergeThreshold`/`enqueueMergeForRange` would
+   * otherwise re-discover the same unmerged run and re-enqueue it forever.
+   * The merge-quarantine klaxon owns visibility; this guard stays silent.
    */
-  protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[] }): void {
+  protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
+    if (this.mergeQuarantine.has(sha256Json(merge.sourceIds))) return;
     this.mergeQueue.push(merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
   }
@@ -2995,11 +3101,162 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Pop from the merge queue and persist the new queue snapshot.
    */
-  protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[] } | undefined {
+  protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[]; attempts?: number } | undefined {
     this.requireBranchMutation('dequeueMerge');
     const merge = this.mergeQueue.shift();
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
     return merge;
+  }
+
+  /**
+   * Bounded-retry accounting for a merge whose response was rejected by the
+   * terminal-disposition gate. The attempt counter lives ON the persisted
+   * queue entry, so restarts don't reset the policy. At the limit, the merge
+   * moves from the queue into the durable quarantine — never a retry loop,
+   * never silent loss.
+   */
+  protected recordMergeRejection(
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number },
+    rejection: MergeDispositionRejection,
+  ): void {
+    this.requireBranchMutation('recordMergeRejection');
+    if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
+    merge.attempts = (merge.attempts ?? 0) + 1;
+    const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
+    if (merge.attempts >= limit) {
+      this.dequeueMerge();
+      this.quarantineMerge(merge, rejection, limit);
+      return;
+    }
+    this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    console.warn(
+      `[autobiographical] L${merge.level} merge attempt ${merge.attempts}/${limit} rejected ` +
+        `(${rejection.outcome}${rejection.stopReason ? `, stop=${rejection.stopReason}` : ''}) — ` +
+        `entry retained for retry`,
+    );
+  }
+
+  /** Move an exhausted merge into the durable quarantine and receipt it. */
+  protected quarantineMerge(
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number },
+    rejection: MergeDispositionRejection,
+    limit: number,
+  ): void {
+    const record: MergeQuarantineRecord = {
+      key: sha256Json(merge.sourceIds),
+      level: merge.level,
+      sourceIds: merge.sourceIds,
+      attempts: merge.attempts ?? limit,
+      lastOutcome: rejection.outcome,
+      ...(rejection.stopReason !== undefined ? { lastStopReason: rejection.stopReason } : {}),
+      ...(rejection.errorType !== undefined ? { lastErrorType: rejection.errorType } : {}),
+      lastRequestHash: rejection.requestHash,
+      quarantinedAt: Date.now(),
+    };
+    this.mergeQuarantine.set(record.key, record);
+    this.persistMergeQuarantine();
+    console.error(
+      `[merge-quarantine] ⚠️ L${merge.level} merge over ${merge.sourceIds.length} sources ` +
+        `quarantined after ${record.attempts} rejected attempt(s) ` +
+        `(last: ${record.lastOutcome}${record.lastStopReason ? `, stop=${record.lastStopReason}` : ''}). ` +
+        `Sources stay unmerged; operator action required (inspect, then clearMergeQuarantine). ` +
+        `key=${record.key.slice(0, 12)}`,
+    );
+    logCompressionCall({
+      event: 'merge:quarantined',
+      operation: `merge_l${merge.level}`,
+      metadata: { ...record },
+    });
+  }
+
+  protected persistMergeQuarantine(): void {
+    this.store?.setStateJson(this.mergeQuarantineStateId, [...this.mergeQuarantine.values()]);
+  }
+
+  /**
+   * Merge-quarantine status for observers/operators.
+   */
+  getMergeQuarantineStatus(): { count: number; records: MergeQuarantineRecord[] } {
+    return { count: this.mergeQuarantine.size, records: [...this.mergeQuarantine.values()] };
+  }
+
+  /**
+   * Operator action: lift merge quarantine for one key (or all). The next
+   * `checkMergeThreshold` pass re-discovers the unmerged run and re-enqueues
+   * it with a fresh attempt budget.
+   */
+  clearMergeQuarantine(key?: string): void {
+    this.requireLoadedBranch('clearMergeQuarantine');
+    if (key !== undefined) {
+      if (!this.mergeQuarantine.delete(key)) return;
+    } else {
+      if (this.mergeQuarantine.size === 0) return;
+      this.mergeQuarantine.clear();
+    }
+    this.persistMergeQuarantine();
+    console.warn(`[merge-quarantine] cleared ${key ? `key=${key.slice(0, 12)}` : 'ALL records'} — merges eligible for re-enqueue`);
+    this.checkMergeThreshold();
+  }
+
+  /**
+   * Sweep merge-quarantine records whose debt no longer exists, so the
+   * klaxon only sounds on real debt:
+   *  - every source now has a parent (covered by a later successful merge
+   *    or repair) → paid, clear;
+   *  - no source summary exists anymore (surgery/repair removed them) →
+   *    unretryable orphan, clear;
+   *  - any source still unmerged and present → live debt, keep.
+   */
+  protected sweepPaidOffMergeQuarantine(): void {
+    if (this.mergeQuarantine.size === 0) return;
+    const byId = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) byId.set(s.id, s);
+    let swept = 0;
+    for (const [key, record] of [...this.mergeQuarantine]) {
+      const live = record.sourceIds.filter((id) => {
+        const s = byId.get(id);
+        return s !== undefined && !getSummaryParentId(s);
+      });
+      if (live.length === 0) {
+        this.mergeQuarantine.delete(key);
+        swept++;
+      }
+    }
+    if (swept > 0) {
+      this.persistMergeQuarantine();
+      console.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
+    }
+  }
+
+  /**
+   * Repeating klaxon for merge quarantine, mirroring the chunk-quarantine
+   * klaxon: quarantined merges keep their sources unmerged, the frontier
+   * widens, and deep-level folds stall — debt, not a resting state. Uses
+   * the same interval config; `quarantineAlarmIntervalMs: 0` disables.
+   */
+  protected soundMergeQuarantineAlarmIfNeeded(): void {
+    const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
+    if (interval <= 0) return;
+    const now = Date.now();
+    if (!this.mergeQuarantineAlarmActive && now - this.mergeQuarantineAlarmLastAt < interval) return;
+    this.sweepPaidOffMergeQuarantine();
+    if (this.mergeQuarantine.size === 0) {
+      if (this.mergeQuarantineAlarmActive) {
+        this.mergeQuarantineAlarmActive = false;
+        this.mergeQuarantineAlarmLastAt = 0;
+        console.error('[merge-quarantine] ✅ ALL CLEAR — merge quarantine empty; alarm stands down');
+      }
+      return;
+    }
+    if (this.mergeQuarantineAlarmActive && now - this.mergeQuarantineAlarmLastAt < interval) return;
+    this.mergeQuarantineAlarmActive = true;
+    this.mergeQuarantineAlarmLastAt = now;
+    const keys = [...this.mergeQuarantine.keys()].map((k) => k.slice(0, 12)).join(',');
+    console.error(
+      `[merge-quarantine] ⚠️ ${this.mergeQuarantine.size} merge(s) quarantined — their sources ` +
+        `stay unmerged and deep-level folding is stalled for those spans. Operator action ` +
+        `required (inspect llm-calls receipts; clearMergeQuarantine to retry). keys=${keys}`,
+    );
   }
 
   /**
@@ -3299,6 +3556,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the alarm on every interval for as long as ANY chunk is quarantined
     // (after sweeping records whose debt is already paid).
     await this.soundQuarantineAlarmIfNeeded();
+    this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
     if (!ctx.membrane) {
@@ -3352,6 +3610,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
+      } catch (error) {
+        // Terminal-disposition rejection: the LLM answered, but with a
+        // refusal / truncation / tool call / empty — bounded-retry policy,
+        // not a crash. Anything else (429, network, timeout) keeps the
+        // pre-existing semantics: rethrow, entry stays queued, next tick
+        // retries with no attempt accounting.
+        if (error instanceof MergeDispositionRejection) {
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.recordMergeRejection(merge, error);
+          return;
+        }
+        throw error;
       } finally {
         this.pendingCompression = null;
       }
@@ -4622,7 +4892,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       successfulTrace = attemptTraces[attemptTraces.length - 1];
 
-      if (this.compressionResponseStopReason(response) === 'refusal') {
+      // Terminal-disposition gate (2026-08-01): only a complete `end_turn`
+      // may proceed toward persistence. A refusal takes the curve-fallback
+      // path as before; any OTHER non-end_turn disposition (max_tokens
+      // truncation, tool_use, abort, malformed/missing stopReason) rides
+      // the same bounded machinery — variants are unlikely to dodge a
+      // truncation the way they dodge a classifier, but the path gives us
+      // bounded attempts, durable receipts, and quarantine instead of
+      // either canonizing an incomplete memory or retrying forever.
+      const canonicalStopReason = this.compressionResponseStopReason(response);
+      if (canonicalStopReason !== 'end_turn') {
+        const canonicalOutcome: CompressionAttemptOutcome =
+          canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete';
         const canonicalProviderInputTokens = this.compressionResponseInputTokens(response);
         fallbackPlan = this.compressionRefusalPlan(
           request,
@@ -4642,13 +4923,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const outcomes: CompressionRefusalOutcomeRecord[] = [{
           curveLabel: 'canonical',
           requestHash: canonicalRequestHash,
-          outcome: 'refusal',
-          stopReason: 'refusal',
+          outcome: canonicalOutcome,
+          ...(canonicalStopReason !== undefined ? { stopReason: canonicalStopReason } : {}),
         }];
-        attemptTraces[0]!.outcome = 'refusal';
+        attemptTraces[0]!.outcome = canonicalOutcome;
         successfulTrace = undefined;
         logCompressionCall({
-          event: 'compression:canonical-refused',
+          event: canonicalOutcome === 'refusal'
+            ? 'compression:canonical-refused'
+            : 'compression:canonical-incomplete',
           operation: 'compress_l1',
           metadata: attemptTraces[0],
         });
@@ -4887,6 +5170,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         phaseType: chunk.phaseType,
         ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
         ...(responseContent ? { responseContent } : {}),
+        // Terminal-disposition provenance: which request authored this
+        // memory and how the generation ended (always 'end_turn' post-gate;
+        // the field's presence marks the entry as gate-verified).
+        ...(successfulTrace
+          ? {
+              provenance: {
+                stopReason: successfulTrace.stopReason ?? 'end_turn',
+                requestHash: successfulTrace.requestHash,
+                model,
+              },
+            }
+          : {}),
       };
 
       this.pushSummary(entry);
@@ -5499,6 +5794,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    // Request identity — persisted on the authored summary (provenance) and
+    // stamped on every failure receipt, so any parent can be traced back to
+    // the exact llm-calls log entry that authored it.
+    const requestHash = sha256Json(request);
+
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
@@ -5524,22 +5824,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response = await ctx.membrane.complete(stripReasoningFromRequest(request), { formatter: this.nativeFormatter });
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+
+      // Terminal-disposition gate (2026-08-01): a consolidation may become
+      // canonical only after a COMPLETE accepted disposition — `end_turn` +
+      // nonempty text. This path used to persist ANY nonempty text, which is
+      // exactly how a 163-character refusal preamble became the L4 parent
+      // over six real L3 children. Refusal, max_tokens truncation, tool_use,
+      // abort, empty, and malformed responses all reject: children stay
+      // unmerged, a durable receipt is logged, and tick() applies the
+      // bounded retry/quarantine policy (never an immediate retry loop).
+      const assessment = this.assessFallbackCompressionResponse(response);
+      if (assessment.outcome !== 'valid') {
+        const stopReason = 'stopReason' in assessment ? assessment.stopReason : undefined;
+        const errorType = assessment.outcome === 'provider_error' ? assessment.errorType : undefined;
+        console.warn(
+          `[autobiographical] L${targetLevel} merge response rejected (${assessment.outcome}` +
+            `${stopReason ? `, stop=${stopReason}` : ''}${errorType ? `, ${errorType}` : ''}) — ` +
+            `${sources.length} sources left unmerged`,
+        );
+        logCompressionCall({
+          event: 'merge:disposition-rejected',
+          operation: `merge_l${targetLevel}`,
+          metadata: {
+            target_level: targetLevel,
+            source_ids: sourceIds,
+            outcome: assessment.outcome,
+            stop_reason: stopReason ?? null,
+            error_type: errorType ?? null,
+            request_hash: requestHash,
+            model: this.requireCompressionModel(),
+          },
+        });
+        throw new MergeDispositionRejection(
+          targetLevel, assessment.outcome, requestHash, stopReason, errorType,
+        );
+      }
+
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
       // are captured for replay — see the L1 site / captureResponseContent.
-      const mergedText = response.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
-      const responseContent = captureResponseContent(response.content);
+      const mergedText = assessment.text;
+      const responseContent = captureResponseContent(assessment.response.content);
       logResponse = mergedText;
-
-      // Empty merged generation: skip the merge entirely (do NOT push or mark
-      // sources merged) so we never store/recall an empty summary. Sources stay
-      // unmerged and can be retried.
-      if (!mergedText.trim()) {
-        console.warn(`[autobiographical] empty merged L${targetLevel} summary (${sources.length} sources) — skipping merge`);
-        return;
-      }
 
       // Compute source range from constituent summaries
       const sourceRange = {
@@ -5564,6 +5889,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         created: Date.now(),
         ...(sources.length > 0 && sources.every((s) => s.witnessed) ? { witnessed: true } : {}),
         ...(responseContent ? { responseContent } : {}),
+        // Terminal-disposition provenance (see SummaryEntry.provenance):
+        // always 'end_turn' post-gate; presence marks the entry gate-verified.
+        provenance: {
+          stopReason: 'end_turn',
+          requestHash,
+          model: this.requireCompressionModel(),
+        },
       };
       logNewSummaryId = newEntry.id;
 
@@ -5581,7 +5913,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Check if this merge triggers a further merge
       this.checkMergeThreshold();
     } catch (error) {
-      console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+      // Disposition rejections already warned + receipted above — don't
+      // double-log them as crashes; tick() consumes them for retry policy.
+      if (!(error instanceof MergeDispositionRejection)) {
+        console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+      }
       logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {

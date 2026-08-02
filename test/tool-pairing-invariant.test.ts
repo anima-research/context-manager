@@ -260,7 +260,7 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
     const manager = await ContextManager.open({
       path: STORE,
       strategy,
-      membrane: { complete: async () => ({ content: [{ type: 'text', text: 's' }] }) } as never,
+      membrane: { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 's' }] }) } as never,
     });
 
     for (let i = 0; i < 5; i++) {

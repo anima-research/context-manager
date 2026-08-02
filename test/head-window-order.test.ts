@@ -44,6 +44,7 @@ function createCapturingMembrane() {
         .join('').length;
       const summary = `[mock summary] ` + 'x '.repeat(Math.max(30, Math.floor(inputChars / 10)));
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: summary }],
         usage: { input_tokens: Math.ceil(inputChars / 4), output_tokens: Math.ceil(summary.length / 4) },
       };

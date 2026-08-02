@@ -30,6 +30,7 @@ function makeMockMembrane() {
       const text = `[mock summary #${callCount}] This is a summary of an earlier portion of the conversation.`;
       responses.push(text);
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text }],
       };
     },

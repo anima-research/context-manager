@@ -63,6 +63,7 @@ function mockMembrane() {
           .join('').length;
         const text = `[mock summary inChars=${inputChars}] ` + 'x '.repeat(40);
         return {
+          stopReason: 'end_turn',
           content: [{ type: 'text', text }],
           usage: { input_tokens: Math.ceil(inputChars / 4), output_tokens: 25 },
         };

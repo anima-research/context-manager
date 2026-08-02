@@ -267,7 +267,7 @@ describe('AutobiographicalStrategy — speculation cap does not deadlock (regres
   });
 
   it('over-cap with queued merges still drains merges, then the cap clears', async () => {
-    const membrane = { complete: async () => ({ content: [{ type: 'text', text: '[mock]' }] }) };
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
     const strategy = new DrainStrategy({
       headWindowTokens: 0,
       recentWindowTokens: 5,
@@ -355,7 +355,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
     const manager = await ContextManager.open({
       path: TEST_STORE_PATH,
       strategy,
-      membrane: { complete: async () => ({ content: [{ type: 'text', text: 'x' }] }) } as any,
+      membrane: { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) } as any,
     });
     const ids: string[] = [];
     for (let i = 0; i < 60; i++) ids.push(strategy.seedL1(`s${i}`).id);

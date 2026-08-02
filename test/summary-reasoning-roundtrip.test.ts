@@ -37,6 +37,7 @@ function makeThinkingMembrane() {
     complete: async () => {
       calls++;
       return {
+        stopReason: 'end_turn',
         content: [
           {
             type: 'thinking',
@@ -196,6 +197,7 @@ describe('Summary reasoning round-trip (Fable-5 signed thinking)', () => {
         calls++;
         requests.push(JSON.parse(JSON.stringify(req)));
         return {
+          stopReason: 'end_turn',
           content: [
             { type: 'thinking', thinking: '', signature: `sig-${calls}` },
             { type: 'text', text: `Summary #${calls}: notable things occurred.` },
@@ -266,6 +268,7 @@ describe('Summary reasoning round-trip (Fable-5 signed thinking)', () => {
       complete: async () => {
         calls++;
         return {
+          stopReason: 'end_turn',
           content: [{ type: 'text', text: `Plain summary #${calls}.` }],
           usage: { inputTokens: 100, outputTokens: 10 },
         };

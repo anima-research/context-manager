@@ -106,6 +106,7 @@ function createValidatingMembrane(compressionRatio = 5) {
         'x '.repeat(Math.max(0, Math.floor((targetChars - 30) / 2)));
       calls.push({ messages: request.messages, outputChars: summary.length });
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: summary }],
         usage: {
           input_tokens: Math.ceil(inputChars / 4),

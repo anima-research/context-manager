@@ -41,7 +41,7 @@ describe('AutobiographicalStrategy compression model contract', () => {
         membrane: {
           complete: async () => {
             membraneCalls++;
-            return { content: [{ type: 'text', text: 'must not be written' }] };
+            return { stopReason: 'end_turn', content: [{ type: 'text', text: 'must not be written' }] };
           },
         } as never,
       });

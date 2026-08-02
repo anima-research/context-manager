@@ -851,13 +851,13 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('continues across empty output and provider error, then accepts persistable max_tokens text', async () => {
+  it('continues across empty output and provider error, then accepts persistable end_turn text', async () => {
     const providerError = Object.assign(new Error('synthetic variant failure'), { type: 'invalid_request' });
     const mock = flexibleMembrane([
       { stop: 'refusal' },
       { stop: 'end_turn', text: '' },
       { error: providerError },
-      { stop: 'max_tokens', text: 'persistable truncated memory' },
+      { stop: 'end_turn', text: 'persistable recovered memory' },
     ]);
     const fx = await fixture(mock.membrane);
     const extraChildren = [
@@ -883,7 +883,7 @@ describe('compression refusal recall curves', () => {
     const produced = fx.strategy.summariesView().find(
       (entry) => entry.sourceIds.join(':') === fx.target.messages.map((message) => message.id).join(':'),
     );
-    assert.equal(produced?.content, 'persistable truncated memory');
+    assert.equal(produced?.content, 'persistable recovered memory');
     assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
     fx.manager.close();
   });
@@ -945,11 +945,11 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('continues after a malformed fallback and persists later max_tokens text', async () => {
+  it('continues after a malformed fallback and persists later end_turn text', async () => {
     const mock = flexibleMembrane([
       { stop: 'refusal' },
       { raw: { stopReason: 'end_turn', content: [null] } },
-      { stop: 'max_tokens', text: 'later bounded memory' },
+      { stop: 'end_turn', text: 'later bounded memory' },
     ]);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
@@ -959,7 +959,7 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('preserves canonical non-refusal empty, max_tokens, and error behavior', async () => {
+  it('preserves canonical empty/error behavior; canonical max_tokens is never canonized', async () => {
     {
       const mock = flexibleMembrane([{ stop: 'end_turn', text: '' }]);
       const fx = await fixture(mock.membrane);
@@ -981,10 +981,24 @@ describe('compression refusal recall curves', () => {
       fx.manager.close();
     }
     {
+      // Terminal-disposition gate (2026-08-01): a truncated canonical
+      // generation must NOT become a permanent memory, however plausible its
+      // text. It rides the bounded fallback machinery ('incomplete') and,
+      // with every attempt truncated, exhausts into quarantine.
       const mock = flexibleMembrane([{ stop: 'max_tokens', text: 'canonical partial memory' }]);
-      const fx = await fixture(mock.membrane);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
       await fx.strategy.run(fx.target, managerContext(fx.manager));
-      assert.equal(fx.target.compressed, true);
+      assert.equal(fx.target.compressed, false, 'truncated memory must never be canonized');
+      const produced = fx.strategy.summariesView().find(
+        (entry) => entry.content === 'canonical partial memory',
+      );
+      assert.equal(produced, undefined);
+      const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted');
+      assert.ok(exhausted, 'exhaustion is receipted durably');
+      const outcomes = (exhausted!.outcomes as Array<{ outcome: string; stopReason?: string }>);
+      assert.equal(outcomes[0]!.outcome, 'incomplete');
+      assert.equal(outcomes[0]!.stopReason, 'max_tokens');
+      assert.ok(outcomes.every((outcome) => outcome.outcome === 'incomplete'));
       fx.manager.close();
     }
     {

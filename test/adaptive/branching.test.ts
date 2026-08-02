@@ -37,6 +37,7 @@ function makeMockMembrane() {
     complete: async () => {
       callCount++;
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: `[mock summary #${callCount}]` }],
       };
     },

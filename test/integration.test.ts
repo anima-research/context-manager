@@ -1034,6 +1034,7 @@ describe('ContextManager', () => {
             throw new Error('Simulated LLM failure');
           }
           return {
+            stopReason: 'end_turn',
             content: [{ type: 'text', text: 'Summary of the conversation chunk' }],
           };
         },

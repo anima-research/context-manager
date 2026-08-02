@@ -44,7 +44,7 @@ describe('Concurrent compression: stale chunk identity', () => {
       complete: async () => {
         llmCalls++;
         await new Promise((r) => setTimeout(r, 80));
-        return { content: [{ type: 'text', text: `Summary #${llmCalls} of the chunk` }] };
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${llmCalls} of the chunk` }] };
       },
     };
 

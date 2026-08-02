@@ -137,7 +137,7 @@ describe('One-to-one representation: ownership vs head window', () => {
     const membrane = {
       complete: async (req: unknown) => {
         captured.push(structuredClone(req));
-        return { content: [{ type: 'text', text: 'fresh L1 summary text' }] };
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'fresh L1 summary text' }] };
       },
     };
     const strategy = new ProbeStrategy({
@@ -215,7 +215,7 @@ describe('One-to-one representation: ownership vs head window', () => {
     const membrane = {
       complete: async (req: unknown) => {
         captured.push(structuredClone(req));
-        return { content: [{ type: 'text', text: 'consolidated L2 text' }] };
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'consolidated L2 text' }] };
       },
     };
     const strategy = new ProbeStrategy({
@@ -282,7 +282,7 @@ describe('One-to-one representation: ownership vs head window', () => {
       complete: async (req: unknown) => {
         payloads.push(structuredClone(req));
         n++;
-        return { content: [{ type: 'text', text: `Summary #${n}` }] };
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${n}` }] };
       },
     };
     const strategy = new ProbeStrategy({

@@ -697,6 +697,7 @@ describe('KnowledgeStrategy', () => {
         complete: async (request: any) => {
           lastRequest = request;
           return {
+            stopReason: 'end_turn',
             content: [{ type: 'text', text: 'Summary of the chunk' }],
           };
         },
