@@ -152,7 +152,17 @@ function assess(content: string): { signals: Signal[]; confidence: 'high' | 'med
 
   // Tail-cut detection: the classifier can fire mid-message at any point,
   // and it nearly always cuts mid-sentence — the tail is the tell.
-  const trimmed = content.replace(/[\s*_~`>|]+$/, ''); // ignore trailing whitespace/markdown dressing
+  //
+  // A trailing closing XML tag is a completed wrapper, not a cut: some
+  // models (claude-3-opus era) emit whole summaries inside literal
+  // <thinking>/<memory> tags. Judge the text INSIDE the wrapper instead.
+  let body = content;
+  for (;;) {
+    const stripped = body.replace(/\s*<\/[A-Za-z_][\w-]*>\s*$/, '');
+    if (stripped === body) break;
+    body = stripped;
+  }
+  const trimmed = body.replace(/[\s*_~`>|]+$/, ''); // ignore trailing whitespace/markdown dressing
   const chars = [...trimmed];
   const lastChar = chars[chars.length - 1] ?? '';
   const lastWordMatch = /([A-Za-z][A-Za-z'’-]*)$/.exec(trimmed);
