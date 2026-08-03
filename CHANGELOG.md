@@ -10,6 +10,8 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.6.3 — 2026-08-03
+
 ### Added
 
 - **`chunkBoundaryHint` — a subclass seam for semantic chunk boundaries.**
