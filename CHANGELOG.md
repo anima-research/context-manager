@@ -9,3 +9,29 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 [releases page](https://github.com/anima-research/context-manager/releases).
 
 ## Unreleased
+
+### Added
+
+- **`chunkBoundaryHint` — a subclass seam for semantic chunk boundaries.**
+  Strategies with domain knowledge about conversation structure (chat-topic
+  transitions, episode breaks) can close a chunk early at a semantic boundary
+  without forking `rebuildChunks` — hinted closes persist chunk records and
+  respect the minimum-size and tool_use-pairing guards exactly like size-based
+  closes. Motivation: connectome-host's FrontdeskStrategy forked the whole
+  chunker for topic-aware boundaries and silently bypassed chunk-record
+  persistence and the fail-closed orphan guard.
+- **Budget-saturation liveness gates** (`test/long-context-saturation.test.ts`)
+  — the regression net for the 2026-08-03 production outage class (hierarchical
+  renderer saturating its fixed budget into a terminal `UncoveredDropError`
+  refusal loop): the adaptive path must compile every turn of a workload whose
+  raw history is several times the budget, and under pathological pressure may
+  refuse only with the recoverable `OverBudgetError` class, never an uncovered
+  drop.
+
+### Changed
+
+- The adaptive path's tail-shortfall and newest-turn-retention refusals now
+  name their stage (`Tail emission dropped reserved recent-window messages`,
+  `Structural repair did not retain the newest turn`) instead of masquerading
+  as picker exhaustion with impossible arithmetic ("742 tokens still exceed
+  hard budget 11220").
