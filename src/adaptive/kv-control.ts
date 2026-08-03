@@ -484,7 +484,24 @@ function relevanceCut(
   const tokens = renderLayout(inputs, tree, F).totalTokens;
   // Fits, or a full round made no progress, or round cap → done. Otherwise
   // re-fold on the projected frontier with a resynced ledger.
-  if (tokens <= windowTokens || tokens >= projTokens || round >= 2) return { F, tokens };
+  if (tokens <= windowTokens || tokens >= projTokens || round >= 2) {
+    // NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
+    // feature — every exempted leaf means the store's summary tree is
+    // NON-NESTED (two live lineages over one span), and its messages are
+    // now SEMANTICALLY DOUBLE-REPRESENTED in the window (rendered raw or
+    // via their own chain WHILE a covering recall also renders). The solve
+    // proceeding is the mitigation; the topology is the disease. Surface it
+    // on every affected compile until the store is repaired (nesting
+    // reconciler — see the 2026-08-03 opus4 incident).
+    if (overlapExempt.size > 0) {
+      console.error(
+        `[kv-overlap] ⚠️ non-nested summary tree: ${overlapExempt.size} leaf(s) with ` +
+          `conflicting lineage tolerated this compile (double-representation in window). ` +
+          `Store needs nesting repair. sample=${[...overlapExempt].slice(0, 5).join(',')}`,
+      );
+    }
+    return { F, tokens };
+  }
   projTokens = tokens;
   ledger = new TokenLedger(tree, inputs, ordered, F);
 
