@@ -3641,6 +3641,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.recordMergeRejection(merge, error);
           return;
         }
+        // A NON-RETRYABLE provider error (membrane retryable:false — e.g.
+        // context_length, invalid_request) is deterministic: the identical
+        // request fails identically on every tick, and the rethrow path
+        // below has no attempt accounting — a hot retry loop (opus4
+        // 2026-08-03: 442 context_length 400s at ~6s intervals, 2.7GB of
+        // full-payload error logs). Route it through the same bounded
+        // attempts/quarantine policy as disposition rejections; the merge
+        // prompt halves its recall budget per attempt (see executeMerge),
+        // so each retry is a genuinely smaller request. Retryable errors
+        // (429, network, timeout) keep the pre-existing rethrow semantics.
+        const membraneType = (error as { type?: unknown; retryable?: unknown }) ?? {};
+        if (
+          error instanceof Error &&
+          membraneType.retryable === false &&
+          typeof membraneType.type === 'string'
+        ) {
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.recordMergeRejection(
+            merge,
+            new MergeDispositionRejection(
+              merge.level,
+              'provider_error',
+              sha256Json({ level: merge.level, sourceIds: merge.sourceIds, transport: membraneType.type }),
+              undefined,
+              membraneType.type,
+            ),
+          );
+          return;
+        }
         throw error;
       } finally {
         this.pendingCompression = null;
@@ -5627,7 +5656,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    const mergeRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+    // Recall budget shrinks by half per prior failed attempt on this same
+    // queue entry. The wire limit is enforced by the PROVIDER, not our
+    // estimator (which can under-read a big merge prompt by 10-20%): when a
+    // merge 400s with context_length, retrying the identical request fails
+    // identically forever (opus4 2026-08-03: 442 consecutive 400s at ~6s —
+    // "189583 + 16000 > 200000" — after a lineage wipe returned 97 summaries
+    // to the frontier and the prior-recall set ballooned). Halving the
+    // recall budget per attempt makes each bounded retry (see the
+    // non-retryable branch in the tick catch) MEANINGFULLY smaller, so the
+    // pair converges instead of looping. attempts lives on the persisted
+    // queue entry; reference-equality on sourceIds scopes this to the
+    // queue-driven path.
+    const mergeAttempts =
+      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
+    const configuredRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+    const mergeRecallBudget = Math.max(
+      8_000,
+      Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
+    );
+    if (mergeRecallBudget < configuredRecallBudget) {
+      console.warn(
+        `[autobiographical] L${targetLevel} merge retry ${mergeAttempts}: recall budget shrunk ` +
+          `${configuredRecallBudget} -> ${mergeRecallBudget} tokens (halved per failed attempt)`,
+      );
+    }
     const { kept: keptPriorSummaries, keptTokens: mergeRecallTokens } = this.capRecallPairs(
       priorSummariesAll,
       mergeRecallBudget,
