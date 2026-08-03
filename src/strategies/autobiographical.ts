@@ -738,6 +738,26 @@ function stripReasoningFromRequest(request: NormalizedRequest): NormalizedReques
   };
 }
 
+/**
+ * Strip a literal `<thinking>…</thinking>` preamble that some models emit as
+ * PLAIN TEXT at the start of a summary generation despite the "no preamble"
+ * instruction (observed on Claude 3 Opus — `<thinking>` before `<memory>` —
+ * and on Opus 4 L3→L4 merges, 2026-08-03). Stored verbatim it renders as
+ * meta-text in every recall and eats the entry's token budget. This strips
+ * only a LEADING tag pair (plus one unclosed-leading-tag degenerate case);
+ * mid-content mentions of thinking tags are content, not preamble, and are
+ * left alone. Native `thinking` content blocks are unaffected — they are
+ * filtered structurally and carried via captureResponseContent.
+ */
+export function stripThinkingPreamble(text: string): string {
+  const closed = text.replace(/^\s*<thinking>[\s\S]*?<\/thinking>\s*/i, '');
+  if (closed !== text) return closed;
+  // Degenerate: opening tag with no close — the whole generation was
+  // "thinking". Treat as empty so the empty-summary guards skip it.
+  if (/^\s*<thinking>/i.test(text) && !/<\/thinking>/i.test(text)) return '';
+  return text;
+}
+
 function summarizeTelemetryMessages(
   messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>,
 ): Array<{
@@ -4622,9 +4642,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it asks what reading was like and what was learned, forcing the
     // model to reflect from its own vantage point in agent-first-person.
     const docContext = this.detectDocContext(chunk, ctx);
-    const instructionText = docContext
-      ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
-      : this.getCompressionInstruction(chunk, targetTokens);
+    const instructionText = this.applyIdentityReminder(
+      docContext
+        ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
+        : this.getCompressionInstruction(chunk, targetTokens),
+    );
     llmMessages.push({
       participant: 'Context Manager',
       content: [{ type: 'text', text: instructionText }],
@@ -5109,10 +5131,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // reasoning returned alongside generated text, and summaries are
       // replayed in the agent's own voice (see captureResponseContent).
       const acceptedResponse = response as NormalizedResponse;
-      const summaryText = acceptedResponse.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
+      const summaryText = stripThinkingPreamble(
+        acceptedResponse.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text)
+          .join('\n'),
+      );
       const responseContent = captureResponseContent(acceptedResponse.content);
       logResponse = summaryText;
 
@@ -5717,14 +5741,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
     }
-    const mergeInstructionText = mergeReadingContext
-      ? this.getReadingMergeInstruction(
-          targetLevel,
-          sources,
-          mergeReadingContext.totalTokens,
-          targetTokens,
-        )
-      : this.getMergeInstruction(targetLevel, sources, targetTokens);
+    const mergeInstructionText = this.applyIdentityReminder(
+      mergeReadingContext
+        ? this.getReadingMergeInstruction(
+            targetLevel,
+            sources,
+            mergeReadingContext.totalTokens,
+            targetTokens,
+          )
+        : this.getMergeInstruction(targetLevel, sources, targetTokens),
+    );
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
@@ -5862,9 +5888,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
       // are captured for replay — see the L1 site / captureResponseContent.
-      const mergedText = assessment.text;
+      const mergedText = stripThinkingPreamble(assessment.text);
       const responseContent = captureResponseContent(assessment.response.content);
       logResponse = mergedText;
+
+      // The disposition gate guarantees nonempty PRE-strip text; a
+      // generation that was entirely a literal <thinking> preamble strips
+      // to nothing. Skip (sources stay unmerged, retried later) rather
+      // than store an empty summary.
+      if (!mergedText.trim()) {
+        console.warn(
+          `[autobiographical] L${targetLevel} merge generation was all <thinking> preamble — ` +
+            `skipping (${sources.length} sources left unmerged)`,
+        );
+        return;
+      }
 
       // Compute source range from constituent summaries
       const sourceRange = {
@@ -7678,6 +7716,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return typeof seq === 'number' && seq < pin;
       })
     );
+  }
+
+  /**
+   * Append the configured identity reminder (if any) to a compression or
+   * merge instruction. Applied at the two llmMessages call sites (L1 chunk
+   * and merge) rather than inside the format functions so subclass
+   * instruction overrides are covered too. See
+   * `AutobiographicalConfig.identityReminder` for rationale (identity flip
+   * over pure-witness chunks in multi-resident channels).
+   */
+  protected applyIdentityReminder(instruction: string): string {
+    const reminder = this.config.identityReminder?.trim();
+    return reminder ? `${instruction}\n\n${reminder}` : instruction;
   }
 
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
