@@ -278,6 +278,18 @@ function relevanceCut(
 ): { F: Map<ChunkId, number>; tokens: number } {
   const F = new Map(base);
   const byId = new Map(ordered.map((c) => [c.id, c] as const));
+  // OVERLAP TOLERANCE (2026-08-03, opus4). After store surgery a summary
+  // "tree" can be non-nested: a group's leafChunkIds may include leaves whose
+  // OWN l1Id lineage tops out below the group's level or climbs through a
+  // different family. Folding such a leaf to the group's level plants an
+  // unrenderable mark; the final validity projection then monotone-LOWERS the
+  // whole group around it — one disagreeing leaf un-folded a 200-leaf group,
+  // 615 leaves cascaded (+24k tokens) and the solve returned an over-W
+  // frontier while a produced L4/L5 layer sat unused. Leaves whose lineage
+  // disagrees are skipped by folds and exempted from unanimity: they render
+  // raw beside the recall — exactly the renderer's existing ownership-wins
+  // semantics for boundary-cut members.
+  const overlapExempt = new Set<ChunkId>();
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
     const sa = salienceOf(a);
@@ -288,7 +300,7 @@ function relevanceCut(
 
   // Incremental accounting: O(group) per move instead of O(n) renderLayout.
   const _tl = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  const ledger = new TokenLedger(tree, inputs, ordered, F);
+  let ledger = new TokenLedger(tree, inputs, ordered, F);
   if (_tl) console.error(`[kv-timing] ledger-init ${Date.now() - _tl}ms tokens=${ledger.tokens}`);
 
   // Eligibility memo, keyed (node, level, phase). The verdict is a pure
@@ -343,6 +355,14 @@ function relevanceCut(
         if (!groupEligible(ancestor.id, ancestor.leafChunkIds, level, ignoreShapeCaps)) continue;
         for (const leafId of ancestor.leafChunkIds) {
           if ((caps.get(leafId) ?? 0) < 0) continue; // protected: stays raw beside the recall
+          // Overlap tolerance: only mark leaves whose own lineage renders as
+          // part of THIS node at this level. Disagreeing leaves keep their
+          // level and become unanimity-exempt (see declaration above).
+          const own = tree.ancestorAt(leafId, level);
+          if (!own || own.id !== ancestor.id) {
+            overlapExempt.add(leafId);
+            continue;
+          }
           const leaf = byId.get(leafId);
           const from = F.get(leafId) ?? 0;
           if (from < level) {
@@ -355,6 +375,17 @@ function relevanceCut(
     }
     return false;
   };
+
+  // FOLD → PROJECT FIXPOINT (2026-08-03). The validity projection at the end
+  // can only LOWER levels; on a non-nested tree its repairs add tokens after
+  // the phases stopped at target, and a single projection pass used to be
+  // final — the solve returned an over-W frontier with deeper summaries
+  // still unused ("W — the only physics" violated; opus4: ledger 150k,
+  // post-projection render 174k > W 166k, L4/L5 never touched). Iterate:
+  // re-fold on the projected frontier (the ledger is rebuilt to match) until
+  // the render fits under W, a round makes no progress, or the round cap.
+  let projTokens = Number.POSITIVE_INFINITY;
+  for (let round = 0; ; round++) {
 
   // Phase A: fold under the shape prior toward the target.
   if (ledger.tokens > target) foldPass(false, target);
@@ -377,7 +408,7 @@ function relevanceCut(
         if (ledger.tokens >= target) break;
         const c = ordered[oi]; // youngest-first
         if ((F.get(c.id) ?? 0) !== level) continue;
-        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
+        if (rawZone.has(c.id) || immovable.has(c.id) || overlapExempt.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
         const attemptKey = `${node.id}:${level}`;
@@ -386,7 +417,8 @@ function relevanceCut(
         for (const leafId of node.leafChunkIds) {
           // Protected members sit at raw beside the recall (boundary-cut
           // tolerance) — they neither veto nor participate in the un-fold.
-          if (rawZone.has(leafId) || immovable.has(leafId)) continue;
+          // Overlap-exempt members likewise (their lineage disagrees).
+          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue;
           if ((F.get(leafId) ?? 0) !== level) {
             eligible = false;
             break;
@@ -402,7 +434,7 @@ function relevanceCut(
         // carried while its ledger believed it sat on target).
         const moved: Array<[ChunkId, number]> = [];
         for (const leafId of node.leafChunkIds) {
-          if (rawZone.has(leafId) || immovable.has(leafId)) continue; // protected: not part of the fold
+          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue; // protected: not part of the fold
           const from = F.get(leafId) ?? 0;
           if (from <= level - 1) continue; // already at/below the destination
           const leaf = byId.get(leafId);
@@ -442,12 +474,21 @@ function relevanceCut(
   // phases just made (monotone-lowering the whole group back toward carried).
   const projectionExempt = new Set<ChunkId>();
   for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
+  // Overlap-exempt leaves render beside their group's recall (ownership-wins)
+  // and must not veto unanimity — same exemption as the boundary-cut set.
+  for (const id of overlapExempt) projectionExempt.add(id);
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
   if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
   // projection may have moved leaves — recompute once, not per move).
   const tokens = renderLayout(inputs, tree, F).totalTokens;
-  return { F, tokens };
+  // Fits, or a full round made no progress, or round cap → done. Otherwise
+  // re-fold on the projected frontier with a resynced ledger.
+  if (tokens <= windowTokens || tokens >= projTokens || round >= 2) return { F, tokens };
+  projTokens = tokens;
+  ledger = new TokenLedger(tree, inputs, ordered, F);
+
+  } // fold → project fixpoint loop
 }
 
 /**
