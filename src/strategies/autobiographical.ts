@@ -6683,6 +6683,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, rejectionBudget, totalTokens, pse);
     if (tailStats.messages !== messages.length - effectiveRecentStart) {
       throw new OverBudgetError({
+        stage: 'Tail emission dropped reserved recent-window messages',
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
         diagnostics: {
@@ -6736,6 +6737,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       if (!newestRetained) {
         throw new OverBudgetError({
+          stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
           diagnostics: {
@@ -8169,12 +8171,57 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let currentTokens = 0;
     let chunkFilteredStart = 0;
 
+    // Close the running chunk over [chunkFilteredStart, endExclusive). Shared
+    // by the size-based close and the subclass boundary hint below — both
+    // persist the boundary identically.
+    const closeCurrent = (endExclusive: number): void => {
+      const chunk: Chunk = {
+        index: this.chunks.length,
+        startIndex: chunkFilteredStart,
+        endIndex: endExclusive,
+        messages: [...currentChunk],
+        tokens: currentTokens,
+        compressed: false,
+      };
+      // Persist the boundary the moment it closes — from here on this
+      // span is owned and never re-keyed by config drift or restarts.
+      if (this.chunkPersistenceEnabled) {
+        const record: ChunkRecord = {
+          id: `c-${this.chunkIdCounter++}`,
+          sourceIds: chunk.messages.map(m => m.id),
+          compressed: false,
+        };
+        this.appendChunkRecord(record);
+        chunk.recordId = record.id;
+      }
+      this.chunks.push(chunk);
+      this.compressionQueue.push(chunk.index);
+
+      currentChunk = [];
+      currentTokens = 0;
+      chunkFilteredStart = endExclusive;
+    };
+
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
       let msgTokens = store.estimateTokens(msg);
 
       if (this.config.attachmentsIgnoreSize) {
         msgTokens = this.estimateTextOnlyTokens(msg);
+      }
+
+      // Subclass boundary hint: close BEFORE appending `msg` when the
+      // subclass marks a semantic boundary between the running chunk's last
+      // message and this one (e.g. a chat-topic transition). An undersized
+      // boundary chunk is deliberate — a semantic boundary outranks the size
+      // target — but the chunker's minimum message count and the tool_use
+      // pairing guard below still apply.
+      if (
+        currentChunk.length >= 4 &&
+        !this.lastMessageContainsToolUse(currentChunk) &&
+        this.chunkBoundaryHint(currentChunk[currentChunk.length - 1], msg, currentChunk)
+      ) {
+        closeCurrent(i);
       }
 
       currentChunk.push(msg);
@@ -8196,31 +8243,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
 
       if (shouldClose) {
-        const chunk: Chunk = {
-          index: this.chunks.length,
-          startIndex: chunkFilteredStart,
-          endIndex: i + 1,
-          messages: [...currentChunk],
-          tokens: currentTokens,
-          compressed: false,
-        };
-        // Persist the boundary the moment it closes — from here on this
-        // span is owned and never re-keyed by config drift or restarts.
-        if (this.chunkPersistenceEnabled) {
-          const record: ChunkRecord = {
-            id: `c-${this.chunkIdCounter++}`,
-            sourceIds: chunk.messages.map(m => m.id),
-            compressed: false,
-          };
-          this.appendChunkRecord(record);
-          chunk.recordId = record.id;
-        }
-        this.chunks.push(chunk);
-        this.compressionQueue.push(chunk.index);
-
-        currentChunk = [];
-        currentTokens = 0;
-        chunkFilteredStart = i + 1;
+        closeCurrent(i + 1);
       }
     }
 
@@ -8246,6 +8269,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return lastId !== undefined && this._demandedL1Chunks.has(lastId);
       });
     }
+  }
+
+  /**
+   * Subclass seam consulted between two adjacent frontier messages during
+   * chunking: return true to close the running chunk BEFORE `next` is
+   * appended — e.g. at a conversation-topic transition — even though the
+   * running sum has not reached `targetChunkTokens`. Keeping unrelated
+   * topics out of one chunk keeps their summaries from being fused.
+   *
+   * Consulted only once the running chunk has the chunker's minimum message
+   * count, and never overrides the tool_use pairing guard. The base never
+   * hints, so boundaries are unchanged for strategies that don't override
+   * this. Hinted closes persist chunk records exactly like size-based ones.
+   */
+  protected chunkBoundaryHint(
+    prev: StoredMessage,
+    next: StoredMessage,
+    currentChunk: readonly StoredMessage[],
+  ): boolean {
+    void prev; void next; void currentChunk;
+    return false;
   }
 
   /**
