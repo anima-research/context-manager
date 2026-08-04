@@ -6601,7 +6601,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (block.type === 'text') rawRun.parts.push(block.text);
             }
           } else {
-            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById);
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
             if (!ancestor) {
               // Fall back to raw
               if (currentRun?.kind !== 'raw') {
@@ -6647,7 +6647,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.rsRaw('middleRaw', tokens);
         i++;
       } else {
-        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById);
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -7177,13 +7177,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     level: number,
     chunksByMessageId: ReadonlyMap<MessageId, Chunk>,
     summariesById?: ReadonlyMap<string, SummaryEntry>,
+    /** Fold-path fallback (see selectAdaptive): message → covering L1 id
+     *  from L1 sourceIds, for released/boundary-drifted chunk records.
+     *  MUST be passed wherever the planner used the same fallback, or the
+     *  emitter renders raw what the plan priced folded (emission refusal). */
+    l1Fallback?: ReadonlyMap<MessageId, SummaryId>,
   ): SummaryEntry | null {
     if (level <= 0) return null;
     const chunk = chunksByMessageId.get(messageId);
-    if (!chunk?.summaryId) return null;
+    const startId = chunk?.summaryId ?? l1Fallback?.get(messageId);
+    if (!startId) return null;
     const lookup = (id: string): SummaryEntry | undefined =>
       summariesById ? summariesById.get(id) : this.summaries.find((s) => s.id === id);
-    let current: SummaryEntry | undefined = lookup(chunk.summaryId);
+    let current: SummaryEntry | undefined = lookup(startId);
     while (current && current.level < level) {
       const parentId = getSummaryParentId(current);
       if (!parentId) return null;
