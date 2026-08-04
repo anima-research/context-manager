@@ -6159,6 +6159,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
 
+    // Fold-path fallback (2026-08-04). Chunk records are the PRODUCTION
+    // ledger, not the coverage authority: a released or boundary-drifted
+    // chunk (repair surgery; the covered-under-different-boundaries dedup
+    // guard) leaves `ch.summaryId` unset, and its messages then had NO fold
+    // path — permanently raw middle mass — while live L1s covering those
+    // messages (under different boundaries) rendered recalls right above
+    // them: semantic double-representation AND unfoldable tokens (opus4:
+    // 233 raw messages pinned under re-merged L4s; the June c-279 chunk had
+    // been in this deadlock silently). L1 `sourceIds` IS the coverage
+    // authority — fall back to it when the ledger has no pointer.
+    const l1ByMessage = new Map<MessageId, SummaryId>();
+    for (const s of this.summaries) {
+      if (s.level !== 1) continue;
+      for (const mid of s.sourceIds) {
+        if (!l1ByMessage.has(mid)) l1ByMessage.set(mid, s.id);
+      }
+    }
+
     // The foldable middle is everything outside the LIVE head window and the
     // reserved tail — INCLUDING [0, headStart) after a head-window reset.
     // Excluding that zone made pre-transition history invisible to the picker
@@ -6188,7 +6206,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         pinned: pinnedSet.has(i) && bound === undefined,
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
-        l1Id: ch?.summaryId,
+        l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
         salience: AutobiographicalStrategy.staticSalience(msg),
       });
     }
