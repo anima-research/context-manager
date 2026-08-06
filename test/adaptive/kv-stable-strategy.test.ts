@@ -133,3 +133,84 @@ test('kv-stable exhausted semantics: true only when even full folding exceeds th
   assert.equal(result.exhausted, true, 'over-the-wall is the one true exhausted state');
   assert.ok(result.finalTokens > 100, 'and the tokens confirm it');
 });
+
+// ---------------------------------------------------------------------------
+// Demand-side production under escalation (issue #56).
+//
+// Pre-change the solve returned `produced: []` unconditionally, so under
+// kv-stable the caller's demand path (handleProducedOps → enqueueL1ForRange →
+// the l1HoldbackChunks exemption) could never fire. At tight operating points
+// the budget wall lands while the only uncompressed material is the unclosed
+// trailing span plus the held-back newest closed chunk — the speculative
+// queue is empty, demand can never be raised, and every compile escalates
+// infeasible forever (the L1-holdback deadlock).
+// ---------------------------------------------------------------------------
+
+test('kv-stable demand (issue #56): escalation with uncovered chunks emits an L1 produce op', () => {
+  // No summaries at all: nothing can fold, so a wall below the raw total
+  // escalates and every foldable chunk is L1-uncovered.
+  const ch = buildChronicleWithChain({ chunkCount: 6, tokensPerChunk: 1000, produceChain: false });
+  const inputs = inputsOf(ch);
+  const strategy = new KvStableStrategy({});
+  const result = new Picker(strategy).run(inputs, BUDGET(2_000));
+
+  assert.equal(strategy.lastPlan()?.escalated, true, 'test premise: escalated');
+  assert.equal(result.exhausted, true, 'a produce op does not make the current plan feasible');
+  assert.deepEqual(
+    result.produced,
+    [{ level: 1, range: { firstChunkId: ch.chunks[0].id, lastChunkId: ch.chunks[5].id } }],
+    'one L1 request coalescing the whole uncovered run reaches the caller through the picker',
+  );
+});
+
+test('kv-stable demand (issue #56): covered / pinned / locked chunks split the uncovered runs', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 10, tokensPerChunk: 1000, produceChain: false });
+  ch.produceL1([ch.chunks[2].id, ch.chunks[3].id]); // L1 exists → not demanded
+  ch.chunks[6].pinned = true;                        // force-raw → producing an L1 is pointless
+  ch.chunks[8].lockedByAgent = true;                 // frozen at carried resolution → same
+  const inputs = inputsOf(ch);
+  const strategy = new KvStableStrategy({});
+  const sol = strategy.solve(inputs, BUDGET(500));
+
+  assert.equal(strategy.lastPlan()?.escalated, true, 'test premise: escalated');
+  assert.deepEqual(
+    sol.produced.map((p) => [p.level, p.range.firstChunkId, p.range.lastChunkId]),
+    [
+      [1, ch.chunks[0].id, ch.chunks[1].id],
+      [1, ch.chunks[4].id, ch.chunks[5].id],
+      [1, ch.chunks[7].id, ch.chunks[7].id],
+      [1, ch.chunks[9].id, ch.chunks[9].id],
+    ],
+    'requests cover exactly the foldable uncovered runs',
+  );
+});
+
+test('kv-stable demand (issue #56): head/tail chunks are never demanded', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 6, tokensPerChunk: 1000, produceChain: false });
+  const inputs: PickerInputs = {
+    ...inputsOf(ch),
+    headChunkIds: new Set([ch.chunks[0].id]),
+    tailChunkIds: new Set([ch.chunks[5].id]),
+  };
+  const strategy = new KvStableStrategy({});
+  const sol = strategy.solve(inputs, BUDGET(2_000));
+
+  assert.equal(strategy.lastPlan()?.escalated, true, 'test premise: escalated');
+  assert.deepEqual(
+    sol.produced,
+    [{ level: 1, range: { firstChunkId: ch.chunks[1].id, lastChunkId: ch.chunks[4].id } }],
+    'the run excludes the flat zone',
+  );
+});
+
+test('kv-stable demand (issue #56): a feasible wall emits no produce ops', () => {
+  // Speculative pre-production stays the pre-producer's job — the demand
+  // path exists only for the escalated state.
+  const ch = buildChronicleWithChain({ chunkCount: 6, tokensPerChunk: 1000, produceChain: false });
+  const inputs = inputsOf(ch);
+  const strategy = new KvStableStrategy({});
+  const sol = strategy.solve(inputs, BUDGET(100_000));
+
+  assert.equal(strategy.lastPlan()?.escalated, false, 'test premise: feasible');
+  assert.deepEqual(sol.produced, [], 'no speculative produce under a feasible wall');
+});

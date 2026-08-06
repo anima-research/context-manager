@@ -150,4 +150,39 @@ describe('AutobiographicalStrategy — L1 holdback', () => {
     );
     manager.close();
   });
+
+  it('a demand range ending in the unclosed trailing span reaches every closed chunk (issue #56)', async () => {
+    // kv-stable's escalation demand path emits one produce op per contiguous
+    // L1-uncovered run, and such a run naturally extends from the oldest
+    // uncompressed closed chunk THROUGH the unclosed trailing span (whose
+    // messages map to no chunk). The tail-endpoint fallback must resolve that
+    // to "through the newest closed chunk" so the whole backlog — including
+    // the held-back newest chunk — is demanded in one call, not one chunk
+    // per compile while the agent is down on OverBudgetError.
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+    await closeChunks(manager, strategy, 3);
+    const chunks = strategy.closedChunks();
+    const newest = chunks[chunks.length - 1];
+    assert.ok(!strategy.queuedChunkIndices().includes(newest.index), 'sanity: newest held back');
+
+    // A fresh message beyond every closed chunk — the unclosed trailing span.
+    const trailingId = manager.addMessage('user', textBlock('trailing unchunked message'));
+    assert.ok(
+      !strategy.closedChunks().some((c) => c.messages.some((m) => m.id === trailingId)),
+      'test premise: the trailing message belongs to no closed chunk',
+    );
+
+    strategy.demandRange(chunks[0].messages[0].id, trailingId);
+
+    const queued = strategy.queuedChunkIndices();
+    for (const ch of strategy.closedChunks()) {
+      assert.ok(
+        queued.includes(ch.index) || ch.compressed,
+        `closed chunk ${ch.index} must be queued (or already compressed) after one demand call`,
+      );
+    }
+    manager.close();
+  });
 });

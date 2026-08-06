@@ -917,10 +917,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Record ids whose compression was refused by the L1 overlap guard. */
   private _overlapBlocked = new Set<string>();
 
+  /** Consecutive retryable-server-error (5xx) merge failures tolerated on
+   *  the same queue head before routing into the bounded rejection policy.
+   *  High enough that a real transient episode (429-adjacent blips, brief
+   *  outages) never burns attempts; low enough that a week-long provider
+   *  fault (rhys 2026-08-06: 514 identical 500s) converges in ~an hour of
+   *  ticks instead of never. */
+  static readonly MERGE_SERVER_ERROR_STREAK_LIMIT = 12;
+
+  /** Distinct quarantined request shapes tolerated per chunk before the
+   *  quarantine goes sticky by chunk hash. Shape changes legitimately
+   *  invalidate a quarantine (a chunk refused text-only may pass once
+   *  carriers/tools arrive) — but unbounded shape drift is the 2026-08-06
+   *  ear-loop: frontier churn minted a new shape every pass at ~\$0.5 a
+   *  cycle. Three shapes is enough for every legitimate healing path
+   *  observed (text-only → +carriers → +tools). */
+  static readonly CHUNK_QUARANTINE_SHAPE_CAP = 3;
+
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -1768,7 +1785,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
@@ -3201,7 +3218,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
@@ -3751,6 +3768,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             ),
           );
           return;
+        }
+        // Retryable SERVER errors (500/529) are usually transient — but a
+        // PERSISTENT one on the same payload loops forever under pure
+        // rethrow (rhys 2026-08-06: 514 consecutive merge 500s across a
+        // week-long provider episode, zero accounting). Count a streak on
+        // the persisted head entry; past the bound, route through the same
+        // bounded rejection policy (whose retries also shrink the recall
+        // budget, giving the provider a genuinely different request).
+        // Below the bound the rethrow keeps transient semantics: no
+        // attempt burn for a blip.
+        if (
+          error instanceof Error &&
+          membraneType.retryable === true &&
+          membraneType.type === 'server'
+        ) {
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          merge.serverErrorStreak = (merge.serverErrorStreak ?? 0) + 1;
+          this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+          if (merge.serverErrorStreak >= AutobiographicalStrategy.MERGE_SERVER_ERROR_STREAK_LIMIT) {
+            this.recordMergeRejection(
+              merge,
+              new MergeDispositionRejection(
+                merge.level,
+                'provider_error',
+                sha256Json({ level: merge.level, sourceIds: merge.sourceIds, transport: 'server-persistent' }),
+                undefined,
+                'server-persistent',
+              ),
+            );
+            return;
+          }
         }
         throw error;
       } finally {
@@ -4973,10 +5021,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       fallbackPlan,
     );
     const durableQuarantine = this.readCompressionQuarantineProjection();
-    const durableActive = durableQuarantine.get(quarantineRecord.key) ??
-      [...durableQuarantine.values()].find(
-        (active) => active.record.familyKey === quarantineRecord.familyKey,
-      );
+    // Bounded by chunk hash, not just request identity (2026-08-06
+    // ear-loop): as sibling chunks mint, the recall frontier shifts, so
+    // every maintenance pass built a NEW key/familyKey for the same
+    // refusing span — each cycle burned a full refused call and minted a
+    // duplicate quarantine record, forever. A GENUINE shape change
+    // (carriers arrive, tools arrive, config change) deserves a fresh
+    // attempt — that self-healing is deliberate and pinned by tests — so
+    // the gate is a CAP, not a wall: up to CHUNK_QUARANTINE_SHAPE_CAP
+    // distinct quarantined shapes per chunk, then sticky until
+    // success-clear, paid-off sweep, or operator clear (all of which
+    // already match by chunkSourceHash).
+    const sameHash = [...durableQuarantine.values()].filter(
+      (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash,
+    );
+    const durableActive = durableQuarantine.get(quarantineRecord.key)
+      ?? sameHash.find((active) => active.record.familyKey === quarantineRecord.familyKey)
+      ?? (sameHash.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameHash[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       logCompressionCall({
@@ -5427,7 +5488,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // an empty assistant text block → Anthropic 400 "content must be non-empty".
       // Leave the chunk raw rather than poisoning memory with an empty summary.
       if (!summaryText.trim()) {
-        console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — skipping (chunk left raw)`);
+        console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — quarantining (chunk stays raw)`);
+        // Durable accounting (cm #55): without it, an all-thinking chunk
+        // that survived the prose retry was re-attempted on every
+        // maintenance pass forever (canonical + retry per cycle). Same
+        // exhaustion path as the refusal curves; the record is sticky by
+        // chunk hash and clears via success-clear / sweep / operator.
+        if (this.isCompressionBranchCurrent(sourceBranch)) {
+          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [
+            { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+            { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+          ]);
+        }
         return;
       }
 

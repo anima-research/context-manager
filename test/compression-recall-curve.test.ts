@@ -997,11 +997,20 @@ describe('compression refusal recall curves', () => {
 
   it('preserves canonical empty/error behavior; canonical max_tokens is never canonized', async () => {
     {
+      // cm #55 (2026-08-06): an empty generation is no longer a silent
+      // skip — after the plain-prose retry also comes back empty, the
+      // chunk exhausts into durable quarantine (bounded accounting for
+      // every non-success outcome; previously this re-attempted on every
+      // maintenance pass forever).
       const mock = flexibleMembrane([{ stop: 'end_turn', text: '' }]);
       const fx = await fixture(mock.membrane);
       await fx.strategy.run(fx.target, managerContext(fx.manager));
       assert.equal(fx.target.compressed, false);
-      assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
+      const exhausted = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
+      assert.equal(exhausted.length, 1, 'empty generations exhaust durably now');
+      const outcomes = exhausted[0]!.outcomes as Array<{ outcome: string; curveLabel: string }>;
+      assert.ok(outcomes.every((o) => o.outcome === 'unusable_empty'));
+      assert.ok(outcomes.some((o) => o.curveLabel === 'canonical-plain-prose'), 'prose retry was attempted first');
       fx.manager.close();
     }
     for (const malformed of [

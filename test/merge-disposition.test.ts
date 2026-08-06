@@ -430,6 +430,29 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('persistent retryable server errors on the merge head are bounded (the rhys 500-loop)', async () => {
+    // rhys 2026-08-06: 514 consecutive merge 500s across a week-long
+    // provider episode — retryable:true meant pure rethrow, zero attempt
+    // accounting, forever. Below the streak bound the transient semantics
+    // hold (rethrow, no attempt burn); at the bound the failure routes into
+    // the normal bounded rejection policy.
+    const serverErr = Object.assign(new Error('500 {"type":"api_error"}'), {
+      type: 'server', retryable: true,
+    });
+    const mock = scripted([{ error: serverErr }]);
+    const fx = await fixture(mock.membrane);
+
+    const LIMIT = (AutobiographicalStrategy as unknown as { MERGE_SERVER_ERROR_STREAK_LIMIT: number })
+      .MERGE_SERVER_ERROR_STREAK_LIMIT;
+    for (let i = 1; i < LIMIT; i++) {
+      await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows (transient tier)`);
+      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burn below the bound');
+    }
+    await fx.strategy.tick(ctx(fx.manager)); // streak hits the bound: recorded, not thrown
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the streak limit');
+    await fx.manager.close();
+  });
+
   it('quarantine debt is swept once the sources are covered by a parent', async () => {
     const mock = scripted([{ stop: 'refusal', text: 'nope' }]);
     const fx = await fixture(mock.membrane, { mergeAttemptLimit: 1 });
