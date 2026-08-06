@@ -89,6 +89,32 @@ const COMPRESSION_MARKER =
   'The messages that follow are the slice of recent experience you are ' +
   'about to compress. After them, write the memory in your own voice.';
 
+/**
+ * Retry-only line for tool_use compression rejections. Summarizer requests
+ * declare the agent's live tools (the labclaude reasoning_extraction
+ * requirement), so a think-first model can answer a mint prompt on-pattern —
+ * a tool call carrying the draft — which the single-shot compression path
+ * cannot continue past (lena 2026-08-04/06, merge AND L1 sites). Forbidding
+ * tools structurally makes the same model emit nothing (bench-verified);
+ * this sentence, appended only on the retry, is what works.
+ */
+const NO_TOOLS_RETRY_LINE =
+  '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.';
+
+/** Clone a compression request with NO_TOOLS_RETRY_LINE appended to the final instruction message. */
+function withNoToolsLine(request: NormalizedRequest): NormalizedRequest {
+  const messages = request.messages.map((m, i) => {
+    if (i !== request.messages.length - 1) return m;
+    const content = m.content.map((block, j) =>
+      j === m.content.length - 1 && block.type === 'text'
+        ? { ...block, text: block.text + NO_TOOLS_RETRY_LINE }
+        : block,
+    );
+    return { ...m, content };
+  });
+  return { ...request, messages };
+}
+
 /** Standard compression instruction for chat/general chunks. */
 function formatInstruction(targetTokens: number): string {
   return (
@@ -4957,7 +4983,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // truncation the way they dodge a classifier, but the path gives us
       // bounded attempts, durable receipts, and quarantine instead of
       // either canonizing an incomplete memory or retrying forever.
-      const canonicalStopReason = this.compressionResponseStopReason(response);
+      let canonicalStopReason = this.compressionResponseStopReason(response);
+
+      // tool_use is the one non-end_turn disposition the curve variants
+      // CANNOT dodge: they vary the recall frontier, not the response mode,
+      // so a think-first model fails every variant identically and the chunk
+      // quarantines (lena 2026-08-06, L1 site — the merge site had already
+      // grown this retry). One immediate canonical retry with the no-tools
+      // line, before the curve plan burns its bounded attempts.
+      if (canonicalStopReason === 'tool_use') {
+        console.warn(
+          `[autobiographical] canonical L1 mint rejected on tool_use — retrying once with no-tools instruction`,
+        );
+        const retryResponse = await runAttempt(
+          withNoToolsLine(request),
+          'canonical-no-tools',
+          keptSummaries.map((summary) => summary.id),
+          keptSummaries.map((summary) => summary.level),
+          canonicalCoverageHash,
+        );
+        const retryStopReason = this.compressionResponseStopReason(retryResponse);
+        if (retryStopReason === 'end_turn') {
+          response = retryResponse;
+          canonicalStopReason = retryStopReason;
+          successfulTrace = attemptTraces[attemptTraces.length - 1];
+        }
+      }
       if (canonicalStopReason !== 'end_turn') {
         const canonicalOutcome: CompressionAttemptOutcome =
           canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete';
@@ -5879,8 +5930,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] L${targetLevel} merge retry after tool_use rejection — appending no-tools instruction`,
       );
-      mergeInstructionText +=
-        '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.';
+      mergeInstructionText += NO_TOOLS_RETRY_LINE;
     }
     llmMessages.push({
       participant: 'Context Manager',

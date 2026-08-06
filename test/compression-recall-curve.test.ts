@@ -353,6 +353,42 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('canonical tool_use gets ONE no-tools retry before the curve plan burns (lena 2026-08-06)', async () => {
+    // Curve variants vary the recall frontier, not the response mode — a
+    // think-first model fails every variant identically. The retry must be
+    // the canonical request plus exactly one sentence.
+    const mock = flexibleMembrane([
+      {
+        raw: {
+          stopReason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+          usage: { inputTokens: 100, outputTokens: 50 },
+        },
+      },
+      { stop: 'end_turn', text: 'a memory written as prose after the no-tools retry' },
+    ]);
+    const fx = await fixture(mock.membrane);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 2, 'one retry, zero curve-fallback calls');
+    assert.ok(
+      !JSON.stringify(mock.calls[0]!.request).includes('do not call any tools'),
+      'first attempt stays byte-identical to the canonical prompt',
+    );
+    const retry = mock.calls[1]!.request;
+    const lastMessage = retry.messages[retry.messages.length - 1]!;
+    const lastText = lastMessage.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('');
+    assert.ok(
+      lastText.includes('do not call any tools for this'),
+      'retry carries the no-tools line on the final instruction message',
+    );
+    assert.equal(fx.target.compressed, true, 'retry output persists as the L1');
+    assert.equal(quarantineEvents(fx.manager).length, 0, 'a healed tool_use leaves no quarantine debt');
+    fx.manager.close();
+  });
+
   it('two thousand canonical successes append zero quarantine events', async () => {
     let calls = 0;
     const membrane = {
