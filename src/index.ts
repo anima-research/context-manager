@@ -14,6 +14,9 @@ export { BlobManager } from './blob-manager.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
+export { WindowedPassthroughStrategy } from './strategies/windowed-passthrough.js';
+export type { WindowedPassthroughOptions } from './strategies/windowed-passthrough.js';
+export { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot, type Chunk } from './strategies/autobiographical.js';
 export { KnowledgeStrategy } from './strategies/knowledge.js';
 
