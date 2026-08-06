@@ -327,6 +327,80 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('refusal rejection switches the retry to the source-level fallback payload', async () => {
+    // The labclaude 2026-08-06 wedge: an L2 merge whose one-level-deeper raw
+    // replay carries enough diffuse classifier-trigger mass is refused on
+    // INPUT, deterministically, on every identical retry (5/5, then
+    // quarantine, pyramid frozen). The retry must swap the TARGET expansion
+    // for the sources themselves as recall pairs; the first attempt stays
+    // byte-identical to the standard prompt.
+    const mock = scripted([
+      { stop: 'refusal' },
+      { stop: 'end_turn', text: 'the merged memory body, written as prose' },
+    ]);
+    const fx = await fixture(mock.membrane);
+
+    const flat = (call: unknown): string =>
+      JSON.stringify((call as { messages: unknown }).messages);
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 1: refused
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
+    assert.ok(flat(mock.calls[0]).includes('raw-0'), 'first attempt replays the raw span');
+    assert.ok(
+      !flat(mock.calls[0]).includes('authored L1-100'),
+      'first attempt does not show the source summaries',
+    );
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 2: source-level fallback
+    const second = flat(mock.calls[1]);
+    assert.ok(
+      second.includes('authored L1-100') && second.includes('authored L1-101'),
+      'retry shows the sources themselves as recall pairs',
+    );
+    assert.ok(!second.includes('raw-0'), 'retry does not replay the raw span');
+    assert.ok(
+      second.includes('the L1 memories above'),
+      'retry instruction describes summary-level content, not raw conversation',
+    );
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
+    assert.equal(fx.strategy.mergeQueueView().length, 0, 'queue drained');
+    await fx.manager.close();
+  });
+
+  it('refusal fallback is sticky and composes with the no-tools retry line', async () => {
+    // refusal → tool_use → third attempt: hadRefusal keeps the source-level
+    // payload (no raw→fallback oscillation) AND lastStopReason=tool_use adds
+    // the no-tools sentence. Both retry remedies apply at once.
+    const NO_TOOLS_LINE = 'do not call any tools for this';
+    const mock = scripted([
+      { stop: 'refusal' },
+      {
+        raw: {
+          stopReason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+        },
+      },
+      { stop: 'end_turn', text: 'the merged memory body, written as prose' },
+    ]);
+    const fx = await fixture(mock.membrane);
+
+    const flat = (call: unknown): string =>
+      JSON.stringify((call as { messages: unknown }).messages);
+
+    await fx.strategy.tick(ctx(fx.manager)); // refused
+    await fx.strategy.tick(ctx(fx.manager)); // fallback payload, dies on tool_use
+    await fx.strategy.tick(ctx(fx.manager)); // fallback payload + no-tools line
+    const third = flat(mock.calls[2]);
+    assert.ok(
+      third.includes('authored L1-100') && !third.includes('raw-0'),
+      'third attempt keeps the source-level fallback payload',
+    );
+    assert.ok(third.includes(NO_TOOLS_LINE), 'third attempt carries the no-tools instruction');
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
+    assert.equal(fx.strategy.mergeQueueView().length, 0, 'queue drained');
+    await fx.manager.close();
+  });
+
   it('quarantine debt is swept once the sources are covered by a parent', async () => {
     const mock = scripted([{ stop: 'refusal', text: 'nope' }]);
     const fx = await fixture(mock.membrane, { mergeAttemptLimit: 1 });

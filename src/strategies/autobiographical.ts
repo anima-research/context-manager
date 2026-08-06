@@ -855,7 +855,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -1703,7 +1703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
@@ -3136,13 +3136,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
     if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
     merge.attempts = (merge.attempts ?? 0) + 1;
     if (rejection.stopReason !== undefined) merge.lastStopReason = rejection.stopReason;
+    // Sticky across the entry's lifetime: once any attempt was classifier-
+    // refused, later retries keep the source-level fallback payload even if
+    // an intervening rejection had a different stop reason (prevents the
+    // raw→refusal→fallback→tool_use→raw oscillation).
+    if (rejection.stopReason === 'refusal') merge.hadRefusal = true;
     const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     if (merge.attempts >= limit) {
       this.dequeueMerge();
@@ -5734,8 +5739,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // For L2 (sources at L1, sourceLevel=0): expand to raw L0 messages.
     // For L3+ (sources at L_{n-1}, sourceLevel=n-2): expand to L_{n-2}
     //   summaries as recall pairs.
+    //
+    // REFUSAL FALLBACK (retry-only): a classifier-refused merge is refused
+    // on the INPUT — deterministically, every retry — when the one-level-
+    // deeper raw replay carries enough cumulative trigger mass (labclaude
+    // 2026-08-06: L2 over the walk-day span, reasoning_extraction at 4
+    // output tokens, 5/5 identical; bisected sub-slices all PASSED, so the
+    // mass is diffuse, not one strikeable span — vocabulary substitution
+    // has no target). The remedy is to shrink what the summarizer is shown:
+    // on a retry after a refusal rejection, emit the SOURCES THEMSELVES as
+    // recall pairs instead of expanding a level deeper. Bench-verified on
+    // the captured live request: raw replay refused, source-level payload
+    // minted a grounded L2 whose threads match the raw-slice control arms.
+    // First attempts stay byte-identical (KV/behavior stability); bounded
+    // fidelity loss only on the degraded retry, and the summaries shown are
+    // the agent's own words, so nothing is falsified.
+    const refusalFallback =
+      this.mergeQueue[0]?.sourceIds === sourceIds &&
+      (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
+      (this.mergeQueue[0]?.hadRefusal === true ||
+        this.mergeQueue[0]?.lastStopReason === 'refusal');
+    if (refusalFallback) {
+      console.warn(
+        `[autobiographical] L${targetLevel} merge retry after refusal rejection — ` +
+          `source-level fallback payload (sources shown as recall pairs, no deeper expansion)`,
+      );
+      logCompressionCall({
+        event: 'merge-refusal-fallback',
+        site: 'merge',
+        targetLevel,
+        sources: sourceIds,
+      });
+    }
     for (const src of sources) {
-      if (src.sourceLevel === 0) {
+      if (refusalFallback) {
+        // Emit the source itself as a recall pair, whatever its level.
+        llmMessages.push({
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: `[CM] Recall memory ${src.id}.` }],
+        });
+        llmMessages.push({
+          participant,
+          content: this.summaryAnswerContent(src),
+        });
+      } else if (src.sourceLevel === 0) {
         // Source is an L1; its sourceIds are raw message ids. Emit them raw.
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
@@ -5796,14 +5843,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     let mergeInstructionText = this.applyIdentityReminder(
-      mergeReadingContext
-        ? this.getReadingMergeInstruction(
-            targetLevel,
-            sources,
-            mergeReadingContext.totalTokens,
-            targetTokens,
-          )
-        : this.getMergeInstruction(targetLevel, sources, targetTokens),
+      refusalFallback
+        ? // Fallback payload shows the sources THEMSELVES, so the "content
+          // one level deeper" description the standard getters derive would
+          // be wrong — call the formatters with the sources' own level.
+          // Reading-mode is skipped too: it narrates raw shards the model
+          // is no longer being shown.
+          sources.length > 0 && sources.every((s) => s.witnessed)
+          ? formatWitnessedMergeInstruction(targetLevel, sources[0].level, targetTokens)
+          : formatMergeInstruction(targetLevel, sources[0].level, targetTokens)
+        : mergeReadingContext
+          ? this.getReadingMergeInstruction(
+              targetLevel,
+              sources,
+              mergeReadingContext.totalTokens,
+              targetTokens,
+            )
+          : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
     // Retry-only no-tools line. The summarizer request declares the agent's
     // live tools (classifier requirement, see `tools: ctx.tools` below), and
