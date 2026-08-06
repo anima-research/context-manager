@@ -855,7 +855,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -1703,7 +1703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
@@ -3136,12 +3136,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
     if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
     merge.attempts = (merge.attempts ?? 0) + 1;
+    if (rejection.stopReason !== undefined) merge.lastStopReason = rejection.stopReason;
     const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     if (merge.attempts >= limit) {
       this.dequeueMerge();
@@ -5794,7 +5795,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
     }
-    const mergeInstructionText = this.applyIdentityReminder(
+    let mergeInstructionText = this.applyIdentityReminder(
       mergeReadingContext
         ? this.getReadingMergeInstruction(
             targetLevel,
@@ -5804,6 +5805,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           )
         : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    // Retry-only no-tools line. The summarizer request declares the agent's
+    // live tools (classifier requirement, see `tools: ctx.tools` below), and
+    // a model whose recent spans are tool-heavy can answer the merge prompt
+    // on-pattern — a `think` call carrying the summary draft, which the
+    // single-shot compression path cannot continue past (lena 2026-08-04:
+    // 97 merges rejected unusable_empty/stop=tool_use, pyramid frozen,
+    // 46h outage). Forbidding tools structurally (tool_choice:none) makes
+    // the same model emit NOTHING (bench-verified), so the remedy is this
+    // sentence — and only on a retry after a tool_use rejection, keeping
+    // first-attempt prompts byte-identical for KV/behavior stability.
+    const retryAfterToolUse =
+      this.mergeQueue[0]?.sourceIds === sourceIds &&
+      (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
+      this.mergeQueue[0]?.lastStopReason === 'tool_use';
+    if (retryAfterToolUse) {
+      console.warn(
+        `[autobiographical] L${targetLevel} merge retry after tool_use rejection — appending no-tools instruction`,
+      );
+      mergeInstructionText +=
+        '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.';
+    }
     llmMessages.push({
       participant: 'Context Manager',
       content: [{

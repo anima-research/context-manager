@@ -289,6 +289,44 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('tool_use rejection appends the no-tools line on the retry — and only on the retry', async () => {
+    // The lena 2026-08-04 wedge: a summarizer whose recent spans are
+    // tool-heavy answers the merge prompt with a `think` call carrying the
+    // draft; the single-shot compression path dies at the tool boundary on
+    // every identical retry. The retry must differ by exactly one sentence.
+    const NO_TOOLS_LINE = 'do not call any tools for this';
+    const mock = scripted([
+      {
+        raw: {
+          stopReason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+        },
+      },
+      { stop: 'end_turn', text: 'the merged memory body, written as prose' },
+    ]);
+    const fx = await fixture(mock.membrane);
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 1: rejected
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
+    const instructionOf = (call: unknown): string => {
+      const messages = (call as { messages: Array<{ content: Array<{ text?: string }> }> }).messages;
+      return messages[messages.length - 1]!.content.map((b) => b.text ?? '').join('\n');
+    };
+    assert.ok(
+      !instructionOf(mock.calls[0]).includes(NO_TOOLS_LINE),
+      'first attempt must be byte-identical to the standard prompt',
+    );
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 2: retry with the line
+    assert.ok(
+      instructionOf(mock.calls[1]).includes(NO_TOOLS_LINE),
+      'retry after tool_use must carry the no-tools instruction',
+    );
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
+    assert.equal(fx.strategy.mergeQueueView().length, 0, 'queue drained');
+    await fx.manager.close();
+  });
+
   it('quarantine debt is swept once the sources are covered by a parent', async () => {
     const mock = scripted([{ stop: 'refusal', text: 'nope' }]);
     const fx = await fixture(mock.membrane, { mergeAttemptLimit: 1 });
