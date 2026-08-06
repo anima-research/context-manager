@@ -31,7 +31,9 @@ import type { RenderLayout } from '../src/adaptive/render-offsets.js';
 // ---- mock Membrane: returns a summary of a fixed realistic size ----
 function makeMockMembrane(summaryChars: number) {
   const text = 'm'.repeat(Math.max(4, summaryChars));
-  return { complete: async () => ({ content: [{ type: 'text', text }] }) };
+  // stopReason is REQUIRED since the terminal-disposition gate (2026-08-01):
+  // without 'end_turn' every mock compression is quarantined as incomplete.
+  return { complete: async () => ({ content: [{ type: 'text', text }], stopReason: 'end_turn' }) };
 }
 
 function hash(s: string): string {
