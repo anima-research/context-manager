@@ -115,6 +115,26 @@ function withNoToolsLine(request: NormalizedRequest): NormalizedRequest {
   return { ...request, messages };
 }
 
+/**
+ * Final escalation for tool_use compression rejections: an assistant prefill.
+ * A span saturated with the agent's own tool-call turns can out-pull the
+ * no-tools sentence (lena 2026-08-06: L1 chunks and an L3 merge failed the
+ * line-carrying retry under multiple frontiers). A trailing message voiced as
+ * the summarizer participant renders as assistant role, so the model must
+ * CONTINUE prose already begun — a tool call can no longer be the first move.
+ * The prefill text is not persisted (the response continues after it).
+ */
+const MEMORY_PREFILL_TEXT = 'The memory:';
+function withMemoryPrefill(request: NormalizedRequest, participant: string): NormalizedRequest {
+  return {
+    ...request,
+    messages: [
+      ...request.messages,
+      { participant, content: [{ type: 'text', text: MEMORY_PREFILL_TEXT }] },
+    ],
+  };
+}
+
 /** Standard compression instruction for chat/general chunks. */
 function formatInstruction(targetTokens: number): string {
   return (
@@ -5002,11 +5022,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           keptSummaries.map((summary) => summary.level),
           canonicalCoverageHash,
         );
-        const retryStopReason = this.compressionResponseStopReason(retryResponse);
+        let retryStopReason = this.compressionResponseStopReason(retryResponse);
         if (retryStopReason === 'end_turn') {
           response = retryResponse;
           canonicalStopReason = retryStopReason;
           successfulTrace = attemptTraces[attemptTraces.length - 1];
+        } else if (retryStopReason === 'tool_use') {
+          // The span out-pulls the sentence — force prose with a prefill.
+          console.warn(
+            `[autobiographical] no-tools retry also rejected on tool_use — escalating to assistant prefill`,
+          );
+          const prefillResponse = await runAttempt(
+            withMemoryPrefill(
+              withNoToolsLine(request),
+              this.config.summaryParticipant ?? 'Claude',
+            ),
+            'canonical-prefill',
+            keptSummaries.map((summary) => summary.id),
+            keptSummaries.map((summary) => summary.level),
+            canonicalCoverageHash,
+          );
+          if (this.compressionResponseStopReason(prefillResponse) === 'end_turn') {
+            response = prefillResponse;
+            canonicalStopReason = 'end_turn';
+            successfulTrace = attemptTraces[attemptTraces.length - 1];
+          }
         }
       }
       if (canonicalStopReason !== 'end_turn') {
@@ -6001,10 +6041,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    // Escalation past the no-tools sentence: if the line-carrying retry has
+    // itself been rejected on tool_use (attempts ≥ 2 with a tool_use last
+    // stop), force prose with an assistant prefill — same rationale as the
+    // L1 site's 'canonical-prefill' stage.
+    const prefillEscalation =
+      retryAfterToolUse && (this.mergeQueue[0]?.attempts ?? 0) >= 2;
+    const dispatchRequest = prefillEscalation
+      ? withMemoryPrefill(request, this.config.summaryParticipant ?? 'Claude')
+      : request;
+    if (prefillEscalation) {
+      console.warn(
+        `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to assistant prefill`,
+      );
+    }
+
     // Request identity — persisted on the authored summary (provenance) and
     // stamped on every failure receipt, so any parent can be traced back to
     // the exact llm-calls log entry that authored it.
-    const requestHash = sha256Json(request);
+    const requestHash = sha256Json(dispatchRequest);
 
     const callStart = Date.now();
     let logResponse: string | undefined;
@@ -6014,11 +6069,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       let response: NormalizedResponse;
       try {
-        response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+        response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(request)) throw error;
+        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -6028,7 +6083,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
         });
-        response = await ctx.membrane.complete(stripReasoningFromRequest(request), { formatter: this.nativeFormatter });
+        response = await ctx.membrane.complete(stripReasoningFromRequest(dispatchRequest), { formatter: this.nativeFormatter });
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
 
