@@ -31,6 +31,13 @@ export interface WindowedPassthroughOptions {
    * Default: `${namespace}/windowed:anchor`.
    */
   anchorStateId?: string;
+  /**
+   * Per-message token ceiling, surfaced as ContextStrategy.maxMessageTokens
+   * (the framework truncates oversized tool results / attachments against
+   * it, at storage and in-flight). Side-process agents should mirror their
+   * principal's value so the two see the same truncation policy.
+   */
+  maxMessageTokens?: number;
 }
 
 /**
@@ -49,6 +56,7 @@ export interface WindowedPassthroughOptions {
  */
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
+  readonly maxMessageTokens?: number;
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
@@ -64,6 +72,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
     this.reAnchorFraction = fraction;
     this.anchorStateIdOverride = options.anchorStateId;
+    this.maxMessageTokens = options.maxMessageTokens;
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
