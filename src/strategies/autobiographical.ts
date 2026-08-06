@@ -116,23 +116,25 @@ function withNoToolsLine(request: NormalizedRequest): NormalizedRequest {
 }
 
 /**
- * Final escalation for tool_use compression rejections: an assistant prefill.
+ * Final escalation for tool_use compression rejections: drop the tools param.
  * A span saturated with the agent's own tool-call turns can out-pull the
  * no-tools sentence (lena 2026-08-06: L1 chunks and an L3 merge failed the
- * line-carrying retry under multiple frontiers). A trailing message voiced as
- * the summarizer participant renders as assistant role, so the model must
- * CONTINUE prose already begun — a tool call can no longer be the first move.
- * The prefill text is not persisted (the response continues after it).
+ * line-carrying retry under multiple frontiers). With no tools declared the
+ * response physically cannot be a tool call. Assistant prefill is NOT an
+ * option — opus-4-6-era models reject it ("This model does not support
+ * assistant message prefill", observed live 2026-08-06).
+ *
+ * Trade-off, eyes open: a tools-less request replaying tool-block history is
+ * the labclaude reasoning_extraction risk (2026-07-09) — which is why this
+ * is the LAST rung, reached only after two tool_use rejections, a pattern
+ * seen on opus-family summarizers (Fable-family compression failures are
+ * refusal-class and ride the source-level fallback instead). Bench receipt:
+ * the tools-less arm of the lena merge bench minted cleanly, content
+ * matching the tools-declared control.
  */
-const MEMORY_PREFILL_TEXT = 'The memory:';
-function withMemoryPrefill(request: NormalizedRequest, participant: string): NormalizedRequest {
-  return {
-    ...request,
-    messages: [
-      ...request.messages,
-      { participant, content: [{ type: 'text', text: MEMORY_PREFILL_TEXT }] },
-    ],
-  };
+function withoutToolsParam(request: NormalizedRequest): NormalizedRequest {
+  const { tools: _tools, ...rest } = request as NormalizedRequest & { tools?: unknown };
+  return rest as NormalizedRequest;
 }
 
 /** Standard compression instruction for chat/general chunks. */
@@ -5028,22 +5030,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           canonicalStopReason = retryStopReason;
           successfulTrace = attemptTraces[attemptTraces.length - 1];
         } else if (retryStopReason === 'tool_use') {
-          // The span out-pulls the sentence — force prose with a prefill.
+          // The span out-pulls the sentence — remove the tools param so a
+          // tool call is structurally impossible (see withoutToolsParam).
           console.warn(
-            `[autobiographical] no-tools retry also rejected on tool_use — escalating to assistant prefill`,
+            `[autobiographical] no-tools retry also rejected on tool_use — escalating to tools-less request`,
           );
-          const prefillResponse = await runAttempt(
-            withMemoryPrefill(
-              withNoToolsLine(request),
-              this.config.summaryParticipant ?? 'Claude',
-            ),
-            'canonical-prefill',
+          const toolslessResponse = await runAttempt(
+            withoutToolsParam(withNoToolsLine(request)),
+            'canonical-toolless',
             keptSummaries.map((summary) => summary.id),
             keptSummaries.map((summary) => summary.level),
             canonicalCoverageHash,
           );
-          if (this.compressionResponseStopReason(prefillResponse) === 'end_turn') {
-            response = prefillResponse;
+          if (this.compressionResponseStopReason(toolslessResponse) === 'end_turn') {
+            response = toolslessResponse;
             canonicalStopReason = 'end_turn';
             successfulTrace = attemptTraces[attemptTraces.length - 1];
           }
@@ -6043,16 +6043,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Escalation past the no-tools sentence: if the line-carrying retry has
     // itself been rejected on tool_use (attempts ≥ 2 with a tool_use last
-    // stop), force prose with an assistant prefill — same rationale as the
-    // L1 site's 'canonical-prefill' stage.
-    const prefillEscalation =
+    // stop), drop the tools param so a tool call is structurally impossible
+    // — same rationale as the L1 site's 'canonical-toolless' stage.
+    const toollessEscalation =
       retryAfterToolUse && (this.mergeQueue[0]?.attempts ?? 0) >= 2;
-    const dispatchRequest = prefillEscalation
-      ? withMemoryPrefill(request, this.config.summaryParticipant ?? 'Claude')
+    const dispatchRequest = toollessEscalation
+      ? withoutToolsParam(request)
       : request;
-    if (prefillEscalation) {
+    if (toollessEscalation) {
       console.warn(
-        `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to assistant prefill`,
+        `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to tools-less request`,
       );
     }
 
