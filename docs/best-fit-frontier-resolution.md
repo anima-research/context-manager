@@ -1,7 +1,17 @@
 # Adaptive Resolution V2 — Best-Fit Frontier Solver with KV-Stability
 
-**Status:** Draft / design. Companion to `adaptive-resolution-design.md` (V1). Lands behind the
-existing `foldingStrategy` flag; the greedy `flat-profile` stays default until this is validated.
+**Status: HISTORICAL (2026-08-05).** The DP solver this document specifies was
+built and then **removed** (`ea198a1`) — its sliding-half-life value model
+created the very churn its λ term fought (`kv-stable-context-control.md`,
+"Why this exists"). No DP solver is pending; the production solver is the
+rev 5.0 single-path solve (`adaptive-resolution-design.md` §13). Three live
+descendants keep this document referenced from code:
+- **V2 leveled pins** (§7) — `ProtectedRange.level` / `maxLevel`, honored by the picker and kv-stable;
+- **the KV-cost model** (§4) — `render-offsets.ts` (`kvCost`), now the solver's exact perturbation measure;
+- **the summary-tree substrate** (§3/§6/§11) — `summary-tree.ts`.
+
+~~**Status:** Draft / design. Companion to `adaptive-resolution-design.md` (V1). Lands behind the
+existing `foldingStrategy` flag; the greedy `flat-profile` stays default until this is validated.~~
 
 ---
 

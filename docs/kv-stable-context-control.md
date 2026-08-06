@@ -143,6 +143,13 @@ only the optimum when costs are uniform and there are no pins.
 
 ## Prototype (this repo)
 
+> **Historical (rev 5.1, 2026-08-05):** the bullets below describe the
+> **retired** §12-era controller (hysteresis band + reach cap + escalation).
+> `kv-control.ts` now implements the rev 5.0 single-path solve — see
+> `adaptive-resolution-design.md` §13, and §13.6 for the robustness machinery
+> (boundary-cut/overlap tolerance, fold→project fixpoint) it has since grown.
+> The measurement harness described further down is unchanged and current.
+
 `src/adaptive/kv-control.ts` implements a tractable first cut:
 
 - **Bidirectional, within a hysteresis band [expandAt, foldAt]** — the frontier

@@ -1,6 +1,8 @@
 /**
  * KvStableStrategy — the KV-stable context controller as a folding SOLVER
- * (see `docs/kv-stable-context-control.md`).
+ * (the rev 5.0 single-path solve; see `docs/adaptive-resolution-design.md`
+ * §13. `docs/kv-stable-context-control.md` is the historical "why" and the
+ * measurement harness).
  *
  * One `solve` call computes the complete target frontier with
  * `planControlledFrontier` (the *same* policy the replay harness measures)
@@ -8,10 +10,11 @@
  *
  * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
  * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
- * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and sheds the
- * foldable middle oldest-first/leveled under a per-turn divergence **reach
- * cap** (the perturbation cap P), yielding the reach cap only as far as
- * needed to stay under the hard wall (`totalBudget`).
+ * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and reconciles a
+ * from-scratch relevance-ideal cut against the carried frontier under a
+ * perturbation TRUST REGION P (exact kvCost, not a spatial gate) — adopting
+ * the ideal within P, amortizing bigger repairs via suffix adoption, and
+ * exceeding P only with a recorded override. There is no emergency path.
  *
  * It does not emit produce requests — deeper folding than has been produced
  * is the speculative pre-producer's job; the controller only targets levels

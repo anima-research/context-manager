@@ -56,12 +56,13 @@ export interface ControlOptions {
   lowWatermark?: number;
   /** High-watermark; fold is triggered above it. Default = budgetTokens. */
   highWatermark?: number;
-  /** Per-turn divergence reach: how far back (tokens from the live end) a fold
-   *  may normally edit — the structural perturbation cap P, and the primary
-   *  cost↔continuity knob. Smaller = gentler per-turn KV perturbation (shallow
-   *  divergence) but less efficient compression → more/again folding. Exceeded
-   *  ONLY to avoid the hard wall W. Default = budgetTokens (effectively
-   *  unbounded). */
+  /** Trust region P on per-turn perturbation, in tokens the provider would
+   *  re-read (exact kvCost — design §13.4; NOT a spatial gate on which chunks
+   *  may move). The primary cost↔continuity knob: smaller = gentler per-turn
+   *  KV perturbation but slower convergence to the ideal cut (suffix adoption
+   *  amortizes repairs across turns). Exceeded only via a recorded override
+   *  (bootstrap / infeasible / quality-gap). Default = budgetTokens
+   *  (effectively unbounded). */
   reachTokens?: number;
   /** Attended window kept raw + stable (the flat zone). */
   attendedWindowTokens: number;
@@ -109,9 +110,12 @@ export interface ControlResult {
 }
 
 /**
- * Per-chunk maximum fold depth from the saliency field: flat zone and pins are
+ * Per-chunk fold-depth band from the saliency field: flat zone and pins are
  * raw (0); otherwise log-age banded against the base-k geometry. The "finest
- * requirement wins" — this is the cap the shedder may not exceed.
+ * requirement wins". This is the SOFT shape prior of the ideal cut (design
+ * §13.3): phase A folds under it, phase B folds past it when W demands —
+ * only the hard protections (−1 sentinel, assigned by the caller) and pin
+ * caps are inviolable.
  */
 export function foldDepthCap(
   chunk: PickerChunk,

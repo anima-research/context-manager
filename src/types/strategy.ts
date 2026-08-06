@@ -793,9 +793,11 @@ export interface AutobiographicalConfig {
    * Folding strategy name when adaptiveResolution is on. One of:
    *   'flat-profile' (default) — level-equalizing
    *   'oldest-first' — chronological
-   *   'kv-stable' — the KV-stable context controller: minimizes real prefix
-   *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
-   *     from the live PickerInputs. See docs/kv-stable-context-control.md.
+   *   'kv-stable' — the KV-stable context controller: the rev 5.0 single-path
+   *     solve — a relevance-ideal cut reconciled against the carried frontier
+   *     under a perturbation trust region (exact kvCost; no λ, no emergency
+   *     path). Built per-compile from the live PickerInputs. See
+   *     docs/adaptive-resolution-design.md §13.
    * Custom strategies can be plugged in by the host application.
    */
   foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';

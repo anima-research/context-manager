@@ -151,7 +151,8 @@ export interface PickerChunk {
   /**
    * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap).
    * Set from a `ProtectedRange.maxLevel`. Honored only by the KV-stable
-   * controller (in normal and emergency shedding). Ignored elsewhere.
+   * controller, throughout the solve — there is no emergency path (design
+   * §13). Ignored elsewhere.
    */
   pinMaxLevel?: number;
   /**

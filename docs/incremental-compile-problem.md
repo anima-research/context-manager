@@ -401,6 +401,17 @@ the residual 1.5–1.9 s live), lazy blob resolution (open 25–29 s/boot,
 ~2 GB RSS), then the settled-zone architecture (§6) for true
 unbounded-growth safety.
 
+## Postscript (2026-08-05)
+
+The §9.3 fixes (eligibility memo, unanimity memo, phase-C `attempted`
+short-circuit) are all live and unchanged. One later development re-opens the
+cost picture: the **fold→project fixpoint** (`b99fcc3`, 2026-08-03;
+`adaptive-resolution-design.md` §13.6) can re-run the phase pipeline up to two
+extra rounds per compile on a *non-nested* tree — so a store in the
+overlap-tolerated degraded mode pays up to ~3× the §9.3 phase cost until it
+gets nesting repair. Healthy trees exit in one round; the §6 "settled zone"
+direction remains unbuilt.
+
 ## 10. Related
 
 - `docs/kv-stable-context-control.md` — prefix-stability goal

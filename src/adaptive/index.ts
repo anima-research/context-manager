@@ -3,10 +3,10 @@
  *
  * See `docs/adaptive-resolution-design.md` for the architectural overview.
  *
- * Status: V1 implementation, not yet wired into `AutobiographicalStrategy`.
- * Modules in this directory are exercised via the test harness in
- * `test/adaptive/` and will be integrated into the strategy in a follow-up
- * once the design is validated against real workloads.
+ * Status: wired into `AutobiographicalStrategy` (`selectAdaptive`) and in
+ * production — deployed agents run the kv-stable solver from this directory
+ * (design §13). Also exercised standalone via `test/adaptive/` and the
+ * replay harness (`kv-replay`).
  */
 
 // Chunker
