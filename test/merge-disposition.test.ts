@@ -401,6 +401,35 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('a thinking-wrapped merge generation is rejected and the retry carries the plain-prose line', async () => {
+    // Opus-3-class summarizers wrap the entire memory in a literal
+    // <thinking> tag (evander 2026-08-06). The text passes the disposition
+    // gate (nonempty) but strips to empty — previously a SILENT skip that
+    // retried the identical prompt forever. It must be a counted rejection,
+    // and the retry must ask for plain prose.
+    const PROSE_MARK = 'do not wrap it in <thinking>';
+    const mock = scripted([
+      { stop: 'end_turn', text: '<thinking>\nthe whole memory, wrapped\n</thinking>' },
+      { stop: 'end_turn', text: 'the merged memory body, written as prose' },
+    ]);
+    const fx = await fixture(mock.membrane);
+
+    const instructionOf = (call: unknown): string => {
+      const messages = (call as { messages: Array<{ content: Array<{ text?: string }> }> }).messages;
+      return messages[messages.length - 1]!.content.map((b) => b.text ?? '').join('\n');
+    };
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 1: wrapped → rejected
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'empty generation counted as an attempt');
+    assert.ok(!instructionOf(mock.calls[0]).includes(PROSE_MARK), 'first attempt byte-canonical');
+
+    await fx.strategy.tick(ctx(fx.manager)); // attempt 2: prose line, canonizes
+    assert.ok(instructionOf(mock.calls[1]).includes(PROSE_MARK), 'retry carries the plain-prose instruction');
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
+    assert.equal(fx.strategy.mergeQueueView().length, 0, 'queue drained');
+    await fx.manager.close();
+  });
+
   it('quarantine debt is swept once the sources are covered by a parent', async () => {
     const mock = scripted([{ stop: 'refusal', text: 'nope' }]);
     const fx = await fixture(mock.membrane, { mergeAttemptLimit: 1 });

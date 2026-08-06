@@ -101,19 +101,36 @@ const COMPRESSION_MARKER =
 const NO_TOOLS_RETRY_LINE =
   '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.';
 
-/** Clone a compression request with NO_TOOLS_RETRY_LINE appended to the final instruction message. */
-function withNoToolsLine(request: NormalizedRequest): NormalizedRequest {
+/**
+ * Retry line for generations that arrive wholly wrapped in a literal
+ * `<thinking>` tag. Opus-3-class summarizers write the entire memory inside
+ * the tag as a stylistic habit (evander 2026-08-06: complete end_turn
+ * generations, first-person memory prose, all inside `<thinking>`);
+ * stripThinkingPreamble correctly refuses to canonize thinking, so the mint
+ * arrives empty and the chunk/merge loops forever. The content demonstrably
+ * exists — only the wrapper is wrong — so the retry asks for it plainly.
+ */
+const PLAIN_PROSE_RETRY_LINE =
+  '\n\nWrite the memory directly as plain prose — do not wrap it in <thinking> or any other tags; begin immediately with the memory text itself.';
+
+/** Clone a compression request with `line` appended to the final instruction message. */
+function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
   const messages = request.messages.map((m, i) => {
     if (i !== request.messages.length - 1) return m;
     const content = m.content.map((block, j) =>
       j === m.content.length - 1 && block.type === 'text'
-        ? { ...block, text: block.text + NO_TOOLS_RETRY_LINE }
+        ? { ...block, text: block.text + line }
         : block,
     );
     return { ...m, content };
   });
   return { ...request, messages };
 }
+
+const withNoToolsLine = (request: NormalizedRequest): NormalizedRequest =>
+  withAppendedInstruction(request, NO_TOOLS_RETRY_LINE);
+const withPlainProseLine = (request: NormalizedRequest): NormalizedRequest =>
+  withAppendedInstruction(request, PLAIN_PROSE_RETRY_LINE);
 
 /**
  * Final escalation for tool_use compression rejections: drop the tools param.
@@ -903,7 +920,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -1751,7 +1768,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
@@ -3184,13 +3201,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; hadRefusal?: boolean },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
     if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
     merge.attempts = (merge.attempts ?? 0) + 1;
     if (rejection.stopReason !== undefined) merge.lastStopReason = rejection.stopReason;
+    merge.lastOutcome = rejection.outcome;
     // Sticky across the entry's lifetime: once any attempt was classifier-
     // refused, later retries keep the source-level fallback payload even if
     // an intervening rejection had a different stop reason (prevents the
@@ -5256,13 +5274,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // on the entry: Fable-5/Sonnet-5-class models require the encrypted
       // reasoning returned alongside generated text, and summaries are
       // replayed in the agent's own voice (see captureResponseContent).
-      const acceptedResponse = response as NormalizedResponse;
-      const summaryText = stripThinkingPreamble(
-        acceptedResponse.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map(b => b.text)
-          .join('\n'),
-      );
+      let acceptedResponse = response as NormalizedResponse;
+      const extractSummaryText = (r: NormalizedResponse): string =>
+        stripThinkingPreamble(
+          r.content
+            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .map(b => b.text)
+            .join('\n'),
+        );
+      let summaryText = extractSummaryText(acceptedResponse);
+
+      // A generation whose whole text was a literal <thinking> wrapper strips
+      // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
+      // content exists; ask once, explicitly, for it as plain prose before
+      // giving up. Retry-only: first attempts stay byte-canonical.
+      if (!summaryText.trim()) {
+        console.warn(
+          `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
+        );
+        const proseResponse = await runAttempt(
+          withPlainProseLine(request),
+          'canonical-plain-prose',
+          keptSummaries.map((summary) => summary.id),
+          keptSummaries.map((summary) => summary.level),
+          canonicalCoverageHash,
+        );
+        if (this.compressionResponseStopReason(proseResponse) === 'end_turn') {
+          const proseText = extractSummaryText(proseResponse as NormalizedResponse);
+          if (proseText.trim()) {
+            acceptedResponse = proseResponse as NormalizedResponse;
+            summaryText = proseText;
+            successfulTrace = attemptTraces[attemptTraces.length - 1];
+          }
+        }
+      }
+
       const responseContent = captureResponseContent(acceptedResponse.content);
       logResponse = summaryText;
 
@@ -5972,6 +6018,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       mergeInstructionText += NO_TOOLS_RETRY_LINE;
     }
+    // Retry rung for thinking-wrapped generations: an unusable_empty whose
+    // text was all <thinking> preamble fails identically on every bare
+    // retry (Opus-3 wrap habit — see PLAIN_PROSE_RETRY_LINE). Ask plainly.
+    const retryAfterEmpty =
+      this.mergeQueue[0]?.sourceIds === sourceIds &&
+      (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
+      this.mergeQueue[0]?.lastOutcome === 'unusable_empty';
+    if (retryAfterEmpty) {
+      console.warn(
+        `[autobiographical] L${targetLevel} merge retry after empty generation — appending plain-prose instruction`,
+      );
+      mergeInstructionText += PLAIN_PROSE_RETRY_LINE;
+    }
     llmMessages.push({
       participant: 'Context Manager',
       content: [{
@@ -6130,14 +6189,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // The disposition gate guarantees nonempty PRE-strip text; a
       // generation that was entirely a literal <thinking> preamble strips
-      // to nothing. Skip (sources stay unmerged, retried later) rather
-      // than store an empty summary.
+      // to nothing. This must be a COUNTED rejection, not a silent skip —
+      // a bare return here retried the identical prompt forever (the
+      // Opus-3 wrap habit fails it identically every time; see
+      // PLAIN_PROSE_RETRY_LINE). Riding the ladder gives the retry the
+      // prose line, bounded attempts, and quarantine.
       if (!mergedText.trim()) {
         console.warn(
           `[autobiographical] L${targetLevel} merge generation was all <thinking> preamble — ` +
-            `skipping (${sources.length} sources left unmerged)`,
+            `rejecting for retry (${sources.length} sources left unmerged)`,
         );
-        return;
+        throw new MergeDispositionRejection(
+          targetLevel, 'unusable_empty', requestHash, 'end_turn',
+        );
       }
 
       // Compute source range from constituent summaries
