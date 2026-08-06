@@ -3408,7 +3408,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const candidates = new Set<Chunk>();
     const first = messageIdToChunk.get(firstMsgId);
-    const last = messageIdToChunk.get(lastMsgId);
+    // Tail-endpoint fallback (issue #56): the range's last message may sit in
+    // the unclosed trailing span — messages the chunker hasn't realized yet,
+    // which by construction lie AFTER every closed chunk. The kv-stable
+    // escalation demand path emits ranges over contiguous L1-uncovered runs,
+    // and such a run naturally extends from the newest uncompressed closed
+    // chunk into the unclosed span. Resolving only `first` would demand one
+    // chunk per compile while the agent is hard-down on OverBudgetError;
+    // treating the unresolved tail as "through the newest closed chunk"
+    // demands the whole backlog in one compile instead.
+    const last = messageIdToChunk.get(lastMsgId)
+      ?? (first ? this.chunks[this.chunks.length - 1] : undefined);
     if (first) candidates.add(first);
     if (last) candidates.add(last);
     // Also catch chunks fully spanned by the range (rare, but supports the
@@ -3815,6 +3825,106 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       l3: this.summaries.filter(s => s.level === 3 && !s.mergedInto).length,
       pendingMerges: this.mergeQueue.length,
     };
+  }
+
+  /**
+   * Compression-debt reduction — the single authority for "is this
+   * resident's memory organ keeping up." Consumed by /healthz (fleet-watch
+   * alarms on it) and, later, by the resident-facing notice (af #99). The
+   * 2026-08-06 five-resident wedge day showed every outage was weeks of
+   * silently-failing compression surfacing as a sudden budget crisis: the
+   * failure was never the wedge, the wedge was the accumulated interest on
+   * an invisible failure. This method makes the interest visible.
+   *
+   * States:
+   * - `healthy`  — no quarantines; no closed chunk has waited > 1h.
+   * - `degraded` — any quarantine record exists, or the oldest closed-but-
+   *                uncompressed chunk has waited > 1h.
+   * - `critical` — the oldest pending chunk has waited > 6h AND there is a
+   *                quarantine or a 5+ chunk backlog: the organ is not
+   *                recovering on its own; an operator is needed.
+   *
+   * The OPEN frontier chunk (still accumulating messages) is not debt and
+   * is excluded. Ages derive from the newest message inside the oldest
+   * pending chunk — chunk records carry no timestamps of their own.
+   * Read-only, never throws (health surface contract).
+   */
+  getCompressionDebt(now: number = Date.now()): {
+    state: 'healthy' | 'degraded' | 'critical';
+    pendingChunks: number;
+    oldestPendingAgeMs: number | null;
+    mergeQueueDepth: number;
+    mergeQueueMaxAttempts: number;
+    mergeQuarantineCount: number;
+    compressionQuarantineCount: number;
+    unmergedFrontier: { l1: number; l2: number; l3: number };
+    lastMintAt: number | null;
+  } {
+    const DEGRADED_AFTER_MS = 60 * 60 * 1000;
+    const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
+    const empty = {
+      state: 'healthy' as const,
+      pendingChunks: 0,
+      oldestPendingAgeMs: null,
+      mergeQueueDepth: 0,
+      mergeQueueMaxAttempts: 0,
+      mergeQuarantineCount: 0,
+      compressionQuarantineCount: 0,
+      unmergedFrontier: { l1: 0, l2: 0, l3: 0 },
+      lastMintAt: null,
+    };
+    try {
+      // Exclude the trailing open chunk: it is life, not debt.
+      const closed = this.chunks.filter((c, i) => !(i === this.chunks.length - 1 && !c.compressed));
+      const pending = closed.filter((c) => !c.compressed);
+      // Chronicle timestamps may be µs; normalize to ms defensively.
+      const toMs = (t: number): number => (t > 1e14 ? t / 1000 : t);
+      let oldestPendingAgeMs: number | null = null;
+      for (const c of pending) {
+        const ts = c.messages
+          .map((m) => (m as unknown as { timestamp?: number }).timestamp)
+          .filter((t): t is number => typeof t === 'number');
+        if (!ts.length) continue;
+        const closedAt = toMs(Math.max(...ts));
+        const age = now - closedAt;
+        if (oldestPendingAgeMs === null || age > oldestPendingAgeMs) oldestPendingAgeMs = age;
+      }
+      const mergeQuarantineCount = this.mergeQuarantine.size;
+      const compressionQuarantineCount = this.getCompressionQuarantineStatus().count;
+      const quarantines = mergeQuarantineCount + compressionQuarantineCount;
+      const mints = this.summaries
+        .map((s) => s.created)
+        .filter((t): t is number => typeof t === 'number');
+      const lastMintAt = mints.length ? toMs(Math.max(...mints)) : null;
+
+      let state: 'healthy' | 'degraded' | 'critical' = 'healthy';
+      const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
+      if (quarantines > 0 || stale) state = 'degraded';
+      if (
+        oldestPendingAgeMs !== null &&
+        oldestPendingAgeMs > CRITICAL_AFTER_MS &&
+        (quarantines > 0 || pending.length >= 5)
+      ) {
+        state = 'critical';
+      }
+      return {
+        state,
+        pendingChunks: pending.length,
+        oldestPendingAgeMs,
+        mergeQueueDepth: this.mergeQueue.length,
+        mergeQueueMaxAttempts: Math.max(0, ...this.mergeQueue.map((m) => m.attempts ?? 0)),
+        mergeQuarantineCount,
+        compressionQuarantineCount,
+        unmergedFrontier: {
+          l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto).length,
+          l2: this.summaries.filter((s) => s.level === 2 && !s.mergedInto).length,
+          l3: this.summaries.filter((s) => s.level === 3 && !s.mergedInto).length,
+        },
+        lastMintAt,
+      };
+    } catch {
+      return empty;
+    }
   }
 
   /**
