@@ -267,6 +267,14 @@ export function accountFrontier(
 export class Picker {
   constructor(private readonly solver: FoldingSolver) {}
 
+  /** Name of the solver this picker runs — surfaced so every compile can be
+   *  attributed to the policy that actually planned it (solver observability:
+   *  a config clobber that silently downgrades kv-stable → flat-profile is
+   *  invisible without this). */
+  get solverName(): string {
+    return this.solver.name;
+  }
+
   run(inputs: PickerInputs, budget: FoldingBudget): PickerResult {
     const solution = this.solver.solve(inputs, budget);
     const { frontier, produced } = solution;
