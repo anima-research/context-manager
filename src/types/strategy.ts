@@ -424,6 +424,10 @@ export interface RenderStats {
     budgetMet: boolean;
     exhausted: boolean;
     moves: number;
+    /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
+     *  'flat-profile'). Surfaces the policy actually in force — a config
+     *  clobber that silently downgrades the solver is invisible without it. */
+    solver?: string;
   };
 }
 

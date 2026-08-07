@@ -1028,6 +1028,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Lazy picker instance, built from config.foldingStrategy. */
   private _adaptivePicker: Picker | null = null;
+  /** foldingStrategy as resolved at construction — the drift baseline for
+   *  [picker-config-drift]. */
+  private _constructedFoldingStrategy: AutobiographicalConfig['foldingStrategy'];
 
   /** A future usable window the KV-stable controller is preparing while the
    * caller keeps compiling against its current hard window. */
@@ -1057,6 +1060,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.compressionSlackRatio ??= 0.1;
       this.config.speculativeProduction ??= true;
     }
+    // The solver committed to at construction. buildPicker compares the live
+    // config against this on every compile: a runtime mutation (e.g. an
+    // override merge carrying `foldingStrategy: undefined`) silently swaps
+    // the solver — and with it the entire cache-stability policy — for that
+    // compile. That drift must be LOUD (see [picker-config-drift]).
+    this._constructedFoldingStrategy = this.config.foldingStrategy;
   }
   /**
    * Explicit operator escape hatch. A retry remains canonical-first; clearing
@@ -1158,8 +1167,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
-      if (overrides && Object.keys(overrides).length > 0) {
-        this.config = { ...savedConfig, ...overrides };
+      // Drop explicit undefined/null overrides BEFORE spreading: a spread
+      // with `foldingStrategy: undefined` ERASES the live key and silently
+      // downgrades the solver to flat-profile for this preview's compile
+      // (JSON-driven callers — fleet hub, panel forms — can produce exactly
+      // that shape). Absence is the only way to mean "keep the live value".
+      const cleaned = overrides
+        ? Object.fromEntries(
+            Object.entries(overrides).filter(([, v]) => v !== undefined && v !== null),
+          )
+        : undefined;
+      if (cleaned && Object.keys(cleaned).length > 0) {
+        this.config = { ...savedConfig, ...cleaned };
         // Both memoize config-derived values, so a swapped config must not see
         // a cache built under the old one.
         this._adaptivePicker = null;
@@ -4303,7 +4322,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _emittedSummaryIds: Set<string> = new Set();
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
-  private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number } | null = null;
+  private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -4349,6 +4368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budgetMet: m?.budgetMet ?? false,
         exhausted: m?.exhausted ?? false,
         moves: m?.moves ?? 0,
+        ...(m?.solver !== undefined ? { solver: m.solver } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -4356,7 +4376,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const line =
         `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
-        ` moves=${m?.moves}`;
+        ` moves=${m?.moves} solver=${m?.solver}`;
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
@@ -6751,6 +6771,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       budgetMet: result.budgetMet,
       exhausted: result.exhausted,
       moves: result.moves,
+      solver: picker.solverName,
     };
 
     // Every trust-region override is loud (design §13.4) — silence was half
@@ -7472,6 +7493,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     inputs: PickerInputs,
     preparedBudget?: { totalBudget: number; targetBudget: number },
   ): Picker {
+    // Drift alarm: the live config must still name the solver chosen at
+    // construction. Nothing legitimate rewrites foldingStrategy at runtime —
+    // a mismatch means an override merge (or other mutation) clobbered it,
+    // and THIS compile is about to run under the wrong cache policy. The
+    // 2026-08-07 fable investigation found exactly one such compile
+    // ([picker-unrealizable] solver=flat-profile in a kv-stable agent) with
+    // no way to attribute it; this line is the attribution.
+    if (this.config.foldingStrategy !== this._constructedFoldingStrategy) {
+      console.error(
+        `[picker-config-drift] foldingStrategy=${JSON.stringify(this.config.foldingStrategy)} ` +
+          `differs from constructed=${JSON.stringify(this._constructedFoldingStrategy)} — ` +
+          `a runtime mutation clobbered the solver choice; this compile runs the wrong solver`,
+        new Error('picker-config-drift stack').stack,
+      );
+    }
     if (this.config.foldingStrategy === 'kv-stable') {
       const strategy = new KvStableStrategy({
         reachTokens: preparedBudget === undefined

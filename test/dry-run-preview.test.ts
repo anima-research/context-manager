@@ -24,6 +24,7 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ProduceRequest } from '../src/adaptive/folding-strategy.js';
+import type { Picker, PickerInputs } from '../src/adaptive/picker.js';
 
 const TEST_STORE_PATH = './test-dry-run-preview';
 
@@ -39,6 +40,17 @@ function textBlock(text: string): ContentBlock[] {
 class SpyStrategy extends AutobiographicalStrategy {
   producedCalls = 0;
   persistCalls = 0;
+  /** Solver name of every picker built — attribution for the clobber test. */
+  pickerSolverNames: string[] = [];
+
+  protected buildPicker(
+    inputs: PickerInputs,
+    preparedBudget?: { totalBudget: number; targetBudget: number },
+  ): Picker {
+    const picker = super.buildPicker(inputs, preparedBudget);
+    this.pickerSolverNames.push(picker.solverName);
+    return picker;
+  }
 
   protected handleProducedOps(ops: readonly ProduceRequest[], opts?: { speculative?: boolean }): void {
     this.producedCalls++;
@@ -162,6 +174,46 @@ describe('AutobiographicalStrategy — dry-run preview', () => {
 
     assert.strictEqual(strategy.configTail(), tailBefore, 'recentWindowTokens must be restored');
     assert.strictEqual(strategy.configChunk(), chunkBefore, 'targetChunkTokens must be restored');
+  });
+
+  it('drops explicit undefined/null overrides instead of clobbering live keys', async () => {
+    const strategy = makeStrategy({ foldingStrategy: 'kv-stable' });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+
+    // The live compile must both run kv-stable and REPORT it (planVsActual
+    // is the fleet's only from-outside solver check, via /debug/context/makeup).
+    const stats = (strategy as unknown as {
+      getRenderStats: (s: unknown) => { planVsActual?: { solver?: string } } | null;
+    }).getRenderStats(undefined);
+    assert.strictEqual(
+      stats?.planVsActual?.solver, 'kv-stable',
+      'planVsActual must expose the solver that planned the compile',
+    );
+
+    // A JSON-driven caller (fleet hub, panel form) can serialize absent form
+    // fields as explicit undefined/null. Spreading those into the config would
+    // ERASE the live foldingStrategy and silently run this preview's compile
+    // on flat-profile — the exact drift the 2026-08-07 fable investigation
+    // could not attribute. They must be dropped, not spread.
+    strategy.pickerSolverNames.length = 0;
+    const preview = manager.previewContext(
+      { maxTokens: 100_000, reserveForResponse: 200 },
+      {
+        foldingStrategy: undefined,
+        compressionSlackRatio: null as unknown as number,
+        targetChunkTokens: 777,
+      },
+    );
+    assert.ok(preview, 'preview with sparse overrides must succeed');
+    assert.ok(strategy.pickerSolverNames.length > 0, 'preview must have built a picker');
+    for (const name of strategy.pickerSolverNames) {
+      assert.strictEqual(
+        name, 'kv-stable',
+        'undefined/null overrides must not downgrade the solver for the previewed compile',
+      );
+    }
   });
 
   it('a larger tail override raises the previewed tail cost', async () => {
