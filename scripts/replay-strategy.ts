@@ -196,9 +196,12 @@ async function main() {
 
   // 2×2: folding policy (flat / kv-stable) × marker placement (strategy / ideal).
   // Isolates the dominant lever (markers) from the folding-policy effect.
+  // --kv-only skips the flat-profile variants — they are invariant to
+  // --reach, so parameter sweeps only need them once (in a full-grid run).
+  const kvOnly = args.includes('--kv-only');
   const grid: Record<string, TraceResult> = {};
   for (const markerMode of ['strategy', 'ideal'] as const) {
-    for (const useKvStable of [false, true]) {
+    for (const useKvStable of kvOnly ? [true] : [false, true]) {
       const r = await runVariant({ name, useKvStable, reachTokens, markerMode, ...common });
       const tag = `${useKvStable ? 'kv-stable' : 'flat-profile'} · ${markerMode}-markers`;
       grid[`${useKvStable ? 'kv' : 'flat'}_${markerMode}`] = r;
@@ -210,14 +213,16 @@ async function main() {
   const meta = { name, chunks: chunks.length, rawTotal, budgetTokens, medianSummaryTokens, stride, reachTokens: reachTokens ?? null };
   // The viewer compares the two policies under the better (ideal) marker placement.
   writeFileSync(`${outDir}/${name}-kv-trace.json`, JSON.stringify({ meta, ...grid.kv_ideal }));
-  writeFileSync(`${outDir}/${name}-flat-trace.json`, JSON.stringify({ meta, ...grid.flat_ideal }));
+  if (grid.flat_ideal) writeFileSync(`${outDir}/${name}-flat-trace.json`, JSON.stringify({ meta, ...grid.flat_ideal }));
 
   console.log(`\nMarker placement is the dominant lever:`);
-  console.log(`  flat:  strategy-markers ${(grid.flat_strategy.overallHitRate * 100).toFixed(1)}% → ideal-markers ${(grid.flat_ideal.overallHitRate * 100).toFixed(1)}% hit`);
+  if (grid.flat_strategy) console.log(`  flat:  strategy-markers ${(grid.flat_strategy.overallHitRate * 100).toFixed(1)}% → ideal-markers ${(grid.flat_ideal.overallHitRate * 100).toFixed(1)}% hit`);
   console.log(`  kv:    strategy-markers ${(grid.kv_strategy.overallHitRate * 100).toFixed(1)}% → ideal-markers ${(grid.kv_ideal.overallHitRate * 100).toFixed(1)}% hit`);
-  const dRe = grid.flat_ideal.totalRecomputed - grid.kv_ideal.totalRecomputed;
-  const dMax = grid.flat_ideal.maxPerturbation - grid.kv_ideal.maxPerturbation;
-  console.log(`Under ideal markers, kv-stable vs flat: recompute ${dRe >= 0 ? '−' : '+'}${fmt(Math.abs(dRe))}, max-perturb ${dMax >= 0 ? '−' : '+'}${fmt(Math.abs(dMax))}`);
+  if (grid.flat_ideal) {
+    const dRe = grid.flat_ideal.totalRecomputed - grid.kv_ideal.totalRecomputed;
+    const dMax = grid.flat_ideal.maxPerturbation - grid.kv_ideal.maxPerturbation;
+    console.log(`Under ideal markers, kv-stable vs flat: recompute ${dRe >= 0 ? '−' : '+'}${fmt(Math.abs(dRe))}, max-perturb ${dMax >= 0 ? '−' : '+'}${fmt(Math.abs(dMax))}`);
+  }
   console.log(`wrote ${outDir}/${name}-{kv,flat}-trace.json`);
 }
 
