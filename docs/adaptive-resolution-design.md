@@ -790,6 +790,25 @@ Every override is loud: the plan reports `override: 'infeasible' | 'quality-gap'
 | 'bootstrap'` plus the exact perturbation, and the strategy layer logs a
 `[kv-escalation]` line. Silence was half of the incident.
 
+**Demand-side production under escalation (issue #56, 2026-08-06).** The
+solver never *speculatively* pre-produces — deeper folding than has been
+produced stays the pre-producer's job — but when the plan **escalates**
+(even full folding exceeds W) while foldable chunks have no L1 coverage at
+all, `KvStableStrategy.solve` emits level-1 `ProduceRequest`s over the
+contiguous uncovered runs (skipping the flat zone, pins, and locked chunks).
+This is the only route into the strategy layer's demand path
+(`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`), which is
+what overrides the `l1HoldbackChunks` window. Without it, tight operating
+points — where the budget wall lands while the only uncompressed material is
+the unclosed trailing span plus the held-back newest closed chunk — wedged
+permanently: empty speculative queue, no way to raise demand, every compile
+re-escalating infeasible (the L1-holdback deadlock; external repro at
+budgets 14–26k). A produce op still never authorizes an inference — the
+escalated compile hard-fails as before — but recovery now needs only the
+production drain, not config surgery. A range whose tail ends in the
+unclosed trailing span (not yet a chunk) resolves "through the newest closed
+chunk" at the consumer, so the whole backlog is demanded in one compile.
+
 ### 13.3 Salience as a coefficient (not a cap)
 
 `foldDepthCap`'s log-age banding survives only as the *shape prior* inside the

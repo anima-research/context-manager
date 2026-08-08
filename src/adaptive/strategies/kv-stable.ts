@@ -16,9 +16,15 @@
  * the ideal within P, amortizing bigger repairs via suffix adoption, and
  * exceeding P only with a recorded override. There is no emergency path.
  *
- * It does not emit produce requests — deeper folding than has been produced
- * is the speculative pre-producer's job; the controller only targets levels
- * whose summaries already exist. Deterministic.
+ * It does not SPECULATIVELY emit produce requests — deeper folding than has
+ * been produced is the speculative pre-producer's job; the controller only
+ * targets levels whose summaries already exist. The one exception is DEMAND
+ * under escalation (issue #56): when even full folding exceeds the hard wall
+ * W while foldable chunks have no L1 coverage at all, production is the only
+ * remaining lever, and the caller's demand path (`handleProducedOps` →
+ * `enqueueL1ForRange` → the L1-holdback exemption) is reachable only through
+ * produce ops — so the solve emits L1 requests for the uncovered ranges.
+ * Deterministic.
  *
  * History: this used to walk the plan into the picker one group-atomic
  * raise/lower op at a time. Group ops cannot express a frontier that cuts
@@ -34,6 +40,7 @@ import type {
   FoldingSolution,
   FoldingBudget,
   ChunkId,
+  ProduceRequest,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
@@ -154,9 +161,45 @@ export class KvStableStrategy implements FoldingSolver {
     });
     this._lastPlan = plan;
     this._lastTarget = plan.resolutions;
+
+    // DEMAND-SIDE PRODUCTION (issue #56). Speculative pre-production stays the
+    // pre-producer's job — but when even full folding exceeds the hard wall W
+    // (plan.escalated) while foldable chunks have no L1 at all, producing
+    // those L1s is the only lever left, and the caller's demand path
+    // (`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`) fires
+    // only on produce ops. Emitting none wedged tight operating points
+    // PERMANENTLY: the L1 holdback filter kept the newest closed chunk(s) out
+    // of the speculative queue, demand could never be raised to override the
+    // holdback, and every compile re-escalated infeasible (the L1-holdback
+    // deadlock — external repro at budgets 14–26k). Contiguous uncovered runs
+    // coalesce into one request each; the consumer maps message ranges back
+    // onto closed chunks and dedupes against its queue, so re-emission on
+    // subsequent escalated compiles is convergent, and a range covering only
+    // the unclosed trailing span (not yet a chunk) is skipped harmlessly.
+    const produced: ProduceRequest[] = [];
+    if (plan.escalated) {
+      const bySequence = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
+      let run: { first: ChunkId; last: ChunkId } | null = null;
+      const flush = (): void => {
+        if (run) produced.push({ level: 1, range: { firstChunkId: run.first, lastChunkId: run.last } });
+        run = null;
+      };
+      for (const c of bySequence) {
+        // Uncovered AND foldable: no L1 lineage, not force-raw (head/tail/
+        // pins — incl. pin-at-k clamped to raw for lack of summaries, which
+        // lands in rawZone above), not frozen (locked keeps its resolution,
+        // so a produced L1 could never be rendered anyway).
+        const uncovered = !c.l1Id && !rawZone.has(c.id) && !frozen.has(c.id);
+        if (!uncovered) { flush(); continue; }
+        if (run) run.last = c.id;
+        else run = { first: c.id, last: c.id };
+      }
+      flush();
+    }
+
     return {
       frontier: plan.resolutions,
-      produced: [],
+      produced,
       // Kv-stable exhaustion is the ESCALATED state only: even full folding
       // exceeds the hard wall W. A dead-band hold above the soft target is
       // the designed steady state, not exhaustion — see
