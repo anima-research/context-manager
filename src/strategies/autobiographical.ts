@@ -5673,10 +5673,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Rules: order candidates by live source position; break runs where the
    * positional gap exceeds `mergeContiguityGapLimit` (holes from wiped/
    * pruned nodes are fine, cross-era bridges are not); exclude candidates
-   * whose OWN span exceeds `mergeMaxSourceSpanMessages` (replay-era wide-
-   * span summaries would bridge anything they join); merge the oldest run
-   * that still has `threshold` members.
+   * whose OWN span exceeds the level-scaled `mergeMaxSourceSpanMessages`
+   * limit (replay-era wide-span summaries would bridge anything they join);
+   * merge the oldest run that still has `threshold` members.
    */
+
+  /**
+   * Deduped LOUD log for merge-candidate exclusions. A silently-dropped
+   * candidate is a silently-stalled pyramid: the flat wide-span quarantine
+   * kept every mythos L4 out of the candidate pool for weeks with no
+   * externally visible signal — the merge queue simply read as empty while
+   * the fold floor sat ~23k tokens too high (found 2026-08-17, subagent
+   * store-clone expedition). One warn per summary id per process.
+   */
+  private _mergeExclusionWarned = new Set<string>();
+  protected warnMergeExclusion(id: string, detail: string): void {
+    if (this._mergeExclusionWarned.has(id)) return;
+    this._mergeExclusionWarned.add(id);
+    console.warn(`[autobiographical] merge-candidate excluded: ${detail}`);
+  }
+
   protected contiguousMergeCandidates(
     unmerged: SummaryEntry[],
     threshold: number,
@@ -5688,13 +5704,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const m of ch.messages) messageOrder.set(m.id, seq++);
     }
     const gapLimit = this.config.mergeContiguityGapLimit ?? 300;
-    const spanLimit = this.config.mergeMaxSourceSpanMessages ?? 1500;
+    const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
+    const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
     for (const s of unmerged) {
       const first = messageOrder.get(s.sourceRange.first);
       const last = messageOrder.get(s.sourceRange.last);
-      if (first === undefined || last === undefined) continue;
-      if (Math.abs(last - first) > spanLimit) continue; // wide-span quarantine
+      if (first === undefined || last === undefined) {
+        // Pruned/missing source messages: the candidate can NEVER merge.
+        // This was a silent drop (rev-5 review: "frontier debt, no log").
+        this.warnMergeExclusion(
+          s.id,
+          `L${s.level} ${s.id}: source position unresolved (pruned source messages?) — permanently unmergeable, frontier debt`,
+        );
+        continue;
+      }
+      // Wide-span quarantine, scaled by level. Legitimate spans grow ~k× per
+      // level, so a FLAT limit silently forbids all consolidation above the
+      // level where it matches a healthy node's span: mythos 2026-08 — every
+      // L4 spans 3.0k–6.9k messages > 1500, so an L5 was structurally
+      // impossible at any store state and the fold floor sat ~23k above
+      // where one L5 puts it. The damage signature this guard exists for
+      // (replay-era bridge summaries, 2026-07-12) is "wide FOR ITS LEVEL",
+      // not absolute width. Limits for L1–L3 are unchanged from the flat
+      // default; L4 gets base×k, L5 base×k², …
+      const spanLimit = spanBase * Math.pow(mergeK, Math.max(0, (s.level ?? 1) - 3));
+      const span = Math.abs(last - first);
+      if (span > spanLimit) {
+        this.warnMergeExclusion(
+          s.id,
+          `L${s.level} ${s.id}: wide-span quarantine — span ${span} msgs > limit ${spanLimit} (base ${spanBase} × ${mergeK}^${Math.max(0, (s.level ?? 1) - 3)})`,
+        );
+        continue;
+      }
       withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
     }
     withPos.sort((a, b) => a.first - b.first);
