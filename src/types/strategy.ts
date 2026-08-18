@@ -600,9 +600,17 @@ export interface AutobiographicalConfig {
   maxCompressionImageBytes?: number;
 
   /**
-   * Merge grouping: exclude candidates whose OWN source span exceeds this
-   * many messages (replay-era summaries can span the entire chronicle and
-   * would bridge any run they join). They stay on the frontier. Default 1500.
+   * Merge grouping: exclude candidates whose OWN source span exceeds the
+   * level-scaled limit `base × mergeThreshold^(max(0, level − 3))`, where
+   * this value is the base (replay-era summaries can span the entire
+   * chronicle and would bridge any run they join). Level-scaled because
+   * legitimate spans grow ~mergeThreshold× per level: a flat limit silently
+   * forbids all consolidation above the level whose healthy span exceeds it
+   * (mythos 2026-08: every L4 spanned 3.0k–6.9k msgs > 1500 → L5 merges
+   * structurally impossible, fold floor stuck ~23k high). L1–L3 limits equal
+   * the base, unchanged from the historical flat behavior. Excluded
+   * candidates stay on the frontier and are logged loudly (once per id).
+   * Default base 1500.
    */
   mergeMaxSourceSpanMessages?: number;
 
