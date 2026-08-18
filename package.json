@@ -24,7 +24,8 @@
     "pretest": "npm run build",
     "test": "node --test dist/test/*.test.js dist/test/adaptive/*.test.js",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "npm run build"
   },
   "keywords": [
     "connectome",
