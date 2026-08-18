@@ -7322,12 +7322,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Place up to four `cache_control` breakpoints across the final ordered
-   * entries: the head/system boundary, the end of the folded history (the
-   * stable prefix that persists turn-to-turn — the most valuable), a mid-history
-   * seam, and the very end (for pure-append reuse). Mirrors `placeMarkers` in
-   * the adaptive layer but operates on emitted entries. Idempotent; clears any
-   * pre-existing markers first.
+   * Previous compile's per-entry cache identities (participant + content
+   * bytes), used to find the measured stable-prefix boundary. In-memory only:
+   * after a restart the first compile falls back to seam placement.
+   */
+  protected _prevCacheKeys?: string[];
+
+  /**
+   * Place up to three message-level `cache_control` breakpoints across the
+   * final ordered entries: the head/system boundary, the MEASURED stable
+   * prefix boundary, and the very end (pure-append reuse).
+   *
+   * The stable-prefix mark used to sit at the folded-history/tail seam
+   * (`historyEnd`) on the assumption that the folded region is stable
+   * turn-to-turn. Measured on mythos llm-calls 2026-08-13..17 that assumption
+   * fails ~1.4×/hour in steady state: fold rotations rewrite the folded
+   * region ABOVE the seam, and a seam marker then performs identically to no
+   * mid marker at all (priced replay over logged bytes: seam ≈ end-only;
+   * divergence-aligned ≈ −10%). So: diff this compile's entries against the
+   * previous compile's (by content identity — bytes are what the provider
+   * hashes) and mark the last entry of the SURVIVING prefix instead. In
+   * steady state (append-only) the boundary degrades gracefully to the seam;
+   * after a rotation it drops to the deepest byte-stable point, so subsequent
+   * requests re-read everything above the churn instead of re-writing it.
+   * See docs/unified-solve-design.md §9.2b.
+   *
+   * The Anthropic limit is 4 cache_control blocks per request INCLUDING the
+   * system block, which membrane marks whenever prompt caching is on — so
+   * message-level markers must never exceed 3 (Rhys, 2026-07-26: "A maximum
+   * of 4 blocks with cache_control may be provided. Found 5."). Deliberately
+   * NOT fixed by stripping in membrane — silently dropped markers are
+   * silently broken caching; the supplier stays within the global budget.
+   * Idempotent; clears any pre-existing markers first.
    */
   protected placeCacheMarkers(
     entries: ContextEntry[],
@@ -7350,27 +7376,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const historyEnd = firstTail - 1; // last middle (folded-history) entry
 
-    const marks = new Set<number>();
-    if (lastHead >= 0) marks.add(lastHead);                       // system / head block
-    if (historyEnd > lastHead) marks.add(historyEnd);            // stable folded prefix (the big one)
-    if (historyEnd - lastHead > 2) marks.add(lastHead + Math.floor((historyEnd - lastHead) / 2)); // mid-history
-    marks.add(n - 1);                                            // end → pure-append reuse
-
-    // The Anthropic limit is 4 cache_control blocks per request INCLUDING the
-    // system block, which membrane marks whenever prompt caching is on. So
-    // message-level markers must never exceed 3 — with all four seams placed
-    // (possible only once folds exist; pre-fold only 2 seams materialize) the
-    // request hard-400s: "A maximum of 4 blocks with cache_control may be
-    // provided. Found 5." (Rhys, 2026-07-26 — his first fold-active compile.)
-    // Drop the mid-history seam first: head and folded-prefix markers protect
-    // the expensive stable prefixes and the end marker buys pure-append
-    // reuse; the mid seam is the cheapest to lose. Deliberately NOT fixed by
-    // stripping in membrane — silently dropped markers are silently broken
-    // caching, which is an invisible-cost bug; the supplier stays within the
-    // global budget instead.
-    if (marks.size > 3) {
-      marks.delete(lastHead + Math.floor((historyEnd - lastHead) / 2));
+    // Measured stable prefix: first index where this compile's entry bytes
+    // diverge from the previous compile's. No previous compile → whole window
+    // counts as stable (seam placement, the old behavior).
+    const keys = entries.map(
+      (e) => `${e.participant} ${JSON.stringify(e.content)}`,
+    );
+    let firstDiff = n;
+    const prev = this._prevCacheKeys;
+    if (prev) {
+      let i = 0;
+      while (i < n && i < prev.length && keys[i] === prev[i]) i++;
+      firstDiff = i;
     }
+    this._prevCacheKeys = keys;
+    const stableEnd = Math.min(historyEnd, firstDiff - 1);
+
+    const marks = new Set<number>();
+    if (lastHead >= 0) marks.add(lastHead);            // system / head block
+    if (stableEnd > lastHead) marks.add(stableEnd);    // measured stable prefix (the big one)
+    marks.add(n - 1);                                  // end → pure-append reuse
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
   }
