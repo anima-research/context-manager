@@ -12,6 +12,9 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ### Fixed
 
+- Append-only autobiographical compiles now preserve the previous request's
+  endpoint as an explicit cache breakpoint, avoiding recent-tail cache misses
+  when a tool-heavy turn appends more than the provider's 20-block lookback.
 - Compression recall pairs now follow canonical message-store order rather
   than lexical source-ID order, preserving chronology and stable prompt-cache
   prefixes when decimal message IDs cross a width boundary (for example,

@@ -3,7 +3,8 @@
  *
  * Load-bearing properties:
  *  - first compile (no previous) degrades to seam placement: {head, historyEnd, end};
- *  - append-only compile keeps the seam marker (stable prefix = whole previous window);
+ *  - append-only compile marks the previous endpoint explicitly, so pure-append
+ *    reuse does not depend on Anthropic's bounded 20-block backward search;
  *  - a fold rotation that rewrites the middle drops the marker to the last
  *    byte-surviving entry, NOT the seam — the seam assumption is the measured
  *    failure (mythos llm-calls 2026-08-13..17: ~1.4 deep rewrites/hour);
@@ -53,7 +54,7 @@ test('first compile: seam placement {head, historyEnd, end}', () => {
   assert.deepEqual(marksOf(es), [1, 7, 10]); // lastHead=1, historyEnd=7, end=10
 });
 
-test('append-only compile keeps the seam marker', () => {
+test('append-only compile preserves the previous endpoint', () => {
   const s = new Exposed({});
   const a = fixture();
   s.place(a.es, a.head, a.tail);
@@ -61,7 +62,28 @@ test('append-only compile keeps the seam marker', () => {
   b.es.push(entry('t3', 'raw-3'));
   b.tail.add('t3');
   s.place(b.es, b.head, b.tail);
-  assert.deepEqual(marksOf(b.es), [1, 7, 11]);
+  assert.deepEqual(marksOf(b.es), [1, 10, 11]);
+});
+
+test('append-only endpoint remains explicit beyond the provider lookback window', () => {
+  const s = new Exposed({});
+  const a = fixture();
+  s.place(a.es, a.head, a.tail);
+  const previousEnd = a.es.length - 1;
+
+  const b = fixture();
+  // Anthropic searches at most 20 blocks backward from a breakpoint. A
+  // tool-heavy turn can append more than that between compiles, so the prior
+  // endpoint must remain a breakpoint in the next request rather than merely
+  // being byte-identical somewhere in the unmarked tail.
+  for (let i = 3; i < 24; i++) {
+    b.es.push(entry(`t${i}`, `raw-${i}`));
+    b.tail.add(`t${i}`);
+  }
+  s.place(b.es, b.head, b.tail);
+
+  assert.ok(b.es.length - 1 - previousEnd > 20);
+  assert.deepEqual(marksOf(b.es), [1, previousEnd, b.es.length - 1]);
 });
 
 test('rotation drops the marker to the surviving prefix, not the seam', () => {
