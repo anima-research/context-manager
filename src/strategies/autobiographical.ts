@@ -428,6 +428,7 @@ interface CompressionRefusalQuarantineRecord {
 }
 
 interface CompressionRefusalNormalizedConfig {
+  accountingVersion: number;
   fallbackLimit: number;
   contextBudgetTokens: number;
   requestConfig: NormalizedRequest['config'];
@@ -645,8 +646,9 @@ function sha256Json(value: unknown): string {
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
+const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
-  'max(canonical_provider_input+positive_expansion,complete_normalized_request_utf8_bound)+output_reserve';
+  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
 const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
@@ -2236,12 +2238,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private compressionResponseInputTokens(response: unknown): number | undefined {
     if (!response || typeof response !== 'object') return undefined;
-    const usage = (response as { usage?: unknown }).usage;
+    const typed = response as {
+      usage?: unknown;
+      details?: { usage?: unknown; model?: { provider?: unknown } };
+    };
+    const detailed = typed.details?.usage;
+    const usage = detailed && typeof detailed === 'object' ? detailed : typed.usage;
     if (!usage || typeof usage !== 'object') return undefined;
-    const inputTokens = (usage as { inputTokens?: unknown }).inputTokens;
-    return typeof inputTokens === 'number' && Number.isFinite(inputTokens) && inputTokens >= 0
-      ? inputTokens
+    const read = (key: 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'): number | undefined => {
+      const value = (usage as Record<string, unknown>)[key];
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    const input = read('inputTokens');
+    const provider = typeof typed.details?.model?.provider === 'string'
+      ? typed.details.model.provider.toLowerCase()
       : undefined;
+    // Anthropic and Bedrock report uncached, cache-write, and cache-read input
+    // as disjoint counters. OpenAI/Gemini/OpenRouter report cache reads as a
+    // subset of inputTokens, so summing there would double-count.
+    if (provider === 'anthropic' || provider === 'bedrock') {
+      if (input === undefined) return undefined;
+      const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
+      return total > 0 ? total : undefined;
+    }
+    // Unknown/other providers are authoritative only when they report a
+    // positive total input count. Zero/partial usage falls back to the
+    // complete normalized request bound rather than admitting blindly.
+    return input !== undefined && input > 0 ? input : undefined;
   }
 
   private fallbackContentBlockError(block: unknown, seen = new Set<object>()): string | undefined {
@@ -2569,9 +2592,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Freeze the exact fallback/admission plan. Before canonical inference this
    * supplies a deterministic family identity; after a refusal it is rebuilt
-   * with authoritative canonical provider usage. Every admission still has a
-   * complete normalized-request floor, so tools/head/raw/config/provider fields
-   * cannot disappear when usage is absent or unexpectedly small.
+   * with authoritative canonical provider usage. When complete provider usage
+   * is absent or not authoritative, admission retains the conservative complete
+   * normalized-request bound; otherwise the unchanged canonical request is
+   * already represented by provider usage and only positive expansion is added.
    */
   private compressionRefusalPlan(
     canonicalRequest: NormalizedRequest,
@@ -2598,12 +2622,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const providerExpandedInputTokens = canonicalProviderInputTokens === undefined
         ? undefined
         : canonicalProviderInputTokens + expansionDeltaTokens;
-      const boundedInputTokens = Math.max(
-        variant.deterministicInputBoundTokens,
-        providerExpandedInputTokens ?? 0,
-      );
-      const accountingSource = providerExpandedInputTokens !== undefined &&
-          providerExpandedInputTokens >= variant.deterministicInputBoundTokens
+      // Once the provider has counted the canonical request, that observed
+      // token total is the authoritative baseline. The complete normalized
+      // UTF-8 bound remains the fail-closed fallback when usage is absent, but
+      // must not override real token accounting: large invariant tool schemas
+      // can be megabytes of JSON while occupying a much smaller token window.
+      // The positive byte-delta below is deliberately conservative for the
+      // changed recall pair; unchanged head/tools/raw/config were physically
+      // accepted and counted by the canonical provider call.
+      const boundedInputTokens = providerExpandedInputTokens
+        ?? variant.deterministicInputBoundTokens;
+      const accountingSource = providerExpandedInputTokens !== undefined
         ? 'canonical_provider_usage_plus_expansion' as const
         : 'complete_normalized_request_bound' as const;
       const outputReserveTokens = Math.max(0, Math.ceil(variant.request.config.maxTokens));
@@ -3117,6 +3146,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
+      accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
       fallbackLimit,
       contextBudgetTokens,
       requestConfig: canonicalRequest.config,
@@ -5066,7 +5096,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // success-clear, paid-off sweep, or operator clear (all of which
     // already match by chunkSourceHash).
     const sameHash = [...durableQuarantine.values()].filter(
-      (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash,
+      (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash &&
+        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
     );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
       ?? sameHash.find((active) => active.record.familyKey === quarantineRecord.familyKey)
