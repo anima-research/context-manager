@@ -121,6 +121,53 @@ describe('Compression prompt ordering (confabulation regression)', () => {
     await manager.close();
   });
 
+  it('keeps prior recalls in Chronicle order when decimal message IDs cross 99', async () => {
+    cleanup();
+    const { membrane, calls } = createCapturingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+      mergeThreshold: 1000,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+
+    const filler = (i: number) => `event ${i} ` + 'chronological substantive history '.repeat(8);
+    for (let i = 0; i < 150; i++) {
+      manager.addMessage(i % 2 === 0 ? 'user' : 'agent', [t(filler(i))]);
+    }
+
+    await drain(manager);
+    let crossedThreeDigits = false;
+    for (const call of calls) {
+      const recallIds = call.messages.flatMap((message) =>
+        message.content.flatMap((block) => {
+          const match = /^\[CM\] Recall memory (.+)\.$/.exec((block as { text?: string }).text ?? '');
+          return match ? [match[1]] : [];
+        }),
+      );
+      const sourceStarts = recallIds.map((id) => {
+        const summary = manager.getSummary(id);
+        assert.ok(summary, `recalled summary ${id} must exist`);
+        return Number(summary.sourceRange.first);
+      });
+      if (sourceStarts.some((id) => id >= 100)) crossedThreeDigits = true;
+      assert.deepStrictEqual(
+        sourceStarts,
+        [...sourceStarts].sort((a, b) => a - b),
+        `recall pairs must follow Chronicle order, got ${sourceStarts.join(', ')}`,
+      );
+    }
+    assert.ok(crossedThreeDigits, 'fixture must exercise the decimal-ID width transition');
+    await manager.close();
+  });
+
   it('thin chunks are stubbed mechanically — no LLM call, non-empty content', async () => {
     cleanup();
     const { membrane, calls } = createCapturingMembrane();

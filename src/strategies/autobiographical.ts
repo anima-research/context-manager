@@ -4761,13 +4761,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
+    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
+    // default IDs happen to be decimal text, where lexical order corrupts the
+    // timeline at the first width transition (`"103" < "15"`). Use the store's
+    // canonical order instead so recall pairs remain chronological for every ID
+    // representation and newly-created summaries extend rather than splice the
+    // provider-cache prefix.
+    const messageOrder = new Map<MessageId, number>(
+      allMessages.map((message, index) => [message.id, index]),
+    );
     const priorSummaries = this.summaries
       // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
       // recall pair triggers Anthropic 400 "text content blocks must be
       // non-empty", which stalls ALL compression (mirrors the render-path guard
       // + load-drop). A single empty summary otherwise poisons every compression.
       .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
-      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+      .sort((a, b) => {
+        const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+        const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+        return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
+      });
 
     // Leaf message coverage of every live summary — the rendering
     // authority for the one-to-one invariant: a message covered by a
