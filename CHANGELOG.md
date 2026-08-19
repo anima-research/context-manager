@@ -10,6 +10,15 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Compression-refusal fallback admission now uses provider-aware total input
+  usage after the canonical call (including disjoint Anthropic/Bedrock cache
+  counters without double-counting subset-style providers), fails closed on
+  zero/partial/unknown usage, and versions the durable accounting contract so
+  legacy byte-bound quarantines remain evidence without consuming the repaired
+  per-chunk shape allowance.
+
 ## 0.6.3 — 2026-08-03
 
 ### Added
