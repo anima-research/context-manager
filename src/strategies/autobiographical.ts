@@ -7397,8 +7397,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * divergence-aligned ≈ −10%). So: diff this compile's entries against the
    * previous compile's (by content identity — bytes are what the provider
    * hashes) and mark the last entry of the SURVIVING prefix instead. In
-   * steady state (append-only) the boundary degrades gracefully to the seam;
-   * after a rotation it drops to the deepest byte-stable point, so subsequent
+   * steady state (append-only) this preserves the previous request endpoint
+   * explicitly; relying on the new end marker's backward search would miss
+   * that cache entry after more than 20 appended provider blocks. After a
+   * rotation the marker drops to the deepest byte-stable point, so subsequent
    * requests re-read everything above the churn instead of re-writing it.
    * See docs/unified-solve-design.md §9.2b.
    *
@@ -7432,8 +7434,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const historyEnd = firstTail - 1; // last middle (folded-history) entry
 
     // Measured stable prefix: first index where this compile's entry bytes
-    // diverge from the previous compile's. No previous compile → whole window
-    // counts as stable (seam placement, the old behavior).
+    // diverge from the previous compile's. No previous compile → seam
+    // placement, the old bounded cold-start behavior. Later pure appends mark
+    // the previous endpoint itself so reuse never depends on Anthropic finding
+    // it within the new end marker's 20-block backward-search window.
     const keys = entries.map(
       (e) => `${e.participant} ${JSON.stringify(e.content)}`,
     );
@@ -7445,7 +7449,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       firstDiff = i;
     }
     this._prevCacheKeys = keys;
-    const stableEnd = Math.min(historyEnd, firstDiff - 1);
+    const stableEnd = prev ? firstDiff - 1 : historyEnd;
 
     const marks = new Set<number>();
     if (lastHead >= 0) marks.add(lastHead);            // system / head block
