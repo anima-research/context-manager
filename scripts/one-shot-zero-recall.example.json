@@ -1,0 +1,16 @@
+{
+  "storePath": "/absolute/path/to/stopped-copy",
+  "namespace": "agents/resident",
+  "branchName": "surgery/resident/chunk-N-ISO",
+  "expectedParentBranch": "main",
+  "expectedRecordsSha256": "sha256",
+  "toolsPath": "/absolute/path/tools.json",
+  "expectedToolsSha256": "sha256",
+  "targetChunkIndex": 0,
+  "expectedSourceRange": ["first-message-id", "last-message-id"],
+  "expectedQuarantineKey": "exact-active-key",
+  "summaryParticipant": "resident",
+  "strategyConfig": {},
+  "receiptPath": "/absolute/path/receipt.json",
+  "acknowledgeStoppedCopiedOrBackedUpStore": true
+}
