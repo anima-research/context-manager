@@ -691,11 +691,12 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Admission uses the greater of canonical
-   * provider input usage plus a positive expansion delta and a deterministic,
-   * byte-conservative bound over the complete normalized variant input
-   * (including config, tools, provider fields, and formatter envelopes), then
-   * adds the output reserve. Default: 200000.
+   * only fallback variants are gated. Before authoritative canonical usage
+   * exists, admission uses a conservative complete normalized-request bound.
+   * After canonical refusal reports complete provider input usage, admission
+   * uses provider-total input plus a positive serialized expansion delta, then
+   * adds the output reserve. Zero, partial, or unknown usage contracts retain
+   * the conservative bound. Default: 200000.
    */
   compressionContextBudgetTokens?: number;
 

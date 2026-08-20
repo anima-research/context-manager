@@ -99,14 +99,23 @@ Default maximum: 3 fallback variants. Make configurable, e.g.:
 Fallback admission uses `compressionContextBudgetTokens` (default `200000`),
 the combined model context budget for request input plus the configured
 `maxTokens` output reserve. The canonical request is still issued unchanged.
-Admission is deterministic before inference: it uses a UTF-8-byte upper bound
-over every input-bearing field of the complete normalized variant (head,
-recall, raw middle, chunk, tools, instruction, system/provider fields), a
-per-message formatter-envelope allowance, and the output reserve. After the
-canonical refusal reports provider input usage, each variant is admitted as
-`max(complete deterministic variant bound, canonical provider input usage +
-positive expansion delta) + output reserve`. Stored `SummaryEntry.tokens` are
-never admission authority.
+Admission is deterministic before inference. Before authoritative canonical
+usage exists, it uses a conservative UTF-8-byte bound over every input-bearing
+field of the complete normalized variant (head, recall, raw middle, chunk,
+tools, instruction, system/provider fields), a per-message formatter-envelope
+allowance, and the output reserve. After canonical refusal reports complete
+provider input usage, v2 admission uses `provider total input + positive
+serialized expansion delta + output reserve`; the complete-request bound
+remains the fail-closed path when usage is absent, zero/partial, or from an
+unknown accounting contract. Provider adapters whose cache counters are
+disjoint (Anthropic/Bedrock) include cache-write/read totals; adapters whose
+cache-read count is a subset use their positive total `inputTokens` once.
+Physical request-byte enforcement remains a separate provider/transport
+constraint. A positive complete provider total is authoritative even when it is
+smaller than the deterministic byte bound: canonical refusal proves that exact
+unchanged request was accepted and counted, and a fallback provider error stays
+inside the bounded attempt curve. Stored `SummaryEntry.tokens` are never
+admission authority.
 The ordered plan records every rejection and at most the normalized positive
 fallback limit of provider attempts. An over-budget variant is recorded and
 skipped without preventing a later eligible variant.

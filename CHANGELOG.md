@@ -12,6 +12,12 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ### Fixed
 
+- Compression-refusal fallback admission now uses provider-aware total input
+  usage after the canonical call (including disjoint Anthropic/Bedrock cache
+  counters without double-counting subset-style providers), fails closed on
+  zero/partial/unknown usage, and versions the durable accounting contract so
+  legacy byte-bound quarantines remain evidence without consuming the repaired
+  per-chunk shape allowance.
 - Append-only autobiographical compiles now preserve the previous request's
   endpoint as an explicit cache breakpoint, avoiding recent-tail cache misses
   when a tool-heavy turn appends more than the provider's 20-block lookback.
