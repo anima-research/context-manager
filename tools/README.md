@@ -15,6 +15,7 @@ own `node_modules`, so run them from a tree with the stack installed.
 | `llm-calls-query` | summarize `llm-calls.*.jsonl(.gz)` — group by kind/stop/category, `--refusals`, `--since/--boot`, streams multi-GB files | no |
 | `tree-doctor.mjs` | audit the autobiographical summary tree for the non-nested / double-representation defect the kv-control picker only warns about tersely; names the overlapping nodes; exit 2 on conflicts (so a repair verifies against it) | no |
 | `quarantine.mjs` | inspect (and `--clear`) the compression quarantine via the strategy's **own** `getCompressionQuarantineStatus()` — never re-derives the ledger projection (the bug that made the old inspect report 0 while ~80 were quarantined) | `--clear` only |
+| `refusal-bisect.mjs` | find the minimal trigger in a refused request (probabilistic, N draws/arm) and map image culprits back to their source message id / branch. `--enumerate-only` maps a request's images to messages with **no API calls**. Makes the June/July/Aug refusal investigations first-class. | no |
 
 Examples:
 
