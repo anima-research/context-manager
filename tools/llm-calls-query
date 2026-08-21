@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""llm-calls-query — fast summaries over an agent's llm-calls.*.jsonl debug logs.
+
+Replaces the copy-pasted `python3 -c "import json; Counter(...)"` one-liners.
+Streams line-by-line (never readFileSync a multi-GB file) and understands the
+membrane debug-log schema:
+
+  {timestamp, kind, durationMs,
+   rawRequest:{model, max_tokens, messages, tools},
+   rawResponse:{stop_reason, stop_details:{category}, usage:{...}}}
+
+Usage:
+  llm-calls-query <data-dir|file> [options]
+
+  <data-dir|file>   an agent data dir (picks newest llm-calls.*.jsonl by mtime),
+                    a specific .jsonl / .jsonl.gz file, or 'ALL' inside a dir.
+
+Options:
+  --since TS        only records whose ISO timestamp >= TS (prefix compare,
+                    e.g. --since 2026-08-21T15:22)
+  --until TS        only records whose timestamp < TS
+  --boot            shorthand: --since the newest file's own boot timestamp
+                    (its filename stamp) — i.e. "this boot only"
+  --group FIELDS    comma list of: kind, stop, category, model  (default: kind,stop)
+  --refusals        list every refusal: time, kind, category, real input tokens
+  --tail N          one line per record for the last N records
+  --files           list candidate files and exit
+  --all-files       scan every llm-calls.*.jsonl(.gz) in the dir, not just newest
+
+Exit status is 0 unless no records matched (2), so it composes in scripts.
+"""
+import sys, os, json, gzip, glob, argparse
+from collections import Counter
+
+def iter_files(target, all_files):
+    if os.path.isfile(target):
+        return [target]
+    pat = os.path.join(target, "llm-calls.*.jsonl*")
+    files = sorted(glob.glob(pat), key=lambda p: os.path.getmtime(p))
+    if not files:
+        # also try a bare data/ subdir
+        pat2 = os.path.join(target, "data", "llm-calls.*.jsonl*")
+        files = sorted(glob.glob(pat2), key=lambda p: os.path.getmtime(p))
+    if not files:
+        return []
+    return files if all_files else [files[-1]]
+
+def open_maybe_gz(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", errors="replace")
+    return open(path, "rt", errors="replace")
+
+def boot_stamp(path):
+    # llm-calls.2026-08-21T15-22-09-680Z.jsonl -> 2026-08-21T15:22:09
+    base = os.path.basename(path)
+    try:
+        raw = base.split("llm-calls.")[1].split(".jsonl")[0]
+        d, t = raw.split("T")
+        hh, mm, ss, _ms, *_ = t.split("-")
+        return f"{d}T{hh}:{mm}:{ss}"
+    except Exception:
+        return None
+
+def real_input(usage):
+    if not usage:
+        return 0
+    return (usage.get("input_tokens", 0) or 0) + \
+           (usage.get("cache_read_input_tokens", 0) or 0) + \
+           (usage.get("cache_creation_input_tokens", 0) or 0)
+
+def field_of(rec, name):
+    rr = rec.get("rawResponse") or {}
+    rq = rec.get("rawRequest") or {}
+    if name == "kind": return rec.get("kind")
+    if name == "stop": return rr.get("stop_reason")
+    if name == "category": return (rr.get("stop_details") or {}).get("category")
+    if name == "model": return rq.get("model")
+    return None
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("target")
+    ap.add_argument("--since"); ap.add_argument("--until")
+    ap.add_argument("--boot", action="store_true")
+    ap.add_argument("--group", default="kind,stop")
+    ap.add_argument("--refusals", action="store_true")
+    ap.add_argument("--tail", type=int, default=0)
+    ap.add_argument("--files", action="store_true")
+    ap.add_argument("--all-files", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__); return 0
+
+    files = iter_files(a.target, a.all_files)
+    if not files:
+        print(f"no llm-calls files under {a.target}", file=sys.stderr); return 2
+    if a.files:
+        for f in files:
+            print(f"{os.path.getsize(f):>14}  {boot_stamp(f)}  {f}")
+        return 0
+    if a.boot and not a.since:
+        a.since = boot_stamp(files[-1])
+        print(f"# --boot => --since {a.since}", file=sys.stderr)
+
+    gfields = [g.strip() for g in a.group.split(",") if g.strip()]
+    groups = Counter(); cats = Counter(); tail = []
+    refusals = []
+    n = 0; tok_max = 0; out_sum = 0
+    span = [None, None]
+
+    for path in files:
+        with open_maybe_gz(path) as fh:
+            for line in fh:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ts = rec.get("timestamp", "")
+                if a.since and ts < a.since: continue
+                if a.until and ts >= a.until: continue
+                n += 1
+                if span[0] is None or ts < span[0]: span[0] = ts
+                if span[1] is None or ts > span[1]: span[1] = ts
+                key = tuple(field_of(rec, g) for g in gfields)
+                groups[key] += 1
+                rr = rec.get("rawResponse") or {}
+                if rr.get("stop_reason") == "refusal":
+                    cat = (rr.get("stop_details") or {}).get("category")
+                    cats[cat] += 1
+                    if a.refusals:
+                        refusals.append((ts, rec.get("kind"), cat, real_input(rr.get("usage"))))
+                u = rr.get("usage") or {}
+                tok_max = max(tok_max, real_input(u))
+                out_sum += (u.get("output_tokens", 0) or 0)
+                if a.tail:
+                    tail.append((ts, rec.get("kind"), rr.get("stop_reason"),
+                                 (rr.get("stop_details") or {}).get("category")))
+
+    if n == 0:
+        print("no records matched", file=sys.stderr); return 2
+
+    print(f"records: {n}   span: {span[0]} .. {span[1]}   files: {len(files)}")
+    print(f"max real input: {tok_max:,}   total output: {out_sum:,}")
+    print(f"\ngroup by {'+'.join(gfields)}:")
+    for key, c in sorted(groups.items(), key=lambda kv: -kv[1]):
+        label = "/".join(str(x) for x in key)
+        print(f"  {c:>7}  {label}")
+    if cats:
+        print("\nrefusal categories:")
+        for cat, c in cats.most_common():
+            print(f"  {c:>7}  {cat}")
+    if a.refusals and refusals:
+        print("\nrefusals:")
+        for ts, k, cat, tok in refusals[-200:]:
+            print(f"  {ts[-13:]}  {k:9} {cat:10} real_in={tok:,}")
+    if a.tail:
+        print(f"\nlast {a.tail}:")
+        for ts, k, s, cat in tail[-a.tail:]:
+            print(f"  {ts[-13:]}  {k:9} {s} {cat or ''}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
