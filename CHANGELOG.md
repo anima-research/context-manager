@@ -10,6 +10,17 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Added
+
+- Compression and merge requests now carry prompt-cache breakpoints at their
+  stability strata — end of head window, last level≥2 recall pair, last
+  recall pair — with a 1h cache TTL (#37). The mint lane previously sent its
+  entire recall prefix (~60–93% of input) uncached on every call. Markers are
+  suppressed when the recall ladder was budget-capped (front-eviction shifts
+  the prefix, making cache writes counterproductive). New options:
+  `compressionCacheMarkers` (default `true`) and `compressionCacheTtl`
+  (default `'1h'`).
+
 ### Fixed
 
 - Compression-refusal fallback admission now uses provider-aware total input
