@@ -20,6 +20,13 @@ export { KnowledgeStrategy } from './strategies/knowledge.js';
 // Utilities
 export { splitMixedToolMessages, stripUnpairedToolBlocks } from './normalize-tool-messages.js';
 
+// Errors — cross-package behavioral surface. agent-framework gates its
+// OverBudget drain breaker on these errors (AF PR #58, framework.ts
+// classifyInferenceError); exporting them from the root gives consumers a
+// real `instanceof` instead of stringly-typed `err.name` matching.
+export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
+export type { OverBudgetDiagnostics } from './adaptive/picker.js';
+
 // Types
 export type {
   // Message types

@@ -28,6 +28,15 @@ import type {
 import type { SummaryEntry } from '../types/strategy.js';
 import { getSummaryParentId } from '../types/strategy.js';
 
+/** Diagnostic snapshot of the picker's final state when it refused. */
+export interface OverBudgetDiagnostics {
+  headTokens: number;
+  tailTokens: number;
+  middleTokens: number;
+  middleChunkCount: number;
+  deepestLevel: number;
+}
+
 /**
  * Error raised when the picker has folded everything it can and the
  * resulting context still exceeds the hard token budget.
@@ -37,6 +46,10 @@ import { getSummaryParentId } from '../types/strategy.js';
  * larger-context model, drop the head/tail windows explicitly, or surface a
  * "context too large" error to the user.
  *
+ * Cross-package behavioral surface: agent-framework gates its OverBudget
+ * drain breaker on this error (AF PR #58), so it is re-exported from the
+ * package root for a real `instanceof` across the boundary.
+ *
  * See `docs/adaptive-resolution-design.md` §3.10.
  */
 export class OverBudgetError extends Error {
@@ -45,13 +58,7 @@ export class OverBudgetError extends Error {
   /** The token count the strategy could not reduce below `budget`. */
   readonly actual: number;
   /** Diagnostic snapshot of the picker's final state. */
-  readonly diagnostics: {
-    headTokens: number;
-    tailTokens: number;
-    middleTokens: number;
-    middleChunkCount: number;
-    deepestLevel: number;
-  };
+  readonly diagnostics: OverBudgetDiagnostics;
 
   constructor(opts: {
     budget: number;
