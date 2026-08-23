@@ -731,6 +731,79 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
+ * Sentinel marking a message as a prompt-cache breakpoint while a compression
+ * request is being assembled. Lifted to the message-level `cacheBreakpoint`
+ * flag by `liftCacheBreakpoints` when the request is built.
+ *
+ * It rides a CONTENT BLOCK rather than the message envelope because the
+ * envelope does not survive assembly: `splitMixedToolMessages`,
+ * `stripUnpairedToolBlocks` and the request-final `stripEmptyTextBlocks` map
+ * each return fresh `{participant, content}` objects, dropping every other
+ * field, and they split and merge messages so a positional index taken before
+ * the pipeline does not identify the same message after it. Blocks ride
+ * through by reference, so a block is the one thing that can carry a mark
+ * across.
+ *
+ * It is placed on a TEXT block: the API rejects `cache_control` on
+ * `thinking` / `redacted_thinking`, and recall-pair answers routinely end in
+ * signed reasoning carriers. Membrane enforces the same rule when it converts
+ * the lifted flag back into `cache_control` (`lastCacheableBlockIndex`).
+ *
+ * The marked block is CLONED. These arrays alias the store's own block
+ * objects, and a mark leaking back into the live compile would spend one of
+ * the provider's four breakpoints.
+ */
+const CACHE_BREAKPOINT_MARK = '__cmCacheBreakpoint';
+
+function markCacheBreakpoint(
+  msgs: Array<{ participant: string; content: ContentBlock[] }>,
+): void {
+  const last = msgs[msgs.length - 1];
+  if (!last) return;
+  for (let k = last.content.length - 1; k >= 0; k--) {
+    const block = last.content[k] as { type: string; text?: unknown };
+    if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      const content = last.content.slice();
+      content[k] = {
+        ...(last.content[k] as object),
+        [CACHE_BREAKPOINT_MARK]: true,
+      } as unknown as ContentBlock;
+      msgs[msgs.length - 1] = { participant: last.participant, content };
+      return;
+    }
+  }
+}
+
+/**
+ * Replace the assembly-time block sentinels with the message-level
+ * `cacheBreakpoint` flag membrane understands, leaving the blocks themselves
+ * exactly as they were.
+ *
+ * Going through `cacheBreakpoint` rather than writing `cache_control` onto the
+ * block directly is what makes these breakpoints behave like the live
+ * compile's. Membrane applies the flag only when prompt caching is on, so a
+ * host running a transport that rejects `cache_control` (`promptCaching:
+ * false` — Bedrock legacy Claude) keeps getting requests without it; a block
+ * written directly would be copied to the wire unconditionally and 400 there.
+ * It also counts toward membrane's breakpoint tally, so the redundant
+ * tools/system fallbacks are suppressed, and it places the marker via
+ * `lastCacheableBlockIndex` so it can never land on a thinking block.
+ */
+function liftCacheBreakpoints(
+  msg: { participant: string; content: ContentBlock[] },
+): { participant: string; content: ContentBlock[]; cacheBreakpoint?: boolean } {
+  const isMarked = (b: ContentBlock): boolean =>
+    !!(b as unknown as Record<string, unknown>)[CACHE_BREAKPOINT_MARK];
+  if (!msg.content.some(isMarked)) return msg;
+  const content = msg.content.map((b) => {
+    if (!isMarked(b)) return b;
+    const { [CACHE_BREAKPOINT_MARK]: _mark, ...rest } = b as unknown as Record<string, unknown>;
+    return rest as unknown as ContentBlock;
+  });
+  return { participant: msg.participant, content, cacheBreakpoint: true };
+}
+
+/**
  * Strip `thinking` / `redacted_thinking` blocks from RAW messages entering
  * compression input.
  *
@@ -4866,6 +4939,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
+    // Cache breakpoint 1 of 2 — end of the head window, so the cached prefix is
+    // tools + head. This is the request's permanent prefix: it survives every
+    // frontier change, so it still reads when breakpoint 2 has re-keyed.
+    // Nothing is pushed before the head loop, so a non-empty list here means
+    // the head produced messages; an entirely summary-covered head marks
+    // nothing and leaves breakpoint 2 to carry the request alone.
+    if (llmMessages.length > 0) markCacheBreakpoint(llmMessages);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
@@ -4948,6 +5028,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       participant: 'Context Manager',
       content: [{ type: 'text', text: COMPRESSION_MARKER }],
     });
+    // Cache breakpoint 2 of 2 — everything before the chunk: head + recall
+    // frontier + raw middle. Placed on the in-band marker rather than on the
+    // last recall-pair answer for two reasons. It is strictly more prefix
+    // (the raw middle joins the cached span), and it leaves every recall pair
+    // byte-identical to `summaryAnswerContent(parent)`, which
+    // `buildRecallCurveVariants` requires: it locates the pair to expand by
+    // exact JSON equality against that construction, so a `cache_control` on
+    // a pair body would silently cost that parent its refusal-fallback
+    // variant. The marker message always exists, so this needs no
+    // empty-frontier special case.
+    markCacheBreakpoint(llmMessages);
 
     // ---- 5. Chunk messages raw ----
     for (const m of chunk.messages) {
@@ -5041,7 +5132,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // verbatim (see the recall-pair sites).
       messages: cleaned
         .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-        .filter(m => m.content.length > 0),
+        .filter(m => m.content.length > 0)
+        .map(liftCacheBreakpoints),
+      // TTL for the breakpoints marked during assembly. Membrane reads this
+      // when it converts them to `cache_control`, and ignores it when prompt
+      // caching is off.
+      cacheTtl: this.config.compressionCacheTtl ?? '1h',
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
@@ -6072,6 +6168,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
+    // Cache breakpoint 1 of 2 — end of the head window (see the L1 site).
+    const headBreakpointAt = llmMessages.length;
+    if (llmMessages.length > 0) markCacheBreakpoint(llmMessages);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries or ` +
@@ -6159,6 +6258,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
       }
     }
+
+    // Cache breakpoint 2 of 2 — end of the prior recall frontier and raw
+    // middle, i.e. everything before the merge target. Marked only when this
+    // section produced messages; otherwise the head breakpoint is already the
+    // last one and re-marking it would be a no-op. Unlike the L1 site there is
+    // no in-band marker message to hang this on, and no exact-JSON matching to
+    // disturb: `buildRecallCurveVariants` runs on the L1 path only.
+    if (llmMessages.length > headBreakpointAt) markCacheBreakpoint(llmMessages);
 
     // ---- 2. TARGET: expand sources one level deeper ----
     // For L2 (sources at L1, sourceLevel=0): expand to raw L0 messages.
@@ -6366,7 +6473,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // verbatim (see the recall-pair sites).
       messages: cleaned
         .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-        .filter(m => m.content.length > 0),
+        .filter(m => m.content.length > 0)
+        .map(liftCacheBreakpoints),
+      // TTL for the breakpoints marked during assembly. Membrane reads this
+      // when it converts them to `cache_control`, and ignores it when prompt
+      // caching is off.
+      cacheTtl: this.config.compressionCacheTtl ?? '1h',
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:

@@ -1,5 +1,6 @@
 {
   "shedOversizeImages": true,
+  "cacheTtl": "1h",
   "messages": [
     { "participant": "Context Manager", "content": [{ "type": "text", "text": "[CM] Recall memory L2-200." }] },
     { "participant": "Claude", "content": [{ "type": "text", "text": "authored L2-200" }] },
@@ -7,7 +8,7 @@
     { "participant": "Claude", "content": [{ "type": "text", "text": "authored L2-201" }] },
     { "participant": "User", "content": [{ "text": "raw-8 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
     { "participant": "Claude", "content": [{ "text": "raw-9 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
-    { "participant": "Context Manager", "content": [{ "type": "text", "text": "System: You will soon form a new memory, get ready. The messages that follow are the slice of recent experience you are about to compress. After them, write the memory in your own voice." }] },
+    { "participant": "Context Manager", "content": [{ "type": "text", "text": "System: You will soon form a new memory, get ready. The messages that follow are the slice of recent experience you are about to compress. After them, write the memory in your own voice." }], "cacheBreakpoint": true },
     { "participant": "User", "content": [{ "text": "raw-10 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
     { "participant": "Claude", "content": [{ "text": "raw-11 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
     { "participant": "Context Manager", "content": [{ "type": "text", "text": "Write the memory of events since the most recent memory system notification. Speak in the first person from your own perspective. Preserve concrete details — file paths, exact values, decisions, unresolved questions, the user's active asks. Target ~2000 tokens. Output only the memory body — no preamble, no section headers unless they help preservation, no meta-commentary about summarizing. Memorize only what actually happened in that slice: if it holds little beyond routine system traffic (heartbeats, empty turns, failure notices), a short memory saying so is correct — do not pad it by re-narrating events you already remember from earlier as if they had just happened again." }] }

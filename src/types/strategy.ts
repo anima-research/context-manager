@@ -680,6 +680,20 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * `cacheTtl` for compression (L1) and merge (L2+) requests, which carry a
+   * prompt-cache breakpoint after the head window and another at the end of
+   * the recall frontier. Default '1h'. Ignored, like the breakpoints
+   * themselves, when prompt caching is off.
+   *
+   * Why 1h rather than the provider's 5m default: compression calls arrive
+   * every ~12-48 minutes in steady state, so a 5m breakpoint usually expires
+   * before the next call and bills the write premium with no read to show for
+   * it. Bursts (a backlog draining chunk after chunk) hit either TTL. Set
+   * '5m' if your deployment compresses in tight bursts and never in trickle.
+   */
+  compressionCacheTtl?: '5m' | '1h';
+
+  /**
    * Maximum number of same-model recall-curve variants attempted after an L1
    * canonical request is explicitly refused. Each variant expands exactly one
    * already-authored frontier summary into its persisted direct children.

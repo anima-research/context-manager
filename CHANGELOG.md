@@ -10,6 +10,22 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Added
+
+- Compression (L1) and merge (L2+) requests now carry prompt-cache
+  breakpoints: one at the end of the head window, one at the end of
+  everything preceding the payload (the recall frontier and raw middle). These
+  requests previously carried no breakpoint at all, so the tools, head and
+  whole recall frontier were re-billed at full price on every summarizer call.
+  Marks reach the request as the message-level `cacheBreakpoint` flag, so
+  membrane applies them only when prompt caching is on and counts them against
+  its own budget; no content block changes shape, and no stored block is
+  mutated.
+- `compressionCacheTtl?: '5m' | '1h'` (default `'1h'`) sets `cacheTtl` on
+  those requests. 1h rather than the provider's 5m default because
+  steady-state compression cadence is longer than five minutes, so a 5m
+  breakpoint tends to bill the write premium and expire before the read.
+
 ### Fixed
 
 - Compression-refusal fallback admission now uses provider-aware total input
