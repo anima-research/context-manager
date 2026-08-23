@@ -209,6 +209,47 @@ describe('Compression requests: cache seams (issue #37)', () => {
     }
   });
 
+  it('stale block-level cache_control on replayed content is stripped (4-breakpoint safety)', async () => {
+    cleanup();
+    const { membrane, calls } = createCapturingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+    for (let i = 0; i < 40; i++) {
+      // Imported histories can carry request-time cache_control on stored
+      // blocks (Arc exports). The formatter counts those toward Anthropic's
+      // 4-breakpoint limit alongside the seams.
+      const block = {
+        type: 'text',
+        text: `turn ${i} of imported traffic with stale markers `.repeat(3),
+        cache_control: { type: 'ephemeral' },
+      } as unknown as ContentBlock;
+      manager.addMessage(i % 2 === 0 ? 'user' : 'agent', [block]);
+      await drain(manager);
+    }
+    await manager.close();
+    assert.ok(calls.length > 0, 'expected compression calls');
+    for (const { request } of calls) {
+      for (const m of request.messages) {
+        for (const b of m.content) {
+          assert.strictEqual((b as { cache_control?: unknown }).cache_control, undefined,
+            'stale block-level cache_control must not reach the mint request');
+        }
+      }
+      assert.ok(breakpointIndices(request).length <= 3,
+        'total breakpoints must stay within the seam budget');
+    }
+  });
+
   it('head window present → the message before the first pair is marked', async () => {
     const calls = await runWorkload({ headWindowTokens: 60 }, 40);
     const laddered = calls.filter((c) => recallHeaderIndices(c.request).length > 0 && !isMerge(c.request));

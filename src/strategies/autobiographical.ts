@@ -2203,7 +2203,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     recallLadder: readonly SummaryEntry[],
     capped: boolean,
   ): void {
-    if (this.config.compressionCacheMarkers === false || capped) return;
+    if (this.config.compressionCacheMarkers === false) return;
+    // Replayed history can carry stale BLOCK-level cache_control from the
+    // original live requests (imported stores; see membrane's native-formatter
+    // passthrough note). Those were another request's placement decisions, and
+    // the formatter counts them toward Anthropic's 4-breakpoint limit — left
+    // in place, two of them plus the three seams below would push the request
+    // past it and the API hard-rejects, stalling compression. Strip them
+    // (copy-on-write: block objects are shared with the message store).
+    // cache_control is request plumbing, not content, so verbatim-replay
+    // KV-honesty is unaffected. The kill switch above restores byte-exact
+    // pre-seam behavior, passthrough included.
+    for (const m of messages) {
+      if (m.content.some((b) => (b as { cache_control?: unknown }).cache_control !== undefined)) {
+        m.content = m.content.map((b) => {
+          if ((b as { cache_control?: unknown }).cache_control === undefined) return b;
+          const { cache_control: _stale, ...rest } = b as ContentBlock & { cache_control?: unknown };
+          return rest as ContentBlock;
+        });
+      }
+    }
+    if (capped) return;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;

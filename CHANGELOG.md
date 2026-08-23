@@ -17,7 +17,9 @@ Releases up to and including 0.6.2 predate this file; for their contents see
   recall pair — with a 1h cache TTL (#37). The mint lane previously sent its
   entire recall prefix (~60–93% of input) uncached on every call. Markers are
   suppressed when the recall ladder was budget-capped (front-eviction shifts
-  the prefix, making cache writes counterproductive). New options:
+  the prefix, making cache writes counterproductive), and stale block-level
+  `cache_control` riding replayed imported content is stripped so the seams
+  can never push a request past Anthropic's 4-breakpoint limit. New options:
   `compressionCacheMarkers` (default `true`) and `compressionCacheTtl`
   (default `'1h'`).
 
