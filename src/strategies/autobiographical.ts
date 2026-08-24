@@ -7540,12 +7540,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * requests re-read everything above the churn instead of re-writing it.
    * See docs/unified-solve-design.md §9.2b.
    *
-   * The Anthropic limit is 4 cache_control blocks per request INCLUDING the
-   * system block, which membrane marks whenever prompt caching is on — so
-   * message-level markers must never exceed 3 (Rhys, 2026-07-26: "A maximum
-   * of 4 blocks with cache_control may be provided. Found 5."). Deliberately
-   * NOT fixed by stripping in membrane — silently dropped markers are
-   * silently broken caching; the supplier stays within the global budget.
+   * Slot contract with membrane (the request compiler's side of it):
+   * Anthropic allows 4 cache_control blocks per request INCLUDING any on
+   * tools/system. The split is: **this strategy holds first claim, up to 3
+   * message-level markers; membrane is residual claimant on whatever
+   * remains**, spending it end-position-only — a tools+system fallback when
+   * zero message markers arrive, and a floating marker on the newest
+   * message when the native tool loop rebuilds the request between tool
+   * rounds (which this strategy never sees: compile runs once per turn,
+   * and without the float every tool round re-paid the whole appended
+   * suffix at full input price — the qa-ops 2026-08-20 8M-token incident).
+   *
+   * An earlier revision of this comment justified the 3-cap with "membrane
+   * marks the system block whenever prompt caching is on" — membrane has
+   * not done that unconditionally for some time, which is exactly how a
+   * whole free slot went unnoticed; the cap is now an asserted invariant
+   * rather than a comment-enforced courtesy. Enforcement is asymmetric by
+   * design: the supplier hard-fails at compile time (cheap, CI-catchable,
+   * see below), while membrane enforces by counting — it withholds its own
+   * residual marker (with a warning) rather than stripping ours, because
+   * silently dropped markers are silently broken caching and an
+   * over-budget request from our side is the loud 400 we prefer to silent
+   * degradation (Rhys, 2026-07-26: "A maximum of 4 blocks with
+   * cache_control may be provided. Found 5.").
+   *
    * Idempotent; clears any pre-existing markers first.
    */
   protected placeCacheMarkers(
@@ -7591,6 +7609,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (lastHead >= 0) marks.add(lastHead);            // system / head block
     if (stableEnd > lastHead) marks.add(stableEnd);    // measured stable prefix (the big one)
     marks.add(n - 1);                                  // end → pure-append reuse
+
+    // First-claim cap (see the slot contract above). Structurally ≤3 today;
+    // this guards the invariant against a future fourth seam, because the
+    // overrun would otherwise surface as either a hard 400 on every
+    // inference or membrane silently losing its tool-loop floating marker.
+    if (marks.size > 3) {
+      throw new Error(
+        `placeCacheMarkers: ${marks.size} message-level cache markers exceed ` +
+        `the strategy's first-claim budget of 3 (Anthropic allows 4 total; ` +
+        `the remainder is membrane's residual claim)`,
+      );
+    }
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
   }

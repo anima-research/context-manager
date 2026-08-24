@@ -12,6 +12,21 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Changed
+
+- The cache-breakpoint slot contract with membrane is now stated explicitly
+  at `placeCacheMarkers` and enforced with a compile-time assertion: this
+  strategy holds first claim on up to 3 message-level markers of Anthropic's
+  4 `cache_control` slots; membrane is residual claimant on the remainder
+  (tools/system fallback when no message markers arrive, and its tool-loop
+  floating cache marker). The previous comment justified the 3-cap with a
+  membrane behavior — an unconditional system-block marker — that membrane
+  dropped some time ago, which left the fourth slot unclaimed and unnoticed
+  while tool-loop suffixes went uncached (the qa-ops 2026-08-20 incident).
+  No placement behavior changes; a future edit that emits a fourth marker
+  now fails loudly at compile time instead of surfacing as a hard 400 or as
+  membrane silently losing its float.
+
 ### Added
 
 - Compression and merge requests now carry prompt-cache breakpoints at their
