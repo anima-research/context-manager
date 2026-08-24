@@ -52,6 +52,7 @@ export type {
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  RecallEnvelopeMode,
   SummaryLevel,
   SummaryEntry,
   PhaseType,

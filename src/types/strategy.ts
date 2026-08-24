@@ -459,6 +459,9 @@ export interface CompressionQuarantineStatus {
   keys: string[];
 }
 
+/** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
+export type RecallEnvelopeMode = 'none' | 'xml';
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -526,6 +529,25 @@ export interface AutobiographicalConfig {
   identityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
+
+  /**
+   * Structural delimiting for recall ANSWER content.
+   *
+   *  - `'none'` (default) — answers render exactly as they always have: the
+   *    Q-side label opens the memory and the turn boundary is the only thing
+   *    that closes it. Output is byte-identical to the pre-envelope render.
+   *  - `'xml'` — each answer's prose is fenced by
+   *    `<cm-recall id="…" level="…" span="…">` … `</cm-recall>`, so the end of
+   *    a recalled memory is marked as explicitly as its start (instances have
+   *    been observed reading past it into unrelated content). Attributes come
+   *    from the summary record; one the record cannot answer for is omitted.
+   *
+   * The envelope is a collision-tolerant delimiter convention, not parseable
+   * XML: answer text is model prose and is never entity-escaped.
+   *
+   * Q-side labels are identical under both modes.
+   */
+  recallEnvelope?: RecallEnvelopeMode;
   /** Participant name for the summary (defaults to "Summary") */
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
@@ -666,7 +688,8 @@ export interface AutobiographicalConfig {
    * large enough to overflow the API window. Walks newest-first so
    * proximate context survives; the kept set is then re-sorted
    * chronologically. Each summary takes (its content tokens + 50 for
-   * the wrapping "[CM] Recall memory <id>." question).
+   * the wrapping "[CM] Recall memory <id>." question, plus that summary's
+   * envelope tags when `recallEnvelope` is on).
    *
    * Default 100000 — chosen so that even an L_n merge (which packs
    * recall + head + expanded target + instruction into one request)
@@ -1132,6 +1155,7 @@ Capture what matters:
 
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
+  recallEnvelope: 'none',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
   maxLiveImages: 6,

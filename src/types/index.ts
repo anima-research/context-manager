@@ -40,6 +40,7 @@ export type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
+  RecallEnvelopeMode,
   SummaryLevel,
   SummaryEntry,
   PhaseType,

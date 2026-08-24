@@ -31,6 +31,7 @@ import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { MessageStore } from '../message-store.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -2153,6 +2154,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Per-summary +50 token overhead accounts for the "[CM] Recall memory
    * <id>." question turn that wraps each recall body. Rough but defensive.
+   *
+   * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
+   * tags, so the estimate prices that summary's ACTUAL envelope string on top
+   * — attributes included, and zero when the envelope is off. A second magic
+   * constant would drift from the tag the moment either changed.
    */
   protected capRecallPairs(
     summariesChronological: SummaryEntry[],
@@ -2162,7 +2168,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let total = 0;
     for (let i = summariesChronological.length - 1; i >= 0; i--) {
       const s = summariesChronological[i]!;
-      const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50;
+      const envelopeText = recallEnvelopeAddedText(s, this.config.recallEnvelope);
+      const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50 +
+        this.estimateTokens([{ type: 'text', text: envelopeText }]);
       if (total + est > maxTokens) continue;
       kept.push(s);
       total += est;
@@ -9744,12 +9752,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * text block from `content`.
    *
    * Returns a fresh array so callers can never mutate the stored entry.
+   *
+   * Every recall answer in the codebase is built here — presented context on
+   * both select paths, the mint/merge recall ladders, refusal-curve expansion
+   * — so the `recallEnvelope` delimiter is applied here too, once.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
-    if (summary.responseContent && summary.responseContent.length > 0) {
-      return [...summary.responseContent];
-    }
-    return [{ type: 'text', text: summary.content }];
+    const content: ContentBlock[] = summary.responseContent && summary.responseContent.length > 0
+      ? [...summary.responseContent]
+      : [{ type: 'text', text: summary.content }];
+    return wrapRecallAnswerContent(content, summary, this.config.recallEnvelope);
   }
 
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
