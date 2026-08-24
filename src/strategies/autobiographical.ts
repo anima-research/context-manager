@@ -5784,10 +5784,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       logCompressionCall({
         operation: 'compress_l1',
-        // Null when the request carried no system field, so the pre-threading
-        // log shape is preserved exactly; summarized (not verbatim) when it
-        // did, matching how `messages` is logged.
-        system: ctx.systemPrompt ? summarizeTelemetryText(ctx.systemPrompt) : null,
+        // The DISPATCHED bytes, read off the request object — deliberately
+        // NOT ctx.systemPrompt again. This finally runs after an awaited
+        // round trip and that getter is live, so a host activation landing
+        // mid-flight would make this receipt name a prompt the call never
+        // sent. Every rung that can actually reach the wire from here
+        // (recall-curve variants, withAppendedInstruction, withoutToolsParam,
+        // stripReasoningFromRequest) derives from `request` by spread and
+        // leaves `system` untouched, so the canonical request's field is the
+        // sent value for all of them. Null when the request carried no
+        // system field, so the pre-threading log shape is preserved exactly;
+        // summarized (not verbatim) when it did, matching how `messages` is
+        // logged.
+        system: request.system ? summarizeTelemetryText(request.system) : null,
         messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
@@ -6682,8 +6691,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
-        // See the twin note at the compress_l1 site.
-        system: ctx.systemPrompt ? summarizeTelemetryText(ctx.systemPrompt) : null,
+        // The DISPATCHED bytes — see the twin note at the compress_l1 site
+        // for why this must not re-read ctx.systemPrompt after the await.
+        // `dispatchRequest` is what went on the wire: `request` itself, or
+        // its tools-less escalation, which drops the tools param and carries
+        // `system` through by spread.
+        system: dispatchRequest.system ? summarizeTelemetryText(dispatchRequest.system) : null,
         messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           target_level: targetLevel,
