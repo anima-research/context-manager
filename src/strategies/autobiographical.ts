@@ -2197,13 +2197,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Effective ladder reuse also requires the append-stable source order
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
+   *
+   * Returns true iff at least one breakpoint was placed — callers attach
+   * `cacheTtl` only then, so every marker-less request (kill switch, capped
+   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * canonical hash / quarantine identity.
    */
   protected applyMintCacheSeams(
     messages: NormalizedRequest['messages'],
     recallLadder: readonly SummaryEntry[],
     capped: boolean,
-  ): void {
-    if (this.config.compressionCacheMarkers === false) return;
+  ): boolean {
+    if (this.config.compressionCacheMarkers === false) return false;
     // Replayed history can carry stale BLOCK-level cache_control from the
     // original live requests (imported stores; see membrane's native-formatter
     // passthrough note). Those were another request's placement decisions, and
@@ -2223,7 +2228,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
     }
-    if (capped) return;
+    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -2241,10 +2246,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       frontierEnd = i + 1;
       if (level >= 2) deepEnd = i + 1;
     }
-    if (frontierEnd === -1) return; // no ladder yet — nothing stable to cache
+    if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
       if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
     }
+    return true;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -5106,7 +5112,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mintMessages = cleaned
       .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
       .filter(m => m.content.length > 0);
-    this.applyMintCacheSeams(
+    const mintSeamed = this.applyMintCacheSeams(
       mintMessages,
       keptSummaries,
       keptSummaries.length < priorSummaries.length,
@@ -5126,8 +5132,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // which must reach the API verbatim (see the recall-pair sites).
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
-      // 5-minute cache window, where markers cost more than they save.
-      cacheTtl: this.config.compressionCacheTtl,
+      // 5-minute cache window, where markers cost more than they save. Only
+      // attached when a seam was actually placed — a marker-less request
+      // must keep its pre-seam shape (canonical hash, quarantine identity).
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
@@ -6437,7 +6445,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mintMessages = cleaned
       .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
       .filter(m => m.content.length > 0);
-    this.applyMintCacheSeams(
+    const mintSeamed = this.applyMintCacheSeams(
       mintMessages,
       keptPriorSummaries,
       keptPriorSummaries.length < priorSummariesAll.length,
@@ -6460,8 +6468,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // which must reach the API verbatim (see the recall-pair sites).
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
-      // 5-minute cache window, where markers cost more than they save.
-      cacheTtl: this.config.compressionCacheTtl,
+      // 5-minute cache window, where markers cost more than they save. Only
+      // attached when a seam was actually placed — a marker-less request
+      // must keep its pre-seam shape (canonical hash, quarantine identity).
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:

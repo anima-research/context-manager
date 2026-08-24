@@ -138,11 +138,13 @@ describe('Compression requests: cache seams (issue #37)', () => {
     }
   });
 
-  it('the first mint (no prior ladder) carries no markers', async () => {
+  it('the first mint (no prior ladder) carries no markers and no cacheTtl', async () => {
     const calls = await runWorkload({}, 40);
     const first = calls[0].request;
     assert.strictEqual(recallHeaderIndices(first).length, 0, 'first mint should have no recall pairs');
     assert.strictEqual(breakpointIndices(first).length, 0, 'no ladder → nothing to mark');
+    assert.ok(!Object.prototype.hasOwnProperty.call(first, 'cacheTtl'),
+      'marker-less request must keep the pre-seam shape (no cacheTtl key)');
   });
 
   it('merge requests mark only prior-ladder pairs, never expanded sources', async () => {
@@ -198,14 +200,49 @@ describe('Compression requests: cache seams (issue #37)', () => {
     for (const { request } of late) {
       assert.strictEqual(breakpointIndices(request).length, 0,
         'capped ladder → markers suppressed (front-eviction shifts the prefix)');
+      assert.ok(!Object.prototype.hasOwnProperty.call(request, 'cacheTtl'),
+        'capped (marker-less) request must not carry cacheTtl');
     }
     assert.ok(capped.length > 0, 'expected at least one laddered call in the capped run');
   });
 
-  it('compressionCacheMarkers: false disables seams entirely', async () => {
-    const calls = await runWorkload({ compressionCacheMarkers: false }, 40);
+  it('compressionCacheMarkers: false restores the complete pre-seam request shape', async () => {
+    cleanup();
+    const { membrane, calls } = createCapturingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+      compressionCacheMarkers: false,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+    for (let i = 0; i < 40; i++) {
+      // Stale block-level cache_control must survive under the kill switch:
+      // byte-exact pre-seam behavior includes the passthrough.
+      const block = {
+        type: 'text',
+        text: `turn ${i} of imported traffic under the kill switch `.repeat(3),
+        cache_control: { type: 'ephemeral' },
+      } as unknown as ContentBlock;
+      manager.addMessage(i % 2 === 0 ? 'user' : 'agent', [block]);
+      await drain(manager);
+    }
+    await manager.close();
+    assert.ok(calls.length > 0, 'expected compression calls');
     for (const { request } of calls) {
-      assert.strictEqual(breakpointIndices(request).length, 0);
+      assert.strictEqual(breakpointIndices(request).length, 0, 'no markers under the kill switch');
+      assert.ok(!Object.prototype.hasOwnProperty.call(request, 'cacheTtl'),
+        'no cacheTtl key under the kill switch (canonical hashes must match pre-seam)');
+      const staleSurvivors = request.messages.flatMap((m) => m.content)
+        .filter((b) => (b as { cache_control?: unknown }).cache_control !== undefined);
+      assert.ok(staleSurvivors.length > 0,
+        'stale block-level cache_control must pass through untouched under the kill switch');
     }
   });
 
