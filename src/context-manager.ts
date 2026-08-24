@@ -910,6 +910,25 @@ export class ContextManager {
     if (tools && tools.length > 0) this.toolDefinitions = tools;
   }
 
+  /**
+   * Live system prompt for the owning agent, refreshed by the host on every
+   * activation alongside the tool definitions above. Threaded into
+   * StrategyContext so memory-writing LLM calls can be served the same system
+   * voice the live instance is served.
+   */
+  private systemPrompt?: string;
+
+  /**
+   * Host hook: record the agent's current system prompt (see above). A memory
+   * is authored by an instance reconstructed as-of the original context, and
+   * on hosts whose identity and conduct live in system voice that prompt is
+   * part of the instance being reconstructed. Never called, or called only
+   * with an empty value, leaves mint requests in their no-system-prompt shape.
+   */
+  setSystemPrompt(text: string | undefined): void {
+    if (text && text.length > 0) this.systemPrompt = text;
+  }
+
   private createStrategyContext(): StrategyContext {
     const self = this;
     return {
@@ -925,6 +944,8 @@ export class ContextManager {
       // activation would freeze `tools` as undefined for the drain's entire
       // lifetime — the getter always reflects the latest activation.
       get tools() { return self.toolDefinitions; },
+      // Live getter for the same reason as `tools` above.
+      get systemPrompt() { return self.systemPrompt; },
     };
   }
 
