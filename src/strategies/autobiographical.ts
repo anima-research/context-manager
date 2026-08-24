@@ -1062,6 +1062,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.compressionSlackRatio ??= 0.1;
       this.config.speculativeProduction ??= true;
     }
+    // Compression-lane prompt caching (issue #37)
+    this.config.compressionCacheMarkers ??= true;
+    this.config.compressionCacheTtl ??= '1h';
     // The solver committed to at construction. buildPicker compares the live
     // config against this on every compile: a runtime mutation (e.g. an
     // override merge carrying `foldingStrategy: undefined`) silently swaps
@@ -2166,6 +2169,88 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     kept.reverse();
     return { kept, keptTokens: total };
+  }
+
+  /**
+   * Issue #37: tag a mint request's stability strata with cache breakpoints.
+   *
+   * Consecutive compression/merge requests share a long, append-mostly
+   * prefix — head window + prior recall pairs (~60% of input on synthetic
+   * workloads, ~93% on mature stores) — that previously went to the API
+   * with zero `cache_control` and was re-read cold on every call. Markers
+   * land at the three boundaries whose survival probability ranks highest
+   * (measured optimum; `analysis/2026-08-20-cm37-cache-partition-experiments.md`
+   * in the workspace root):
+   *
+   *   1. end of head window        — survives everything short of identity edits
+   *   2. last level>=2 recall pair — survives appends AND L1→L2 merges (a
+   *      merge replaces the run at this boundary and extends it)
+   *   3. last recall pair          — the append frontier
+   *
+   * Only pairs whose id is in `recallLadder` (the kept prior-summary list)
+   * count as prefix: a merge's expanded SOURCE pairs are its volatile
+   * payload, and marking them would cache-write content that never recurs.
+   *
+   * `capped` requests get no markers: recall-budget front-eviction shifts
+   * the prefix on every subsequent mint, and cache writes on a shifting
+   * prefix are pure waste (measured up to +42% total cost at 1h TTL).
+   * Effective ladder reuse also requires the append-stable source order
+   * fix (2026-08-19); on stores minted under the older lexical order the
+   * markers are merely harmless.
+   *
+   * Returns true iff at least one breakpoint was placed — callers attach
+   * `cacheTtl` only then, so every marker-less request (kill switch, capped
+   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * canonical hash / quarantine identity.
+   */
+  protected applyMintCacheSeams(
+    messages: NormalizedRequest['messages'],
+    recallLadder: readonly SummaryEntry[],
+    capped: boolean,
+  ): boolean {
+    if (this.config.compressionCacheMarkers === false) return false;
+    // Replayed history can carry stale BLOCK-level cache_control from the
+    // original live requests (imported stores; see membrane's native-formatter
+    // passthrough note). Those were another request's placement decisions, and
+    // the formatter counts them toward Anthropic's 4-breakpoint limit — left
+    // in place, two of them plus the three seams below would push the request
+    // past it and the API hard-rejects, stalling compression. Strip them
+    // (copy-on-write: block objects are shared with the message store).
+    // cache_control is request plumbing, not content, so verbatim-replay
+    // KV-honesty is unaffected. The kill switch above restores byte-exact
+    // pre-seam behavior, passthrough included.
+    for (const m of messages) {
+      if (m.content.some((b) => (b as { cache_control?: unknown }).cache_control !== undefined)) {
+        m.content = m.content.map((b) => {
+          if ((b as { cache_control?: unknown }).cache_control === undefined) return b;
+          const { cache_control: _stale, ...rest } = b as ContentBlock & { cache_control?: unknown };
+          return rest as ContentBlock;
+        });
+      }
+    }
+    if (capped) return false;
+    const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
+    let headEnd = -1;
+    let deepEnd = -1;
+    let frontierEnd = -1;
+    for (let i = 0; i < messages.length - 1; i++) {
+      const m = messages[i]!;
+      if (m.participant !== 'Context Manager' || m.content.length !== 1) continue;
+      const block = m.content[0];
+      if (block?.type !== 'text') continue;
+      const match = /^\[CM\] Recall memory (.+)\.$/.exec(block.text);
+      if (!match) continue;
+      const level = levelById.get(match[1]!);
+      if (level === undefined) continue;
+      if (frontierEnd === -1 && i > 0) headEnd = i - 1;
+      frontierEnd = i + 1;
+      if (level >= 2) deepEnd = i + 1;
+    }
+    if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
+    for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
+      if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
+    }
+    return true;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -5021,6 +5106,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
     );
 
+    // Final wire-shape messages. Sanitize: strip empty text blocks and drop
+    // any message left with no content (empty text reaches the API as a 400
+    // that stalls ALL compression — see the twin note on the request below).
+    const mintMessages = cleaned
+      .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+      .filter(m => m.content.length > 0);
+    const mintSeamed = this.applyMintCacheSeams(
+      mintMessages,
+      keptSummaries,
+      keptSummaries.length < priorSummaries.length,
+    );
+
     const request: NormalizedRequest = {
       // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
       // raw history that can carry more inline image bytes than the API's
@@ -5029,19 +5126,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
-      // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
-      // message left with no content. An empty-content turn (e.g. a silent/skip
-      // turn that produced no text) otherwise reaches the API as an empty text
-      // block → 400 "text content blocks must be non-empty", which throws in the
-      // speculative drain and stalls ALL compression. (Twin of the empty-summary
-      // recall-header guard — together they cover every source of the 400.)
       // NOTE (2026-07-16): thinking is stripped from RAW messages at their
-      // llmMessages insertion sites, not here — a blanket strip would also
-      // remove the recall-pair reasoning carriers, which must reach the API
-      // verbatim (see the recall-pair sites).
-      messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-        .filter(m => m.content.length > 0),
+      // llmMessages insertion sites, not in the mintMessages sanitize — a
+      // blanket strip would also remove the recall-pair reasoning carriers,
+      // which must reach the API verbatim (see the recall-pair sites).
+      messages: mintMessages,
+      // 1h TTL on the seam markers: steady-state mint cadence exceeds the
+      // 5-minute cache window, where markers cost more than they save. Only
+      // attached when a seam was actually placed — a marker-less request
+      // must keep its pre-seam shape (canonical hash, quarantine identity).
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
@@ -6343,6 +6437,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
     );
 
+    // Final wire-shape messages. Sanitize: strip empty text blocks and drop
+    // any message left with no content (empty text reaches the API as a 400
+    // that stalls ALL compression — see the twin note on the request below).
+    // Seams count only `keptPriorSummaries` pairs as stable prefix — the
+    // expanded SOURCE pairs below the prior ladder are this merge's payload.
+    const mintMessages = cleaned
+      .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+      .filter(m => m.content.length > 0);
+    const mintSeamed = this.applyMintCacheSeams(
+      mintMessages,
+      keptPriorSummaries,
+      keptPriorSummaries.length < priorSummariesAll.length,
+    );
+
     // NO system prompt — identity is established by the head window
     // (present at the start of llmMessages above) and by the prior
     // recall pairs. Same rationale as compressChunkHierarchical.
@@ -6354,19 +6462,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
-      // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
-      // message left with no content. An empty-content turn (e.g. a silent/skip
-      // turn that produced no text) otherwise reaches the API as an empty text
-      // block → 400 "text content blocks must be non-empty", which throws in the
-      // speculative drain and stalls ALL compression. (Twin of the empty-summary
-      // recall-header guard — together they cover every source of the 400.)
       // NOTE (2026-07-16): thinking is stripped from RAW messages at their
-      // llmMessages insertion sites, not here — a blanket strip would also
-      // remove the recall-pair reasoning carriers, which must reach the API
-      // verbatim (see the recall-pair sites).
-      messages: cleaned
-        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-        .filter(m => m.content.length > 0),
+      // llmMessages insertion sites, not in the mintMessages sanitize — a
+      // blanket strip would also remove the recall-pair reasoning carriers,
+      // which must reach the API verbatim (see the recall-pair sites).
+      messages: mintMessages,
+      // 1h TTL on the seam markers: steady-state mint cadence exceeds the
+      // 5-minute cache window, where markers cost more than they save. Only
+      // attached when a seam was actually placed — a marker-less request
+      // must keep its pre-seam shape (canonical hash, quarantine identity).
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:

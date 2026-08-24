@@ -680,6 +680,34 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * Prompt-cache breakpoints on compression/merge requests (issue #37).
+   *
+   * Mint requests are dominated by a stable, append-mostly prefix (head
+   * window + prior recall pairs — ~60% synthetic, ~93% on mature stores)
+   * that was re-sent uncached on every call. When enabled, the request is
+   * tagged at its stability strata: end of head, last level>=2 recall pair,
+   * last recall pair. Markers are suppressed for any request whose recall
+   * ladder was budget-capped (`compressionRecallBudgetTokens`): front
+   * eviction shifts the prefix every mint, and measured cache writes there
+   * are pure waste (up to +42% cost). Requires append-stable ladder order
+   * (the 2026-08-19 source-order fix) to be effective.
+   *
+   * Default: true.
+   */
+  compressionCacheMarkers?: boolean;
+
+  /**
+   * Cache TTL for compression-lane breakpoints. Mint cadence is typically
+   * minutes-to-hours in steady state — beyond the 5-minute TTL, where
+   * markers cost more than they save — so the lane defaults to '1h'
+   * (write premium 2x vs 1.25x, break-even reuse probability 0.53 vs 0.22).
+   * Back-to-back drains work under either.
+   *
+   * Default: '1h'.
+   */
+  compressionCacheTtl?: '5m' | '1h';
+
+  /**
    * Maximum number of same-model recall-curve variants attempted after an L1
    * canonical request is explicitly refused. Each variant expands exactly one
    * already-authored frontier summary into its persisted direct children.
