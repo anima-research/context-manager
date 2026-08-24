@@ -5102,9 +5102,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // instance, and (b) provide an alternative identity source that competes
     // with the structural one carried by the conversation itself. Both
     // objections invert when the host DOES serve a system prompt on every
-    // activation: the original instance saw it, so replaying it is the
-    // KV-honest reconstruction and omitting it is what installs a competing
-    // (system-promptless) identity. See ContextManager.setSystemPrompt.
+    // activation, because then the header is no longer synthetic.
+    //
+    // Be precise about WHICH prompt this is, because the mechanism does not
+    // supply the one the wording would suggest: ContextManager keeps only
+    // the LATEST value the host pushed (setSystemPrompt), never a
+    // per-message historical prompt, so what is threaded here is the host's
+    // CURRENT identity policy governing this mint — not a replay of what the
+    // original instance was served while the chunk was being lived. Where
+    // the prompt is stable across that span, the two coincide and replaying
+    // it is the KV-honest reconstruction; where the host has changed it, the
+    // memory is authored under the identity the host serves NOW, and this
+    // code has no way to recover the older one. On either reading, omitting
+    // it is what installs a competing (system-promptless) identity.
+    // See ContextManager.setSystemPrompt.
     // Own the byte wall here rather than delegating to membrane's shed: cap
     // the prompt's inline image bytes newest-first before the request is built.
     // A tighter budget than the live window's: a compression prompt also
@@ -6480,11 +6491,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
 
     // The HOST's system prompt, or none — same rationale as
-    // compressChunkHierarchical. Undeclared, identity is established by the
-    // head window (present at the start of llmMessages above) and by the
-    // prior recall pairs. Declared, it is part of the instance this merge
-    // reconstructs — and a merge re-summarizes summaries, so an omission
-    // here compounds upward through every level of the pyramid.
+    // compressChunkHierarchical, including the currency caveat spelled out
+    // there: the threaded value is the host's LATEST, so this merge is
+    // governed by the current identity policy, not by whatever was served
+    // when the source summaries were authored. Undeclared, identity is
+    // established by the head window (present at the start of llmMessages
+    // above) and by the prior recall pairs. Declared, it is the identity
+    // this merge is authored under — and a merge re-summarizes summaries,
+    // so an omission here compounds upward through every level of the
+    // pyramid.
     const request: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than

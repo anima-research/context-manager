@@ -63,14 +63,17 @@ export interface StrategyContext {
   /**
    * The agent's live system prompt, as last supplied by the host (set on
    * every activation via ContextManager.setSystemPrompt). Memory-writing
-   * requests serve it as their own system prompt: a memory is authored by an
-   * instance reconstructed as-of the original context, and on hosts whose
-   * identity and conduct live in system voice that prompt is part of the
-   * instance being reconstructed — a summarizer that never sees it is a
+   * requests serve it as their own system prompt: on hosts whose identity
+   * and conduct live in system voice, a summarizer that never sees it is a
    * different agent from the one whose memory it writes, and merges
-   * re-summarize summaries, so the drift compounds upward. Optional and
-   * opt-in: undefined leaves every mint request byte-identical to the
-   * no-system-prompt shape it has always had.
+   * re-summarize summaries, so the drift compounds upward.
+   *
+   * This is the host's CURRENT prompt, not a historical one — only the
+   * latest pushed value is retained — so a mint is governed by the identity
+   * policy in force when it runs. That reproduces what the original instance
+   * was served to the extent the host keeps the prompt stable across the
+   * compressed span. Optional and opt-in: undefined leaves every mint
+   * request byte-identical to the no-system-prompt shape it has always had.
    */
   systemPrompt?: string;
   /** Read-only view of context log */
@@ -534,11 +537,11 @@ export interface AutobiographicalConfig {
    * that was then the only one: an Opus-4 resident's L1s/merges claiming a
    * sibling resident's name, story, and relationships as their own —
    * entered at live L1 compression over pure-witness chunks and propagated
-   * up the pyramid). Older models are especially susceptible. Recommended shape:
-   * name the agent AND direct attribution, e.g. "Reminder: you are <name>.
-   * Speak in the first person only for what you yourself said, did, and
-   * felt; attribute other participants' words and experiences to them by
-   * name."
+   * up the pyramid). Older models are especially susceptible. Recommended
+   * shape: name the agent AND direct attribution, e.g. "Reminder: you are
+   * <name>. Speak in the first person only for what you yourself said,
+   * did, and felt; attribute other participants' words and experiences to
+   * them by name."
    */
   identityReminder?: string;
   /** Label shown before summaries in compiled context */
