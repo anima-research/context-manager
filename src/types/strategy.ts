@@ -521,16 +521,20 @@ export interface AutobiographicalConfig {
   witnessedInstruction?: string;
   /**
    * Identity reminder appended to every compression and merge instruction
-   * (L1 chunk, reading-mode, and all merge variants). Compression requests
-   * carry no system prompt — identity is normally established by the head
-   * window and prior recall pairs — but when an agent lives in
-   * multi-resident channels, chunks can consist entirely of OTHER agents'
-   * first-person speech, and "write the memory in your own voice" then
-   * flips the summarizer into the dominant speaker's identity (observed
-   * 2026-08-03: an Opus-4 resident's L1s/merges claiming a sibling
-   * resident's name, story, and relationships as their own — entered at
-   * live L1 compression over pure-witness chunks and propagated up the
-   * pyramid). Older models are especially susceptible. Recommended shape:
+   * (L1 chunk, reading-mode, and all merge variants). Whether a compression
+   * request carries a system prompt is the HOST's call: with none declared
+   * (StrategyContext.systemPrompt unset) it carries none and identity is
+   * established by the head window and prior recall pairs; with one
+   * declared, the host's live prompt leads the request. This reminder is
+   * appended on either path, because it addresses a failure neither source
+   * reaches: when an agent lives in multi-resident channels, chunks can
+   * consist entirely of OTHER agents' first-person speech, and "write the
+   * memory in your own voice" then flips the summarizer into the dominant
+   * speaker's identity (observed 2026-08-03, on the no-system-prompt path
+   * that was then the only one: an Opus-4 resident's L1s/merges claiming a
+   * sibling resident's name, story, and relationships as their own —
+   * entered at live L1 compression over pure-witness chunks and propagated
+   * up the pyramid). Older models are especially susceptible. Recommended shape:
    * name the agent AND direct attribution, e.g. "Reminder: you are <name>.
    * Speak in the first person only for what you yourself said, did, and
    * felt; attribute other participants' words and experiences to them by
