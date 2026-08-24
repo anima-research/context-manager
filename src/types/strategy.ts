@@ -547,6 +547,21 @@ export interface AutobiographicalConfig {
    *
    * Q-side labels are identical under both modes.
    *
+   * WHY THE DEFAULT IS OFF. Recall answers are built at one shared choke
+   * point, and the presented window is not its only consumer: the same
+   * enveloped answers are replayed into the recall ladders that PROMPT
+   * compression — the mint and merge requests that produce the next
+   * generation of summaries. Turning the envelope on therefore changes the
+   * summarizer's own inputs, not only what the agent reads. What that does to
+   * the summaries a model then writes — whether the tags are ignored, echoed
+   * into summary prose, or read as a format worth imitating — is UNMEASURED.
+   * The evidence behind this feature is that instances read past an
+   * unterminated memory; there is none either way on what enveloping does to
+   * minting, and default-off is deliberate for that reason rather than
+   * caution about the render. Before enabling it fleet-wide, turn it on
+   * against a mature store and read the summaries it MINTS, not merely the
+   * window it presents.
+   *
    * Under `maxMessageTokens`, a capped answer is truncated as PROSE and
    * enveloped afterwards, so opener and closer survive every cap; the tags
    * themselves are not charged against that cap (they are priced in the
