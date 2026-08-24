@@ -9,6 +9,37 @@ import type {
 } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
 
+/** Detect provider-supported raster image types from their byte signature.
+ * Returns null for unknown/container types so callers can preserve the
+ * declared MIME rather than guessing. */
+function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
+  if (bytes.length >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 6) {
+    const signature = Buffer.from(bytes.subarray(0, 6)).toString('ascii');
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
+  }
+  if (bytes.length >= 12 &&
+      Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
+      Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  return null;
+}
+
+function canonicalImageMediaTypeFromBase64(data: string, declared: string): string {
+  // The first 16 decoded bytes cover every signature above. Decode only a
+  // short prefix so legacy multi-megabyte blobs do not get copied in full.
+  const prefix = Buffer.from(data.slice(0, 32), 'base64');
+  return sniffRasterImageMediaType(prefix) ?? declared;
+}
+
 /**
  * Manages blob storage for media content.
  * Extracts base64 data from content blocks and stores them in Chronicle's blob storage.
@@ -134,11 +165,18 @@ export class BlobManager {
     originalType: BlobReference['originalType']
   ): BlobReference {
     const buffer = Buffer.from(source.data, 'base64');
-    const hash = this.store.storeBlob(buffer, source.mediaType);
+    // Transport MIME is testimony, not authority over the bytes. A wrong
+    // image label otherwise survives in BlobReference and causes permanent
+    // provider 400s every time the message is rendered. Canonicalize only
+    // raster formats with unambiguous signatures; preserve unknown types.
+    const mediaType = originalType === 'image'
+      ? sniffRasterImageMediaType(buffer) ?? source.mediaType
+      : source.mediaType;
+    const hash = this.store.storeBlob(buffer, mediaType);
 
     return {
       hash,
-      mediaType: source.mediaType,
+      mediaType,
       originalType,
     };
   }
@@ -158,7 +196,12 @@ export class BlobManager {
     const source: Base64Source = {
       type: 'base64',
       data,
-      mediaType: ref.mediaType,
+      // Repair legacy references on read as well as new ingress on write.
+      // This changes only the provider-facing MIME label, never blob bytes or
+      // persisted source state.
+      mediaType: ref.originalType === 'image'
+        ? canonicalImageMediaTypeFromBase64(data, ref.mediaType)
+        : ref.mediaType,
     };
 
     switch (ref.originalType) {
