@@ -25,7 +25,8 @@ import {
   getMintRequestByHash,
   getMintRequestPreimageBytes,
 } from '../src/index.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
+import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
 const BASE = './test-mint-preimage';
@@ -68,6 +69,10 @@ function acceptingMembrane() {
 class Probe extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {
     this.pushSummary(entry);
+  }
+
+  run(chunk: Chunk, context: StrategyContext): Promise<void> {
+    return this.compressChunkHierarchical(chunk, context);
   }
 
   qMerge(level: number, sourceIds: string[]): void {
@@ -241,4 +246,172 @@ describe('Mint request preimages', () => {
     assert.equal(parent!.provenance!.model, ZZ_MINT_MODEL);
     await fx.manager.close();
   });
+});
+
+/**
+ * The ACCEPTED request is the authoring request (sol review, 2026-08-24).
+ *
+ * A mint ladder can send several byte-distinct requests before one is taken:
+ * a tool_use rejection re-asks with the no-tools line, and a carrier-400
+ * re-asks with reasoning blocks stripped. Only the request the transport
+ * ACCEPTED authored the summary, so provenance must hash it, the preimage
+ * must BE it, and the rejected bytes must not be stored as anybody's mint
+ * preimage. Before this fix the carrier path hashed and persisted the
+ * REJECTED original: `sha256(preimage) === requestHash` verified green over
+ * bytes the model never read.
+ */
+type ScriptedAttemptOutcome = 'accept' | 'tool_use' | 'carrier_reject';
+
+interface RecordedAttempt {
+  request: NormalizedRequest;
+  outcome: ScriptedAttemptOutcome;
+}
+
+/** Membrane stand-in that plays a fixed outcome script and keeps every request. */
+function scriptedMintMembrane(script: ScriptedAttemptOutcome[]) {
+  const attempts: RecordedAttempt[] = [];
+  return {
+    attempts,
+    membrane: {
+      complete: async (request: NormalizedRequest) => {
+        const outcome = script[attempts.length] ?? 'accept';
+        attempts.push({ request: structuredClone(request), outcome });
+        if (outcome === 'carrier_reject') {
+          throw Object.assign(
+            new Error('invalid_request: thinking blocks cannot be modified'),
+            { httpStatus: 400 },
+          );
+        }
+        return {
+          stopReason: outcome === 'tool_use' ? 'tool_use' : 'end_turn',
+          content: [t(`zz-l1-memory-${attempts.length}`)],
+          usage: { inputTokens: 100, outputTokens: 20 },
+        };
+      },
+    } as never,
+  };
+}
+
+/**
+ * A recall-bearing L1 whose stored response blocks include signed thinking,
+ * so the compression request built over it carries reasoning carriers — the
+ * precondition for the carrier-transport degraded path.
+ */
+function zzCarrierL1(id: string, ids: string[], first: number, last: number): SummaryEntry {
+  return {
+    id,
+    level: 1,
+    content: `zz-authored ${id}`,
+    tokens: 20,
+    sourceLevel: 0,
+    sourceIds: [ids[first]!, ids[last]!],
+    sourceRange: { first: ids[first]!, last: ids[last]! },
+    created: 1,
+    responseContent: [
+      { type: 'thinking', thinking: `zz-private-${id}`, signature: `zz-sig-${id}` },
+      { type: 'redacted_thinking', data: `zz-enc-${id}` },
+      { type: 'text', text: `zz-authored ${id}` },
+    ] as ContentBlock[],
+  };
+}
+
+/** One chunk, driven straight through the real L1 ladder, over carrier recall. */
+async function acceptedRequestFixture(
+  membrane: unknown,
+): Promise<{ manager: ContextManager; strategy: Probe; target: Chunk }> {
+  const strategy = new Probe({
+    compressionModel: ZZ_MINT_MODEL,
+    targetChunkTokens: 100,
+    recentWindowTokens: 0,
+    headWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0,
+    mergeThreshold: 99,
+    quarantineAlarmIntervalMs: 0,
+  });
+  const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
+  const ids: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [t(`zz-raw-${i} ` + 'substance '.repeat(12))]));
+  }
+  strategy.seed(zzCarrierL1('L1-900', ids, 0, 1));
+  strategy.seed(zzCarrierL1('L1-901', ids, 2, 3));
+
+  const targetIds = new Set(ids.slice(8, 10));
+  const target: Chunk = {
+    index: 999,
+    startIndex: 8,
+    endIndex: 10,
+    messages: ctx(manager).messageStore.getAll().filter((message) => targetIds.has(message.id)),
+    tokens: 100,
+    compressed: false,
+  };
+  return { manager, strategy, target };
+}
+
+const acceptedRequestCases: Array<{ label: string; script: ScriptedAttemptOutcome[] }> = [
+  { label: 'tool_use rejection then the no-tools retry', script: ['tool_use', 'accept'] },
+  { label: 'carrier-400 rejection then the stripped retry', script: ['carrier_reject', 'accept'] },
+];
+
+describe('Mint preimages follow the accepted request', () => {
+  after(cleanup);
+
+  for (const testCase of acceptedRequestCases) {
+    it(`${testCase.label}: provenance and preimage are the accepted bytes`, async () => {
+      const mock = scriptedMintMembrane(testCase.script);
+      const fx = await acceptedRequestFixture(mock.membrane);
+
+      await fx.strategy.run(fx.target, ctx(fx.manager));
+
+      assert.equal(mock.attempts.length, testCase.script.length, 'setup: the script ran as written');
+      const accepted = mock.attempts[mock.attempts.length - 1]!;
+      assert.equal(accepted.outcome, 'accept', 'setup: the last attempt is the accepted one');
+      const rejected = mock.attempts.slice(0, -1);
+      assert.ok(
+        mock.attempts[0]!.request.messages.some((message) =>
+          message.content.some((block) => block.type === 'thinking'),
+        ),
+        'setup: the first attempt carries reasoning blocks (the carrier path needs them)',
+      );
+
+      const acceptedBytes = Buffer.from(JSON.stringify(accepted.request), 'utf8');
+      for (const attempt of rejected) {
+        assert.notEqual(
+          JSON.stringify(attempt.request),
+          acceptedBytes.toString('utf8'),
+          'setup: the retry is byte-distinct from the request it replaced',
+        );
+      }
+
+      const minted = fx.strategy.summariesView().find((entry) => entry.provenance);
+      assert.ok(minted, 'the chunk minted an L1 carrying provenance');
+      const requestHash = minted!.provenance!.requestHash;
+      assert.equal(
+        requestHash,
+        sha256(acceptedBytes),
+        'provenance.requestHash is sha256 of the request the membrane ACCEPTED',
+      );
+
+      const stored = getMintRequestPreimageBytes(fx.manager.getStore(), requestHash);
+      assert.ok(stored, 'preimage stored under provenance.requestHash');
+      assert.equal(
+        stored!.toString('utf8'),
+        acceptedBytes.toString('utf8'),
+        'the stored preimage IS the accepted request, byte for byte',
+      );
+      assert.equal(sha256(stored!), requestHash, 'sha256(retrieved) === requestHash');
+
+      for (const attempt of rejected) {
+        const rejectedHash = sha256(Buffer.from(JSON.stringify(attempt.request), 'utf8'));
+        assert.equal(
+          getMintRequestPreimageBytes(fx.manager.getStore(), rejectedHash),
+          null,
+          'a rejected request is not a mint and is not stored as a preimage',
+        );
+      }
+
+      await fx.manager.close();
+    });
+  }
 });

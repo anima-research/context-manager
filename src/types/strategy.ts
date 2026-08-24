@@ -905,6 +905,8 @@ export interface AutobiographicalConfig {
    * store as the summaries — mint requests are large (a full compression
    * context), so hosts that keep their own durable request log, or that
    * accept unreadable provenance, can set this false to skip the writes.
+   * Writing is best-effort even when true: a store that refuses the blob is
+   * reported on stderr and the mint proceeds without a preimage.
    */
   persistMintPreimages?: boolean;
 }
@@ -1006,14 +1008,18 @@ export interface SummaryEntry {
    * evidence, so entries authored before the 2026-08-01 disposition gate
    * (which could canonize refusals/truncations, e.g. the 163-char cyber
    * refusal that became an L4 parent) are auditable: `provenance` absent →
-   * pre-gate entry, verify against llm-calls logs via content match;
-   * present → `requestHash` keys the exact request.
+   * pre-gate entry, verify against host-harness logs via content match;
+   * present → `requestHash` keys the request that authored this summary.
    *
-   * That key is readable, not merely verifiable: unless the mint ran with
-   * `persistMintPreimages: false` (or predates that persistence), the
-   * authoring request is stored as a content-addressed blob under this very
-   * hash — `getMintRequestByHash(store, requestHash)`, src/mint-preimage.ts.
-   * Audit no longer depends on a host-side llm-calls log surviving.
+   * That key is normally readable, not merely verifiable: the authoring
+   * request is stored as a content-addressed blob under this very hash —
+   * `getMintRequestByHash(store, requestHash)`, src/mint-preimage.ts — so
+   * audit no longer depends on a host-side llm-calls log surviving. It is
+   * BEST-EFFORT, though: a preimage is absent when the mint predates that
+   * persistence, when it ran with `persistMintPreimages: false`, or when the
+   * store refused the blob (loud on stderr, never fatal — a summary outranks
+   * its receipt). A present `provenance` therefore promises a verifiable
+   * hash, not a retrievable request.
    */
   provenance?: {
     /** Terminal stopReason of the accepted response (always 'end_turn' for post-gate entries). */
@@ -1021,7 +1027,10 @@ export interface SummaryEntry {
     /**
      * sha256 of the JSON-serialized membrane request that authored this
      * summary, and — by chronicle's content addressing — the blob key its
-     * persisted preimage is stored under.
+     * persisted preimage is stored under. Always the request the transport
+     * ACCEPTED: when a degraded-mode retry sends different bytes than the
+     * first attempt (carrier stripping), those accepted bytes are what this
+     * hash keys, because they are what the model actually read.
      */
     requestHash: string;
     /** Compression model that authored this summary. */
