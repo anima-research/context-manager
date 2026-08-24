@@ -24,7 +24,9 @@ Releases up to and including 0.6.2 predate this file; for their contents see
   collision-tolerant delimiter convention, not parseable XML); reasoning
   carriers are left byte-identical; Q-side labels are unchanged in both modes,
   so zero-recall surgery keys on exactly what it always did. The recall-pair
-  budget prices each summary's actual envelope string. Default `'none'`
+  budget prices each summary's actual envelope string. Under
+  `maxMessageTokens` a capped answer is truncated as prose and enveloped
+  afterwards, so opener and closer survive every cap. Default `'none'`
   renders byte-identically to before.
 - Compression and merge requests now carry prompt-cache breakpoints at their
   stability strata — end of head window, last level≥2 recall pair, last

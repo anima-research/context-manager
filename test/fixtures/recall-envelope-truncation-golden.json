@@ -1,0 +1,592 @@
+{
+  "hierarchicalPositioned": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L2-100]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-me\n\n[truncated — original was 13 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-101]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-pl\n\n[truncated — original was 6 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-102]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-wi\n\n[truncated — original was 6 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-turn-late\n\n[truncated — original was 19 tokens]"
+        }
+      ]
+    }
+  ],
+  "hierarchicalPositionedTightCap": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L2-100]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 13 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-101]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 6 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-102]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 6 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-t\n\n[truncated — original was 19 tokens]"
+        }
+      ]
+    }
+  ],
+  "hierarchicalCombined": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-merged-level covering the first two tu\n\n[truncated — original was 13 tokens]"
+        },
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n\n[truncated — original was 19 tokens]"
+        }
+      ]
+    }
+  ],
+  "hierarchicalCombinedTightCap": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 13 tokens]"
+        },
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-t\n\n[truncated — original was 19 tokens]"
+        }
+      ]
+    }
+  ],
+  "adaptive": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-1 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-2 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-3 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-4 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-5 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-20. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-21. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-22. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-23. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-24. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-25. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-26. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-27. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-28. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-29. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    }
+  ],
+  "adaptiveTightCap": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    }
+  ]
+}

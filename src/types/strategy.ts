@@ -546,6 +546,12 @@ export interface AutobiographicalConfig {
    * XML: answer text is model prose and is never entity-escaped.
    *
    * Q-side labels are identical under both modes.
+   *
+   * Under `maxMessageTokens`, a capped answer is truncated as PROSE and
+   * enveloped afterwards, so opener and closer survive every cap; the tags
+   * themselves are not charged against that cap (they are priced in the
+   * recall-pair budget instead), so a cap smaller than the tag text still
+   * renders intact tags around the few characters it bought.
    */
   recallEnvelope?: RecallEnvelopeMode;
   /** Participant name for the summary (defaults to "Summary") */
