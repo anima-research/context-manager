@@ -20,6 +20,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
+    "regen": "tsc",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "node --test dist/test/*.test.js dist/test/adaptive/*.test.js",
