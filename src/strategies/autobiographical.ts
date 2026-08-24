@@ -5660,12 +5660,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
     /**
-     * Attempt requests by their `requestHash`, so the ACCEPTED one can be
-     * persisted as a preimage once the disposition gate passes (refused
-     * attempts are not mints and are not stored). References only — every
-     * request here is already retained by `request`/`variants` for the life
-     * of this call — and deliberately NOT hung on the trace objects, which
-     * are JSON-serialized into the compression log.
+     * Accepted attempt requests by their `requestHash`, so the one that
+     * authored the summary can be persisted as a preimage once the
+     * disposition gate passes (refused attempts are not mints and are not
+     * stored). Usually a reference to a request `request`/`variants` already
+     * retain; in the carrier-transport degraded path it is the stripped copy
+     * the transport actually took, which nothing else holds. Deliberately NOT
+     * hung on the trace objects, which are JSON-serialized into the
+     * compression log.
      */
     const attemptRequestsByHash = new Map<string, NormalizedRequest>();
 
@@ -5681,6 +5683,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ): Promise<unknown> => {
         const started = Date.now();
         let response: unknown;
+        // The request the transport ACCEPTED, which is the one that authored
+        // whatever comes back. It is `attemptRequest` unless the carrier
+        // fallback below fires, in which case the transport REFUSED those
+        // bytes and the stripped copy is the authoring request. Everything
+        // downstream — trace hash, the accepted-request map, the persisted
+        // preimage — keys off this, so a summary's provenance never names a
+        // request the model never saw (sol review, 2026-08-24).
+        let acceptedRequest = attemptRequest;
         try {
           response = await ctx.membrane!.complete(
             attemptRequest,
@@ -5702,8 +5712,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
+          acceptedRequest = stripReasoningFromRequest(attemptRequest);
           response = await ctx.membrane!.complete(
-            stripReasoningFromRequest(attemptRequest),
+            acceptedRequest,
             { formatter: this.nativeFormatter },
           );
         }
@@ -5721,9 +5732,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ...(expandedParentId ? { expandedParentId } : {}),
           ...(expandedChildIds ? { expandedChildIds } : {}),
           leafCoverageHash,
-          requestHash: sha256Json(attemptRequest),
-          messageCount: attemptRequest.messages.length,
-          estimatedTokens: this.estimateCompressionRequestTokens(attemptRequest),
+          requestHash: sha256Json(acceptedRequest),
+          messageCount: acceptedRequest.messages.length,
+          estimatedTokens: this.estimateCompressionRequestTokens(acceptedRequest),
           renderedTokens: this.compressionResponseInputTokens(response),
           stopReason,
           refusalCategory: response && typeof response === 'object'
@@ -5733,7 +5744,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           persisted: false,
         };
         attemptTraces.push(trace);
-        attemptRequestsByHash.set(trace.requestHash, attemptRequest);
+        attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
       };
 
@@ -7193,11 +7204,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
 
-    // Request identity — persisted on the authored summary (provenance) and
-    // stamped on every failure receipt, so any parent can be traced back to
-    // the exact llm-calls log entry that authored it.
-    const requestHash = sha256Json(dispatchRequest);
-
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
@@ -7205,6 +7211,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     try {
       let response: NormalizedResponse;
+      // The request the transport ACCEPTED — `dispatchRequest` unless the
+      // carrier fallback below fires, in which case the transport refused
+      // those bytes and the stripped copy is what authored the merge. See
+      // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
+      let acceptedRequest = dispatchRequest;
       try {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
@@ -7220,8 +7231,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
         });
-        response = await ctx.membrane.complete(stripReasoningFromRequest(dispatchRequest), { formatter: this.nativeFormatter });
+        acceptedRequest = stripReasoningFromRequest(dispatchRequest);
+        response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
       }
+      // Request identity — persisted on the authored summary (provenance) and
+      // stamped on every failure receipt, so any parent can be traced back to
+      // the request that authored it: sha256 of the accepted request's JSON,
+      // which is also the blob key its persisted preimage lives under (see
+      // src/mint-preimage.ts). Computed AFTER dispatch because only then is
+      // the accepted request known.
+      const requestHash = sha256Json(acceptedRequest);
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
 
       // Terminal-disposition gate (2026-08-01): a consolidation may become
@@ -7317,7 +7336,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Provenance the auditor can READ: store the accepted request under the
       // hash the entry carries, before the entry itself lands.
-      this.persistMintPreimage(ctx, dispatchRequest, requestHash);
+      this.persistMintPreimage(ctx, acceptedRequest, requestHash);
 
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
