@@ -1,10 +1,11 @@
 {
   "shedOversizeImages": true,
+  "cacheTtl": "1h",
   "messages": [
     { "participant": "Context Manager", "content": [{ "type": "text", "text": "[CM] Recall memory L2-200." }] },
     { "participant": "Claude", "content": [{ "type": "text", "text": "authored L2-200" }] },
     { "participant": "Context Manager", "content": [{ "type": "text", "text": "[CM] Recall memory L2-201." }] },
-    { "participant": "Claude", "content": [{ "type": "text", "text": "authored L2-201" }] },
+    { "participant": "Claude", "content": [{ "type": "text", "text": "authored L2-201" }], "cacheBreakpoint": true },
     { "participant": "User", "content": [{ "text": "raw-8 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
     { "participant": "Claude", "content": [{ "text": "raw-9 substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive substantive ", "type": "text" }] },
     { "participant": "Context Manager", "content": [{ "type": "text", "text": "System: You will soon form a new memory, get ready. The messages that follow are the slice of recent experience you are about to compress. After them, write the memory in your own voice." }] },

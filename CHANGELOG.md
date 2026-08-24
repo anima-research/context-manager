@@ -2,7 +2,9 @@
 
 Notable changes to `@animalabs/context-manager`, loosely following
 [Keep a Changelog](https://keepachangelog.com/). Entries land with the change
-that causes them — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
+that causes them, as fragment files in [`changelog.d/`](changelog.d/) that are
+folded into a version section at release time — see
+[CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 Releases up to and including 0.6.2 predate this file; for their contents see
 `git log` and the
@@ -10,15 +12,33 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Changed
+
+- The cache-breakpoint slot contract with membrane is now stated explicitly
+  at `placeCacheMarkers` and enforced with a compile-time assertion: this
+  strategy holds first claim on up to 3 message-level markers of Anthropic's
+  4 `cache_control` slots; membrane is residual claimant on the remainder
+  (tools/system fallback when no message markers arrive, and its tool-loop
+  floating cache marker). The previous comment justified the 3-cap with a
+  membrane behavior — an unconditional system-block marker — that membrane
+  dropped some time ago, which left the fourth slot unclaimed and unnoticed
+  while tool-loop suffixes went uncached (the qa-ops 2026-08-20 incident).
+  No placement behavior changes; a future edit that emits a fourth marker
+  now fails loudly at compile time instead of surfacing as a hard 400 or as
+  membrane silently losing its float.
+
 ### Added
 
-- **`OverBudgetError`, `UncoveredDropError` (and `OverBudgetDiagnostics`) are
-  exported from the package root** (#41). Both errors are cross-package
-  behavioral surface — agent-framework gates its OverBudget drain breaker and
-  `context_refusal` classification on them (AF PR #58,
-  `classifyInferenceError`) but could only match `err.name` across the
-  boundary. Consumers now get a real `instanceof`; the constructors' message
-  wording stops being implicitly load-bearing. Additive, no behavior change.
+- Compression and merge requests now carry prompt-cache breakpoints at their
+  stability strata — end of head window, last level≥2 recall pair, last
+  recall pair — with a 1h cache TTL (#37). The mint lane previously sent its
+  entire recall prefix (~60–93% of input) uncached on every call. Markers are
+  suppressed when the recall ladder was budget-capped (front-eviction shifts
+  the prefix, making cache writes counterproductive), and stale block-level
+  `cache_control` riding replayed imported content is stripped so the seams
+  can never push a request past Anthropic's 4-breakpoint limit. New options:
+  `compressionCacheMarkers` (default `true`) and `compressionCacheTtl`
+  (default `'1h'`).
 
 ### Fixed
 
