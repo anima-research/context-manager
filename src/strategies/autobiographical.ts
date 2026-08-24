@@ -32,6 +32,7 @@ import { getSummaryParentId } from '../types/strategy.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { MessageStore } from '../message-store.js';
+import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -4693,6 +4694,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Persist the request that authored a mint, keyed by the `requestHash`
+   * its `provenance` carries (src/mint-preimage.ts). Runs at ACCEPTANCE, not
+   * at dispatch: refused and quarantined attempts are not mints, and a
+   * compression context is large enough that storing every rung of a refusal
+   * curve would multiply store growth for receipts nobody minted against.
+   * Disabled by `persistMintPreimages: false`.
+   */
+  private persistMintPreimage(
+    ctx: StrategyContext,
+    request: NormalizedRequest | undefined,
+    requestHash: string,
+  ): void {
+    if (this.config.persistMintPreimages === false) return;
+    if (!request) {
+      console.error(
+        `[autobiographical] no authoring request retained for accepted mint ${requestHash} — ` +
+          'provenance stays verifiable but unreadable',
+      );
+      return;
+    }
+    persistMintRequestPreimage(ctx.store, request, requestHash);
+  }
+
+  /**
    * Compress a raw message chunk into an L1 summary using self-voice framing.
    * No system prompt — framing via message structure only.
    */
@@ -5261,6 +5286,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
     let inFlightError: unknown;
+    /**
+     * Attempt requests by their `requestHash`, so the ACCEPTED one can be
+     * persisted as a preimage once the disposition gate passes (refused
+     * attempts are not mints and are not stored). References only — every
+     * request here is already retained by `request`/`variants` for the life
+     * of this call — and deliberately NOT hung on the trace objects, which
+     * are JSON-serialized into the compression log.
+     */
+    const attemptRequestsByHash = new Map<string, NormalizedRequest>();
 
     try {
       const runAttempt = async (
@@ -5326,6 +5360,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           persisted: false,
         };
         attemptTraces.push(trace);
+        attemptRequestsByHash.set(trace.requestHash, attemptRequest);
         return response;
       };
 
@@ -5720,6 +5755,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       };
 
+      // Provenance the auditor can READ: store the accepted request under the
+      // hash the entry carries, before the entry itself lands.
+      if (successfulTrace) {
+        this.persistMintPreimage(
+          ctx,
+          attemptRequestsByHash.get(successfulTrace.requestHash),
+          successfulTrace.requestHash,
+        );
+      }
       this.pushSummary(entry);
       chunk.compressed = true;
       chunk.summaryId = entry.id;
@@ -6629,6 +6673,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
       };
       logNewSummaryId = newEntry.id;
+
+      // Provenance the auditor can READ: store the accepted request under the
+      // hash the entry carries, before the entry itself lands.
+      this.persistMintPreimage(ctx, dispatchRequest, requestHash);
 
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
