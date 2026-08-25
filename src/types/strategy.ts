@@ -475,6 +475,9 @@ export interface CompressionQuarantineStatus {
   keys: string[];
 }
 
+/** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
+export type RecallEnvelopeMode = 'none' | 'xml';
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -546,6 +549,46 @@ export interface AutobiographicalConfig {
   identityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
+
+  /**
+   * Structural delimiting for recall ANSWER content.
+   *
+   *  - `'none'` (default) — answers render exactly as they always have: the
+   *    Q-side label opens the memory and the turn boundary is the only thing
+   *    that closes it. Output is byte-identical to the pre-envelope render.
+   *  - `'xml'` — each answer's prose is fenced by
+   *    `<cm-recall id="…" level="…" span="…">` … `</cm-recall>`, so the end of
+   *    a recalled memory is marked as explicitly as its start (instances have
+   *    been observed reading past it into unrelated content). Attributes come
+   *    from the summary record; one the record cannot answer for is omitted.
+   *
+   * The envelope is a collision-tolerant delimiter convention, not parseable
+   * XML: answer text is model prose and is never entity-escaped.
+   *
+   * Q-side labels are identical under both modes.
+   *
+   * WHY THE DEFAULT IS OFF. Recall answers are built at one shared choke
+   * point, and the presented window is not its only consumer: the same
+   * enveloped answers are replayed into the recall ladders that PROMPT
+   * compression — the mint and merge requests that produce the next
+   * generation of summaries. Turning the envelope on therefore changes the
+   * summarizer's own inputs, not only what the agent reads. What that does to
+   * the summaries a model then writes — whether the tags are ignored, echoed
+   * into summary prose, or read as a format worth imitating — is UNMEASURED.
+   * The evidence behind this feature is that instances read past an
+   * unterminated memory; there is none either way on what enveloping does to
+   * minting, and default-off is deliberate for that reason rather than
+   * caution about the render. Before enabling it fleet-wide, turn it on
+   * against a mature store and read the summaries it MINTS, not merely the
+   * window it presents.
+   *
+   * Under `maxMessageTokens`, a capped answer is truncated as PROSE and
+   * enveloped afterwards, so opener and closer survive every cap; the tags
+   * themselves are not charged against that cap (they are priced in the
+   * recall-pair budget instead), so a cap smaller than the tag text still
+   * renders intact tags around the few characters it bought.
+   */
+  recallEnvelope?: RecallEnvelopeMode;
   /** Participant name for the summary (defaults to "Summary") */
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
@@ -686,7 +729,8 @@ export interface AutobiographicalConfig {
    * large enough to overflow the API window. Walks newest-first so
    * proximate context survives; the kept set is then re-sorted
    * chronologically. Each summary takes (its content tokens + 50 for
-   * the wrapping "[CM] Recall memory <id>." question).
+   * the wrapping "[CM] Recall memory <id>." question, plus that summary's
+   * envelope tags when `recallEnvelope` is on).
    *
    * Default 100000 — chosen so that even an L_n merge (which packs
    * recall + head + expanded target + instruction into one request)
@@ -1203,6 +1247,7 @@ Capture what matters:
 
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
+  recallEnvelope: 'none',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
   maxLiveImages: 6,

@@ -32,6 +32,7 @@ import { getSummaryParentId } from '../types/strategy.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -90,6 +91,16 @@ const COMPRESSION_MARKER =
   'System: You will soon form a new memory, get ready. ' +
   'The messages that follow are the slice of recent experience you are ' +
   'about to compress. After them, write the memory in your own voice.';
+
+/**
+ * The interstitial text between two summaries in the legacy combined recall
+ * answer (`positionedRecallPairs: false`). Hoisted out of
+ * `combinedRecallAnswerContent` because the shared-budget path must PRICE it
+ * before deciding whether the next summary can be admitted, and the tests that
+ * pin that arithmetic derive their caps from this same string: one source of
+ * truth for the separator's bytes, and therefore for its cost.
+ */
+export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
 /**
  * Retry-only line for tool_use compression rejections. Summarizer requests
@@ -2293,6 +2304,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Per-summary +50 token overhead accounts for the "[CM] Recall memory
    * <id>." question turn that wraps each recall body. Rough but defensive.
+   *
+   * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
+   * tags, so the estimate prices that summary's ACTUAL envelope string on top
+   * — attributes included, and zero when the envelope is off. A second magic
+   * constant would drift from the tag the moment either changed.
    */
   protected capRecallPairs(
     summariesChronological: SummaryEntry[],
@@ -2302,7 +2318,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let total = 0;
     for (let i = summariesChronological.length - 1; i >= 0; i--) {
       const s = summariesChronological[i]!;
-      const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50;
+      const envelopeText = recallEnvelopeAddedText(s, this.config.recallEnvelope);
+      const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50 +
+        this.estimateTokens([{ type: 'text', text: envelopeText }]);
       if (total + est > maxTokens) continue;
       kept.push(s);
       total += est;
@@ -7472,11 +7490,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 content: [{ type: 'text', text: summaryLabel }],
                 sourceRelation: 'derived',
               };
-              const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
               const answerEntry: ContextEntry = {
                 index: entries.length + 1,
                 participant: summaryParticipant,
-                content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+                content: this.summaryAnswerContentCapped(ancestor, msgCap),
                 sourceRelation: 'derived',
               };
               const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
@@ -7581,11 +7598,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content: [{ type: 'text', text: summaryLabel }],
           sourceRelation: 'derived',
         };
-        const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
           participant: summaryParticipant,
-          content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+          content: this.summaryAnswerContentCapped(ancestor, msgCap),
           sourceRelation: 'derived',
         };
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
@@ -8578,11 +8594,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content: [{ type: 'text', text: headerText }],
               sourceRelation: 'derived',
             };
-            const answerContent: ContentBlock[] = this.summaryAnswerContent(summary);
             const answerEntry: ContextEntry = {
               index: entries.length + 1,
               participant: summaryParticipant,
-              content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+              content: this.summaryAnswerContentCapped(summary, msgCap),
               sourceRelation: 'derived',
             };
             const pairTokens =
@@ -8659,15 +8674,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Per-summary blocks (verbatim reasoning + text when captured) are
           // concatenated with the legacy '---' separators as interstitial
           // text blocks — signed thinking must ride along here too.
-          const answerContent: ContentBlock[] = [];
-          selectedSummaries.forEach((s, idx) => {
-            if (idx > 0) answerContent.push({ type: 'text', text: '\n\n---\n\n' });
-            answerContent.push(...this.summaryAnswerContent(s));
-          });
           const answerEntry: ContextEntry = {
             index: entries.length + 1,
             participant: summaryParticipant,
-            content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
+            content: this.combinedRecallAnswerContent(selectedSummaries, msgCap),
             sourceRelation: 'derived',
           };
 
@@ -10037,12 +10047,114 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * text block from `content`.
    *
    * Returns a fresh array so callers can never mutate the stored entry.
+   *
+   * Every recall answer in the codebase is built here — presented context on
+   * both select paths, the mint/merge recall ladders, refusal-curve expansion
+   * — so the `recallEnvelope` delimiter is applied here too, once.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
+    return wrapRecallAnswerContent(
+      this.summaryAnswerProse(summary),
+      summary,
+      this.config.recallEnvelope,
+    );
+  }
+
+  /**
+   * The answer body BEFORE any envelope: verbatim `responseContent` when the
+   * entry carries it, else a plain text block from `content`. Split out of
+   * `summaryAnswerContent` so a capped render can truncate the prose and
+   * envelope the result, rather than truncating an already-enveloped body.
+   */
+  protected summaryAnswerProse(summary: SummaryEntry): ContentBlock[] {
     if (summary.responseContent && summary.responseContent.length > 0) {
       return [...summary.responseContent];
     }
     return [{ type: 'text', text: summary.content }];
+  }
+
+  /**
+   * `summaryAnswerContent` under a `maxMessageTokens` cap: the cap is spent on
+   * the PROSE, and the envelope is applied to what survives.
+   *
+   * Ordering is the whole point. Truncating an enveloped answer retains a
+   * prefix and appends the truncator's own marker, which drops the closing
+   * tag and — under a cap smaller than the opener — emits a half-written one:
+   * a delimiter convention that sometimes lies is worse than no convention,
+   * because the reader learns to distrust the tags that ARE intact. Wrapping
+   * last makes opener and closer survive every cap by construction.
+   *
+   * The envelope is therefore NOT charged against `maxMessageTokens`; a
+   * capped enveloped answer runs over the cap by its own tag text. That is
+   * the same soft-cap overshoot the truncator already takes for granted — it
+   * appends its `[truncated — original was N tokens]` marker AFTER spending
+   * the budget — and the envelope is priced where the accounting is load
+   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
+   * the render is opener + whatever prose the cap bought + marker + closer:
+   * never an empty envelope, never a torn one.
+   */
+  protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
+    const prose = this.summaryAnswerProse(summary);
+    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+    return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
+  }
+
+  /**
+   * The legacy combined recall answer (`positionedRecallPairs: false`): every
+   * selected summary concatenated into one assistant turn with `---`
+   * separators, under a single `maxMessageTokens` cap.
+   *
+   * With the envelope off this is the pre-existing expression, byte for byte:
+   * concatenate, then truncate the whole turn. Those bytes are a
+   * compatibility promise and the flat truncation is what produces them.
+   *
+   * With the envelope on the cap is spent summary by summary instead, each
+   * summary's prose truncated against what the earlier ones left and then
+   * enveloped intact. The emission shape matches the flat truncator's —
+   * whole summaries until the budget runs out, a truncation marker on the one
+   * that straddles it, nothing after — but a summary that would have been cut
+   * in half is dropped whole rather than emitted with a torn envelope.
+   *
+   * The drop-whole boundary sits at the SEPARATOR: a summary is admitted only
+   * when the remaining budget can pay for the separator in front of it AND buy
+   * at least one token of prose behind it. Deciding the other way round — the
+   * separator charged after the summary it precedes was already emitted —
+   * spends past the cap by the separator's own width plus whatever prose the
+   * exhausted budget still bought, which is how one shared cap stops being
+   * shared.
+   */
+  protected combinedRecallAnswerContent(
+    summaries: SummaryEntry[],
+    maxTokens: number,
+  ): ContentBlock[] {
+    if (this.config.recallEnvelope !== 'xml') {
+      const content: ContentBlock[] = [];
+      summaries.forEach((s, idx) => {
+        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+        content.push(...this.summaryAnswerContent(s));
+      });
+      return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
+    }
+
+    const content: ContentBlock[] = [];
+    const separatorCost = this.estimateTextOnlyTokens(
+      { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
+    );
+    let remainingTokens = maxTokens;
+    for (const [idx, s] of summaries.entries()) {
+      const separatorTokens = idx > 0 ? separatorCost : 0;
+      const proseBudget = remainingTokens - separatorTokens;
+      if (maxTokens > 0 && proseBudget <= 0) break;
+      const prose = this.summaryAnswerProse(s);
+      const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
+      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      if (maxTokens > 0) {
+        remainingTokens -=
+          this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
+      }
+    }
+    return content;
   }
 
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {

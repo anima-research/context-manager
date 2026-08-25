@@ -1,0 +1,236 @@
+{
+  "hierarchical": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L2-100]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-merged-level covering the first two turns"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-101]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-plain-prose"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "[Recall L1-102]"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-with-carriers"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "adaptive": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-1 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-2 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-3 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-4 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-5 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-memory-6 recollection of an earlier stretch"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-24. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-25. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-26. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-27. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-28. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "text": "zz-adaptive-turn-29. zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz ",
+          "type": "text"
+        }
+      ]
+    }
+  ]
+}
