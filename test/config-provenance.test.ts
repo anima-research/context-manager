@@ -22,7 +22,11 @@
  *  - a subclass's forced values are attributed to the subclass, not to the
  *    caller, and the report names the strategy the instance actually is;
  *  - default silence: with `logEffectiveConfig` unset, nothing is emitted; with
- *    it on, exactly one structured line carrying both maps.
+ *    it on, exactly one structured line carrying both maps;
+ *  - wire completeness: JSON drops a present-as-undefined key from `effective`,
+ *    so the line names those keys in `presentAsUndefined` and the report's own
+ *    invariant (provenance keys are exactly the effective keys plus the
+ *    present-as-undefined ones, disjointly) survives serialization.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -126,6 +130,7 @@ interface EffectiveConfigLogLine {
   strategy: string;
   effective: Record<string, unknown>;
   provenance: Record<string, string>;
+  presentAsUndefined: string[];
 }
 
 /** The library talks to stderr for several reasons; this test is about one of
@@ -450,6 +455,44 @@ describe('AutobiographicalStrategy: effective-config report', () => {
     assert.deepStrictEqual(
       Object.keys(report.provenance).sort(),
       Object.keys(report.effective).sort(),
+    );
+  });
+
+  it('names present-as-undefined keys on the wire, and keeps nulls as effective values', async () => {
+    const { reports } = await reportFromInitializing(
+      new AutobiographicalStrategy({
+        recentWindowTokens: undefined,
+        productionBudgetTokens: null as unknown as number,
+        logEffectiveConfig: true,
+      }),
+    );
+
+    assert.strictEqual(reports.length, 1);
+    const report = reports[0]!;
+
+    // Spread fidelity kept this key present-as-undefined in memory; JSON has no
+    // undefined, so `effective` cannot carry it and the third field must.
+    assert.strictEqual('recentWindowTokens' in report.effective, false);
+    assert.strictEqual(report.provenance.recentWindowTokens, 'caller');
+    assert.strictEqual(report.presentAsUndefined.includes('recentWindowTokens'), true);
+
+    // null IS a JSON value: it rides `effective` as itself and is not one of
+    // the dropped keys.
+    assert.strictEqual('productionBudgetTokens' in report.effective, true);
+    assert.strictEqual(report.effective.productionBudgetTokens, null);
+    assert.strictEqual(report.provenance.productionBudgetTokens, 'caller');
+    assert.strictEqual(report.presentAsUndefined.includes('productionBudgetTokens'), false);
+
+    // The invariant the emission site documents, checked over the whole line:
+    // provenance keys are exactly the effective keys plus the present-as-
+    // undefined ones, and those two sets are disjoint.
+    assert.deepStrictEqual(
+      Object.keys(report.provenance).sort(),
+      [...Object.keys(report.effective), ...report.presentAsUndefined].sort(),
+    );
+    assert.deepStrictEqual(
+      Object.keys(report.effective).filter((key) => report.presentAsUndefined.includes(key)),
+      [],
     );
   });
 

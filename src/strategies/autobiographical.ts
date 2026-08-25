@@ -1168,6 +1168,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `logEffectiveConfig`. Structured single line on stderr, the same door the
    * library's other structured diagnostics use.
    *
+   * THE LINE CARRIES THREE MAPS BECAUSE JSON HAS NO `undefined`. Spread
+   * fidelity keeps a caller's own `undefined` key present in the effective
+   * config (see ConfigResolutionSemantics), and `JSON.stringify` drops exactly
+   * those keys — so serializing `effective` alone would emit a report whose
+   * provenance names keys the effective map does not have. `presentAsUndefined`
+   * lists them instead, computed HERE from the resolved values rather than
+   * carried on EffectiveConfigReport, so the list cannot drift from the map it
+   * describes and needs no special case for a key an enforced or host layer
+   * supplied as undefined. Its invariant, over the emitted line:
+   *
+   *   keys(provenance) === keys(effective) ∪ presentAsUndefined, disjointly
+   *
+   * `null` is a JSON value and needs none of this: it rides `effective` as
+   * itself, with its own provenance, and is never present-as-undefined.
+   *
    * DEFERRED PAST CONSTRUCTION, and it has to be: `name` is a field
    * initializer, and a subclass's initializers run only AFTER the base
    * constructor returns, so a report emitted where the config resolves would
@@ -1181,11 +1196,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const report = this.unreportedEffectiveConfig;
     if (!report) return;
     this.unreportedEffectiveConfig = null;
+    const presentAsUndefined = Object.keys(report.effective).filter(
+      (key) => report.effective[key] === undefined,
+    );
     console.error(JSON.stringify({
       event: 'config:effective',
       strategy: this.name,
       effective: report.effective,
       provenance: report.provenance,
+      presentAsUndefined,
     }));
   }
   /**
