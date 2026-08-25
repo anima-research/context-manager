@@ -29,6 +29,7 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
+import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { MessageStore } from '../message-store.js';
@@ -880,6 +881,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   get maxMessageTokens(): number { return this.config.maxMessageTokens; }
 
   protected config: AutobiographicalConfig;
+  /**
+   * Which layer supplied each effective config key — 'library-default' or
+   * 'caller'. Keyed exactly as `config` is. Hosts that stack further layers of
+   * their own can produce the same map for the merged whole by running their
+   * layers through `resolveEffectiveConfig` directly.
+   */
+  readonly configProvenance: Record<string, string>;
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
@@ -1046,31 +1054,71 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _previewInFlight = false;
 
   constructor(config: AutobiographicalOptions = {}) {
-    this.config = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config };
-    // Hierarchical is on by default; set hierarchical: false to use legacy single-level
-    this.config.hierarchical ??= true;
-    if (this.config.hierarchical) {
-      this.config.mergeThreshold ??= 6;
-      this.config.summaryTargetTokens ??= 2000;
-      this.config.l3BudgetTokens ??= 30000;
-      this.config.l2BudgetTokens ??= 30000;
-      this.config.l1BudgetTokens ??= 30000;
+    const callerLayer: ConfigLayer = { source: 'caller', values: config as Record<string, unknown> };
+    const libraryDefaults: Record<string, unknown> = {
+      ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
+      // Hierarchical is on by default; set hierarchical: false to use legacy single-level
+      hierarchical: true,
+      // Compression-lane prompt caching (issue #37)
+      compressionCacheMarkers: true,
+      compressionCacheTtl: '1h',
+    };
+    // Two default blocks are gated on config that itself resolves through the
+    // layers, so resolve once to read the gates, extend the default layer, and
+    // resolve again. Same outcome as the `??=` chain this replaces — a default
+    // only stands where the caller supplied nothing (see resolveEffectiveConfig
+    // on why an explicit undefined/null counts as nothing) — but now every key
+    // lands through ONE site that records which layer won it.
+    const gates = resolveEffectiveConfig([
+      { source: 'library-default', values: libraryDefaults },
+      callerLayer,
+    ]).effective;
+    if (gates.hierarchical) {
+      libraryDefaults.mergeThreshold = 6;
+      libraryDefaults.summaryTargetTokens = 2000;
+      libraryDefaults.l3BudgetTokens = 30000;
+      libraryDefaults.l2BudgetTokens = 30000;
+      libraryDefaults.l1BudgetTokens = 30000;
     }
     // Adaptive-resolution defaults
-    if (this.config.adaptiveResolution) {
-      this.config.foldingStrategy ??= 'flat-profile';
-      this.config.compressionSlackRatio ??= 0.1;
-      this.config.speculativeProduction ??= true;
+    if (gates.adaptiveResolution) {
+      libraryDefaults.foldingStrategy = 'flat-profile';
+      libraryDefaults.compressionSlackRatio = 0.1;
+      libraryDefaults.speculativeProduction = true;
     }
-    // Compression-lane prompt caching (issue #37)
-    this.config.compressionCacheMarkers ??= true;
-    this.config.compressionCacheTtl ??= '1h';
+    const resolved = resolveEffectiveConfig([
+      { source: 'library-default', values: libraryDefaults },
+      callerLayer,
+    ]);
+    // The resolver is schema-agnostic by design, so it hands back an untyped
+    // bag; the library-default layer above supplies every non-optional key of
+    // AutobiographicalConfig, which is what makes this narrowing sound.
+    this.config = resolved.effective as unknown as AutobiographicalConfig;
+    this.configProvenance = resolved.provenance;
+    if (this.config.logEffectiveConfig) this.emitEffectiveConfigReport(resolved);
     // The solver committed to at construction. buildPicker compares the live
     // config against this on every compile: a runtime mutation (e.g. an
     // override merge carrying `foldingStrategy: undefined`) silently swaps
     // the solver — and with it the entire cache-stability policy — for that
     // compile. That drift must be LOUD (see [picker-config-drift]).
     this._constructedFoldingStrategy = this.config.foldingStrategy;
+  }
+
+  /**
+   * One-shot operator report of what configuration actually governs this
+   * strategy: every effective key with the layer that supplied it. Opt-in via
+   * `logEffectiveConfig`, and emitted from the constructor — that is where the
+   * config resolves, and it runs exactly once per instance. Structured single
+   * line on stderr, the same door the library's other structured diagnostics
+   * use.
+   */
+  private emitEffectiveConfigReport(report: EffectiveConfigReport): void {
+    console.error(JSON.stringify({
+      event: 'config:effective',
+      strategy: this.name,
+      effective: report.effective,
+      provenance: report.provenance,
+    }));
   }
   /**
    * Explicit operator escape hatch. A retry remains canonical-first; clearing

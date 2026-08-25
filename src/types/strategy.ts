@@ -894,6 +894,15 @@ export interface AutobiographicalConfig {
    * positive; no effect unless lower than the live compile budget.
    */
   productionBudgetTokens?: number;
+
+  /**
+   * Emit a one-shot effective-config report at construction: one structured
+   * line on stderr (`event: 'config:effective'`) carrying every resolved key
+   * with the layer that supplied it — 'library-default' or 'caller'. Default
+   * false; nothing is emitted unless this is explicitly on. The same map is
+   * always available programmatically as `strategy.configProvenance`.
+   */
+  logEffectiveConfig?: boolean;
 }
 
 /**
