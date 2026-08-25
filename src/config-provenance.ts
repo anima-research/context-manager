@@ -29,34 +29,51 @@ export interface EffectiveConfigReport {
 }
 
 /**
- * Collapse ordered layers (base first) into effective values plus the source
- * that won each key. The LAST layer supplying a value for a key wins.
+ * What a layer supplying `undefined` or `null` for a key MEANS. The two live
+ * merge idioms in this codebase disagree about it, they are not
+ * interchangeable, and picking one silently is how a "pure refactor" changes
+ * behavior — so every call states which one it is asking for.
  *
- * NULL-VS-UNDEFINED — this matches the live coalescing semantics of the
- * codebase rather than raw object spread, and the two differ:
- *
- *  - Every `??` / `??=` default site in the library (`summaryTargetTokens ?? 2000`,
- *    `this.config.mergeThreshold ??= 6`, ...) is nullish-coalescing, so `null`
- *    and `undefined` are treated identically: both mean "not supplied", and the
- *    lower layer's value stands.
- *  - `previewContext` states the same rule explicitly for its override merge,
+ *  - `'skip-nullish'` — the `??` / `??=` reading, and the general host-facing
+ *    one. Every default site in the library (`summaryTargetTokens ?? 2000`,
+ *    `this.config.mergeThreshold ??= 6`, ...) is nullish-coalescing, and
+ *    `previewContext` states the same rule explicitly for its override merge,
  *    dropping `undefined` and `null` entries BEFORE spreading because a spread
- *    with `foldingStrategy: undefined` erases the live key: "Absence is the only
- *    way to mean 'keep the live value'."
+ *    with `foldingStrategy: undefined` erases the live key: "Absence is the
+ *    only way to mean 'keep the live value'." So a layer supplying either does
+ *    not win a key and does not steal a lower layer's win, and a key no layer
+ *    supplies non-nullishly is absent from both maps — never
+ *    present-as-undefined.
  *
- * So a layer supplying `undefined` or `null` for a key does not win it and does
- * not steal a lower layer's win. A key no layer supplies non-nullishly is absent
- * from both maps — never present-as-undefined.
+ *  - `'spread-fidelity'` — the `{ ...defaults, ...caller }` reading. A layer's
+ *    OWN keys win, nullish included, exactly as object spread assigns them:
+ *    `{ recentWindowTokens: undefined }` erases the default and leaves the key
+ *    present-as-undefined. This is what `AutobiographicalStrategy`'s
+ *    constructor did before it resolved through this module, and it is what it
+ *    still asks for, so that wiring the resolver in changed no effective value
+ *    for any caller.
+ */
+export type ConfigResolutionSemantics = 'skip-nullish' | 'spread-fidelity';
+
+/**
+ * Collapse ordered layers (base first) into effective values plus the source
+ * that won each key. The LAST layer supplying a value for a key wins, where
+ * "supplying" is what `semantics` says it is — see ConfigResolutionSemantics,
+ * and state the mode deliberately: the two readings differ for exactly the
+ * inputs that are easiest to leave untested.
  *
  * Only own enumerable properties are read, and values are copied by reference:
  * the report shares object/array values with its layers rather than cloning.
  */
-export function resolveEffectiveConfig(layers: ConfigLayer[]): EffectiveConfigReport {
+export function resolveEffectiveConfig(
+  layers: ConfigLayer[],
+  semantics: ConfigResolutionSemantics,
+): EffectiveConfigReport {
   const effective: Record<string, unknown> = {};
   const provenance: Record<string, string> = {};
   for (const layer of layers) {
     for (const [key, value] of Object.entries(layer.values)) {
-      if (value === undefined || value === null) continue;
+      if (semantics === 'skip-nullish' && (value === undefined || value === null)) continue;
       effective[key] = value;
       provenance[key] = layer.source;
     }

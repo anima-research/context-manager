@@ -867,6 +867,54 @@ function captureResponseContent(content: ContentBlock[]): ContentBlock[] | undef
 }
 
 /**
+ * The constructor's conditional `??=` default blocks, expressed as the values
+ * they would fill in. Gated exactly as they were when they ran as statements:
+ * `hierarchical` defaults to true before it is read as a gate, and
+ * `adaptiveResolution` is read as the caller left it.
+ */
+function conditionalLibraryDefaults(supplied: Record<string, unknown>): Record<string, unknown> {
+  const defaults: Record<string, unknown> = {
+    // Hierarchical is on by default; set hierarchical: false to use legacy single-level
+    hierarchical: true,
+  };
+  if (supplied.hierarchical ?? true) {
+    defaults.mergeThreshold = 6;
+    defaults.summaryTargetTokens = 2000;
+    defaults.l3BudgetTokens = 30000;
+    defaults.l2BudgetTokens = 30000;
+    defaults.l1BudgetTokens = 30000;
+  }
+  // Adaptive-resolution defaults
+  if (supplied.adaptiveResolution) {
+    defaults.foldingStrategy = 'flat-profile';
+    defaults.compressionSlackRatio = 0.1;
+    defaults.speculativeProduction = true;
+  }
+  // Compression-lane prompt caching (issue #37)
+  defaults.compressionCacheMarkers = true;
+  defaults.compressionCacheTtl = '1h';
+  return defaults;
+}
+
+/**
+ * The `??=` half of those blocks: a default only fills a key the layers left
+ * nullish. Narrowing the layer to those keys is what keeps `??=` semantics
+ * available inside a spread-fidelity resolve, where a top layer would
+ * otherwise overwrite a value the caller did supply.
+ */
+function defaultsForKeysLeftNullish(
+  supplied: Record<string, unknown>,
+  defaults: Record<string, unknown>,
+): Record<string, unknown> {
+  const fills: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(defaults)) {
+    const current = supplied[key];
+    if (current === undefined || current === null) fills[key] = value;
+  }
+  return fills;
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -888,6 +936,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * layers through `resolveEffectiveConfig` directly.
    */
   readonly configProvenance: Record<string, string>;
+  /** The effective-config report this instance still owes stderr, or null once
+   *  it has been emitted — or immediately, when `logEffectiveConfig` is off.
+   *  See reportEffectiveConfigOnce for why the emission waits. */
+  private unreportedEffectiveConfig: EffectiveConfigReport | null;
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
@@ -1054,48 +1106,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _previewInFlight = false;
 
   constructor(config: AutobiographicalOptions = {}) {
-    const callerLayer: ConfigLayer = { source: 'caller', values: config as Record<string, unknown> };
-    const libraryDefaults: Record<string, unknown> = {
-      ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
-      // Hierarchical is on by default; set hierarchical: false to use legacy single-level
-      hierarchical: true,
-      // Compression-lane prompt caching (issue #37)
-      compressionCacheMarkers: true,
-      compressionCacheTtl: '1h',
-    };
-    // Two default blocks are gated on config that itself resolves through the
-    // layers, so resolve once to read the gates, extend the default layer, and
-    // resolve again. Same outcome as the `??=` chain this replaces — a default
-    // only stands where the caller supplied nothing (see resolveEffectiveConfig
-    // on why an explicit undefined/null counts as nothing) — but now every key
-    // lands through ONE site that records which layer won it.
-    const gates = resolveEffectiveConfig([
-      { source: 'library-default', values: libraryDefaults },
-      callerLayer,
-    ]).effective;
-    if (gates.hierarchical) {
-      libraryDefaults.mergeThreshold = 6;
-      libraryDefaults.summaryTargetTokens = 2000;
-      libraryDefaults.l3BudgetTokens = 30000;
-      libraryDefaults.l2BudgetTokens = 30000;
-      libraryDefaults.l1BudgetTokens = 30000;
-    }
-    // Adaptive-resolution defaults
-    if (gates.adaptiveResolution) {
-      libraryDefaults.foldingStrategy = 'flat-profile';
-      libraryDefaults.compressionSlackRatio = 0.1;
-      libraryDefaults.speculativeProduction = true;
-    }
-    const resolved = resolveEffectiveConfig([
-      { source: 'library-default', values: libraryDefaults },
-      callerLayer,
-    ]);
+    const suppliedLayers: ConfigLayer[] = [
+      { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
+      { source: 'caller', values: config as Record<string, unknown> },
+    ];
+    // A subclass that forces values gets its OWN layer above the caller, so the
+    // provenance map never attributes a library-enforced value to the host that
+    // did not ask for it (KnowledgeStrategy's `hierarchical`).
+    const enforcedLayer = this.enforcedConfigLayer();
+    if (enforcedLayer) suppliedLayers.push(enforcedLayer);
+    // SPREAD FIDELITY, deliberately. This resolve reproduces the constructor's
+    // historical `{ ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config }` key for
+    // key — a caller key explicitly set to `undefined` or `null` erases the
+    // default and stays present, exactly as the spread left it — so resolving
+    // through the layers changed no effective value for any caller. The
+    // host-facing `'skip-nullish'` reading is a different function of the same
+    // inputs (see ConfigResolutionSemantics); it is not what this wiring means.
+    const supplied = resolveEffectiveConfig(suppliedLayers, 'spread-fidelity');
+    const resolved = resolveEffectiveConfig(
+      [
+        ...suppliedLayers,
+        {
+          source: 'library-default',
+          values: defaultsForKeysLeftNullish(supplied.effective, conditionalLibraryDefaults(supplied.effective)),
+        },
+      ],
+      'spread-fidelity',
+    );
     // The resolver is schema-agnostic by design, so it hands back an untyped
-    // bag; the library-default layer above supplies every non-optional key of
-    // AutobiographicalConfig, which is what makes this narrowing sound.
+    // bag; the library-default layers above supply every non-optional key of
+    // AutobiographicalConfig that the caller did not itself override, which is
+    // what makes this narrowing as sound as the spread it replaces.
     this.config = resolved.effective as unknown as AutobiographicalConfig;
     this.configProvenance = resolved.provenance;
-    if (this.config.logEffectiveConfig) this.emitEffectiveConfigReport(resolved);
+    this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
     // The solver committed to at construction. buildPicker compares the live
     // config against this on every compile: a runtime mutation (e.g. an
     // override merge carrying `foldingStrategy: undefined`) silently swaps
@@ -1105,14 +1149,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Config this class forces regardless of what the caller passed, as its own
+   * named layer above 'caller'. Base classes force nothing; a subclass whose
+   * construction overrides caller input declares it here instead of smuggling
+   * the value through the caller's own layer, where the provenance map would
+   * report the host as its source.
+   *
+   * Called from the base constructor, so an override must be a pure prototype
+   * method: it runs BEFORE the subclass's own field initializers.
+   */
+  protected enforcedConfigLayer(): ConfigLayer | null {
+    return null;
+  }
+
+  /**
    * One-shot operator report of what configuration actually governs this
    * strategy: every effective key with the layer that supplied it. Opt-in via
-   * `logEffectiveConfig`, and emitted from the constructor — that is where the
-   * config resolves, and it runs exactly once per instance. Structured single
-   * line on stderr, the same door the library's other structured diagnostics
-   * use.
+   * `logEffectiveConfig`. Structured single line on stderr, the same door the
+   * library's other structured diagnostics use.
+   *
+   * DEFERRED PAST CONSTRUCTION, and it has to be: `name` is a field
+   * initializer, and a subclass's initializers run only AFTER the base
+   * constructor returns, so a report emitted where the config resolves would
+   * label every KnowledgeStrategy instance 'autobiographical'. Emitting on
+   * first use instead costs nothing an operator can observe — `initialize` is
+   * the one gate every real use passes, since every other entrypoint throws
+   * until a branch is loaded — and it needs no cooperation from subclasses,
+   * which a post-construction hook would.
    */
-  private emitEffectiveConfigReport(report: EffectiveConfigReport): void {
+  private reportEffectiveConfigOnce(): void {
+    const report = this.unreportedEffectiveConfig;
+    if (!report) return;
+    this.unreportedEffectiveConfig = null;
     console.error(JSON.stringify({
       event: 'config:effective',
       strategy: this.name,
@@ -1453,6 +1521,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
+    // First use of the fully-constructed instance: the deferred effective-config
+    // report is emitted here so it can name the real strategy (see
+    // reportEffectiveConfigOnce).
+    this.reportEffectiveConfigOnce();
     // Invalidate the committed identity before touching any branch-scoped
     // mirror. A stale caller must fail closed for the entire initialization
     // interval, not continue using the previously loaded branch.

@@ -20,7 +20,7 @@ export { KnowledgeStrategy } from './strategies/knowledge.js';
 // Utilities
 export { splitMixedToolMessages, stripUnpairedToolBlocks } from './normalize-tool-messages.js';
 export { resolveEffectiveConfig } from './config-provenance.js';
-export type { ConfigLayer, EffectiveConfigReport } from './config-provenance.js';
+export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } from './config-provenance.js';
 
 // Types
 export type {
