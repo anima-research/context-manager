@@ -29,6 +29,22 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ### Added
 
+- `ContextManager.setSystemPrompt(text)` threads the host's live system prompt
+  into memory-minting LLM requests — both L1 chunk compression and level
+  merges — as the request's `system` field, ahead of the identity head, the
+  same layout a live activation uses. The mint prompt reconstructs the agent's
+  own past view (same head, same recall ladder, same tool definitions), and on
+  hosts whose identity and conduct live in system voice the system prompt is
+  part of that view; without it, memories were authored by a system-promptless
+  variant of the agent and merges re-summarized those summaries upward. The
+  hook mirrors `setToolDefinitions`: hosts push on every activation, an empty
+  or `undefined` push never downgrades the recorded value. Opt-in — with the
+  setter never called, mint requests keep their exact previous shape, carrying
+  no `system` key at all, so canonical request hashes and compression
+  quarantine identities are unchanged. Hosts that do set it also give a
+  marker-less mint (first mint, capped ladder, markers off) a cache breakpoint
+  on the system block via membrane's existing no-message-breakpoint fallback,
+  which previously had nowhere to land on this lane.
 - Compression and merge requests now carry prompt-cache breakpoints at their
   stability strata — end of head window, last level≥2 recall pair, last
   recall pair — with a 1h cache TTL (#37). The mint lane previously sent its

@@ -5087,14 +5087,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // NO system prompt. The agent's identity is established by the head
-    // (the actual conversation opening — user message + agent reply that
-    // grounded the original instance). A system prompt would (a) add a
-    // synthetic header the original instance never saw, disturbing KV
-    // consistency between the summarizer and the original instance, and
-    // (b) provide an alternative identity source that competes with the
-    // structural one carried by the conversation itself. Anchoring
-    // identity by the chronicle's actual head is more honest.
+    // The HOST's system prompt, or none — never a synthetic one. With no
+    // host prompt declared (ctx.systemPrompt undefined) the request carries
+    // no system field at all: the agent's identity is established by the
+    // head (the actual conversation opening — user message + agent reply
+    // that grounded the original instance), and a summarizer-only header
+    // would (a) add a synthetic header the original instance never saw,
+    // disturbing KV consistency between the summarizer and the original
+    // instance, and (b) provide an alternative identity source that competes
+    // with the structural one carried by the conversation itself. Both
+    // objections invert when the host DOES serve a system prompt on every
+    // activation: the original instance saw it, so replaying it is the
+    // KV-honest reconstruction and omitting it is what installs a competing
+    // (system-promptless) identity. See ContextManager.setSystemPrompt.
     // Own the byte wall here rather than delegating to membrane's shed: cap
     // the prompt's inline image bytes newest-first before the request is built.
     // A tighter budget than the live window's: a compression prompt also
@@ -5119,6 +5124,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
 
     const request: NormalizedRequest = {
+      // Served FIRST, ahead of the head — the live activation's own layout
+      // (system prompt -> head -> middle). Conditionally spread rather than
+      // assigned: an undeclared prompt must leave the request shape, its
+      // canonical hash and its quarantine identity byte-identical to what
+      // they were before this field existed.
+      ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
       // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
       // raw history that can carry more inline image bytes than the API's
       // request cap. Dropping the OLDEST images from the summarizer's view is
@@ -5768,7 +5779,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       logCompressionCall({
         operation: 'compress_l1',
-        system: null,
+        // Null when the request carried no system field, so the pre-threading
+        // log shape is preserved exactly; summarized (not verbatim) when it
+        // did, matching how `messages` is logged.
+        system: ctx.systemPrompt ? summarizeTelemetryText(ctx.systemPrompt) : null,
         messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
@@ -6451,10 +6465,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptPriorSummaries.length < priorSummariesAll.length,
     );
 
-    // NO system prompt — identity is established by the head window
-    // (present at the start of llmMessages above) and by the prior
-    // recall pairs. Same rationale as compressChunkHierarchical.
+    // The HOST's system prompt, or none — same rationale as
+    // compressChunkHierarchical. Undeclared, identity is established by the
+    // head window (present at the start of llmMessages above) and by the
+    // prior recall pairs. Declared, it is part of the instance this merge
+    // reconstructs — and a merge re-summarizes summaries, so an omission
+    // here compounds upward through every level of the pyramid.
     const request: NormalizedRequest = {
+      // Served FIRST, ahead of the head — the live activation's own layout
+      // (system prompt -> head -> middle). Conditionally spread rather than
+      // assigned: an undeclared prompt must leave the request shape and its
+      // request hash byte-identical to what they were before this field
+      // existed.
+      ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
       // EXPLICIT image-loss opt-in (2026-07-12): summarizer prompts replay
       // raw history that can carry more inline image bytes than the API's
       // request cap. Dropping the OLDEST images from the summarizer's view is
@@ -6654,7 +6677,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       logCompressionCall({
         operation: `merge_l${targetLevel}`,
-        system: null,
+        // See the twin note at the compress_l1 site.
+        system: ctx.systemPrompt ? summarizeTelemetryText(ctx.systemPrompt) : null,
         messages: summarizeTelemetryMessages(cleaned),
         metadata: {
           target_level: targetLevel,

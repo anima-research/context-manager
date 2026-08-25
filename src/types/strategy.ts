@@ -60,6 +60,19 @@ export interface StrategyContext {
    * refused. Optional because ticks can fire before the first activation.
    */
   tools?: ToolDefinition[];
+  /**
+   * The agent's live system prompt, as last supplied by the host (set on
+   * every activation via ContextManager.setSystemPrompt). Memory-writing
+   * requests serve it as their own system prompt: a memory is authored by an
+   * instance reconstructed as-of the original context, and on hosts whose
+   * identity and conduct live in system voice that prompt is part of the
+   * instance being reconstructed — a summarizer that never sees it is a
+   * different agent from the one whose memory it writes, and merges
+   * re-summarize summaries, so the drift compounds upward. Optional and
+   * opt-in: undefined leaves every mint request byte-identical to the
+   * no-system-prompt shape it has always had.
+   */
+  systemPrompt?: string;
   /** Read-only view of context log */
   contextLog: ContextLogView;
   /** Membrane instance for LLM calls (compression) */
