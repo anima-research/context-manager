@@ -680,6 +680,42 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * Residence-scoped direct source-only L1 compression (2026-08-25).
+   *
+   * When true, an L1 compression request contains ONLY the in-band
+   * compression marker, the exact target chunk (raw), and the write-memory
+   * directive — the head window, the prior recall pairs, and any non-target
+   * raw recent-window material are all omitted. This is ONE direct call, not a
+   * canonical→refusal→fallback escalation.
+   *
+   * Motivation (Mythos 2026-08-25): L1 compression was refused by the Fable
+   * safety classifier when the request compiled the raw recent-window room
+   * traffic alongside one target chunk. On a copied store the failing
+   * contribution was localized to the raw recent-window block as a class in
+   * that exact request: recall pairs, the tool manifest, the head window, and
+   * the target chunk were each ruled out individually, and two 4-message
+   * subsets of the raw-recent block (the incident thread and a size/role-
+   * matched control) were each insufficient to clear the refusal, while
+   * removing the whole block did. This does NOT establish that the carrier is
+   * a diffuse "cumulative mass" or that no smaller subset is load-bearing —
+   * only that the raw-recent block as a class carries it here. Handing the
+   * summarizer only the thing it is summarizing is the correct scope; the
+   * copied drain cleared all quarantined chunks first-try and the summaries
+   * passed a full fidelity audit.
+   *
+   * Source-preserving: no message, summary, or chunk is edited; only the
+   * provider-facing request is scoped. The marker/target/directive are emitted
+   * structurally (sections 4–6 of the builder), never matched by substring.
+   * Tools are still declared (`ctx.tools`): a summarizer replaying
+   * tool_use/tool_result history with no tools param is a deterministic
+   * reasoning_extraction refusal (labclaude 2026-07-09). Affects L1 only;
+   * executeMerge and generateTransitionSummary are unchanged.
+   *
+   * Default undefined/false — every other resident is unaffected.
+   */
+  compressionSourceOnly?: boolean;
+
+  /**
    * Maximum number of same-model recall-curve variants attempted after an L1
    * canonical request is explicitly refused. Each variant expands exactly one
    * already-authored frontier summary into its persisted direct children.
