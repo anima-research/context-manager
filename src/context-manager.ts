@@ -919,11 +919,17 @@ export class ContextManager {
   private systemPrompt?: string;
 
   /**
-   * Host hook: record the agent's current system prompt (see above). A memory
-   * is authored by an instance reconstructed as-of the original context, and
-   * on hosts whose identity and conduct live in system voice that prompt is
-   * part of the instance being reconstructed. Never called, or called only
-   * with an empty value, leaves mint requests in their no-system-prompt shape.
+   * Host hook: record the agent's current system prompt (see above). Only the
+   * LATEST value is retained — this is a single slot, not a per-message
+   * history — so a mint is served the identity policy in force AT MINT TIME.
+   * That equals what the original instance was served exactly insofar as the
+   * host keeps the prompt stable across the span being compressed; where it
+   * has changed, the memory is authored under the current policy and the
+   * older text is not recoverable from here. On hosts whose identity and
+   * conduct live in system voice, serving it at all is what keeps the
+   * summarizer the same agent as the one whose memory it writes. Never
+   * called, or called only with an empty value, leaves mint requests in
+   * their no-system-prompt shape.
    */
   setSystemPrompt(text: string | undefined): void {
     if (text && text.length > 0) this.systemPrompt = text;
