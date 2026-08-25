@@ -66,7 +66,7 @@ function blockTypes(req: NormalizedRequest): Set<string> {
   const s = new Set<string>(); for (const m of req.messages) for (const b of m.content) s.add(b.type); return s;
 }
 
-interface Opts { sourceOnly?: boolean; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; }
+interface Opts { sourceOnly?: boolean; mergeSourceOnly?: boolean; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; }
 
 async function build(membrane: unknown, opts: Opts = {}) {
   const strategy = new ProbeStrategy({
@@ -79,6 +79,7 @@ async function build(membrane: unknown, opts: Opts = {}) {
     mergeThreshold: 99,
     compressionRefusalCurveFallbacks: 3,
     compressionSourceOnly: opts.sourceOnly,
+    compressionMergeSourceOnly: opts.mergeSourceOnly,
   } as never);
   const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
   if (opts.tools) manager.setToolDefinitions(opts.tools);
@@ -187,5 +188,47 @@ describe('source-only L1 compression', () => {
     const on = await mergeReq(true);
     const off = await mergeReq(false);
     assert.equal(JSON.stringify(on), JSON.stringify(off), 'merge request identical regardless of compressionSourceOnly');
+  });
+});
+
+
+describe('source-only hierarchical merge', () => {
+  after(cleanup);
+
+  async function mergeRequest(mergeSourceOnly: boolean, tools: ToolDefinition[] = []): Promise<NormalizedRequest> {
+    const { calls, membrane } = capturingMembrane('end_turn');
+    const fx = await build(membrane, { sourceOnly: false, mergeSourceOnly, tools });
+    fx.strategy.seed(summary('L1-200', fx.ids[4]!, fx.ids[5]!, [fx.ids[4]!, fx.ids[5]!]));
+    fx.strategy.seed(summary('L1-201', fx.ids[6]!, fx.ids[7]!, [fx.ids[6]!, fx.ids[7]!]));
+    await fx.strategy.runMerge(2, ['L1-200', 'L1-201'], managerContext(fx.manager));
+    assert.equal(calls.length, 1);
+    return calls[0]!;
+  }
+
+  it('DISCRIMINATOR: merge source-only keeps exact target + directive + tools, omits unrelated autobiography', async () => {
+    const tools: ToolDefinition[] = [{ name: 'demo', description: 'd', inputSchema: { type: 'object', properties: {} } } as never];
+    const req = await mergeRequest(true, tools);
+    assert.ok(Array.isArray(req.tools) && req.tools.length === 1, 'live tool catalog retained');
+    for (const id of ['raw-4 ', 'raw-5 ', 'raw-6 ', 'raw-7 ']) {
+      assert.ok(texts(req).some((t) => t.includes(id)), `target ${id} present`);
+    }
+    assert.ok(!texts(req).some((t) => t.includes('raw-2 ')), 'unrelated head absent');
+    assert.ok(!texts(req).some((t) => t.includes('raw-8 ')), 'unrelated raw middle/tail absent');
+    assert.deepEqual(recallIds(req), [], 'no unrelated prior recalls in L2 raw expansion');
+    assert.ok(texts(req).some((t) => t.includes('Attribution discipline: preserve who made each claim.')), 'attribution guard present');
+  });
+
+  it('LOAD-BEARING: default merge path still contains autobiographical prefix and no attribution guard', async () => {
+    const req = await mergeRequest(false);
+    assert.ok(texts(req).some((t) => t.includes('raw-2 ')) || recallIds(req).length > 0, 'ordinary merge prefix retained');
+    assert.ok(!texts(req).some((t) => t.includes('Attribution discipline: preserve who made each claim.')), 'ordinary merge bytes unchanged');
+  });
+
+  it('INVARIANT: primary compile is byte-identical with merge source-only on vs off', async () => {
+    const a = await build(capturingMembrane().membrane, { mergeSourceOnly: true });
+    const b = await build(capturingMembrane().membrane, { mergeSourceOnly: false });
+    const reqA = await a.manager.compile({ maxTokens: 200_000, reserveForResponse: 16_000 });
+    const reqB = await b.manager.compile({ maxTokens: 200_000, reserveForResponse: 16_000 });
+    assert.equal(JSON.stringify(reqA.messages), JSON.stringify(reqB.messages));
   });
 });

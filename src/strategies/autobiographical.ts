@@ -5958,6 +5958,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
+    // Residence-scoped copied-treatment candidate: merge requests can omit
+    // unrelated autobiographical prefix/recent context while preserving the
+    // exact target expansion, directive and live tool catalog. Default off.
+    const mergeSourceOnly = this.config.compressionMergeSourceOnly === true;
 
     // Build the merge prompt with one-level-deeper target expansion +
     // prefix of older context:
@@ -6074,7 +6078,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
     let headCoveredSkipped = 0;
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+    for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
       if (priorSummaryMessageIds.has(m.id) || sourceLeafIds.has(m.id)) {
         headCoveredSkipped++;
@@ -6111,8 +6115,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue-driven path.
     const mergeAttempts =
       this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
-    const configuredRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
-    const mergeRecallBudget = Math.max(
+    const configuredRecallBudget = mergeSourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+    const mergeRecallBudget = mergeSourceOnly ? 0 : Math.max(
       8_000,
       Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
     );
@@ -6161,7 +6165,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.
     // Usually empty (chunking is contiguous).
-    if (mergeStartIdx >= 0) {
+    if (mergeStartIdx >= 0 && !mergeSourceOnly) {
       for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
@@ -6296,6 +6300,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    if (mergeSourceOnly) {
+      mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
+    }
     // Retry-only no-tools line. The summarizer request declares the agent's
     // live tools (classifier requirement, see `tools: ctx.tools` below), and
     // a model whose recent spans are tool-heavy can answer the merge prompt

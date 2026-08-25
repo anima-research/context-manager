@@ -716,6 +716,28 @@ export interface AutobiographicalConfig {
   compressionSourceOnly?: boolean;
 
   /**
+   * Residence-scoped source-only hierarchical merge requests (2026-08-25).
+   *
+   * When true, L2+ merge requests omit the unrelated autobiographical head,
+   * prior-recall frontier, and uncovered raw middle. They retain the exact
+   * merge target expanded one level deeper, the merge directive, signed
+   * summary carriers inside that target, and the live tool catalog. The
+   * directive adds explicit attribution discipline so another participant's
+   * diagnosis, promise, operational status, or forecast is not silently
+   * adopted as the resident's own fact. Source records and existing summaries
+   * remain unchanged; only the request scope changes.
+   *
+   * Motivation (Mythos 2026-08-25): source-only L1 compression succeeded,
+   * but ordinary merge requests still refused and quarantined. The unmerged
+   * L1 frontier crossed maxSpeculativeL1s, which blocked further L1 production
+   * while raw debt grew. Exact copied L2 and L3 target-only requests completed;
+   * an attribution control caught and corrected a borrowed-status failure.
+   *
+   * Default undefined/false — ordinary merge bytes remain unchanged.
+   */
+  compressionMergeSourceOnly?: boolean;
+
+  /**
    * Maximum number of same-model recall-curve variants attempted after an L1
    * canonical request is explicitly refused. Each variant expands exactly one
    * already-authored frontier summary into its persisted direct children.
