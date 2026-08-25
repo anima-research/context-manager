@@ -11,6 +11,11 @@ export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWin
 export { concatBodyGroups } from './adaptive/render.js';
 export { ContextLog } from './context-log.js';
 export { BlobManager } from './blob-manager.js';
+export {
+  persistMintRequestPreimage,
+  getMintRequestPreimageBytes,
+  getMintRequestByHash,
+} from './mint-preimage.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
