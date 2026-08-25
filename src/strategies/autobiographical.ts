@@ -91,6 +91,16 @@ const COMPRESSION_MARKER =
   'about to compress. After them, write the memory in your own voice.';
 
 /**
+ * The interstitial text between two summaries in the legacy combined recall
+ * answer (`positionedRecallPairs: false`). Hoisted out of
+ * `combinedRecallAnswerContent` because the shared-budget path must PRICE it
+ * before deciding whether the next summary can be admitted, and the tests that
+ * pin that arithmetic derive their caps from this same string: one source of
+ * truth for the separator's bytes, and therefore for its cost.
+ */
+export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
+
+/**
  * Retry-only line for tool_use compression rejections. Summarizer requests
  * declare the agent's live tools (the labclaude reasoning_extraction
  * requirement), so a think-first model can answer a mint prompt on-pattern —
@@ -9811,35 +9821,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * whole summaries until the budget runs out, a truncation marker on the one
    * that straddles it, nothing after — but a summary that would have been cut
    * in half is dropped whole rather than emitted with a torn envelope.
+   *
+   * The drop-whole boundary sits at the SEPARATOR: a summary is admitted only
+   * when the remaining budget can pay for the separator in front of it AND buy
+   * at least one token of prose behind it. Deciding the other way round — the
+   * separator charged after the summary it precedes was already emitted —
+   * spends past the cap by the separator's own width plus whatever prose the
+   * exhausted budget still bought, which is how one shared cap stops being
+   * shared.
    */
   protected combinedRecallAnswerContent(
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
-    const separatorText = '\n\n---\n\n';
     if (this.config.recallEnvelope !== 'xml') {
       const content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content.push({ type: 'text', text: separatorText });
+        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
         content.push(...this.summaryAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
 
     const content: ContentBlock[] = [];
+    const separatorCost = this.estimateTextOnlyTokens(
+      { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
+    );
     let remainingTokens = maxTokens;
-    summaries.forEach((s, idx) => {
-      if (maxTokens > 0 && remainingTokens <= 0) return;
+    for (const [idx, s] of summaries.entries()) {
+      const separatorTokens = idx > 0 ? separatorCost : 0;
+      const proseBudget = remainingTokens - separatorTokens;
+      if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.summaryAnswerProse(s);
-      const capped = maxTokens > 0 ? this.truncateContent(prose, remainingTokens) : prose;
-      if (idx > 0) content.push({ type: 'text', text: separatorText });
+      const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
+      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       if (maxTokens > 0) {
-        const separatorTokens = idx > 0 ? Math.ceil(separatorText.length / 4) : 0;
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
       }
-    });
+    }
     return content;
   }
 

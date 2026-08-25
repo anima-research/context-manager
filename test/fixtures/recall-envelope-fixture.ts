@@ -102,6 +102,17 @@ async function withTempStore<T>(run: (path: string) => Promise<T>): Promise<T> {
 export const HIERARCHICAL_FIXTURE_SUMMARY_IDS = ['L2-100', 'L1-101', 'L1-102'] as const;
 
 /**
+ * The prose of the first two recall answers the hierarchical fixture renders,
+ * in render order. Hoisted because the combined-path budget cases price these
+ * exact strings through the production estimator to DERIVE their caps: a cap
+ * written as a literal would silently stop landing where it means to the first
+ * time this prose is edited.
+ */
+export const HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE =
+  'zz-memory-merged-level covering the first two turns';
+export const HIERARCHICAL_FIXTURE_PLAIN_PROSE = 'zz-memory-plain-prose';
+
+/**
  * Render the default (`selectHierarchical`) path over a fixed set of seeded
  * summaries: an L2 merged from two L1s, then two unmerged L1s, the second of
  * which replays reasoning carriers.
@@ -150,7 +161,7 @@ export async function renderHierarchicalFixture(
     strategy.seedSummary({
       id: 'L2-100',
       level: 2,
-      content: 'zz-memory-merged-level covering the first two turns',
+      content: HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
       tokens: 13,
       sourceLevel: 1,
       sourceIds: ['L1-0', 'L1-1'],
@@ -159,7 +170,7 @@ export async function renderHierarchicalFixture(
     strategy.seedSummary({
       id: 'L1-101',
       level: 1,
-      content: 'zz-memory-plain-prose',
+      content: HIERARCHICAL_FIXTURE_PLAIN_PROSE,
       tokens: 6,
       sourceLevel: 0,
       sourceIds: [zz3],
