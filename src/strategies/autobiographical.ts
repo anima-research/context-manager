@@ -4942,8 +4942,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // two authorities disagree, ownership wins: a head-range message
     // covered by a live summary renders via its recall pair below, not
     // raw. Rendering it both ways duplicated the seed in every payload.
+    // Residence-scoped source-only L1 compression (see `compressionSourceOnly`
+    // in strategy config). When on, sections 1 (head), 2 (recall), and 3 (raw
+    // middle) below are skipped structurally — the summarizer receives ONLY the
+    // marker + exact target chunk + directive (sections 4–6). Tools stay
+    // declared (reasoning_extraction guard). L1 only; merge/transition paths do
+    // not consult this flag.
+    const sourceOnly = this.config.compressionSourceOnly === true;
     let headCoveredSkipped = 0;
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+    for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
       if (priorSummaryMessageIds.has(m.id)) {
         headCoveredSkipped++;
@@ -4970,12 +4977,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
     // merged exclusion the unmerged frontier can be large at extreme scale.
-    const recallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
+    // Source-only mode uses a zero recall budget: capRecallPairs returns an
+    // empty set, so no recall pair is emitted below AND buildRecallCurveVariants
+    // has no frontier to expand (canonical-only, one call).
+    const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
     const { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
       priorSummaries,
       recallBudget,
     );
-    if (keptSummaries.length < priorSummaries.length) {
+    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
       const dropped = priorSummaries.length - keptSummaries.length;
       console.warn(
         `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
@@ -5019,7 +5029,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // as the head: coverage is judged against `priorSummaryMessageIds`
     // (all live summaries, not the budget-capped keptSummaries).
     const chunkFirstId = chunk.messages[0]?.id;
-    if (chunkFirstId) {
+    if (chunkFirstId && !sourceOnly) {
       const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
       for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
         const m = allMessages[i];
