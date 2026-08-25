@@ -215,3 +215,90 @@ describe('MessageStore.getWindow', () => {
     store.close();
   });
 });
+
+describe('image MIME canonicalization', () => {
+  beforeEach(cleanup);
+  after(cleanup);
+
+  const cases = [
+    {
+      name: 'PNG',
+      bytes: Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'),
+      expected: 'image/png',
+    },
+    {
+      name: 'JPEG',
+      bytes: Buffer.from('ffd8ffe000104a4649460001', 'hex'),
+      expected: 'image/jpeg',
+    },
+    {
+      name: 'GIF89a',
+      bytes: Buffer.from('47494638396101000100', 'hex'),
+      expected: 'image/gif',
+    },
+    {
+      name: 'WebP',
+      bytes: Buffer.from('524946460c00000057454250', 'hex'),
+      expected: 'image/webp',
+    },
+  ];
+
+  for (const specimen of cases) {
+    it(`canonicalizes mislabeled ${specimen.name} bytes on ingress`, () => {
+      const { store, messages } = openStore();
+      messages.append('user', [{
+        type: 'image',
+        source: {
+          type: 'base64',
+          mediaType: 'image/jpeg' === specimen.expected ? 'image/png' : 'image/jpeg',
+          data: specimen.bytes.toString('base64'),
+        },
+      } as ContentBlock]);
+
+      const raw = messages.getWindow(0, 1, { resolveBlobs: false });
+      const ref = raw.messages[0].content[0] as unknown as {
+        type: 'blob_ref'; ref: { mediaType: string };
+      };
+      assert.equal(ref.type, 'blob_ref');
+      assert.equal(ref.ref.mediaType, specimen.expected);
+
+      const resolved = messages.getWindow(0, 1).messages[0].content[0];
+      assert.equal(resolved.type, 'image');
+      if (resolved.type === 'image' && resolved.source.type === 'base64') {
+        assert.equal(resolved.source.mediaType, specimen.expected);
+        assert.equal(resolved.source.data, specimen.bytes.toString('base64'));
+      }
+      store.close();
+    });
+  }
+
+  it('repairs a legacy mislabeled image on resolve without rewriting its stored reference', () => {
+    const { store, messages } = openStore();
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const hash = store.storeBlob(png, 'image/jpeg');
+    messages.append('user', [{
+      type: 'blob_ref',
+      ref: { hash, mediaType: 'image/jpeg', originalType: 'image' },
+    } as unknown as ContentBlock]);
+
+    const rawBefore = messages.getWindow(0, 1, { resolveBlobs: false });
+    const legacyRef = rawBefore.messages[0].content[0] as unknown as {
+      type: 'blob_ref'; ref: { mediaType: string };
+    };
+    assert.equal(legacyRef.ref.mediaType, 'image/jpeg');
+
+    const resolved = messages.getWindow(0, 1).messages[0].content[0];
+    assert.equal(resolved.type, 'image');
+    if (resolved.type === 'image' && resolved.source.type === 'base64') {
+      assert.equal(resolved.source.mediaType, 'image/png');
+      assert.equal(resolved.source.data, png.toString('base64'));
+    }
+
+    const rawAfter = messages.getWindow(0, 1, { resolveBlobs: false });
+    const stillLegacy = rawAfter.messages[0].content[0] as unknown as {
+      type: 'blob_ref'; ref: { mediaType: string };
+    };
+    assert.equal(stillLegacy.ref.mediaType, 'image/jpeg');
+    store.close();
+  });
+});
