@@ -1,14 +1,22 @@
 /**
  * Mint requests must carry the host's live system prompt (opt-in).
  *
- * The summarizer that authors a memory is deliberately reconstructed as-of
- * the original context — same head, same recall ladder, same tool
- * definitions the live instance runs with. One layer of that reconstruction
- * was structurally missing: the system prompt the host serves the live agent
- * on every activation never reached the mint. On hosts whose identity and
- * conduct live in system voice, every memory was therefore authored by a
- * system-promptless variant of the agent — and merges re-summarize
- * summaries, so the drift compounded upward through the pyramid.
+ * A mint request is deliberately built as-of the span it compresses — same
+ * head, same recall ladder, no tail after the chunk. One identity layer was
+ * structurally missing from it: the system prompt the host serves the live
+ * agent on every activation never reached the mint at all. On hosts whose
+ * identity and conduct live in system voice, every memory was therefore
+ * authored by a system-promptless variant of the agent — and merges
+ * re-summarize summaries, so the drift compounded upward through the pyramid.
+ *
+ * What the threading supplies is the host's CURRENT prompt, not a historical
+ * one. ContextManager keeps it in a single slot that setSystemPrompt
+ * overwrites, never a per-message history, so a mint is served the identity
+ * policy in force AT MINT TIME. That equals what the original instance was
+ * served exactly insofar as the host keeps the prompt stable across the
+ * compressed span; where it has changed, the memory is authored under the
+ * current policy and the older text is not recoverable from here. See
+ * ContextManager.setSystemPrompt.
  *
  * The fix mirrors the tool-definition precedent: ContextManager
  * .setSystemPrompt(text) -> StrategyContext.systemPrompt -> the `system`
@@ -19,6 +27,17 @@
  * Opt-in means opt-in: with the setter never called, a mint request carries
  * no `system` key at all, so its canonical hash and quarantine identity are
  * byte-identical to the pre-threading shape.
+ *
+ * What the cases below pin, and what they do not. Five pin the THREADING:
+ * that both mint families carry the set prompt, that it leads the request
+ * rather than being spliced into the replayed messages, that an undeclared
+ * host leaves the pre-threading request shape untouched, and that
+ * KnowledgeStrategy inherits it. One pins the SLOT — 'an empty or undefined
+ * later call never downgrades a recorded prompt' — which is last-value-wins
+ * behaviour, not history: it asserts that a later push replaces the recorded
+ * value and that an empty push does not blank it. No case here asserts that a
+ * mint receives the prompt that was in force during the span it compresses,
+ * because the mechanism does not retain one.
  */
 
 import { describe, it, before, after } from 'node:test';
