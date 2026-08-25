@@ -53,8 +53,17 @@ export function persistMintRequestPreimage(
 }
 
 /**
- * Raw preimage bytes for a `provenance.requestHash`, or null when the mint
- * predates this module / was minted with `persistMintPreimages: false`.
+ * Raw preimage bytes for a `provenance.requestHash`, or null.
+ *
+ * Null has three causes, all of them ordinary — a summary carrying
+ * provenance is never evidence that its preimage is readable:
+ *  1. the mint predates this module;
+ *  2. it ran with `persistMintPreimages: false`;
+ *  3. persistence was attempted and FAILED. Storage is best-effort by
+ *     design (`persistMintRequestPreimage` above): a store that refuses the
+ *     blob must not cost the summary the LLM just paid for, so the failure
+ *     is loud on stderr and the mint lands with a hash whose preimage was
+ *     never written.
  *
  * Verify with `createHash('sha256').update(bytes).digest('hex') === requestHash`:
  * the store keys blobs by that digest, so a returned buffer IS the request
@@ -69,7 +78,8 @@ export function getMintRequestPreimageBytes(
 
 /**
  * The authoring request behind a `provenance.requestHash`, parsed, or null
- * when no preimage was persisted for it.
+ * when no preimage was persisted for it (three causes — see
+ * `getMintRequestPreimageBytes`).
  *
  * Throws if the hash names a blob that is not a stored request (media blobs
  * live in the same content-addressed space) — a wrong hash should be loud,
