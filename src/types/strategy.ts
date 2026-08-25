@@ -894,6 +894,19 @@ export interface AutobiographicalConfig {
    * positive; no effect unless lower than the live compile budget.
    */
   productionBudgetTokens?: number;
+
+  /**
+   * Persist the exact request that authored each minted summary, keyed by
+   * the `provenance.requestHash` the summary already carries (see
+   * `SummaryEntry.provenance` and `src/mint-preimage.ts`). Default true:
+   * without it the hash keys an `llm-calls` log this library does not write,
+   * so provenance survives only as long as the host's harness logs do.
+   * Preimages are stored as content-addressed blobs in the same Chronicle
+   * store as the summaries — mint requests are large (a full compression
+   * context), so hosts that keep their own durable request log, or that
+   * accept unreadable provenance, can set this false to skip the writes.
+   */
+  persistMintPreimages?: boolean;
 }
 
 /**
@@ -994,12 +1007,22 @@ export interface SummaryEntry {
    * (which could canonize refusals/truncations, e.g. the 163-char cyber
    * refusal that became an L4 parent) are auditable: `provenance` absent →
    * pre-gate entry, verify against llm-calls logs via content match;
-   * present → `requestHash` keys the exact request in the llm-calls log.
+   * present → `requestHash` keys the exact request.
+   *
+   * That key is readable, not merely verifiable: unless the mint ran with
+   * `persistMintPreimages: false` (or predates that persistence), the
+   * authoring request is stored as a content-addressed blob under this very
+   * hash — `getMintRequestByHash(store, requestHash)`, src/mint-preimage.ts.
+   * Audit no longer depends on a host-side llm-calls log surviving.
    */
   provenance?: {
     /** Terminal stopReason of the accepted response (always 'end_turn' for post-gate entries). */
     stopReason: string;
-    /** sha256 of the JSON-serialized membrane request that authored this summary. */
+    /**
+     * sha256 of the JSON-serialized membrane request that authored this
+     * summary, and — by chronicle's content addressing — the blob key its
+     * persisted preimage is stored under.
+     */
     requestHash: string;
     /** Compression model that authored this summary. */
     model?: string;
@@ -1141,4 +1164,5 @@ Write naturally, as recollection of what you experienced.`,
   compressionRefusalCurveFallbacks: 3,
   compressionContextBudgetTokens: 200000,
   overBudgetGraceRatio: 0.02,
+  persistMintPreimages: true,
 };
