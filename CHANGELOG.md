@@ -33,6 +33,10 @@ Releases up to and including 0.6.2 predate this file; for their contents see
   source, for operators who want the resolved picture in their logs rather than
   through a debugger. It is emitted at strategy initialization rather than at
   construction, so a subclass instance reports the strategy it actually is.
+  The line carries a third field, `presentAsUndefined`: keys a caller supplied
+  as explicit `undefined` stay present in the effective config but cannot
+  survive JSON, so they are named there instead — every provenance key is
+  either valued in `effective` or listed in `presentAsUndefined`, never both.
 - Compression and merge requests now carry prompt-cache breakpoints at their
   stability strata — end of head window, last level≥2 recall pair, last
   recall pair — with a 1h cache TTL (#37). The mint lane previously sent its
