@@ -4694,7 +4694,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Compress a raw message chunk into an L1 summary using self-voice framing.
-   * No system prompt — framing via message structure only.
+   * The request's `system` field carries the HOST's live prompt when one has
+   * been declared (ContextManager.setSystemPrompt -> ctx.systemPrompt), and
+   * is absent entirely when none has — undeclared, framing is by message
+   * structure only. Never a synthetic summarizer header on either path. Full
+   * rationale, and the currency caveat on the declared path, at the request
+   * builder below.
    */
   protected async compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
