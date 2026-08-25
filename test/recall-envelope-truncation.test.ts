@@ -31,11 +31,20 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import type { ContentBlock } from '@animalabs/membrane';
-import type { RenderedMessage } from './fixtures/recall-envelope-fixture.js';
+import { COMBINED_RECALL_SEPARATOR_TEXT } from '../src/strategies/autobiographical.js';
+import {
+  HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
+  HIERARCHICAL_FIXTURE_PLAIN_PROSE,
+  type RenderedMessage,
+} from './fixtures/recall-envelope-fixture.js';
 import {
   CAPPED_RENDER_CASE_NAMES,
+  combinedSharedBudgetCases,
+  combinedSharedBudgetPrices,
   renderCappedCase,
+  renderCombinedSharedBudgetCase,
   type CappedRenderCaseName,
+  type CombinedSharedBudgetCase,
 } from './fixtures/recall-envelope-truncation-fixture.js';
 
 const GOLDEN = JSON.parse(
@@ -137,6 +146,109 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
         assert.match(inside[1], TRUNCATION_MARKER, `${label}: a tight cap must truncate`);
         assert.ok(inside[1].length > 0, `${label}: the envelope must not be empty`);
       }
+    }
+  });
+});
+
+const ENVELOPE_OPENER = /^<cm-recall[^>]*>\n/;
+const ENVELOPE_CLOSER = /\n<\/cm-recall>$/;
+const TRAILING_TRUNCATION_MARKER = /\n\n\[truncated — original was \d+ tokens\]$/;
+const ENVELOPE_BODY = /<cm-recall[^>]*>\n([\s\S]*?)\n<\/cm-recall>/g;
+
+function combinedAnswerOf(messages: RenderedMessage[], label: string): RenderedMessage {
+  const answers = recallAnswers(messages);
+  assert.equal(answers.length, 1, `${label}: the legacy combined path emits exactly one recall answer`);
+  return answers[0];
+}
+
+function envelopeBodies(answer: RenderedMessage): string[] {
+  return [...textOf(answer).matchAll(ENVELOPE_BODY)].map((match) => match[1]);
+}
+
+function separatorCount(answer: RenderedMessage): number {
+  return answer.content.filter(
+    (block) => block.type === 'text' && block.text === COMBINED_RECALL_SEPARATOR_TEXT,
+  ).length;
+}
+
+/**
+ * What the render CHARGED against the cap: the prose it emitted plus the
+ * separators between summaries, priced the way the strategy prices them. The
+ * envelope's tags and the truncator's own marker are excluded because both are
+ * documented soft-cap overshoot — they are appended after the budget is spent,
+ * not bought out of it.
+ */
+function chargedTokens(answer: RenderedMessage): number {
+  let tokens = 0;
+  for (const block of answer.content) {
+    if (block.type === 'thinking') {
+      tokens += Math.ceil(block.thinking.length / 4);
+      continue;
+    }
+    if (block.type !== 'text') continue;
+    const charged = block.text
+      .replace(ENVELOPE_OPENER, '')
+      .replace(ENVELOPE_CLOSER, '')
+      .replace(TRAILING_TRUNCATION_MARKER, '');
+    tokens += Math.ceil(charged.length / 4);
+  }
+  return tokens;
+}
+
+function assertSharedBudgetShape(answer: RenderedMessage, testCase: CombinedSharedBudgetCase): void {
+  const label = `${testCase.name} (cap ${testCase.maxMessageTokens})`;
+  const bodies = envelopeBodies(answer);
+  const text = textOf(answer);
+  assertNoTornEnvelope(text, label);
+  assert.equal(bodies[0], HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, `${label}: summary one must be admitted whole`);
+
+  if (testCase.expectation === 'stopsAfterFirstSummary') {
+    assert.equal(bodies.length, 1, `${label}: emission must stop after summary one`);
+    assert.equal(separatorCount(answer), 0, `${label}: a separator it cannot pay for must not be emitted`);
+    assert.doesNotMatch(text, TRUNCATION_MARKER, `${label}: nothing may be truncated behind the stop`);
+    return;
+  }
+
+  assert.equal(bodies.length, 2, `${label}: summary two must be admitted`);
+  assert.equal(separatorCount(answer), 1, `${label}: exactly one separator sits between the two summaries`);
+
+  if (testCase.expectation === 'bothSummariesWhole') {
+    assert.equal(bodies[1], HIERARCHICAL_FIXTURE_PLAIN_PROSE, `${label}: summary two must be admitted whole`);
+    assert.doesNotMatch(text, TRUNCATION_MARKER, `${label}: a cap that pays for both must truncate neither`);
+    return;
+  }
+
+  const { firstSummary, separator } = combinedSharedBudgetPrices();
+  const proseBudget = testCase.maxMessageTokens - firstSummary - separator;
+  assert.match(bodies[1], TRUNCATION_MARKER, `${label}: summary two must carry the truncation marker`);
+  const emittedProse = bodies[1].replace(TRAILING_TRUNCATION_MARKER, '');
+  assert.ok(
+    emittedProse.length > 0 && HIERARCHICAL_FIXTURE_PLAIN_PROSE.startsWith(emittedProse),
+    `${label}: summary two's body must be a non-empty prefix of its prose, got ${JSON.stringify(emittedProse)}`,
+  );
+  assert.equal(
+    Math.ceil(emittedProse.length / 4),
+    proseBudget,
+    `${label}: summary two may spend only what the separator left`,
+  );
+}
+
+describe('recallEnvelope under maxMessageTokens: the combined turn spends ONE shared cap', () => {
+  for (const testCase of combinedSharedBudgetCases()) {
+    it(`${testCase.name}: cap ${testCase.maxMessageTokens} ${testCase.expectation}`, async () => {
+      const rendered = await renderCombinedSharedBudgetCase(testCase);
+      assertSharedBudgetShape(combinedAnswerOf(rendered.messages, testCase.name), testCase);
+    });
+  }
+
+  it('never spends more prose and separators than the cap allows', async () => {
+    for (const testCase of combinedSharedBudgetCases()) {
+      const rendered = await renderCombinedSharedBudgetCase(testCase);
+      const answer = combinedAnswerOf(rendered.messages, testCase.name);
+      assert.ok(
+        chargedTokens(answer) <= testCase.maxMessageTokens,
+        `${testCase.name}: combined turn charged ${chargedTokens(answer)} tokens against a cap of ${testCase.maxMessageTokens}`,
+      );
     }
   });
 });

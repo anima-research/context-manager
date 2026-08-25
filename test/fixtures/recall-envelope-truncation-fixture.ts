@@ -17,8 +17,12 @@
  *    therefore the one place a cap can fall BETWEEN two envelopes.
  */
 
-import type { AutobiographicalOptions } from '../../src/types/index.js';
+import { AutobiographicalStrategy } from '../../src/index.js';
+import { COMBINED_RECALL_SEPARATOR_TEXT } from '../../src/strategies/autobiographical.js';
+import type { AutobiographicalOptions, StoredMessage } from '../../src/types/index.js';
 import {
+  HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
+  HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   renderAdaptiveFixture,
   renderHierarchicalFixture,
   type FixtureRender,
@@ -79,4 +83,98 @@ export async function renderCappedCase(
   return testCase.path === 'hierarchical'
     ? renderHierarchicalFixture(options)
     : renderAdaptiveFixture(options);
+}
+
+/** Reaches the production token estimator the combined path spends through. */
+class CombinedRecallProsePricer extends AutobiographicalStrategy {
+  priceProse(text: string): number {
+    return this.estimateTextOnlyTokens({ content: [{ type: 'text', text }] } as StoredMessage);
+  }
+}
+
+export interface CombinedSharedBudgetPrices {
+  firstSummary: number;
+  separator: number;
+  secondSummary: number;
+}
+
+/**
+ * What the combined xml path spends on the first two hierarchical-fixture
+ * summaries and on the separator between them, priced by the estimator the
+ * render itself uses. Every cap below is arithmetic over these three numbers,
+ * so the cases keep meaning what they say when the fixture prose changes.
+ */
+export function combinedSharedBudgetPrices(): CombinedSharedBudgetPrices {
+  const pricer = new CombinedRecallProsePricer({});
+  return {
+    firstSummary: pricer.priceProse(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE),
+    separator: pricer.priceProse(COMBINED_RECALL_SEPARATOR_TEXT),
+    secondSummary: pricer.priceProse(HIERARCHICAL_FIXTURE_PLAIN_PROSE),
+  };
+}
+
+/** What the render owes at a given cap, once the first summary is fully in. */
+export type CombinedSharedBudgetExpectation =
+  | 'bothSummariesWhole'
+  | 'separatorThenTruncatedSecond'
+  | 'stopsAfterFirstSummary';
+
+export interface CombinedSharedBudgetCase {
+  name: string;
+  maxMessageTokens: number;
+  expectation: CombinedSharedBudgetExpectation;
+}
+
+/**
+ * Caps that land in the seam the `CAPPED_RENDER_CASES` cannot reach: every one
+ * of them fully admits the first summary, so what the render does next is
+ * decided by the SEPARATOR arithmetic rather than by a cut inside summary one.
+ * (`hierarchicalCombined` caps at 12 against a 13-token first summary, so its
+ * cap never survives to meet a separator at all.)
+ *
+ * These are deliberately NOT members of `CAPPED_RENDER_CASES`: that record is
+ * enumerated by the default-mode golden capture, so adding a key there would
+ * move the golden. The shared-budget seam is xml-only — the flat path spends
+ * its cap through one `truncateContent` call over the whole concatenation —
+ * so these cases render in xml mode and leave the pinned bytes alone.
+ */
+export function combinedSharedBudgetCases(): CombinedSharedBudgetCase[] {
+  const { firstSummary, separator, secondSummary } = combinedSharedBudgetPrices();
+  return [
+    {
+      name: 'bothSummariesAndTheSeparatorFitExactly',
+      maxMessageTokens: firstSummary + separator + secondSummary,
+      expectation: 'bothSummariesWhole',
+    },
+    {
+      name: 'separatorPlusOneTokenOfTheSecondSummary',
+      maxMessageTokens: firstSummary + separator + 1,
+      expectation: 'separatorThenTruncatedSecond',
+    },
+    {
+      name: 'exactlyTheFirstSummary',
+      maxMessageTokens: firstSummary,
+      expectation: 'stopsAfterFirstSummary',
+    },
+    {
+      name: 'oneTokenPastTheFirstSummary',
+      maxMessageTokens: firstSummary + 1,
+      expectation: 'stopsAfterFirstSummary',
+    },
+    {
+      name: 'separatorAffordableButNoProseBehindIt',
+      maxMessageTokens: firstSummary + separator,
+      expectation: 'stopsAfterFirstSummary',
+    },
+  ];
+}
+
+export async function renderCombinedSharedBudgetCase(
+  testCase: CombinedSharedBudgetCase,
+): Promise<FixtureRender> {
+  return renderHierarchicalFixture({
+    maxMessageTokens: testCase.maxMessageTokens,
+    positionedRecallPairs: false,
+    recallEnvelope: 'xml',
+  });
 }
