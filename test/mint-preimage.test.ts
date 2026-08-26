@@ -7,11 +7,12 @@
  * provenance they could verify (re-hash a request you already have) but not
  * read (recover the request from the hash). The invariant under test:
  *
- *   For every mint, the exact request preimage is durably retrievable by the
- *   record's own requestHash, and sha256(retrieved) === requestHash. It rides
- *   Chronicle's content-addressed blob store — the same store the summary
- *   persists to, keyed by the same digest — so it survives a reopen. Default
- *   ON; `persistMintPreimages: false` writes nothing and throws nothing.
+ *   With `persistMintPreimages: true`, the exact request preimage is durably
+ *   retrievable by the record's own requestHash, and sha256(retrieved) ===
+ *   requestHash. It rides Chronicle's content-addressed blob store — the same
+ *   store the summary persists to — so it survives a reopen. The option is
+ *   OPT-IN: absent config and an explicit false both write nothing and throw
+ *   nothing, and every test below that expects a preimage asks for one.
  */
 
 import { after, describe, it } from 'node:test';
@@ -166,7 +167,7 @@ describe('Mint request preimages', () => {
 
   it('merge mint: the preimage is retrievable by requestHash and hashes back to it', async () => {
     const mock = acceptingMembrane();
-    const fx = await mergeFixture(mock.membrane);
+    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: true });
 
     await fx.strategy.tick(ctx(fx.manager));
     const parent = fx.strategy.summariesView().find((s) => s.level === 2);
@@ -199,7 +200,7 @@ describe('Mint request preimages', () => {
 
   it('L1 mint: the accepted attempt is the preimage stored', async () => {
     const mock = acceptingMembrane();
-    const fx = await l1Fixture(mock.membrane);
+    const fx = await l1Fixture(mock.membrane, { persistMintPreimages: true });
 
     const l1 = fx.strategy.summariesView().find((s) => s.level === 1 && s.provenance);
     assert.ok(l1, 'setup: a chunk compressed into an L1 with provenance');
@@ -216,27 +217,55 @@ describe('Mint request preimages', () => {
     await fx.manager.close();
   });
 
-  it('persistMintPreimages: false writes nothing and mints anyway', async () => {
-    const mock = acceptingMembrane();
-    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: false });
+  /**
+   * The option is opt-in (maintainer review, PR #79, finding 3): a fleet that
+   * deploys from a checkout must not start writing preimages on the next pull.
+   * Absent config and an explicit false are both OFF, an explicit true is ON,
+   * and the mint lands identically in all three — so this case discriminates
+   * the switch rather than riding whatever the default happens to be.
+   */
+  const persistenceCases: Array<{ label: string; options: ConstructorParameters<typeof Probe>[0]; persisted: boolean }> = [
+    { label: 'absent config', options: {}, persisted: false },
+    { label: 'persistMintPreimages: false', options: { persistMintPreimages: false }, persisted: false },
+    // A host threading an unset flag through (`persistMintPreimages:
+    // hostOptions.preimages`) lands an explicit undefined, which overrides the
+    // default in the constructor's spread — so the gate reads `!== true`
+    // rather than `=== false`.
+    { label: 'persistMintPreimages: undefined', options: { persistMintPreimages: undefined }, persisted: false },
+    { label: 'persistMintPreimages: true', options: { persistMintPreimages: true }, persisted: true },
+  ];
 
-    await fx.strategy.tick(ctx(fx.manager));
-    const parent = fx.strategy.summariesView().find((s) => s.level === 2);
-    assert.ok(parent, 'the mint still lands with persistence off');
-    const requestHash = parent!.provenance!.requestHash;
-    assert.match(requestHash, /^[a-f0-9]{64}$/, 'provenance is unchanged by the off-switch');
-    assert.equal(
-      getMintRequestPreimageBytes(fx.manager.getStore(), requestHash),
-      null,
-      'nothing written',
-    );
-    assert.equal(getMintRequestByHash(fx.manager.getStore(), requestHash), null);
-    await fx.manager.close();
-  });
+  for (const testCase of persistenceCases) {
+    it(`${testCase.label}: the mint lands and the preimage is ${testCase.persisted ? 'written' : 'not written'}`, async () => {
+      const mock = acceptingMembrane();
+      const fx = await mergeFixture(mock.membrane, testCase.options);
+
+      await fx.strategy.tick(ctx(fx.manager));
+      const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+      assert.ok(parent, 'the mint lands either way');
+      const requestHash = parent!.provenance!.requestHash;
+      assert.match(requestHash, /^[a-f0-9]{64}$/, 'provenance is unchanged by the switch');
+
+      const bytes = getMintRequestPreimageBytes(fx.manager.getStore(), requestHash);
+      if (testCase.persisted) {
+        assert.ok(bytes, 'the opt-in wrote the preimage');
+        assert.equal(sha256(bytes!), requestHash);
+        assert.ok(getMintRequestByHash(fx.manager.getStore(), requestHash));
+      } else {
+        assert.equal(bytes, null, 'nothing written');
+        assert.equal(getMintRequestByHash(fx.manager.getStore(), requestHash), null);
+        assert.equal(
+          describeStoredMintPreimage(fx.manager.getStore(), requestHash).form,
+          'absent',
+        );
+      }
+      await fx.manager.close();
+    });
+  }
 
   it('provenance keeps exactly its three fields', async () => {
     const mock = acceptingMembrane();
-    const fx = await mergeFixture(mock.membrane);
+    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: true });
 
     await fx.strategy.tick(ctx(fx.manager));
     const parent = fx.strategy.summariesView().find((s) => s.level === 2);
@@ -323,6 +352,7 @@ async function acceptedRequestFixture(
 ): Promise<{ manager: ContextManager; strategy: Probe; target: Chunk }> {
   const strategy = new Probe({
     compressionModel: ZZ_MINT_MODEL,
+    persistMintPreimages: true,
     targetChunkTokens: 100,
     recentWindowTokens: 0,
     headWindowTokens: 0,
@@ -454,6 +484,7 @@ async function imageMintFixture(
 ): Promise<{ manager: ContextManager; strategy: Probe }> {
   const strategy = new Probe({
     compressionModel: ZZ_MINT_MODEL,
+    persistMintPreimages: true,
     targetChunkTokens: 50,
     recentWindowTokens: 0,
     headWindowTokens: 0,
@@ -639,7 +670,7 @@ describe('Mint preimages do not re-embed inline media', () => {
 
   it('text-only mint: the preimage is still the plain request blob', async () => {
     const mock = acceptingMembrane();
-    const fx = await l1Fixture(mock.membrane);
+    const fx = await l1Fixture(mock.membrane, { persistMintPreimages: true });
     const store = fx.manager.getStore();
     const l1 = fx.strategy.summariesView().find((s) => s.level === 1 && s.provenance);
     const requestHash = l1!.provenance!.requestHash;
@@ -693,7 +724,7 @@ describe('Preimage persistence never blocks the mint', () => {
   it('storeBlob throws: the mint lands, provenance is present, the read is null', async () => {
     const mock = acceptingMembrane();
     const path = freshPath();
-    const fx = await mergeFixture(mock.membrane, {}, path);
+    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: true }, path);
     const store = fx.manager.getStore();
 
     await fx.strategy.tick({ ...ctx(fx.manager), store: storeRefusing(store, 'storeBlob') });

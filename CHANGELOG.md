@@ -103,25 +103,40 @@ Releases up to and including 0.6.2 predate this file; for their contents see
   can never push a request past Anthropic's 4-breakpoint limit. New options:
   `compressionCacheMarkers` (default `true`) and `compressionCacheTtl`
   (default `'1h'`).
-- Mint request preimages are now persisted by default, so
-  `provenance.requestHash` is readable and not merely verifiable. The field's
-  contract said the hash "keys the exact request in the llm-calls log" — a log
-  this library never wrote: the only library-owned log is the JSONL telemetry
-  behind `CONTEXT_MANAGER_COMPRESSION_LOG`, off unless a host sets it, and the
-  `llm-calls` files are host-harness artifacts. On every accepted L1 and merge
-  mint the authoring request is now stored as a blob in the same Chronicle
-  store as the summary; because chronicle keys blobs by sha256 of their bytes —
-  the same digest `requestHash` already is — the preimage lands under the hash
-  the summary carries, deduplicated across retries, with no new format and no
-  new filesystem convention. Read it with `getMintRequestByHash(store, hash)`
-  or `getMintRequestPreimageBytes(store, hash)` (new public exports). Refused
-  and quarantined attempts are not mints and are not stored. Preimages are
-  persisted best-effort: a store failure never blocks the mint and leaves no
-  preimage, so a reader gets null — alongside the two other absence causes,
-  pre-feature mints and `persistMintPreimages: false`. The hash on the entry
-  stays verifiable either way. New option: `persistMintPreimages` (default
-  `true`) for hosts that keep their own durable request log or accept
-  unreadable provenance — mint requests are large.
+- Mint request preimages can now be persisted, so `provenance.requestHash` is
+  readable and not merely verifiable. The field's contract said the hash "keys
+  the exact request in the llm-calls log" — a log this library never wrote: the
+  only library-owned log is the JSONL telemetry behind
+  `CONTEXT_MANAGER_COMPRESSION_LOG`, off unless a host sets it, and the
+  `llm-calls` files are host-harness artifacts. With the option on, every
+  accepted L1 and merge mint stores its authoring request in the same Chronicle
+  store as the summary, retrievable by the hash the summary already carries.
+  Read it with `getMintRequestByHash(store, hash)` or
+  `getMintRequestPreimageBytes(store, hash)` (new public exports); ask what one
+  costs with `describeStoredMintPreimage(store, hash)`. Refused and quarantined
+  attempts are not mints and are not stored.
+- New option: `persistMintPreimages`, **opt-in, default `false`**. Absent
+  config means off — only an explicit `true` enables it. Preimage text is real
+  growth at mint cadence (a mint request is a whole compression context) and
+  this library ships no retention knob for it yet, so a fleet that deploys from
+  a checkout would otherwise have every resident begin writing preimages on the
+  next pull. Turning it on is a deliberate act, taken with an eye on store size.
+- Inline media is stored by REFERENCE, not re-embedded. A mint replays raw
+  history, so one preimage can carry megabytes of base64 image content, and
+  content-addressing cannot dedupe it across mints: the blob key is the hash of
+  the whole request and no two mints send the same request. Media-bearing
+  preimages are therefore stored as an envelope — the request's own JSON text
+  plus references to the media blobs `MessageStore` already put in the store —
+  and reads splice the base64 back in. Text-only preimages are unchanged: the
+  plain request blob under its own digest. What comes back out of the read APIs
+  is the original request bytes either way; the splice is verified against
+  `requestHash` when it is written and again when it is read, and a damaged
+  store raises `MintPreimageMaterializationError` rather than quietly returning
+  something else.
+- Preimages are persisted best-effort: a store failure never blocks the mint
+  and leaves no preimage, so a reader gets null — alongside the two other
+  absence causes, pre-feature mints and persistence left off. The hash on the
+  entry stays verifiable either way.
 
 ### Fixed
 

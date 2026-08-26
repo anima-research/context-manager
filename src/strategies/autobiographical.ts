@@ -4856,14 +4856,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * at dispatch: refused and quarantined attempts are not mints, and a
    * compression context is large enough that storing every rung of a refusal
    * curve would multiply store growth for receipts nobody minted against.
-   * Disabled by `persistMintPreimages: false`.
+   * Opt-in: only an explicit `persistMintPreimages: true` enables it, so a
+   * host that never configured it — including one that pulls this version
+   * into a running deployment, and one that passes an unset flag straight
+   * through into the options — writes nothing.
    */
   private persistMintPreimage(
     ctx: StrategyContext,
     request: NormalizedRequest | undefined,
     requestHash: string,
   ): void {
-    if (this.config.persistMintPreimages === false) return;
+    if (this.config.persistMintPreimages !== true) return;
     if (!request) {
       console.error(
         `[autobiographical] no authoring request retained for accepted mint ${requestHash} — ` +
