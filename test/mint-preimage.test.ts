@@ -26,6 +26,7 @@ import {
   getMintRequestByHash,
   getMintRequestPreimageBytes,
 } from '../src/index.js';
+import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
@@ -449,6 +450,7 @@ async function imageMintFixture(
   data: string,
   options: ConstructorParameters<typeof Probe>[0] = {},
   path = freshPath(),
+  storeRefusal?: 'storeBlob' | 'treeSet',
 ): Promise<{ manager: ContextManager; strategy: Probe }> {
   const strategy = new Probe({
     compressionModel: ZZ_MINT_MODEL,
@@ -469,7 +471,12 @@ async function imageMintFixture(
     );
   }
   await manager.compile();
-  await strategy.tick(ctx(manager));
+  const context = ctx(manager);
+  await strategy.tick(
+    storeRefusal
+      ? { ...context, store: storeRefusing(manager.getStore(), storeRefusal) }
+      : context,
+  );
   return { manager, strategy };
 }
 
@@ -650,6 +657,87 @@ describe('Mint preimages do not re-embed inline media', () => {
       getMintRequestPreimageBytes(store, requestHash)!.toString('utf8'),
       'and the read path returns exactly those bytes',
     );
+    await fx.manager.close();
+  });
+});
+
+/**
+ * A store that refuses the preimage never costs the mint (maintainer review,
+ * PR #79, finding 2 — the test the PR body claimed existed and did not).
+ *
+ * Preimage persistence is deliberately best-effort: a memory outranks its
+ * receipt, so a store that cannot take the blob must cost the summary the LLM
+ * just paid for exactly nothing. That is the load-bearing safety property of
+ * this feature, and nothing pinned it. The seam is the true external one —
+ * `StrategyContext.store`, the Chronicle handle the preimage write goes
+ * through — so the strategy's own archive writes (captured at attach) still
+ * land on the real store while the preimage write fails.
+ */
+function storeRefusing(store: JsStore, method: 'storeBlob' | 'treeSet'): JsStore {
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      if (property === method) {
+        return () => {
+          throw new Error(`zz-store-refuses-${method}`);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? (value as (...args: never[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
+describe('Preimage persistence never blocks the mint', () => {
+  after(cleanup);
+
+  it('storeBlob throws: the mint lands, provenance is present, the read is null', async () => {
+    const mock = acceptingMembrane();
+    const path = freshPath();
+    const fx = await mergeFixture(mock.membrane, {}, path);
+    const store = fx.manager.getStore();
+
+    await fx.strategy.tick({ ...ctx(fx.manager), store: storeRefusing(store, 'storeBlob') });
+
+    const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+    assert.ok(parent, 'the mint lands even though the preimage write threw');
+    const requestHash = parent!.provenance!.requestHash;
+    assert.match(requestHash, /^[a-f0-9]{64}$/, 'provenance is present, with its hash');
+    assert.equal(
+      getMintRequestPreimageBytes(store, requestHash),
+      null,
+      'the preimage read is null — a verifiable hash is not a readable request',
+    );
+    assert.equal(getMintRequestByHash(store, requestHash), null);
+    assert.equal(describeStoredMintPreimage(store, requestHash).form, 'absent');
+
+    // Accepted into the ARCHIVE, not merely into memory: it survives reopen.
+    await fx.manager.close();
+    const reopened = await mergeFixture(mock.membrane, {}, path, false);
+    assert.ok(
+      reopened.strategy.summariesView().some((s) => s.provenance?.requestHash === requestHash),
+      'the summary whose preimage failed to store is durably archived',
+    );
+    assert.equal(getMintRequestPreimageBytes(reopened.manager.getStore(), requestHash), null);
+    await reopened.manager.close();
+  });
+
+  it('the envelope index refusing writes: the media-bearing mint lands anyway', async () => {
+    const data = zzImageBase64(53);
+    const mock = acceptingMembrane();
+    const fx = await imageMintFixture(mock.membrane, data, {}, freshPath(), 'treeSet');
+    const store = fx.manager.getStore();
+    const requestHash = carrierRequestHash(mock.calls, data);
+
+    assert.ok(
+      fx.strategy.summariesView().some((s) => s.provenance?.requestHash === requestHash),
+      'the media-bearing mint lands even though the envelope index refused the write',
+    );
+    assert.equal(
+      getMintRequestPreimageBytes(store, requestHash),
+      null,
+      'an unindexed envelope reads as absent, not as a throw',
+    );
+    assert.equal(describeStoredMintPreimage(store, requestHash).form, 'absent');
     await fx.manager.close();
   });
 });
