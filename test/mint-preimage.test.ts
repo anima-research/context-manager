@@ -22,6 +22,7 @@ import { existsSync, rmSync } from 'node:fs';
 import {
   ContextManager,
   AutobiographicalStrategy,
+  describeStoredMintPreimage,
   getMintRequestByHash,
   getMintRequestPreimageBytes,
 } from '../src/index.js';
@@ -414,4 +415,241 @@ describe('Mint preimages follow the accepted request', () => {
       await fx.manager.close();
     });
   }
+});
+
+/**
+ * Inline media does not ride the preimage (maintainer review, PR #79).
+ *
+ * A single mint replays raw history, so one preimage can carry megabytes of
+ * base64 image content — and content-addressing cannot dedupe it, because the
+ * blob key is the hash of the WHOLE request and every mint's request differs.
+ * That was the dominant growth term. The image bytes are already in this same
+ * Chronicle store (MessageStore extracts every base64 source to a blob on
+ * add), so the preimage persists as an envelope of literal JSON spans plus
+ * blob references, and read-time materialization splices the base64 back in.
+ * The feature's contract is unchanged and load-bearing: what comes back out
+ * is the ORIGINAL request bytes, `sha256(materialized) === requestHash`.
+ */
+const ZZ_IMAGE_DECODED_BYTES = 120_000;
+
+function zzImageBase64(seed: number): string {
+  const pixels = Buffer.alloc(ZZ_IMAGE_DECODED_BYTES);
+  for (let i = 0; i < pixels.length; i++) pixels[i] = (i * 37 + seed) % 251;
+  return pixels.toString('base64');
+}
+
+const zzImageBlock = (data: string): ContentBlock => ({
+  type: 'image',
+  source: { type: 'base64', mediaType: 'image/png', data },
+});
+
+/** A chunk carrying one inline image, driven through the real L1 mint ladder. */
+async function imageMintFixture(
+  membrane: unknown,
+  data: string,
+  options: ConstructorParameters<typeof Probe>[0] = {},
+  path = freshPath(),
+): Promise<{ manager: ContextManager; strategy: Probe }> {
+  const strategy = new Probe({
+    compressionModel: ZZ_MINT_MODEL,
+    targetChunkTokens: 50,
+    recentWindowTokens: 0,
+    headWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0,
+    ...options,
+  });
+  const manager = await ContextManager.open({ path, strategy, membrane: membrane as never });
+  for (let i = 0; i < 8; i++) {
+    manager.addMessage(
+      i % 2 ? 'Claude' : 'User',
+      i === 2
+        ? [t('zz-shot-of-the-terminal'), zzImageBlock(data)]
+        : [t(`zz-chunked-${i} ` + 'word '.repeat(30))],
+    );
+  }
+  await manager.compile();
+  await strategy.tick(ctx(manager));
+  return { manager, strategy };
+}
+
+/** The requestHash of the mint attempt whose request carried `data` inline. */
+function carrierRequestHash(calls: unknown[], data: string): string {
+  const carrier = calls.find((call) => JSON.stringify(call).includes(data));
+  assert.ok(carrier, 'setup: some mint request carried the inline image');
+  return sha256(Buffer.from(JSON.stringify(carrier), 'utf8'));
+}
+
+describe('Mint preimages do not re-embed inline media', () => {
+  after(cleanup);
+
+  it('image-bearing mint: no whole-request blob, and the bytes still hash back', async () => {
+    const data = zzImageBase64(11);
+    const mock = acceptingMembrane();
+    const fx = await imageMintFixture(mock.membrane, data);
+    const store = fx.manager.getStore();
+    const requestHash = carrierRequestHash(mock.calls, data);
+
+    assert.ok(
+      fx.strategy.summariesView().some((s) => s.provenance?.requestHash === requestHash),
+      'setup: the image-bearing request is the one a summary was minted from',
+    );
+
+    const wholeRequestBlob = store.getBlob(requestHash);
+    assert.equal(
+      wholeRequestBlob === null ? 0 : wholeRequestBlob.length,
+      0,
+      'the image base64 must not be re-embedded as a whole-request preimage blob',
+    );
+
+    const bytes = getMintRequestPreimageBytes(store, requestHash);
+    assert.ok(bytes, 'the preimage is still readable');
+    assert.equal(sha256(bytes!), requestHash, 'sha256(materialized) === requestHash');
+    assert.ok(
+      bytes!.toString('utf8').includes(data),
+      'the image is spliced back inline, byte for byte',
+    );
+
+    const parsed = getMintRequestByHash(store, requestHash);
+    assert.ok(Array.isArray((parsed as { messages?: unknown[] }).messages));
+
+    const described = describeStoredMintPreimage(store, requestHash);
+    assert.equal(described.form, 'envelope', 'a media-bearing preimage stores as an envelope');
+    assert.ok(
+      described.form === 'envelope' && described.storedBytes < 10_000,
+      `the stored envelope carries no base64 body (stored ${JSON.stringify(described)})`,
+    );
+    await fx.manager.close();
+  });
+
+  it('image-bearing mint: the envelope references the blob the store already holds', async () => {
+    const data = zzImageBase64(23);
+    const mock = acceptingMembrane();
+    const fx = await imageMintFixture(mock.membrane, data);
+    const store = fx.manager.getStore();
+    const requestHash = carrierRequestHash(mock.calls, data);
+
+    const imageBlobHash = sha256(Buffer.from(data, 'base64'));
+    assert.ok(
+      store.getBlob(imageBlobHash),
+      'setup: the message store already holds the image as a content-addressed blob',
+    );
+
+    const described = describeStoredMintPreimage(store, requestHash);
+    assert.deepEqual(
+      described.form === 'envelope' ? described.blobHashes : described,
+      [imageBlobHash],
+      'the envelope names the blob the messages already stored — it shares, it does not copy',
+    );
+
+    // The growth receipt: a second copy of this image would put another
+    // ~161KB of base64 in the store. Blob bytes stay within the image itself.
+    assert.ok(
+      store.stats().blobSizeBytes < ZZ_IMAGE_DECODED_BYTES * 1.1,
+      `preimage persistence adds no image bytes (blobSizeBytes ${store.stats().blobSizeBytes})`,
+    );
+
+    const stored = getMintRequestPreimageBytes(store, requestHash);
+    assert.ok(stored, 'the preimage reads back');
+    assert.equal(sha256(stored!), requestHash);
+    await fx.manager.close();
+  });
+
+  it('image-bearing mint: the preimage survives close and reopen', async () => {
+    const data = zzImageBase64(37);
+    const mock = acceptingMembrane();
+    const path = freshPath();
+    const fx = await imageMintFixture(mock.membrane, data, {}, path);
+    const requestHash = carrierRequestHash(mock.calls, data);
+    assert.equal(sha256(getMintRequestPreimageBytes(fx.manager.getStore(), requestHash)!), requestHash);
+    await fx.manager.close();
+
+    const reopened = await ContextManager.open({
+      path,
+      strategy: new Probe({ compressionModel: ZZ_MINT_MODEL, autoTickOnNewMessage: false }),
+      membrane: mock.membrane as never,
+    });
+    const reloaded = getMintRequestPreimageBytes(reopened.getStore(), requestHash);
+    assert.ok(reloaded, 'the preimage outlives the process that minted it');
+    assert.equal(sha256(reloaded!), requestHash, 'and still hashes back after reopen');
+    assert.ok(reloaded!.toString('utf8').includes(data), 'image included');
+    await reopened.close();
+  });
+
+  it('several images, one of them repeated: every span splices back in order', async () => {
+    const first = zzImageBase64(71);
+    const second = zzImageBase64(97);
+    const mock = acceptingMembrane();
+    const strategy = new Probe({
+      compressionModel: ZZ_MINT_MODEL,
+      persistMintPreimages: true,
+      targetChunkTokens: 50,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+    });
+    const manager = await ContextManager.open({
+      path: freshPath(),
+      strategy,
+      membrane: mock.membrane as never,
+    });
+    for (let i = 0; i < 8; i++) {
+      const content =
+        i === 1 ? [t('zz-shot-one'), zzImageBlock(first), zzImageBlock(second)]
+        : i === 3 ? [t('zz-shot-again'), zzImageBlock(first)]
+        : [t(`zz-chunked-${i} ` + 'word '.repeat(30))];
+      manager.addMessage(i % 2 ? 'Claude' : 'User', content);
+    }
+    await manager.compile();
+    await strategy.tick(ctx(manager));
+
+    const store = manager.getStore();
+    const carrier = mock.calls.find(
+      (call) => JSON.stringify(call).includes(first) && JSON.stringify(call).includes(second),
+    );
+    assert.ok(carrier, 'setup: one mint request carries all three inline images');
+    const requestJson = JSON.stringify(carrier);
+    const requestHash = sha256(Buffer.from(requestJson, 'utf8'));
+
+    const described = describeStoredMintPreimage(store, requestHash);
+    assert.equal(described.form, 'envelope');
+    assert.deepEqual(
+      described.form === 'envelope' ? described.blobHashes : described,
+      [
+        sha256(Buffer.from(first, 'base64')),
+        sha256(Buffer.from(second, 'base64')),
+        sha256(Buffer.from(first, 'base64')),
+      ],
+      'one reference per occurrence, in document order — the repeat shares its blob',
+    );
+
+    const bytes = getMintRequestPreimageBytes(store, requestHash);
+    assert.equal(bytes!.toString('utf8'), requestJson, 'the whole request splices back byte for byte');
+    assert.equal(sha256(bytes!), requestHash);
+    await manager.close();
+  });
+
+  it('text-only mint: the preimage is still the plain request blob', async () => {
+    const mock = acceptingMembrane();
+    const fx = await l1Fixture(mock.membrane);
+    const store = fx.manager.getStore();
+    const l1 = fx.strategy.summariesView().find((s) => s.level === 1 && s.provenance);
+    const requestHash = l1!.provenance!.requestHash;
+
+    assert.equal(
+      describeStoredMintPreimage(store, requestHash).form,
+      'inline',
+      'a text-only preimage keeps the plain whole-request form',
+    );
+    const plain = store.getBlob(requestHash);
+    assert.ok(plain, 'a text-only preimage keeps the plain content-addressed form');
+    assert.equal(sha256(plain!), requestHash);
+    assert.equal(
+      plain!.toString('utf8'),
+      getMintRequestPreimageBytes(store, requestHash)!.toString('utf8'),
+      'and the read path returns exactly those bytes',
+    );
+    await fx.manager.close();
+  });
 });
