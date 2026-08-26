@@ -14,25 +14,25 @@ import type { NormalizedRequest } from '@animalabs/membrane';
  * to keep. A hash you can verify but not read is provenance only while
  * somebody else's log lives.
  *
- * Chronicle's blob store closes that gap with no new format and no new
- * filesystem convention: `storeBlob` keys content by sha256 of the bytes —
- * the SAME digest `sha256Json` computes for `requestHash` — so a text-only
- * preimage written here is retrievable under the hash the summary already
- * carries, deduplicated across retries for free, and durable in the same
- * store the summary itself persists to.
+ * For text-only requests, Chronicle's blob store closes that gap without a
+ * wrapper or new filesystem convention: `storeBlob` keys content by sha256 of
+ * the bytes — the SAME digest `sha256Json` computes for `requestHash` — so the
+ * preimage is retrievable under the hash the summary already carries,
+ * deduplicated across retries for free, and durable in the same store the
+ * summary itself persists to.
  *
  * INLINE MEDIA IS NOT RE-EMBEDDED (maintainer review, PR #79). A mint request
  * replays raw history, so a single preimage can carry megabytes of base64
  * image content, and content-addressing cannot dedupe it: the blob key is the
  * hash of the WHOLE request and no two mints send the same request. That was
- * the dominant growth term, unbounded over a long-lived store. The image bytes
- * are already in this store — `MessageStore` extracts every base64 media
- * source to a content-addressed blob on add (`BlobManager`) — so a
- * media-bearing preimage persists as an ENVELOPE: the request's own JSON text
- * split into literal spans and references to those existing blobs, keyed by
- * `requestHash` in a Chronicle tree state. `getMintRequestPreimageBytes`
- * splices the base64 back in at read time and verifies the result, so the
- * feature's contract is unchanged and enforced at both ends:
+ * the dominant growth term, unbounded over a long-lived store. A media-bearing
+ * preimage therefore persists as an ENVELOPE: the request's own JSON text
+ * split into literal spans and references to content-addressed media blobs in
+ * the same store, keyed by `requestHash` in a Chronicle tree state. Media that
+ * `MessageStore` already extracted reuses its existing blob; any other inline
+ * media is stored once. `getMintRequestPreimageBytes` restores the exact
+ * original base64 spelling, splices it back in, and verifies the result, so
+ * the feature's contract is unchanged and enforced at both ends:
  * `sha256(returned) === requestHash`, byte for byte.
  */
 const MINT_REQUEST_PREIMAGE_CONTENT_TYPE = 'application/json';
@@ -48,16 +48,21 @@ const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
 
 const MINT_PREIMAGE_ENVELOPE_VERSION = 1;
 
-/**
- * Base64 payloads below this stay inline in the envelope's literal text: a
- * blob record per thumbnail costs more than the bytes it saves, and the growth
- * term the review names is megabyte-scale image content.
- */
-const MIN_EXTRACTED_BASE64_CHARS = 1024;
+interface Base64Whitespace {
+  at: number;
+  text: string;
+}
+
+interface Base64EncodingForm {
+  alphabet: 'standard' | 'url' | 'mixed';
+  paddingChars: number;
+  urlSafePositions?: number[];
+  whitespace?: Base64Whitespace[];
+}
 
 type MintPreimageSegment =
   | { kind: 'literal'; text: string }
-  | { kind: 'mediaBlob'; blobHash: string; base64Chars: number };
+  | { kind: 'mediaBlob'; blobHash: string; encoding: Base64EncodingForm };
 
 interface MintPreimageEnvelope {
   version: number;
@@ -67,7 +72,15 @@ interface MintPreimageEnvelope {
 interface InlineBase64Media {
   data: string;
   mediaType: string;
+  jsonStart: number;
+  jsonEnd: number;
 }
+
+type JsonSpan =
+  | { kind: 'string'; start: number; end: number }
+  | { kind: 'array'; items: JsonSpan[] }
+  | { kind: 'object'; fields: Map<string, JsonSpan> }
+  | { kind: 'scalar' };
 
 /**
  * A stored envelope exists but its bytes cannot be reproduced — a referenced
@@ -77,8 +90,8 @@ interface InlineBase64Media {
  * the read APIs keeps its narrow meaning of "nothing was persisted here".
  */
 export class MintPreimageMaterializationError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = 'MintPreimageMaterializationError';
   }
 }
@@ -87,58 +100,268 @@ function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-/**
- * Every inline base64 media payload in the request, in the order
- * `JSON.stringify` emits them — membrane's `Base64Source` (image, document,
- * audio, video, including the ones nested inside tool results) and the
- * `generated_image` block, which carries its own base64 field.
- */
+class JsonSpanParser {
+  private cursor = 0;
+
+  constructor(private readonly json: string) {}
+
+  parse(): JsonSpan {
+    const value = this.parseValue();
+    this.skipWhitespace();
+    if (this.cursor !== this.json.length) {
+      throw new SyntaxError(`unexpected JSON content at byte ${this.cursor}`);
+    }
+    return value;
+  }
+
+  private parseValue(): JsonSpan {
+    this.skipWhitespace();
+    const current = this.json[this.cursor];
+    if (current === '"') return this.parseString();
+    if (current === '{') return this.parseObject();
+    if (current === '[') return this.parseArray();
+    return this.parseScalar();
+  }
+
+  private parseString(): Extract<JsonSpan, { kind: 'string' }> {
+    const start = this.cursor;
+    this.expect('"');
+    let escaped = false;
+    while (this.cursor < this.json.length) {
+      const current = this.json[this.cursor]!;
+      this.cursor++;
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (current === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (current === '"') {
+        return { kind: 'string', start, end: this.cursor };
+      }
+    }
+    throw new SyntaxError(`unterminated JSON string at byte ${start}`);
+  }
+
+  private parseObject(): Extract<JsonSpan, { kind: 'object' }> {
+    const fields = new Map<string, JsonSpan>();
+    this.expect('{');
+    this.skipWhitespace();
+    if (this.json[this.cursor] === '}') {
+      this.cursor++;
+      return { kind: 'object', fields };
+    }
+    while (true) {
+      const keySpan = this.parseString();
+      const key = decodeJsonString(this.json, keySpan);
+      this.skipWhitespace();
+      this.expect(':');
+      fields.set(key, this.parseValue());
+      this.skipWhitespace();
+      const delimiter = this.json[this.cursor];
+      this.cursor++;
+      if (delimiter === '}') return { kind: 'object', fields };
+      if (delimiter !== ',') {
+        throw new SyntaxError(`expected ',' or '}' at byte ${this.cursor - 1}`);
+      }
+      this.skipWhitespace();
+    }
+  }
+
+  private parseArray(): Extract<JsonSpan, { kind: 'array' }> {
+    const items: JsonSpan[] = [];
+    this.expect('[');
+    this.skipWhitespace();
+    if (this.json[this.cursor] === ']') {
+      this.cursor++;
+      return { kind: 'array', items };
+    }
+    while (true) {
+      items.push(this.parseValue());
+      this.skipWhitespace();
+      const delimiter = this.json[this.cursor];
+      this.cursor++;
+      if (delimiter === ']') return { kind: 'array', items };
+      if (delimiter !== ',') {
+        throw new SyntaxError(`expected ',' or ']' at byte ${this.cursor - 1}`);
+      }
+      this.skipWhitespace();
+    }
+  }
+
+  private parseScalar(): Extract<JsonSpan, { kind: 'scalar' }> {
+    const start = this.cursor;
+    while (
+      this.cursor < this.json.length &&
+      !/[\s,\]}]/.test(this.json[this.cursor]!)
+    ) {
+      this.cursor++;
+    }
+    JSON.parse(this.json.slice(start, this.cursor));
+    return { kind: 'scalar' };
+  }
+
+  private skipWhitespace(): void {
+    while (/\s/.test(this.json[this.cursor] ?? '')) this.cursor++;
+  }
+
+  private expect(expected: string): void {
+    if (this.json[this.cursor] !== expected) {
+      throw new SyntaxError(`expected '${expected}' at byte ${this.cursor}`);
+    }
+    this.cursor++;
+  }
+}
+
+function decodeJsonString(
+  json: string,
+  span: Extract<JsonSpan, { kind: 'string' }>,
+): string {
+  return JSON.parse(json.slice(span.start, span.end)) as string;
+}
+
+function jsonStringValue(json: string, span: JsonSpan | undefined): string | null {
+  return span?.kind === 'string' ? decodeJsonString(json, span) : null;
+}
+
 function collectInlineBase64Media(
-  value: unknown,
+  json: string,
+  span: JsonSpan,
   found: InlineBase64Media[] = [],
 ): InlineBase64Media[] {
-  if (Array.isArray(value)) {
-    for (const item of value) collectInlineBase64Media(item, found);
+  if (span.kind === 'array') {
+    for (const item of span.items) collectInlineBase64Media(json, item, found);
     return found;
   }
-  if (value === null || typeof value !== 'object') return found;
-  const fields = value as Record<string, unknown>;
-  if (fields.type === 'base64' && typeof fields.data === 'string' && typeof fields.mediaType === 'string') {
-    found.push({ data: fields.data, mediaType: fields.mediaType });
+  if (span.kind !== 'object') return found;
+  const type = jsonStringValue(json, span.fields.get('type'));
+  const dataSpan = span.fields.get('data');
+  const data = jsonStringValue(json, dataSpan);
+  const mediaType = type === 'base64'
+    ? jsonStringValue(json, span.fields.get('mediaType'))
+    : type === 'generated_image'
+      ? jsonStringValue(json, span.fields.get('mimeType'))
+      : null;
+  if (dataSpan?.kind === 'string' && data !== null && mediaType !== null) {
+    found.push({
+      data,
+      mediaType,
+      jsonStart: dataSpan.start,
+      jsonEnd: dataSpan.end,
+    });
     return found;
   }
-  if (fields.type === 'generated_image' && typeof fields.data === 'string' && typeof fields.mimeType === 'string') {
-    found.push({ data: fields.data, mediaType: fields.mimeType });
-    return found;
+  for (const nested of span.fields.values()) {
+    collectInlineBase64Media(json, nested, found);
   }
-  for (const nested of Object.values(fields)) collectInlineBase64Media(nested, found);
   return found;
 }
 
-/**
- * The envelope for a request whose JSON text carries extractable media, or
- * null when there is none — in which case the caller stores the plain
- * preimage. Extraction is byte-conservative: a payload is only replaced when
- * base64 decode/re-encode reproduces the original characters exactly, so the
- * splice can never invent bytes the request did not have.
- */
+function applyBase64EncodingForm(
+  bytes: Buffer,
+  encoding: Base64EncodingForm,
+): string | null {
+  const canonical = bytes.toString('base64');
+  const canonicalBody = canonical.replace(/=+$/, '');
+  const canonicalPaddingChars = canonical.length - canonicalBody.length;
+  if (
+    encoding.paddingChars !== 0 &&
+    encoding.paddingChars !== canonicalPaddingChars
+  ) {
+    return null;
+  }
+
+  let body = canonicalBody;
+  if (encoding.alphabet === 'url') {
+    body = body.replace(/\+/g, '-').replace(/\//g, '_');
+  } else if (encoding.alphabet === 'mixed') {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const at of encoding.urlSafePositions ?? []) {
+      const current = canonicalBody[at];
+      if (at < cursor || (current !== '+' && current !== '/')) return null;
+      parts.push(canonicalBody.slice(cursor, at), current === '+' ? '-' : '_');
+      cursor = at + 1;
+    }
+    parts.push(canonicalBody.slice(cursor));
+    body = parts.join('');
+  }
+
+  const symbols = body + '='.repeat(encoding.paddingChars);
+  if (!encoding.whitespace || encoding.whitespace.length === 0) return symbols;
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const whitespace of encoding.whitespace) {
+    if (whitespace.at < cursor || whitespace.at > symbols.length) return null;
+    parts.push(symbols.slice(cursor, whitespace.at), whitespace.text);
+    cursor = whitespace.at;
+  }
+  parts.push(symbols.slice(cursor));
+  return parts.join('');
+}
+
+function parseBase64EncodingForm(
+  data: string,
+): { bytes: Buffer; encoding: Base64EncodingForm } | null {
+  const whitespace: Base64Whitespace[] = [];
+  let removedChars = 0;
+  const symbols = data.replace(/[ \t\r\n]+/g, (text: string, offset: number) => {
+    whitespace.push({ at: offset - removedChars, text });
+    removedChars += text.length;
+    return '';
+  });
+  const padding = /=+$/.exec(symbols)?.[0] ?? '';
+  if (padding.length > 2) return null;
+  const body = padding.length > 0 ? symbols.slice(0, -padding.length) : symbols;
+  if (body.includes('=') || !/^[A-Za-z0-9+/_-]*$/.test(body)) return null;
+  const remainder = body.length % 4;
+  if (remainder === 1) return null;
+  const canonicalPaddingChars = remainder === 0 ? 0 : 4 - remainder;
+  if (padding.length !== 0 && padding.length !== canonicalPaddingChars) return null;
+
+  const standardBody = body.replace(/-/g, '+').replace(/_/g, '/');
+  const canonical = standardBody + '='.repeat(canonicalPaddingChars);
+  const bytes = Buffer.from(canonical, 'base64');
+  if (bytes.toString('base64') !== canonical) return null;
+
+  const hasStandardAlphabet = /[+/]/.test(body);
+  const hasUrlAlphabet = /[-_]/.test(body);
+  const alphabet = hasUrlAlphabet
+    ? hasStandardAlphabet
+      ? 'mixed'
+      : 'url'
+    : 'standard';
+  const urlSafePositions = alphabet === 'mixed'
+    ? [...body.matchAll(/[-_]/g)].map((match) => match.index)
+    : undefined;
+  const encoding: Base64EncodingForm = {
+    alphabet,
+    paddingChars: padding.length,
+    ...(urlSafePositions ? { urlSafePositions } : {}),
+    ...(whitespace.length > 0 ? { whitespace } : {}),
+  };
+  return applyBase64EncodingForm(bytes, encoding) === data
+    ? { bytes, encoding }
+    : null;
+}
+
 function buildPreimageEnvelope(
   store: JsStore,
   requestJson: string,
-  media: InlineBase64Media[],
 ): MintPreimageEnvelope | null {
+  const json = new JsonSpanParser(requestJson).parse();
+  const media = collectInlineBase64Media(requestJson, json);
   const segments: MintPreimageSegment[] = [];
   let cursor = 0;
-  for (const { data, mediaType } of media) {
-    if (data.length < MIN_EXTRACTED_BASE64_CHARS) continue;
-    const decoded = Buffer.from(data, 'base64');
-    if (decoded.toString('base64') !== data) continue;
-    const at = requestJson.indexOf(data, cursor);
-    if (at < 0) continue;
-    const blobHash = store.storeBlob(decoded, mediaType);
-    segments.push({ kind: 'literal', text: requestJson.slice(cursor, at) });
-    segments.push({ kind: 'mediaBlob', blobHash, base64Chars: data.length });
-    cursor = at + data.length;
+  for (const { data, mediaType, jsonStart, jsonEnd } of media) {
+    const parsed = parseBase64EncodingForm(data);
+    if (parsed === null) continue;
+    const blobHash = store.storeBlob(parsed.bytes, mediaType);
+    segments.push({ kind: 'literal', text: requestJson.slice(cursor, jsonStart) });
+    segments.push({ kind: 'mediaBlob', blobHash, encoding: parsed.encoding });
+    cursor = jsonEnd;
   }
   if (segments.length === 0) return null;
   segments.push({ kind: 'literal', text: requestJson.slice(cursor) });
@@ -158,11 +381,119 @@ function materializeEnvelope(store: JsStore, envelope: MintPreimageEnvelope): Bu
     }
     const blob = store.getBlob(segment.blobHash);
     if (blob === null) return null;
-    const base64 = blob.toString('base64');
-    if (base64.length !== segment.base64Chars) return null;
-    parts.push(Buffer.from(base64, 'utf8'));
+    const base64 = applyBase64EncodingForm(blob, segment.encoding);
+    if (base64 === null) return null;
+    parts.push(Buffer.from(JSON.stringify(base64), 'utf8'));
   }
   return Buffer.concat(parts);
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseBase64EncodingFormRecord(value: unknown): Base64EncodingForm {
+  const record = requireRecord(value, 'media encoding');
+  const alphabet = record.alphabet;
+  const paddingChars = record.paddingChars;
+  if (alphabet !== 'standard' && alphabet !== 'url' && alphabet !== 'mixed') {
+    throw new TypeError('media encoding alphabet is invalid');
+  }
+  if (
+    !Number.isSafeInteger(paddingChars) ||
+    (paddingChars as number) < 0 ||
+    (paddingChars as number) > 2
+  ) {
+    throw new TypeError('media encoding paddingChars is invalid');
+  }
+
+  let urlSafePositions: number[] | undefined;
+  if (alphabet === 'mixed') {
+    if (!Array.isArray(record.urlSafePositions)) {
+      throw new TypeError('mixed media encoding requires urlSafePositions');
+    }
+    urlSafePositions = [];
+    let previous = -1;
+    for (const position of record.urlSafePositions) {
+      if (
+        !Number.isSafeInteger(position) ||
+        (position as number) <= previous
+      ) {
+        throw new TypeError('media encoding urlSafePositions is invalid');
+      }
+      previous = position as number;
+      urlSafePositions.push(previous);
+    }
+  }
+
+  let whitespace: Base64Whitespace[] | undefined;
+  if (record.whitespace !== undefined) {
+    if (!Array.isArray(record.whitespace)) {
+      throw new TypeError('media encoding whitespace is invalid');
+    }
+    whitespace = [];
+    let previous = -1;
+    for (const item of record.whitespace) {
+      const whitespaceRecord = requireRecord(item, 'media encoding whitespace');
+      const at = whitespaceRecord.at;
+      const text = whitespaceRecord.text;
+      if (
+        !Number.isSafeInteger(at) ||
+        (at as number) < previous
+      ) {
+        throw new TypeError('media encoding whitespace position is invalid');
+      }
+      if (typeof text !== 'string' || !/^[ \t\r\n]+$/.test(text)) {
+        throw new TypeError('media encoding whitespace text is invalid');
+      }
+      previous = at as number;
+      whitespace.push({ at: previous, text });
+    }
+  }
+
+  return {
+    alphabet,
+    paddingChars: paddingChars as number,
+    ...(urlSafePositions ? { urlSafePositions } : {}),
+    ...(whitespace ? { whitespace } : {}),
+  };
+}
+
+function parseEnvelopeRecord(
+  value: unknown,
+  requestHash: string,
+): MintPreimageEnvelope {
+  const record = requireRecord(value, 'mint preimage envelope');
+  if (typeof record.version !== 'number') {
+    throw new TypeError('mint preimage envelope version must be a number');
+  }
+  if (record.version !== MINT_PREIMAGE_ENVELOPE_VERSION) {
+    throw new MintPreimageMaterializationError(
+      `mint preimage envelope for ${requestHash} is version ${record.version}, ` +
+        `this build reads version ${MINT_PREIMAGE_ENVELOPE_VERSION}`,
+    );
+  }
+  if (!Array.isArray(record.segments)) {
+    throw new TypeError('mint preimage envelope segments must be an array');
+  }
+  const segments = record.segments.map((value, index): MintPreimageSegment => {
+    const segment = requireRecord(value, `mint preimage envelope segment ${index}`);
+    if (segment.kind === 'literal' && typeof segment.text === 'string') {
+      return { kind: 'literal', text: segment.text };
+    }
+    if (segment.kind === 'mediaBlob' && typeof segment.blobHash === 'string') {
+      return {
+        kind: 'mediaBlob',
+        blobHash: segment.blobHash,
+        encoding: parseBase64EncodingFormRecord(segment.encoding),
+      };
+    }
+    throw new TypeError(`mint preimage envelope segment ${index} is invalid`);
+  });
+  return { version: record.version, segments };
 }
 
 function readEnvelope(store: JsStore, requestHash: string): MintPreimageEnvelope | null {
@@ -174,14 +505,15 @@ function readEnvelope(store: JsStore, requestHash: string): MintPreimageEnvelope
       `mint preimage envelope ${indexed.blobHash} for ${requestHash} is indexed but its blob is gone`,
     );
   }
-  const envelope = JSON.parse(bytes.toString('utf8')) as MintPreimageEnvelope;
-  if (envelope.version !== MINT_PREIMAGE_ENVELOPE_VERSION) {
+  try {
+    return parseEnvelopeRecord(JSON.parse(bytes.toString('utf8')) as unknown, requestHash);
+  } catch (cause) {
+    if (cause instanceof MintPreimageMaterializationError) throw cause;
     throw new MintPreimageMaterializationError(
-      `mint preimage envelope for ${requestHash} is version ${envelope.version}, ` +
-        `this build reads version ${MINT_PREIMAGE_ENVELOPE_VERSION}`,
+      `mint preimage envelope for ${requestHash} is malformed`,
+      { cause },
     );
   }
-  return envelope;
 }
 
 function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHash: string): void {
@@ -230,8 +562,7 @@ export function persistMintRequestPreimage(
           'under the STORED key only',
       );
     }
-    const media = collectInlineBase64Media(request);
-    const envelope = media.length > 0 ? buildPreimageEnvelope(store, requestJson, media) : null;
+    const envelope = buildPreimageEnvelope(store, requestJson);
     if (envelope !== null) {
       const materialized = materializeEnvelope(store, envelope);
       if (materialized !== null && materialized.equals(preimage)) {
@@ -279,7 +610,16 @@ export function getMintRequestPreimageBytes(
   if (plain !== null) return plain;
   const envelope = readEnvelope(store, requestHash);
   if (envelope === null) return null;
-  const materialized = materializeEnvelope(store, envelope);
+  let materialized: Buffer | null;
+  try {
+    materialized = materializeEnvelope(store, envelope);
+  } catch (cause) {
+    if (cause instanceof MintPreimageMaterializationError) throw cause;
+    throw new MintPreimageMaterializationError(
+      `mint preimage ${requestHash} could not be materialized`,
+      { cause },
+    );
+  }
   if (materialized === null) {
     throw new MintPreimageMaterializationError(
       `mint preimage ${requestHash} references media blobs this store no longer has`,
@@ -311,37 +651,4 @@ export function getMintRequestByHash(
   const bytes = getMintRequestPreimageBytes(store, requestHash);
   if (bytes === null) return null;
   return JSON.parse(bytes.toString('utf8')) as NormalizedRequest;
-}
-
-/**
- * What a preimage costs this store, without materializing it: `inline` is the
- * plain whole-request blob (text-only mints), `envelope` is the media-bearing
- * form, where `storedBytes` counts ONLY the envelope — the media blobs it
- * names are the ones the messages themselves already put in the store, so
- * `blobHashes` is exactly the list of blobs this preimage shares rather than
- * copies. Answers "what is preimage persistence growing?" directly.
- */
-export type StoredMintPreimage =
-  | { form: 'absent' }
-  | { form: 'inline'; storedBytes: number }
-  | { form: 'envelope'; storedBytes: number; blobHashes: string[] };
-
-export function describeStoredMintPreimage(
-  store: JsStore,
-  requestHash: string,
-): StoredMintPreimage {
-  const plain = store.getBlob(requestHash);
-  if (plain !== null) return { form: 'inline', storedBytes: plain.length };
-  const indexed = store.treeGet(MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, requestHash);
-  if (indexed === null) return { form: 'absent' };
-  const envelope = readEnvelope(store, requestHash);
-  if (envelope === null) return { form: 'absent' };
-  return {
-    form: 'envelope',
-    storedBytes: indexed.size,
-    blobHashes: envelope.segments
-      .filter((segment): segment is Extract<MintPreimageSegment, { kind: 'mediaBlob' }> =>
-        segment.kind === 'mediaBlob')
-      .map((segment) => segment.blobHash),
-  };
 }
