@@ -87,6 +87,7 @@ export {
   OverBudgetError,
   UncoveredDropError,
   accountFrontier,
+  type OverBudgetDiagnostics,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,
