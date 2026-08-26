@@ -188,25 +188,31 @@ export class MessageStore {
 
 
   private indexWriteVersion = -1;
+  private indexBranch = '';
 
   /**
-   * Id→index lookup that survives sibling-instance writes. Same-instance
-   * mutators maintain the index themselves and stamp indexWriteVersion at
-   * their bump; a version the stamp hasn't seen means a SIBLING
-   * MessageStore on this JsStore wrote (append shifts nothing, but
-   * removals shift indices and new ids are unknown) — rebuild once, then
-   * resolve. O(1) on every same-instance path (2026-07-25 review class:
-   * stale sibling index previously threw "Message not found" or, after
-   * shifts, would have mutated the wrong item).
+   * Id→index lookup that survives both sibling-instance writes and Chronicle
+   * branch switches. Same-instance mutators maintain the index themselves and
+   * stamp indexWriteVersion at their bump; a version the stamp hasn't seen
+   * means a SIBLING MessageStore on this JsStore wrote. Branches can expose
+   * different append-log shapes without changing that process-local version,
+   * so branch name is an independent freshness key. Rebuild once, then
+   * resolve. O(1) on every same-instance, same-branch path (2026-07-25 review
+   * class: a stale index previously threw "Message not found" or, after
+   * shifts, would have mutated or branched from the wrong item).
    */
   private lookupIndex(messageId: MessageId): number | undefined {
-    if (this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)) {
+    if (
+      this.indexBranch !== this.store.currentBranch().name ||
+      this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
+    ) {
       this.rebuildIndex();
     }
     return this.idToIndex.get(messageId);
   }
 
   private rebuildIndex(): void {
+    this.indexBranch = this.store.currentBranch().name;
     this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
