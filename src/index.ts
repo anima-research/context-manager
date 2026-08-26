@@ -15,7 +15,10 @@ export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,
   getMintRequestByHash,
+  describeStoredMintPreimage,
+  MintPreimageMaterializationError,
 } from './mint-preimage.js';
+export type { StoredMintPreimage } from './mint-preimage.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
