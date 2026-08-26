@@ -8,6 +8,7 @@ import type {
   PhaseType,
 } from '../types/index.js';
 import { AutobiographicalStrategy, type Chunk } from './autobiographical.js';
+import type { ConfigLayer } from '../config-provenance.js';
 
 const DEFAULT_RESEARCH_PREFIXES = ['mcpl:', 'zulip:'];
 const DEFAULT_SUBAGENT_PREFIXES = ['subagent:'];
@@ -31,11 +32,20 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   private knowledgeConfig: KnowledgeConfig;
 
   constructor(config: KnowledgeOptions = {}) {
-    // Force hierarchical mode
-    super({ ...config, hierarchical: true });
+    super(config);
     // Merge knowledge-specific fields onto the base config so all KnowledgeConfig
     // fields are actually present (super() only stores AutobiographicalConfig fields).
     this.knowledgeConfig = { ...this.config, ...config } as KnowledgeConfig;
+  }
+
+  /**
+   * Hierarchical mode is forced: the phase-aware pyramid is what this strategy
+   * IS, and a caller cannot switch it off. It is enforced as its own layer
+   * rather than folded into the caller's — the effective value is the same
+   * `true` either way, but the provenance map now says who really chose it.
+   */
+  protected enforcedConfigLayer(): ConfigLayer | null {
+    return { source: 'knowledge-enforced', values: { hierarchical: true } };
   }
 
   // ============================================================================

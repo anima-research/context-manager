@@ -930,6 +930,25 @@ export interface AutobiographicalConfig {
    * positive; no effect unless lower than the live compile budget.
    */
   productionBudgetTokens?: number;
+
+  /**
+   * Emit a one-shot effective-config report when the strategy INITIALIZES: one
+   * structured line on stderr (`event: 'config:effective'`) carrying every
+   * resolved key with the layer that supplied it — 'library-default',
+   * 'caller', 'knowledge-enforced', or whatever a host names its own layers.
+   * A strategy that is constructed and never initialized emits nothing, and a
+   * subclass instance reports the strategy it actually is. Default false;
+   * nothing is emitted unless this is explicitly on. The same map is always
+   * available programmatically as `strategy.configProvenance`.
+   *
+   * The line carries three maps, not two: `effective`, `provenance`, and
+   * `presentAsUndefined`. A key a caller supplied as explicit `undefined` stays
+   * present in the effective config (spread fidelity) but cannot survive JSON,
+   * so it is listed by name in `presentAsUndefined` instead — leaving every
+   * provenance key either valued in `effective` or named there, and never both.
+   * `null` is a JSON value and rides `effective` as itself.
+   */
+  logEffectiveConfig?: boolean;
 }
 
 /**
