@@ -23,11 +23,12 @@ import { existsSync, rmSync } from 'node:fs';
 import {
   ContextManager,
   AutobiographicalStrategy,
-  describeStoredMintPreimage,
   getMintRequestByHash,
   getMintRequestPreimageBytes,
+  MintPreimageMaterializationError,
+  persistMintRequestPreimage,
 } from '../src/index.js';
-import type { JsStore } from '@animalabs/chronicle';
+import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
@@ -93,6 +94,31 @@ function ctx(manager: ContextManager): StrategyContext {
 
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function storedEnvelopeBytes(store: JsStore, requestHash: string): Buffer {
+  const indexed = store.treeGet('mint-preimage-envelopes', requestHash);
+  assert.ok(indexed, 'the request hash indexes a mint preimage envelope');
+  const bytes = store.getBlob(indexed!.blobHash);
+  assert.ok(bytes, 'the indexed mint preimage envelope blob exists');
+  return bytes!;
+}
+
+type StoredEnvelopeSegment =
+  | { kind: 'literal'; text: string }
+  | { kind: 'mediaBlob'; blobHash: string };
+
+function storedEnvelopeSegments(store: JsStore, requestHash: string): StoredEnvelopeSegment[] {
+  const envelope = JSON.parse(storedEnvelopeBytes(store, requestHash).toString('utf8')) as {
+    segments: StoredEnvelopeSegment[];
+  };
+  return envelope.segments;
+}
+
+function storedEnvelopeBlobHashes(store: JsStore, requestHash: string): string[] {
+  return storedEnvelopeSegments(store, requestHash).flatMap((segment) =>
+    segment.kind === 'mediaBlob' ? [segment.blobHash] : [],
+  );
 }
 
 /**
@@ -254,10 +280,6 @@ describe('Mint request preimages', () => {
       } else {
         assert.equal(bytes, null, 'nothing written');
         assert.equal(getMintRequestByHash(fx.manager.getStore(), requestHash), null);
-        assert.equal(
-          describeStoredMintPreimage(fx.manager.getStore(), requestHash).form,
-          'absent',
-        );
       }
       await fx.manager.close();
     });
@@ -474,6 +496,22 @@ const zzImageBlock = (data: string): ContentBlock => ({
   source: { type: 'base64', mediaType: 'image/png', data },
 });
 
+function persistDirectRequest(content: ContentBlock[]): {
+  store: JsStore;
+  requestJson: string;
+  requestHash: string;
+} {
+  const store = JsStore.create({ path: freshPath() });
+  const request: NormalizedRequest = {
+    messages: [{ participant: 'zz-user', content }],
+    config: { model: ZZ_MINT_MODEL, maxTokens: 1 },
+  };
+  const requestJson = JSON.stringify(request);
+  const requestHash = sha256(Buffer.from(requestJson, 'utf8'));
+  persistMintRequestPreimage(store, request, requestHash);
+  return { store, requestJson, requestHash };
+}
+
 /** A chunk carrying one inline image, driven through the real L1 mint ladder. */
 async function imageMintFixture(
   membrane: unknown,
@@ -551,12 +589,12 @@ describe('Mint preimages do not re-embed inline media', () => {
     const parsed = getMintRequestByHash(store, requestHash);
     assert.ok(Array.isArray((parsed as { messages?: unknown[] }).messages));
 
-    const described = describeStoredMintPreimage(store, requestHash);
-    assert.equal(described.form, 'envelope', 'a media-bearing preimage stores as an envelope');
+    const envelope = storedEnvelopeBytes(store, requestHash);
     assert.ok(
-      described.form === 'envelope' && described.storedBytes < 10_000,
-      `the stored envelope carries no base64 body (stored ${JSON.stringify(described)})`,
+      envelope.length < 10_000,
+      `the stored envelope is small (${envelope.length} bytes)`,
     );
+    assert.equal(envelope.includes(Buffer.from(data)), false, 'the envelope carries no base64 body');
     await fx.manager.close();
   });
 
@@ -573,9 +611,8 @@ describe('Mint preimages do not re-embed inline media', () => {
       'setup: the message store already holds the image as a content-addressed blob',
     );
 
-    const described = describeStoredMintPreimage(store, requestHash);
     assert.deepEqual(
-      described.form === 'envelope' ? described.blobHashes : described,
+      storedEnvelopeBlobHashes(store, requestHash),
       [imageBlobHash],
       'the envelope names the blob the messages already stored — it shares, it does not copy',
     );
@@ -650,10 +687,8 @@ describe('Mint preimages do not re-embed inline media', () => {
     const requestJson = JSON.stringify(carrier);
     const requestHash = sha256(Buffer.from(requestJson, 'utf8'));
 
-    const described = describeStoredMintPreimage(store, requestHash);
-    assert.equal(described.form, 'envelope');
     assert.deepEqual(
-      described.form === 'envelope' ? described.blobHashes : described,
+      storedEnvelopeBlobHashes(store, requestHash),
       [
         sha256(Buffer.from(first, 'base64')),
         sha256(Buffer.from(second, 'base64')),
@@ -668,6 +703,85 @@ describe('Mint preimages do not re-embed inline media', () => {
     await manager.close();
   });
 
+  it('small image: the image part is replaced uniformly', () => {
+    const data = Buffer.alloc(96, 17).toString('base64');
+    const fx = persistDirectRequest([zzImageBlock(data)]);
+
+    assert.equal(fx.store.getBlob(fx.requestHash), null, 'no whole-request blob is stored');
+    const envelope = storedEnvelopeBytes(fx.store, fx.requestHash);
+    assert.equal(envelope.includes(Buffer.from(data)), false, 'the small payload is absent from the envelope');
+    assert.equal(getMintRequestPreimageBytes(fx.store, fx.requestHash)!.toString('utf8'), fx.requestJson);
+    fx.store.close();
+  });
+
+  it('unpadded base64: the original spelling materializes byte for byte', () => {
+    const data = Buffer.alloc(120_001, 31).toString('base64').replace(/=+$/, '');
+    const fx = persistDirectRequest([zzImageBlock(data)]);
+
+    assert.equal(fx.store.getBlob(fx.requestHash), null, 'no whole-request blob is stored');
+    const envelope = storedEnvelopeBytes(fx.store, fx.requestHash);
+    assert.equal(envelope.includes(Buffer.from(data)), false, 'the unpadded payload is absent from the envelope');
+    const materialized = getMintRequestPreimageBytes(fx.store, fx.requestHash);
+    assert.equal(materialized!.toString('utf8'), fx.requestJson);
+    assert.equal(sha256(materialized!), fx.requestHash);
+    fx.store.close();
+  });
+
+  it('base64url with line whitespace: the original spelling materializes byte for byte', () => {
+    const decoded = Buffer.alloc(4_097);
+    for (let index = 0; index < decoded.length; index++) {
+      decoded[index] = (index * 43 + 197) % 256;
+    }
+    const unwrapped = decoded
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const data = unwrapped.replace(/(.{67})/g, '$1\r\n');
+    assert.match(data, /[-_]/, 'setup: the spelling uses the URL-safe alphabet');
+    assert.ok(data.includes('\r\n'), 'setup: the spelling carries line whitespace');
+    const fx = persistDirectRequest([zzImageBlock(data)]);
+
+    assert.equal(fx.store.getBlob(fx.requestHash), null, 'no whole-request blob is stored');
+    const envelope = storedEnvelopeBytes(fx.store, fx.requestHash);
+    assert.equal(envelope.includes(Buffer.from(data)), false, 'the original spelling is absent from the envelope');
+    const materialized = getMintRequestPreimageBytes(fx.store, fx.requestHash);
+    assert.equal(materialized!.toString('utf8'), fx.requestJson);
+    assert.equal(sha256(materialized!), fx.requestHash);
+    fx.store.close();
+  });
+
+  it('payload repeated in earlier text: the image occurrence is replaced', () => {
+    const data = zzImageBase64(109);
+    const fx = persistDirectRequest([t(data), zzImageBlock(data)]);
+
+    const segments = storedEnvelopeSegments(fx.store, fx.requestHash);
+    const mediaIndex = segments.findIndex((segment) => segment.kind === 'mediaBlob');
+    assert.notEqual(mediaIndex, -1, 'the envelope contains the image blob reference');
+    const literalBefore = segments
+      .slice(0, mediaIndex)
+      .flatMap((segment) => segment.kind === 'literal' ? [segment.text] : [])
+      .join('');
+    const literalAfter = segments
+      .slice(mediaIndex + 1)
+      .flatMap((segment) => segment.kind === 'literal' ? [segment.text] : [])
+      .join('');
+    assert.ok(literalBefore.includes(data), 'the earlier text occurrence stays literal');
+    assert.equal(
+      literalAfter.includes(data),
+      false,
+      'the image data occurrence does not remain after the image blob reference',
+    );
+    assert.deepEqual(
+      storedEnvelopeBlobHashes(fx.store, fx.requestHash),
+      [sha256(Buffer.from(data, 'base64'))],
+    );
+    const materialized = getMintRequestPreimageBytes(fx.store, fx.requestHash);
+    assert.equal(materialized!.toString('utf8'), fx.requestJson);
+    assert.equal(sha256(materialized!), fx.requestHash);
+    fx.store.close();
+  });
+
   it('text-only mint: the preimage is still the plain request blob', async () => {
     const mock = acceptingMembrane();
     const fx = await l1Fixture(mock.membrane, { persistMintPreimages: true });
@@ -675,11 +789,6 @@ describe('Mint preimages do not re-embed inline media', () => {
     const l1 = fx.strategy.summariesView().find((s) => s.level === 1 && s.provenance);
     const requestHash = l1!.provenance!.requestHash;
 
-    assert.equal(
-      describeStoredMintPreimage(store, requestHash).form,
-      'inline',
-      'a text-only preimage keeps the plain whole-request form',
-    );
     const plain = store.getBlob(requestHash);
     assert.ok(plain, 'a text-only preimage keeps the plain content-addressed form');
     assert.equal(sha256(plain!), requestHash);
@@ -689,6 +798,50 @@ describe('Mint preimages do not re-embed inline media', () => {
       'and the read path returns exactly those bytes',
     );
     await fx.manager.close();
+  });
+});
+
+function storeWithEnvelopeBytes(envelopeBytes: Buffer): { store: JsStore; requestHash: string } {
+  const requestHash = sha256(Buffer.from('zz-malformed-envelope-request', 'utf8'));
+  const envelopeHash = sha256(envelopeBytes);
+  const store = {
+    getBlob: (hash: string) => hash === envelopeHash ? envelopeBytes : null,
+    treeGet: () => ({ blobHash: envelopeHash, size: envelopeBytes.length, mode: 0 }),
+  } as unknown as JsStore;
+  return { store, requestHash };
+}
+
+describe('Mint preimage materialization failures', () => {
+  it('malformed envelope JSON raises the typed error with its cause', () => {
+    const fx = storeWithEnvelopeBytes(Buffer.from('{zz-invalid-json', 'utf8'));
+
+    assert.throws(
+      () => getMintRequestPreimageBytes(fx.store, fx.requestHash),
+      (error: unknown) => {
+        assert.ok(error instanceof MintPreimageMaterializationError);
+        assert.ok(error.cause instanceof SyntaxError);
+        return true;
+      },
+    );
+  });
+
+  it('malformed envelope segment shape raises the typed error with its cause', () => {
+    const fx = storeWithEnvelopeBytes(Buffer.from(JSON.stringify({
+      version: 1,
+      segments: [{
+        kind: 'mediaBlob',
+        blobHash: sha256(Buffer.from('zz-malformed-envelope-media', 'utf8')),
+      }],
+    }), 'utf8'));
+
+    assert.throws(
+      () => getMintRequestPreimageBytes(fx.store, fx.requestHash),
+      (error: unknown) => {
+        assert.ok(error instanceof MintPreimageMaterializationError);
+        assert.ok(error.cause instanceof TypeError);
+        return true;
+      },
+    );
   });
 });
 
@@ -739,7 +892,6 @@ describe('Preimage persistence never blocks the mint', () => {
       'the preimage read is null — a verifiable hash is not a readable request',
     );
     assert.equal(getMintRequestByHash(store, requestHash), null);
-    assert.equal(describeStoredMintPreimage(store, requestHash).form, 'absent');
 
     // Accepted into the ARCHIVE, not merely into memory: it survives reopen.
     await fx.manager.close();
@@ -768,7 +920,6 @@ describe('Preimage persistence never blocks the mint', () => {
       null,
       'an unindexed envelope reads as absent, not as a throw',
     );
-    assert.equal(describeStoredMintPreimage(store, requestHash).form, 'absent');
     await fx.manager.close();
   });
 });

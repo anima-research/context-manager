@@ -986,13 +986,14 @@ export interface AutobiographicalConfig {
    * survives only as long as the host's harness logs do.
    *
    * OPT-IN, default false. Preimages are stored in the same Chronicle store
-   * as the summaries — inline media is stored by reference to the blobs the
-   * messages already put there, but the request TEXT (a full compression
-   * context) is real growth at mint cadence, and this library has no
-   * retention knob for it yet. Fleets that deploy from checkout would
-   * otherwise have every resident start writing preimages on the next pull,
-   * so turning it on is a deliberate act with an eye on store size. Absent
-   * config means off: only an explicit `true` enables it.
+   * as the summaries — inline media is stored by content-addressed reference,
+   * reusing blobs the messages already put there and storing other inline
+   * media once. The request TEXT (a full compression context) remains real
+   * growth at mint cadence, and this library has no retention knob for it
+   * yet. Fleets that deploy from checkout would otherwise have every
+   * resident start writing preimages on the next pull, so turning it on is a
+   * deliberate act with an eye on store size. Absent config means off: only
+   * an explicit `true` enables it.
    *
    * Writing is best-effort even when true: a store that refuses the write is
    * reported on stderr and the mint proceeds without a preimage.
