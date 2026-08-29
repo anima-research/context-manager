@@ -265,3 +265,47 @@ test('kv-unified malformed relaxation fails closed and invalid bands fail loudly
     KvUnifiedPolicyError,
   );
 });
+
+test('kv-unified left-to-right labels agree with recursive oracle on full welfare selection', () => {
+  const { inputs } = fixture();
+  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
+  const solver = new ExactKvUnifiedPolicySolver(inputs);
+  const options = {
+    maxTokens: 250,
+    presentation: rawPresentation(inputs),
+    cache: {
+      immutablePrefixHash: 'tools-v1',
+      layout: rawLayout,
+      markers: [
+        { unitIndex: 2, offset: 180 },
+        { unitIndex: 4, offset: 360 },
+      ],
+    },
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0,
+      budgetUnderLambda: 100,
+      budgetOverLambda: 200,
+      cacheLambda: 500,
+      cacheScale: 100,
+      continuityLambda: 700,
+      continuityScale: 100,
+      continuityRecencyHalfLifeTokens: 90,
+      continuityRecencyFloor: 0.1,
+      continuityStableFloor: 1,
+    },
+  } as const;
+  const recursive = solver.solve({ ...options, candidateSource: 'recursive' });
+  const labels = solver.solve({ ...options, candidateSource: 'labels' });
+  assert.equal(recursive.feasible, true);
+  assert.equal(labels.feasible, true);
+  if (!recursive.feasible || !labels.feasible) return;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    inputs.chunks.map((chunk) => `${chunk.id}:${candidate.frontier.get(chunk.id) ?? 0}`).join('|');
+  assert.equal(signature(labels.selected), signature(recursive.selected));
+  assert.equal(labels.selected.score, recursive.selected.score);
+  assert.deepEqual(
+    labels.candidates.map((candidate) => [signature(candidate), candidate.score]),
+    recursive.candidates.map((candidate) => [signature(candidate), candidate.score]),
+  );
+});
