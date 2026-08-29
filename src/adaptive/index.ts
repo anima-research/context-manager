@@ -65,6 +65,18 @@ export {
   ExactEnumerationLimitError,
 } from './kv-unified.js';
 export {
+  ExactKvUnifiedPolicySolver,
+  KvUnifiedPolicyError,
+  DEFAULT_KV_UNIFIED_WELFARE_POLICY,
+  type PresentedLeaf,
+  type AcceptedPresentationReference,
+  type ProviderCacheReference,
+  type KvUnifiedWelfarePolicy,
+  type ExactPolicySolveOptions,
+  type ExactPolicyCandidate,
+  type ExactPolicySolveResult,
+} from './kv-unified-policy.js';
+export {
   renderLayout,
   kvCost,
   earliestDivergenceIndex,
