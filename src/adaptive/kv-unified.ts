@@ -125,6 +125,55 @@ export type MinimumTokenResult =
       readonly certificate: MinimumTokenCertificate;
     };
 
+export interface CanonicalSelectAction {
+  readonly level: number;
+  readonly renderedTokens: number;
+  readonly participantLeafIds: readonly ChunkId[];
+  readonly protectedHoleLeafIds: readonly ChunkId[];
+}
+
+export interface CanonicalDecisionNode {
+  readonly key: string;
+  readonly kind: 'leaf' | 'summary';
+  readonly id: ChunkId | SummaryId;
+  readonly firstSequence: number;
+  /** Null when no active leaf can legally select this representation. */
+  readonly select: CanonicalSelectAction | null;
+  /** Chronological child keys followed by the expand action. */
+  readonly expandKeys: readonly string[];
+}
+
+export interface CanonicalDecisionDag {
+  readonly roots: readonly string[];
+  readonly nodes: ReadonlyMap<string, CanonicalDecisionNode>;
+  readonly nodeCount: number;
+  readonly expandEdgeCount: number;
+}
+
+export interface ExactCutCandidate {
+  readonly frontier: ReadonlyMap<ChunkId, number>;
+  readonly renderedTokens: number;
+}
+
+export interface ExactCutEnumerationStats {
+  readonly statesVisited: number;
+  readonly candidatesGenerated: number;
+  readonly maxCandidatesAtState: number;
+  readonly terminalCandidates: number;
+}
+
+export interface ExactCutEnumeration {
+  readonly candidates: readonly ExactCutCandidate[];
+  readonly stats: ExactCutEnumerationStats;
+}
+
+export class ExactEnumerationLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ExactEnumerationLimitError';
+  }
+}
+
 interface MutableSummary {
   id: SummaryId;
   level: number;
@@ -437,6 +486,247 @@ export class CanonicalSummaryForest {
     );
   }
 
+  /**
+   * Linear structural decision graph. A summary has a select action and
+   * chronological expand edges. Protected holes are action annotations: a
+   * solver intersects them with its active-leaf set and continues through
+   * the expand edges for the holes only.
+   */
+  decisionDag(): CanonicalDecisionDag {
+    const nodes = new Map<string, CanonicalDecisionNode>();
+    let expandEdgeCount = 0;
+    for (const leaf of this.orderedLeafList) {
+      const key = leafKey(leaf.id);
+      nodes.set(key, {
+        key,
+        kind: 'leaf',
+        id: leaf.id,
+        firstSequence: leaf.sequence,
+        select: leaf.allowedLevels.includes(0)
+          ? {
+              level: 0,
+              renderedTokens: leaf.externallyAccounted ? 0 : leaf.rawTokens,
+              participantLeafIds: [leaf.id],
+              protectedHoleLeafIds: [],
+            }
+          : null,
+        expandKeys: [],
+      });
+    }
+    for (const summary of this.allSummaries()) {
+      const key = summaryKey(summary.id);
+      const participants = summary.leafIds.filter((leafId) =>
+        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+      );
+      const holes = summary.leafIds.filter((leafId) => !participants.includes(leafId));
+      const expandKeys = this.orderedChildren(summary).map((child) => child.key);
+      expandEdgeCount += expandKeys.length;
+      nodes.set(key, {
+        key,
+        kind: 'summary',
+        id: summary.id,
+        firstSequence: summary.firstSequence,
+        select:
+          participants.length > 0
+            ? {
+                level: summary.level,
+                renderedTokens: summary.recallTokens,
+                participantLeafIds: participants,
+                protectedHoleLeafIds: holes,
+              }
+            : null,
+        expandKeys,
+      });
+    }
+    return {
+      roots: this.roots.map((root) =>
+        root.kind === 'leaf' ? leafKey(root.id) : summaryKey(root.id),
+      ),
+      nodes,
+      nodeCount: nodes.size,
+      expandEdgeCount,
+    };
+  }
+
+  /**
+   * Development oracle: enumerate every structurally feasible cut on a small
+   * forest. This walks the same select/expand semantics as the production DP,
+   * including protected holes, and records frontier-growth telemetry.
+   */
+  enumerateExactCuts(options: {
+    maxLeaves?: number;
+    maxCandidates?: number;
+    maxTokens?: number;
+  } = {}): ExactCutEnumeration {
+    const maxLeaves = options.maxLeaves ?? 12;
+    const maxCandidates = options.maxCandidates ?? 1_000_000;
+    const maxTokens = options.maxTokens ?? Number.POSITIVE_INFINITY;
+    if (this.orderedLeafList.length > maxLeaves) {
+      throw new ExactEnumerationLimitError(
+        `exact cut enumeration is limited to ${maxLeaves} leaves; got ${this.orderedLeafList.length}`,
+      );
+    }
+    if (this.constraintConflicts.length > 0) {
+      return {
+        candidates: [],
+        stats: {
+          statesVisited: 0,
+          candidatesGenerated: 0,
+          maxCandidatesAtState: 0,
+          terminalCandidates: 0,
+        },
+      };
+    }
+
+    const memo = new Map<string, Map<string, Map<ChunkId, number>>>();
+    let statesVisited = 0;
+    let candidatesGenerated = 0;
+    let maxCandidatesAtState = 0;
+    const checkLimit = (count: number): void => {
+      maxCandidatesAtState = Math.max(maxCandidatesAtState, count);
+      if (count > maxCandidates) {
+        throw new ExactEnumerationLimitError(
+          `exact cut enumeration exceeded ${maxCandidates} candidates in one state`,
+        );
+      }
+    };
+
+    const enumerateLeaf = (id: ChunkId): Map<string, Map<ChunkId, number>> => {
+      const leaf = this.leafMap.get(id)!;
+      const cuts = new Map<string, Map<ChunkId, number>>();
+      if (leaf.allowedLevels.includes(0)) {
+        const frontier = new Map<ChunkId, number>([[id, 0]]);
+        cuts.set(this.frontierSignature(frontier, [id]), frontier);
+      }
+      candidatesGenerated += cuts.size;
+      checkLimit(cuts.size);
+      return cuts;
+    };
+
+    const enumerateChildren = (
+      summary: CanonicalSummary,
+      activeLeafIds: readonly ChunkId[],
+      enumerateSummary: (
+        id: SummaryId,
+        active: readonly ChunkId[],
+      ) => Map<string, Map<ChunkId, number>>,
+    ): Map<string, Map<ChunkId, number>> => {
+      const active = new Set(activeLeafIds);
+      let combined = new Map<string, Map<ChunkId, number>>([['', new Map()]]);
+      for (const child of this.orderedChildren(summary)) {
+        let childCuts: Map<string, Map<ChunkId, number>>;
+        if (child.kind === 'leaf') {
+          if (!active.has(child.id)) continue;
+          childCuts = enumerateLeaf(child.id);
+        } else {
+          const childSummary = this.summaryMap.get(child.id)!;
+          const childActive = childSummary.leafIds.filter((leafId) => active.has(leafId));
+          if (childActive.length === 0) continue;
+          childCuts = enumerateSummary(child.id, childActive);
+        }
+        const next = new Map<string, Map<ChunkId, number>>();
+        for (const left of combined.values()) {
+          for (const right of childCuts.values()) {
+            const frontier = combineFrontiers(left, right);
+            next.set(this.frontierSignature(frontier, activeLeafIds), frontier);
+          }
+        }
+        combined = next;
+        candidatesGenerated += combined.size;
+        checkLimit(combined.size);
+      }
+      return combined;
+    };
+
+    const enumerateSummary = (
+      id: SummaryId,
+      activeLeafIds: readonly ChunkId[],
+    ): Map<string, Map<ChunkId, number>> => {
+      const key = `${id}\u0000${activeLeafIds.join('\u0001')}`;
+      const cached = memo.get(key);
+      if (cached) return cloneFrontierSet(cached);
+      statesVisited++;
+      const summary = this.summaryMap.get(id)!;
+      const all = enumerateChildren(summary, activeLeafIds, enumerateSummary);
+      const participants = activeLeafIds.filter((leafId) =>
+        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+      );
+      if (participants.length > 0) {
+        const participantSet = new Set(participants);
+        const holes = activeLeafIds.filter((leafId) => !participantSet.has(leafId));
+        const holeCuts = enumerateChildren(summary, holes, enumerateSummary);
+        for (const holeCut of holeCuts.values()) {
+          const frontier = new Map(holeCut);
+          for (const leafId of participants) frontier.set(leafId, summary.level);
+          all.set(this.frontierSignature(frontier, activeLeafIds), frontier);
+        }
+      }
+      candidatesGenerated += all.size;
+      checkLimit(all.size);
+      memo.set(key, cloneFrontierSet(all));
+      return cloneFrontierSet(all);
+    };
+
+    let terminal = new Map<string, Map<ChunkId, number>>([['', new Map()]]);
+    for (const root of this.roots) {
+      const rootCuts =
+        root.kind === 'leaf'
+          ? enumerateLeaf(root.id)
+          : enumerateSummary(root.id, this.summaryMap.get(root.id)!.leafIds);
+      const next = new Map<string, Map<ChunkId, number>>();
+      for (const left of terminal.values()) {
+        for (const right of rootCuts.values()) {
+          const frontier = combineFrontiers(left, right);
+          next.set(this.frontierSignature(frontier, this.orderedLeafList.map((leaf) => leaf.id)), frontier);
+        }
+      }
+      terminal = next;
+      candidatesGenerated += terminal.size;
+      checkLimit(terminal.size);
+    }
+
+    const candidates = [...terminal.values()]
+      .map((frontier) => ({ frontier, renderedTokens: this.tokensForFrontier(frontier) }))
+      .filter((candidate) => candidate.renderedTokens <= maxTokens)
+      .sort((a, b) =>
+        a.renderedTokens - b.renderedTokens ||
+        this.frontierSignature(a.frontier, this.orderedLeafList.map((leaf) => leaf.id)).localeCompare(
+          this.frontierSignature(b.frontier, this.orderedLeafList.map((leaf) => leaf.id)),
+        ),
+      );
+    return {
+      candidates,
+      stats: {
+        statesVisited,
+        candidatesGenerated,
+        maxCandidatesAtState,
+        terminalCandidates: candidates.length,
+      },
+    };
+  }
+
+  tokensForFrontier(frontier: ReadonlyMap<ChunkId, number>): number {
+    let tokens = this.fixedTokens;
+    const summaries = new Set<SummaryId>();
+    for (const leaf of this.orderedLeafList) {
+      const level = frontier.get(leaf.id) ?? 0;
+      if (!leaf.allowedLevels.includes(level)) {
+        throw new Error(`frontier selects disallowed L${level} for ${leaf.id}`);
+      }
+      if (level === 0) {
+        if (!leaf.externallyAccounted) tokens += leaf.rawTokens;
+        continue;
+      }
+      const summaryId = leaf.summaryIds.find(
+        (candidateId) => this.summaryMap.get(candidateId)!.level === level,
+      );
+      if (!summaryId) throw new Error(`frontier selects unavailable L${level} for ${leaf.id}`);
+      summaries.add(summaryId);
+    }
+    for (const summaryId of summaries) tokens += this.summaryMap.get(summaryId)!.recallTokens;
+    return tokens;
+  }
+
   /** Exact minimum-token cut, including protected-hole emissions. */
   minimumTokens(maxTokens = Number.POSITIVE_INFINITY): MinimumTokenResult {
     if (this.constraintConflicts.length > 0) {
@@ -506,6 +796,33 @@ export class CanonicalSummaryForest {
     }
     constraints.push(...(options.constraints?.get(chunk.id) ?? []));
     return constraints;
+  }
+
+  private orderedChildren(summary: CanonicalSummary): Array<
+    | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string }
+    | { kind: 'summary'; id: SummaryId; firstSequence: number; key: string }
+  > {
+    return [
+      ...summary.directLeafIds.map((id) => ({
+        kind: 'leaf' as const,
+        id,
+        firstSequence: this.leafMap.get(id)!.sequence,
+        key: leafKey(id),
+      })),
+      ...summary.childSummaryIds.map((id) => ({
+        kind: 'summary' as const,
+        id,
+        firstSequence: this.summaryMap.get(id)!.firstSequence,
+        key: summaryKey(id),
+      })),
+    ].sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
+  }
+
+  private frontierSignature(
+    frontier: ReadonlyMap<ChunkId, number>,
+    leafIds: readonly ChunkId[],
+  ): string {
+    return leafIds.map((leafId) => `${leafId}:${frontier.get(leafId) ?? '-'}`).join('|');
   }
 
   private coverLeaf(id: ChunkId): PartialCut | null {
@@ -632,4 +949,27 @@ function chooseCheaper(a: PartialCut | null, b: PartialCut | null): PartialCut |
 
 function cloneCut(cut: PartialCut | null): PartialCut | null {
   return cut ? { tokens: cut.tokens, frontier: new Map(cut.frontier) } : null;
+}
+
+function leafKey(id: ChunkId): string {
+  return `leaf:${id}`;
+}
+
+function summaryKey(id: SummaryId): string {
+  return `summary:${id}`;
+}
+
+function combineFrontiers(
+  a: ReadonlyMap<ChunkId, number>,
+  b: ReadonlyMap<ChunkId, number>,
+): Map<ChunkId, number> {
+  const combined = new Map(a);
+  for (const [id, level] of b) combined.set(id, level);
+  return combined;
+}
+
+function cloneFrontierSet(
+  cuts: ReadonlyMap<string, ReadonlyMap<ChunkId, number>>,
+): Map<string, Map<ChunkId, number>> {
+  return new Map([...cuts].map(([key, frontier]) => [key, new Map(frontier)]));
 }

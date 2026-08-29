@@ -56,6 +56,13 @@ export {
   type ConstraintConflict,
   type MinimumTokenCertificate,
   type MinimumTokenResult,
+  type CanonicalSelectAction,
+  type CanonicalDecisionNode,
+  type CanonicalDecisionDag,
+  type ExactCutCandidate,
+  type ExactCutEnumerationStats,
+  type ExactCutEnumeration,
+  ExactEnumerationLimitError,
 } from './kv-unified.js';
 export {
   renderLayout,

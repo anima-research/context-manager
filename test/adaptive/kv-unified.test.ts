@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   CanonicalForestError,
   CanonicalSummaryForest,
+  ExactEnumerationLimitError,
   type CanonicalLeafConstraint,
 } from '../../src/adaptive/kv-unified.js';
 import { accountFrontier, type PickerInputs } from '../../src/adaptive/picker.js';
@@ -246,4 +247,80 @@ test('kv-unified minimum-token pass agrees with brute force on random small fore
       assert.equal(result.floorTokens, bruteFloor, `case ${caseIndex} token floor`);
     }
   }
+});
+
+test('kv-unified decision DAG is linear and preserves chronological expand edges', () => {
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 4,
+    tokensPerChunk: 90,
+    mergeThreshold: 2,
+    recallPairTokens: 55,
+  });
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  const dag = forest.decisionDag();
+
+  assert.equal(dag.nodeCount, 7, '4 leaves + 2 L1s + 1 L2');
+  assert.equal(dag.expandEdgeCount, 6, 'one expand edge per ownership-tree edge');
+  assert.deepEqual(dag.roots, ['summary:L2-0']);
+  assert.deepEqual(dag.nodes.get('summary:L2-0')?.expandKeys, [
+    'summary:L1-0',
+    'summary:L1-1',
+  ]);
+  assert.deepEqual(dag.nodes.get('summary:L1-0')?.expandKeys, ['leaf:c-0000', 'leaf:c-0001']);
+  assert.deepEqual(dag.nodes.get('summary:L2-0')?.select?.participantLeafIds, [
+    'c-0000',
+    'c-0001',
+    'c-0002',
+    'c-0003',
+  ]);
+});
+
+test('kv-unified exact oracle enumerates the complete cut set and reports growth', () => {
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 4,
+    tokensPerChunk: 90,
+    mergeThreshold: 2,
+    recallPairTokens: 55,
+  });
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  const enumeration = forest.enumerateExactCuts();
+
+  assert.equal(enumeration.candidates.length, 5, 'L2 select or four combinations under two L1s');
+  assert.deepEqual(
+    enumeration.candidates.map((candidate) => candidate.renderedTokens),
+    [55, 110, 235, 235, 360],
+  );
+  assert.equal(enumeration.stats.terminalCandidates, 5);
+  assert.ok(enumeration.stats.statesVisited >= 3);
+  assert.ok(enumeration.stats.maxCandidatesAtState >= 5);
+  const minimum = forest.minimumTokens();
+  assert.equal(minimum.feasible, true);
+  assert.equal(enumeration.candidates[0].renderedTokens, minimum.floorTokens);
+});
+
+test('kv-unified exact oracle enumerates protected-hole select and expand alternatives', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100, pinned: true });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.produceL1(['a', 'b']);
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+
+  const dag = forest.decisionDag();
+  assert.deepEqual(dag.nodes.get('summary:L1-0')?.select?.participantLeafIds, ['b']);
+  assert.deepEqual(dag.nodes.get('summary:L1-0')?.select?.protectedHoleLeafIds, ['a']);
+  assert.deepEqual(
+    forest.enumerateExactCuts().candidates.map((candidate) => candidate.renderedTokens),
+    [150, 200],
+  );
+});
+
+test('kv-unified exact oracle refuses forests above its explicit development limit', () => {
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 6,
+    tokensPerChunk: 90,
+    mergeThreshold: 2,
+    recallPairTokens: 55,
+  });
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.throws(() => forest.enumerateExactCuts({ maxLeaves: 5 }), ExactEnumerationLimitError);
 });
