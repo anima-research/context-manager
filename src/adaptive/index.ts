@@ -43,6 +43,21 @@ export {
   type SummaryNode,
 } from './summary-tree.js';
 export {
+  CanonicalSummaryForest,
+  CanonicalForestError,
+  type CanonicalConstraintKind,
+  type CanonicalLeafConstraint,
+  type CanonicalForestOptions,
+  type CanonicalForestIssueCode,
+  type CanonicalForestIssue,
+  type CanonicalLeaf,
+  type CanonicalSummary,
+  type CanonicalRoot,
+  type ConstraintConflict,
+  type MinimumTokenCertificate,
+  type MinimumTokenResult,
+} from './kv-unified.js';
+export {
   renderLayout,
   kvCost,
   earliestDivergenceIndex,
