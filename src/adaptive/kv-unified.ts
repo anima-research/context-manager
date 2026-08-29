@@ -174,6 +174,31 @@ export class ExactEnumerationLimitError extends Error {
   }
 }
 
+export interface SparseLabelStats {
+  readonly labelsCreated: number;
+  readonly labelsExpanded: number;
+  readonly structuralStates: number;
+  readonly maxLabelsPerState: number;
+  readonly terminalLabels: number;
+}
+
+export interface SparseLabelResult {
+  readonly candidates: readonly ExactCutCandidate[];
+  readonly stats: SparseLabelStats;
+}
+
+export class SparseLabelCeilingError extends Error {
+  readonly ceiling: number;
+  readonly labelsCreated: number;
+
+  constructor(ceiling: number, labelsCreated: number) {
+    super(`kv-unified exact label propagation exceeded ceiling ${ceiling} at ${labelsCreated}`);
+    this.name = 'SparseLabelCeilingError';
+    this.ceiling = ceiling;
+    this.labelsCreated = labelsCreated;
+  }
+}
+
 interface MutableSummary {
   id: SummaryId;
   level: number;
@@ -727,6 +752,157 @@ export class CanonicalSummaryForest {
     return tokens;
   }
 
+  /**
+   * Exact left-to-right label propagation. Unlike the recursive enumeration
+   * oracle, this chooses a representation at the oldest uncovered leaf and
+   * advances a structural remaining-leaf state. It is the production DP's
+   * unpruned reference implementation; a hard ceiling prevents accidental
+   * exponential use before bounded pruning is enabled.
+   */
+  propagateExactLabels(options: {
+    maxTokens?: number;
+    labelCeiling?: number;
+  } = {}): SparseLabelResult {
+    if (this.constraintConflicts.length > 0) {
+      return {
+        candidates: [],
+        stats: {
+          labelsCreated: 0,
+          labelsExpanded: 0,
+          structuralStates: 0,
+          maxLabelsPerState: 0,
+          terminalLabels: 0,
+        },
+      };
+    }
+    const maxTokens = options.maxTokens ?? Number.POSITIVE_INFINITY;
+    const labelCeiling = options.labelCeiling ?? 1_000_000;
+    const leaves = this.orderedLeafList;
+    const indexById = new Map(leaves.map((leaf, index) => [leaf.id, index] as const));
+    const bit = (index: number): bigint => 1n << BigInt(index);
+    let initialRemaining = 0n;
+    const initialFrontier = new Map<ChunkId, number>();
+    for (let index = 0; index < leaves.length; index++) {
+      if (leaves[index].externallyAccounted) initialFrontier.set(leaves[index].id, 0);
+      else initialRemaining |= bit(index);
+    }
+
+    interface WorkLabel {
+      remaining: bigint;
+      renderedTokens: number;
+      frontier: Map<ChunkId, number>;
+    }
+    const stack: WorkLabel[] = [
+      { remaining: initialRemaining, renderedTokens: this.fixedTokens, frontier: initialFrontier },
+    ];
+    const terminal = new Map<string, ExactCutCandidate>();
+    const labelsByState = new Map<string, number>();
+    let labelsCreated = 1;
+    let labelsExpanded = 0;
+    let maxLabelsPerState = 1;
+
+    const noteState = (remaining: bigint): void => {
+      const key = remaining.toString(16);
+      const count = (labelsByState.get(key) ?? 0) + 1;
+      labelsByState.set(key, count);
+      maxLabelsPerState = Math.max(maxLabelsPerState, count);
+    };
+    noteState(initialRemaining);
+    const push = (label: WorkLabel): void => {
+      if (label.renderedTokens > maxTokens) return;
+      labelsCreated++;
+      if (labelsCreated > labelCeiling) {
+        throw new SparseLabelCeilingError(labelCeiling, labelsCreated);
+      }
+      noteState(label.remaining);
+      stack.push(label);
+    };
+
+    while (stack.length > 0) {
+      const label = stack.pop()!;
+      if (label.remaining === 0n) {
+        const signature = this.frontierSignature(
+          label.frontier,
+          leaves.map((leaf) => leaf.id),
+        );
+        terminal.set(signature, {
+          frontier: label.frontier,
+          renderedTokens: label.renderedTokens,
+        });
+        continue;
+      }
+      labelsExpanded++;
+      const oldestIndex = lowestSetBit(label.remaining);
+      const leaf = leaves[oldestIndex];
+
+      if (leaf.allowedLevels.includes(0)) {
+        const frontier = new Map(label.frontier);
+        frontier.set(leaf.id, 0);
+        push({
+          remaining: label.remaining & ~bit(oldestIndex),
+          renderedTokens: label.renderedTokens + leaf.rawTokens,
+          frontier,
+        });
+      }
+
+      for (const summaryId of leaf.summaryIds) {
+        const summary = this.summaryMap.get(summaryId)!;
+        if (!leaf.allowedLevels.includes(summary.level)) continue;
+        let participantMask = 0n;
+        const participantIds: ChunkId[] = [];
+        let overlapsEarlierFreeChoice = false;
+        for (const candidateId of summary.leafIds) {
+          const candidateIndex = indexById.get(candidateId)!;
+          const candidateBit = bit(candidateIndex);
+          const candidateAllowsSummary = this.leafMap
+            .get(candidateId)!
+            .allowedLevels.includes(summary.level);
+          if ((label.remaining & candidateBit) === 0n && candidateAllowsSummary) {
+            // This leaf was already rendered at a finer choice even though it
+            // could have participated in this summary. Only a constraint-
+            // forced hole may sit beside an ancestor recall.
+            overlapsEarlierFreeChoice = true;
+            break;
+          }
+          if (
+            (label.remaining & candidateBit) !== 0n &&
+            candidateAllowsSummary
+          ) {
+            participantMask |= candidateBit;
+            participantIds.push(candidateId);
+          }
+        }
+        if (overlapsEarlierFreeChoice) continue;
+        if ((participantMask & bit(oldestIndex)) === 0n) continue;
+        const frontier = new Map(label.frontier);
+        for (const participantId of participantIds) frontier.set(participantId, summary.level);
+        push({
+          remaining: label.remaining & ~participantMask,
+          renderedTokens: label.renderedTokens + summary.recallTokens,
+          frontier,
+        });
+      }
+    }
+
+    const candidates = [...terminal.values()].sort(
+      (a, b) =>
+        a.renderedTokens - b.renderedTokens ||
+        this.frontierSignature(a.frontier, leaves.map((leaf) => leaf.id)).localeCompare(
+          this.frontierSignature(b.frontier, leaves.map((leaf) => leaf.id)),
+        ),
+    );
+    return {
+      candidates,
+      stats: {
+        labelsCreated,
+        labelsExpanded,
+        structuralStates: labelsByState.size,
+        maxLabelsPerState,
+        terminalLabels: candidates.length,
+      },
+    };
+  }
+
   /** Exact minimum-token cut, including protected-hole emissions. */
   minimumTokens(maxTokens = Number.POSITIVE_INFINITY): MinimumTokenResult {
     if (this.constraintConflicts.length > 0) {
@@ -972,4 +1148,14 @@ function cloneFrontierSet(
   cuts: ReadonlyMap<string, ReadonlyMap<ChunkId, number>>,
 ): Map<string, Map<ChunkId, number>> {
   return new Map([...cuts].map(([key, frontier]) => [key, new Map(frontier)]));
+}
+
+function lowestSetBit(value: bigint): number {
+  let index = 0;
+  let cursor = value;
+  while ((cursor & 1n) === 0n) {
+    cursor >>= 1n;
+    index++;
+  }
+  return index;
 }
