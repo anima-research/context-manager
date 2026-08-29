@@ -8085,8 +8085,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Memoized true render cost of a summary's recall pair (label + answer
-   *  content including carriers). Keyed by id+tokens so a re-generated
-   *  summary under a reused id re-prices. */
+   *  content as the LIVE WINDOW renders it — carriers included under
+   *  `carrierPolicy: 'full'`, omitted under `'live-strip'`, because this
+   *  price feeds the fold planner for that same emission). Keyed by id+tokens
+   *  so a re-generated summary under a reused id re-prices. */
   private _pairCostCache = new Map<string, number>();
 
   protected recallPairCost(s: SummaryEntry): number {
@@ -8096,7 +8098,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const cost =
       this.estimateTokens([{ type: 'text', text: label }]) +
-      this.estimateTokens(this.summaryAnswerContent(s));
+      this.estimateTokens(this.liveWindowAnswerContent(s));
     this._pairCostCache.set(key, cost);
     return cost;
   }
@@ -9991,9 +9993,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Returns a fresh array so callers can never mutate the stored entry.
    *
-   * Every recall answer in the codebase is built here — presented context on
-   * both select paths, the mint/merge recall ladders, refusal-curve expansion
-   * — so the `recallEnvelope` delimiter is applied here too, once.
+   * This is the MINT-SIDE answer, and carriers ride it unconditionally: the
+   * mint/merge recall ladders and refusal-curve expansion all build here, and
+   * the carriers' anti-refusal duty on that surface is measured (see
+   * `carrierPolicy`). The live window builds from the same prose through
+   * `liveWindowAnswerProse`, which is where `carrierPolicy` applies. Both
+   * roads pass through `wrapRecallAnswerContent`, so the `recallEnvelope`
+   * delimiter is still applied once per answer, whichever surface asked.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
@@ -10017,6 +10023,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The answer body for the LIVE WINDOW — the surface the agent whose memory
+   * this is reads back — under `carrierPolicy`.
+   *
+   * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
+   * Under `'live-strip'` the captured reasoning carriers are omitted from the
+   * live render alone: whole blocks dropped, every surviving block passed
+   * through untouched, so the same entry's mint-side recall still replays its
+   * signed blocks byte-verbatim. Mutating a carrier here would break the
+   * signature that the mint surface depends on — hence omission, never
+   * rewriting.
+   *
+   * A carrier-only entry (reasoning captured, no prose block — degenerate, and
+   * guarded against at mint time) would strip to an empty assistant turn,
+   * which the API rejects outright. The fallback is the same plain text block
+   * a legacy carrier-free entry renders, so the memory is still readable and
+   * the turn is still valid.
+   */
+  protected liveWindowAnswerProse(summary: SummaryEntry): ContentBlock[] {
+    const prose = this.summaryAnswerProse(summary);
+    if (this.config.carrierPolicy !== 'live-strip') return prose;
+    const stripped = stripThinkingBlocks(prose);
+    const carriesProse = stripped.some(
+      (block) => block.type === 'text' && block.text.trim().length > 0,
+    );
+    return carriesProse ? stripped : [{ type: 'text', text: summary.content }];
+  }
+
+  /**
+   * `summaryAnswerContent` for the live window: the policy-filtered body under
+   * the same envelope. Used where a live render is PRICED rather than emitted
+   * (`recallPairCost`), so the plan and the emission agree about carriers.
+   */
+  protected liveWindowAnswerContent(summary: SummaryEntry): ContentBlock[] {
+    return wrapRecallAnswerContent(
+      this.liveWindowAnswerProse(summary),
+      summary,
+      this.config.recallEnvelope,
+    );
+  }
+
+  /**
    * `summaryAnswerContent` under a `maxMessageTokens` cap: the cap is spent on
    * the PROSE, and the envelope is applied to what survives.
    *
@@ -10037,7 +10084,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never an empty envelope, never a torn one.
    */
   protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
-    const prose = this.summaryAnswerProse(summary);
+    const prose = this.liveWindowAnswerProse(summary);
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
   }
@@ -10074,7 +10121,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
         if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
-        content.push(...this.summaryAnswerContent(s));
+        content.push(...this.liveWindowAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
@@ -10088,7 +10135,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const separatorTokens = idx > 0 ? separatorCost : 0;
       const proseBudget = remainingTokens - separatorTokens;
       if (maxTokens > 0 && proseBudget <= 0) break;
-      const prose = this.summaryAnswerProse(s);
+      const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
       if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
