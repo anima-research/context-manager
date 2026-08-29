@@ -201,7 +201,18 @@ export async function renderHierarchicalFixture(
  * Deterministic membrane stand-in: numbered summaries, no network. Records
  * each request's messages so tests can inspect the mint-path recall ladder.
  */
-function makeMockMembrane(): { membrane: unknown; requests: RenderedMessage[][] } {
+function adaptiveTextResponseContent(callCount: number): ContentBlock[] {
+  return [
+    {
+      type: 'text',
+      text: `zz-adaptive-memory-${callCount} recollection of an earlier stretch`,
+    },
+  ];
+}
+
+function makeMockMembrane(
+  responseContentForCall: (callCount: number) => ContentBlock[],
+): { membrane: unknown; requests: RenderedMessage[][] } {
   const requests: RenderedMessage[][] = [];
   let callCount = 0;
   return {
@@ -212,7 +223,7 @@ function makeMockMembrane(): { membrane: unknown; requests: RenderedMessage[][] 
         callCount++;
         return {
           stopReason: 'end_turn',
-          content: [{ type: 'text', text: `zz-adaptive-memory-${callCount} recollection of an earlier stretch` }],
+          content: responseContentForCall(callCount),
         };
       },
     },
@@ -225,6 +236,7 @@ function makeMockMembrane(): { membrane: unknown; requests: RenderedMessage[][] 
  */
 export async function renderAdaptiveFixture(
   options: AutobiographicalOptions = {},
+  responseContentForCall: (callCount: number) => ContentBlock[] = adaptiveTextResponseContent,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
     const strategy = new AutobiographicalStrategy({
@@ -237,7 +249,7 @@ export async function renderAdaptiveFixture(
       adaptiveResolution: true,
       ...options,
     });
-    const mock = makeMockMembrane();
+    const mock = makeMockMembrane(responseContentForCall);
     const manager = await ContextManager.open({
       path,
       strategy,

@@ -8087,15 +8087,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Memoized true render cost of a summary's recall pair (label + answer
    *  content as the LIVE WINDOW renders it — carriers included under
    *  `carrierPolicy: 'full'`, omitted under `'live-strip'`, because this
-   *  price feeds the fold planner for that same emission). Keyed by id+tokens
-   *  so a re-generated summary under a reused id re-prices. */
+   *  price feeds the fold planner for that same emission). Keyed by the
+   *  summary identity and every config value that changes these bytes, so a
+   *  scoped preview cannot reuse or poison another policy's price. */
   private _pairCostCache = new Map<string, number>();
 
   protected recallPairCost(s: SummaryEntry): number {
-    const key = `${s.id}:${s.tokens}`;
+    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
+    const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy]);
     const cached = this._pairCostCache.get(key);
     if (cached !== undefined) return cached;
-    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const cost =
       this.estimateTokens([{ type: 'text', text: label }]) +
       this.estimateTokens(this.liveWindowAnswerContent(s));

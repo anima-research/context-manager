@@ -23,6 +23,10 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { CarrierPolicy, SummaryEntry } from '../src/types/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import {
+  renderAdaptiveFixture,
+  renderHierarchicalFixture,
+} from './fixtures/recall-envelope-fixture.js';
 
 const TEST_STORE_PATH = './test-carrier-policy';
 const ZZ_COMPRESSION_MODEL = 'zz-compression-model';
@@ -133,6 +137,37 @@ function findMintRecallAnswer(requests: CapturedRequest[], signature: string) {
     }
   }
   return undefined;
+}
+
+function carrierBlockCount(
+  messages: ReadonlyArray<{ content: ReadonlyArray<ContentBlock> }>,
+): number {
+  return messages.reduce(
+    (count, message) =>
+      count +
+      message.content.filter(
+        (block) => block.type === 'thinking' || block.type === 'redacted_thinking',
+      ).length,
+    0,
+  );
+}
+
+function adaptiveCarrierResponseContent(callCount: number): ContentBlock[] {
+  return [
+    {
+      type: 'thinking',
+      thinking: `zz-adaptive-archivist-scratch-${callCount}`,
+      signature: `zz-adaptive-sig-${callCount}-fedcba9876543210`,
+    },
+    {
+      type: 'redacted_thinking',
+      data: `zz-adaptive-enc-${callCount}-payload==`,
+    },
+    {
+      type: 'text',
+      text: `zz-adaptive-memory-${callCount} recollection of the ite1 stretch`,
+    },
+  ];
 }
 
 describe('carrierPolicy', () => {
@@ -321,6 +356,90 @@ describe('carrierPolicy', () => {
       mint[0],
       entry.responseContent![0],
       'the enveloped mint answer never rewrites a signed block',
+    );
+  });
+
+  it("'live-strip' strips carriers on the adaptive live-render path", async () => {
+    const full = await renderAdaptiveFixture(
+      { carrierPolicy: 'full' },
+      adaptiveCarrierResponseContent,
+    );
+    const stripped = await renderAdaptiveFixture(
+      { carrierPolicy: 'live-strip' },
+      adaptiveCarrierResponseContent,
+    );
+
+    assert.ok(
+      carrierBlockCount(full.messages) > 0,
+      'setup: adaptive full render emits carrier-bearing summaries',
+    );
+    assert.strictEqual(
+      carrierBlockCount(stripped.messages),
+      0,
+      'adaptive live-strip render omits every carrier block',
+    );
+  });
+
+  it("'live-strip' strips carriers from the legacy combined live-render path", async () => {
+    const full = await renderHierarchicalFixture({
+      carrierPolicy: 'full',
+      positionedRecallPairs: false,
+    });
+    const stripped = await renderHierarchicalFixture({
+      carrierPolicy: 'live-strip',
+      positionedRecallPairs: false,
+    });
+
+    assert.ok(
+      carrierBlockCount(full.messages) > 0,
+      'setup: combined full render emits the carrier-bearing summary',
+    );
+    assert.strictEqual(
+      carrierBlockCount(stripped.messages),
+      0,
+      'combined live-strip render omits every carrier block',
+    );
+    assert.ok(
+      stripped.messages.some((message) =>
+        message.content.some(
+          (block) => block.type === 'text' && block.text.includes('zz-memory-with-carriers'),
+        ),
+      ),
+      'the combined answer retains the carrier-bearing memory prose',
+    );
+  });
+
+  it('scopes memoized recall-pair pricing to the carrier policy', () => {
+    const carrierEntry: SummaryEntry = {
+      id: 'zz-sum-ite1',
+      level: 1,
+      content: 'zz-memory-ite1',
+      tokens: 10,
+      sourceIds: ['zz-msg-ite1'],
+      sourceRange: { first: 'zz-msg-ite1', last: 'zz-msg-ite1' },
+      sourceLevel: 0,
+      created: 1,
+      responseContent: [
+        {
+          type: 'thinking',
+          thinking: 'zz-thinking '.repeat(100),
+          signature: 'zz-signature-ite1',
+        },
+        { type: 'text', text: 'zz-memory-ite1' },
+      ],
+    };
+    const strategy = new AutobiographicalStrategy({ carrierPolicy: 'full' });
+    const pricingProbe = strategy as unknown as {
+      config: { carrierPolicy?: CarrierPolicy };
+      recallPairCost(summary: SummaryEntry): number;
+    };
+
+    assert.strictEqual(pricingProbe.recallPairCost(carrierEntry), 313);
+    pricingProbe.config.carrierPolicy = 'live-strip';
+    assert.strictEqual(
+      pricingProbe.recallPairCost(carrierEntry),
+      13,
+      'a scoped policy swap must not reuse the full render price',
     );
   });
 });
