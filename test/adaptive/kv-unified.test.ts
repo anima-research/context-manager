@@ -5,6 +5,7 @@ import {
   CanonicalForestError,
   CanonicalSummaryForest,
   ExactEnumerationLimitError,
+  SparseLabelCeilingError,
   type CanonicalLeafConstraint,
 } from '../../src/adaptive/kv-unified.js';
 import { accountFrontier, type PickerInputs } from '../../src/adaptive/picker.js';
@@ -323,4 +324,39 @@ test('kv-unified exact oracle refuses forests above its explicit development lim
   });
   const forest = new CanonicalSummaryForest(inputsOf(chronicle));
   assert.throws(() => forest.enumerateExactCuts({ maxLeaves: 5 }), ExactEnumerationLimitError);
+});
+
+test('kv-unified left-to-right labels reproduce the recursive exact frontier', () => {
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 8,
+    tokensPerChunk: 90,
+    mergeThreshold: 2,
+    recallPairTokens: 55,
+  });
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  const recursive = forest.enumerateExactCuts();
+  const labels = forest.propagateExactLabels();
+  const signature = (frontier: ReadonlyMap<string, number>): string =>
+    chronicle.chunks.map((chunk) => `${chunk.id}:${frontier.get(chunk.id) ?? 0}`).join('|');
+  assert.deepEqual(
+    labels.candidates.map((candidate) => [candidate.renderedTokens, signature(candidate.frontier)]),
+    recursive.candidates.map((candidate) => [candidate.renderedTokens, signature(candidate.frontier)]),
+  );
+  assert.equal(labels.stats.terminalLabels, recursive.stats.terminalCandidates);
+  assert.ok(labels.stats.structuralStates > 1);
+  assert.ok(labels.stats.maxLabelsPerState > 0);
+});
+
+test('kv-unified exact labels stop loudly at the configured pre-bucketing ceiling', () => {
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 12,
+    tokensPerChunk: 90,
+    mergeThreshold: 2,
+    recallPairTokens: 55,
+  });
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.throws(
+    () => forest.propagateExactLabels({ labelCeiling: 10 }),
+    SparseLabelCeilingError,
+  );
 });

@@ -63,6 +63,9 @@ export {
   type ExactCutEnumerationStats,
   type ExactCutEnumeration,
   ExactEnumerationLimitError,
+  SparseLabelCeilingError,
+  type SparseLabelStats,
+  type SparseLabelResult,
 } from './kv-unified.js';
 export {
   ExactKvUnifiedPolicySolver,
