@@ -81,6 +81,9 @@ export interface ExactPolicySolveOptions {
   readonly continuityMultiplier?: number;
   readonly maxLeaves?: number;
   readonly maxCandidates?: number;
+  /** Recursive oracle or the independent left-to-right label engine. */
+  readonly candidateSource?: 'recursive' | 'labels';
+  readonly labelCeiling?: number;
 }
 
 export interface ExactPolicyCandidate {
@@ -144,11 +147,28 @@ export class ExactKvUnifiedPolicySolver {
     const feasibility = this.forest.minimumTokens(options.maxTokens);
     if (!feasibility.feasible) return { feasible: false, feasibility };
 
-    const enumeration = this.forest.enumerateExactCuts({
-      maxLeaves: options.maxLeaves,
-      maxCandidates: options.maxCandidates,
-      maxTokens: options.maxTokens,
-    });
+    const enumeration =
+      options.candidateSource === 'labels'
+        ? (() => {
+            const labels = this.forest.propagateExactLabels({
+              maxTokens: options.maxTokens,
+              labelCeiling: options.labelCeiling ?? options.maxCandidates,
+            });
+            return {
+              candidates: labels.candidates,
+              stats: {
+                statesVisited: labels.stats.structuralStates,
+                candidatesGenerated: labels.stats.labelsCreated,
+                maxCandidatesAtState: labels.stats.maxLabelsPerState,
+                terminalCandidates: labels.stats.terminalLabels,
+              },
+            };
+          })()
+        : this.forest.enumerateExactCuts({
+            maxLeaves: options.maxLeaves,
+            maxCandidates: options.maxCandidates,
+            maxTokens: options.maxTokens,
+          });
     const cacheRelevant =
       options.cache !== undefined &&
       options.currentImmutablePrefixHash !== undefined &&
