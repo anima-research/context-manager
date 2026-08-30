@@ -10,6 +10,7 @@ import {
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
+import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { buildChronicleWithChain, type MockChronicle } from './harness.js';
 
 function fixture(): { chronicle: MockChronicle; inputs: PickerInputs } {
@@ -308,4 +309,41 @@ test('kv-unified left-to-right labels agree with recursive oracle on full welfar
     labels.candidates.map((candidate) => [signature(candidate), candidate.score]),
     recursive.candidates.map((candidate) => [signature(candidate), candidate.score]),
   );
+});
+
+test('kv-unified partial-metric Pareto propagation agrees with the exhaustive oracle', () => {
+  const { inputs } = fixture();
+  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
+  const options = {
+    maxTokens: 250,
+    presentation: rawPresentation(inputs),
+    cache: {
+      immutablePrefixHash: 'tools-v1',
+      layout: rawLayout,
+      markers: [{ unitIndex: 2, offset: 180 }, { unitIndex: 4, offset: 360 }],
+    },
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0,
+      budgetUnderLambda: 100,
+      budgetOverLambda: 200,
+      cacheLambda: 500,
+      cacheScale: 100,
+      continuityLambda: 700,
+      continuityScale: 100,
+      continuityRecencyHalfLifeTokens: 90,
+      continuityRecencyFloor: 0.1,
+      continuityStableFloor: 1,
+    },
+  } as const;
+  const oracle = new ExactKvUnifiedPolicySolver(inputs).solve(options);
+  const pareto = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
+  assert.equal(oracle.feasible, true);
+  assert.equal(pareto.feasible, true);
+  if (!oracle.feasible || !pareto.feasible) return;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    inputs.chunks.map((chunk) => `${chunk.id}:${candidate.frontier.get(chunk.id) ?? 0}`).join('|');
+  assert.equal(signature(pareto.selected), signature(oracle.selected));
+  assert.equal(pareto.selected.score, oracle.selected.score);
+  assert.ok((pareto.propagation?.labelsDominated ?? 0) >= 0);
 });
