@@ -370,6 +370,33 @@ test('kv-unified grid mode stays hard-feasible and reports a score-error bound',
   assert.ok(result.candidates.some((candidate) => candidate.renderedTokens === 55));
 });
 
+test('kv-unified grid mode retains cache and continuity floor witnesses', () => {
+  const { inputs } = fixture();
+  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
+  const options = {
+    maxTokens: 250,
+    presentation: rawPresentation(inputs),
+    cache: {
+      immutablePrefixHash: 'tools',
+      layout: rawLayout,
+      markers: [{ unitIndex: 2, offset: 180 }, { unitIndex: 4, offset: 360 }],
+    },
+    currentImmutablePrefixHash: 'tools',
+  } as const;
+  const exact = new ExactKvUnifiedPolicySolver(inputs).solve(options);
+  const grid = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+  });
+  assert.equal(exact.feasible, true);
+  assert.equal(grid.feasible, true);
+  if (!exact.feasible || !grid.feasible) return;
+  assert.equal(grid.cacheFloor, exact.cacheFloor);
+  assert.equal(grid.continuityFloor, exact.continuityFloor);
+});
+
 test('kv-unified FoldingSolver adapter applies the selected feasible frontier', () => {
   const { inputs } = fixture();
   const strategy = new KvUnifiedStrategy({
