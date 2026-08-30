@@ -338,12 +338,31 @@ test('kv-unified partial-metric Pareto propagation agrees with the exhaustive or
   } as const;
   const oracle = new ExactKvUnifiedPolicySolver(inputs).solve(options);
   const pareto = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
+  const leafPareto = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, engine: 'leaf' });
   assert.equal(oracle.feasible, true);
   assert.equal(pareto.feasible, true);
-  if (!oracle.feasible || !pareto.feasible) return;
+  assert.equal(leafPareto.feasible, true);
+  if (!oracle.feasible || !pareto.feasible || !leafPareto.feasible) return;
   const signature = (candidate: ExactPolicyCandidate): string =>
     inputs.chunks.map((chunk) => `${chunk.id}:${candidate.frontier.get(chunk.id) ?? 0}`).join('|');
   assert.equal(signature(pareto.selected), signature(oracle.selected));
   assert.equal(pareto.selected.score, oracle.selected.score);
+  assert.equal(signature(pareto.selected), signature(leafPareto.selected));
   assert.ok((pareto.propagation?.labelsDominated ?? 0) >= 0);
+});
+
+test('kv-unified grid mode stays hard-feasible and reports that its bound is pending', () => {
+  const { inputs } = fixture();
+  const result = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    maxTokens: 250,
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+  });
+  assert.equal(result.feasible, true);
+  if (!result.feasible) return;
+  assert.ok(result.selected.renderedTokens <= 250);
+  assert.equal(result.propagation?.approximationBounded, false);
+  assert.equal(result.propagation?.tokenBucketSize, 100);
+  assert.ok(result.candidates.some((candidate) => candidate.renderedTokens === 55));
 });

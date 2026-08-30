@@ -46,10 +46,22 @@ export interface ParetoPropagationStats {
   readonly maxLabelsPerState: number;
   readonly terminalLabels: number;
   readonly tokenBucketSize: number;
+  readonly continuityBucketSize: number;
+  readonly fidelityBucketSize: number;
+  /** False until per-path bucket error accumulation is implemented. */
+  readonly approximationBounded: boolean;
 }
 
 export type ParetoPolicySolveResult = ExactPolicySolveResult & {
   readonly propagation?: ParetoPropagationStats;
+};
+
+export type ParetoSolveOptions = ExactPolicySolveOptions & {
+  labelCeiling?: number;
+  tokenBucketSize?: number;
+  continuityBucketSize?: number;
+  fidelityBucketSize?: number;
+  engine?: 'auto' | 'leaf' | 'dag';
 };
 
 /** Exact sparse Pareto propagation. R bucketing is added only after this
@@ -77,11 +89,16 @@ export class ParetoKvUnifiedPolicySolver {
     }
   }
 
-  solve(options: ExactPolicySolveOptions & {
-    labelCeiling?: number;
-    /** 0 = exact R; positive = approximate token-state buckets. */
-    tokenBucketSize?: number;
-  }): ParetoPolicySolveResult {
+  solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
+    const internalHoles = this.hasInternalProtectedHoles();
+    if (options.engine === 'dag' && internalHoles) {
+      throw new Error('recursive DAG engine does not yet support internal protected holes');
+    }
+    if (options.engine !== 'leaf' && !internalHoles) return this.solveDag(options);
+    return this.solveLeaf(options);
+  }
+
+  private solveLeaf(options: ParetoSolveOptions): ParetoPolicySolveResult {
     const feasibility = this.forest.minimumTokens(options.maxTokens);
     if (!feasibility.feasible) return { feasible: false, feasibility };
     const policy = normalizePolicy(options.policy);
@@ -115,6 +132,8 @@ export class ParetoKvUnifiedPolicySolver {
 
     const ceiling = options.labelCeiling ?? 1_000_000;
     const tokenBucketSize = Math.max(0, Math.floor(options.tokenBucketSize ?? 0));
+    const continuityBucketSize = Math.max(0, options.continuityBucketSize ?? 0);
+    const fidelityBucketSize = Math.max(0, options.fidelityBucketSize ?? 0);
     const stack: ParetoLabel[] = [];
     const states = new Map<string, ParetoLabel[]>();
     let labelsCreated = 0;
@@ -123,7 +142,7 @@ export class ParetoKvUnifiedPolicySolver {
     let maxLabelsPerState = 0;
     const insert = (label: ParetoLabel): void => {
       if (label.renderedTokens > options.maxTokens) return;
-      const key = stateKey(label, tokenBucketSize);
+      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
       const current = states.get(key) ?? [];
       for (const incumbent of current) {
         if (dominates(incumbent, label)) {
@@ -215,8 +234,203 @@ export class ParetoKvUnifiedPolicySolver {
         maxLabelsPerState,
         terminalLabels: terminal.length,
         tokenBucketSize,
+        continuityBucketSize,
+        fidelityBucketSize,
+        approximationBounded:
+          tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0,
       },
     };
+  }
+
+  private solveDag(options: ParetoSolveOptions): ParetoPolicySolveResult {
+    const feasibility = this.forest.minimumTokens(options.maxTokens);
+    if (!feasibility.feasible) return { feasible: false, feasibility };
+    const policy = normalizePolicy(options.policy);
+    const cacheRelevant =
+      options.cache !== undefined &&
+      options.currentImmutablePrefixHash !== undefined &&
+      options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
+    const markerByUnit = new Map(
+      (options.cache?.markers ?? []).map((marker) => [marker.unitIndex, marker.offset]),
+    );
+    const externalIds = this.leaves.filter((leaf) => leaf.externallyAccounted).map((leaf) => leaf.id);
+    let initial: ParetoLabel = {
+      active: true,
+      remaining: 0n,
+      renderedTokens: 0,
+      extensionTokens: 0,
+      continuityLoss: 0,
+      fidelityLoss: 0,
+      cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
+      trace: externalIds.length > 0 ? { parent: null, ids: externalIds, level: 0 } : null,
+    };
+    if (this.inputs.headTokens > 0) {
+      initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, false, options, markerByUnit);
+    }
+    const ceiling = options.labelCeiling ?? 1_000_000;
+    const tokenBucketSize = Math.max(0, Math.floor(options.tokenBucketSize ?? 0));
+    const continuityBucketSize = Math.max(0, options.continuityBucketSize ?? 0);
+    const fidelityBucketSize = Math.max(0, options.fidelityBucketSize ?? 0);
+    let labelsCreated = 1;
+    let labelsExpanded = 0;
+    let labelsDominated = 0;
+    let maxLabelsPerState = 1;
+    let states = 0;
+    const prune = (labels: ParetoLabel[]): ParetoLabel[] => {
+      states++;
+      const groups = new Map<string, ParetoLabel[]>();
+      for (const label of labels) {
+        if (label.renderedTokens > options.maxTokens) continue;
+        const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
+        const current = groups.get(key) ?? [];
+        if (continuityBucketSize > 0 && fidelityBucketSize > 0 && current.length > 0) {
+          const incumbent = current[0];
+          if (representativeOrder(label, incumbent) < 0) {
+            groups.set(key, [label]);
+            labelsDominated++;
+          } else {
+            labelsDominated++;
+          }
+          continue;
+        }
+        if (current.some((incumbent) => dominates(incumbent, label))) {
+          labelsDominated++;
+          continue;
+        }
+        const survivors = current.filter((incumbent) => {
+          const removed = dominates(label, incumbent);
+          if (removed) labelsDominated++;
+          return !removed;
+        });
+        survivors.push(label);
+        groups.set(key, survivors);
+      }
+      const result = [...groups.values()].flat();
+      labelsCreated += result.length;
+      maxLabelsPerState = Math.max(maxLabelsPerState, result.length);
+      if (result.length > ceiling) throw new SparseLabelCeilingError(ceiling, result.length);
+      return result;
+    };
+    const orderedChildren = (summaryId: string): Array<{ kind: 'leaf' | 'summary'; id: string; sequence: number }> => {
+      const summary = this.forest.summary(summaryId)!;
+      return [
+        ...summary.directLeafIds.map((id) => ({ kind: 'leaf' as const, id, sequence: this.forest.leaf(id)!.sequence })),
+        ...summary.childSummaryIds.map((id) => ({ kind: 'summary' as const, id, sequence: this.forest.summary(id)!.firstSequence })),
+      ].sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
+    };
+    const processSummary = (summaryId: string, incoming: ParetoLabel[]): ParetoLabel[] => {
+      labelsExpanded += incoming.length;
+      const summary = this.forest.summary(summaryId)!;
+      const participants = summary.leafIds.filter((id) => !this.forest.leaf(id)!.externallyAccounted);
+      let selected: ParetoLabel[] = [];
+      if (participants.length > 0 && participants.every((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level))) {
+        selected = incoming.map((label) => {
+          const assigned = this.assign(label, participants, summary.level, policy, options);
+          return this.emit(
+            assigned,
+            'recall',
+            summary.id,
+            summary.recallTokens,
+            this.isExtension(summary.leafIds, options),
+            options,
+            markerByUnit,
+          );
+        });
+      }
+      let expanded = incoming;
+      for (const child of orderedChildren(summaryId)) {
+        if (child.kind === 'summary') {
+          expanded = processSummary(child.id, expanded);
+        } else {
+          const leaf = this.forest.leaf(child.id)!;
+          if (leaf.externallyAccounted) continue;
+          if (!leaf.allowedLevels.includes(0)) { expanded = []; break; }
+          expanded = expanded.map((label) => {
+            const assigned = this.assign(label, [leaf.id], 0, policy, options);
+            return this.emit(
+              assigned,
+              'raw',
+              leaf.id,
+              leaf.rawTokens,
+              this.isExtension([leaf.id], options),
+              options,
+              markerByUnit,
+            );
+          });
+        }
+        expanded = prune(expanded);
+      }
+      return prune([...selected, ...expanded]);
+    };
+
+    let labels = [initial];
+    for (const root of this.forest.roots) {
+      if (root.kind === 'summary') labels = processSummary(root.id, labels);
+      else {
+        const leaf = this.forest.leaf(root.id)!;
+        if (!leaf.externallyAccounted) {
+          labels = labels.map((label) => this.emit(
+            this.assign(label, [leaf.id], 0, policy, options),
+            'raw',
+            leaf.id,
+            leaf.rawTokens,
+            this.isExtension([leaf.id], options),
+            options,
+            markerByUnit,
+          ));
+        }
+      }
+      labels = prune(labels);
+    }
+    const terminal: ExactCutCandidate[] = [];
+    for (const label of labels) {
+      let finished = label;
+      if (this.inputs.tailTokens > 0) {
+        finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, false, options, markerByUnit);
+      }
+      if (finished.renderedTokens <= options.maxTokens) {
+        terminal.push({ frontier: reconstructFrontier(finished.trace), renderedTokens: finished.renderedTokens });
+      }
+    }
+    if (!terminal.some((candidate) => sameFrontier(candidate.frontier, feasibility.frontier))) {
+      terminal.push({ frontier: feasibility.frontier, renderedTokens: feasibility.floorTokens });
+    }
+    const scored = new ExactKvUnifiedPolicySolver(this.inputs, this.forest).scoreCandidates(
+      terminal,
+      options,
+      {
+        statesVisited: states,
+        candidatesGenerated: labelsCreated,
+        maxCandidatesAtState: maxLabelsPerState,
+        terminalCandidates: terminal.length,
+      },
+    );
+    if (!scored.feasible) return scored;
+    return {
+      ...scored,
+      propagation: {
+        labelsCreated,
+        labelsExpanded,
+        labelsDominated,
+        states,
+        maxLabelsPerState,
+        terminalLabels: terminal.length,
+        tokenBucketSize,
+        continuityBucketSize,
+        fidelityBucketSize,
+        approximationBounded:
+          tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0,
+      },
+    };
+  }
+
+  private hasInternalProtectedHoles(): boolean {
+    for (const summary of this.forest.allSummaries()) {
+      const live = summary.leafIds.filter((id) => !this.forest.leaf(id)!.externallyAccounted);
+      const allowed = live.filter((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level));
+      if (allowed.length > 0 && allowed.length < live.length) return true;
+    }
+    return false;
   }
 
   private assign(label: ParetoLabel, ids: readonly ChunkId[], level: number, policy: KvUnifiedWelfarePolicy, options: ExactPolicySolveOptions): ParetoLabel {
@@ -269,7 +483,12 @@ export class ParetoKvUnifiedPolicySolver {
   }
 }
 
-function stateKey(label: ParetoLabel, tokenBucketSize: number): string {
+function stateKey(
+  label: ParetoLabel,
+  tokenBucketSize: number,
+  continuityBucketSize: number,
+  fidelityBucketSize: number,
+): string {
   const tokenKey = tokenBucketSize > 0
     ? Math.ceil(label.renderedTokens / tokenBucketSize)
     : label.renderedTokens;
@@ -280,6 +499,8 @@ function stateKey(label: ParetoLabel, tokenBucketSize: number): string {
     label.cache.intact ? 1 : 0,
     label.cache.matchedUnits,
     label.cache.cachedTokens,
+    continuityBucketSize > 0 ? Math.floor(label.continuityLoss / continuityBucketSize) : 'c*',
+    fidelityBucketSize > 0 ? Math.floor(label.fidelityLoss / fidelityBucketSize) : 'f*',
   ].join(':');
 }
 
@@ -314,4 +535,13 @@ function sameFrontier(a: ReadonlyMap<ChunkId, number>, b: ReadonlyMap<ChunkId, n
   if (a.size !== b.size) return false;
   for (const [id, level] of a) if (b.get(id) !== level) return false;
   return true;
+}
+
+function representativeOrder(a: ParetoLabel, b: ParetoLabel): number {
+  return (
+    a.fidelityLoss - b.fidelityLoss ||
+    a.continuityLoss - b.continuityLoss ||
+    a.renderedTokens - b.renderedTokens ||
+    a.cache.matchedUnits - b.cache.matchedUnits
+  );
 }
