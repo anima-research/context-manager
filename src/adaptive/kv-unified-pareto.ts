@@ -48,8 +48,9 @@ export interface ParetoPropagationStats {
   readonly tokenBucketSize: number;
   readonly continuityBucketSize: number;
   readonly fidelityBucketSize: number;
-  /** False until per-path bucket error accumulation is implemented. */
+  /** True when approximationScoreErrorBound covers configured grid pruning. */
   readonly approximationBounded: boolean;
+  readonly approximationScoreErrorBound: number;
 }
 
 export type ParetoPolicySolveResult = ExactPolicySolveResult & {
@@ -236,8 +237,14 @@ export class ParetoKvUnifiedPolicySolver {
         tokenBucketSize,
         continuityBucketSize,
         fidelityBucketSize,
-        approximationBounded:
-          tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0,
+        approximationBounded: true,
+        approximationScoreErrorBound: this.approximationBound(
+          options,
+          policy,
+          tokenBucketSize,
+          continuityBucketSize,
+          fidelityBucketSize,
+        ),
       },
     };
   }
@@ -419,7 +426,14 @@ export class ParetoKvUnifiedPolicySolver {
         continuityBucketSize,
         fidelityBucketSize,
         approximationBounded:
-          tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0,
+          true,
+        approximationScoreErrorBound: this.approximationBound(
+          options,
+          policy,
+          tokenBucketSize,
+          continuityBucketSize,
+          fidelityBucketSize,
+        ),
       },
     };
   }
@@ -431,6 +445,53 @@ export class ParetoKvUnifiedPolicySolver {
       if (allowed.length > 0 && allowed.length < live.length) return true;
     }
     return false;
+  }
+
+  private approximationBound(
+    options: ExactPolicySolveOptions,
+    policy: KvUnifiedWelfarePolicy,
+    tokenBucketSize: number,
+    continuityBucketSize: number,
+    fidelityBucketSize: number,
+  ): number {
+    if (tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0) return 0;
+    // A representative can replace a path at most once per decision node.
+    // Summing one bucket width per node is deliberately conservative but
+    // explicit; replay can justify tighter production widths later.
+    const decisions = this.forest.decisionDag().nodeCount;
+    const tokenError = decisions * tokenBucketSize;
+    const continuityError = decisions * continuityBucketSize;
+    const fidelityError = decisions * fidelityBucketSize;
+    const low = policy.budgetLowRatio * options.maxTokens;
+    const high = policy.budgetHighRatio * options.maxTokens;
+    const budgetSlope = Math.max(
+      low > 0 ? (2 * policy.budgetUnderLambda) / low : 0,
+      options.maxTokens > high
+        ? (2 * policy.budgetOverLambda) / (options.maxTokens - high)
+        : 0,
+    );
+    const cachePrice = Math.max(0, policy.cacheWritePrice - policy.cacheReadPrice);
+    const maxCache = options.maxTokens * cachePrice;
+    const cacheSlope = (2 * policy.cacheLambda * maxCache) / (policy.cacheScale ** 2);
+    const maxContinuity = this.leaves.reduce(
+      (total, leaf) => total + leaf.rawTokens * Math.max(...leaf.availableLevels),
+      0,
+    );
+    const continuitySlope =
+      (2 * policy.continuityLambda * maxContinuity) / (policy.continuityScale ** 2);
+    const rho =
+      options.continuityMultiplier !== undefined &&
+      Number.isFinite(options.continuityMultiplier) &&
+      options.continuityMultiplier >= 0 &&
+      options.continuityMultiplier <= 1
+        ? options.continuityMultiplier
+        : 1;
+    return (
+      fidelityError +
+      budgetSlope * tokenError +
+      cacheSlope * tokenError * cachePrice +
+      rho * continuitySlope * continuityError
+    );
   }
 
   private assign(label: ParetoLabel, ids: readonly ChunkId[], level: number, policy: KvUnifiedWelfarePolicy, options: ExactPolicySolveOptions): ParetoLabel {
