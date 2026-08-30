@@ -86,6 +86,14 @@ export {
   type ParetoPolicySolveResult,
 } from './kv-unified-pareto.js';
 export {
+  KvUnifiedReceiptChain,
+  type PendingPresentationSubmission,
+  type PresentationDelta,
+  type PresentationReceipt,
+  type ReceiptChainSnapshot,
+  type SerializedReceiptChain,
+} from './kv-unified-receipts.js';
+export {
   renderLayout,
   kvCost,
   earliestDivergenceIndex,
