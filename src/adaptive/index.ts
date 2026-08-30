@@ -80,6 +80,11 @@ export {
   type ExactPolicySolveResult,
 } from './kv-unified-policy.js';
 export {
+  ParetoKvUnifiedPolicySolver,
+  type ParetoPropagationStats,
+  type ParetoPolicySolveResult,
+} from './kv-unified-pareto.js';
+export {
   renderLayout,
   kvCost,
   earliestDivergenceIndex,

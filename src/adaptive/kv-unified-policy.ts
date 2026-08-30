@@ -7,7 +7,12 @@
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
-import { CanonicalSummaryForest, type ExactCutEnumerationStats, type MinimumTokenResult } from './kv-unified.js';
+import {
+  CanonicalSummaryForest,
+  type ExactCutCandidate,
+  type ExactCutEnumerationStats,
+  type MinimumTokenResult,
+} from './kv-unified.js';
 import { SummaryTree } from './summary-tree.js';
 import { renderLayout, type RenderLayout } from './render-offsets.js';
 import { evaluateCacheHit, type CacheMarker } from './kv-cache-sim.js';
@@ -169,11 +174,22 @@ export class ExactKvUnifiedPolicySolver {
             maxCandidates: options.maxCandidates,
             maxTokens: options.maxTokens,
           });
+    return this.scoreCandidates(enumeration.candidates, options, enumeration.stats);
+  }
+
+  scoreCandidates(
+    sourceCandidates: readonly ExactCutCandidate[],
+    options: ExactPolicySolveOptions,
+    stats: ExactCutEnumerationStats,
+  ): ExactPolicySolveResult {
+    const policy = normalizePolicy(options.policy);
+    const feasibility = this.forest.minimumTokens(options.maxTokens);
+    if (!feasibility.feasible) return { feasible: false, feasibility };
     const cacheRelevant =
       options.cache !== undefined &&
       options.currentImmutablePrefixHash !== undefined &&
       options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
-    const unscored: UnscoredCandidate[] = enumeration.candidates.map((candidate) => {
+    const unscored: UnscoredCandidate[] = sourceCandidates.map((candidate) => {
       const layout = renderLayout(this.inputs, this.tree, candidate.frontier);
       return {
         frontier: candidate.frontier,
@@ -219,7 +235,7 @@ export class ExactKvUnifiedPolicySolver {
       cacheFloor,
       continuityFloor,
       cacheRelevant,
-      enumeration: enumeration.stats,
+      enumeration: stats,
     };
   }
 
@@ -231,10 +247,7 @@ export class ExactKvUnifiedPolicySolver {
     let loss = 0;
     for (const chunk of this.orderedChunks) {
       if (this.inputs.headChunkIds.has(chunk.id) || this.inputs.tailChunkIds.has(chunk.id)) continue;
-      const level = frontier.get(chunk.id) ?? 0;
-      const age = Math.max(1, newestSequence - chunk.sequence + 1);
-      const salience = clamp(chunk.salience ?? 1, 0.2, 1);
-      loss += salience * age ** (-policy.alpha) * chunk.rawTokens * level;
+      loss += fidelityLeafLoss(chunk, frontier.get(chunk.id) ?? 0, newestSequence, policy);
     }
     return loss;
   }
@@ -245,8 +258,6 @@ export class ExactKvUnifiedPolicySolver {
     policy: KvUnifiedWelfarePolicy,
   ): number {
     if (!presentation) return 0;
-    const recencyHalfLife = positive(policy.continuityRecencyHalfLifeTokens);
-    const stableHalfLife = positive(policy.continuityStableHalfLife);
     let distanceFromLiveEdge = 0;
     let loss = 0;
     for (let index = this.orderedChunks.length - 1; index >= 0; index--) {
@@ -258,16 +269,15 @@ export class ExactKvUnifiedPolicySolver {
       const level = frontier.get(chunk.id) ?? 0;
       const repHash = this.representationHash(chunk.id, level);
       if (repHash === previous.repHash && level === previous.level) continue;
-      const recency =
-        policy.continuityRecencyFloor +
-        (1 - policy.continuityRecencyFloor) * 2 ** (-midpointAge / recencyHalfLife);
-      const tau = Math.max(0, presentation.currentSeq - previous.lastChangedSeq);
-      const stability =
-        policy.continuityStableFloor +
-        (1 - policy.continuityStableFloor) * 2 ** (-tau / stableHalfLife);
-      const salience = clamp(chunk.salience ?? 1, 0.2, 1);
-      const representationDistance = Math.max(1, Math.abs(level - previous.level));
-      loss += salience * chunk.rawTokens * recency * stability * representationDistance;
+      loss += continuityLeafLoss(
+        chunk,
+        level,
+        repHash,
+        previous,
+        presentation.currentSeq,
+        midpointAge,
+        policy,
+      );
     }
     return loss;
   }
@@ -313,7 +323,7 @@ export class ExactKvUnifiedPolicySolver {
   }
 }
 
-function normalizePolicy(
+export function normalizePolicy(
   override: Partial<KvUnifiedWelfarePolicy> | undefined,
 ): KvUnifiedWelfarePolicy {
   const policy = { ...DEFAULT_KV_UNIFIED_WELFARE_POLICY, ...override };
@@ -356,6 +366,41 @@ function normalizePolicy(
     throw new KvUnifiedPolicyError('budgetLowRatio must not exceed budgetHighRatio');
   }
   return policy;
+}
+
+export function fidelityLeafLoss(
+  chunk: PickerInputs['chunks'][number],
+  level: number,
+  newestSequence: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
+  return salience * age ** (-policy.alpha) * chunk.rawTokens * level;
+}
+
+export function continuityLeafLoss(
+  chunk: PickerInputs['chunks'][number],
+  level: number,
+  repHash: string,
+  previous: PresentedLeaf | undefined,
+  currentSeq: number,
+  midpointAgeTokens: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  if (!previous || (repHash === previous.repHash && level === previous.level)) return 0;
+  const recency =
+    policy.continuityRecencyFloor +
+    (1 - policy.continuityRecencyFloor) *
+      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
+  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
+  const stability =
+    policy.continuityStableFloor +
+    (1 - policy.continuityStableFloor) *
+      2 ** (-tau / positive(policy.continuityStableHalfLife));
+  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
+  const representationDistance = Math.max(1, Math.abs(level - previous.level));
+  return salience * chunk.rawTokens * recency * stability * representationDistance;
 }
 
 function budgetPenalty(
