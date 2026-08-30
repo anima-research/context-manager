@@ -291,13 +291,18 @@ export class ParetoKvUnifiedPolicySolver {
         const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
         const current = groups.get(key) ?? [];
         if (continuityBucketSize > 0 && fidelityBucketSize > 0 && current.length > 0) {
-          const incumbent = current[0];
-          if (representativeOrder(label, incumbent) < 0) {
-            groups.set(key, [label]);
-            labelsDominated++;
-          } else {
-            labelsDominated++;
-          }
+          const pool = [...current, label];
+          const chosen = uniqueLabels([
+            [...pool].sort(representativeOrder)[0],
+            [...pool].sort((a, b) =>
+              a.continuityLoss - b.continuityLoss || representativeOrder(a, b),
+            )[0],
+            [...pool].sort((a, b) =>
+              a.renderedTokens - b.renderedTokens || representativeOrder(a, b),
+            )[0],
+          ]);
+          labelsDominated += pool.length - chosen.length;
+          groups.set(key, chosen);
           continue;
         }
         if (current.some((incumbent) => dominates(incumbent, label))) {
@@ -605,4 +610,8 @@ function representativeOrder(a: ParetoLabel, b: ParetoLabel): number {
     a.renderedTokens - b.renderedTokens ||
     a.cache.matchedUnits - b.cache.matchedUnits
   );
+}
+
+function uniqueLabels(labels: readonly ParetoLabel[]): ParetoLabel[] {
+  return labels.filter((label, index) => labels.indexOf(label) === index);
 }
