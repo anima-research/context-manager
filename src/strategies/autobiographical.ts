@@ -4220,8 +4220,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const toMs = (t: number): number => (t > 1e14 ? t / 1000 : t);
       let oldestPendingAgeMs: number | null = null;
       for (const c of pending) {
+        // Live StoredMessage carries `timestamp: Date`; the serialized form
+        // carries a number. The original number-only filter silently dropped
+        // EVERY in-memory message, so oldestPendingAgeMs was null whenever
+        // chunks held Date timestamps — the staleness detector (degraded>1h,
+        // critical>6h) was dead code in production and `healthy` was
+        // unearned (production signature 2026-08-29: pendingChunks>0,
+        // age=null, state=healthy). Accept both shapes.
         const ts = c.messages
-          .map((m) => (m as unknown as { timestamp?: number }).timestamp)
+          .map((m) => {
+            const t = (m as unknown as { timestamp?: number | Date }).timestamp;
+            return t instanceof Date ? t.getTime() : typeof t === 'number' ? t : undefined;
+          })
           .filter((t): t is number => typeof t === 'number');
         if (!ts.length) continue;
         const closedAt = toMs(Math.max(...ts));
