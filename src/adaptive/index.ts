@@ -33,6 +33,7 @@ export type {
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
 export { KvStableStrategy, type KvStableOptions } from './strategies/kv-stable.js';
+export { KvUnifiedStrategy, type KvUnifiedOptions } from './strategies/kv-unified.js';
 
 // Summary tree + rendered-unit accounting (shared substrate)
 export {

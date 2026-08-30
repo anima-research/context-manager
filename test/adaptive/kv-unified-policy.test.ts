@@ -11,6 +11,8 @@ import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
+import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
+import { Picker } from '../../src/adaptive/picker.js';
 import { buildChronicleWithChain, type MockChronicle } from './harness.js';
 
 function fixture(): { chronicle: MockChronicle; inputs: PickerInputs } {
@@ -351,7 +353,7 @@ test('kv-unified partial-metric Pareto propagation agrees with the exhaustive or
   assert.ok((pareto.propagation?.labelsDominated ?? 0) >= 0);
 });
 
-test('kv-unified grid mode stays hard-feasible and reports that its bound is pending', () => {
+test('kv-unified grid mode stays hard-feasible and reports a score-error bound', () => {
   const { inputs } = fixture();
   const result = new ParetoKvUnifiedPolicySolver(inputs).solve({
     maxTokens: 250,
@@ -362,7 +364,26 @@ test('kv-unified grid mode stays hard-feasible and reports that its bound is pen
   assert.equal(result.feasible, true);
   if (!result.feasible) return;
   assert.ok(result.selected.renderedTokens <= 250);
-  assert.equal(result.propagation?.approximationBounded, false);
+  assert.equal(result.propagation?.approximationBounded, true);
+  assert.ok((result.propagation?.approximationScoreErrorBound ?? 0) > 0);
   assert.equal(result.propagation?.tokenBucketSize, 100);
   assert.ok(result.candidates.some((candidate) => candidate.renderedTokens === 55));
+});
+
+test('kv-unified FoldingSolver adapter applies the selected feasible frontier', () => {
+  const { inputs } = fixture();
+  const strategy = new KvUnifiedStrategy({
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+    policy: { budgetUnderLambda: 0, budgetOverLambda: 0 },
+  });
+  const result = new Picker(strategy).run(inputs, {
+    totalBudget: 250,
+    targetBudget: 250,
+    slack: 0,
+  });
+  assert.ok(result.finalTokens <= 250);
+  assert.equal(result.unrealizable, 0);
+  assert.equal(strategy.lastResult?.feasible, true);
 });
