@@ -5386,12 +5386,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sourceOnlyCleaned = stripUnpairedToolBlocks(
         this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
       );
+      const sourceOnlyFallbackWireMessages = sourceOnlyCleaned
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .filter(m => m.content.length > 0);
+      // Keep the final rung wire-identical to legacy direct source-only. With
+      // an empty recall ladder this places no owned seam/TTL, but when cache
+      // markers are enabled it still strips stale imported block-level
+      // cache_control before dispatch. The kill switch preserves passthrough.
+      this.applyMintCacheSeams(sourceOnlyFallbackWireMessages, [], false);
       sourceOnlyFallbackRequest = {
         ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
         shedOversizeImages: true,
-        messages: sourceOnlyCleaned
-          .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
-          .filter(m => m.content.length > 0),
+        messages: sourceOnlyFallbackWireMessages,
         config: structuredClone(request.config),
         tools: ctx.tools,
       };
