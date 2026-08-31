@@ -8001,9 +8001,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected _prevCacheKeys?: string[];
 
   /**
-   * Place up to three message-level `cache_control` breakpoints across the
-   * final ordered entries: the head/system boundary, the MEASURED stable
-   * prefix boundary, and the very end (pure-append reuse).
+   * Place message-level `cache_control` breakpoints across the final ordered
+   * entries. `kv-unified` owns all four provider slots and uses rendered-token
+   * thirds of non-tail history plus the tail end. Other strategies retain the
+   * legacy three-slot contract: head/system, measured stable-prefix boundary,
+   * and end.
    *
    * The stable-prefix mark used to sit at the folded-history/tail seam
    * (`historyEnd`) on the assumption that the folded region is stable
@@ -8066,7 +8068,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sid = entries[i].sourceMessageId;
       if (sid && tailMessageIds.has(sid)) { firstTail = i; break; }
     }
-    const historyEnd = firstTail - 1; // last middle (folded-history) entry
+    const historyEnd = firstTail - 1; // last non-tail entry
+
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // CM owns all four slots in kv-unified mode. Place three history
+      // breakpoints at the nearest legal rendered-token boundaries to
+      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
+      // no separate early/system marker: every history prefix already
+      // includes tools, system, and the raw head on the provider wire.
+      const marks = new Set<number>();
+      if (historyEnd >= 0) {
+        const cumulative: number[] = [0];
+        for (let i = 0; i <= historyEnd; i++) {
+          cumulative.push(
+            cumulative[cumulative.length - 1]! +
+            Math.max(1, this.estimateTokens(entries[i]?.content ?? [])),
+          );
+        }
+        const nearestBoundary = (fraction: number): number => {
+          const target = cumulative[cumulative.length - 1]! * fraction;
+          let bestBoundary = 1;
+          for (let boundary = 2; boundary < cumulative.length; boundary++) {
+            if (
+              Math.abs(cumulative[boundary]! - target) <
+              Math.abs(cumulative[bestBoundary]! - target)
+            ) bestBoundary = boundary;
+          }
+          return bestBoundary - 1;
+        };
+        marks.add(nearestBoundary(1 / 3));
+        marks.add(nearestBoundary(2 / 3));
+        marks.add(historyEnd);
+      }
+      marks.add(n - 1);
+      if (marks.size > 4) {
+        throw new Error(
+          `placeCacheMarkers: ${marks.size} caller-owned markers exceed Anthropic's limit of 4`,
+        );
+      }
+      for (const idx of marks) entries[idx]!.cacheMarker = true;
+      return;
+    }
 
     // Measured stable prefix: first index where this compile's entry bytes
     // diverge from the previous compile's. No previous compile → seam
