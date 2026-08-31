@@ -48,6 +48,31 @@ nodes in strict mode and has a quarantined floor of 302,069 tokens.  Fable
 therefore needs the treeification/quarantine choice to be explicit; the live
 configuration now fails closed if that boolean is absent.
 
+An initial no-receipt sweep at W=400k, band [0.70, 0.935], and the provisional
+hinge prices demonstrates why alpha cannot be adopted as a harmless default:
+
+| Export | alpha | selected tokens | selected level counts (L0/L1/L2/L3/L4) |
+|---|---:|---:|---:|
+| current | 0.5 | 394,377 | 394 / 458 / 2,913 / 33,354 / 10,574 |
+| current | 0.7 | 377,999 | 373 / 339 / 3,053 / 30,521 / 13,407 |
+| current | 1.0 | 371,112 | 525 / 468 / 3,582 / 17,432 / 25,686 |
+| 2026-08-24 masked | 0.5 | 386,502 | 301 / 370 / 4,106 / 32,236 / 0 |
+| 2026-08-24 masked | 0.7 | 381,102 | 431 / 396 / 3,950 / 24,640 / 7,596 |
+| 2026-08-24 masked | 1.0 | 369,398 | 435 / 392 / 3,950 / 18,829 / 13,407 |
+
+These runs omit an accepted-presentation/cache reference, so they are shape
+checks rather than transition-policy replays.  They show that the 0.5–1.0 fit
+bracket materially changes both occupancy and which history remains fine.
+
+The current analytic approximation certificate is valid but not useful at
+this scale: it sums a bucket width per decision node and reports a score bound
+above 2 billion for the representative 10k/10k/50k grid.  Narrowing all
+buckets to 1k reduces the bound by roughly an order of magnitude but costs
+about 6.8 s per current-Fable solve and still leaves a very loose certificate.
+Production needs either an a-posteriori path-wise bound or a replay-validated
+operational error threshold; the present global bound must not be presented
+as evidence that a chosen Fable frontier is close to exact.
+
 ## Estimator evidence and a fixed measurement bug
 
 The append-only `service-stderr.log` contains 49 estimator-calibration samples
@@ -114,4 +139,6 @@ field throws before a solve can select or persist a frontier.
    pending spans into stability-labelled marker placement.  The current live
    adapter only demands missing L1 coverage when the exact hard floor is over
    budget; that prevents a deadlock but is not the complete §8 ranking layer.
-
+5. Replace or tighten the node-count-times-bucket approximation certificate;
+   the current bound is formally conservative but operationally vacuous on a
+   47k-leaf forest.
