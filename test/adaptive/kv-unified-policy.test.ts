@@ -353,21 +353,110 @@ test('kv-unified partial-metric Pareto propagation agrees with the exhaustive or
   assert.ok((pareto.propagation?.labelsDominated ?? 0) >= 0);
 });
 
-test('kv-unified grid mode stays hard-feasible and reports a score-error bound', () => {
+test('kv-unified grid mode stays hard-feasible and reports an a-posteriori score-error bound', () => {
   const { inputs } = fixture();
-  const result = new ParetoKvUnifiedPolicySolver(inputs).solve({
+  const options = {
     maxTokens: 250,
     tokenBucketSize: 100,
     continuityBucketSize: 100,
     fidelityBucketSize: 100,
+  } as const;
+  const result = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
+  const exact = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    tokenBucketSize: 0,
+    continuityBucketSize: 0,
+    fidelityBucketSize: 0,
   });
   assert.equal(result.feasible, true);
-  if (!result.feasible) return;
+  assert.equal(exact.feasible, true);
+  if (!result.feasible || !exact.feasible) return;
   assert.ok(result.selected.renderedTokens <= 250);
   assert.equal(result.propagation?.approximationBounded, true);
-  assert.ok((result.propagation?.approximationScoreErrorBound ?? 0) > 0);
+  assert.ok(
+    result.selected.score - exact.selected.score <=
+      (result.propagation?.approximationScoreErrorBound ?? -1) + 1e-9,
+  );
+  assert.ok((result.propagation?.approximationTokenErrorBound ?? -1) >= 0);
+  assert.ok((result.propagation?.approximationContinuityErrorBound ?? -1) >= 0);
+  assert.ok((result.propagation?.approximationFidelityErrorBound ?? -1) >= 0);
   assert.equal(result.propagation?.tokenBucketSize, 100);
   assert.ok(result.candidates.some((candidate) => candidate.renderedTokens === 55));
+});
+
+test('kv-unified a-posteriori bound covers exact welfare regret on varied small forests', () => {
+  for (let caseIndex = 0; caseIndex < 20; caseIndex++) {
+    const chronicle = buildChronicleWithChain({
+      chunkCount: 6,
+      tokensPerChunk: 70,
+      mergeThreshold: 2,
+      recallPairTokens: 35,
+    });
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks.map((chunk, index) => ({
+        ...chunk,
+        rawTokens: 55 + ((index * 29 + caseIndex * 17) % 70),
+        salience: 0.2 + (((index * 13 + caseIndex * 7) % 9) / 10),
+      })),
+      summaries: chronicle.summaries,
+      recallPairTokens: new Map(
+        [...chronicle.recallPairTokens].map(([id, tokens], index) => [
+          id,
+          tokens + ((index * 11 + caseIndex * 5) % 30),
+        ]),
+      ),
+      headTokens: 0,
+      tailTokens: 0,
+      headChunkIds: new Set(),
+      tailChunkIds: new Set(),
+    };
+    const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
+    const cacheOptions = caseIndex % 2 === 0
+      ? {
+          cache: {
+            immutablePrefixHash: 'stable-tools',
+            layout: rawLayout,
+            markers: [
+              { unitIndex: 2, offset: rawLayout.units[2]?.offset ?? 0 },
+              { unitIndex: 4, offset: rawLayout.units[4]?.offset ?? rawLayout.totalTokens },
+            ],
+          },
+          currentImmutablePrefixHash: 'stable-tools',
+        }
+      : {};
+    const options = {
+      maxTokens: 260 + (caseIndex % 4) * 20,
+      presentation: rawPresentation(inputs),
+      ...cacheOptions,
+      policy: {
+        alpha: 0.4 + (caseIndex % 4) * 0.2,
+        budgetLowRatio: 0.5,
+        budgetHighRatio: 0.8,
+        budgetUnderLambda: 300 + caseIndex * 10,
+        budgetOverLambda: 700 + caseIndex * 20,
+        cacheLambda: 400 + caseIndex * 10,
+        cacheScale: 200,
+        continuityLambda: 500 + caseIndex * 15,
+        continuityScale: 200,
+        continuityRecencyHalfLifeTokens: 150,
+        continuityRecencyFloor: 0.2,
+        continuityStableFloor: 1,
+      },
+    } as const;
+    const exact = new ExactKvUnifiedPolicySolver(inputs).solve(options);
+    const approximate = new ParetoKvUnifiedPolicySolver(inputs).solve({
+      ...options,
+      tokenBucketSize: 80,
+      continuityBucketSize: 100,
+      fidelityBucketSize: 100,
+    });
+    assert.equal(exact.feasible, true, `exact case ${caseIndex}`);
+    assert.equal(approximate.feasible, true, `approximate case ${caseIndex}`);
+    if (!exact.feasible || !approximate.feasible) continue;
+    const regret = approximate.selected.score - exact.selected.score;
+    const bound = approximate.propagation?.approximationScoreErrorBound ?? -1;
+    assert.ok(regret <= bound + 1e-9, `case ${caseIndex}: regret ${regret} > bound ${bound}`);
+  }
 });
 
 test('kv-unified grid mode retains cache and continuity floor witnesses', () => {
