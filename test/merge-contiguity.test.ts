@@ -24,6 +24,9 @@ class Probe extends AutobiographicalStrategy {
   pick(unmerged: SummaryEntry[], threshold: number): SummaryEntry[] | null {
     return this.contiguousMergeCandidates(unmerged, threshold);
   }
+  setSummaries(summaries: SummaryEntry[]): void {
+    (this as unknown as { summaries: SummaryEntry[] }).summaries = summaries;
+  }
 }
 
 function summary(id: string, first: number, last: number): SummaryEntry {
@@ -74,6 +77,32 @@ test('small holes bridge; interior runs consolidate early; the newest run waits'
   assert.ok(p.pick(unmerged, 5), 'the contiguous five qualify at threshold 5');
   // The NEWEST run can still grow — below threshold it waits.
   assert.equal(p.pick(unmerged.slice(0, 5), 6), null, 'newest run below threshold waits');
+});
+
+test('a small hole does not bridge while its lower-level group is still pending', () => {
+  const p = probe();
+  const unmerged = [
+    summary('a', 0, 50), summary('b', 51, 100),
+    summary('c', 101, 150), summary('d', 151, 200),
+    // Only 216 live messages separate d and e: the ordinary scar tolerance
+    // would bridge it, but an orphan L1 proves an L2 is still pending there.
+    summary('e', 417, 470), summary('f', 471, 520),
+  ];
+  p.setSummaries([{
+    id: 'pending-l1',
+    level: 1,
+    content: 'pending lower group',
+    tokens: 100,
+    sourceLevel: 0,
+    sourceIds: ['m-201', 'm-416'],
+    sourceRange: { first: 'm-201', last: 'm-416' },
+    created: 1,
+  } as SummaryEntry]);
+
+  const picked = p.pick(unmerged, 6);
+  assert.ok(picked, 'the now-interior older run can consolidate');
+  assert.deepEqual(picked!.map((entry) => entry.id), ['a', 'b', 'c', 'd']);
+  assert.ok(!picked!.some((entry) => entry.id === 'e' || entry.id === 'f'));
 });
 
 test('wide-span (replay-era) candidates are quarantined from any run', () => {
