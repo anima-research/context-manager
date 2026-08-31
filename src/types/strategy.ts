@@ -666,6 +666,10 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /** Legacy first-choice target-only merge request. Default false. */
+  compressionMergeSourceOnly?: boolean;
+  /** Use target-only merge request only on the final persisted merge attempt. Default false. */
+  compressionMergeSourceOnlyFallback?: boolean;
   /** Token target for each summary at any level (default: 2000) */
   summaryTargetTokens?: number;
   /** Token budget for L3 summaries in select() (default: 30000) */
@@ -734,6 +738,9 @@ export interface AutobiographicalConfig {
    * Default undefined/false — every other resident is unaffected.
    */
   compressionSourceOnly?: boolean;
+
+  /** Final bounded source-only L1 attempt after canonical + recall variants. */
+  compressionSourceOnlyFallback?: boolean;
 
   /**
    * Residence-scoped source-only hierarchical merge requests (2026-08-25).

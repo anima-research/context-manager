@@ -66,7 +66,7 @@ function blockTypes(req: NormalizedRequest): Set<string> {
   const s = new Set<string>(); for (const m of req.messages) for (const b of m.content) s.add(b.type); return s;
 }
 
-interface Opts { sourceOnly?: boolean; mergeSourceOnly?: boolean; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; }
+interface Opts { sourceOnly?: boolean; sourceOnlyFallback?: boolean; fallbackLimit?: number; mergeSourceOnly?: boolean; systemPrompt?: string; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; }
 
 async function build(membrane: unknown, opts: Opts = {}) {
   const strategy = new ProbeStrategy({
@@ -77,12 +77,14 @@ async function build(membrane: unknown, opts: Opts = {}) {
     autoTickOnNewMessage: false,
     minChunkCharsForLLM: 0,
     mergeThreshold: 99,
-    compressionRefusalCurveFallbacks: 3,
+    compressionRefusalCurveFallbacks: opts.fallbackLimit ?? 3,
     compressionSourceOnly: opts.sourceOnly,
     compressionMergeSourceOnly: opts.mergeSourceOnly,
+    compressionSourceOnlyFallback: opts.sourceOnlyFallback,
   } as never);
   const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
   if (opts.tools) manager.setToolDefinitions(opts.tools);
+  if (opts.systemPrompt !== undefined) manager.setSystemPrompt(opts.systemPrompt);
   const ids: string[] = [];
   for (let i = 0; i < 12; i++) ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
   // seed a live L1 summary over the earliest pair -> becomes a recall pair when NOT source-only
@@ -174,6 +176,162 @@ describe('source-only L1 compression', () => {
     assert.ok(q.count >= 1, 'chunk family quarantined (normal receipt)');
   });
 
+
+  it('FINAL FALLBACK: canonical runs first; one source-only call runs only after refusal', async () => {
+    const calls: NormalizedRequest[] = []; let n = 0;
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls.push(structuredClone(request)); n++;
+      return n === 1
+        ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+        : { content: [text('fallback memory')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+    } } as never;
+    const fx = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.length, 2);
+    assert.ok(recallIds(calls[0]!).length > 0);
+    assert.ok(texts(calls[0]!).some((t) => t.includes('raw-2 ')));
+    assert.deepEqual(recallIds(calls[1]!), []);
+    assert.ok(!texts(calls[1]!).some((t) => t.includes('raw-2 ')));
+    for (const ct of ['raw-10', 'raw-11']) assert.ok(texts(calls[1]!).some((t) => t.includes(ct)));
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+  });
+
+
+  it('FINAL FALLBACK ORDER: configured recall variant runs before source-only', async () => {
+    const calls: NormalizedRequest[] = []; let n = 0;
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls.push(structuredClone(request)); n++;
+      return n < 3
+        ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+        : { content: [text('source-only succeeds last')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+    } } as never;
+    const fx = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 1 });
+    const childA = summary('L1-300', fx.ids[4]!, fx.ids[5]!, [fx.ids[4]!, fx.ids[5]!]);
+    const childB = summary('L1-301', fx.ids[6]!, fx.ids[7]!, [fx.ids[6]!, fx.ids[7]!]);
+    childA.mergedInto = 'L2-302'; childB.mergedInto = 'L2-302';
+    const parent: SummaryEntry = {
+      id: 'L2-302', level: 2, content: 'authored parent', tokens: 20, sourceLevel: 1,
+      sourceIds: ['L1-300', 'L1-301'], sourceRange: { first: fx.ids[4]!, last: fx.ids[7]! }, created: 302,
+    };
+    fx.strategy.seed(childA); fx.strategy.seed(childB); fx.strategy.seed(parent);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.length, 3, 'canonical, one recall variant, one source-only final');
+    assert.ok(recallIds(calls[0]!).includes('L2-302'), 'canonical carries parent recall');
+    assert.ok(recallIds(calls[1]!).includes('L1-300') && recallIds(calls[1]!).includes('L1-301'), 'variant expands parent to children');
+    assert.deepEqual(recallIds(calls[2]!), [], 'source-only is strictly last');
+    assert.ok(!texts(calls[2]!).some((t) => t.includes('raw-2 ')), 'source-only omits unrelated head');
+  });
+
+  it('FINAL FALLBACK: canonical success suppresses source-only', async () => {
+    const { calls, membrane } = capturingMembrane('end_turn');
+    const fx = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.length, 1);
+    assert.ok(recallIds(calls[0]!).length > 0);
+  });
+
+  it('FINAL FALLBACK: final refusal is bounded and quarantines', async () => {
+    const { calls, membrane } = capturingMembrane('refusal');
+    const fx = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.length, 2);
+    assert.ok(recallIds(calls[0]!).length > 0);
+    assert.deepEqual(recallIds(calls[1]!), []);
+    assert.ok(fx.strategy.getCompressionQuarantineStatus().count >= 1);
+  });
+
+
+  it('FINAL FALLBACK SHAPE: system/config/tools/messages equal legacy direct source-only', async () => {
+    const tools: ToolDefinition[] = [{ name: 'demo', description: 'd', inputSchema: { type: 'object', properties: {} } } as never];
+    const directCapture = capturingMembrane('end_turn');
+    const direct = await build(directCapture.membrane, { sourceOnly: true, systemPrompt: 'resident identity', tools });
+    await direct.strategy.run(direct.target, managerContext(direct.manager));
+
+    const calls: NormalizedRequest[] = []; let n = 0;
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls.push(structuredClone(request)); n++;
+      return n === 1
+        ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+        : { content: [text('fallback memory')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+    } } as never;
+    const fallback = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0, systemPrompt: 'resident identity', tools });
+    await fallback.strategy.run(fallback.target, managerContext(fallback.manager));
+    assert.deepEqual(calls[1], directCapture.calls[0], 'final fallback is exact legacy source-only wire shape');
+  });
+
+  it('FINAL FALLBACK: thinking-wrapped final output quarantines without a later canonical retry', async () => {
+    const calls: NormalizedRequest[] = []; let n = 0;
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls.push(structuredClone(request)); n++;
+      return n === 1
+        ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+        : { content: [text('<thinking>only wrapper</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+    } } as never;
+    const fx = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.length, 2, 'no canonical/plain-prose request after source-only-final');
+    assert.ok(fx.strategy.getCompressionQuarantineStatus().count >= 1, 'empty stripped final output quarantines');
+  });
+
+  it('FINAL FALLBACK FAMILY: enabling it invalidates old quarantine without manual clear', async () => {
+    const path = freshPath();
+    const cfg = (fallback: boolean) => ({
+      compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000,
+      autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: fallback,
+    } as never);
+    const refused = capturingMembrane('refusal');
+    const s1 = new ProbeStrategy(cfg(false));
+    const m1 = await ContextManager.open({ path, strategy: s1, membrane: refused.membrane as never });
+    const ids: string[] = []; for (let i = 0; i < 12; i++) ids.push(m1.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
+    s1.seed(summary('L1-100', ids[0]!, ids[1]!, [ids[0]!, ids[1]!]));
+    const target1: Chunk = { index: 999, startIndex: 10, endIndex: 12, messages: managerContext(m1).messageStore.getAll().filter(m => [ids[10]!, ids[11]!].includes(m.id)), tokens: 100, compressed: false };
+    await s1.run(target1, managerContext(m1));
+    assert.ok(s1.getCompressionQuarantineStatus().count >= 1, 'old ladder quarantined');
+    m1.close();
+
+    const calls: NormalizedRequest[] = []; let n = 0;
+    const membrane = { complete: async (request: NormalizedRequest) => { calls.push(structuredClone(request)); n++; return n === 1
+      ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+      : { content: [text('fresh-family fallback')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } }; } } as never;
+    const s2 = new ProbeStrategy(cfg(true));
+    const m2 = await ContextManager.open({ path, strategy: s2, membrane });
+    const target2: Chunk = { index: 999, startIndex: 10, endIndex: 12, messages: managerContext(m2).messageStore.getAll().filter(m => [ids[10]!, ids[11]!].includes(m.id)), tokens: 100, compressed: false };
+    await s2.run(target2, managerContext(m2));
+    assert.equal(calls.length, 2, 'new family ran canonical then final fallback without manual clear');
+    m2.close();
+  });
+
+
+  it('FINAL FALLBACK FAMILY CAP: old-regime cap does not block new regime; new-regime cap remains sticky', async () => {
+    const seedStore = async (path: string) => {
+      const s = new ProbeStrategy({ compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, compressionRefusalCurveFallbacks: 0 } as never);
+      const m = await ContextManager.open({ path, strategy: s, membrane: capturingMembrane('refusal').membrane as never });
+      const ids: string[] = []; for (let i = 0; i < 12; i++) ids.push(m.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
+      s.seed(summary('L1-100', ids[0]!, ids[1]!, [ids[0]!, ids[1]!])); m.close(); return ids;
+    };
+    const run = async (path: string, ids: string[], fallback: boolean, budget: number, outcomes: Array<'refusal'|'end_turn'>) => {
+      const calls: NormalizedRequest[] = []; let n = 0;
+      const membrane = { complete: async (request: NormalizedRequest) => { calls.push(structuredClone(request)); const outcome = outcomes[Math.min(n++, outcomes.length - 1)]!; return outcome === 'end_turn'
+        ? { content: [text('memory')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } }
+        : { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }; } } as never;
+      const strategy = new ProbeStrategy({ compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, compressionSourceOnlyFallback: fallback } as never);
+      const manager = await ContextManager.open({ path, strategy, membrane });
+      const target: Chunk = { index: 999, startIndex: 10, endIndex: 12, messages: managerContext(manager).messageStore.getAll().filter(m => [ids[10]!, ids[11]!].includes(m.id)), tokens: 100, compressed: false };
+      await strategy.run(target, managerContext(manager)); const count = strategy.getCompressionQuarantineStatus().count; manager.close(); return { calls, count };
+    };
+
+    const oldPath = freshPath(); const oldIds = await seedStore(oldPath);
+    for (const budget of [100_000, 101_000, 102_000]) await run(oldPath, oldIds, false, budget, ['refusal']);
+    const fresh = await run(oldPath, oldIds, true, 100_000, ['refusal', 'end_turn']);
+    assert.equal(fresh.calls.length, 2, 'fallback-enabled regime earns canonical + final despite old-regime cap');
+
+    const newPath = freshPath(); const newIds = await seedStore(newPath);
+    for (const budget of [100_000, 101_000, 102_000]) await run(newPath, newIds, true, budget, ['refusal', 'refusal']);
+    const capped = await run(newPath, newIds, true, 103_000, ['refusal', 'refusal']);
+    assert.equal(capped.calls.length, 0, 'fourth request shape in same fallback regime is suppressed by cap');
+  });
+
   it('MERGE INVARIANT: executeMerge builds a byte-identical request with the flag on vs off', async () => {
     async function mergeReq(sourceOnly: boolean): Promise<NormalizedRequest> {
       const { calls, membrane } = capturingMembrane('end_turn');
@@ -189,6 +347,26 @@ describe('source-only L1 compression', () => {
     const off = await mergeReq(false);
     assert.equal(JSON.stringify(on), JSON.stringify(off), 'merge request identical regardless of compressionSourceOnly');
   });
+
+  it('MERGE FINAL FALLBACK: last persisted attempt matches legacy target-only wire shape', async () => {
+    async function mergeReq(mode: 'ordinary' | 'legacy' | 'final', attempts: number): Promise<NormalizedRequest> {
+      const { calls, membrane } = capturingMembrane('end_turn');
+      const strategy = new ProbeStrategy({ compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, mergeAttemptLimit: 5, compressionMergeSourceOnly: mode === 'legacy', compressionMergeSourceOnlyFallback: mode === 'final' } as never);
+      const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
+      manager.setSystemPrompt('resident identity');
+      const ids: string[] = []; for (let i = 0; i < 12; i++) ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
+      strategy.seed(summary('L1-200', ids[4]!, ids[5]!, [ids[4]!, ids[5]!])); strategy.seed(summary('L1-201', ids[6]!, ids[7]!, [ids[6]!, ids[7]!]));
+      const sourceIds = ['L1-200', 'L1-201'];
+      (strategy as unknown as { mergeQueue: unknown[] }).mergeQueue = [{ level: 2, sourceIds, attempts }];
+      await strategy.runMerge(2, sourceIds, managerContext(manager)); assert.equal(calls.length, 1); return calls[0]!;
+    }
+    const legacy = await mergeReq('legacy', 0);
+    const final = await mergeReq('final', 4);
+    const beforeFinal = await mergeReq('final', 3);
+    assert.deepEqual(final, legacy, 'terminal merge fallback equals legacy target-only wire shape');
+    assert.notDeepEqual(beforeFinal, legacy, 'merge remains canonical/recall-aware before final persisted attempt');
+  });
+
 });
 
 
