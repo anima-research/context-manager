@@ -74,6 +74,7 @@ export class ParetoKvUnifiedPolicySolver {
   private readonly chunksById: ReadonlyMap<ChunkId, PickerInputs['chunks'][number]>;
   private readonly indexById: ReadonlyMap<ChunkId, number>;
   private readonly midpointAge = new Map<ChunkId, number>();
+  private readonly summaryMetricCache = new Map<string, { continuity: number; fidelity: number }>();
   private readonly newestSequence: number;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
@@ -223,6 +224,7 @@ export class ParetoKvUnifiedPolicySolver {
       terminal,
       options,
       scoringStats,
+      feasibility,
     );
     if (!scored.feasible) return scored;
     return {
@@ -337,7 +339,14 @@ export class ParetoKvUnifiedPolicySolver {
       let selected: ParetoLabel[] = [];
       if (participants.length > 0 && participants.every((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level))) {
         selected = incoming.map((label) => {
-          const assigned = this.assign(label, participants, summary.level, policy, options);
+          const assigned = this.assignSummary(
+            label,
+            summary.id,
+            participants,
+            summary.level,
+            policy,
+            options,
+          );
           return this.emit(
             assigned,
             'recall',
@@ -419,6 +428,7 @@ export class ParetoKvUnifiedPolicySolver {
         maxCandidatesAtState: maxLabelsPerState,
         terminalCandidates: terminal.length,
       },
+      feasibility,
     );
     if (!scored.feasible) return scored;
     return {
@@ -526,9 +536,49 @@ export class ParetoKvUnifiedPolicySolver {
       ...label,
       active: true,
       remaining,
-      trace: { parent: label.trace, ids: [...ids], level },
+      trace: { parent: label.trace, ids, level },
       continuityLoss,
       fidelityLoss,
+    };
+  }
+
+  private assignSummary(
+    label: ParetoLabel,
+    summaryId: string,
+    ids: readonly ChunkId[],
+    level: number,
+    policy: KvUnifiedWelfarePolicy,
+    options: ExactPolicySolveOptions,
+  ): ParetoLabel {
+    const key = `${summaryId}:${options.presentation?.currentSeq ?? 'none'}`;
+    let metrics = this.summaryMetricCache.get(key);
+    if (!metrics) {
+      let continuity = 0;
+      let fidelity = 0;
+      for (const id of ids) {
+        const chunk = this.chunksById.get(id)!;
+        fidelity += fidelityLeafLoss(chunk, level, this.newestSequence, policy);
+        const previous = options.presentation?.leaves.get(id);
+        const repHash = `summary:${summaryId}`;
+        continuity += continuityLeafLoss(
+          chunk,
+          level,
+          repHash,
+          previous,
+          options.presentation?.currentSeq ?? 0,
+          this.midpointAge.get(id)!,
+          policy,
+        );
+      }
+      metrics = { continuity, fidelity };
+      this.summaryMetricCache.set(key, metrics);
+    }
+    return {
+      ...label,
+      active: true,
+      trace: { parent: label.trace, ids, level },
+      continuityLoss: label.continuityLoss + metrics.continuity,
+      fidelityLoss: label.fidelityLoss + metrics.fidelity,
     };
   }
 
@@ -572,7 +622,7 @@ export class ParetoKvUnifiedPolicySolver {
     return {
       ...label,
       active: true,
-      trace: { parent: label.trace, ids: [...ids], level: 0 },
+      trace: { parent: label.trace, ids, level: 0 },
       continuityLoss,
     };
   }

@@ -944,32 +944,111 @@ export class CanonicalSummaryForest {
       };
     }
 
-    const memo = new Map<string, PartialCut | null>();
-    let combined: PartialCut = { tokens: 0, frontier: new Map() };
+    const memo = new Map<string, number>();
+    const selectedChoice = new Map<string, boolean>();
+    const keyOf = (id: SummaryId, active: readonly ChunkId[]): string =>
+      `${id}\u0000${active.join('\u0001')}`;
+    const leafCost = (id: ChunkId): number => {
+      const leaf = this.leafMap.get(id)!;
+      if (!leaf.allowedLevels.includes(0)) return IMPOSSIBLE;
+      return leaf.externallyAccounted ? 0 : leaf.rawTokens;
+    };
+    const childrenCost = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): number => {
+      const active = new Set(activeIds);
+      let total = 0;
+      for (const child of this.orderedChildren(summary)) {
+        if (child.kind === 'leaf') {
+          if (!active.has(child.id)) continue;
+          total += leafCost(child.id);
+        } else {
+          const childSummary = this.summaryMap.get(child.id)!;
+          const childActive = childSummary.leafIds.filter((id) => active.has(id));
+          if (childActive.length > 0) total += summaryCost(child.id, childActive);
+        }
+        if (!Number.isFinite(total)) return IMPOSSIBLE;
+      }
+      return total;
+    };
+    const summaryCost = (id: SummaryId, activeIds: readonly ChunkId[]): number => {
+      if (activeIds.length === 0) return 0;
+      const key = keyOf(id, activeIds);
+      const cached = memo.get(key);
+      if (cached !== undefined) return cached;
+      const summary = this.summaryMap.get(id)!;
+      const expanded = childrenCost(summary, activeIds);
+      const participants = activeIds.filter((leafId) =>
+        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+      );
+      let selected = IMPOSSIBLE;
+      if (participants.length > 0) {
+        const participantSet = new Set(participants);
+        const holes = activeIds.filter((leafId) => !participantSet.has(leafId));
+        const holeCost = childrenCost(summary, holes);
+        if (Number.isFinite(holeCost)) selected = summary.recallTokens + holeCost;
+      }
+      const useSelected = selected < expanded;
+      const best = useSelected ? selected : expanded;
+      memo.set(key, best);
+      selectedChoice.set(key, useSelected);
+      return best;
+    };
+
+    let variableTokens = 0;
     for (const root of this.roots) {
-      const cut =
+      const cost =
         root.kind === 'leaf'
-          ? this.coverLeaf(root.id)
-          : this.coverSummary(root.id, this.summaryMap.get(root.id)!.leafIds, memo);
-      if (!cut) {
+          ? leafCost(root.id)
+          : summaryCost(root.id, this.summaryMap.get(root.id)!.leafIds);
+      if (!Number.isFinite(cost)) {
         return {
           feasible: false,
           floorTokens: null,
           certificate: this.certificate('constraint-conflict', null, maxTokens),
         };
       }
-      combined = mergeCuts(combined, cut);
+      variableTokens += cost;
     }
-    const floorTokens = this.fixedTokens + combined.tokens;
+    const frontier = new Map<ChunkId, number>();
+    const reconstructLeaf = (id: ChunkId): void => { frontier.set(id, 0); };
+    const reconstructChildren = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): void => {
+      const active = new Set(activeIds);
+      for (const child of this.orderedChildren(summary)) {
+        if (child.kind === 'leaf') {
+          if (active.has(child.id)) reconstructLeaf(child.id);
+        } else {
+          const childSummary = this.summaryMap.get(child.id)!;
+          const childActive = childSummary.leafIds.filter((id) => active.has(id));
+          if (childActive.length > 0) reconstructSummary(child.id, childActive);
+        }
+      }
+    };
+    const reconstructSummary = (id: SummaryId, activeIds: readonly ChunkId[]): void => {
+      const summary = this.summaryMap.get(id)!;
+      if (selectedChoice.get(keyOf(id, activeIds))) {
+        const participants = activeIds.filter((leafId) =>
+          this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+        );
+        const participantSet = new Set(participants);
+        for (const leafId of participants) frontier.set(leafId, summary.level);
+        reconstructChildren(summary, activeIds.filter((leafId) => !participantSet.has(leafId)));
+      } else {
+        reconstructChildren(summary, activeIds);
+      }
+    };
+    for (const root of this.roots) {
+      if (root.kind === 'leaf') reconstructLeaf(root.id);
+      else reconstructSummary(root.id, this.summaryMap.get(root.id)!.leafIds);
+    }
+    const floorTokens = this.fixedTokens + variableTokens;
     if (floorTokens > maxTokens) {
       return {
         feasible: false,
         floorTokens,
-        frontier: combined.frontier,
+        frontier,
         certificate: this.certificate('over-budget', floorTokens, maxTokens),
       };
     }
-    return { feasible: true, floorTokens, frontier: combined.frontier };
+    return { feasible: true, floorTokens, frontier };
   }
 
   private constraintsFor(
