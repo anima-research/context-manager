@@ -478,6 +478,32 @@ export interface CompressionQuarantineStatus {
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
 export type RecallEnvelopeMode = 'none' | 'xml';
 
+export interface KvUnifiedConfig {
+  policy: {
+    alpha: number;
+    budgetLowRatio: number;
+    budgetHighRatio: number;
+    budgetUnderLambda: number;
+    budgetOverLambda: number;
+    cacheLambda: number;
+    cacheScale: number;
+    cacheReadPrice: number;
+    cacheWritePrice: number;
+    continuityLambda: number;
+    continuityScale: number;
+    continuityRecencyHalfLifeTokens: number;
+    continuityRecencyFloor: number;
+    continuityStableHalfLife: number;
+    continuityStableFloor: number;
+  };
+  tokenBucketSize: number;
+  continuityBucketSize: number;
+  fidelityBucketSize: number;
+  labelCeiling: number;
+  adoptEpsilon: number;
+  quarantineNonContiguousSummaries: boolean;
+}
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -948,7 +974,11 @@ export interface AutobiographicalConfig {
    *     docs/adaptive-resolution-design.md §13.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'kv-unified';
+
+  /** Explicit, fail-closed kv-unified policy. Every field is required when
+   * foldingStrategy is `kv-unified`; there are no live defaults. */
+  kvUnified?: KvUnifiedConfig;
 
   /**
    * Trust region P (tokens) for `foldingStrategy: 'kv-stable'` — bounds how

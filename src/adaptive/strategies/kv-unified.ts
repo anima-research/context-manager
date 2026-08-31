@@ -4,6 +4,7 @@ import type {
   FoldingSolver,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
+import { CanonicalSummaryForest } from '../kv-unified.js';
 import {
   ParetoKvUnifiedPolicySolver,
   type ParetoPolicySolveResult,
@@ -11,7 +12,9 @@ import {
 } from '../kv-unified-pareto.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
-  /** Production defaults remain unset until Phase-0 replay chooses them. */
+  /** Live adapter refuses missing policy/grid fields when true. */
+  requireExplicitPolicy?: boolean;
+  quarantineNonContiguousSummaries?: boolean;
 }
 /**
  * FoldingSolver adapter for kv-unified. It is intentionally not in the live
@@ -28,7 +31,11 @@ export class KvUnifiedStrategy implements FoldingSolver {
   }
 
   solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
-    const solver = new ParetoKvUnifiedPolicySolver(inputs);
+    if (this.options.requireExplicitPolicy) validateExplicitOptions(this.options);
+    const forest = new CanonicalSummaryForest(inputs, {
+      quarantineNonContiguousSummaries: this.options.quarantineNonContiguousSummaries,
+    });
+    const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
     const result = solver.solve({
       ...this.options,
       maxTokens: budget.totalBudget,
@@ -57,5 +64,30 @@ export class KvUnifiedStrategy implements FoldingSolver {
       produced: [],
       exhausted: false,
     };
+  }
+}
+
+// Kept as a function to avoid making the validation path depend on mutable
+// development defaults.
+function validateExplicitOptions(options: KvUnifiedOptions): void {
+  const requiredPolicy = [
+    'alpha', 'budgetLowRatio', 'budgetHighRatio', 'budgetUnderLambda',
+    'budgetOverLambda', 'cacheLambda', 'cacheScale', 'cacheReadPrice',
+    'cacheWritePrice', 'continuityLambda', 'continuityScale',
+    'continuityRecencyHalfLifeTokens', 'continuityRecencyFloor',
+    'continuityStableHalfLife', 'continuityStableFloor',
+  ] as const;
+  if (!options.policy) throw new Error('kv-unified requires an explicit policy');
+  for (const key of requiredPolicy) {
+    if (options.policy[key] === undefined) throw new Error(`kv-unified policy is missing ${key}`);
+  }
+  for (const key of ['tokenBucketSize', 'continuityBucketSize', 'fidelityBucketSize', 'labelCeiling'] as const) {
+    const value = options[key];
+    if (!Number.isFinite(value) || (value ?? 0) <= 0) {
+      throw new Error(`kv-unified requires positive ${key}`);
+    }
+  }
+  if (!Number.isFinite(options.adoptEpsilon) || (options.adoptEpsilon ?? -1) < 0) {
+    throw new Error('kv-unified requires non-negative adoptEpsilon');
   }
 }
