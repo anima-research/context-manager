@@ -119,4 +119,7 @@ function validateExplicitOptions(options: KvUnifiedOptions): void {
   if (!Number.isFinite(options.adoptEpsilon) || (options.adoptEpsilon ?? -1) < 0) {
     throw new Error('kv-unified requires non-negative adoptEpsilon');
   }
+  if (typeof options.quarantineNonContiguousSummaries !== 'boolean') {
+    throw new Error('kv-unified requires an explicit quarantineNonContiguousSummaries boolean');
+  }
 }
