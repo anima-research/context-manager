@@ -29,6 +29,13 @@ export interface ReceiptChainSnapshot {
   head: PresentationReceipt | null;
   leaves: ReadonlyMap<ChunkId, PresentedLeaf>;
   cache: ProviderCacheReference | null;
+  wireReceipt?: ObservedCacheWireReceipt | null;
+}
+
+export interface ObservedCacheWireReceipt {
+  requestHash: string;
+  acceptedAt: number;
+  markers: Array<{ ordinal: number; prefixHash: string; estimatedOffset: number }>;
 }
 
 export interface SerializedReceiptChain {
@@ -36,6 +43,7 @@ export interface SerializedReceiptChain {
   leaves: Array<[ChunkId, PresentedLeaf]>;
   cache: ProviderCacheReference | null;
   settledSubmissionIds: string[];
+  wireReceipt: ObservedCacheWireReceipt | null;
 }
 
 /** Pure single-flight receipt state machine. Persistence is layered on its
@@ -45,6 +53,7 @@ export class KvUnifiedReceiptChain {
   private headValue: PresentationReceipt | null;
   private leavesValue: Map<ChunkId, PresentedLeaf>;
   private cacheValue: ProviderCacheReference | null;
+  private wireReceiptValue: ObservedCacheWireReceipt | null;
   private pending: PendingPresentationSubmission | null = null;
   private settled = new Set<string>();
 
@@ -52,6 +61,7 @@ export class KvUnifiedReceiptChain {
     this.headValue = snapshot?.head ?? null;
     this.leavesValue = new Map(snapshot?.leaves ?? []);
     this.cacheValue = snapshot?.cache ?? null;
+    this.wireReceiptValue = snapshot?.wireReceipt ?? null;
   }
 
   static deserialize(value: SerializedReceiptChain): KvUnifiedReceiptChain {
@@ -59,6 +69,7 @@ export class KvUnifiedReceiptChain {
       head: value.head,
       leaves: new Map(value.leaves),
       cache: value.cache,
+      wireReceipt: value.wireReceipt,
     });
     chain.settled = new Set(value.settledSubmissionIds);
     return chain;
@@ -67,6 +78,7 @@ export class KvUnifiedReceiptChain {
   get head(): PresentationReceipt | null { return this.headValue; }
   get leaves(): ReadonlyMap<ChunkId, PresentedLeaf> { return this.leavesValue; }
   get cache(): ProviderCacheReference | null { return this.cacheValue; }
+  get wireReceipt(): ObservedCacheWireReceipt | null { return this.wireReceiptValue; }
   get inFlightSubmissionId(): string | null { return this.pending?.submissionId ?? null; }
 
   begin(submission: PendingPresentationSubmission): void {
@@ -79,12 +91,14 @@ export class KvUnifiedReceiptChain {
     submissionId: string,
     acceptedAt: number,
     cache: ProviderCacheReference | null,
+    wireReceipt?: Omit<ObservedCacheWireReceipt, 'acceptedAt'>,
   ): { presentationAdvanced: boolean; duplicate: boolean } {
     if (this.settled.has(submissionId)) return { presentationAdvanced: false, duplicate: true };
     const pending = this.requirePending(submissionId);
     this.pending = null;
     this.settled.add(submissionId);
     this.cacheValue = cache;
+    if (wireReceipt) this.wireReceiptValue = { ...wireReceipt, acceptedAt };
     if (this.headValue?.layoutHash === pending.layoutHash) {
       return { presentationAdvanced: false, duplicate: false };
     }
@@ -118,6 +132,7 @@ export class KvUnifiedReceiptChain {
       head: this.headValue,
       leaves: new Map(this.leavesValue),
       cache: this.cacheValue,
+      wireReceipt: this.wireReceiptValue,
     };
   }
 
@@ -127,6 +142,7 @@ export class KvUnifiedReceiptChain {
       leaves: [...this.leavesValue],
       cache: this.cacheValue,
       settledSubmissionIds: [...this.settled].slice(-256),
+      wireReceipt: this.wireReceiptValue,
     };
   }
 

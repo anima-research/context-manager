@@ -62,11 +62,16 @@ test('kv-unified receipt callbacks are idempotent by unique submission id', () =
 test('kv-unified receipt state round-trips through a Chronicle-safe JSON shape', () => {
   const chain = new KvUnifiedReceiptChain();
   chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
-  chain.accept('s1', 100, null);
+  chain.accept('s1', 100, null, {
+    requestHash: 'wire',
+    markers: [{ ordinal: 0, prefixHash: 'prefix', estimatedOffset: 123 }],
+  });
   const encoded = JSON.parse(JSON.stringify(chain.serialize()));
   const restored = KvUnifiedReceiptChain.deserialize(encoded);
   assert.equal(restored.head?.receiptHash, chain.head?.receiptHash);
   assert.equal(restored.leaves.get('a')?.repHash, 'raw:a');
+  assert.equal(restored.wireReceipt?.acceptedAt, 100);
+  assert.equal(restored.wireReceipt?.markers[0]?.estimatedOffset, 123);
   assert.deepEqual(restored.accept('s1', 100, null), {
     presentationAdvanced: false,
     duplicate: true,
