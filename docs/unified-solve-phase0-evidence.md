@@ -38,15 +38,26 @@ headroom-risk input.  Estimator uncertainty and the operator's tolerance for
 back-to-back calls can require more room, while neither number chooses the
 upper-hinge welfare price.
 
-The current historical Fable export has 47,693 message leaves.  With explicit
-non-contiguous-summary quarantine, its exact feasibility floor is 273,827
-tokens and a representative bounded solve completes in about 0.72 s on the
-development machine (10k token/continuity buckets, 50k fidelity bucket,
-peak frontier 69 labels).  Exact floor computation completes in about 0.05 s.
-The 2026-08-24T05:00Z created-masked export contains 11 non-contiguous summary
-nodes in strict mode and has a quarantined floor of 302,069 tokens.  Fable
-therefore needs the treeification/quarantine choice to be explicit; the live
-configuration now fails closed if that boolean is absent.
+The current historical Fable export has 47,693 message leaves.  Strict
+canonicalization reports non-contiguous ownership in several high summaries.
+An **offline solver experiment** that excludes those ancestors has an exact
+feasibility floor of 273,827 tokens, and a representative bounded solve
+completes in about 0.72 s on the development machine (10k token/continuity
+buckets, 50k fidelity bucket, peak frontier 69 labels).  Exact floor
+computation completes in about 0.05 s.  The 2026-08-24T05:00Z created-masked
+export contains 11 non-contiguous summary nodes in strict mode; the same
+exclusion experiment has a floor of 302,069 tokens.
+
+This is **not Fable quarantine state**.  Her live recipe has no such setting,
+her last generic compression-quarantine event is all-clear, and no merge
+quarantine warning appears in the service log.  The implementation option
+currently named `quarantineNonContiguousSummaries` is a solver-local prototype
+that removes unusable ancestors from the solve; its name conflates that
+experiment with the strategy's real compression/refusal quarantine.  These
+measurements prove only that strict canonicalization rejects the export.  They
+do not justify silently enabling ancestor exclusion for Fable.  Before pilot,
+either diagnose/repair the ownership links or implement and review a genuine
+treeification transform that preserves render semantics.
 
 An initial no-receipt sweep at W=400k, band [0.70, 0.935], and the provisional
 hinge prices demonstrates why alpha cannot be adopted as a harmless default:
@@ -114,7 +125,6 @@ remain explicit policy choices.
 
 They support:
 
-- explicit quarantine/treeification for the known Fable scars;
 - a preliminary upper occupancy boundary no higher than about 0.935 if one
   p99 append is the desired buffer at W=400k; and
 - refusing to calibrate the new cache term from the old marker simulation.
@@ -129,8 +139,10 @@ They do not choose:
 
 Those are normative choices to be displayed as frontier tradeoffs.  The live
 strategy intentionally has no fallback recipe: `foldingStrategy:
-"kv-unified"` without every policy, approximation, adoption, and quarantine
-field throws before a solve can select or persist a frontier.
+"kv-unified"` without every policy, approximation, adoption, and structural-
+handling field throws before a solve can select or persist a frontier.  That
+fail-closed gate does not make the current ancestor-exclusion prototype an
+approved Fable policy.
 
 ## Gates remaining before a Fable switch
 
@@ -144,3 +156,6 @@ field throws before a solve can select or persist a frontier.
    pending spans into stability-labelled marker placement.  The current live
    adapter only demands missing L1 coverage when the exact hard floor is over
    budget; that prevents a deadlock but is not the complete §8 ranking layer.
+5. Resolve the non-contiguous ownership findings without calling them Fable
+   quarantine: establish whether they are exporter artifacts, repairable store
+   scars, or inputs requiring a semantics-preserving treeification transform.
