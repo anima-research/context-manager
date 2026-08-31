@@ -124,3 +124,17 @@ test('kv-unified owns four message-level cache marker slots', () => {
   assert.equal(entries.filter((entry) => (entry as { cacheMarker?: boolean }).cacheMarker).length, 4);
   assert.equal((entries[19] as { cacheMarker?: boolean }).cacheMarker, true, 'end marker retained');
 });
+
+test('kv-unified fails closed when the treeification policy is omitted', async () => {
+  const configured = strategy() as unknown as {
+    config: { kvUnified?: { quarantineNonContiguousSummaries?: boolean } };
+  };
+  delete configured.config.kvUnified!.quarantineNonContiguousSummaries;
+  const manager = await ContextManager.open({ path: STORE, strategy: configured as unknown as AutobiographicalStrategy });
+  manager.addMessage('user', [{ type: 'text', text: 'fail closed' }]);
+  await assert.rejects(
+    manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }),
+    /requires an explicit quarantineNonContiguousSummaries boolean/,
+  );
+  manager.close();
+});
