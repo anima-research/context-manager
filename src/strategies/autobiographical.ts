@@ -39,6 +39,13 @@ import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type Pic
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { SummaryTree } from '../adaptive/summary-tree.js';
+import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
+import {
+  KvUnifiedReceiptChain,
+  type SerializedReceiptChain,
+} from '../adaptive/kv-unified-receipts.js';
+import type { PresentedLeaf } from '../adaptive/kv-unified-policy.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -983,6 +990,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
+  private kvUnifiedReceipts = new KvUnifiedReceiptChain();
+  private kvUnifiedDraft: { leaves: Map<ChunkId, PresentedLeaf>; layout: RenderLayout } | null = null;
+  private kvUnifiedPendingLayout: RenderLayout | null = null;
   /** Legacy snapshot used by the unapproved first implementation. Read-only. */
   protected get compressionRefusalQuarantineStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine`;
@@ -1644,6 +1655,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       } catch { /* already registered */ }
     }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      try {
+        this.store.registerState({
+          id: this.kvUnifiedReceiptStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+    }
     try {
       this.store.registerState({
         id: this.counterStateId,
@@ -1853,6 +1872,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (typeof id === 'string') this.locked.add(id);
         }
       }
+    }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+        : new KvUnifiedReceiptChain();
+      this.kvUnifiedDraft = null;
+      this.kvUnifiedPendingLayout = null;
     }
   }
 
@@ -6748,6 +6775,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             totalBudget: preparedTotal,
             targetBudget: preparedTotal * (1 - slack),
           },
+      opts?.kvUnifiedImmutablePrefixHash,
     );
     // NOTE: a dry run also disturbs transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
@@ -6757,6 +6785,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
+    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
+      const tree = new SummaryTree(pickerInputs);
+      const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
+      const leaves = new Map<ChunkId, PresentedLeaf>();
+      for (const chunk of pickerInputs.chunks) {
+        const level = result.finalResolutions.get(chunk.id) ?? 0;
+        const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
+        if (level > 0 && !summaryId) {
+          throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+        }
+        const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
+        const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
+        leaves.set(chunk.id, {
+          repHash,
+          level,
+          lastChangedSeq:
+            previous?.repHash === repHash && previous.level === level
+              ? previous.lastChangedSeq
+              : nextSequence,
+        });
+      }
+      this.kvUnifiedDraft = {
+        leaves,
+        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+      };
+    }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
     // PLANNER/EMITTER RECONCILIATION (2026-07-26). The picker plans against
@@ -7298,6 +7352,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch { /* persistence is best-effort */ }
   }
 
+  /** Bind the most recently selected kv-unified presentation to a unique
+   * provider submission. Compilation alone never advances receipt state. */
+  beginKvUnifiedSubmission(args: {
+    submissionId: string;
+    requestHash: string;
+    layoutHash: string;
+  }): void {
+    this.requireLoadedBranch('beginKvUnifiedSubmission');
+    if (this.config.foldingStrategy !== 'kv-unified' || !this.kvUnifiedDraft) {
+      throw new Error('No kv-unified presentation draft is available for submission');
+    }
+    this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
+  }
+
+  isKvUnifiedEnabled(): boolean {
+    return this.config.foldingStrategy === 'kv-unified';
+  }
+
+  reportKvUnifiedAccepted(args: { submissionId: string; acceptedAt?: number }): void {
+    this.requireLoadedBranch('reportKvUnifiedAccepted');
+    this.kvUnifiedReceipts.accept(args.submissionId, args.acceptedAt ?? Date.now(), null);
+    this.kvUnifiedPendingLayout = null;
+    this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+  }
+
+  reportKvUnifiedFailed(submissionId: string): void {
+    this.requireLoadedBranch('reportKvUnifiedFailed');
+    this.kvUnifiedReceipts.fail(submissionId);
+    this.kvUnifiedPendingLayout = null;
+  }
+
   private _calibrationArmed = false;
 
   private _calibration = 1;
@@ -7493,6 +7579,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected buildPicker(
     inputs: PickerInputs,
     preparedBudget?: { totalBudget: number; targetBudget: number },
+    immutablePrefixHash?: string,
   ): Picker {
     // Drift alarm: the live config must still name the solver chosen at
     // construction. Nothing legitimate rewrites foldingStrategy at runtime —
@@ -7532,18 +7619,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        ...(this.kvUnifiedReceipts.head
+          ? {
+              presentation: {
+                currentSeq: this.kvUnifiedReceipts.head.sequence,
+                leaves: this.kvUnifiedReceipts.leaves,
+              },
+            }
+          : {}),
+        ...(this.kvUnifiedReceipts.cache ? { cache: this.kvUnifiedReceipts.cache } : {}),
+        ...(immutablePrefixHash ? { currentImmutablePrefixHash: immutablePrefixHash } : {}),
         requireExplicitPolicy: true,
       });
+      this._lastKvUnified = strategy;
       this._lastKvStable = null;
       return new Picker(strategy);
     }
     this._lastKvStable = null;
+    this._lastKvUnified = null;
     return this.getAdaptivePicker();
   }
 
   /** The kv-stable strategy instance behind the most recent compile — kept for
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
+  private _lastKvUnified: KvUnifiedStrategy | null = null;
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
