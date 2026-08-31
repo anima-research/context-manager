@@ -2204,8 +2204,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     messages: NormalizedRequest['messages'],
     recallLadder: readonly SummaryEntry[],
     capped: boolean,
-  ): void {
-    if (this.config.compressionCacheMarkers === false || capped) return;
+  ): boolean {
+    if (this.config.compressionCacheMarkers === false) return false;
+    // Replayed history can carry stale BLOCK-level cache_control from the
+    // original live requests (imported stores; see membrane's native-formatter
+    // passthrough note). Those were another request's placement decisions, and
+    // the formatter counts them toward Anthropic's 4-breakpoint limit — left
+    // in place, two of them plus the three seams below would push the request
+    // past it and the API hard-rejects, stalling compression. Strip them
+    // (copy-on-write: block objects are shared with the message store).
+    // cache_control is request plumbing, not content, so verbatim-replay
+    // KV-honesty is unaffected. The kill switch above restores byte-exact
+    // pre-seam behavior, passthrough included.
+    for (const m of messages) {
+      if (m.content.some((b) => (b as { cache_control?: unknown }).cache_control !== undefined)) {
+        m.content = m.content.map((b) => {
+          if ((b as { cache_control?: unknown }).cache_control === undefined) return b;
+          const { cache_control: _stale, ...rest } = b as ContentBlock & { cache_control?: unknown };
+          return rest as ContentBlock;
+        });
+      }
+    }
+    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -2223,10 +2243,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       frontierEnd = i + 1;
       if (level >= 2) deepEnd = i + 1;
     }
-    if (frontierEnd === -1) return; // no ladder yet — nothing stable to cache
+    if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
       if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
     }
+    return true;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -5133,7 +5154,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mintMessages = cleaned
       .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
       .filter(m => m.content.length > 0);
-    this.applyMintCacheSeams(
+    const mintSeamed = this.applyMintCacheSeams(
       mintMessages,
       keptSummaries,
       keptSummaries.length < priorSummaries.length,
@@ -5160,7 +5181,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
       // 5-minute cache window, where markers cost more than they save.
-      cacheTtl: this.config.compressionCacheTtl,
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:
@@ -6571,7 +6592,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mintMessages = cleaned
       .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
       .filter(m => m.content.length > 0);
-    this.applyMintCacheSeams(
+    const mintSeamed = this.applyMintCacheSeams(
       mintMessages,
       keptPriorSummaries,
       keptPriorSummaries.length < priorSummariesAll.length,
@@ -6608,7 +6629,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
       // 5-minute cache window, where markers cost more than they save.
-      cacheTtl: this.config.compressionCacheTtl,
+      ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
         // Generous output ceiling so a memory-write is never truncated mid-thought:

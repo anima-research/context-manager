@@ -666,8 +666,6 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
-  /** Legacy first-choice target-only merge request. Default false. */
-  compressionMergeSourceOnly?: boolean;
   /** Use target-only merge request only on the final persisted merge attempt. Default false. */
   compressionMergeSourceOnlyFallback?: boolean;
   /** Token target for each summary at any level (default: 2000) */
