@@ -30,6 +30,13 @@ interface ParetoLabel {
   fidelityLoss: number;
   cache: CacheState;
   trace: AssignmentTrace | null;
+  approximation: ApproximationEnvelope;
+}
+
+interface ApproximationEnvelope {
+  token: number;
+  continuity: number;
+  fidelity: number;
 }
 
 interface AssignmentTrace {
@@ -51,6 +58,9 @@ export interface ParetoPropagationStats {
   /** True when approximationScoreErrorBound covers configured grid pruning. */
   readonly approximationBounded: boolean;
   readonly approximationScoreErrorBound: number;
+  readonly approximationTokenErrorBound: number;
+  readonly approximationContinuityErrorBound: number;
+  readonly approximationFidelityErrorBound: number;
 }
 
 export type ParetoPolicySolveResult = ExactPolicySolveResult & {
@@ -127,6 +137,7 @@ export class ParetoKvUnifiedPolicySolver {
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
       trace: externalIds.length > 0 ? { parent: null, ids: externalIds, level: 0 } : null,
+      approximation: ZERO_APPROXIMATION,
     };
     if (this.inputs.headTokens > 0) {
       initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, false, options, markerByUnit);
@@ -240,13 +251,12 @@ export class ParetoKvUnifiedPolicySolver {
         continuityBucketSize,
         fidelityBucketSize,
         approximationBounded: true,
-        approximationScoreErrorBound: this.approximationBound(
-          options,
-          policy,
-          tokenBucketSize,
-          continuityBucketSize,
-          fidelityBucketSize,
-        ),
+        // The leaf engine performs exact dominance only. Bucket keys can
+        // retain extra labels but never discard a nondominated one.
+        approximationScoreErrorBound: 0,
+        approximationTokenErrorBound: 0,
+        approximationContinuityErrorBound: 0,
+        approximationFidelityErrorBound: 0,
       },
     };
   }
@@ -272,6 +282,7 @@ export class ParetoKvUnifiedPolicySolver {
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
       trace: externalIds.length > 0 ? { parent: null, ids: externalIds, level: 0 } : null,
+      approximation: ZERO_APPROXIMATION,
     };
     if (this.inputs.headTokens > 0) {
       initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, false, options, markerByUnit);
@@ -291,35 +302,32 @@ export class ParetoKvUnifiedPolicySolver {
       for (const label of labels) {
         if (label.renderedTokens > options.maxTokens) continue;
         const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
-        const current = groups.get(key) ?? [];
-        if (continuityBucketSize > 0 && fidelityBucketSize > 0 && current.length > 0) {
-          const pool = [...current, label];
-          const chosen = uniqueLabels([
-            [...pool].sort(representativeOrder)[0],
-            [...pool].sort((a, b) =>
-              a.continuityLoss - b.continuityLoss || representativeOrder(a, b),
-            )[0],
-            [...pool].sort((a, b) =>
-              a.renderedTokens - b.renderedTokens || representativeOrder(a, b),
-            )[0],
-          ]);
-          labelsDominated += pool.length - chosen.length;
-          groups.set(key, chosen);
-          continue;
-        }
-        if (current.some((incumbent) => dominates(incumbent, label))) {
-          labelsDominated++;
-          continue;
-        }
-        const survivors = current.filter((incumbent) => {
-          const removed = dominates(label, incumbent);
-          if (removed) labelsDominated++;
-          return !removed;
-        });
-        survivors.push(label);
-        groups.set(key, survivors);
+        const current = groups.get(key);
+        if (current) current.push(label);
+        else groups.set(key, [label]);
       }
-      const result = [...groups.values()].flat();
+      const result: ParetoLabel[] = [];
+      for (const pool of groups.values()) {
+        const nondominated = pool.filter(
+          (candidate, index) => !pool.some(
+            (other, otherIndex) => otherIndex !== index && dominates(other, candidate),
+          ),
+        );
+        const representatives = continuityBucketSize > 0 && fidelityBucketSize > 0
+          ? uniqueLabels([
+              [...nondominated].sort(representativeOrder)[0],
+              [...nondominated].sort((a, b) =>
+                a.continuityLoss - b.continuityLoss || representativeOrder(a, b),
+              )[0],
+              [...nondominated].sort((a, b) =>
+                a.renderedTokens - b.renderedTokens || representativeOrder(a, b),
+              )[0],
+            ])
+          : nondominated;
+        const covered = coverApproximationPool(pool, representatives);
+        labelsDominated += pool.length - covered.length;
+        result.push(...covered);
+      }
       labelsCreated += result.length;
       maxLabelsPerState = Math.max(maxLabelsPerState, result.length);
       if (result.length > ceiling) throw new SparseLabelCeilingError(ceiling, result.length);
@@ -431,6 +439,7 @@ export class ParetoKvUnifiedPolicySolver {
       feasibility,
     );
     if (!scored.feasible) return scored;
+    const approximation = maxApproximation(labels);
     return {
       ...scored,
       propagation: {
@@ -443,15 +452,11 @@ export class ParetoKvUnifiedPolicySolver {
         tokenBucketSize,
         continuityBucketSize,
         fidelityBucketSize,
-        approximationBounded:
-          true,
-        approximationScoreErrorBound: this.approximationBound(
-          options,
-          policy,
-          tokenBucketSize,
-          continuityBucketSize,
-          fidelityBucketSize,
-        ),
+        approximationBounded: true,
+        approximationScoreErrorBound: this.approximationBound(options, policy, approximation),
+        approximationTokenErrorBound: approximation.token,
+        approximationContinuityErrorBound: approximation.continuity,
+        approximationFidelityErrorBound: approximation.fidelity,
       },
     };
   }
@@ -468,18 +473,11 @@ export class ParetoKvUnifiedPolicySolver {
   private approximationBound(
     options: ExactPolicySolveOptions,
     policy: KvUnifiedWelfarePolicy,
-    tokenBucketSize: number,
-    continuityBucketSize: number,
-    fidelityBucketSize: number,
+    approximation: ApproximationEnvelope,
   ): number {
-    if (tokenBucketSize === 0 && continuityBucketSize === 0 && fidelityBucketSize === 0) return 0;
-    // A representative can replace a path at most once per decision node.
-    // Summing one bucket width per node is deliberately conservative but
-    // explicit; replay can justify tighter production widths later.
-    const decisions = this.forest.decisionDag().nodeCount;
-    const tokenError = decisions * tokenBucketSize;
-    const continuityError = decisions * continuityBucketSize;
-    const fidelityError = decisions * fidelityBucketSize;
+    const tokenError = approximation.token;
+    const continuityError = approximation.continuity;
+    const fidelityError = approximation.fidelity;
     const low = policy.budgetLowRatio * options.maxTokens;
     const high = policy.budgetHighRatio * options.maxTokens;
     const budgetSlope = Math.max(
@@ -492,7 +490,14 @@ export class ParetoKvUnifiedPolicySolver {
     const maxCache = options.maxTokens * cachePrice;
     const cacheSlope = (2 * policy.cacheLambda * maxCache) / (policy.cacheScale ** 2);
     const maxContinuity = this.leaves.reduce(
-      (total, leaf) => total + leaf.rawTokens * Math.max(...leaf.availableLevels),
+      (total, leaf) => {
+        const previousLevel = options.presentation?.leaves.get(leaf.id)?.level ?? 0;
+        const maxDistance = Math.max(
+          1,
+          ...leaf.availableLevels.map((level) => Math.abs(level - previousLevel)),
+        );
+        return total + leaf.rawTokens * maxDistance;
+      },
       0,
     );
     const continuitySlope =
@@ -504,11 +509,15 @@ export class ParetoKvUnifiedPolicySolver {
       options.continuityMultiplier <= 1
         ? options.continuityMultiplier
         : 1;
+    const hysteresis = options.presentation && Number.isFinite(options.adoptEpsilon)
+      ? Math.max(0, options.adoptEpsilon ?? 0)
+      : 0;
     return (
       fidelityError +
       budgetSlope * tokenError +
       cacheSlope * tokenError * cachePrice +
-      rho * continuitySlope * continuityError
+      rho * continuitySlope * continuityError +
+      hysteresis
     );
   }
 
@@ -689,6 +698,66 @@ function stateKey(
     continuityBucketSize > 0 ? Math.floor(label.continuityLoss / continuityBucketSize) : 'c*',
     fidelityBucketSize > 0 ? Math.floor(label.fidelityLoss / fidelityBucketSize) : 'f*',
   ].join(':');
+}
+
+const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
+  token: 0,
+  continuity: 0,
+  fidelity: 0,
+});
+
+/** Attach every discarded path to one retained representative.  The
+ * component envelopes are one-sided: how much worse the representative may
+ * be than an exact path it stands in for.  Subsequent actions add the same
+ * component costs at the same structural/cache state, so the envelope carries
+ * forward unchanged until another prune. */
+function coverApproximationPool(
+  pool: readonly ParetoLabel[],
+  representatives: readonly ParetoLabel[],
+): ParetoLabel[] {
+  const covered = representatives.map((label) => ({
+    ...label,
+    approximation: { ...label.approximation },
+  }));
+  for (const source of pool) {
+    let chosen = 0;
+    let chosenCost = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < covered.length; i++) {
+      const candidate = covered[i];
+      const cost =
+        Math.abs(candidate.renderedTokens - source.renderedTokens) +
+        Math.max(0, candidate.continuityLoss - source.continuityLoss) +
+        Math.max(0, candidate.fidelityLoss - source.fidelityLoss);
+      if (cost < chosenCost) {
+        chosen = i;
+        chosenCost = cost;
+      }
+    }
+    const target = covered[chosen];
+    target.approximation.token = Math.max(
+      target.approximation.token,
+      source.approximation.token + Math.abs(target.renderedTokens - source.renderedTokens),
+    );
+    target.approximation.continuity = Math.max(
+      target.approximation.continuity,
+      source.approximation.continuity + Math.max(0, target.continuityLoss - source.continuityLoss),
+    );
+    target.approximation.fidelity = Math.max(
+      target.approximation.fidelity,
+      source.approximation.fidelity + Math.max(0, target.fidelityLoss - source.fidelityLoss),
+    );
+  }
+  return covered;
+}
+
+function maxApproximation(labels: readonly ParetoLabel[]): ApproximationEnvelope {
+  const result = { token: 0, continuity: 0, fidelity: 0 };
+  for (const label of labels) {
+    result.token = Math.max(result.token, label.approximation.token);
+    result.continuity = Math.max(result.continuity, label.approximation.continuity);
+    result.fidelity = Math.max(result.fidelity, label.approximation.fidelity);
+  }
+  return result;
 }
 
 function dominates(a: ParetoLabel, b: ParetoLabel): boolean {

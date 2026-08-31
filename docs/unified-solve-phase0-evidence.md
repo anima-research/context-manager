@@ -64,14 +64,19 @@ These runs omit an accepted-presentation/cache reference, so they are shape
 checks rather than transition-policy replays.  They show that the 0.5–1.0 fit
 bracket materially changes both occupancy and which history remains fine.
 
-The current analytic approximation certificate is valid but not useful at
-this scale: it sums a bucket width per decision node and reports a score bound
-above 2 billion for the representative 10k/10k/50k grid.  Narrowing all
-buckets to 1k reduces the bound by roughly an order of magnitude but costs
-about 6.8 s per current-Fable solve and still leaves a very loose certificate.
-Production needs either an a-posteriori path-wise bound or a replay-validated
-operational error threshold; the present global bound must not be presented
-as evidence that a chosen Fable frontier is close to exact.
+The original analytic approximation certificate was not useful at this scale:
+it summed a bucket width per decision node and reported a score bound above
+2 billion for the representative 10k/10k/50k grid.  Narrowing all buckets to
+1k cost about 6.8 s per current-Fable solve and still left a very loose global
+bound.  The implementation now propagates one-sided error envelopes through
+the representatives actually retained at each prune.  On the same current
+Fable solve it preserves the selected frontier, runs in about 0.48 s, and
+reports a 60,216 score-unit bound decomposed as 6,736 rendered tokens, zero
+continuity units (there is no presentation in this shape sweep), and 58,142
+fidelity units.  Twenty varied small-forest cases, including warm-cache
+transitions, verify the reported bound against exhaustive welfare regret.
+This is materially informative rather than vacuous, though replay must still
+decide what production bound is acceptable.
 
 ## Estimator evidence and a fixed measurement bug
 
@@ -139,6 +144,3 @@ field throws before a solve can select or persist a frontier.
    pending spans into stability-labelled marker placement.  The current live
    adapter only demands missing L1 coverage when the exact hard floor is over
    budget; that prevents a deadlock but is not the complete §8 ranking layer.
-5. Replace or tighten the node-count-times-bucket approximation certificate;
-   the current bound is formally conservative but operationally vacuous on a
-   47k-leaf forest.
