@@ -453,3 +453,20 @@ test('kv-unified adoption epsilon holds a feasible presentation but never an ove
   assert.equal(forced.feasible, true);
   if (forced.feasible) assert.ok(forced.selected.renderedTokens <= 250);
 });
+
+test('kv-unified infeasibility demands missing L1s instead of deadlocking', () => {
+  const { chronicle, inputs } = fixture();
+  chronicle.summaries.clear();
+  chronicle.recallPairTokens.clear();
+  for (const chunk of inputs.chunks) chunk.l1Id = undefined;
+  const solution = new KvUnifiedStrategy().solve(inputs, {
+    totalBudget: 100,
+    targetBudget: 100,
+    slack: 0,
+  });
+  assert.equal(solution.exhausted, true);
+  assert.deepEqual(solution.produced, [{
+    level: 1,
+    range: { firstChunkId: 'c-0000', lastChunkId: 'c-0003' },
+  }]);
+});
