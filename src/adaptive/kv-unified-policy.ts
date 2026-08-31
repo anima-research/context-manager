@@ -134,13 +134,12 @@ interface UnscoredCandidate {
 export class ExactKvUnifiedPolicySolver {
   readonly forest: CanonicalSummaryForest;
 
-  private readonly tree: SummaryTree;
+  private tree: SummaryTree | null = null;
   private readonly orderedChunks: PickerInputs['chunks'];
   private readonly summaryLeaves = new Map<SummaryId, readonly ChunkId[]>();
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
-    this.tree = new SummaryTree(inputs);
     this.orderedChunks = [...inputs.chunks].sort(
       (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
     );
@@ -183,16 +182,19 @@ export class ExactKvUnifiedPolicySolver {
     sourceCandidates: readonly ExactCutCandidate[],
     options: ExactPolicySolveOptions,
     stats: ExactCutEnumerationStats,
+    knownFeasibility?: Extract<MinimumTokenResult, { feasible: true }>,
   ): ExactPolicySolveResult {
     const policy = normalizePolicy(options.policy);
-    const feasibility = this.forest.minimumTokens(options.maxTokens);
+    const feasibility = knownFeasibility ?? this.forest.minimumTokens(options.maxTokens);
     if (!feasibility.feasible) return { feasible: false, feasibility };
     const cacheRelevant =
       options.cache !== undefined &&
       options.currentImmutablePrefixHash !== undefined &&
       options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
     const unscored: UnscoredCandidate[] = sourceCandidates.map((candidate) => {
-      const layout = renderLayout(this.inputs, this.tree, candidate.frontier);
+      const layout = cacheRelevant
+        ? renderLayout(this.inputs, this.getTree(), candidate.frontier)
+        : { units: [], totalTokens: candidate.renderedTokens };
       return {
         frontier: candidate.frontier,
         layout,
@@ -333,6 +335,11 @@ export class ExactKvUnifiedPolicySolver {
     );
     if (!summaryId) throw new Error(`missing L${level} representation for ${chunkId}`);
     return `summary:${summaryId}`;
+  }
+
+  private getTree(): SummaryTree {
+    this.tree ??= new SummaryTree(this.inputs);
+    return this.tree;
   }
 
   private matchesPresentation(
