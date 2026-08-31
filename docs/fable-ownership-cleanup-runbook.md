@@ -1,8 +1,14 @@
 # Fable ownership cleanup runbook
 
-Status: validated on an isolated 2026-08-31 snapshot; **not applied to the
-live store**.  Commits `83b36a9`, `44712a4`, and `569f7e8` must be deployed
-before any live cleanup so regenerated work uses strict ownership seams.
+Status: validated on an isolated snapshot and applied live on 2026-08-31.
+The cleanup-only integration branch deployed to Fable is
+`deploy/fable-ownership-cleanup` at `075eba8` (the upstream-based equivalents
+of commits `83b36a9`, `44712a4`, and `569f7e8`).
+
+Live cutover boundary: `20260831T213330Z`. The untouched post-stop store is
+preserved at
+`/home/fable/fable-cm/data/sessions/d784b4ca.pre-ownership-cleanup-20260831T213330Z`.
+The active session remains `/home/fable/fable-cm/data/sessions/d784b4ca`.
 
 ## Validated copied-store result
 
@@ -25,7 +31,22 @@ SHA-256:
 - Exact minimum-token floor at W=400k: 184,046.
 - Representative bounded solve: 380,387 tokens in about 0.74 s.
 
-The original snapshot and live session were not modified.
+The original 08-31 diagnostic snapshot was not modified. The disposable test
+copy was removed after the successful live cutover; its final aggregate export
+and the live rollback directory remain.
+
+## Live result
+
+- 47,909 messages at the pre-switch validation boundary.
+- 1,842 summaries after the full live-derived drain.
+- Strict canonical closure and zero impossible carried resolutions.
+- Zero pending chunks, queued merges, or quarantines before switch.
+- Exact strict floor: 171,068 tokens at W=433,616.
+- Production `kv-stable` prime: 396,607 rendered tokens, `exhausted=false`.
+- First accepted live turn: 401,130 planned/actual, delta zero, 110 moves,
+  `exhausted=false`; provider turn completed successfully.
+- Service remained active with zero restarts and no new over-budget,
+  unrealizable, or quarantine error.
 
 ## What the cleanup does
 
@@ -110,4 +131,3 @@ as the rollback artifact, and switch only after an explicit operator review of
 the final receipts and metrics. The first accepted presentation is a reason-
 coded surgery: continuity may be relaxed explicitly; cache state is cold if
 the immutable tool/system prefix changed.
-
