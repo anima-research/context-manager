@@ -60,8 +60,23 @@ test('kv-unified presentation commits only after acceptance and survives restart
   assert.equal(receipts(first).head, null, 'compile creates a draft only');
   first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
   assert.equal(receipts(first).head, null, 'submission is not acceptance');
-  first.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 123 });
+  const markerCount = (
+    first as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
+  ).kvUnifiedPendingMarkerUnitIndices.length;
+  first.reportKvUnifiedAccepted({
+    submissionId: 's1',
+    acceptedAt: 123,
+    wireReceipt: {
+      requestHash: 'wire1',
+      markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+        ordinal,
+        prefixHash: `prefix-${ordinal}`,
+        estimatedOffset: ordinal + 1,
+      })),
+    },
+  });
   assert.equal(receipts(first).head?.sequence, 1);
+  assert.equal(receipts(first).cache?.immutablePrefixHash, 'immutable-v1');
   manager.close();
 
   const second = strategy();
