@@ -2,6 +2,7 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import type { ContextEntry } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
 
 const STORE = './test-kv-unified-integration-store';
@@ -100,4 +101,26 @@ test('kv-unified failed submission clears single flight without committing', asy
   assert.equal(receipts(selected).head, null);
   assert.equal(receipts(selected).inFlightSubmissionId, null);
   manager.close();
+});
+
+test('kv-unified owns four message-level cache marker slots', () => {
+  const selected = strategy();
+  const entries = Array.from({ length: 20 }, (_, index) => ({
+    index,
+    sourceMessageId: `m${index}`,
+    sourceRelation: 'copy' as const,
+    participant: 'user',
+    content: [{ type: 'text' as const, text: `entry-${index} ${'x'.repeat(40)}` }],
+  }));
+  (
+    selected as unknown as {
+      placeCacheMarkers: (
+        entries: ContextEntry[],
+        head: ReadonlySet<string>,
+        tail: ReadonlySet<string>,
+      ) => void;
+    }
+  ).placeCacheMarkers(entries as ContextEntry[], new Set(['m0', 'm1']), new Set(['m17', 'm18', 'm19']));
+  assert.equal(entries.filter((entry) => (entry as { cacheMarker?: boolean }).cacheMarker).length, 4);
+  assert.equal((entries[19] as { cacheMarker?: boolean }).cacheMarker, true, 'end marker retained');
 });

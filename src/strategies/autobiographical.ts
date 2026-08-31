@@ -7497,6 +7497,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const historyEnd = firstTail - 1; // last middle (folded-history) entry
 
+    if (this.config.foldingStrategy === 'kv-unified') {
+      const marks = new Set<number>();
+      const summaryById = new Map(this.summaries.map((summary) => [summary.id, summary]));
+      let deepEnd = lastHead;
+      for (let i = lastHead + 1; i <= historyEnd; i++) {
+        const sourceId = entries[i]?.sourceMessageId;
+        const level = sourceId ? summaryById.get(sourceId)?.level : undefined;
+        if (level !== undefined && level >= 4) deepEnd = i;
+        else if (deepEnd > lastHead) break;
+      }
+      const tokenCost = (index: number): number =>
+        Math.max(1, this.estimateTokens(entries[index]?.content ?? []));
+      const seamAtFraction = (lo: number, hi: number, fraction: number): number => {
+        if (hi <= lo) return lo;
+        let total = 0;
+        for (let i = lo; i <= hi; i++) total += tokenCost(i);
+        const target = total * fraction;
+        let seen = 0;
+        for (let i = lo; i <= hi; i++) {
+          seen += tokenCost(i);
+          if (seen >= target) return i;
+        }
+        return hi;
+      };
+      if (deepEnd <= lastHead && historyEnd > lastHead) {
+        deepEnd = seamAtFraction(lastHead + 1, historyEnd, 0.25);
+      }
+      if (deepEnd >= 0 && deepEnd < historyEnd) marks.add(deepEnd);
+      if (historyEnd > deepEnd + 1) {
+        marks.add(seamAtFraction(deepEnd + 1, historyEnd - 1, 0.5));
+      }
+      if (historyEnd >= 0) marks.add(historyEnd);
+      marks.add(n - 1);
+      for (const idx of [...marks].sort((a, b) => a - b).slice(0, 4)) {
+        if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+      }
+      return;
+    }
+
     const marks = new Set<number>();
     if (lastHead >= 0) marks.add(lastHead);                       // system / head block
     if (historyEnd > lastHead) marks.add(historyEnd);            // stable folded prefix (the big one)
