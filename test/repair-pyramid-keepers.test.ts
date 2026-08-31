@@ -266,3 +266,46 @@ test('dangling-merged sole-coverage L1 counts as LIVE in the fold-floor estimate
     rmSync(parent, { recursive: true, force: true });
   }
 });
+
+test('full repair refuses a record-backed L1 whose live coverage is non-contiguous', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'repair-keepers-'));
+  const dir = join(parent, 'store');
+  try {
+    const summaries = [l1('L1-fused', ['m-0', 'm-1', 'm-8', 'm-9'])];
+    const records = [{
+      id: 'c-fused',
+      sourceIds: ['m-0', 'm-1', 'm-8', 'm-9'],
+      compressed: true,
+      summaryId: 'L1-fused',
+    }];
+    buildStore(dir, { summaries, records, messageCount: 10 });
+
+    const result = runRepair(dir, ['--apply']);
+    assert.equal(result.code, 6, result.out);
+    assert.match(result.out, /L1-fused: authored live coverage is non-contiguous/, result.out);
+    assert.match(result.out, /refusing to apply/i, result.out);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('explicit uncompressed records make retired L1 coverage deferred rather than lost', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'repair-keepers-'));
+  const dir = join(parent, 'store');
+  try {
+    const summaries = [l1('L1-fused', ['m-0', 'm-1', 'm-8', 'm-9'])];
+    const records = [
+      { id: 'c-early', sourceIds: ['m-0', 'm-1'], compressed: false },
+      { id: 'c-late', sourceIds: ['m-8', 'm-9'], compressed: false },
+    ];
+    buildStore(dir, { summaries, records, messageCount: 10 });
+
+    const dry = runRepair(dir);
+    assert.equal(dry.code, 0, dry.out);
+    assert.match(dry.out, /L1: 1 total → keep 0, prune 1/, dry.out);
+    assert.match(dry.out, /4 deferred to explicit uncompressed records; 0 LOST\/UNOWNED/, dry.out);
+    assert.match(dry.out, /canonical closure verified/, dry.out);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
