@@ -41,7 +41,7 @@ upper-hinge welfare price.
 The current historical Fable export has 47,693 message leaves.  Strict
 canonicalization reports non-contiguous ownership in several high summaries.
 An **offline solver experiment** that excludes those ancestors has an exact
-feasibility floor of 273,827 tokens, and a representative bounded solve
+feasibility floor of 312,291 tokens on the current v2 export, and a representative bounded solve
 completes in about 0.72 s on the development machine (10k token/continuity
 buckets, 50k fidelity bucket, peak frontier 69 labels).  Exact floor
 computation completes in about 0.05 s.  The 2026-08-24T05:00Z created-masked
@@ -58,6 +58,19 @@ measurements prove only that strict canonicalization rejects the export.  They
 do not justify silently enabling ancestor exclusion for Fable.  Before pilot,
 either diagnose/repair the ownership links or implement and review a genuine
 treeification transform that preserves render semantics.
+
+The subsequent ownership diagnosis found that exclusion is not the right
+repair.  The persisted chunk records themselves do not overlap, but 170 stale
+L1 generations remain in the summary archive; mutable parent pointers and
+authored `sourceIds` disagree around some of those generations.  Two
+record-backed L1s are intrinsically disjoint, and one L3 skipped a lower group
+that landed four minutes later.  A simulated strict closure—keep the
+record-backed L1 generation per span, retire authored parents whose child set
+is no longer intact, split/re-author the two disjoint records, and retire the
+one gap-crossing L3—leaves 1,799 usable authored nodes with zero
+semantic-ownership mismatches.  Its exact pre-drain floor is 363,130 tokens.
+That fits W=400k but does not leave enough operational margin to perform as a
+live repair; the upper levels must be regenerated offline before activation.
 
 An initial no-receipt sweep at W=400k, band [0.70, 0.935], and the provisional
 hinge prices demonstrates why alpha cannot be adopted as a harmless default:
