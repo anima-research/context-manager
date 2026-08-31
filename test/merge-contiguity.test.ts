@@ -27,6 +27,36 @@ class Probe extends AutobiographicalStrategy {
   setSummaries(summaries: SummaryEntry[]): void {
     (this as unknown as { summaries: SummaryEntry[] }).summaries = summaries;
   }
+  setMergeQueue(queue: Array<{ level: number; sourceIds: string[] }>): void {
+    (this as unknown as { mergeQueue: unknown[] }).mergeQueue = queue;
+  }
+  sanitizeQueue(messageIds: string[]): void {
+    this.sanitizePersistedMergeQueue({
+      getAll: () => messageIds.map((id) => ({ id })),
+    } as never);
+  }
+  mergeQueueLength(): number {
+    return (this as unknown as { mergeQueue: unknown[] }).mergeQueue.length;
+  }
+}
+
+class QuarantineProbe extends Probe {
+  regrouped = 0;
+  protected override checkMergeThreshold(): void { this.regrouped++; }
+  seedQuarantine(sourceIds: string[]): void {
+    (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set('q', {
+      key: 'q',
+      level: 2,
+      sourceIds,
+      attempts: 5,
+      quarantinedAt: 1,
+      lastOutcome: 'refusal',
+    });
+  }
+  sweep(): void { this.sweepPaidOffMergeQuarantine(); }
+  quarantineSize(): number {
+    return (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.size;
+  }
 }
 
 function summary(id: string, first: number, last: number): SummaryEntry {
@@ -58,25 +88,17 @@ test('contiguous run merges; a cross-era candidate is left out', () => {
   assert.deepEqual(run!.map((s) => s.id).sort(), ['a','b','c','d','e','f'], 'contiguous six, no bridge');
 });
 
-test('small holes bridge; interior runs consolidate early; the newest run waits', () => {
+test('any hole containing live messages splits merge runs', () => {
   const p = probe();
   const unmerged = [
-    summary('a', 0, 50), summary('b', 120, 200),   // 70-message hole: fine
+    summary('a', 0, 50), summary('b', 120, 200),   // live hole: hard seam
     summary('c', 201, 300), summary('d', 301, 400),
     summary('e', 401, 500),
     summary('f', 3000, 3100),                       // 2500-message gap: breaks
   ];
-  // The a–e run is INTERIOR (f's run is newer). Summaries are only produced
-  // at the live end, so a stranded interior run can never reach threshold —
-  // it consolidates as soon as it has 2 members (2026-07-12 starvation fix;
-  // mythos froze on exactly this shape after poison-node surgery).
   const interior = p.pick(unmerged, 6);
-  assert.ok(interior, 'interior run consolidates without reaching threshold');
-  assert.deepEqual(interior!.map((s) => s.id).sort(), ['a', 'b', 'c', 'd', 'e'], 'the stranded five, not f');
-  assert.ok(!interior!.some((x) => x.id === 'f'), 'the distant candidate is never bridged in');
-  assert.ok(p.pick(unmerged, 5), 'the contiguous five qualify at threshold 5');
-  // The NEWEST run can still grow — below threshold it waits.
-  assert.equal(p.pick(unmerged.slice(0, 5), 6), null, 'newest run below threshold waits');
+  assert.deepEqual(interior!.map((summary) => summary.id), ['b', 'c', 'd', 'e']);
+  assert.ok(!interior!.some((summary) => summary.id === 'a' || summary.id === 'f'));
 });
 
 test('a small hole does not bridge while its lower-level group is still pending', () => {
@@ -84,8 +106,8 @@ test('a small hole does not bridge while its lower-level group is still pending'
   const unmerged = [
     summary('a', 0, 50), summary('b', 51, 100),
     summary('c', 101, 150), summary('d', 151, 200),
-    // Only 216 live messages separate d and e: the ordinary scar tolerance
-    // would bridge it, but an orphan L1 proves an L2 is still pending there.
+    // Only 216 live messages separate d and e; strict live adjacency treats
+    // the represented middle as a hard seam.
     summary('e', 417, 470), summary('f', 471, 520),
   ];
   p.setSummaries([{
@@ -140,4 +162,30 @@ test('stranded interior runs merge at >=2; only the newest run waits for the thr
   // The newest run alone (nothing stranded) still waits for the full threshold.
   const onlyNewest = unmerged.slice(5);
   assert.equal(p.pick(onlyNewest, 6), null, 'the growable run waits for 6');
+});
+
+test('partially paid quarantine is stale and releases orphan regrouping', () => {
+  const p = new QuarantineProbe({ adaptiveResolution: true, autoTickOnNewMessage: false });
+  p.setSummaries([
+    { ...summary('a', 0, 10), mergedInto: 'L3-paid' },
+    summary('b', 11, 20),
+  ]);
+  p.seedQuarantine(['a', 'b']);
+
+  p.sweep();
+
+  assert.equal(p.quarantineSize(), 0);
+  assert.equal(p.regrouped, 1, 'remaining orphan is reconsidered under the current grammar');
+});
+
+test('persisted merge queues from the old gap grammar are discarded', () => {
+  const p = probe();
+  const a = summary('a', 0, 50);
+  const b = summary('b', 120, 200);
+  p.setSummaries([a, b]);
+  p.setMergeQueue([{ level: 3, sourceIds: [a.id, b.id] }]);
+
+  p.sanitizeQueue(Array.from({ length: 5000 }, (_, index) => `m-${index}`));
+
+  assert.equal(p.mergeQueueLength(), 0);
 });

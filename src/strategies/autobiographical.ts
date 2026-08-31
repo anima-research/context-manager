@@ -1639,6 +1639,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
       this.rebuildChunks(ctx.messageStore);
+      if (abortIfStale()) return;
+      this.sanitizePersistedMergeQueue(ctx.messageStore);
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
       // compression/merge completion does this, but a store that boots with a
       // backlog above threshold and an empty queue (e.g. after a pyramid
@@ -3547,6 +3549,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return merge;
   }
 
+  /** Drop persisted queue entries authored under an older grouping grammar.
+   * A queue is intent, not memory: if its sources are now parented, missing,
+   * out of order, or separated by another live representation, replaying it
+   * would mint a crossed node. The threshold pass immediately below rebuilds
+   * valid work from the surviving orphan frontier. */
+  protected sanitizePersistedMergeQueue(store: MessageStoreView): void {
+    if (this.mergeQueue.length === 0) return;
+    const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
+    const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
+      if (merge.sourceIds.length < 2) return false;
+      let previousEnd: number | null = null;
+      for (const sourceId of merge.sourceIds) {
+        const source = byId.get(sourceId);
+        if (
+          !source ||
+          source.level !== merge.level - 1 ||
+          getSummaryParentId(source)
+        ) return false;
+        const first = position.get(source.sourceRange.first);
+        const last = position.get(source.sourceRange.last);
+        if (first === undefined || last === undefined || last < first) return false;
+        if (previousEnd !== null && first !== previousEnd + 1) return false;
+        previousEnd = last;
+      }
+      return true;
+    };
+    const before = this.mergeQueue.length;
+    this.mergeQueue = this.mergeQueue.filter(valid);
+    if (this.mergeQueue.length === before) return;
+    this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    console.warn(
+      `[autobiographical] discarded ${before - this.mergeQueue.length} stale/non-contiguous ` +
+        `persisted merge queue entr${before - this.mergeQueue.length === 1 ? 'y' : 'ies'}; ` +
+        `the current grammar will regroup surviving orphans`,
+    );
+  }
+
   /**
    * Bounded-retry accounting for a merge whose response was rejected by the
    * terminal-disposition gate. The attempt counter lives ON the persisted
@@ -3649,6 +3689,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * klaxon only sounds on real debt:
    *  - every source now has a parent (covered by a later successful merge
    *    or repair) → paid, clear;
+   *  - only some sources now have parents → the exact quarantined group is
+   *    stale and can never be retried without reparenting; clear it so the
+   *    remaining orphans can be regrouped;
    *  - no source summary exists anymore (surgery/repair removed them) →
    *    unretryable orphan, clear;
    *  - any source still unmerged and present → live debt, keep.
@@ -3663,7 +3706,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const s = byId.get(id);
         return s !== undefined && !getSummaryParentId(s);
       });
-      if (live.length === 0) {
+      if (live.length !== record.sourceIds.length) {
         this.mergeQuarantine.delete(key);
         swept++;
       }
@@ -3671,6 +3714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (swept > 0) {
       this.persistMergeQuarantine();
       console.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
+      this.checkMergeThreshold();
     }
   }
 
@@ -6157,11 +6201,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * above it went unusable and the fold floor stopped fitting the budget.
    *
    * Rules: order candidates by live source position; break runs where the
-   * positional gap exceeds `mergeContiguityGapLimit` (holes from wiped/
-   * pruned nodes are fine, cross-era bridges are not); exclude candidates
-   * whose OWN span exceeds the level-scaled `mergeMaxSourceSpanMessages`
-   * limit (replay-era wide-span summaries would bridge anything they join);
-   * merge the oldest run that still has `threshold` members.
+   * live source positions are not exactly adjacent (a hole containing
+   * record-owned material is a different representation and cannot be folded
+   * into this parent); exclude candidates whose OWN span exceeds the
+   * level-scaled `mergeMaxSourceSpanMessages` limit (replay-era wide-span
+   * summaries would bridge anything they join); merge the oldest run that
+   * still has `threshold` members.
    */
 
   /**
@@ -6189,7 +6234,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const ch of this.chunks) {
       for (const m of ch.messages) messageOrder.set(m.id, seq++);
     }
-    const gapLimit = this.config.mergeContiguityGapLimit ?? 300;
     const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
     const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
@@ -6227,35 +6271,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     withPos.sort((a, b) => a.first - b.first);
 
-    const gapHasPendingLowerCoverage = (
-      sourceLevel: number,
-      leftEnd: number,
-      rightStart: number,
-    ): boolean => {
-      if (sourceLevel <= 1 || rightStart <= leftEnd + 1) return false;
-      return this.summaries.some((summary) => {
-        if (summary.level !== sourceLevel - 1 || getSummaryParentId(summary)) return false;
-        const first = messageOrder.get(summary.sourceRange.first);
-        const last = messageOrder.get(summary.sourceRange.last);
-        if (first === undefined || last === undefined) return false;
-        const lo = Math.min(first, last);
-        const hi = Math.max(first, last);
-        return lo < rightStart && hi > leftEnd;
-      });
-    };
-
-    // Split into contiguous runs (a gap larger than `gapLimit` starts a new one).
+    // Split into strictly contiguous live runs. Deleted messages do not occupy
+    // positions in `messageOrder`, so this still bridges true tombstones; it
+    // refuses only holes containing another live representation.
     const runs: Array<typeof withPos> = [];
     let run: typeof withPos = [];
     let runEnd = -Infinity;
     for (const x of withPos) {
-      if (
-        run.length > 0 &&
-        (
-          x.first - runEnd > gapLimit ||
-          gapHasPendingLowerCoverage(x.s.level, runEnd, x.first)
-        )
-      ) {
+      if (run.length > 0 && x.first !== runEnd + 1) {
         runs.push(run);
         run = [];
         runEnd = -Infinity;

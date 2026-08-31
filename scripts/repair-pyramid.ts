@@ -91,6 +91,7 @@ if (!storePath || !namespace) {
 const SUMS = `${namespace}/autobio:summaries`;
 const CHUNKS = `${namespace}/autobio:chunks`;
 const MERGEQ = `${namespace}/autobio:mergeQueue`;
+const RESOLUTIONS = `${namespace}/autobio:resolutions`;
 
 const store = JsStore.open({ path: storePath });
 
@@ -336,6 +337,53 @@ if (!frontierOnly) {
   }
 }
 
+// Reconcile carried working-frontier levels with the surviving authored
+// ancestry. The renderer falls back to raw for a missing L_k, but persisting
+// that impossible level makes the first post-repair compile report hundreds
+// of unrealizable targets and creates an avoidable continuity jump.
+const rawResolutions = store.getStateJson(RESOLUTIONS);
+const hasResolutionsState = rawResolutions !== null && rawResolutions !== undefined;
+const repairedResolutions: Record<string, number> = {
+  ...(
+    rawResolutions && typeof rawResolutions === 'object' && !Array.isArray(rawResolutions)
+      ? rawResolutions as Record<string, number>
+      : {}
+  ),
+};
+const survivingById = new Map(survivors.map((summary) => [summary.id, summary] as const));
+const l1ByMessage = new Map<string, string>();
+for (const record of chunkRecords) {
+  if (!record.summaryId || !survivingById.has(record.summaryId)) continue;
+  for (const messageId of record.sourceIds) l1ByMessage.set(messageId, record.summaryId);
+}
+for (const summary of survivors) {
+  if (summary.level !== 1) continue;
+  for (const messageId of summary.sourceIds) {
+    if (!l1ByMessage.has(messageId)) l1ByMessage.set(messageId, summary.id);
+  }
+}
+let resolutionsAdjusted = 0;
+for (const [messageId, requested] of Object.entries(repairedResolutions)) {
+  if (!Number.isSafeInteger(requested) || requested <= 0) {
+    delete repairedResolutions[messageId];
+    continue;
+  }
+  let summaryId = l1ByMessage.get(messageId);
+  let deepest = 0;
+  const seen = new Set<string>();
+  while (summaryId && !seen.has(summaryId)) {
+    seen.add(summaryId);
+    const summary = survivingById.get(summaryId);
+    if (!summary) break;
+    if (summary.level <= requested) deepest = Math.max(deepest, summary.level);
+    summaryId = parentOf(summary);
+  }
+  if (deepest === requested) continue;
+  resolutionsAdjusted++;
+  if (deepest > 0) repairedResolutions[messageId] = deepest;
+  else delete repairedResolutions[messageId];
+}
+
 // ---- coverage invariant (2026-07-12 guard) ----
 // A repair must never SHRINK live summary coverage: every live message that
 // some L1 covered before must still be covered by a surviving L1 after.
@@ -457,6 +505,7 @@ console.log(`survivors:    ${survivors.length} (${unmerged} returned to unmerged
 if (explicitlyRetired.size > 0) {
   console.log(`retired:      ${[...explicitlyRetired].sort().join(', ')}`);
 }
+console.log(`resolutions:  ${resolutionsAdjusted} impossible carried level(s) clamped/cleared`);
 console.log(`merge queue:  ${mergeQueue.length} → ${cleanQueue.length}`);
 console.log(
   `coverage:     ${coverageBefore.size} live messages L1-covered before → ${coverageAfter.size} after ` +
@@ -518,5 +567,6 @@ if (floorAfter > floorBefore * 1.25 && !allowFloorGrowth) {
 
 store.setStateJson(SUMS, survivors);
 store.setStateJson(MERGEQ, cleanQueue);
+if (hasResolutionsState) store.setStateJson(RESOLUTIONS, repairedResolutions);
 store.close();
 console.log('\nAPPLIED. Run the offline merge drain (or let the agent re-merge live).');
