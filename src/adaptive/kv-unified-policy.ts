@@ -89,6 +89,8 @@ export interface ExactPolicySolveOptions {
   /** Recursive oracle or the independent left-to-right label engine. */
   readonly candidateSource?: 'recursive' | 'labels';
   readonly labelCeiling?: number;
+  /** Score improvement required to replace a feasible accepted presentation. */
+  readonly adoptEpsilon?: number;
 }
 
 export interface ExactPolicyCandidate {
@@ -228,9 +230,20 @@ export class ExactKvUnifiedPolicySolver {
         frontierSignature(b.frontier, this.orderedChunks.map((chunk) => chunk.id)),
       ),
     );
+    let selected = candidates[0];
+    const epsilon =
+      Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
+        ? options.adoptEpsilon!
+        : 0;
+    if (epsilon > 0 && options.presentation) {
+      const carried = candidates.find((candidate) =>
+        this.matchesPresentation(candidate.frontier, options.presentation!),
+      );
+      if (carried && carried.score <= selected.score + epsilon) selected = carried;
+    }
     return {
       feasible: true,
-      selected: candidates[0],
+      selected,
       candidates,
       cacheFloor,
       continuityFloor,
@@ -320,6 +333,20 @@ export class ExactKvUnifiedPolicySolver {
     );
     if (!summaryId) throw new Error(`missing L${level} representation for ${chunkId}`);
     return `summary:${summaryId}`;
+  }
+
+  private matchesPresentation(
+    frontier: ReadonlyMap<ChunkId, number>,
+    presentation: AcceptedPresentationReference,
+  ): boolean {
+    for (const [leafId, previous] of presentation.leaves) {
+      if (!this.forest.leaf(leafId)) continue;
+      const level = frontier.get(leafId) ?? 0;
+      if (level !== previous.level || this.representationHash(leafId, level) !== previous.repHash) {
+        return false;
+      }
+    }
+    return true;
   }
 }
 
