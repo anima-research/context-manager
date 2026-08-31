@@ -6227,12 +6227,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     withPos.sort((a, b) => a.first - b.first);
 
+    const gapHasPendingLowerCoverage = (
+      sourceLevel: number,
+      leftEnd: number,
+      rightStart: number,
+    ): boolean => {
+      if (sourceLevel <= 1 || rightStart <= leftEnd + 1) return false;
+      return this.summaries.some((summary) => {
+        if (summary.level !== sourceLevel - 1 || getSummaryParentId(summary)) return false;
+        const first = messageOrder.get(summary.sourceRange.first);
+        const last = messageOrder.get(summary.sourceRange.last);
+        if (first === undefined || last === undefined) return false;
+        const lo = Math.min(first, last);
+        const hi = Math.max(first, last);
+        return lo < rightStart && hi > leftEnd;
+      });
+    };
+
     // Split into contiguous runs (a gap larger than `gapLimit` starts a new one).
     const runs: Array<typeof withPos> = [];
     let run: typeof withPos = [];
     let runEnd = -Infinity;
     for (const x of withPos) {
-      if (run.length > 0 && x.first - runEnd > gapLimit) {
+      if (
+        run.length > 0 &&
+        (
+          x.first - runEnd > gapLimit ||
+          gapHasPendingLowerCoverage(x.s.level, runEnd, x.first)
+        )
+      ) {
         runs.push(run);
         run = [];
         runEnd = -Infinity;
@@ -6377,13 +6400,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // Defensive: if every source is already mergedInto something, this is a
-    // stale queue entry (could happen if multiple merges for the same
-    // sourceIds were enqueued before the dedup fix in checkMergeThreshold).
-    // Skip rather than produce a redundant near-identical higher-level entry.
-    if (sources.every(s => s.mergedInto)) {
+    // A queued merge may become stale after another worker/earlier queue item
+    // parents only SOME of its sources. Reparenting the whole list in that
+    // state rewrites the authored child graph and creates crossed lineages
+    // (Fable's L2-37/L2-43 scar). Any parented source invalidates this queue
+    // item; the remaining orphans will be regrouped by the next threshold
+    // pass. Never mutate an already-authored parent edge.
+    const alreadyParented = sources.filter((source) => getSummaryParentId(source));
+    if (alreadyParented.length > 0) {
       console.warn(
-        `executeMerge: all sources already merged into ${sources[0].mergedInto}, skipping (stale queue entry)`,
+        `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
+          `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
       );
       return;
     }
@@ -9450,6 +9477,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ---- 3. Chunk the frontier: compressible messages not owned by any record. ----
     const messagesToChunk = this.getCompressibleMessages(store)
       .filter(m => !consumed.has(m.id));
+    const livePosition = new Map<string, number>();
+    store.getAll().forEach((message, index) => livePosition.set(message.id, index));
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
@@ -9488,6 +9517,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
+      const previous = currentChunk[currentChunk.length - 1];
+      if (
+        previous &&
+        livePosition.get(msg.id) !== (livePosition.get(previous.id) ?? -2) + 1
+      ) {
+        // The filtered compressible stream can jump over record-owned,
+        // pinned, or current-head messages. Joining the two sides minted
+        // Fable's disjoint L1-267/L1-403 chunks: one recall then owned two
+        // distant chronological regions and poisoned every ancestor merge.
+        // Close even a thin run at the ownership seam. A short summary (or
+        // raw fallback while it is pending) is cheaper than a non-tree span.
+        closeCurrent(i);
+      }
       let msgTokens = store.estimateTokens(msg);
 
       if (this.config.attachmentsIgnoreSize) {

@@ -131,6 +131,52 @@ describe('Head Window Reset', () => {
 
       manager.close();
     });
+
+    it('splits newly compressible runs at persisted ownership gaps', async () => {
+      cleanup();
+      const strategy = new AutobiographicalStrategy({
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        targetChunkTokens: 100_000,
+      });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const ids = Array.from({ length: 10 }, (_, index) =>
+        manager.addMessage(index % 2 ? 'assistant' : 'user', textBlock(`message ${index}`)),
+      );
+      const internals = strategy as unknown as {
+        chunkRecords: Array<{
+          id: string;
+          sourceIds: string[];
+          compressed: boolean;
+          summaryId?: string;
+        }>;
+        chunkIdCounter: number;
+        rebuildChunks: (store: unknown) => void;
+      };
+      // Simulate an already-owned middle. The remaining compressible stream
+      // is [0,1,8,9]; it must not become one disjoint L1 chunk.
+      internals.chunkRecords = [{
+        id: 'c-0',
+        sourceIds: ids.slice(2, 8),
+        compressed: true,
+      }];
+      internals.chunkIdCounter = 1;
+      internals.rebuildChunks(
+        (manager as unknown as { messageStore: unknown }).messageStore,
+      );
+
+      assert.deepStrictEqual(
+        internals.chunkRecords.map((record) => record.sourceIds),
+        [ids.slice(2, 8), ids.slice(0, 2)],
+      );
+      assert.ok(
+        !internals.chunkRecords.some((record) =>
+          record.sourceIds.includes(ids[1]!) && record.sourceIds.includes(ids[8]!),
+        ),
+        'no persisted chunk may bridge the record-owned middle',
+      );
+      manager.close();
+    });
   });
 
   describe('getHeadWindowStartIndex', () => {
