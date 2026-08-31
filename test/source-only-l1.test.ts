@@ -66,7 +66,7 @@ function blockTypes(req: NormalizedRequest): Set<string> {
   const s = new Set<string>(); for (const m of req.messages) for (const b of m.content) s.add(b.type); return s;
 }
 
-interface Opts { sourceOnly?: boolean; sourceOnlyFallback?: boolean; fallbackLimit?: number; mergeSourceOnly?: boolean; systemPrompt?: string; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; }
+interface Opts { sourceOnly?: boolean; sourceOnlyFallback?: boolean; fallbackLimit?: number; mergeSourceOnly?: boolean; systemPrompt?: string; extraChunkBlocks?: ContentBlock[]; tools?: ToolDefinition[]; cacheMarkers?: boolean; }
 
 async function build(membrane: unknown, opts: Opts = {}) {
   const strategy = new ProbeStrategy({
@@ -81,6 +81,7 @@ async function build(membrane: unknown, opts: Opts = {}) {
     compressionSourceOnly: opts.sourceOnly,
     compressionMergeSourceOnly: opts.mergeSourceOnly,
     compressionSourceOnlyFallback: opts.sourceOnlyFallback,
+    compressionCacheMarkers: opts.cacheMarkers,
   } as never);
   const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
   if (opts.tools) manager.setToolDefinitions(opts.tools);
@@ -257,6 +258,28 @@ describe('source-only L1 compression', () => {
     const fallback = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0, systemPrompt: 'resident identity', tools });
     await fallback.strategy.run(fallback.target, managerContext(fallback.manager));
     assert.deepEqual(calls[1], directCapture.calls[0], 'final fallback is exact legacy source-only wire shape');
+  });
+
+  it('FINAL FALLBACK SHAPE: stale cache_control sanitation matches legacy direct source-only', async () => {
+    const stale = { type: 'text', text: 'imported cache carrier', cache_control: { type: 'ephemeral' } } as never;
+    for (const cacheMarkers of [true, false]) {
+      const directCapture = capturingMembrane('end_turn');
+      const direct = await build(directCapture.membrane, { sourceOnly: true, cacheMarkers, extraChunkBlocks: [stale] });
+      await direct.strategy.run(direct.target, managerContext(direct.manager));
+
+      const calls: NormalizedRequest[] = []; let n = 0;
+      const membrane = { complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request)); n++;
+        return n === 1
+          ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+          : { content: [text('fallback memory')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+      } } as never;
+      const fallback = await build(membrane, { sourceOnlyFallback: true, fallbackLimit: 0, cacheMarkers, extraChunkBlocks: [stale] });
+      await fallback.strategy.run(fallback.target, managerContext(fallback.manager));
+      assert.deepEqual(calls[1], directCapture.calls[0], `cache marker kill-switch=${cacheMarkers} preserves exact legacy wire shape`);
+      const cacheControls = calls[1]!.messages.flatMap((m) => m.content).filter((b) => (b as { cache_control?: unknown }).cache_control !== undefined);
+      assert.equal(cacheControls.length, cacheMarkers ? 0 : 1, cacheMarkers ? 'enabled sanitizer strips stale block cache_control' : 'kill switch preserves stale passthrough');
+    }
   });
 
   it('FINAL FALLBACK: thinking-wrapped final output quarantines without a later canonical retry', async () => {
