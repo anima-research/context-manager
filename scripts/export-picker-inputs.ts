@@ -79,8 +79,17 @@ async function main() {
   const messages = manager.getAllMessages().filter((message) =>
     at === undefined || message.timestamp.getTime() <= at,
   );
-  const summaries = (((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [])
+  const availableSummaries = (((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [])
     .filter((summary) => at === undefined || summary.created <= at);
+  const availableSummaryIds = new Set(availableSummaries.map((summary) => summary.id));
+  const summaries = availableSummaries.map((summary) => {
+    const parentId = summary.parentId ?? summary.mergedInto;
+    if (!parentId || availableSummaryIds.has(parentId)) return summary;
+    const copy = { ...summary };
+    delete copy.parentId;
+    delete copy.mergedInto;
+    return copy;
+  });
   const liveChunks =
     ((strategy as unknown as {
       chunks: Array<{ messages: Array<{ id: string }>; summaryId?: string }>;
@@ -93,7 +102,7 @@ async function main() {
   // repaired/boundary-drifted messages with no live chunk-ledger pointer.
   const l1Of = new Map<string, string>();
   for (const chunk of liveChunks) {
-    if (!chunk.summaryId) continue;
+    if (!chunk.summaryId || !availableSummaryIds.has(chunk.summaryId)) continue;
     for (const message of chunk.messages) l1Of.set(message.id, chunk.summaryId);
   }
   for (const s of summaries) {
