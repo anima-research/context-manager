@@ -47,7 +47,7 @@ import {
   KvUnifiedReceiptChain,
   type SerializedReceiptChain,
 } from '../adaptive/kv-unified-receipts.js';
-import type { PresentedLeaf } from '../adaptive/kv-unified-policy.js';
+import type { PresentedLeaf, ProviderCacheReference } from '../adaptive/kv-unified-policy.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -1067,8 +1067,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
-  private kvUnifiedDraft: { leaves: Map<ChunkId, PresentedLeaf>; layout: RenderLayout } | null = null;
+  private kvUnifiedDraft: {
+    leaves: Map<ChunkId, PresentedLeaf>;
+    layout: RenderLayout;
+    immutablePrefixHash?: string;
+    markerUnitIndices: number[];
+  } | null = null;
   private kvUnifiedPendingLayout: RenderLayout | null = null;
+  private kvUnifiedPendingMarkerUnitIndices: number[] = [];
+  private kvUnifiedPendingImmutablePrefixHash: string | null = null;
   /** Legacy snapshot used by the unapproved first implementation. Read-only. */
   protected get compressionRefusalQuarantineStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine`;
@@ -2037,6 +2044,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : new KvUnifiedReceiptChain();
       this.kvUnifiedDraft = null;
       this.kvUnifiedPendingLayout = null;
+      this.kvUnifiedPendingMarkerUnitIndices = [];
+      this.kvUnifiedPendingImmutablePrefixHash = null;
     }
   }
 
@@ -7336,6 +7345,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedDraft = {
         leaves,
         layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+        markerUnitIndices: [],
       };
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -7804,6 +7815,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+      const indices: number[] = [];
+      for (const entry of merged) {
+        if (!entry.cacheMarker || !entry.sourceMessageId) continue;
+        let matched = -1;
+        for (let i = 0; i < this.kvUnifiedDraft.layout.units.length; i++) {
+          if (this.kvUnifiedDraft.layout.units[i].key === entry.sourceMessageId) matched = i + 1;
+        }
+        if (matched > 0 && !indices.includes(matched)) indices.push(matched);
+      }
+      this.kvUnifiedDraft.markerUnitIndices = indices;
+    }
     this.assertMiddleCoverage();
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
@@ -7890,6 +7913,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
     this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
+    this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
+    this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;
   }
 
   isKvUnifiedEnabled(): boolean {
@@ -7905,13 +7930,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }): void {
     this.requireLoadedBranch('reportKvUnifiedAccepted');
+    let cache: ProviderCacheReference | null = null;
+    if (
+      args.wireReceipt &&
+      this.kvUnifiedPendingLayout &&
+      this.kvUnifiedPendingImmutablePrefixHash &&
+      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length
+    ) {
+      cache = {
+        immutablePrefixHash: this.kvUnifiedPendingImmutablePrefixHash,
+        layout: this.kvUnifiedPendingLayout,
+        markers: this.kvUnifiedPendingMarkerUnitIndices.map((unitIndex) => ({
+          unitIndex,
+          offset:
+            unitIndex >= this.kvUnifiedPendingLayout!.units.length
+              ? this.kvUnifiedPendingLayout!.totalTokens
+              : this.kvUnifiedPendingLayout!.units[unitIndex].offset,
+        })),
+      };
+    }
     this.kvUnifiedReceipts.accept(
       args.submissionId,
       args.acceptedAt ?? Date.now(),
-      null,
+      cache,
       args.wireReceipt,
     );
     this.kvUnifiedPendingLayout = null;
+    this.kvUnifiedPendingMarkerUnitIndices = [];
+    this.kvUnifiedPendingImmutablePrefixHash = null;
     this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
   }
 
@@ -7919,6 +7965,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.requireLoadedBranch('reportKvUnifiedFailed');
     this.kvUnifiedReceipts.fail(submissionId);
     this.kvUnifiedPendingLayout = null;
+    this.kvUnifiedPendingMarkerUnitIndices = [];
+    this.kvUnifiedPendingImmutablePrefixHash = null;
   }
 
   private _calibrationArmed = false;
