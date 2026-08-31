@@ -200,6 +200,9 @@ export interface SelectOptions {
    * bookkeeping. Over-budget becomes a reported condition rather than a throw.
    */
   dryRun?: boolean;
+  /** Exact normalized tools/system/context-prefix identity supplied by the
+   * host for kv-unified cache relevance. */
+  kvUnifiedImmutablePrefixHash?: string;
 }
 
 /**
