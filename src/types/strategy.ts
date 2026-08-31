@@ -736,6 +736,8 @@ export interface AutobiographicalConfig {
    * Default undefined/false — ordinary merge bytes remain unchanged.
    */
   compressionMergeSourceOnly?: boolean;
+
+  /**
    * Prompt-cache breakpoints on compression/merge requests (issue #37).
    *
    * Mint requests are dominated by a stable, append-mostly prefix (head
