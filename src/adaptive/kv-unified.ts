@@ -27,6 +27,9 @@ export interface CanonicalForestOptions {
   constraints?: ReadonlyMap<ChunkId, readonly CanonicalLeafConstraint[]>;
   /** Scar-tolerance leaves that must render raw beside any covering recall. */
   overlapExempt?: ReadonlySet<ChunkId>;
+  /** Explicit treeification mode: quarantine non-contiguous summary nodes and
+   * truncate ownership chains below them instead of rejecting the store. */
+  quarantineNonContiguousSummaries?: boolean;
 }
 
 export type CanonicalForestIssueCode =
@@ -220,6 +223,7 @@ export class CanonicalSummaryForest {
   readonly fixedTokens: number;
   readonly roots: readonly CanonicalRoot[];
   readonly constraintConflicts: readonly ConstraintConflict[];
+  readonly quarantinedSummaryIds: readonly SummaryId[];
 
   private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
   private readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
@@ -354,36 +358,62 @@ export class CanonicalSummaryForest {
 
     if (issues.length > 0) throw new CanonicalForestError(issues);
 
-    for (const chunk of chunks) {
-      const chain = chains.get(chunk.id) ?? [];
-      if (chain.length > 0) mutableSummaries.get(chain[0])!.directLeafIds.add(chunk.id);
-      for (let i = 0; i < chain.length; i++) {
-        mutableSummaries.get(chain[i])!.leafIds.add(chunk.id);
-        if (i + 1 < chain.length) {
-          mutableSummaries.get(chain[i + 1])!.childSummaryIds.add(chain[i]);
-        }
-      }
-    }
-
     const indexOfLeaf = new Map(chunks.map((chunk, index) => [chunk.id, index] as const));
-    for (const summary of mutableSummaries.values()) {
-      const indices = [...summary.leafIds]
-        .map((id) => indexOfLeaf.get(id)!)
-        .sort((a, b) => a - b);
-      if (indices.length === 0) continue;
-      for (let i = 1; i < indices.length; i++) {
-        if (indices[i] !== indices[i - 1] + 1) {
-          issues.push({
-            code: 'non-contiguous-ownership',
-            message: `summary ${summary.id} owns non-contiguous live leaves`,
-            leafIds: [...summary.leafIds],
-            summaryIds: [summary.id],
+    const quarantined = new Set<SummaryId>();
+    const rebuildOwnership = (): void => {
+      mutableSummaries.clear();
+      for (const chain of chains.values()) {
+        for (const id of chain) {
+          if (mutableSummaries.has(id)) continue;
+          const entry = inputs.summaries.get(id)!;
+          mutableSummaries.set(id, {
+            id,
+            level: entry.level,
+            recallTokens: inputs.recallPairTokens?.get(id) ?? entry.tokens,
+            parentId: getSummaryParentId(entry),
+            childSummaryIds: new Set(),
+            directLeafIds: new Set(),
+            leafIds: new Set(),
           });
-          break;
         }
       }
+      for (const chunk of chunks) {
+        const chain = chains.get(chunk.id) ?? [];
+        if (chain.length > 0) mutableSummaries.get(chain[0])!.directLeafIds.add(chunk.id);
+        for (let i = 0; i < chain.length; i++) {
+          mutableSummaries.get(chain[i])!.leafIds.add(chunk.id);
+          if (i + 1 < chain.length) mutableSummaries.get(chain[i + 1])!.childSummaryIds.add(chain[i]);
+        }
+      }
+    };
+    while (true) {
+      rebuildOwnership();
+      const contiguityIssues: CanonicalForestIssue[] = [];
+      for (const summary of mutableSummaries.values()) {
+        const indices = [...summary.leafIds].map((id) => indexOfLeaf.get(id)!).sort((a, b) => a - b);
+        for (let i = 1; i < indices.length; i++) {
+          if (indices[i] !== indices[i - 1] + 1) {
+            contiguityIssues.push({
+              code: 'non-contiguous-ownership',
+              message: `summary ${summary.id} owns non-contiguous live leaves`,
+              leafIds: [...summary.leafIds],
+              summaryIds: [summary.id],
+            });
+            break;
+          }
+        }
+      }
+      if (contiguityIssues.length === 0) break;
+      if (!options.quarantineNonContiguousSummaries) {
+        throw new CanonicalForestError(contiguityIssues);
+      }
+      const newlyQuarantined = new Set(contiguityIssues.flatMap((issue) => issue.summaryIds));
+      for (const id of newlyQuarantined) quarantined.add(id);
+      for (const [leafId, chain] of chains) {
+        const cut = chain.findIndex((id) => newlyQuarantined.has(id));
+        if (cut >= 0) chains.set(leafId, chain.slice(0, cut));
+      }
     }
-    if (issues.length > 0) throw new CanonicalForestError(issues);
 
     const summaryMap = new Map<SummaryId, CanonicalSummary>();
     for (const summary of mutableSummaries.values()) {
@@ -491,6 +521,7 @@ export class CanonicalSummaryForest {
     this.orderedLeafList = chunks.map((chunk) => leafMap.get(chunk.id)!);
     this.roots = roots;
     this.constraintConflicts = conflicts;
+    this.quarantinedSummaryIds = [...quarantined].sort();
   }
 
   orderedLeaves(): readonly CanonicalLeaf[] {

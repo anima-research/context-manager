@@ -6,7 +6,7 @@
  * know the data round-trips end-to-end before the browser ever loads it.
  *
  * Usage:
- *   node dist/scripts/export-picker-inputs.js <store-path> [--out <file.json>]
+ *   node dist/scripts/export-picker-inputs.js <store-path> [--out <file.json>] [--at <iso8601>]
  *   node dist/scripts/export-picker-inputs.js ../../llr-migrated --out playground/data/llr.json
  */
 
@@ -53,6 +53,12 @@ async function main() {
   const outPath = outIdx >= 0 ? args[outIdx + 1] : 'playground/data/chronicle.json';
   const nsIdx = args.indexOf('--ns');
   const namespace = nsIdx >= 0 ? args[nsIdx + 1] : undefined;
+  const atIdx = args.indexOf('--at');
+  const atRaw = atIdx >= 0 ? args[atIdx + 1] : undefined;
+  const at = atRaw === undefined ? undefined : Date.parse(atRaw);
+  if (atRaw !== undefined && !Number.isFinite(at)) {
+    throw new Error(`Invalid --at timestamp: ${atRaw}`);
+  }
 
   // Match the deployment recipe so head/tail + msgCap line up with reality.
   const strategy = new AutobiographicalStrategy({
@@ -70,8 +76,11 @@ async function main() {
     ...(namespace ? { namespace } : {}),
   });
 
-  const messages = manager.getAllMessages();
-  const summaries = ((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [];
+  const messages = manager.getAllMessages().filter((message) =>
+    at === undefined || message.timestamp.getTime() <= at,
+  );
+  const summaries = (((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [])
+    .filter((summary) => at === undefined || summary.created <= at);
   const liveChunks =
     ((strategy as unknown as {
       chunks: Array<{ messages: Array<{ id: string }>; summaryId?: string }>;
@@ -99,7 +108,9 @@ async function main() {
     id: msg.id,
     sequence: i,
     rawTokens: estimateTokens(msg as { content?: unknown[] }),
-    currentResolution: resolutions.get(msg.id) ?? 0,
+    // A present-day resolution snapshot is not historical state. Created-time
+    // fixtures reconstruct their previous frontier from the request tape.
+    currentResolution: at === undefined ? (resolutions.get(msg.id) ?? 0) : 0,
     lockedByAgent: false,
     bodyGroupId: (msg as { bodyGroupId?: string }).bodyGroupId,
     pinned: false,
@@ -148,7 +159,13 @@ async function main() {
 
   // ---- Write the playground payload ----
   const payload = {
-    meta: { store: storePath, messages: messages.length, summaries: summaries.length, rawTokens: rawTotal },
+    meta: {
+      store: storePath,
+      messages: messages.length,
+      summaries: summaries.length,
+      rawTokens: rawTotal,
+      ...(at === undefined ? {} : { at: new Date(at).toISOString(), resolutions: 'cleared' }),
+    },
     newestSequence: newestSeq,
     chunks,
     summaries,
