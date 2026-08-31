@@ -414,3 +414,33 @@ test('kv-unified FoldingSolver adapter applies the selected feasible frontier', 
   assert.equal(result.unrealizable, 0);
   assert.equal(strategy.lastResult?.feasible, true);
 });
+
+test('kv-unified adoption epsilon holds a feasible presentation but never an over-wall one', () => {
+  const { inputs } = fixture();
+  const solver = new ExactKvUnifiedPolicySolver(inputs);
+  const held = solver.solve({
+    maxTokens: 400,
+    presentation: rawPresentation(inputs),
+    adoptEpsilon: 1_000_000,
+    policy: {
+      budgetLowRatio: 0,
+      budgetHighRatio: 1,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 0,
+      cacheLambda: 0,
+      continuityLambda: 0,
+    },
+  });
+  assert.equal(held.feasible, true);
+  if (!held.feasible) return;
+  assert.equal(held.selected.renderedTokens, 360);
+  assert.ok([...held.selected.frontier.values()].every((level) => level === 0));
+
+  const forced = solver.solve({
+    maxTokens: 250,
+    presentation: rawPresentation(inputs),
+    adoptEpsilon: 1_000_000,
+  });
+  assert.equal(forced.feasible, true);
+  if (forced.feasible) assert.ok(forced.selected.renderedTokens <= 250);
+});
