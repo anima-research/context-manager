@@ -444,6 +444,8 @@ interface CompressionRefusalNormalizedConfig {
   fallbackLimit: number;
   contextBudgetTokens: number;
   requestConfig: NormalizedRequest['config'];
+  sourceOnlyFallbackEnabled?: boolean;
+  sourceOnlyFallbackRequestHash?: string;
 }
 
 type CompressionAttemptOutcome =
@@ -3379,6 +3381,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     variants: RecallCurveVariant[],
     plan: CompressionRefusalPlanRecord[],
     canonicalProviderInputTokens?: number,
+    sourceOnlyFallbackRequestHash?: string,
   ): CompressionRefusalQuarantineRecord {
     const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
     const frontierHash = sha256Json(
@@ -3392,6 +3395,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       fallbackLimit,
       contextBudgetTokens,
       requestConfig: canonicalRequest.config,
+      ...(this.config.compressionSourceOnlyFallback === true
+        ? { sourceOnlyFallbackEnabled: true }
+        : {}),
+      ...(sourceOnlyFallbackRequestHash !== undefined
+        ? { sourceOnlyFallbackRequestHash }
+        : {}),
     };
     const familyKey = sha256Json({
       model,
@@ -5211,6 +5220,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ---- 4. In-band marker ----
+    // Structural start of the exact source-only shape. Never recover this by
+    // searching text: the target itself may quote the marker.
+    const sourceOnlyStartIndex = llmMessages.length;
     llmMessages.push({
       participant: 'Context Manager',
       content: [{ type: 'text', text: COMPRESSION_MARKER }],
@@ -5240,6 +5252,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       participant: 'Context Manager',
       content: [{ type: 'text', text: instructionText }],
     });
+
+    const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
+      ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
+      : undefined;
 
     // Split any bundled tool_use+tool_result cycles in non-user turns into
     // separate API-shape messages. claude.ai-imported sessions carry these
@@ -5361,10 +5377,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
+    if (sourceOnlyFallbackMessages) {
+      this.capCompressionImageBytes(
+        sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
+        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+      );
+      const sourceOnlyCleaned = stripUnpairedToolBlocks(
+        this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
+      );
+      sourceOnlyFallbackRequest = {
+        ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
+        shedOversizeImages: true,
+        messages: sourceOnlyCleaned
+          .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+          .filter(m => m.content.length > 0),
+        config: structuredClone(request.config),
+        tools: ctx.tools,
+      };
+    }
+
     // Retain the exact normalized canonical request and frontier. Variants are
     // derived solely by replacing one isolated recall pair; the canonical call
     // below is always issued first and is never rebuilt through fallback code.
     const canonicalRequestHash = sha256Json(request);
+    const sourceOnlyFallbackRequestHash = sourceOnlyFallbackRequest
+      ? sha256Json(sourceOnlyFallbackRequest)
+      : undefined;
     const variants = this.buildRecallCurveVariants(
       request,
       keptSummaries,
@@ -5380,6 +5419,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries,
       variants,
       fallbackPlan,
+      undefined,
+      sourceOnlyFallbackRequestHash,
     );
     const durableQuarantine = this.readCompressionQuarantineProjection();
     // Bounded by chunk hash, not just request identity (2026-08-06
@@ -5397,9 +5438,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash &&
         active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
     );
+    // The shape cap is per request regime, not merely per source chunk. Enabling
+    // the final source-only rung is a genuine request-family change and must
+    // earn a fresh bounded family even when the old regime already filled its
+    // cap. Within the new regime the cap remains sticky.
+    const sameRegime = sameHash.filter((active) =>
+      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
+        quarantineRecord.normalizedConfig.sourceOnlyFallbackEnabled &&
+      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
+        quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash,
+    );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
-      ?? sameHash.find((active) => active.record.familyKey === quarantineRecord.familyKey)
-      ?? (sameHash.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameHash[0] : undefined);
+      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
+      ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       logCompressionCall({
@@ -5618,6 +5669,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           variants,
           fallbackPlan,
           canonicalProviderInputTokens,
+          sourceOnlyFallbackRequestHash,
         );
         const outcomes: CompressionRefusalOutcomeRecord[] = [{
           curveLabel: 'canonical',
@@ -5778,6 +5830,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           break;
         }
 
+        if (!fallbackResponse && sourceOnlyFallbackRequest) {
+          const curveLabel = 'source-only-final';
+          const requestHash = sha256Json(sourceOnlyFallbackRequest);
+          try {
+            const sourceOnlyResponse = await runAttempt(
+              sourceOnlyFallbackRequest, curveLabel, [], [],
+              sha256Json(chunk.messages.map((message) => message.id)),
+            );
+            const trace = attemptTraces[attemptTraces.length - 1]!;
+            const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
+            if (assessment.outcome === 'valid') {
+              trace.outcome = 'success';
+              fallbackResponse = assessment.response;
+              response = assessment.response;
+              successfulTrace = trace;
+            } else {
+              trace.outcome = assessment.outcome;
+              outcomes.push({
+                curveLabel, requestHash, outcome: assessment.outcome,
+                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+              });
+            }
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+          } catch (error) {
+            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            const errorType = error && typeof error === 'object' && 'type' in error
+              ? String((error as { type: unknown }).type)
+              : error instanceof Error ? error.name : typeof error;
+            const trace = attemptTraces[attemptTraces.length - 1];
+            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
+            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+          }
+        }
+
         if (!fallbackResponse) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
@@ -5821,7 +5908,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
-      if (!summaryText.trim()) {
+      const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
+      if (!summaryText.trim() && !sourceOnlyFinalWon) {
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
@@ -5857,10 +5945,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // exhaustion path as the refusal curves; the record is sticky by
         // chunk hash and clears via success-clear / sweep / operator.
         if (this.isCompressionBranchCurrent(sourceBranch)) {
-          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [
-            { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
-            { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
-          ]);
+          const emptyOutcomes: CompressionRefusalOutcomeRecord[] = sourceOnlyFinalWon
+            ? [{
+                curveLabel: 'source-only-final',
+                outcome: 'unusable_empty',
+                requestHash: sourceOnlyFallbackRequestHash!,
+              }]
+            : [
+                { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+                { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+              ];
+          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
         }
         return;
       }
@@ -6258,6 +6353,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
+    const mergeAttempts =
+      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
+    const mergeAttemptLimit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
+    const mergeSourceOnly = this.config.compressionMergeSourceOnly === true ||
+      (this.config.compressionMergeSourceOnlyFallback === true &&
+        mergeAttempts >= mergeAttemptLimit - 1);
 
     // Build the merge prompt with one-level-deeper target expansion +
     // prefix of older context:
@@ -6374,7 +6475,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
     let headCoveredSkipped = 0;
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+    for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
       if (priorSummaryMessageIds.has(m.id) || sourceLeafIds.has(m.id)) {
         headCoveredSkipped++;
@@ -6409,10 +6510,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // pair converges instead of looping. attempts lives on the persisted
     // queue entry; reference-equality on sourceIds scopes this to the
     // queue-driven path.
-    const mergeAttempts =
-      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
-    const configuredRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
-    const mergeRecallBudget = Math.max(
+    const configuredRecallBudget = mergeSourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+    const mergeRecallBudget = mergeSourceOnly ? 0 : Math.max(
       8_000,
       Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
     );
@@ -6461,7 +6560,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.
     // Usually empty (chunking is contiguous).
-    if (mergeStartIdx >= 0) {
+    if (mergeStartIdx >= 0 && !mergeSourceOnly) {
       for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
@@ -6596,6 +6695,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    if (mergeSourceOnly) {
+      mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
+    }
     // Retry-only no-tools line. The summarizer request declares the agent's
     // live tools (classifier requirement, see `tools: ctx.tools` below), and
     // a model whose recent spans are tool-heavy can answer the merge prompt
