@@ -2,6 +2,8 @@ import type {
   FoldingBudget,
   FoldingSolution,
   FoldingSolver,
+  ProduceRequest,
+  ChunkId,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { CanonicalSummaryForest } from '../kv-unified.js';
@@ -45,7 +47,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
       if (result.feasibility.frontier) {
         return {
           frontier: result.feasibility.frontier,
-          produced: [],
+          produced: demandMissingL1(inputs),
           exhausted: true,
         };
       }
@@ -65,6 +67,33 @@ export class KvUnifiedStrategy implements FoldingSolver {
       exhausted: false,
     };
   }
+}
+
+function demandMissingL1(inputs: PickerInputs): ProduceRequest[] {
+  const produced: ProduceRequest[] = [];
+  let run: { first: ChunkId; last: ChunkId } | null = null;
+  const flush = (): void => {
+    if (run) {
+      produced.push({
+        level: 1,
+        range: { firstChunkId: run.first, lastChunkId: run.last },
+      });
+    }
+    run = null;
+  };
+  for (const chunk of [...inputs.chunks].sort((a, b) => a.sequence - b.sequence)) {
+    const foldable =
+      !chunk.l1Id &&
+      !chunk.pinned &&
+      !chunk.lockedByAgent &&
+      !inputs.headChunkIds.has(chunk.id) &&
+      !inputs.tailChunkIds.has(chunk.id);
+    if (!foldable) { flush(); continue; }
+    if (run) run.last = chunk.id;
+    else run = { first: chunk.id, last: chunk.id };
+  }
+  flush();
+  return produced;
 }
 
 // Kept as a function to avoid making the validation path depend on mutable
