@@ -415,6 +415,15 @@ test('kv-unified FoldingSolver adapter applies the selected feasible frontier', 
   assert.equal(strategy.lastResult?.feasible, true);
 });
 
+test('kv-unified live adapter fails closed without every explicit policy field', () => {
+  const { inputs } = fixture();
+  const strategy = new KvUnifiedStrategy({ requireExplicitPolicy: true });
+  assert.throws(
+    () => new Picker(strategy).run(inputs, { totalBudget: 250, targetBudget: 250, slack: 0 }),
+    /requires an explicit policy/,
+  );
+});
+
 test('kv-unified adoption epsilon holds a feasible presentation but never an over-wall one', () => {
   const { inputs } = fixture();
   const solver = new ExactKvUnifiedPolicySolver(inputs);

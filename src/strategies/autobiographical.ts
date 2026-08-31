@@ -38,6 +38,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
+import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -7520,6 +7521,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strictReach: preparedBudget !== undefined,
       });
       this._lastKvStable = strategy;
+      return new Picker(strategy);
+    }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      const configured = this.config.kvUnified;
+      if (!configured) {
+        throw new Error(
+          'foldingStrategy "kv-unified" requires a complete kvUnified configuration; live defaults are forbidden',
+        );
+      }
+      const strategy = new KvUnifiedStrategy({
+        ...configured,
+        requireExplicitPolicy: true,
+      });
+      this._lastKvStable = null;
       return new Picker(strategy);
     }
     this._lastKvStable = null;
