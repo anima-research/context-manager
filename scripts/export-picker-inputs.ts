@@ -72,14 +72,26 @@ async function main() {
 
   const messages = manager.getAllMessages();
   const summaries = ((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [];
+  const liveChunks =
+    ((strategy as unknown as {
+      chunks: Array<{ messages: Array<{ id: string }>; summaryId?: string }>;
+    }).chunks) ?? [];
   const resolutions =
     ((strategy as unknown as { resolutions: Map<string, number> }).resolutions) ?? new Map();
 
-  // message id → covering L1 summary id (level-1, sourceLevel-0 summaries)
+  // message id → covering L1 summary id. Match selectAdaptive exactly:
+  // persisted chunk ownership wins; sourceIds are a first-match fallback for
+  // repaired/boundary-drifted messages with no live chunk-ledger pointer.
   const l1Of = new Map<string, string>();
+  for (const chunk of liveChunks) {
+    if (!chunk.summaryId) continue;
+    for (const message of chunk.messages) l1Of.set(message.id, chunk.summaryId);
+  }
   for (const s of summaries) {
     if (s.level === 1 && s.sourceLevel === 0) {
-      for (const mid of s.sourceIds) l1Of.set(mid, s.id);
+      for (const mid of s.sourceIds) {
+        if (!l1Of.has(mid)) l1Of.set(mid, s.id);
+      }
     }
   }
 
