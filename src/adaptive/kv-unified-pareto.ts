@@ -350,25 +350,28 @@ export class ParetoKvUnifiedPolicySolver {
         });
       }
       let expanded = incoming;
-      for (const child of orderedChildren(summaryId)) {
+      const children = orderedChildren(summaryId);
+      for (let childIndex = 0; childIndex < children.length;) {
+        const child = children[childIndex];
         if (child.kind === 'summary') {
           expanded = processSummary(child.id, expanded);
+          childIndex++;
         } else {
-          const leaf = this.forest.leaf(child.id)!;
-          if (leaf.externallyAccounted) continue;
-          if (!leaf.allowedLevels.includes(0)) { expanded = []; break; }
+          const rawRun: string[] = [];
+          while (childIndex < children.length && children[childIndex].kind === 'leaf') {
+            rawRun.push(children[childIndex].id);
+            childIndex++;
+          }
           expanded = expanded.map((label) => {
-            const assigned = this.assign(label, [leaf.id], 0, policy, options);
-            return this.emit(
-              assigned,
-              'raw',
-              leaf.id,
-              leaf.rawTokens,
-              this.isExtension([leaf.id], options),
+            const ids = rawRun.filter((leafId) => !this.forest.leaf(leafId)!.externallyAccounted);
+            if (ids.some((leafId) => !this.forest.leaf(leafId)!.allowedLevels.includes(0))) return null;
+            return this.emitRawRun(
+              this.assignRawRun(label, ids, policy, options),
+              ids,
               options,
               markerByUnit,
             );
-          });
+          }).filter((label): label is ParetoLabel => label !== null);
         }
         expanded = prune(expanded);
       }
@@ -542,6 +545,74 @@ export class ParetoKvUnifiedPolicySolver {
       } else cache.intact = false;
     }
     return { ...label, active: true, renderedTokens, extensionTokens, cache };
+  }
+
+  private assignRawRun(
+    label: ParetoLabel,
+    ids: readonly ChunkId[],
+    policy: KvUnifiedWelfarePolicy,
+    options: ExactPolicySolveOptions,
+  ): ParetoLabel {
+    if (ids.length === 0) return label;
+    let continuityLoss = label.continuityLoss;
+    if (options.presentation) {
+      for (const id of ids) {
+        const chunk = this.chunksById.get(id)!;
+        continuityLoss += continuityLeafLoss(
+          chunk,
+          0,
+          `raw:${id}`,
+          options.presentation.leaves.get(id),
+          options.presentation.currentSeq,
+          this.midpointAge.get(id)!,
+          policy,
+        );
+      }
+    }
+    return {
+      ...label,
+      active: true,
+      trace: { parent: label.trace, ids: [...ids], level: 0 },
+      continuityLoss,
+    };
+  }
+
+  private emitRawRun(
+    label: ParetoLabel,
+    ids: readonly ChunkId[],
+    options: ExactPolicySolveOptions,
+    markerByUnit: ReadonlyMap<number, number>,
+  ): ParetoLabel {
+    if (ids.length === 0) return label;
+    if (label.cache.intact) {
+      let next = label;
+      for (const id of ids) {
+        const leaf = this.forest.leaf(id)!;
+        next = this.emit(
+          next,
+          'raw',
+          id,
+          leaf.rawTokens,
+          this.isExtension([id], options),
+          options,
+          markerByUnit,
+        );
+      }
+      return next;
+    }
+    let tokens = 0;
+    let extensionTokens = 0;
+    for (const id of ids) {
+      const leafTokens = this.forest.leaf(id)!.rawTokens;
+      tokens += leafTokens;
+      if (this.isExtension([id], options)) extensionTokens += leafTokens;
+    }
+    return {
+      ...label,
+      active: true,
+      renderedTokens: label.renderedTokens + tokens,
+      extensionTokens: label.extensionTokens + extensionTokens,
+    };
   }
 
   private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {

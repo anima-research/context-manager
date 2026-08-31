@@ -101,6 +101,26 @@ test('kv-unified canonical forest rejects interleaved root ownership', () => {
   );
 });
 
+test('kv-unified can explicitly quarantine non-contiguous summaries', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  const scar = chronicle.produceL1(['a', 'c']);
+  chronicle.produceL1(['b']);
+
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle), {
+    quarantineNonContiguousSummaries: true,
+  });
+  assert.deepEqual(forest.quarantinedSummaryIds, [scar.id]);
+  assert.deepEqual(forest.leaf('a')?.availableLevels, [0]);
+  assert.deepEqual(forest.leaf('c')?.availableLevels, [0]);
+  assert.deepEqual(forest.leaf('b')?.availableLevels, [0, 1]);
+  const floor = forest.minimumTokens();
+  assert.equal(floor.feasible, true);
+  assert.equal(floor.floorTokens, 250, 'scar leaves raw; healthy L1 remains selectable');
+});
+
 test('kv-unified intersects locks and pins instead of choosing precedence', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 50 });
   const chunk = chronicle.addChunk({ id: 'a', rawTokens: 100, lockedByAgent: true });
