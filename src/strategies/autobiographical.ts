@@ -7371,9 +7371,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return this.config.foldingStrategy === 'kv-unified';
   }
 
-  reportKvUnifiedAccepted(args: { submissionId: string; acceptedAt?: number }): void {
+  reportKvUnifiedAccepted(args: {
+    submissionId: string;
+    acceptedAt?: number;
+    wireReceipt?: {
+      requestHash: string;
+      markers: Array<{ ordinal: number; prefixHash: string; estimatedOffset: number }>;
+    };
+  }): void {
     this.requireLoadedBranch('reportKvUnifiedAccepted');
-    this.kvUnifiedReceipts.accept(args.submissionId, args.acceptedAt ?? Date.now(), null);
+    this.kvUnifiedReceipts.accept(
+      args.submissionId,
+      args.acceptedAt ?? Date.now(),
+      null,
+      args.wireReceipt,
+    );
     this.kvUnifiedPendingLayout = null;
     this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
   }

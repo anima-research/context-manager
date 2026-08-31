@@ -92,6 +92,7 @@ export {
   type PresentationReceipt,
   type ReceiptChainSnapshot,
   type SerializedReceiptChain,
+  type ObservedCacheWireReceipt,
 } from './kv-unified-receipts.js';
 export {
   renderLayout,
