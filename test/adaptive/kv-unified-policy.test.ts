@@ -11,6 +11,7 @@ import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
+import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
 import { Picker } from '../../src/adaptive/picker.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
@@ -391,6 +392,66 @@ test('kv-unified partial-metric Pareto propagation agrees with the exhaustive or
   assert.equal(pareto.selected.score, oracle.selected.score);
   assert.equal(signature(pareto.selected), signature(leafPareto.selected));
   assert.ok((pareto.propagation?.labelsDominated ?? 0) >= 0);
+});
+
+test('kv-unified emits preserved gap-bearing ownership in chronological leaf order', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100, pinned: true });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.addChunk({ id: 'c', rawTokens: 100, pinned: true });
+  chronicle.addChunk({ id: 'd', rawTokens: 100 });
+  chronicle.produceL1(['a', 'c']);
+  const recall = chronicle.produceL1(['b', 'd']);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks,
+    summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs, {
+    preserveGapBearingSummaries: true,
+  });
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const expectedFrontier = new Map([
+    ['a', 0], ['b', 1], ['c', 0], ['d', 1],
+  ]);
+  const expectedLayout = renderLayout(inputs, new SummaryTree(inputs), expectedFrontier);
+  const result = solver.solve({
+    maxTokens: 250,
+    cache: {
+      immutablePrefixHash: 'same',
+      layout: expectedLayout,
+      markers: [{ unitIndex: 3, offset: 250 }],
+    },
+    currentImmutablePrefixHash: 'same',
+  });
+  assert.equal(result.feasible, true);
+  if (!result.feasible) return;
+  assert.deepEqual(
+    result.selected.layout.units.map((unit) => `${unit.kind}:${unit.key}`),
+    ['raw:a', `recall:${recall.id}`, 'raw:c'],
+  );
+  assert.equal(result.selected.renderedTokens, 250);
+  assert.equal(result.selected.cacheChurn, 0, 'buffered DAG emission retains the full warm prefix');
+  const leaf = solver.solve({
+    maxTokens: 250,
+    engine: 'leaf',
+    cache: {
+      immutablePrefixHash: 'same',
+      layout: expectedLayout,
+      markers: [{ unitIndex: 3, offset: 250 }],
+    },
+    currentImmutablePrefixHash: 'same',
+  });
+  assert.equal(leaf.feasible, true);
+  if (!leaf.feasible) return;
+  for (const chunk of inputs.chunks) {
+    assert.equal(result.selected.frontier.get(chunk.id), leaf.selected.frontier.get(chunk.id));
+  }
+  assert.equal(result.selected.cacheChurn, leaf.selected.cacheChurn);
 });
 
 test('kv-unified grid mode stays hard-feasible and reports an a-posteriori score-error bound', () => {

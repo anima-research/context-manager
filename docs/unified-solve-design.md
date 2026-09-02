@@ -156,6 +156,20 @@ at their carried resolution, which is not necessarily raw — with their
 interaction with ancestor selection and partial-group rendering defined, not
 inherited (review §4.4).
 
+Ownership nesting and chronological contiguity are separate invariants. A
+legacy restore or branch insertion can interleave two disjoint ownership
+branches without giving any leaf two owners. The live adapter therefore makes
+the handling policy explicit and fail-closed: reject the store; destructively
+treeify by removing gap-bearing summary actions; or set
+`preserveGapBearingSummaries` and keep those actions. Preservation does not
+claim that an intervening leaf was summarized. It selects the summary only for
+its original participant leaves and emits intervening branches independently.
+The exact-cover and minimum-token passes still operate on the nested ownership
+sets. The bounded DAG buffers cache-relevant units at their first participant's
+sequence until every earlier interleaved branch is decided, then prices the
+true chronological stream. Destructive treeification and preservation are
+mutually exclusive.
+
 ### 2.2 Feasible set — a cut
 
 Binary x_v per node. Constraints:
@@ -204,9 +218,10 @@ Binary x_v per node. Constraints:
 
 ### 2.3 Rendering contract
 
-Chronological by ownership order; boundary-cut and overlap-exempt leaves render
-raw beside their recall (ownership wins) with their tokens charged to the
-covering node's rendered cost. Unchanged from rev 5's renderer.
+Chronological by live-leaf order; boundary-cut, overlap-exempt, and interleaved
+gap branches render independently beside the recall selected for its actual
+participants. Their tokens are charged exactly once. Unchanged contiguous
+ownership retains rev 5's renderer behavior.
 
 ## 3. Objective
 

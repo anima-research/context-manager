@@ -512,6 +512,7 @@ export interface KvUnifiedConfig {
   labelCeiling: number;
   adoptEpsilon: number;
   treeifyNonContiguousSummaries: boolean;
+  preserveGapBearingSummaries: boolean;
 }
 
 export interface AutobiographicalConfig {

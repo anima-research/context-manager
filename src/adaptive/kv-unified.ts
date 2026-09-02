@@ -30,6 +30,11 @@ export interface CanonicalForestOptions {
   /** Explicit treeification mode: remove non-contiguous summary nodes from the
    * candidate forest and retain their children as independent roots. */
   treeifyNonContiguousSummaries?: boolean;
+  /** Preserve summaries whose ownership leaves are disjoint but chronologically
+   * interleaved with another ownership branch. The ownership forest remains
+   * valid, but chronological solvers must treat the intervening branches as
+   * protected gaps and emit them independently. */
+  preserveGapBearingSummaries?: boolean;
 }
 
 export type CanonicalForestIssueCode =
@@ -224,6 +229,7 @@ export class CanonicalSummaryForest {
   readonly roots: readonly CanonicalRoot[];
   readonly constraintConflicts: readonly ConstraintConflict[];
   readonly treeifiedSummaryIds: readonly SummaryId[];
+  readonly gapBearingSummaryIds: readonly SummaryId[];
 
   private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
   private readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
@@ -360,6 +366,15 @@ export class CanonicalSummaryForest {
 
     const indexOfLeaf = new Map(chunks.map((chunk, index) => [chunk.id, index] as const));
     const treeified = new Set<SummaryId>();
+    const gapBearing = new Set<SummaryId>();
+    if (
+      options.treeifyNonContiguousSummaries &&
+      options.preserveGapBearingSummaries
+    ) {
+      throw new Error(
+        'treeifyNonContiguousSummaries and preserveGapBearingSummaries are mutually exclusive',
+      );
+    }
     const rebuildOwnership = (): void => {
       mutableSummaries.clear();
       for (const chain of chains.values()) {
@@ -404,6 +419,12 @@ export class CanonicalSummaryForest {
         }
       }
       if (contiguityIssues.length === 0) break;
+      if (options.preserveGapBearingSummaries) {
+        for (const issue of contiguityIssues) {
+          for (const id of issue.summaryIds) gapBearing.add(id);
+        }
+        break;
+      }
       if (!options.treeifyNonContiguousSummaries) {
         throw new CanonicalForestError(contiguityIssues);
       }
@@ -522,6 +543,7 @@ export class CanonicalSummaryForest {
     this.roots = roots;
     this.constraintConflicts = conflicts;
     this.treeifiedSummaryIds = [...treeified].sort();
+    this.gapBearingSummaryIds = [...gapBearing].sort();
   }
 
   orderedLeaves(): readonly CanonicalLeaf[] {
