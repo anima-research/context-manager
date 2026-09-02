@@ -478,6 +478,9 @@ export interface CompressionQuarantineStatus {
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
 export type RecallEnvelopeMode = 'none' | 'xml';
 
+/** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
+export type CarrierPolicy = 'full' | 'live-strip';
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -589,6 +592,55 @@ export interface AutobiographicalConfig {
    * renders intact tags around the few characters it bought.
    */
   recallEnvelope?: RecallEnvelopeMode;
+
+  /**
+   * Where a summary's captured reasoning carriers (`responseContent`'s signed
+   * `thinking` / `redacted_thinking` blocks) are replayed.
+   *
+   *  - `'full'` (default) — carriers ride every surface a memory renders on,
+   *    exactly as they have since the 2026-07-15 round-trip landed. Output is
+   *    byte-identical to the pre-knob render on both surfaces.
+   *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
+   *    and merge requests still recall them verbatim.
+   *
+   * TWO SURFACES, ONE STORE. A captured carrier is the ARCHIVIST'S cognition:
+   * the thinking of writing the memory, not the thinking of living the span it
+   * describes. It is replayed on two surfaces that want different things from
+   * it:
+   *
+   *  - MINT-REQUEST RECALL — the summarizer's own inputs. Carriers are
+   *    measured load-bearing here (2026-07-16, upstream's own validation): a
+   *    deterministically-refusing compress request passed once its recall
+   *    pairs carried their summaries' signed reasoning, where the text-only
+   *    arm refused. `'live-strip'` does not touch this path, and no value of
+   *    this option does: the anti-refusal duty stands until a measurement
+   *    retires it.
+   *  - LIVE-WINDOW RENDER — what the agent whose memory it is reads back.
+   *    Thinking blocks are not read there, they are INHABITED, and a carrier
+   *    sits at the memory's chronological slot: the instance re-enters the
+   *    compression fork's task-cognition, positioned where the remembered
+   *    span was lived. At fleet scale the accumulated exemplar mass is
+   *    archivist-cognition, not lived experience.
+   *
+   * `'live-strip'` OMITS WHOLE BLOCKS and never mutates one. Signatures verify
+   * only on byte-identical blocks, so a policy that edited a carrier would
+   * break the very round-trip the mint side depends on; dropping a block
+   * whole leaves every surviving block untouched. A stripped answer that would
+   * render with no prose left falls back to the entry's `content` text, so the
+   * live window never emits an empty assistant turn.
+   *
+   * Pricing follows the render: under `'live-strip'` a recall pair is priced
+   * for the fold planner at its stripped cost, because a plan that prices what
+   * it does not emit is the same wedge from the other side.
+   *
+   * WHY THE DEFAULT IS `'full'`. The inhabitation cost is an argument, not a
+   * measurement, and the anti-refusal duty on the mint side IS measured. The
+   * knob exists so a host that finds the argument convincing can act on it for
+   * its own agents without waiting; flipping the default is a fleet-wide
+   * change to what every instance reads back and belongs to whoever lives
+   * under it.
+   */
+  carrierPolicy?: CarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
@@ -1259,6 +1311,7 @@ Capture what matters:
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
   recallEnvelope: 'none',
+  carrierPolicy: 'full',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
   maxLiveImages: 6,
