@@ -41,6 +41,7 @@ function strategy(): AutobiographicalStrategy {
       labelCeiling: 10_000,
       adoptEpsilon: 0,
       treeifyNonContiguousSummaries: false,
+      preserveGapBearingSummaries: false,
     },
   });
 }
@@ -204,6 +205,28 @@ test('kv-unified fails closed when the treeification policy is omitted', async (
   await assert.rejects(
     manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }),
     /requires an explicit treeifyNonContiguousSummaries boolean/,
+  );
+  manager.close();
+});
+
+test('kv-unified fails closed when the gap-bearing policy is omitted', async () => {
+  const configured = strategy() as unknown as {
+    config: {
+      kvUnified?: {
+        treeifyNonContiguousSummaries?: boolean;
+        preserveGapBearingSummaries?: boolean;
+      };
+    };
+  };
+  delete configured.config.kvUnified!.preserveGapBearingSummaries;
+  const manager = await ContextManager.open({
+    path: STORE,
+    strategy: configured as unknown as AutobiographicalStrategy,
+  });
+  manager.addMessage('user', [{ type: 'text', text: 'fail closed' }]);
+  await assert.rejects(
+    manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }),
+    /requires an explicit preserveGapBearingSummaries boolean/,
   );
   manager.close();
 });

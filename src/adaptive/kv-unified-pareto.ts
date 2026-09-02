@@ -21,6 +21,13 @@ interface CacheState {
   cachedTokens: number;
 }
 
+interface PendingEmission {
+  readonly kind: 'raw' | 'recall';
+  readonly key: string;
+  readonly tokens: number;
+  readonly sequence: number;
+}
+
 interface ParetoLabel {
   active: boolean;
   remaining: bigint;
@@ -29,6 +36,9 @@ interface ParetoLabel {
   continuityLoss: number;
   fidelityLoss: number;
   cache: CacheState;
+  /** Cache-relevant units waiting for a chronologically earlier ownership
+   * branch. Non-empty only for preserved gap-bearing ownership. */
+  pendingEmissions: readonly PendingEmission[];
   trace: AssignmentTrace | null;
   approximation: ApproximationEnvelope;
 }
@@ -86,6 +96,7 @@ export class ParetoKvUnifiedPolicySolver {
   private readonly midpointAge = new Map<ChunkId, number>();
   private readonly summaryMetricCache = new Map<string, { continuity: number; fidelity: number }>();
   private readonly newestSequence: number;
+  private bufferGapEmissions = false;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
@@ -103,10 +114,18 @@ export class ParetoKvUnifiedPolicySolver {
 
   solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
     const internalHoles = this.hasInternalProtectedHoles();
+    const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.engine === 'dag' && internalHoles) {
       throw new Error('recursive DAG engine does not yet support internal protected holes');
     }
-    if (options.engine !== 'leaf' && !internalHoles) return this.solveDag(options);
+    if (options.engine !== 'leaf' && !internalHoles) {
+      this.bufferGapEmissions = gapBearingOwnership;
+      try {
+        return this.solveDag(options);
+      } finally {
+        this.bufferGapEmissions = false;
+      }
+    }
     return this.solveLeaf(options);
   }
 
@@ -136,6 +155,7 @@ export class ParetoKvUnifiedPolicySolver {
       continuityLoss: 0,
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
+      pendingEmissions: [],
       trace: externalIds.length > 0 ? { parent: null, ids: externalIds, level: 0 } : null,
       approximation: ZERO_APPROXIMATION,
     };
@@ -281,6 +301,7 @@ export class ParetoKvUnifiedPolicySolver {
       continuityLoss: 0,
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
+      pendingEmissions: [],
       trace: externalIds.length > 0 ? { parent: null, ids: externalIds, level: 0 } : null,
       approximation: ZERO_APPROXIMATION,
     };
@@ -370,6 +391,9 @@ export class ParetoKvUnifiedPolicySolver {
       const children = orderedChildren(summaryId);
       for (let childIndex = 0; childIndex < children.length;) {
         const child = children[childIndex];
+        expanded = expanded.map((label) =>
+          this.flushPendingEmissions(label, child.sequence, options, markerByUnit),
+        );
         if (child.kind === 'summary') {
           expanded = processSummary(child.id, expanded);
           childIndex++;
@@ -397,6 +421,9 @@ export class ParetoKvUnifiedPolicySolver {
 
     let labels = [initial];
     for (const root of this.forest.roots) {
+      labels = labels.map((label) =>
+        this.flushPendingEmissions(label, root.firstSequence, options, markerByUnit),
+      );
       if (root.kind === 'summary') labels = processSummary(root.id, labels);
       else {
         const leaf = this.forest.leaf(root.id)!;
@@ -416,9 +443,22 @@ export class ParetoKvUnifiedPolicySolver {
     }
     const terminal: ExactCutCandidate[] = [];
     for (const label of labels) {
-      let finished = label;
+      let finished = this.flushPendingEmissions(
+        label,
+        Number.POSITIVE_INFINITY,
+        options,
+        markerByUnit,
+      );
       if (this.inputs.tailTokens > 0) {
-        finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, false, options, markerByUnit);
+        finished = this.emit(
+          finished,
+          'tail',
+          'tail',
+          this.inputs.tailTokens,
+          false,
+          options,
+          markerByUnit,
+        );
       }
       if (finished.renderedTokens <= options.maxTokens) {
         terminal.push({ frontier: reconstructFrontier(finished.trace), renderedTokens: finished.renderedTokens });
@@ -594,6 +634,22 @@ export class ParetoKvUnifiedPolicySolver {
   private emit(label: ParetoLabel, kind: 'head' | 'raw' | 'recall' | 'tail', key: string, tokens: number, extension: boolean, options: ExactPolicySolveOptions, markerByUnit: ReadonlyMap<number, number>): ParetoLabel {
     const renderedTokens = label.renderedTokens + tokens;
     const extensionTokens = label.extensionTokens + (extension ? tokens : 0);
+    if (
+      this.bufferGapEmissions &&
+      label.cache.intact &&
+      (kind === 'raw' || kind === 'recall')
+    ) {
+      const sequence = kind === 'raw'
+        ? this.forest.leaf(key)!.sequence
+        : this.forest.summary(key)!.firstSequence;
+      return {
+        ...label,
+        active: true,
+        renderedTokens,
+        extensionTokens,
+        pendingEmissions: [...label.pendingEmissions, { kind, key, tokens, sequence }],
+      };
+    }
     const cache = { ...label.cache };
     if (cache.intact && options.cache) {
       const previous = options.cache.layout.units[cache.matchedUnits];
@@ -604,6 +660,40 @@ export class ParetoKvUnifiedPolicySolver {
       } else cache.intact = false;
     }
     return { ...label, active: true, renderedTokens, extensionTokens, cache };
+  }
+
+  private flushPendingEmissions(
+    label: ParetoLabel,
+    beforeSequence: number,
+    options: ExactPolicySolveOptions,
+    markerByUnit: ReadonlyMap<number, number>,
+  ): ParetoLabel {
+    if (!this.bufferGapEmissions || !label.cache.intact || label.pendingEmissions.length === 0) {
+      return label;
+    }
+    const ordered = [...label.pendingEmissions].sort((a, b) =>
+      a.sequence - b.sequence || a.kind.localeCompare(b.kind) || a.key.localeCompare(b.key),
+    );
+    const cache = { ...label.cache };
+    let consumed = 0;
+    while (consumed < ordered.length && ordered[consumed].sequence < beforeSequence) {
+      const emission = ordered[consumed++];
+      const previous = options.cache?.layout.units[cache.matchedUnits];
+      if (previous?.kind === emission.kind && previous.key === emission.key) {
+        cache.matchedUnits++;
+        const marker = markerByUnit.get(cache.matchedUnits);
+        if (marker !== undefined) cache.cachedTokens = marker;
+      } else {
+        cache.intact = false;
+        return { ...label, active: true, cache, pendingEmissions: [] };
+      }
+    }
+    return {
+      ...label,
+      active: true,
+      cache,
+      pendingEmissions: ordered.slice(consumed),
+    };
   }
 
   private assignRawRun(
@@ -695,6 +785,9 @@ function stateKey(
     label.cache.intact ? 1 : 0,
     label.cache.matchedUnits,
     label.cache.cachedTokens,
+    label.pendingEmissions
+      .map((emission) => `${emission.sequence}/${emission.kind}/${emission.key}`)
+      .join(','),
     continuityBucketSize > 0 ? Math.floor(label.continuityLoss / continuityBucketSize) : 'c*',
     fidelityBucketSize > 0 ? Math.floor(label.fidelityLoss / fidelityBucketSize) : 'f*',
   ].join(':');

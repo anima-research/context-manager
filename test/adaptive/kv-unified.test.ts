@@ -121,6 +121,46 @@ test('kv-unified can explicitly treeify non-contiguous summaries', () => {
   assert.equal(floor.floorTokens, 250, 'scar leaves raw; healthy L1 remains selectable');
 });
 
+test('kv-unified can preserve gap-bearing summaries as disjoint ownership actions', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  chronicle.addChunk({ id: 'd', rawTokens: 100 });
+  const left = chronicle.produceL1(['a', 'c']);
+  const right = chronicle.produceL1(['b', 'd']);
+
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle), {
+    preserveGapBearingSummaries: true,
+  });
+  assert.deepEqual(forest.treeifiedSummaryIds, []);
+  assert.deepEqual(forest.gapBearingSummaryIds, [left.id, right.id].sort());
+  assert.deepEqual(forest.leaf('a')?.availableLevels, [0, 1]);
+  assert.deepEqual(forest.leaf('b')?.availableLevels, [0, 1]);
+
+  const floor = forest.minimumTokens();
+  assert.equal(floor.feasible, true);
+  assert.equal(floor.floorTokens, 100, 'both interleaved recalls remain selectable');
+  if (!floor.feasible) return;
+  assert.equal(accountFrontier(inputsOf(chronicle), floor.frontier).tokens, 100);
+
+  const labels = forest.propagateExactLabels();
+  assert.ok(labels.candidates.some((candidate) => candidate.renderedTokens === 100));
+});
+
+test('gap preservation and destructive treeification cannot both be enabled', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+
+  assert.throws(
+    () => new CanonicalSummaryForest(inputsOf(chronicle), {
+      treeifyNonContiguousSummaries: true,
+      preserveGapBearingSummaries: true,
+    }),
+    /mutually exclusive/,
+  );
+});
+
 test('kv-unified intersects locks and pins instead of choosing precedence', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 50 });
   const chunk = chronicle.addChunk({ id: 'a', rawTokens: 100, lockedByAgent: true });

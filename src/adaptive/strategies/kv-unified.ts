@@ -18,6 +18,7 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
   /** Live adapter refuses missing policy/grid fields when true. */
   requireExplicitPolicy?: boolean;
   treeifyNonContiguousSummaries?: boolean;
+  preserveGapBearingSummaries?: boolean;
   latentDemand?: {
     mergeThreshold: number;
     fallbackRecallTokens: number;
@@ -57,6 +58,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     if (this.options.requireExplicitPolicy) validateExplicitOptions(this.options);
     const forest = new CanonicalSummaryForest(inputs, {
       treeifyNonContiguousSummaries: this.options.treeifyNonContiguousSummaries,
+      preserveGapBearingSummaries: this.options.preserveGapBearingSummaries,
     });
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
     const result = solver.solve({
@@ -256,6 +258,7 @@ function solveWithLatentCandidate(
   const candidateInputs: PickerInputs = { ...inputs, summaries, recallPairTokens };
   const forest = new CanonicalSummaryForest(candidateInputs, {
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
+    preserveGapBearingSummaries: options.preserveGapBearingSummaries,
   });
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
@@ -320,5 +323,13 @@ function validateExplicitOptions(options: KvUnifiedOptions): void {
   }
   if (typeof options.treeifyNonContiguousSummaries !== 'boolean') {
     throw new Error('kv-unified requires an explicit treeifyNonContiguousSummaries boolean');
+  }
+  if (typeof options.preserveGapBearingSummaries !== 'boolean') {
+    throw new Error('kv-unified requires an explicit preserveGapBearingSummaries boolean');
+  }
+  if (options.treeifyNonContiguousSummaries && options.preserveGapBearingSummaries) {
+    throw new Error(
+      'kv-unified treeifyNonContiguousSummaries and preserveGapBearingSummaries are mutually exclusive',
+    );
   }
 }

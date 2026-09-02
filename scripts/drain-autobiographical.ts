@@ -14,7 +14,7 @@ import {
   NativeFormatter,
   type ToolDefinition,
 } from '@animalabs/membrane';
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 
 const args = process.argv.slice(2);
@@ -27,6 +27,7 @@ const model = option('model');
 const participant = option('participant');
 const maxSteps = Number(option('max-steps') ?? '200');
 const toolsLog = option('tools-log');
+const recipePath = option('recipe');
 const clearMergeQuarantineKeys = args
   .filter((arg) => arg.startsWith('--clear-merge-quarantine='))
   .map((arg) => arg.slice('--clear-merge-quarantine='.length))
@@ -64,16 +65,41 @@ const membrane = new Membrane(adapter, {
   formatter: new NativeFormatter(),
   assistantParticipant: participant,
 });
+const recipe = recipePath
+  ? JSON.parse(readFileSync(recipePath, 'utf8')) as {
+      agent?: { systemPrompt?: string; strategy?: Record<string, unknown> };
+    }
+  : undefined;
+const recipeStrategy = recipe?.agent?.strategy ?? {};
+const passthroughKeys = [
+  'compressionMaxTokens',
+  'compressionRefusalCurveFallbacks',
+  'compressionContextBudgetTokens',
+  'compressionSourceOnly',
+  'compressionSourceOnlyFallback',
+  'compressionMergeSourceOnly',
+  'compressionMergeSourceOnlyFallback',
+  'compressionRecallBudgetTokens',
+  'summaryTargetTokens',
+  'identityReminder',
+  'witnessedBeforeSequence',
+  'witnessedInstruction',
+] as const;
+const recipeOptions: Record<string, unknown> = {};
+for (const key of passthroughKeys) {
+  if (recipeStrategy[key] !== undefined) recipeOptions[key] = recipeStrategy[key];
+}
 const strategy = new AutobiographicalStrategy({
+  ...recipeOptions,
   adaptiveResolution: true,
   hierarchical: true,
-  speculativeProduction: true,
+  speculativeProduction: recipeStrategy.speculativeProduction !== false,
   autoTickOnNewMessage: false,
-  headWindowTokens: 4_000,
-  recentWindowTokens: 100_000,
-  maxMessageTokens: 10_000,
-  mergeThreshold: 6,
-  maxSpeculativeL1s: 36,
+  headWindowTokens: Number(recipeStrategy.headWindowTokens ?? 4_000),
+  recentWindowTokens: Number(recipeStrategy.recentWindowTokens ?? 100_000),
+  maxMessageTokens: Number(recipeStrategy.maxMessageTokens ?? 10_000),
+  mergeThreshold: Number(recipeStrategy.mergeThreshold ?? 6),
+  maxSpeculativeL1s: Number(recipeStrategy.maxSpeculativeL1s ?? 36),
   compressionModel: model,
   summaryParticipant: participant,
   enforceBudget: true,
@@ -87,6 +113,7 @@ const manager = await ContextManager.open({
   membrane,
 });
 if (tools.length > 0) manager.setToolDefinitions(tools);
+if (recipe?.agent?.systemPrompt) manager.setSystemPrompt(recipe.agent.systemPrompt);
 for (const key of clearMergeQuarantineKeys) strategy.clearMergeQuarantine(key);
 
 const compact = () => {
