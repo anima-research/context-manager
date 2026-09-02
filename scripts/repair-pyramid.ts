@@ -514,7 +514,7 @@ console.log(
 console.log(
   `structure:    ${structuralIssues.length === 0 ? 'canonical closure verified' : `${structuralIssues.length} issue(s)`}`,
 );
-for (const issue of structuralIssues.slice(0, 20)) console.log(`  - ${issue}`);
+for (const issue of structuralIssues) console.log(`  - ${issue}`);
 console.log(
   `fold floor:   ≥~${Math.round(floorBefore / 1000)}k tokens fully-folded before → ≥~${Math.round(floorAfter / 1000)}k after ` +
     `(OPTIMISTIC lower bound: group-consistency can force shallower renders — mythos 2026-07-12 measured 490k where this estimated ~134k)`,
