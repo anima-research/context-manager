@@ -7362,6 +7362,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             targetBudget: preparedTotal * (1 - slack),
           },
       opts?.kvUnifiedImmutablePrefixHash,
+      opts?.kvUnifiedContinuityRelaxation,
     );
     // NOTE: a dry run also disturbs transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
@@ -7644,6 +7645,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // absorbed shards as missing (the body-group-shard false
               // positive) — same fix as mergeAdjacentBodyGroupRaw.
               sourceMessageIds: [...currentRun.ids],
+              cacheLayoutKey: currentRun.ids.at(-1),
               sourceRelation: 'copy',
               participant,
               content,
@@ -7666,6 +7668,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 participant: summaryParticipant,
                 content: this.summaryAnswerContentCapped(ancestor, msgCap),
                 sourceRelation: 'derived',
+                cacheLayoutKey: ancestor.id,
               };
               const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
               if (totalTokens + pairTokens > prefixBudget) {
@@ -7774,6 +7777,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           participant: summaryParticipant,
           content: this.summaryAnswerContentCapped(ancestor, msgCap),
           sourceRelation: 'derived',
+          cacheLayoutKey: ancestor.id,
         };
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
         if (totalTokens + pairTokens > prefixBudget) {
@@ -7866,16 +7870,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
-      const indices: number[] = [];
-      for (const entry of merged) {
-        if (!entry.cacheMarker || !entry.sourceMessageId) continue;
-        let matched = -1;
-        for (let i = 0; i < this.kvUnifiedDraft.layout.units.length; i++) {
-          if (this.kvUnifiedDraft.layout.units[i].key === entry.sourceMessageId) matched = i + 1;
-        }
-        if (matched > 0 && !indices.includes(matched)) indices.push(matched);
-      }
-      this.kvUnifiedDraft.markerUnitIndices = indices;
+      this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
+        merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
+      );
     }
     this.assertMiddleCoverage();
     this.rsEnd();
@@ -8135,22 +8132,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             Math.max(1, this.estimateTokens(entries[i]?.content ?? [])),
           );
         }
+        const legalBoundaries = entries
+          .slice(0, historyEnd + 1)
+          .flatMap((entry, index) =>
+            (entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1))
+              ? [index]
+              : [],
+          );
         const nearestBoundary = (fraction: number): number => {
           const target = cumulative[cumulative.length - 1]! * fraction;
-          let bestBoundary = 1;
-          for (let boundary = 2; boundary < cumulative.length; boundary++) {
+          let best = legalBoundaries[0]!;
+          for (const index of legalBoundaries.slice(1)) {
             if (
-              Math.abs(cumulative[boundary]! - target) <
-              Math.abs(cumulative[bestBoundary]! - target)
-            ) bestBoundary = boundary;
+              Math.abs(cumulative[index + 1]! - target) <
+              Math.abs(cumulative[best + 1]! - target)
+            ) best = index;
           }
-          return bestBoundary - 1;
+          return best;
         };
-        marks.add(nearestBoundary(1 / 3));
-        marks.add(nearestBoundary(2 / 3));
-        marks.add(historyEnd);
+        if (legalBoundaries.length > 0) {
+          marks.add(nearestBoundary(1 / 3));
+          marks.add(nearestBoundary(2 / 3));
+          marks.add(legalBoundaries.at(-1)!);
+        }
       }
-      marks.add(n - 1);
+      let tailEnd = -1;
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index]!;
+        if (entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1)) {
+          tailEnd = index;
+          break;
+        }
+      }
+      if (tailEnd >= 0) marks.add(tailEnd);
       if (marks.size > 4) {
         throw new Error(
           `placeCacheMarkers: ${marks.size} caller-owned markers exceed Anthropic's limit of 4`,
@@ -8196,6 +8210,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+  }
+
+  /** Convert emitted message markers back to atomic solver-layout boundaries.
+   * Folded recall pairs and merged raw body shards carry `cacheLayoutKey` on
+   * the entry that ends the unit; fixed head/tail regions map to their single
+   * synthetic layout units. Every wire marker must reconcile exactly. */
+  protected reconcileKvUnifiedMarkerIndices(
+    entries: readonly ContextEntry[],
+    layout: RenderLayout,
+    headMessageIds: ReadonlySet<MessageId>,
+    tailMessageIds: ReadonlySet<MessageId>,
+  ): number[] {
+    const indices: number[] = [];
+    for (const entry of entries) {
+      if (!entry.cacheMarker) continue;
+      const sourceId = entry.sourceMessageId;
+      const layoutKey = sourceId && tailMessageIds.has(sourceId)
+        ? 'tail'
+        : sourceId && headMessageIds.has(sourceId)
+          ? 'head'
+          : entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      if (!layoutKey) {
+        throw new Error('kv-unified cache marker has no atomic layout identity');
+      }
+      let matched = -1;
+      for (let i = 0; i < layout.units.length; i++) {
+        if (layout.units[i].key === layoutKey) matched = i + 1;
+      }
+      if (matched <= 0) {
+        throw new Error(`kv-unified cache marker layout key ${layoutKey} is absent from the solved layout`);
+      }
+      if (!indices.includes(matched)) indices.push(matched);
+    }
+    return indices;
   }
 
   /**
@@ -8316,6 +8364,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     inputs: PickerInputs,
     preparedBudget?: { totalBudget: number; targetBudget: number },
     immutablePrefixHash?: string,
+    continuityRelaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
   ): Picker {
     // Drift alarm: the live config must still name the solver chosen at
     // construction. Nothing legitimate rewrites foldingStrategy at runtime —
@@ -8355,6 +8404,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
+        latentDemand: {
+          mergeThreshold: this.config.mergeThreshold ?? 6,
+          fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
+          maxCandidates: 16,
+        },
         ...(this.kvUnifiedReceipts.head
           ? {
               presentation: {
@@ -8374,6 +8429,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._lastKvStable = null;
     this._lastKvUnified = null;
     return this.getAdaptivePicker();
+  }
+
+  /** Validate the audited transition input at the last possible boundary.
+   * Any malformed, unknown, or expired relaxation restores the normal weight. */
+  protected kvUnifiedContinuityMultiplier(
+    relaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
+  ): number {
+    if (!relaxation) return 1;
+    const validReason =
+      relaxation.reason === 'surgery' ||
+      relaxation.reason === 'budget-transition' ||
+      relaxation.reason === 'infrastructure';
+    const validMultiplier =
+      Number.isFinite(relaxation.multiplier) &&
+      relaxation.multiplier >= 0 &&
+      relaxation.multiplier <= 1;
+    const active =
+      Number.isFinite(relaxation.expiresAt) &&
+      (relaxation.multiplier === 1 || relaxation.expiresAt > Date.now());
+    if (!validReason || !validMultiplier || !active) {
+      console.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
+      return 1;
+    }
+    console.error(
+      `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
+      `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
+    );
+    return relaxation.multiplier;
   }
 
   /** The kv-stable strategy instance behind the most recent compile — kept for

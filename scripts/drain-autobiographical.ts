@@ -62,7 +62,6 @@ const adapter = new AnthropicAdapter({
 });
 const membrane = new Membrane(adapter, {
   formatter: new NativeFormatter(),
-  defaultPromptCaching: true,
   assistantParticipant: participant,
 });
 const strategy = new AutobiographicalStrategy({

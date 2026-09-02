@@ -51,13 +51,12 @@ exclusion experiment has a floor of 302,069 tokens.
 This is **not Fable quarantine state**.  Her live recipe has no such setting,
 her last generic compression-quarantine event is all-clear, and no merge
 quarantine warning appears in the service log.  The implementation option
-currently named `quarantineNonContiguousSummaries` is a solver-local prototype
-that removes unusable ancestors from the solve; its name conflates that
-experiment with the strategy's real compression/refusal quarantine.  These
-measurements prove only that strict canonicalization rejects the export.  They
-do not justify silently enabling ancestor exclusion for Fable.  Before pilot,
-either diagnose/repair the ownership links or implement and review a genuine
-treeification transform that preserves render semantics.
+`treeifyNonContiguousSummaries` is a solver-local transform that removes
+unusable ancestors while retaining their children as independent roots. It is
+not compression/refusal quarantine and is always an explicit policy choice.
+These historical measurements prove only that strict canonicalization rejected
+the pre-repair export; they did not justify silently enabling treeification for
+Fable.
 
 The subsequent ownership diagnosis found that exclusion is not the right
 repair.  The persisted chunk records themselves do not overlap, but 170 stale
@@ -134,6 +133,40 @@ receipts exist.  Until then, cache price ratios `{miss 1.0, read 0.1, write
 1.25}` are provider mechanics; `cacheLambda`, `cacheScale`, and curve shape
 remain explicit policy choices.
 
+## Clean-store four-marker replay
+
+The aggregate-only replay tool at `scripts/replay-kv-unified-fable.mjs` runs
+the production Pareto solver against the repaired Fable archive while masking
+messages and summaries at each call boundary. Raw payload tapes remain on the
+Fable box; the tool consumes only exported picker state, the message timeline,
+and per-call structural/usage metadata.
+
+For 1,595 stream calls from 2026-08-11T20:00Z through 2026-08-28T17:00Z,
+W=400k, a solve every ten calls, exact rendered-token history markers at
+33%/66%/100% plus tail, and Fable's six-hour keepalive window:
+
+- all 162 solves were feasible;
+- 1,513 transitions held the existing chain and 81 rotated it;
+- no rotation began before the 33% history marker; 29 began in the 33–66%
+  interval and 52 after 66%; median surviving history depth was 75.8%;
+- full real-call cache misses fell from the no-keepalive counterfactual's 237
+  to 15. Seven were not rotations: initial call 1, immutable-prefix changes
+  3, previous refusals 2, and TTL expiry 1; there were zero unexplained
+  eligible-marker failures;
+- 376 simulated keepalives read 195.0M cache tokens and wrote zero; and
+- billed-write calibration estimates 40.3M unified cache-write tokens, down
+  103.6M (72.0%) from the recorded 143.8M. After charging keepalive reads,
+  the net benefit is 99.6M base-input-token equivalents over the replay.
+
+This is a mechanics counterfactual, not a fitted welfare policy. The pinned
+run deliberately uses `cacheLambda=0`, `continuityLambda=1`, and provisional
+occupancy/fidelity settings; Phase 0 still chooses those exchange rates. The
+keepalive model assumes an exact replay refreshes every marked prefix in the
+request, preserving the 33% and 66% fallbacks. That multi-breakpoint TTL
+behavior still needs one direct-provider validation. Fable's live log has two
+keepalive attempts so far, both transient errors and neither a successful
+refresh receipt.
+
 ## What the measurements do and do not choose
 
 They support:
@@ -154,21 +187,27 @@ Those are normative choices to be displayed as frontier tradeoffs.  The live
 strategy intentionally has no fallback recipe: `foldingStrategy:
 "kv-unified"` without every policy, approximation, adoption, and structural-
 handling field throws before a solve can select or persist a frontier.  That
-fail-closed gate does not make the current ancestor-exclusion prototype an
-approved Fable policy.
+fail-closed gate remains in force after the ownership repair; Fable's pilot
+configuration must explicitly select strict mode rather than ancestor
+exclusion/treeification.
 
 ## Gates remaining before a Fable switch
 
-1. Collect corrected per-call estimator samples and rerun the cache simulator
-   from accepted CM-owned four-marker wire receipts.
-2. Replay the 2026-08-24 03:11/03:59 round trip as two accepted-presentation
-   transitions, rather than relying only on its unit-hash identity proof.
+1. Add timestamps to corrected per-provider-call estimator samples, collect a
+   clean post-fix run, and set headroom risk from that series.
+2. Pin the 2026-08-24 03:11/03:59 pair as an explicit accepted-presentation
+   regression with a zero-cycle assertion, rather than relying only on the
+   full replay and its unit-hash identity proof.
 3. Choose and record the welfare surface and alpha/isotonicity decision, then
-   run the designed occupancy, surgery, tool-prefix, and no-cycle cases.
-4. Finish score-ranked latent higher-level production demand and feed its
-   pending spans into stability-labelled marker placement.  The current live
-   adapter only demands missing L1 coverage when the exact hard floor is over
-   budget; that prevents a deadlock but is not the complete §8 ranking layer.
-5. Resolve the non-contiguous ownership findings without calling them Fable
-   quarantine: establish whether they are exporter artifacts, repairable store
-   scars, or inputs requiring a semantics-preserving treeification transform.
+   run the designed occupancy, surgery, tool-prefix, rapid-budget, and
+   no-cycle cases. In particular, rerun with the chosen nonzero cache policy.
+4. Validate the conservative score-ranked higher-level demand list against
+   the measured supply model and record its candidate/runtime ceiling.
+5. Verify direct-provider multi-breakpoint keepalive refresh and complete raw-
+   wire parity for native, XML, and Bedrock.
+6. Complete the current spec's second-store (Mythos) replay gate, or explicitly
+   amend Phase 2 to authorize a Fable-only first pilot.
+
+The former ownership gate is closed. Fable's active archive was repaired on
+2026-08-31, strict canonical construction now succeeds without treeification,
+and the prevention rules are live; see `fable-ownership-cleanup-runbook.md`.

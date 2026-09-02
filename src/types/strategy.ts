@@ -203,6 +203,13 @@ export interface SelectOptions {
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
+  /** Audited, expiring continuity relaxation for disruptive transitions.
+   * Invalid or expired values fail closed to normal continuity weight. */
+  kvUnifiedContinuityRelaxation?: {
+    reason: 'surgery' | 'budget-transition' | 'infrastructure';
+    multiplier: number;
+    expiresAt: number;
+  };
 }
 
 /**
@@ -504,7 +511,7 @@ export interface KvUnifiedConfig {
   fidelityBucketSize: number;
   labelCeiling: number;
   adoptEpsilon: number;
-  quarantineNonContiguousSummaries: boolean;
+  treeifyNonContiguousSummaries: boolean;
 }
 
 export interface AutobiographicalConfig {

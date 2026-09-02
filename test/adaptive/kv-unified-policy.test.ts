@@ -13,7 +13,7 @@ import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
 import { Picker } from '../../src/adaptive/picker.js';
-import { buildChronicleWithChain, type MockChronicle } from './harness.js';
+import { buildChronicleWithChain, MockChronicle } from './harness.js';
 
 function fixture(): { chronicle: MockChronicle; inputs: PickerInputs } {
   const chronicle = buildChronicleWithChain({
@@ -77,6 +77,46 @@ test('kv-unified exact policy applies the nonlinear occupancy comfort band', () 
   assert.equal(raw.fidelityLoss, 0);
   assert.ok(raw.budgetPenalty > 0, 'near-wall raw cut pays the upper hinge');
   assert.equal(result.selected.budgetPenalty, 0);
+});
+
+test('kv-unified ranks producible higher-level summaries by conservative welfare gain', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+  for (let index = 0; index < 4; index++) {
+    const id = `latent-${index}`;
+    chronicle.addChunk({ id, rawTokens: 100 });
+    chronicle.produceL1([id]);
+  }
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks,
+    summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+  const strategy = new KvUnifiedStrategy({
+    policy: {
+      alpha: 0,
+      budgetLowRatio: 0,
+      budgetHighRatio: 0.5,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 100_000,
+      cacheLambda: 0,
+      continuityLambda: 0,
+    },
+    tokenBucketSize: 10,
+    continuityBucketSize: 10,
+    fidelityBucketSize: 10,
+    labelCeiling: 10_000,
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4 },
+  });
+  const result = strategy.solve(inputs, { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+  assert.equal(result.exhausted, false);
+  assert.equal(strategy.lastDemandEvaluations.length, 2);
+  assert.ok(strategy.lastDemandEvaluations.every((item) => item.conservativeRecallTokens === 30));
+  assert.ok(strategy.lastDemandEvaluations.every((item) => item.conservativeImprovement > 0));
+  assert.deepEqual(result.produced.map((request) => request.level), [2, 2]);
 });
 
 test('kv-unified continuity weights an equivalent recent rewrite more than an old rewrite', () => {

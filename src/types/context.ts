@@ -37,6 +37,9 @@ export interface ContextEntry {
   content: ContentBlock[];
   /** For prompt caching (future) */
   cacheMarker?: boolean;
+  /** Internal cache-layout identity when this entry ends one atomic rendered
+   * unit. Used to reconcile message markers with accepted solver receipts. */
+  cacheLayoutKey?: string;
 }
 
 /**
@@ -49,6 +52,7 @@ export interface ContextEntryInternal {
   participant: string;
   content: StoredContentBlock[];
   cacheMarker?: boolean;
+  cacheLayoutKey?: string;
 }
 
 /**

@@ -40,7 +40,7 @@ function strategy(): AutobiographicalStrategy {
       fidelityBucketSize: 100,
       labelCeiling: 10_000,
       adoptEpsilon: 0,
-      quarantineNonContiguousSummaries: true,
+      treeifyNonContiguousSummaries: false,
     },
   });
 }
@@ -103,14 +103,14 @@ test('kv-unified failed submission clears single flight without committing', asy
   manager.close();
 });
 
-test('kv-unified owns four message-level cache marker slots', () => {
+test('kv-unified places token-weighted 33/66/100 history markers plus tail', () => {
   const selected = strategy();
-  const entries = Array.from({ length: 20 }, (_, index) => ({
+  const entries = Array.from({ length: 12 }, (_, index) => ({
     index,
     sourceMessageId: `m${index}`,
     sourceRelation: 'copy' as const,
     participant: 'user',
-    content: [{ type: 'text' as const, text: `entry-${index} ${'x'.repeat(40)}` }],
+    content: [{ type: 'text' as const, text: 'x'.repeat(index === 2 ? 400 : 40) }],
   }));
   (
     selected as unknown as {
@@ -120,21 +120,116 @@ test('kv-unified owns four message-level cache marker slots', () => {
         tail: ReadonlySet<string>,
       ) => void;
     }
-  ).placeCacheMarkers(entries as ContextEntry[], new Set(['m0', 'm1']), new Set(['m17', 'm18', 'm19']));
-  assert.equal(entries.filter((entry) => (entry as { cacheMarker?: boolean }).cacheMarker).length, 4);
-  assert.equal((entries[19] as { cacheMarker?: boolean }).cacheMarker, true, 'end marker retained');
+  ).placeCacheMarkers(entries as ContextEntry[], new Set(['m0']), new Set(['m9', 'm10', 'm11']));
+  assert.deepEqual(
+    entries.flatMap((entry, index) =>
+      (entry as { cacheMarker?: boolean }).cacheMarker ? [index] : []),
+    [1, 2, 8, 11],
+  );
+});
+
+test('kv-unified reconciles folded, composite, and tail markers to atomic layout units', () => {
+  const selected = strategy() as unknown as {
+    reconcileKvUnifiedMarkerIndices: (
+      entries: ContextEntry[],
+      layout: { units: Array<{ kind: 'head' | 'raw' | 'recall' | 'tail'; key: string; tokens: number; offset: number }>; totalTokens: number },
+      head: ReadonlySet<string>,
+      tail: ReadonlySet<string>,
+    ) => number[];
+  };
+  const entries: ContextEntry[] = [
+    {
+      index: 0,
+      participant: 'user',
+      content: [{ type: 'text', text: 'head' }],
+      sourceMessageId: 'h',
+      sourceRelation: 'copy',
+      cacheMarker: true,
+    },
+    {
+      index: 1,
+      participant: 'user',
+      content: [{ type: 'text', text: 'composite' }],
+      sourceMessageIds: ['a', 'b'],
+      cacheLayoutKey: 'b',
+      sourceRelation: 'copy',
+      cacheMarker: true,
+    },
+    {
+      index: 2,
+      participant: 'Context Manager',
+      content: [{ type: 'text', text: 'recall' }],
+      sourceRelation: 'derived',
+    },
+    {
+      index: 3,
+      participant: 'resident',
+      content: [{ type: 'text', text: 'summary' }],
+      cacheLayoutKey: 'L2-7',
+      sourceRelation: 'derived',
+      cacheMarker: true,
+    },
+    {
+      index: 4,
+      participant: 'user',
+      content: [{ type: 'text', text: 'tail' }],
+      sourceMessageId: 't',
+      sourceRelation: 'copy',
+      cacheMarker: true,
+    },
+  ];
+  const layout = {
+    units: [
+      { kind: 'head' as const, key: 'head', tokens: 10, offset: 0 },
+      { kind: 'raw' as const, key: 'a', tokens: 10, offset: 10 },
+      { kind: 'raw' as const, key: 'b', tokens: 10, offset: 20 },
+      { kind: 'recall' as const, key: 'L2-7', tokens: 10, offset: 30 },
+      { kind: 'tail' as const, key: 'tail', tokens: 10, offset: 40 },
+    ],
+    totalTokens: 50,
+  };
+  assert.deepEqual(
+    selected.reconcileKvUnifiedMarkerIndices(entries, layout, new Set(['h']), new Set(['t'])),
+    [1, 3, 4, 5],
+  );
 });
 
 test('kv-unified fails closed when the treeification policy is omitted', async () => {
   const configured = strategy() as unknown as {
-    config: { kvUnified?: { quarantineNonContiguousSummaries?: boolean } };
+    config: { kvUnified?: { treeifyNonContiguousSummaries?: boolean } };
   };
-  delete configured.config.kvUnified!.quarantineNonContiguousSummaries;
+  delete configured.config.kvUnified!.treeifyNonContiguousSummaries;
   const manager = await ContextManager.open({ path: STORE, strategy: configured as unknown as AutobiographicalStrategy });
   manager.addMessage('user', [{ type: 'text', text: 'fail closed' }]);
   await assert.rejects(
     manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }),
-    /requires an explicit quarantineNonContiguousSummaries boolean/,
+    /requires an explicit treeifyNonContiguousSummaries boolean/,
   );
   manager.close();
+});
+
+test('kv-unified continuity relaxation is audited, expiring, and fail-closed', () => {
+  const selected = strategy() as unknown as {
+    kvUnifiedContinuityMultiplier: (value?: {
+      reason: 'surgery' | 'budget-transition' | 'infrastructure';
+      multiplier: number;
+      expiresAt: number;
+    }) => number;
+  };
+  assert.equal(selected.kvUnifiedContinuityMultiplier(), 1);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'surgery',
+    multiplier: 0.25,
+    expiresAt: Date.now() + 60_000,
+  }), 0.25);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'budget-transition',
+    multiplier: 0,
+    expiresAt: Date.now() - 1,
+  }), 1);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'infrastructure',
+    multiplier: Number.NaN,
+    expiresAt: Date.now() + 60_000,
+  }), 1);
 });

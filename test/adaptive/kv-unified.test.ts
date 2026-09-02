@@ -101,7 +101,7 @@ test('kv-unified canonical forest rejects interleaved root ownership', () => {
   );
 });
 
-test('kv-unified can explicitly quarantine non-contiguous summaries', () => {
+test('kv-unified can explicitly treeify non-contiguous summaries', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 50 });
   chronicle.addChunk({ id: 'a', rawTokens: 100 });
   chronicle.addChunk({ id: 'b', rawTokens: 100 });
@@ -110,9 +110,9 @@ test('kv-unified can explicitly quarantine non-contiguous summaries', () => {
   chronicle.produceL1(['b']);
 
   const forest = new CanonicalSummaryForest(inputsOf(chronicle), {
-    quarantineNonContiguousSummaries: true,
+    treeifyNonContiguousSummaries: true,
   });
-  assert.deepEqual(forest.quarantinedSummaryIds, [scar.id]);
+  assert.deepEqual(forest.treeifiedSummaryIds, [scar.id]);
   assert.deepEqual(forest.leaf('a')?.availableLevels, [0]);
   assert.deepEqual(forest.leaf('c')?.availableLevels, [0]);
   assert.deepEqual(forest.leaf('b')?.availableLevels, [0, 1]);
