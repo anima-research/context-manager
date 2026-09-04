@@ -256,3 +256,138 @@ describe('WindowedPassthroughStrategy', () => {
     await manager2.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review round on #54 (Anarchid, 2026-09-04): branch-scoped anchor, aux-slot
+// guard rails, hard budget, live-image policy, cache markers.
+// ---------------------------------------------------------------------------
+
+const texts = (r: { messages: Array<{ content: ContentBlock[] }> }): string[] =>
+  r.messages.map((m) => (m.content[0] as { text: string }).text);
+
+describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
+  it('re-derives the anchor when the store is switched to a branch without it (host undo/redo path)', async () => {
+    const path = freshPath();
+    const strategy = new WindowedPassthroughStrategy();
+    const manager = await ContextManager.open({ path, strategy });
+    const m1 = manager.addMessage('u', text('m1'));
+    manager.addMessage('u', text('m2'));
+    // A branch whose head is m1, taken BEFORE any anchor is persisted.
+    const alt = manager.branchAt(m1, 'alt');
+    manager.addMessage('u', text('m3'));
+    const m4 = manager.addMessage('u', text('m4'));
+    strategy.setAnchor(manager.getMessage(m4)!.sequence); // persisted on main only
+    assert.deepEqual(texts(await manager.compile()), ['m4']);
+
+    // Host-style raw switch: the chronicle moves, no manager re-initialization
+    // (agent-framework's undo/redo do exactly this).
+    manager.getStore().switchBranch(alt);
+    assert.equal(strategy.getAnchor(), 0, 'the stale in-memory anchor is not carried over');
+    assert.deepEqual(texts(await manager.compile()), ['m1'], 'the window is the branch\'s own, not empty');
+    await manager.close();
+  });
+
+  it('a persisted anchor past the branch head resets to 0 on load', async () => {
+    const path = freshPath();
+    const anchorStateId = 'test/windowed:anchor';
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ anchorStateId }),
+    });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    manager.getStore().setStateJson(anchorStateId, { anchor: 1_000_000 });
+    await manager.close();
+
+    const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
+    const manager2 = await ContextManager.open({ path, strategy: strategy2 });
+    assert.equal(strategy2.getAnchor(), 0);
+    assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
+    await manager2.close();
+  });
+});
+
+describe('WindowedPassthroughStrategy: hard budget', () => {
+  const budget = { maxTokens: 300, reserveForResponse: 50 }; // usable 250
+
+  it('refuses with OverBudgetError when the newest message alone exceeds the usable budget', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({ path, strategy: new WindowedPassthroughStrategy() });
+    manager.addMessage('u', text('x'.repeat(2000))); // ~500 tokens
+    await assert.rejects(manager.compile(budget), (err: Error) => err.name === 'OverBudgetError');
+    await manager.close();
+  });
+
+  it('under maxMessageTokens the same message is truncated with the marker and fits', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('u', text('x'.repeat(2000)));
+    const t = texts(await manager.compile(budget))[0];
+    assert.match(t, /\[truncated — original was 500 tokens\]$/);
+    assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
+    await manager.close();
+  });
+});
+
+describe('WindowedPassthroughStrategy: live-image policy', () => {
+  it('keeps the newest images and replaces older ones with the placeholder', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxLiveImages: 1, imageStripDepthTokens: 0 }),
+    });
+    const withImage = (tag: string): ContentBlock[] => [
+      { type: 'text', text: tag },
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
+    ];
+    manager.addMessage('u', withImage('i1'));
+    manager.addMessage('u', withImage('i2'));
+    manager.addMessage('u', withImage('i3'));
+    const result = await manager.compile();
+    const shape = result.messages.map((m) =>
+      m.content.map((b) => (b.type === 'image' ? 'image' : (b as { text: string }).text)),
+    );
+    assert.deepEqual(shape, [
+      ['i1', '[image dropped from live context]'],
+      ['i2', '[image dropped from live context]'],
+      ['i3', 'image'],
+    ]);
+    await manager.close();
+  });
+});
+
+describe('WindowedPassthroughStrategy: cache markers', () => {
+  const breakpoints = (r: { messages: Array<{ cacheBreakpoint?: boolean }> }): number[] =>
+    r.messages.map((m, i) => (m.cacheBreakpoint ? i : -1)).filter((i) => i >= 0);
+
+  it('marks the end on the first compile, then the previous endpoint plus the new end on append', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({ path, strategy: new WindowedPassthroughStrategy() });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    assert.deepEqual(breakpoints(await manager.compile()), [1]);
+    manager.addMessage('u', text('c'));
+    manager.addMessage('u', text('d'));
+    assert.deepEqual(breakpoints(await manager.compile()), [1, 3], 'previous request endpoint named explicitly + new end');
+    // No growth: the whole window is the surviving prefix; end-only.
+    assert.deepEqual(breakpoints(await manager.compile()), [3]);
+    await manager.close();
+  });
+
+  it('after a re-anchor only the end is marked (no surviving prefix)', async () => {
+    const path = freshPath();
+    const strategy = new WindowedPassthroughStrategy({ reAnchorFraction: 0.5 });
+    const manager = await ContextManager.open({ path, strategy });
+    const budget = { maxTokens: 1000, reserveForResponse: 50 };
+    for (let i = 0; i < 4; i++) manager.addMessage('u', text(`m${i}-${'x'.repeat(200)}`));
+    await manager.compile(budget); // ~4 × 51 tokens: fits
+    for (let i = 4; i < 24; i++) manager.addMessage('u', text(`m${i}-${'x'.repeat(200)}`));
+    const r = await manager.compile(budget); // overflow → coarse re-anchor
+    assert.ok(strategy.getAnchor() > 0, 'anchor moved');
+    assert.deepEqual(breakpoints(r), [r.messages.length - 1]);
+    await manager.close();
+  });
+});
