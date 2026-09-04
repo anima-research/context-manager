@@ -7676,7 +7676,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 sourceRelation: 'derived',
                 cacheLayoutKey: ancestor.id,
               };
-              const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+              // Price the same pair the planner selected. responseContent may
+              // carry signed-empty thinking whose exact generation cost is in
+              // summary.tokens; re-estimating the rendered blocks here would
+              // fall back to 600 tokens and make plan-vs-actual lie low.
+              const pairTokens = this.recallPairCost(ancestor);
               if (totalTokens + pairTokens > prefixBudget) {
                 throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
               }
@@ -7785,7 +7789,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceRelation: 'derived',
           cacheLayoutKey: ancestor.id,
         };
-        const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+        const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
         }
@@ -8562,9 +8566,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const cached = this._pairCostCache.get(key);
     if (cached !== undefined) return cached;
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const estimatedAnswer = this.estimateTokens(this.summaryAnswerContent(s));
+    // When responseContent exists, `tokens` is normally the provider's exact
+    // output-token count for those same replayed blocks (thinking carriers +
+    // text). Re-estimating signed-empty thinking at the 600-token legacy
+    // fallback threw that exact measurement away and under-priced Mythos's 65
+    // selected recalls by 78k tokens. Keep the estimate as a floor for older
+    // entries whose `tokens` predates responseContent capture or was inferred
+    // from text, but never replace a larger provider measurement with it.
+    const answer =
+      s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
+        ? Math.max(s.tokens, estimatedAnswer)
+        : estimatedAnswer;
     const cost =
       this.estimateTokens([{ type: 'text', text: label }]) +
-      this.estimateTokens(this.summaryAnswerContent(s));
+      answer;
     this._pairCostCache.set(key, cost);
     return cost;
   }
@@ -9011,9 +9027,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content: this.summaryAnswerContentCapped(summary, msgCap),
               sourceRelation: 'derived',
             };
-            const pairTokens =
-              this.estimateTokens(questionEntry.content) +
-              this.estimateTokens(answerEntry.content);
+            const pairTokens = this.recallPairCost(summary);
             // Never silently drop a selected representation: everything in
             // this list either covers history (summaries) or IS uncovered
             // history (pins / uncompressed / frontier raw). Emit within

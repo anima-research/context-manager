@@ -67,9 +67,50 @@ function strategyConfig() {
 
 const filler = (n: number) => 'word '.repeat(n);
 
+class RecallCostProbeStrategy extends AutobiographicalStrategy {
+  pairCost(summary: SummaryEntry): number {
+    return this.recallPairCost(summary);
+  }
+
+  contentCost(content: ContentBlock[]): number {
+    return this.estimateTokens(content);
+  }
+}
+
 describe('Summary reasoning round-trip (Fable-5 signed thinking)', () => {
   before(() => cleanup());
   after(() => cleanup());
+
+  it('prices replayed responseContent at no less than its stored provider output count', () => {
+    const strategy = new RecallCostProbeStrategy(strategyConfig());
+    const responseContent: ContentBlock[] = [
+      { type: 'thinking', thinking: '', signature: 'signed-carrier' },
+      { type: 'text', text: 'A short visible summary.' },
+    ];
+    const exactProviderTokens = 4_200;
+    const summary: SummaryEntry = {
+      id: 'L1-exact-cost',
+      level: 1,
+      content: 'A short visible summary.',
+      tokens: exactProviderTokens,
+      sourceLevel: 0,
+      sourceIds: ['m1'],
+      sourceRange: { first: 'm1', last: 'm1' },
+      created: 1,
+      responseContent,
+    };
+    const labelCost = strategy.contentCost([
+      { type: 'text', text: 'What do you remember from earlier?' },
+    ]);
+    assert.strictEqual(strategy.pairCost(summary), exactProviderTokens + labelCost);
+
+    const underestimatedLegacy = { ...summary, id: 'L1-estimate-floor', tokens: 1 };
+    assert.strictEqual(
+      strategy.pairCost(underestimatedLegacy),
+      strategy.contentCost(responseContent) + labelCost,
+      'the response-content estimate remains the floor for legacy token metadata',
+    );
+  });
 
   it('captures, persists, reloads and re-emits summarizer reasoning blocks verbatim', async () => {
     cleanup();
