@@ -20,7 +20,9 @@ import type { MessageStoreView, StoredMessage, MessageId } from './types/index.j
 
 /**
  * Wrap a view so that only messages passing `keep` are visible.
- * All read methods (including `get` by id) see the filtered world.
+ * All read methods (including `get` by id) see the filtered world — note
+ * that `getFrom(index)` therefore indexes the FILTERED sequence of
+ * messages, not raw-store positions.
  */
 export function filterMessageStoreView(
   view: MessageStoreView,
@@ -52,6 +54,11 @@ export function filterMessageStoreView(
 /**
  * Merge one primary view with any number of auxiliary views into a single
  * timeline ordered by `sequence`.
+ *
+ * Cost: every `getAll` / `getFrom` / `getTail` re-concatenates and re-sorts
+ * (O(n log n) per read). Only managers configured with auxiliary views pay
+ * it, and their strategies read once per select; do not hang a hot path
+ * (per-message bookkeeping, tight loops) off a merged view.
  *
  * Token estimation and calibration delegate to the primary view (estimators
  * are store-level and identical across slots of one chronicle store).
