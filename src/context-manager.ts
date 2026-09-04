@@ -81,6 +81,19 @@ interface ContextManagerBaseConfig {
    * ingestion-stamped metadata, not wall-clock or external state):
    * flapping visibility re-busts compiled-prefix stability and can
    * confuse strategies that persist per-message bookkeeping.
+   *
+   * NOT retroactive, and NOT a confidentiality boundary. The filter governs
+   * what the strategy sees from now on. Derived state a strategy persisted
+   * earlier — autobiographical summaries written while a message was still
+   * visible — is neither invalidated nor re-filtered when a predicate is
+   * introduced on an existing store or tightened later; a summary whose
+   * sources are now hidden stays loadable and selectable. `removeMessage`
+   * has the same property. To excise content that may already have been
+   * folded into memory, branch the chronicle before it entered (strategy
+   * state follows the branch); do not reach for a filter. Predicates keyed
+   * on ingestion-time stamps that never change (tune-out's
+   * `metadata.tuneOut`) are unaffected by this caveat: such a message is
+   * hidden from its first instant and can never have been summarized.
    */
   viewFilter?: (message: StoredMessage) => boolean;
   /**
@@ -277,16 +290,32 @@ export class ContextManager {
     // Auxiliary read-only slots for the strategy-facing merged view.
     // Registration is idempotent and harmless when the slot's writer has
     // not opened yet — an empty slot merges as nothing.
-    const auxiliaryStores = (config.auxiliaryMessageViews ?? []).map((aux) => {
+    //
+    // Guard rails: an auxiliary entry that resolves to this manager's OWN
+    // slot would merge every message twice (doubling token accounting,
+    // silently), so it is refused; a slot listed twice is merged once.
+    const ownSlotId = MessageStore.registrationFor(messageNamespace).id;
+    const seenAuxSlots = new Set<string>();
+    const auxiliaryStores = (config.auxiliaryMessageViews ?? []).flatMap((aux) => {
+      const slotId = MessageStore.registrationFor(aux.namespace).id;
+      if (slotId === ownSlotId) {
+        throw new Error(
+          `ContextManagerConfig.auxiliaryMessageViews: "${slotId}" is this manager's own ` +
+          `message slot (namespace ${JSON.stringify(aux.namespace ?? null)}); merging it ` +
+          `would duplicate every message. Auxiliary views must name other writers' slots.`,
+        );
+      }
+      if (seenAuxSlots.has(slotId)) return [];
+      seenAuxSlots.add(slotId);
       try {
         MessageStore.register(store, aux.namespace);
       } catch {
         /* already registered */
       }
-      return new MessageStore(store, {
+      return [new MessageStore(store, {
         estimator: config.tokenEstimator,
         namespace: aux.namespace,
-      });
+      })];
     });
 
     // Namespace passed to strategies. Falls back to a stable per-store value

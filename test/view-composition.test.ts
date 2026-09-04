@@ -307,6 +307,38 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
   });
 });
 
+describe('auxiliaryMessageViews guard rails', () => {
+  it('refuses an auxiliary entry that resolves to the manager\'s own slot', async () => {
+    const path = freshPath();
+    const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+    await assert.rejects(
+      ContextManager.open({
+        store: main.getStore(),
+        strategy: new PassthroughStrategy(),
+        auxiliaryMessageViews: [{}], // non-isolated manager: {} IS its own slot
+      }),
+      /own message slot/,
+    );
+    await main.close();
+  });
+
+  it('merges a slot listed twice exactly once', async () => {
+    const path = freshPath();
+    const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({
+      store: main.getStore(),
+      namespace: 'subconscious/dup',
+      isolate: true,
+      strategy: new PassthroughStrategy(),
+      auxiliaryMessageViews: [{}, {}],
+    });
+    main.addMessage('alice', text('once'));
+    assert.deepEqual(texts(await side.compile()), ['once']);
+    await side.close();
+    await main.close();
+  });
+});
+
 describe('WindowedPassthroughStrategy: hard budget', () => {
   const budget = { maxTokens: 300, reserveForResponse: 50 }; // usable 250
 
