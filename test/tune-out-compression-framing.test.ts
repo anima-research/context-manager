@@ -1,0 +1,125 @@
+/**
+ * Tune-out framing survives into compression INPUT (agent-framework#77).
+ *
+ * The issue's constraint: compression payload builders must not strip the
+ * backlog wrapper or the subconscious's attribution when the resident's
+ * window is folded — otherwise an L2/L3 can render a tuned-out period as
+ * first-person lived presence instead of reported experience. (What the
+ * summary then SAYS may be first person — antra: "fine and expected" —
+ * this pins what the summarizer SEES.)
+ *
+ * Today this holds by construction: the builders strip exactly four
+ * classes (raw-message thinking, empty text blocks, unpaired tool blocks,
+ * oversized images) and preserve participants, which membrane's multiuser
+ * mode renders as name prefixes. This test turns "by construction" into a
+ * contract: extending payload sanitization must not eat these artifacts.
+ */
+import { describe, it, after } from 'node:test';
+import assert from 'node:assert';
+import { rmSync, existsSync } from 'node:fs';
+import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import type { ContentBlock } from '@animalabs/membrane';
+
+const BASE = './test-tune-out-framing';
+let storeSeq = 0;
+function freshPath(): string {
+  return `${BASE}-${storeSeq++}`;
+}
+after(() => {
+  for (let i = 0; i < storeSeq + 1; i++) {
+    const p = `${BASE}-${i}`;
+    if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+  }
+});
+
+const t = (s: string): ContentBlock => ({ type: 'text', text: s });
+
+interface ApiMessage { participant: string; content: ContentBlock[] }
+
+function mockMembrane() {
+  const calls: Array<{ messages: ApiMessage[] }> = [];
+  return {
+    calls,
+    membrane: {
+      complete: async (request: { messages: ApiMessage[] }) => {
+        calls.push({ messages: request.messages });
+        const inputChars = request.messages
+          .flatMap((m) => m.content)
+          .map((b) => (b as { text?: string }).text ?? '')
+          .join('').length;
+        return {
+          stopReason: 'end_turn',
+          content: [{ type: 'text', text: `[mock memory inChars=${inputChars}] ` + 'x '.repeat(40) }],
+          usage: { input_tokens: Math.ceil(inputChars / 4), output_tokens: 25 },
+        };
+      },
+    } as never,
+  };
+}
+
+async function drain(manager: ContextManager): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if (manager.isReady()) return;
+    await manager.tick();
+  }
+  throw new Error('strategy never became ready');
+}
+
+describe('tune-out framing in compression payloads', () => {
+  it('the backlog wrapper, lifecycle notice, and Subconscious attribution reach the summarizer intact', async () => {
+    const path = freshPath();
+    const { membrane, calls } = mockMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 300,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path, strategy, membrane: membrane as never });
+
+    // A window shaped like a post-cancel resident timeline: enough ordinary
+    // turns on both sides that the chunk containing the artifacts CLOSES
+    // (the trailing partial chunk is never compressed), with the
+    // subconscious's voice and the host-framed notice + dump in the middle.
+    const filler = (i: number) => `message ${i} ` + 'word '.repeat(8);
+    for (let i = 0; i < 20; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
+    manager.addMessage('Subconscious', [t(
+      'While you were tuned out, #dev mostly discussed the release; ' +
+      'you were mentioned twice, neither urgent.',
+    )]);
+    manager.addMessage('user', [t(
+      '[Tune-out: disc:guild:noisy cancelled — agent request, 2 wakes]\n\n' +
+      '<tuned-out-backlog channel="disc:guild:noisy" messages=5 truncated=3 (oldest; fetch_history covers the rest)>\n' +
+      'antra: hey scout, quick question\n' +
+      'antra: scout are you there?\n' +
+      '</tuned-out-backlog>',
+    )]);
+    for (let i = 20; i < 60; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
+
+    await drain(manager);
+    assert.ok(calls.length > 0, 'compression ran');
+
+    const allPayloadText = calls
+      .flatMap((c) => c.messages)
+      .map((m) => `${m.participant}\0${m.content.map((b) => (b as { text?: string }).text ?? '').join('\n')}`)
+      .join('\n');
+
+    // The wrapper and notice survive verbatim (payload builders strip only
+    // thinking / empty-text / unpaired-tool / oversized-image classes).
+    assert.match(allPayloadText, /<tuned-out-backlog channel="disc:guild:noisy"/);
+    assert.match(allPayloadText, /\[Tune-out: disc:guild:noisy cancelled/);
+    assert.match(allPayloadText, /truncated=3/);
+
+    // The subconscious's report reaches the summarizer UNDER ITS OWN
+    // PARTICIPANT — the attribution that keeps a fold from rendering the
+    // period as the resident's lived presence.
+    const subMessage = calls
+      .flatMap((c) => c.messages)
+      .find((m) => m.content.some((b) => ((b as { text?: string }).text ?? '').includes('While you were tuned out')));
+    assert.ok(subMessage, 'the subconscious report is in the payload');
+    assert.equal(subMessage!.participant, 'Subconscious');
+
+    await manager.close();
+  });
+});
