@@ -24,7 +24,7 @@ function texts(req: NormalizedRequest): string[] {
 }
 
 /** Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever. */
-function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean }) {
+function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same' }) {
   let leaf = 0;
   const calls: NormalizedRequest[] = [];
   return {
@@ -41,7 +41,8 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
         }
         const which = targets.map((t) => t.split(' ')[0]).join('+');
         leaf++;
-        const details = opts.leafDetails ? { usage: { inputTokens: 100, outputTokens: 20, cacheCreationTokens: 7, cacheReadTokens: 3, thinkingTokens: 999, estimatedCost: { currency: 'USD', total: 9.99 } }, model: { requested: 'same-model', actual: `leaf-model-${leaf}`, provider: `prov-${leaf}` } } : {};
+        const withModel = opts.leafDetails === true || opts.leafDetails === 'same' || (opts.leafDetails === 'first-only' && leaf === 1);
+        const details = opts.leafDetails ? { usage: { inputTokens: 100, outputTokens: 20, cacheCreationTokens: 7, cacheReadTokens: 3, thinkingTokens: 999, estimatedCost: { currency: 'USD', total: 9.99 } }, ...(withModel ? { model: { requested: 'same-model', actual: opts.leafDetails === 'same' ? 'leaf-model' : `leaf-model-${leaf}`, provider: opts.leafDetails === 'same' ? 'prov' : `prov-${leaf}` } } : {}) } : {};
         return { content: [text(`piece:${which}`)], rawAssistantText: `piece:${which}`, toolCalls: [], toolResults: [], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 }, details, raw: { response: {} } };
       },
     } as never,
@@ -264,7 +265,21 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(d.usage.cacheReadTokens, 12, 'cache read summed over leaves (4×3)');
     assert.equal(d.cache.tokensCreated, 28);
     assert.equal(d.model.actual, 'mixed'); assert.equal(d.model.provider, 'mixed');
+    assert.ok(d.cache.hitRatio > 0 && d.cache.hitRatio < 1, 'aggregate hit ratio computed from summed counts');
     const disc = d.usage.discardedAttempts as { attempts: number };
     assert.ok(disc.attempts >= 1, 'refused leaves counted as discarded attempts');
+  });
+
+  it('model identity is unanimous only when every successful leaf reported it; present/missing mix is "mixed"', async () => {
+    const some = await build(cumulativeMembrane({ refuseAt: 2, leafDetails: 'first-only' }).membrane, { split: true });
+    await some.strategy.run(some.target, managerContext(some.manager));
+    assert.equal(some.strategy.details()!.model.actual, 'mixed', 'one leaf reported, others did not → not unanimous');
+    const all = await build(cumulativeMembrane({ refuseAt: 2, leafDetails: 'same' }).membrane, { split: true });
+    await all.strategy.run(all.target, managerContext(all.manager));
+    assert.equal(all.strategy.details()!.model.actual, 'leaf-model', 'all leaves agree → recorded');
+    const none = await build(cumulativeMembrane({ refuseAt: 2 }).membrane, { split: true });
+    await none.strategy.run(none.target, managerContext(none.manager));
+    assert.equal(none.strategy.details()!.model.actual, 'unknown');
+    assert.equal(none.strategy.details()!.cache.hitRatio, 0, 'no cache accounting → zeros, consistent');
   });
 });

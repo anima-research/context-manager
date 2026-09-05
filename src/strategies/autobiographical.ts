@@ -6006,6 +6006,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
           const succ = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cacheSeen: false };
           const leafModels = new Set<string>();
+          let successfulLeaves = 0;
+          let modelReportedLeaves = 0;
           const splitStart = Date.now();
           let abortReason: string | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
@@ -6054,7 +6056,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 succ.inputTokens += assessment.response.usage?.inputTokens ?? 0;
                 succ.outputTokens += assessment.response.usage?.outputTokens ?? 0;
                 if (d?.usage?.cacheCreationTokens !== undefined || d?.usage?.cacheReadTokens !== undefined) { succ.cacheSeen = true; succ.cacheCreationTokens += d?.usage?.cacheCreationTokens ?? 0; succ.cacheReadTokens += d?.usage?.cacheReadTokens ?? 0; }
-                if (d?.model?.actual) leafModels.add(`${d.model.actual}|${d.model.provider ?? ''}`);
+                successfulLeaves++;
+                if (d?.model?.actual) { modelReportedLeaves++; leafModels.add(`${d.model.actual}|${d.model.provider ?? ''}`); }
               }
               const txt = textOf(assessment.response).trim();
               if (txt.length > 0) {
@@ -6114,17 +6117,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                   discardedAttempts: { attempts: attempted.refused + attempted.errors, inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens), outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens) },
                 } as NormalizedResponse['details']['usage'],
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
-                model: leafModels.size === 1
+                // One identity only when EVERY successful leaf reported one and they all agree;
+                // 'mixed' when they disagree or some leaves reported none; 'unknown' when none did.
+                model: (leafModels.size === 1 && modelReportedLeaves === successfulLeaves)
                   ? { requested: String((request.config as { model?: string }).model ?? ''), actual: [...leafModels][0].split('|')[0], provider: [...leafModels][0].split('|')[1] }
-                  : { requested: String((request.config as { model?: string }).model ?? ''), actual: leafModels.size === 0 ? 'unknown' : 'mixed', provider: leafModels.size === 0 ? 'unknown' : 'mixed' },
-                cache: { markersInRequest: 0, tokensCreated: succ.cacheCreationTokens, tokensRead: succ.cacheReadTokens, hitRatio: 0 },
+                  : { requested: String((request.config as { model?: string }).model ?? ''), actual: modelReportedLeaves === 0 ? 'unknown' : 'mixed', provider: modelReportedLeaves === 0 ? 'unknown' : 'mixed' },
+                // Aggregate cache view over successful leaves. hitRatio = read / (read + created + uncached
+                // input) across those leaves; all zeros when no leaf reported cache accounting.
+                cache: { markersInRequest: 0, tokensCreated: succ.cacheCreationTokens, tokensRead: succ.cacheReadTokens, hitRatio: succ.cacheSeen && (succ.cacheReadTokens + succ.cacheCreationTokens + succ.inputTokens) > 0 ? succ.cacheReadTokens / (succ.cacheReadTokens + succ.cacheCreationTokens + succ.inputTokens) : 0 },
               },
               raw: { request: null, response: { stitched: true, compositeHash, contentHash, parts: partsMeta, attempted } },
             };
             this.lastSplitDetails = synthetic.details;
             fallbackResponse = synthetic;
             response = synthetic;
-            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, leafModels: [...leafModels], compositeHash, contentHash, parts: partsMeta, placeholders };
+            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, leaves: { successful: successfulLeaves, modelReported: modelReportedLeaves, models: [...leafModels] }, compositeHash, contentHash, parts: partsMeta, placeholders };
             successfulTrace = {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
