@@ -864,6 +864,10 @@ export interface AutobiographicalConfig {
    * the record). Without it, such a chunk falls through to quarantine. Off by default.
    */
   compressionSplitPlaceholder?: boolean;
+  /** Split-stitch: max sub-calls per chunk (default 40). */
+  compressionSplitMaxCallsPerChunk?: number;
+  /** Split-stitch: max sub-calls per process per 10-minute sliding window (default 80). */
+  compressionSplitMaxCallsPer10Min?: number;
 
   /**
    * Maximum number of same-model recall-curve variants attempted after an L1
