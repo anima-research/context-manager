@@ -169,6 +169,18 @@ const withPlainProseLine = (request: NormalizedRequest): NormalizedRequest =>
  * the tools-less arm of the lena merge bench minted cleanly, content
  * matching the tools-declared control.
  */
+/**
+ * Summarizer models on which a request carrying the compression marker and
+ * directive but NO `tools` param is a deterministic reasoning_extraction
+ * input-block regardless of chunk content (measured: claude-fable-5-1 and
+ * claude-fable-5, 2026-09-05 — bare marker+directive IB 3/3, identical bytes
+ * with the live tool set end_turn 3/3). Prefix-matched; gateway-prefixed ids
+ * ('anthropic/claude-fable-5') and dated snapshots are covered.
+ */
+export function isToolsLessRefusingSummarizer(model: string): boolean {
+  return /(?:^|\/)claude-(?:fable|mythos)-/.test(model);
+}
+
 function withoutToolsParam(request: NormalizedRequest): NormalizedRequest {
   const { tools: _tools, ...rest } = request as NormalizedRequest & { tools?: unknown };
   return rest as NormalizedRequest;
@@ -5354,15 +5366,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // by its tool_result, and any tool_result that doesn't follow a use.
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
-    // Without the agent's live tool definitions, a request that replays
-    // tool-block-bearing history is deterministically refused
-    // (reasoning_extraction -- see the `tools` comment below). Tools are
-    // pushed by the host on every activation; before the first activation
-    // of a session, defer rather than burn a doomed full-window call.
+    // Without the agent's live tool definitions a summarizer request that
+    // replays tool-block-bearing history is deterministically refused
+    // (reasoning_extraction -- see the `tools` comment below; labclaude
+    // 2026-07-09). On Fable/Mythos-family summarizers the refusal is
+    // content-INDEPENDENT: the bare marker+directive with no conversation
+    // at all is input-blocked, while the identical bytes with the live tool
+    // set declared mint cleanly (Linn, claude-fable-5-1, 2026-09-05; same on
+    // claude-fable-5). A pure-chat seed's first speculative L1 therefore
+    // fired ~300ms after boot -- before the host's first
+    // setToolDefinitions -- burned a doomed call and landed in quarantine.
+    // Tools are pushed by the host on MCPL registration / maintenance
+    // passes and on every activation, so defer rather than burn the call.
+    // Opus-family summarizers mint tools-less (lena bench), and test
+    // harnesses never push tools, so the content-independent rule is gated
+    // on the model family.
     const chunkHasToolBlocks = cleaned.some(m =>
       m.content.some((b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'));
-    if (chunkHasToolBlocks && !(ctx.tools && ctx.tools.length > 0)) {
-      console.warn('[autobiographical] deferring chunk compression: history contains tool blocks but host has not provided tool definitions yet (ctx.tools empty) — will retry after next activation');
+    const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
+    if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
+      console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
     }
 
