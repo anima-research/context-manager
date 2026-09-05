@@ -5964,7 +5964,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // tool_result message — is indivisible), source-only shape, same instruction and
         // model, and commits ONE L1 over the chunk only if every piece settles. Any provider
         // error aborts the rung (errors never recurse into smaller calls). Bounded by a
-        // per-chunk call cap and a per-process sliding-window cap.
+        // per-chunk call cap and a sliding-window cap scoped to this strategy instance
+        // (it resets when the process restarts; it is not a durable quota).
         if (!fallbackResponse && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
           const leafHash = sha256Json(chunk.messages.map((message) => message.id));
           const textOf = (m: { content: ContentBlock[] }): string =>
@@ -5992,12 +5993,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               tools: ctx.tools,
             } as NormalizedRequest;
           };
-          type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; requestHash?: string; responseHash?: string; contentHash: string; text: string };
+          type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
           const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
           const parts: SplitPart[] = [];
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
           let inputTokens = 0;
+          const attempted = { calls: 0, refused: 0, inputTokens: 0, outputTokens: 0 };
           let abortReason: string | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
           const WINDOW_MS = 10 * 60_000;
@@ -6028,13 +6030,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             const assessment = this.assessFallbackCompressionResponse(res);
             const trace = attemptTraces[attemptTraces.length - 1]!;
+            {
+              const u = (res as { usage?: { inputTokens?: number; outputTokens?: number } } | undefined)?.usage;
+              attempted.calls++;
+              attempted.inputTokens += u?.inputTokens ?? 0;
+              attempted.outputTokens += u?.outputTokens ?? 0;
+              if (assessment.outcome !== 'valid') attempted.refused++;
+            }
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
               lastGood = assessment.response;
               inputTokens += assessment.response.usage?.inputTokens ?? 0;
               const txt = textOf(assessment.response).trim();
               if (txt.length > 0) {
-                parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), requestHash: sha256Json(sub), responseHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
+                parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: sha256Json(sub), responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
                 return true;
               }
             } else {
@@ -6056,7 +6065,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (this.config.compressionSplitPlaceholder !== true) return false;
             const m = subset[0];
             const who = (textOf(m).match(/^\s*([A-Za-z0-9_ -]{1,24}):\s/) || [])[1] || m.participant;
-            const ph = `[Operator note — not the resident's words: one line posted by ${who} at this point (message id ${m.id}) could not be folded by the memory system in any form and remains only in the record.]`;
+            const ph = `[Operator note — not the resident's words: one preserved message from ${who} at this point (message id ${m.id}) was not summarized in this entry; its exact source remains in the record.]`;
             parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
             return true;
           };
@@ -6066,7 +6075,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const outputTokens = parts.reduce((n, p) => n + p.tokens, 0);
             const contentHash = sha256Json(stitchedText);
             const partsMeta = parts.map(({ text: _text, ...p }) => p);
-            const compositeHash = sha256Json({ leafHash, parts: partsMeta.map((p) => ({ range: p.range, kind: p.kind, requestHash: p.requestHash ?? null, responseHash: p.responseHash ?? null, contentHash: p.contentHash })) });
+            const compositeHash = sha256Json({ leafHash, parts: partsMeta.map((p) => ({ range: p.range, kind: p.kind, requestHash: p.requestHash ?? null, responseContentHash: p.responseContentHash ?? null, contentHash: p.contentHash })) });
             const placeholders = parts.filter((p) => p.kind === 'placeholder').map((p) => ({ messageId: chunk.messages[p.range[0]].id, author: 'operator:compressionSplitPlaceholder', text: p.text, contentHash: p.contentHash }));
             const synthetic: NormalizedResponse = {
               content: [{ type: 'text', text: stitchedText }],
@@ -6075,23 +6084,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               toolResults: [],
               stopReason: 'end_turn' as NormalizedResponse['stopReason'],
               usage: { inputTokens, outputTokens },
+              // `details` describes the LAST successful leaf only; marked as such in raw.
               details: lastGood.details,
-              raw: { request: null, response: { stitched: true, compositeHash, contentHash, parts: partsMeta } },
+              raw: { request: null, response: { stitched: true, detailsScope: 'last-successful-leaf', compositeHash, contentHash, parts: partsMeta, attempted } },
             };
             fallbackResponse = synthetic;
             response = synthetic;
-            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, compositeHash, contentHash, parts: partsMeta, placeholders };
+            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, compositeHash, contentHash, parts: partsMeta, placeholders };
             successfulTrace = {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
             };
             console.error(`[autobiographical] split-stitch fold landed for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
-            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls } });
+            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
           } else {
             const reason = abortReason ?? 'refused';
             outcomes.push({ curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) });
             console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
-            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, piecesDiscarded: parts.length } });
+            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } });
           }
         }
         if (!fallbackResponse) {

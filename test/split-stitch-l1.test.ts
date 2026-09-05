@@ -128,12 +128,15 @@ describe('split-stitch L1 fallback', () => {
     const fx = await build(cumulativeMembrane({ refuseAt: 2 }).membrane, { split: true });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
     const e = fx.strategy.entries()[0]!;
-    const st = e.stitched as { contentHash: string; compositeHash: string; parts: Array<{ requestHash?: string; responseHash?: string; contentHash: string }> };
+    const st = e.stitched as { contentHash: string; compositeHash: string; parts: Array<{ requestHash?: string; responseContentHash?: string; contentHash: string }> };
     const { createHash } = await import('node:crypto');
     const sha = (x: unknown) => createHash('sha256').update(JSON.stringify(x)).digest('hex');
     assert.equal(st.contentHash, sha(e.content), 'contentHash is the SHA-256 of the installed content');
     assert.equal(e.provenance?.requestHash, st.compositeHash, 'provenance requestHash is the composite hash');
-    for (const p of st.parts) { assert.ok(p.contentHash); assert.ok(p.requestHash); assert.ok(p.responseHash); }
+    for (const p of st.parts) { assert.ok(p.contentHash); assert.ok(p.requestHash); assert.ok(p.responseContentHash); }
+    const att = (e.stitched as { attempted: { calls: number; refused: number; inputTokens: number; outputTokens: number } }).attempted;
+    assert.ok(att.calls >= 4 && att.refused >= 1, 'attempted spend includes refused leaves');
+    assert.ok(att.inputTokens > 0);
   });
 
   it('a whole-chunk tool round is indivisible: refused pair installs nothing and sends no sub-request', async () => {
@@ -177,7 +180,45 @@ describe('split-stitch L1 fallback', () => {
     const st = e.stitched as { placeholders: Array<{ messageId: string; author: string; text: string; contentHash: string }> };
     assert.equal(st.placeholders.length, 1);
     assert.equal(st.placeholders[0]!.author, 'operator:compressionSplitPlaceholder');
-    assert.ok(st.placeholders[0]!.text.startsWith('[Operator note — not the resident\'s words:'));
+    assert.ok(st.placeholders[0]!.text.startsWith('[Operator note — not the resident\'s words: one preserved message from'));
+    assert.ok(!st.placeholders[0]!.text.includes('one line'), 'no false "one line" claim');
     assert.ok(e.content.includes(st.placeholders[0]!.text));
+  });
+
+  it('crash after summary append but before the chunk record is marked: reopen adopts, no duplicate mint, no extra calls', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true });
+    // simulate the crash seam: markChunkRecordCompressed throws after pushSummary persisted the entry
+    const proto = Object.getPrototypeOf(Object.getPrototypeOf(fx.strategy)) as { markChunkRecordCompressed: (...a: unknown[]) => void };
+    const original = proto.markChunkRecordCompressed;
+    proto.markChunkRecordCompressed = function () { throw new Error('simulated crash after append'); };
+    let threw = false;
+    try { await fx.strategy.run(fx.target, managerContext(fx.manager)); } catch { threw = true; } finally { proto.markChunkRecordCompressed = original; }
+    assert.ok(threw, 'crash surfaced');
+    assert.equal(fx.strategy.entries().length, 1, 'the appended entry is persisted once');
+    const callsBefore = calls.length;
+    // "reopen": a fresh strategy over the same store must adopt the persisted L1 without new provider calls
+    const path = (fx.manager as unknown as { store: { path?: string } }).store.path;
+    await fx.manager.close();
+    const strategy2 = new ProbeStrategy({ compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionSplitFallback: true } as never);
+    const manager2 = await ContextManager.open({ path: path ?? paths[paths.length - 1]!, strategy: strategy2, membrane: membrane as never });
+    const all = managerContext(manager2).messageStore.getAll();
+    const target2: Chunk = { index: 7, startIndex: 0, endIndex: 4, messages: all.filter((m) => fx.ids.includes(m.id)), tokens: 100, compressed: false };
+    await strategy2.run(target2, managerContext(manager2));
+    assert.equal(calls.length, callsBefore, 'no provider calls on reopen: exact L1 adopted');
+    assert.equal(strategy2.entries().filter((x) => x.sourceIds.join(':') === fx.ids.join(':')).length, 1, 'exactly one L1 over these sources');
+    assert.ok(target2.compressed, 'chunk marked compressed by adoption');
+    await manager2.close();
+  });
+
+  it('a second attempt over the same sources after a committed stitch adopts instead of minting again', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const n = calls.length;
+    const again: Chunk = { ...fx.target, compressed: false, summaryId: undefined };
+    await fx.strategy.run(again, managerContext(fx.manager));
+    assert.equal(calls.length, n, 'no new provider calls');
+    assert.equal(fx.strategy.entries().length, 1, 'still exactly one entry');
   });
 });

@@ -866,7 +866,8 @@ export interface AutobiographicalConfig {
   compressionSplitPlaceholder?: boolean;
   /** Split-stitch: max sub-calls per chunk (default 40). */
   compressionSplitMaxCallsPerChunk?: number;
-  /** Split-stitch: max sub-calls per process per 10-minute sliding window (default 80). */
+  /** Split-stitch: max sub-calls per strategy instance per 10-minute sliding window (default 80).
+   * In-memory only: resets on process restart; not a durable quota. */
   compressionSplitMaxCallsPer10Min?: number;
 
   /**
