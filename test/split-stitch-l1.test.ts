@@ -51,7 +51,7 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
 
 class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
-  details() { return (this as unknown as { lastSplitDetails?: { usage: Record<string, unknown>; model: { actual: string; provider: string }; cache: { tokensCreated: number; tokensRead: number } } }).lastSplitDetails; }
+  details() { return (this as unknown as { lastSplitDetails?: { usage: Record<string, unknown>; model: { actual: string; provider: string }; cache: { tokensCreated: number; tokensRead: number; hitRatio: number } } }).lastSplitDetails; }
   attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } }).lastSplitAttempted; }
   entries(): SummaryEntry[] { return (this as unknown as { summaries: SummaryEntry[] }).summaries; }
 }
