@@ -2299,6 +2299,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   /** Sliding-window timestamps of split-stitch sub-calls (compressionSplitMaxCallsPer10Min). */
   protected splitCallTimes: number[] = [];
+  /** Accounting of the most recent split-stitch attempt (receipts/tests). */
+  protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } | undefined;
 
   protected pushSummary(entry: SummaryEntry): void {
     this.requireBranchMutation('pushSummary');
@@ -5999,7 +6001,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
           let inputTokens = 0;
-          const attempted = { calls: 0, refused: 0, inputTokens: 0, outputTokens: 0 };
+          const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          const splitStart = Date.now();
           let abortReason: string | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
           const WINDOW_MS = 10 * 60_000;
@@ -6019,11 +6022,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const sub = buildSub(subset, target);
             const label = `split:${a}-${b}`;
             calls++;
+            attempted.calls++;
             this.splitCallTimes.push(Date.now());
             let res: unknown;
             try {
               res = await runAttempt(sub, label, [], [], leafHash);
             } catch (error) {
+              attempted.errors++;
               if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
               return false;
@@ -6032,7 +6037,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const trace = attemptTraces[attemptTraces.length - 1]!;
             {
               const u = (res as { usage?: { inputTokens?: number; outputTokens?: number } } | undefined)?.usage;
-              attempted.calls++;
               attempted.inputTokens += u?.inputTokens ?? 0;
               attempted.outputTokens += u?.outputTokens ?? 0;
               if (assessment.outcome !== 'valid') attempted.refused++;
@@ -6064,12 +6068,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             if (this.config.compressionSplitPlaceholder !== true) return false;
             const m = subset[0];
-            const who = (textOf(m).match(/^\s*([A-Za-z0-9_ -]{1,24}):\s/) || [])[1] || m.participant;
-            const ph = `[Operator note — not the resident's words: one preserved message from ${who} at this point (message id ${m.id}) was not summarized in this entry; its exact source remains in the record.]`;
+            // Structural author only: the store's participant field, never text that could be quoted or spoofed.
+            const who = /^(user|assistant|system)$/i.test(m.participant) ? undefined : m.participant;
+            const ph = `[Operator note — not the resident's words: one preserved message${who ? ` from ${who}` : ''} at this point (message id ${m.id}) was not summarized in this entry; its exact source remains in the record.]`;
             parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
             return true;
           };
           const complete = await fold(0, chunk.messages.length - 1, false);
+          this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
             const stitchedText = parts.map((p) => p.text).join('\n\n');
             const outputTokens = parts.reduce((n, p) => n + p.tokens, 0);
@@ -6084,9 +6090,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               toolResults: [],
               stopReason: 'end_turn' as NormalizedResponse['stopReason'],
               usage: { inputTokens, outputTokens },
-              // `details` describes the LAST successful leaf only; marked as such in raw.
-              details: lastGood.details,
-              raw: { request: null, response: { stitched: true, detailsScope: 'last-successful-leaf', compositeHash, contentHash, parts: partsMeta, attempted } },
+              // Aggregate over the whole rung: nothing here is copied from a single leaf.
+              details: {
+                stop: { reason: 'end_turn' as NormalizedResponse['stopReason'], wasTruncated: false },
+                usage: { ...lastGood.details.usage, inputTokens: attempted.inputTokens, outputTokens: attempted.outputTokens },
+                timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
+                model: lastGood.details.model,
+                cache: { markersInRequest: 0, tokensCreated: 0, tokensRead: 0, hitRatio: 0 },
+              },
+              raw: { request: null, response: { stitched: true, compositeHash, contentHash, parts: partsMeta, attempted } },
             };
             fallbackResponse = synthetic;
             response = synthetic;

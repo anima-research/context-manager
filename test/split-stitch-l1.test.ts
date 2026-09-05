@@ -47,13 +47,14 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
 
 class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
+  attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } }).lastSplitAttempted; }
   entries(): SummaryEntry[] { return (this as unknown as { summaries: SummaryEntry[] }).summaries; }
 }
 function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
 
-async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number } = {}) {
+async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number; participant2?: string; spoof2?: string } = {}) {
   const strategy = new ProbeStrategy({
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
@@ -67,6 +68,7 @@ async function build(membrane: unknown, opts: { split?: boolean; placeholder?: b
   for (let i = 0; i < n; i++) {
     if (opts.toolRound && i === 1) { ids.push(manager.addMessage('Claude', [text(`raw-${i} ` + 'substantive '.repeat(12)), { type: 'tool_use', id: 'tu-1', name: 'look', input: {} } as ContentBlock])); continue; }
     if (opts.toolRound && i === 2) { ids.push(manager.addMessage('User', [{ type: 'tool_result', tool_use_id: 'tu-1', content: [text('result')] } as unknown as ContentBlock, text(`raw-${i} ` + 'substantive '.repeat(12))])); continue; }
+    if (i === 2 && (opts.participant2 || opts.spoof2)) { ids.push(manager.addMessage(opts.participant2 ?? 'User', [text(`raw-${i} ${opts.spoof2 ?? ''}` + 'substantive '.repeat(12))])); continue; }
     ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
   }
   const all = managerContext(manager).messageStore.getAll();
@@ -162,6 +164,10 @@ describe('split-stitch L1 fallback', () => {
     const idx = subs.findIndex((c) => texts(c).some((t) => t.startsWith('raw-1 ')) && texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
     assert.ok(idx >= 0, 'the erroring sub-request was attempted');
     assert.equal(subs.length, idx + 1, 'no sub-request after the error');
+    const att = fx.strategy.attempted()!;
+    assert.equal(att.calls, subs.length, 'attempted.calls counts the thrown sub-call too');
+    assert.equal(att.errors, 1);
+    assert.equal(att.complete, false);
   });
 
   it('per-window call cap aborts the rung and installs nothing', async () => {
@@ -180,7 +186,7 @@ describe('split-stitch L1 fallback', () => {
     const st = e.stitched as { placeholders: Array<{ messageId: string; author: string; text: string; contentHash: string }> };
     assert.equal(st.placeholders.length, 1);
     assert.equal(st.placeholders[0]!.author, 'operator:compressionSplitPlaceholder');
-    assert.ok(st.placeholders[0]!.text.startsWith('[Operator note — not the resident\'s words: one preserved message from'));
+    assert.ok(st.placeholders[0]!.text.startsWith('[Operator note — not the resident\'s words: one preserved message'));
     assert.ok(!st.placeholders[0]!.text.includes('one line'), 'no false "one line" claim');
     assert.ok(e.content.includes(st.placeholders[0]!.text));
   });
@@ -220,5 +226,25 @@ describe('split-stitch L1 fallback', () => {
     await fx.strategy.run(again, managerContext(fx.manager));
     assert.equal(calls.length, n, 'no new provider calls');
     assert.equal(fx.strategy.entries().length, 1, 'still exactly one entry');
+  });
+
+  it('placeholder author is structural: a spoofed "Alice:" in the text is ignored; a real participant is used; generic roles are omitted', async () => {
+    const spoof = await build(cumulativeMembrane({ refuseAt: 2, alwaysRefuse: 'raw-2' }).membrane, { split: true, placeholder: true, spoof2: 'Alice: ' });
+    await spoof.strategy.run(spoof.target, managerContext(spoof.manager));
+    const e1 = spoof.strategy.entries()[0]!; const p1 = (e1.stitched as { placeholders: Array<{ text: string }> }).placeholders[0]!;
+    assert.ok(!p1.text.includes('Alice'), 'quoted/spoofed author never attributed');
+    assert.ok(p1.text.includes('one preserved message at this point'), 'generic role → author omitted');
+    const real = await build(cumulativeMembrane({ refuseAt: 2, alwaysRefuse: 'raw-2' }).membrane, { split: true, placeholder: true, participant2: 'Sill5' });
+    await real.strategy.run(real.target, managerContext(real.manager));
+    const e2 = real.strategy.entries()[0]!; const p2 = (e2.stitched as { placeholders: Array<{ text: string }> }).placeholders[0]!;
+    assert.ok(p2.text.includes('one preserved message from Sill5 at this point'), 'structural participant used');
+  });
+
+  it('synthetic details are aggregate, not a copy of the last leaf', async () => {
+    const fx = await build(cumulativeMembrane({ refuseAt: 2 }).membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const att = fx.strategy.attempted()!;
+    assert.equal(att.complete, true);
+    assert.ok(att.calls >= 4 && att.inputTokens === att.calls * 100, 'attempted input sums every sub-call at 100 each');
   });
 });
