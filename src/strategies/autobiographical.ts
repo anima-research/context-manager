@@ -6110,8 +6110,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                   inputTokens: succ.inputTokens,
                   outputTokens: succ.outputTokens,
                   ...(succ.cacheSeen ? { cacheCreationTokens: succ.cacheCreationTokens, cacheReadTokens: succ.cacheReadTokens } : {}),
+                  // discardedAttempts exists on newer membrane DetailedUsage; older membranes ignore the extra field.
                   discardedAttempts: { attempts: attempted.refused + attempted.errors, inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens), outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens) },
-                },
+                } as NormalizedResponse['details']['usage'],
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
                 model: leafModels.size === 1
                   ? { requested: String((request.config as { model?: string }).model ?? ''), actual: [...leafModels][0].split('|')[0], provider: [...leafModels][0].split('|')[1] }
