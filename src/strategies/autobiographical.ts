@@ -2300,6 +2300,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Sliding-window timestamps of split-stitch sub-calls (compressionSplitMaxCallsPer10Min). */
   protected splitCallTimes: number[] = [];
   /** Accounting of the most recent split-stitch attempt (receipts/tests). */
+  /** Aggregate details of the most recent stitched response (receipts/tests). */
+  protected lastSplitDetails: NormalizedResponse['details'] | undefined;
   protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } | undefined;
 
   protected pushSummary(entry: SummaryEntry): void {
@@ -6002,6 +6004,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let calls = 0;
           let inputTokens = 0;
           const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          const succ = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cacheSeen: false };
+          const leafModels = new Set<string>();
           const splitStart = Date.now();
           let abortReason: string | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
@@ -6045,6 +6049,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               trace.outcome = 'success';
               lastGood = assessment.response;
               inputTokens += assessment.response.usage?.inputTokens ?? 0;
+              {
+                const d = assessment.response.details as { usage?: { inputTokens?: number; outputTokens?: number; cacheCreationTokens?: number; cacheReadTokens?: number }; model?: { actual?: string; provider?: string } } | undefined;
+                succ.inputTokens += assessment.response.usage?.inputTokens ?? 0;
+                succ.outputTokens += assessment.response.usage?.outputTokens ?? 0;
+                if (d?.usage?.cacheCreationTokens !== undefined || d?.usage?.cacheReadTokens !== undefined) { succ.cacheSeen = true; succ.cacheCreationTokens += d?.usage?.cacheCreationTokens ?? 0; succ.cacheReadTokens += d?.usage?.cacheReadTokens ?? 0; }
+                if (d?.model?.actual) leafModels.add(`${d.model.actual}|${d.model.provider ?? ''}`);
+              }
               const txt = textOf(assessment.response).trim();
               if (txt.length > 0) {
                 parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: sha256Json(sub), responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
@@ -6090,19 +6101,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               toolResults: [],
               stopReason: 'end_turn' as NormalizedResponse['stopReason'],
               usage: { inputTokens, outputTokens },
-              // Aggregate over the whole rung: nothing here is copied from a single leaf.
+              // Aggregate over the whole rung, built from true sums only: no optional field
+              // (estimatedCost, thinkingTokens, …) is inherited from any single leaf. The model is
+              // recorded only when every successful leaf reported the same identity.
               details: {
                 stop: { reason: 'end_turn' as NormalizedResponse['stopReason'], wasTruncated: false },
-                usage: { ...lastGood.details.usage, inputTokens: attempted.inputTokens, outputTokens: attempted.outputTokens },
+                usage: {
+                  inputTokens: succ.inputTokens,
+                  outputTokens: succ.outputTokens,
+                  ...(succ.cacheSeen ? { cacheCreationTokens: succ.cacheCreationTokens, cacheReadTokens: succ.cacheReadTokens } : {}),
+                  discardedAttempts: { attempts: attempted.refused + attempted.errors, inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens), outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens) },
+                },
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
-                model: lastGood.details.model,
-                cache: { markersInRequest: 0, tokensCreated: 0, tokensRead: 0, hitRatio: 0 },
+                model: leafModels.size === 1
+                  ? { requested: String((request.config as { model?: string }).model ?? ''), actual: [...leafModels][0].split('|')[0], provider: [...leafModels][0].split('|')[1] }
+                  : { requested: String((request.config as { model?: string }).model ?? ''), actual: leafModels.size === 0 ? 'unknown' : 'mixed', provider: leafModels.size === 0 ? 'unknown' : 'mixed' },
+                cache: { markersInRequest: 0, tokensCreated: succ.cacheCreationTokens, tokensRead: succ.cacheReadTokens, hitRatio: 0 },
               },
               raw: { request: null, response: { stitched: true, compositeHash, contentHash, parts: partsMeta, attempted } },
             };
+            this.lastSplitDetails = synthetic.details;
             fallbackResponse = synthetic;
             response = synthetic;
-            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, compositeHash, contentHash, parts: partsMeta, placeholders };
+            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, leafModels: [...leafModels], compositeHash, contentHash, parts: partsMeta, placeholders };
             successfulTrace = {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',

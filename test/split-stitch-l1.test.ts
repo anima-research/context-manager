@@ -24,7 +24,8 @@ function texts(req: NormalizedRequest): string[] {
 }
 
 /** Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever. */
-function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string }) {
+function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean }) {
+  let leaf = 0;
   const calls: NormalizedRequest[] = [];
   return {
     calls,
@@ -39,7 +40,9 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
             raw: { response: { stop_details: { category: 'bio' } } } };
         }
         const which = targets.map((t) => t.split(' ')[0]).join('+');
-        return { content: [text(`piece:${which}`)], rawAssistantText: `piece:${which}`, toolCalls: [], toolResults: [], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 }, details: {}, raw: { response: {} } };
+        leaf++;
+        const details = opts.leafDetails ? { usage: { inputTokens: 100, outputTokens: 20, cacheCreationTokens: 7, cacheReadTokens: 3, thinkingTokens: 999, estimatedCost: { currency: 'USD', total: 9.99 } }, model: { requested: 'same-model', actual: `leaf-model-${leaf}`, provider: `prov-${leaf}` } } : {};
+        return { content: [text(`piece:${which}`)], rawAssistantText: `piece:${which}`, toolCalls: [], toolResults: [], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 }, details, raw: { response: {} } };
       },
     } as never,
   };
@@ -47,6 +50,7 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
 
 class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
+  details() { return (this as unknown as { lastSplitDetails?: { usage: Record<string, unknown>; model: { actual: string; provider: string }; cache: { tokensCreated: number; tokensRead: number } } }).lastSplitDetails; }
   attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } }).lastSplitAttempted; }
   entries(): SummaryEntry[] { return (this as unknown as { summaries: SummaryEntry[] }).summaries; }
 }
@@ -246,5 +250,21 @@ describe('split-stitch L1 fallback', () => {
     const att = fx.strategy.attempted()!;
     assert.equal(att.complete, true);
     assert.ok(att.calls >= 4 && att.inputTokens === att.calls * 100, 'attempted input sums every sub-call at 100 each');
+  });
+
+  it('aggregate details never inherit a single leaf\'s extras; mixed leaf models are reported as mixed', async () => {
+    const fx = await build(cumulativeMembrane({ refuseAt: 2, leafDetails: true }).membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const d = fx.strategy.details()!;
+    assert.ok(d, 'synthetic details captured');
+    assert.equal(d.usage.thinkingTokens, undefined, 'no leaf thinkingTokens inherited');
+    assert.equal(d.usage.estimatedCost, undefined, 'no leaf estimatedCost inherited');
+    assert.equal(d.usage.inputTokens, 400, 'input is the sum over the four successful leaves');
+    assert.equal(d.usage.cacheCreationTokens, 28, 'cache creation summed over leaves (4×7)');
+    assert.equal(d.usage.cacheReadTokens, 12, 'cache read summed over leaves (4×3)');
+    assert.equal(d.cache.tokensCreated, 28);
+    assert.equal(d.model.actual, 'mixed'); assert.equal(d.model.provider, 'mixed');
+    const disc = d.usage.discardedAttempts as { attempts: number };
+    assert.ok(disc.attempts >= 1, 'refused leaves counted as discarded attempts');
   });
 });
