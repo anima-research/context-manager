@@ -8186,7 +8186,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the previous endpoint itself so reuse never depends on Anthropic finding
     // it within the new end marker's 20-block backward-search window.
     const keys = entries.map(
-      (e) => `${e.participant} ${JSON.stringify(e.content)}`,
+      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
     );
     let firstDiff = n;
     const prev = this._prevCacheKeys;
