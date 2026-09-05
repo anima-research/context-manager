@@ -850,6 +850,20 @@ export interface AutobiographicalConfig {
 
   /** Final bounded source-only L1 attempt after canonical + recall variants. */
   compressionSourceOnlyFallback?: boolean;
+  /**
+   * Split-stitch rung (2026-09-05, princess): when every L1 rung (canonical, recall
+   * expansions, source-only-final) is refused, fold the chunk in halves recursively
+   * at message boundaries with the same instruction/model, source-only, and install
+   * the stitched pieces as ONE L1 over the chunk (per-piece ranges/hashes recorded on
+   * the entry as `stitched`). Off by default.
+   */
+  compressionSplitFallback?: boolean;
+  /**
+   * With compressionSplitFallback: allow a one-line bracketed operator placeholder for a
+   * SINGLE message that refuses in every form (names the message id; the message stays in
+   * the record). Without it, such a chunk falls through to quarantine. Off by default.
+   */
+  compressionSplitPlaceholder?: boolean;
 
   /**
    * Maximum number of same-model recall-curve variants attempted after an L1
@@ -1095,6 +1109,8 @@ export type LegacySummaryLevel = 1 | 2 | 3;
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
   id: string;
+  /** Present when the entry was produced by the split-stitch rung (compressionSplitFallback). */
+  stitched?: Record<string, unknown>;
   /** Compression level (1, 2, 3, ... — unbounded in the adaptive-resolution design) */
   level: SummaryLevel;
   /** The summary text */

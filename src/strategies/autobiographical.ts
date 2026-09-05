@@ -5602,6 +5602,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
+    let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
 
     try {
@@ -5952,6 +5953,104 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
 
+        // ---- split-stitch rung (compressionSplitFallback) ----
+        // Every rung above sends the WHOLE chunk; the classifier's cut is on cumulative
+        // content, so pieces small enough pass (princess 2026-09-05: 5/5 quarantined
+        // chunks folded this way, 34 calls, 1 placeholder). Recursive halves, source-only
+        // shape, same instruction/model; stitched pieces become one L1 over the chunk.
+        if (!fallbackResponse && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
+          const leafHash = sha256Json(chunk.messages.map((message) => message.id));
+          const textOf = (m: { content: ContentBlock[] }): string =>
+            m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
+          const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
+            const msgs = [
+              { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
+              ...subset.map((m) => ({ participant: m.participant, content: stripThinkingBlocks(m.content) })),
+              { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
+            ];
+            const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
+            return {
+              ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
+              shedOversizeImages: true,
+              messages: cleaned.map((m) => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) })).filter((m) => m.content.length > 0),
+              config: structuredClone(request.config),
+              tools: ctx.tools,
+            } as NormalizedRequest;
+          };
+          const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
+          const parts: Array<{ range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; requestHash?: string; text: string }> = [];
+          let lastGood: NormalizedResponse | undefined;
+          let calls = 0;
+          const MAX_SPLIT_CALLS = 40;
+          const fold = async (a: number, b: number): Promise<boolean> => {
+            if (calls >= MAX_SPLIT_CALLS) return false;
+            const subset = chunk.messages.slice(a, b + 1);
+            const chars = subset.reduce((n, m) => n + textOf(m).length, 0);
+            const target = Math.max(100, Math.round(targetTokens * chars / chunkChars));
+            const sub = buildSub(subset, target);
+            const label = `split:${a}-${b}`;
+            calls++;
+            try {
+              const res = await runAttempt(sub, label, [], [], leafHash);
+              const assessment = this.assessFallbackCompressionResponse(res);
+              const trace = attemptTraces[attemptTraces.length - 1]!;
+              if (assessment.outcome === 'valid') {
+                trace.outcome = 'success';
+                lastGood = assessment.response;
+                const txt = textOf(assessment.response).trim();
+                if (txt.length > 0) {
+                  parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), requestHash: sha256Json(sub), text: txt });
+                  return true;
+                }
+              } else {
+                trace.outcome = assessment.outcome;
+              }
+            } catch (error) {
+              if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            }
+            if (b > a) {
+              // Lawful boundary: never cut between a tool_use and the tool_result that answers it.
+              const hasType = (m: { content: ContentBlock[] }, t: string) => m.content.some((blk) => blk.type === t);
+              let mid = Math.floor((a + b) / 2);
+              while (mid > a && hasType(chunk.messages[mid], 'tool_use') && hasType(chunk.messages[mid + 1], 'tool_result')) mid--;
+              if (mid <= a) mid = Math.floor((a + b) / 2);
+              const left = await fold(a, mid);
+              const right = await fold(mid + 1, b);
+              return left && right;
+            }
+            if (this.config.compressionSplitPlaceholder !== true) return false;
+            const m = subset[0];
+            const who = (textOf(m).match(/^\s*([A-Za-z0-9_ -]{1,24}):\s/) || [])[1] || m.participant;
+            const ph = `(One line posted by ${who} at this point — message id ${m.id} — could not be folded by the memory system in any form and remains only in the record.)`;
+            parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), text: ph });
+            return true;
+          };
+          const complete = await fold(0, chunk.messages.length - 1);
+          if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
+            const stitchedText = parts.map((p) => p.text).join('\n\n');
+            const outputTokens = parts.reduce((n, p) => n + p.tokens, 0);
+            const synthetic: NormalizedResponse = {
+              ...lastGood,
+              content: [{ type: 'text', text: stitchedText }],
+              rawAssistantText: stitchedText,
+              usage: { ...lastGood.usage, outputTokens },
+              stopReason: 'end_turn' as NormalizedResponse['stopReason'],
+            };
+            fallbackResponse = synthetic;
+            response = synthetic;
+            const placeholders = parts.filter((p) => p.kind === 'placeholder').map((p) => chunk.messages[p.range[0]].id);
+            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), parts: parts.map(({ text: _text, ...p }) => p), placeholders, calls };
+            successfulTrace = {
+              curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
+              requestHash: 'stitched:' + parts.map((p) => (p.requestHash ?? 'placeholder').slice(0, 16)).join('+'),
+              messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
+            };
+            console.error(`[autobiographical] split-stitch fold landed for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
+            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, parts: splitMeta.parts, placeholders, calls } });
+          } else {
+            outcomes.push({ curveLabel: 'split-stitch', requestHash: 'stitched', outcome: 'refusal' });
+          }
+        }
         if (!fallbackResponse) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
@@ -6091,6 +6190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         created: Date.now(),
         phaseType: chunk.phaseType,
         ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
+        ...(splitMeta ? { stitched: splitMeta } : {}),
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance: which request authored this
         // memory and how the generation ended (always 'end_turn' post-gate;
