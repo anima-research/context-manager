@@ -96,6 +96,22 @@ describe('getCompressionDebt', () => {
     assert.equal(s.getCompressionDebt(NOW).state, 'critical');
   });
 
+  it('Date timestamps (the live StoredMessage shape) age correctly', () => {
+    // Production chunks hold StoredMessage objects whose timestamp is a
+    // Date; the number-only filter made every such chunk age-invisible and
+    // the staleness ladder unreachable. The live signature (2026-08-29):
+    // pendingChunks > 0, oldestPendingAgeMs null, state healthy.
+    const s = fresh();
+    s.setChunks([
+      { ...chunk({ compressed: false }), messages: [{ timestamp: new Date(NOW - 2 * HOUR) }] as never },
+      chunk({ compressed: true }),
+    ]);
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.pendingChunks, 1);
+    assert.ok((d.oldestPendingAgeMs ?? 0) > HOUR, 'Date timestamps must produce an age');
+    assert.equal(d.state, 'degraded');
+  });
+
   it('microsecond timestamps normalize (chronicle stores µs)', () => {
     const s = fresh();
     s.setChunks([chunk({ compressed: false, lastMessageAt: (NOW - 2 * HOUR) * 1000 }), chunk({ compressed: true })]);

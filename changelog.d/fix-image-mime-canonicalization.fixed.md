@@ -1,1 +1,0 @@
-- Base64 raster images now derive PNG, JPEG, GIF, or WebP MIME from byte magic on ingress and again when resolving legacy blob references. Incorrect transport metadata can no longer persist into provider requests and hard-down a residence with repeatable image-type 400s; blob bytes and unknown media types remain unchanged.

@@ -40,6 +40,14 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
+import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { SummaryTree } from '../adaptive/summary-tree.js';
+import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
+import {
+  KvUnifiedReceiptChain,
+  type SerializedReceiptChain,
+} from '../adaptive/kv-unified-receipts.js';
+import type { PresentedLeaf, ProviderCacheReference } from '../adaptive/kv-unified-policy.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -444,6 +452,8 @@ interface CompressionRefusalNormalizedConfig {
   fallbackLimit: number;
   contextBudgetTokens: number;
   requestConfig: NormalizedRequest['config'];
+  sourceOnlyFallbackEnabled?: boolean;
+  sourceOnlyFallbackRequestHash?: string;
 }
 
 type CompressionAttemptOutcome =
@@ -1055,6 +1065,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
+  private kvUnifiedReceipts = new KvUnifiedReceiptChain();
+  private kvUnifiedDraft: {
+    leaves: Map<ChunkId, PresentedLeaf>;
+    layout: RenderLayout;
+    immutablePrefixHash?: string;
+    markerUnitIndices: number[];
+  } | null = null;
+  private kvUnifiedPendingLayout: RenderLayout | null = null;
+  private kvUnifiedPendingMarkerUnitIndices: number[] = [];
+  private kvUnifiedPendingImmutablePrefixHash: string | null = null;
   /** Legacy snapshot used by the unapproved first implementation. Read-only. */
   protected get compressionRefusalQuarantineStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine`;
@@ -1618,6 +1639,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
       this.rebuildChunks(ctx.messageStore);
+      if (abortIfStale()) return;
+      this.sanitizePersistedMergeQueue(ctx.messageStore);
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
       // compression/merge completion does this, but a store that boots with a
       // backlog above threshold and an empty queue (e.g. after a pyramid
@@ -1795,6 +1818,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           strategy: 'append_log',
           deltaSnapshotEvery: 50,
           fullSnapshotEvery: 10,
+        });
+      } catch { /* already registered */ }
+    }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      try {
+        this.store.registerState({
+          id: this.kvUnifiedReceiptStateId,
+          strategy: 'snapshot',
         });
       } catch { /* already registered */ }
     }
@@ -2007,6 +2038,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (typeof id === 'string') this.locked.add(id);
         }
       }
+    }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+        : new KvUnifiedReceiptChain();
+      this.kvUnifiedDraft = null;
+      this.kvUnifiedPendingLayout = null;
+      this.kvUnifiedPendingMarkerUnitIndices = [];
+      this.kvUnifiedPendingImmutablePrefixHash = null;
     }
   }
 
@@ -3379,6 +3420,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     variants: RecallCurveVariant[],
     plan: CompressionRefusalPlanRecord[],
     canonicalProviderInputTokens?: number,
+    sourceOnlyFallbackRequestHash?: string,
   ): CompressionRefusalQuarantineRecord {
     const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
     const frontierHash = sha256Json(
@@ -3392,6 +3434,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       fallbackLimit,
       contextBudgetTokens,
       requestConfig: canonicalRequest.config,
+      ...(this.config.compressionSourceOnlyFallback === true
+        ? { sourceOnlyFallbackEnabled: true }
+        : {}),
+      ...(sourceOnlyFallbackRequestHash !== undefined
+        ? { sourceOnlyFallbackRequestHash }
+        : {}),
     };
     const familyKey = sha256Json({
       model,
@@ -3501,6 +3549,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return merge;
   }
 
+  /** Drop persisted queue entries authored under an older grouping grammar.
+   * A queue is intent, not memory: if its sources are now parented, missing,
+   * out of order, or separated by another live representation, replaying it
+   * would mint a crossed node. The threshold pass immediately below rebuilds
+   * valid work from the surviving orphan frontier. */
+  protected sanitizePersistedMergeQueue(store: MessageStoreView): void {
+    if (this.mergeQueue.length === 0) return;
+    const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
+    const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
+      if (merge.sourceIds.length < 2) return false;
+      let previousEnd: number | null = null;
+      for (const sourceId of merge.sourceIds) {
+        const source = byId.get(sourceId);
+        if (
+          !source ||
+          source.level !== merge.level - 1 ||
+          getSummaryParentId(source)
+        ) return false;
+        const first = position.get(source.sourceRange.first);
+        const last = position.get(source.sourceRange.last);
+        if (first === undefined || last === undefined || last < first) return false;
+        if (previousEnd !== null && first !== previousEnd + 1) return false;
+        previousEnd = last;
+      }
+      return true;
+    };
+    const before = this.mergeQueue.length;
+    this.mergeQueue = this.mergeQueue.filter(valid);
+    if (this.mergeQueue.length === before) return;
+    this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    console.warn(
+      `[autobiographical] discarded ${before - this.mergeQueue.length} stale/non-contiguous ` +
+        `persisted merge queue entr${before - this.mergeQueue.length === 1 ? 'y' : 'ies'}; ` +
+        `the current grammar will regroup surviving orphans`,
+    );
+  }
+
   /**
    * Bounded-retry accounting for a merge whose response was rejected by the
    * terminal-disposition gate. The attempt counter lives ON the persisted
@@ -3603,6 +3689,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * klaxon only sounds on real debt:
    *  - every source now has a parent (covered by a later successful merge
    *    or repair) → paid, clear;
+   *  - only some sources now have parents → the exact quarantined group is
+   *    stale and can never be retried without reparenting; clear it so the
+   *    remaining orphans can be regrouped;
    *  - no source summary exists anymore (surgery/repair removed them) →
    *    unretryable orphan, clear;
    *  - any source still unmerged and present → live debt, keep.
@@ -3617,7 +3706,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const s = byId.get(id);
         return s !== undefined && !getSummaryParentId(s);
       });
-      if (live.length === 0) {
+      if (live.length !== record.sourceIds.length) {
         this.mergeQuarantine.delete(key);
         swept++;
       }
@@ -3625,6 +3714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (swept > 0) {
       this.persistMergeQuarantine();
       console.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
+      this.checkMergeThreshold();
     }
   }
 
@@ -4220,8 +4310,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const toMs = (t: number): number => (t > 1e14 ? t / 1000 : t);
       let oldestPendingAgeMs: number | null = null;
       for (const c of pending) {
+        // Live StoredMessage carries `timestamp: Date`; the serialized form
+        // carries a number. The original number-only filter silently dropped
+        // EVERY in-memory message, so oldestPendingAgeMs was null whenever
+        // chunks held Date timestamps — the staleness detector (degraded>1h,
+        // critical>6h) was dead code in production and `healthy` was
+        // unearned (production signature 2026-08-29: pendingChunks>0,
+        // age=null, state=healthy). Accept both shapes.
         const ts = c.messages
-          .map((m) => (m as unknown as { timestamp?: number }).timestamp)
+          .map((m) => {
+            const t = (m as unknown as { timestamp?: number | Date }).timestamp;
+            return t instanceof Date ? t.getTime() : typeof t === 'number' ? t : undefined;
+          })
           .filter((t): t is number => typeof t === 'number');
         if (!ts.length) continue;
         const closedAt = toMs(Math.max(...ts));
@@ -5201,6 +5301,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ---- 4. In-band marker ----
+    // Structural start of the exact source-only shape. Never recover this by
+    // searching text: the target itself may quote the marker.
+    const sourceOnlyStartIndex = llmMessages.length;
     llmMessages.push({
       participant: 'Context Manager',
       content: [{ type: 'text', text: COMPRESSION_MARKER }],
@@ -5230,6 +5333,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       participant: 'Context Manager',
       content: [{ type: 'text', text: instructionText }],
     });
+
+    const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
+      ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
+      : undefined;
 
     // Split any bundled tool_use+tool_result cycles in non-user turns into
     // separate API-shape messages. claude.ai-imported sessions carry these
@@ -5351,10 +5458,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
+    if (sourceOnlyFallbackMessages) {
+      this.capCompressionImageBytes(
+        sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
+        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+      );
+      const sourceOnlyCleaned = stripUnpairedToolBlocks(
+        this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
+      );
+      const sourceOnlyFallbackWireMessages = sourceOnlyCleaned
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .filter(m => m.content.length > 0);
+      // Keep the final rung wire-identical to legacy direct source-only. With
+      // an empty recall ladder this places no owned seam/TTL, but when cache
+      // markers are enabled it still strips stale imported block-level
+      // cache_control before dispatch. The kill switch preserves passthrough.
+      this.applyMintCacheSeams(sourceOnlyFallbackWireMessages, [], false);
+      sourceOnlyFallbackRequest = {
+        ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
+        shedOversizeImages: true,
+        messages: sourceOnlyFallbackWireMessages,
+        config: structuredClone(request.config),
+        tools: ctx.tools,
+      };
+    }
+
     // Retain the exact normalized canonical request and frontier. Variants are
     // derived solely by replacing one isolated recall pair; the canonical call
     // below is always issued first and is never rebuilt through fallback code.
     const canonicalRequestHash = sha256Json(request);
+    const sourceOnlyFallbackRequestHash = sourceOnlyFallbackRequest
+      ? sha256Json(sourceOnlyFallbackRequest)
+      : undefined;
     const variants = this.buildRecallCurveVariants(
       request,
       keptSummaries,
@@ -5370,6 +5506,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries,
       variants,
       fallbackPlan,
+      undefined,
+      sourceOnlyFallbackRequestHash,
     );
     const durableQuarantine = this.readCompressionQuarantineProjection();
     // Bounded by chunk hash, not just request identity (2026-08-06
@@ -5387,9 +5525,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash &&
         active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
     );
+    // The shape cap is per request regime, not merely per source chunk. Enabling
+    // the final source-only rung is a genuine request-family change and must
+    // earn a fresh bounded family even when the old regime already filled its
+    // cap. Within the new regime the cap remains sticky.
+    const sameRegime = sameHash.filter((active) =>
+      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
+        quarantineRecord.normalizedConfig.sourceOnlyFallbackEnabled &&
+      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
+        quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash,
+    );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
-      ?? sameHash.find((active) => active.record.familyKey === quarantineRecord.familyKey)
-      ?? (sameHash.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameHash[0] : undefined);
+      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
+      ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       logCompressionCall({
@@ -5608,6 +5756,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           variants,
           fallbackPlan,
           canonicalProviderInputTokens,
+          sourceOnlyFallbackRequestHash,
         );
         const outcomes: CompressionRefusalOutcomeRecord[] = [{
           curveLabel: 'canonical',
@@ -5768,6 +5917,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           break;
         }
 
+        if (!fallbackResponse && sourceOnlyFallbackRequest) {
+          const curveLabel = 'source-only-final';
+          const requestHash = sha256Json(sourceOnlyFallbackRequest);
+          try {
+            const sourceOnlyResponse = await runAttempt(
+              sourceOnlyFallbackRequest, curveLabel, [], [],
+              sha256Json(chunk.messages.map((message) => message.id)),
+            );
+            const trace = attemptTraces[attemptTraces.length - 1]!;
+            const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
+            if (assessment.outcome === 'valid') {
+              trace.outcome = 'success';
+              fallbackResponse = assessment.response;
+              response = assessment.response;
+              successfulTrace = trace;
+            } else {
+              trace.outcome = assessment.outcome;
+              outcomes.push({
+                curveLabel, requestHash, outcome: assessment.outcome,
+                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+              });
+            }
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+          } catch (error) {
+            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            const errorType = error && typeof error === 'object' && 'type' in error
+              ? String((error as { type: unknown }).type)
+              : error instanceof Error ? error.name : typeof error;
+            const trace = attemptTraces[attemptTraces.length - 1];
+            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
+            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+          }
+        }
+
         if (!fallbackResponse) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
@@ -5811,7 +5995,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
-      if (!summaryText.trim()) {
+      const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
+      if (!summaryText.trim() && !sourceOnlyFinalWon) {
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
@@ -5847,10 +6032,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // exhaustion path as the refusal curves; the record is sticky by
         // chunk hash and clears via success-clear / sweep / operator.
         if (this.isCompressionBranchCurrent(sourceBranch)) {
-          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [
-            { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
-            { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
-          ]);
+          const emptyOutcomes: CompressionRefusalOutcomeRecord[] = sourceOnlyFinalWon
+            ? [{
+                curveLabel: 'source-only-final',
+                outcome: 'unusable_empty',
+                requestHash: sourceOnlyFallbackRequestHash!,
+              }]
+            : [
+                { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+                { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+              ];
+          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
         }
         return;
       }
@@ -6015,11 +6207,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * above it went unusable and the fold floor stopped fitting the budget.
    *
    * Rules: order candidates by live source position; break runs where the
-   * positional gap exceeds `mergeContiguityGapLimit` (holes from wiped/
-   * pruned nodes are fine, cross-era bridges are not); exclude candidates
-   * whose OWN span exceeds the level-scaled `mergeMaxSourceSpanMessages`
-   * limit (replay-era wide-span summaries would bridge anything they join);
-   * merge the oldest run that still has `threshold` members.
+   * live source positions are not exactly adjacent (a hole containing
+   * record-owned material is a different representation and cannot be folded
+   * into this parent); exclude candidates whose OWN span exceeds the
+   * level-scaled `mergeMaxSourceSpanMessages` limit (replay-era wide-span
+   * summaries would bridge anything they join); merge the oldest run that
+   * still has `threshold` members.
    */
 
   /**
@@ -6047,7 +6240,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const ch of this.chunks) {
       for (const m of ch.messages) messageOrder.set(m.id, seq++);
     }
-    const gapLimit = this.config.mergeContiguityGapLimit ?? 300;
     const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
     const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
@@ -6085,12 +6277,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     withPos.sort((a, b) => a.first - b.first);
 
-    // Split into contiguous runs (a gap larger than `gapLimit` starts a new one).
+    // Split into strictly contiguous live runs. Deleted messages do not occupy
+    // positions in `messageOrder`, so this still bridges true tombstones; it
+    // refuses only holes containing another live representation.
     const runs: Array<typeof withPos> = [];
     let run: typeof withPos = [];
     let runEnd = -Infinity;
     for (const x of withPos) {
-      if (run.length > 0 && x.first - runEnd > gapLimit) {
+      if (run.length > 0 && x.first !== runEnd + 1) {
         runs.push(run);
         run = [];
         runEnd = -Infinity;
@@ -6235,19 +6429,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // Defensive: if every source is already mergedInto something, this is a
-    // stale queue entry (could happen if multiple merges for the same
-    // sourceIds were enqueued before the dedup fix in checkMergeThreshold).
-    // Skip rather than produce a redundant near-identical higher-level entry.
-    if (sources.every(s => s.mergedInto)) {
+    // A queued merge may become stale after another worker/earlier queue item
+    // parents only SOME of its sources. Reparenting the whole list in that
+    // state rewrites the authored child graph and creates crossed lineages
+    // (Fable's L2-37/L2-43 scar). Any parented source invalidates this queue
+    // item; the remaining orphans will be regrouped by the next threshold
+    // pass. Never mutate an already-authored parent edge.
+    const alreadyParented = sources.filter((source) => getSummaryParentId(source));
+    if (alreadyParented.length > 0) {
       console.warn(
-        `executeMerge: all sources already merged into ${sources[0].mergedInto}, skipping (stale queue entry)`,
+        `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
+          `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
       );
       return;
     }
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
+    const mergeAttempts =
+      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
+    const mergeAttemptLimit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
+    const mergeSourceOnly = this.config.compressionMergeSourceOnly === true ||
+      (this.config.compressionMergeSourceOnlyFallback === true &&
+        mergeAttempts >= mergeAttemptLimit - 1);
 
     // Build the merge prompt with one-level-deeper target expansion +
     // prefix of older context:
@@ -6364,7 +6568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
     let headCoveredSkipped = 0;
-    for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+    for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
       if (priorSummaryMessageIds.has(m.id) || sourceLeafIds.has(m.id)) {
         headCoveredSkipped++;
@@ -6399,10 +6603,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // pair converges instead of looping. attempts lives on the persisted
     // queue entry; reference-equality on sourceIds scopes this to the
     // queue-driven path.
-    const mergeAttempts =
-      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
-    const configuredRecallBudget = this.config.compressionRecallBudgetTokens ?? 100_000;
-    const mergeRecallBudget = Math.max(
+    const configuredRecallBudget = mergeSourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+    const mergeRecallBudget = mergeSourceOnly ? 0 : Math.max(
       8_000,
       Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
     );
@@ -6451,7 +6653,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.
     // Usually empty (chunking is contiguous).
-    if (mergeStartIdx >= 0) {
+    if (mergeStartIdx >= 0 && !mergeSourceOnly) {
       for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
@@ -6586,6 +6788,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    if (mergeSourceOnly) {
+      mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
+    }
     // Retry-only no-tools line. The summarizer request declares the agent's
     // live tools (classifier requirement, see `tools: ctx.tools` below), and
     // a model whose recent spans are tool-heavy can answer the merge prompt
@@ -7162,6 +7367,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             totalBudget: preparedTotal,
             targetBudget: preparedTotal * (1 - slack),
           },
+      opts?.kvUnifiedImmutablePrefixHash,
+      opts?.kvUnifiedContinuityRelaxation,
     );
     // NOTE: a dry run also disturbs transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
@@ -7171,6 +7378,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
+    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
+      const tree = new SummaryTree(pickerInputs);
+      const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
+      const leaves = new Map<ChunkId, PresentedLeaf>();
+      for (const chunk of pickerInputs.chunks) {
+        const level = result.finalResolutions.get(chunk.id) ?? 0;
+        const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
+        if (level > 0 && !summaryId) {
+          throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+        }
+        const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
+        const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
+        leaves.set(chunk.id, {
+          repHash,
+          level,
+          lastChangedSeq:
+            previous?.repHash === repHash && previous.level === level
+              ? previous.lastChangedSeq
+              : nextSequence,
+        });
+      }
+      this.kvUnifiedDraft = {
+        leaves,
+        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+        markerUnitIndices: [],
+      };
+    }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
     // PLANNER/EMITTER RECONCILIATION (2026-07-26). The picker plans against
@@ -7416,6 +7651,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // absorbed shards as missing (the body-group-shard false
               // positive) — same fix as mergeAdjacentBodyGroupRaw.
               sourceMessageIds: [...currentRun.ids],
+              cacheLayoutKey: currentRun.ids.at(-1),
               sourceRelation: 'copy',
               participant,
               content,
@@ -7438,8 +7674,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 participant: summaryParticipant,
                 content: this.summaryAnswerContentCapped(ancestor, msgCap),
                 sourceRelation: 'derived',
+                cacheLayoutKey: ancestor.id,
               };
-              const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+              // Price the same pair the planner selected. responseContent may
+              // carry signed-empty thinking whose exact generation cost is in
+              // summary.tokens; re-estimating the rendered blocks here would
+              // fall back to 600 tokens and make plan-vs-actual lie low.
+              const pairTokens = this.recallPairCost(ancestor);
               if (totalTokens + pairTokens > prefixBudget) {
                 throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
               }
@@ -7546,8 +7787,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           participant: summaryParticipant,
           content: this.summaryAnswerContentCapped(ancestor, msgCap),
           sourceRelation: 'derived',
+          cacheLayoutKey: ancestor.id,
         };
-        const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
+        const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
         }
@@ -7637,6 +7879,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+      this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
+        merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
+      );
+    }
     this.assertMiddleCoverage();
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
@@ -7710,6 +7957,75 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch { /* persistence is best-effort */ }
   }
 
+  /** Bind the most recently selected kv-unified presentation to a unique
+   * provider submission. Compilation alone never advances receipt state. */
+  beginKvUnifiedSubmission(args: {
+    submissionId: string;
+    requestHash: string;
+    layoutHash: string;
+  }): void {
+    this.requireLoadedBranch('beginKvUnifiedSubmission');
+    if (this.config.foldingStrategy !== 'kv-unified' || !this.kvUnifiedDraft) {
+      throw new Error('No kv-unified presentation draft is available for submission');
+    }
+    this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
+    this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
+    this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;
+  }
+
+  isKvUnifiedEnabled(): boolean {
+    return this.config.foldingStrategy === 'kv-unified';
+  }
+
+  reportKvUnifiedAccepted(args: {
+    submissionId: string;
+    acceptedAt?: number;
+    wireReceipt?: {
+      requestHash: string;
+      markers: Array<{ ordinal: number; prefixHash: string; estimatedOffset: number }>;
+    };
+  }): void {
+    this.requireLoadedBranch('reportKvUnifiedAccepted');
+    let cache: ProviderCacheReference | null = null;
+    if (
+      args.wireReceipt &&
+      this.kvUnifiedPendingLayout &&
+      this.kvUnifiedPendingImmutablePrefixHash &&
+      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length
+    ) {
+      cache = {
+        immutablePrefixHash: this.kvUnifiedPendingImmutablePrefixHash,
+        layout: this.kvUnifiedPendingLayout,
+        markers: this.kvUnifiedPendingMarkerUnitIndices.map((unitIndex) => ({
+          unitIndex,
+          offset:
+            unitIndex >= this.kvUnifiedPendingLayout!.units.length
+              ? this.kvUnifiedPendingLayout!.totalTokens
+              : this.kvUnifiedPendingLayout!.units[unitIndex].offset,
+        })),
+      };
+    }
+    this.kvUnifiedReceipts.accept(
+      args.submissionId,
+      args.acceptedAt ?? Date.now(),
+      cache,
+      args.wireReceipt,
+    );
+    this.kvUnifiedPendingLayout = null;
+    this.kvUnifiedPendingMarkerUnitIndices = [];
+    this.kvUnifiedPendingImmutablePrefixHash = null;
+    this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+  }
+
+  reportKvUnifiedFailed(submissionId: string): void {
+    this.requireLoadedBranch('reportKvUnifiedFailed');
+    this.kvUnifiedReceipts.fail(submissionId);
+    this.kvUnifiedPendingLayout = null;
+    this.kvUnifiedPendingMarkerUnitIndices = [];
+    this.kvUnifiedPendingImmutablePrefixHash = null;
+  }
+
   private _calibrationArmed = false;
 
   private _calibration = 1;
@@ -7742,9 +8058,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected _prevCacheKeys?: string[];
 
   /**
-   * Place up to three message-level `cache_control` breakpoints across the
-   * final ordered entries: the head/system boundary, the MEASURED stable
-   * prefix boundary, and the very end (pure-append reuse).
+   * Place message-level `cache_control` breakpoints across the final ordered
+   * entries. `kv-unified` owns all four provider slots and uses rendered-token
+   * thirds of non-tail history plus the tail end. Other strategies retain the
+   * legacy three-slot contract: head/system, measured stable-prefix boundary,
+   * and end.
    *
    * The stable-prefix mark used to sit at the folded-history/tail seam
    * (`historyEnd`) on the assumption that the folded region is stable
@@ -7807,7 +8125,64 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sid = entries[i].sourceMessageId;
       if (sid && tailMessageIds.has(sid)) { firstTail = i; break; }
     }
-    const historyEnd = firstTail - 1; // last middle (folded-history) entry
+    const historyEnd = firstTail - 1; // last non-tail entry
+
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // CM owns all four slots in kv-unified mode. Place three history
+      // breakpoints at the nearest legal rendered-token boundaries to
+      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
+      // no separate early/system marker: every history prefix already
+      // includes tools, system, and the raw head on the provider wire.
+      const marks = new Set<number>();
+      if (historyEnd >= 0) {
+        const cumulative: number[] = [0];
+        for (let i = 0; i <= historyEnd; i++) {
+          cumulative.push(
+            cumulative[cumulative.length - 1]! +
+            Math.max(1, this.estimateTokens(entries[i]?.content ?? [])),
+          );
+        }
+        const legalBoundaries = entries
+          .slice(0, historyEnd + 1)
+          .flatMap((entry, index) =>
+            (entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1))
+              ? [index]
+              : [],
+          );
+        const nearestBoundary = (fraction: number): number => {
+          const target = cumulative[cumulative.length - 1]! * fraction;
+          let best = legalBoundaries[0]!;
+          for (const index of legalBoundaries.slice(1)) {
+            if (
+              Math.abs(cumulative[index + 1]! - target) <
+              Math.abs(cumulative[best + 1]! - target)
+            ) best = index;
+          }
+          return best;
+        };
+        if (legalBoundaries.length > 0) {
+          marks.add(nearestBoundary(1 / 3));
+          marks.add(nearestBoundary(2 / 3));
+          marks.add(legalBoundaries.at(-1)!);
+        }
+      }
+      let tailEnd = -1;
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index]!;
+        if (entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1)) {
+          tailEnd = index;
+          break;
+        }
+      }
+      if (tailEnd >= 0) marks.add(tailEnd);
+      if (marks.size > 4) {
+        throw new Error(
+          `placeCacheMarkers: ${marks.size} caller-owned markers exceed Anthropic's limit of 4`,
+        );
+      }
+      for (const idx of marks) entries[idx]!.cacheMarker = true;
+      return;
+    }
 
     // Measured stable prefix: first index where this compile's entry bytes
     // diverge from the previous compile's. No previous compile → seam
@@ -7845,6 +8220,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+  }
+
+  /** Convert emitted message markers back to atomic solver-layout boundaries.
+   * Folded recall pairs and merged raw body shards carry `cacheLayoutKey` on
+   * the entry that ends the unit; fixed head/tail regions map to their single
+   * synthetic layout units. Every wire marker must reconcile exactly. */
+  protected reconcileKvUnifiedMarkerIndices(
+    entries: readonly ContextEntry[],
+    layout: RenderLayout,
+    headMessageIds: ReadonlySet<MessageId>,
+    tailMessageIds: ReadonlySet<MessageId>,
+  ): number[] {
+    const indices: number[] = [];
+    for (const entry of entries) {
+      if (!entry.cacheMarker) continue;
+      const sourceId = entry.sourceMessageId;
+      const layoutKey = sourceId && tailMessageIds.has(sourceId)
+        ? 'tail'
+        : sourceId && headMessageIds.has(sourceId)
+          ? 'head'
+          : entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      if (!layoutKey) {
+        throw new Error('kv-unified cache marker has no atomic layout identity');
+      }
+      let matched = -1;
+      for (let i = 0; i < layout.units.length; i++) {
+        if (layout.units[i].key === layoutKey) matched = i + 1;
+      }
+      if (matched <= 0) {
+        throw new Error(`kv-unified cache marker layout key ${layoutKey} is absent from the solved layout`);
+      }
+      if (!indices.includes(matched)) indices.push(matched);
+    }
+    return indices;
   }
 
   /**
@@ -7964,6 +8373,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected buildPicker(
     inputs: PickerInputs,
     preparedBudget?: { totalBudget: number; targetBudget: number },
+    immutablePrefixHash?: string,
+    continuityRelaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
   ): Picker {
     // Drift alarm: the live config must still name the solver chosen at
     // construction. Nothing legitimate rewrites foldingStrategy at runtime —
@@ -7994,13 +8405,74 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastKvStable = strategy;
       return new Picker(strategy);
     }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      const configured = this.config.kvUnified;
+      if (!configured) {
+        throw new Error(
+          'foldingStrategy "kv-unified" requires a complete kvUnified configuration; live defaults are forbidden',
+        );
+      }
+      const strategy = new KvUnifiedStrategy({
+        ...configured,
+        continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
+        latentDemand: {
+          mergeThreshold: this.config.mergeThreshold ?? 6,
+          fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
+          maxCandidates: 16,
+        },
+        ...(this.kvUnifiedReceipts.head
+          ? {
+              presentation: {
+                currentSeq: this.kvUnifiedReceipts.head.sequence,
+                leaves: this.kvUnifiedReceipts.leaves,
+              },
+            }
+          : {}),
+        ...(this.kvUnifiedReceipts.cache ? { cache: this.kvUnifiedReceipts.cache } : {}),
+        ...(immutablePrefixHash ? { currentImmutablePrefixHash: immutablePrefixHash } : {}),
+        requireExplicitPolicy: true,
+      });
+      this._lastKvUnified = strategy;
+      this._lastKvStable = null;
+      return new Picker(strategy);
+    }
     this._lastKvStable = null;
+    this._lastKvUnified = null;
     return this.getAdaptivePicker();
+  }
+
+  /** Validate the audited transition input at the last possible boundary.
+   * Any malformed, unknown, or expired relaxation restores the normal weight. */
+  protected kvUnifiedContinuityMultiplier(
+    relaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
+  ): number {
+    if (!relaxation) return 1;
+    const validReason =
+      relaxation.reason === 'surgery' ||
+      relaxation.reason === 'budget-transition' ||
+      relaxation.reason === 'infrastructure';
+    const validMultiplier =
+      Number.isFinite(relaxation.multiplier) &&
+      relaxation.multiplier >= 0 &&
+      relaxation.multiplier <= 1;
+    const active =
+      Number.isFinite(relaxation.expiresAt) &&
+      (relaxation.multiplier === 1 || relaxation.expiresAt > Date.now());
+    if (!validReason || !validMultiplier || !active) {
+      console.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
+      return 1;
+    }
+    console.error(
+      `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
+      `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
+    );
+    return relaxation.multiplier;
   }
 
   /** The kv-stable strategy instance behind the most recent compile — kept for
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
+  private _lastKvUnified: KvUnifiedStrategy | null = null;
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
@@ -8099,9 +8571,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy]);
     const cached = this._pairCostCache.get(key);
     if (cached !== undefined) return cached;
+    const estimatedAnswer = this.estimateTokens(this.liveWindowAnswerContent(s));
+    // When responseContent exists, `tokens` is normally the provider's exact
+    // output-token count for those same replayed blocks (thinking carriers +
+    // text). Re-estimating signed-empty thinking at the 600-token legacy
+    // fallback threw that exact measurement away and under-priced Mythos's 65
+    // selected recalls by 78k tokens. Keep the estimate as a floor for older
+    // entries whose `tokens` predates responseContent capture or was inferred
+    // from text, but never replace a larger provider measurement with it.
+    //
+    // That measurement counts the carriers, so it is a floor only under
+    // `carrierPolicy: 'full'`, where the live window emits them. Under
+    // `'live-strip'` the carriers never reach the window: pricing them there
+    // would charge the fold planner for bytes that are not rendered — the
+    // Mica-2026-07-26 wedge from the other side — so the stripped render's
+    // estimate stands alone.
+    const answer =
+      carrierPolicy === 'full' && s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
+        ? Math.max(s.tokens, estimatedAnswer)
+        : estimatedAnswer;
     const cost =
       this.estimateTokens([{ type: 'text', text: label }]) +
-      this.estimateTokens(this.liveWindowAnswerContent(s));
+      answer;
     this._pairCostCache.set(key, cost);
     return cost;
   }
@@ -8548,9 +9039,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               content: this.summaryAnswerContentCapped(summary, msgCap),
               sourceRelation: 'derived',
             };
-            const pairTokens =
-              this.estimateTokens(questionEntry.content) +
-              this.estimateTokens(answerEntry.content);
+            const pairTokens = this.recallPairCost(summary);
             // Never silently drop a selected representation: everything in
             // this list either covers history (summaries) or IS uncovered
             // history (pins / uncompressed / frontier raw). Emit within
@@ -9126,6 +9615,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ---- 3. Chunk the frontier: compressible messages not owned by any record. ----
     const messagesToChunk = this.getCompressibleMessages(store)
       .filter(m => !consumed.has(m.id));
+    const livePosition = new Map<string, number>();
+    store.getAll().forEach((message, index) => livePosition.set(message.id, index));
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
@@ -9164,6 +9655,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
+      const previous = currentChunk[currentChunk.length - 1];
+      if (
+        previous &&
+        livePosition.get(msg.id) !== (livePosition.get(previous.id) ?? -2) + 1
+      ) {
+        // The filtered compressible stream can jump over record-owned,
+        // pinned, or current-head messages. Joining the two sides minted
+        // Fable's disjoint L1-267/L1-403 chunks: one recall then owned two
+        // distant chronological regions and poisoned every ancestor merge.
+        // Close even a thin run at the ownership seam. A short summary (or
+        // raw fallback while it is pending) is cheaper than a non-tree span.
+        closeCurrent(i);
+      }
       let msgTokens = store.estimateTokens(msg);
 
       if (this.config.attachmentsIgnoreSize) {

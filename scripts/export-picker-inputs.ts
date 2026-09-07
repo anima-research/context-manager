@@ -6,7 +6,7 @@
  * know the data round-trips end-to-end before the browser ever loads it.
  *
  * Usage:
- *   node dist/scripts/export-picker-inputs.js <store-path> [--out <file.json>]
+ *   node dist/scripts/export-picker-inputs.js <store-path> [--out <file.json>] [--at <iso8601>]
  *   node dist/scripts/export-picker-inputs.js ../../llr-migrated --out playground/data/llr.json
  */
 
@@ -53,6 +53,12 @@ async function main() {
   const outPath = outIdx >= 0 ? args[outIdx + 1] : 'playground/data/chronicle.json';
   const nsIdx = args.indexOf('--ns');
   const namespace = nsIdx >= 0 ? args[nsIdx + 1] : undefined;
+  const atIdx = args.indexOf('--at');
+  const atRaw = atIdx >= 0 ? args[atIdx + 1] : undefined;
+  const at = atRaw === undefined ? undefined : Date.parse(atRaw);
+  if (atRaw !== undefined && !Number.isFinite(at)) {
+    throw new Error(`Invalid --at timestamp: ${atRaw}`);
+  }
 
   // Match the deployment recipe so head/tail + msgCap line up with reality.
   const strategy = new AutobiographicalStrategy({
@@ -70,16 +76,40 @@ async function main() {
     ...(namespace ? { namespace } : {}),
   });
 
-  const messages = manager.getAllMessages();
-  const summaries = ((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [];
+  const messages = manager.getAllMessages().filter((message) =>
+    at === undefined || message.timestamp.getTime() <= at,
+  );
+  const availableSummaries = (((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [])
+    .filter((summary) => at === undefined || summary.created <= at);
+  const availableSummaryIds = new Set(availableSummaries.map((summary) => summary.id));
+  const summaries = availableSummaries.map((summary) => {
+    const parentId = summary.parentId ?? summary.mergedInto;
+    if (!parentId || availableSummaryIds.has(parentId)) return summary;
+    const copy = { ...summary };
+    delete copy.parentId;
+    delete copy.mergedInto;
+    return copy;
+  });
+  const liveChunks =
+    ((strategy as unknown as {
+      chunks: Array<{ messages: Array<{ id: string }>; summaryId?: string }>;
+    }).chunks) ?? [];
   const resolutions =
     ((strategy as unknown as { resolutions: Map<string, number> }).resolutions) ?? new Map();
 
-  // message id → covering L1 summary id (level-1, sourceLevel-0 summaries)
+  // message id → covering L1 summary id. Match selectAdaptive exactly:
+  // persisted chunk ownership wins; sourceIds are a first-match fallback for
+  // repaired/boundary-drifted messages with no live chunk-ledger pointer.
   const l1Of = new Map<string, string>();
+  for (const chunk of liveChunks) {
+    if (!chunk.summaryId || !availableSummaryIds.has(chunk.summaryId)) continue;
+    for (const message of chunk.messages) l1Of.set(message.id, chunk.summaryId);
+  }
   for (const s of summaries) {
     if (s.level === 1 && s.sourceLevel === 0) {
-      for (const mid of s.sourceIds) l1Of.set(mid, s.id);
+      for (const mid of s.sourceIds) {
+        if (!l1Of.has(mid)) l1Of.set(mid, s.id);
+      }
     }
   }
 
@@ -87,7 +117,9 @@ async function main() {
     id: msg.id,
     sequence: i,
     rawTokens: estimateTokens(msg as { content?: unknown[] }),
-    currentResolution: resolutions.get(msg.id) ?? 0,
+    // A present-day resolution snapshot is not historical state. Created-time
+    // fixtures reconstruct their previous frontier from the request tape.
+    currentResolution: at === undefined ? (resolutions.get(msg.id) ?? 0) : 0,
     lockedByAgent: false,
     bodyGroupId: (msg as { bodyGroupId?: string }).bodyGroupId,
     pinned: false,
@@ -136,7 +168,13 @@ async function main() {
 
   // ---- Write the playground payload ----
   const payload = {
-    meta: { store: storePath, messages: messages.length, summaries: summaries.length, rawTokens: rawTotal },
+    meta: {
+      store: storePath,
+      messages: messages.length,
+      summaries: summaries.length,
+      rawTokens: rawTotal,
+      ...(at === undefined ? {} : { at: new Date(at).toISOString(), resolutions: 'cleared' }),
+    },
     newestSequence: newestSeq,
     chunks,
     summaries,

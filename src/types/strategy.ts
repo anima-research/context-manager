@@ -200,6 +200,16 @@ export interface SelectOptions {
    * bookkeeping. Over-budget becomes a reported condition rather than a throw.
    */
   dryRun?: boolean;
+  /** Exact normalized tools/system/context-prefix identity supplied by the
+   * host for kv-unified cache relevance. */
+  kvUnifiedImmutablePrefixHash?: string;
+  /** Audited, expiring continuity relaxation for disruptive transitions.
+   * Invalid or expired values fail closed to normal continuity weight. */
+  kvUnifiedContinuityRelaxation?: {
+    reason: 'surgery' | 'budget-transition' | 'infrastructure';
+    multiplier: number;
+    expiresAt: number;
+  };
 }
 
 /**
@@ -481,6 +491,33 @@ export type RecallEnvelopeMode = 'none' | 'xml';
 /** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
 export type CarrierPolicy = 'full' | 'live-strip';
 
+export interface KvUnifiedConfig {
+  policy: {
+    alpha: number;
+    budgetLowRatio: number;
+    budgetHighRatio: number;
+    budgetUnderLambda: number;
+    budgetOverLambda: number;
+    cacheLambda: number;
+    cacheScale: number;
+    cacheReadPrice: number;
+    cacheWritePrice: number;
+    continuityLambda: number;
+    continuityScale: number;
+    continuityRecencyHalfLifeTokens: number;
+    continuityRecencyFloor: number;
+    continuityStableHalfLife: number;
+    continuityStableFloor: number;
+  };
+  tokenBucketSize: number;
+  continuityBucketSize: number;
+  fidelityBucketSize: number;
+  labelCeiling: number;
+  adoptEpsilon: number;
+  treeifyNonContiguousSummaries: boolean;
+  preserveGapBearingSummaries: boolean;
+}
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -761,6 +798,10 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /** Legacy first-choice target-only merge request. Default false. */
+  compressionMergeSourceOnly?: boolean;
+  /** Use target-only merge request only on the final persisted merge attempt. Default false. */
+  compressionMergeSourceOnlyFallback?: boolean;
   /** Token target for each summary at any level (default: 2000) */
   summaryTargetTokens?: number;
   /** Token budget for L3 summaries in select() (default: 30000) */
@@ -858,6 +899,9 @@ export interface AutobiographicalConfig {
    * Default undefined/false — every other resident is unaffected.
    */
   compressionSourceOnly?: boolean;
+
+  /** Final bounded source-only L1 attempt after canonical + recall variants. */
+  compressionSourceOnlyFallback?: boolean;
 
   /**
    * Maximum number of same-model recall-curve variants attempted after an L1
@@ -993,7 +1037,11 @@ export interface AutobiographicalConfig {
    *     docs/adaptive-resolution-design.md §13.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'kv-unified';
+
+  /** Explicit, fail-closed kv-unified policy. Every field is required when
+   * foldingStrategy is `kv-unified`; there are no live defaults. */
+  kvUnified?: KvUnifiedConfig;
 
   /**
    * Trust region P (tokens) for `foldingStrategy: 'kv-stable'` — bounds how

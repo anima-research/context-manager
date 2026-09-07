@@ -8,6 +8,7 @@ import type {
   ContextLogView,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { MessageStore } from './message-store.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -275,13 +276,29 @@ export class ContextLog {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
-      case 'thinking':
-        // Signature-only blocks (display:'omitted') carry empty thinking text
+      case 'thinking': {
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const signature = (block as { signature?: string }).signature;
+        if (
+          typeof signature === 'string' &&
+          signature.length > 0 &&
+          (!block.thinking || block.thinking.length === 0)
+        ) {
+          return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        }
         return this.tokenEstimator(block.thinking ?? '');
-      case 'redacted_thinking':
+      }
+      case 'redacted_thinking': {
         // Encrypted reasoning payload, round-tripped verbatim — rough
         // estimate from the data length so budgeting isn't blind to it.
-        return this.tokenEstimator((block as { data?: string }).data ?? '');
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const data = (block as { data?: string }).data;
+        return typeof data === 'string' && data.length > 0
+          ? Math.round(data.length / MessageStore.ENCRYPTED_CARRIER_CHARS_PER_TOKEN)
+          : MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+      }
       case 'tool_use':
         return this.tokenEstimator(JSON.stringify(block.input)) + 20;
       case 'tool_result':

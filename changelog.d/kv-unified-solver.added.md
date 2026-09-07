@@ -1,0 +1,2 @@
+- Add the fail-closed `kv-unified` context solver with exact feasibility certificates, bounded Pareto welfare selection, accepted-presentation/cache receipts, expiring continuity relaxation, score-ranked latent summary demand, and token-weighted 33/66/100 history markers plus a tail marker.
+- Add aggregate-only Fable replay tooling and canonical ownership repair/prevention for stale, crossed, and non-contiguous summary ancestry.

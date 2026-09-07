@@ -50,7 +50,13 @@ function l1(id: string, sourceIds: string[], mergedInto?: string): Sum {
 
 function buildStore(
   dir: string,
-  opts: { summaries: Sum[]; records: unknown[]; messageCount: number; messages?: unknown[] },
+  opts: {
+    summaries: Sum[];
+    records: unknown[];
+    messageCount: number;
+    messages?: unknown[];
+    resolutions?: Record<string, number>;
+  },
 ): void {
   const store = JsStore.openOrCreate({ path: dir });
   const reg = (id: string) => {
@@ -60,6 +66,7 @@ function buildStore(
   reg(`${NS}/autobio:summaries`);
   reg(`${NS}/autobio:chunks`);
   reg(`${NS}/autobio:mergeQueue`);
+  reg(`${NS}/autobio:resolutions`);
   store.setStateJson(
     'messages',
     opts.messages ?? Array.from({ length: opts.messageCount }, (_, i) => ({ id: `m-${i}` })),
@@ -67,6 +74,7 @@ function buildStore(
   store.setStateJson(`${NS}/autobio:summaries`, opts.summaries);
   store.setStateJson(`${NS}/autobio:chunks`, opts.records);
   store.setStateJson(`${NS}/autobio:mergeQueue`, []);
+  store.setStateJson(`${NS}/autobio:resolutions`, opts.resolutions ?? {});
   store.close();
 }
 
@@ -262,6 +270,84 @@ test('dangling-merged sole-coverage L1 counts as LIVE in the fold-floor estimate
     const sums = store.getStateJson(`${NS}/autobio:summaries`);
     store.close();
     assert.equal((sums as Sum[]).length, 5, 'no write happened');
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('full repair refuses a record-backed L1 whose live coverage is non-contiguous', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'repair-keepers-'));
+  const dir = join(parent, 'store');
+  try {
+    const summaries = [l1('L1-fused', ['m-0', 'm-1', 'm-8', 'm-9'])];
+    const records = [{
+      id: 'c-fused',
+      sourceIds: ['m-0', 'm-1', 'm-8', 'm-9'],
+      compressed: true,
+      summaryId: 'L1-fused',
+    }];
+    buildStore(dir, { summaries, records, messageCount: 10 });
+
+    const result = runRepair(dir, ['--apply']);
+    assert.equal(result.code, 6, result.out);
+    assert.match(result.out, /L1-fused: authored live coverage is non-contiguous/, result.out);
+    assert.match(result.out, /refusing to apply/i, result.out);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('explicit uncompressed records make retired L1 coverage deferred rather than lost', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'repair-keepers-'));
+  const dir = join(parent, 'store');
+  try {
+    const summaries = [l1('L1-fused', ['m-0', 'm-1', 'm-8', 'm-9'])];
+    const records = [
+      { id: 'c-early', sourceIds: ['m-0', 'm-1'], compressed: false },
+      { id: 'c-late', sourceIds: ['m-8', 'm-9'], compressed: false },
+    ];
+    buildStore(dir, { summaries, records, messageCount: 10 });
+
+    const dry = runRepair(dir);
+    assert.equal(dry.code, 0, dry.out);
+    assert.match(dry.out, /L1: 1 total → keep 0, prune 1/, dry.out);
+    assert.match(dry.out, /4 deferred to explicit uncompressed records; 0 LOST\/UNOWNED/, dry.out);
+    assert.match(dry.out, /canonical closure verified/, dry.out);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('repair clamps carried resolutions to the deepest surviving ancestor', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'repair-keepers-'));
+  const dir = join(parent, 'store');
+  try {
+    const child = l1('L1-a', ['m-0', 'm-1'], 'L2-a');
+    const parentSummary: Sum = {
+      id: 'L2-a',
+      level: 2,
+      content: 'parent',
+      tokens: 100,
+      sourceLevel: 1,
+      sourceIds: [child.id],
+      created: 2,
+    };
+    buildStore(dir, {
+      summaries: [child, parentSummary],
+      records: [{
+        id: 'c-a', sourceIds: child.sourceIds, compressed: true, summaryId: child.id,
+      }],
+      messageCount: 2,
+      resolutions: { 'm-0': 3, 'm-1': 2 },
+    });
+
+    const result = runRepair(dir, ['--apply']);
+    assert.equal(result.code, 0, result.out);
+    assert.match(result.out, /resolutions:\s+1 impossible carried level\(s\) clamped\/cleared/, result.out);
+    const store = JsStore.open({ path: dir });
+    const resolutions = store.getStateJson(`${NS}/autobio:resolutions`);
+    store.close();
+    assert.deepEqual(resolutions, { 'm-0': 2, 'm-1': 2 });
   } finally {
     rmSync(parent, { recursive: true, force: true });
   }

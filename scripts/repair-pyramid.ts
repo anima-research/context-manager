@@ -51,6 +51,7 @@ interface SummaryEntry {
   sourceLevel: number;
   sourceIds: string[];
   sourceRange?: { first: string; last: string };
+  parentId?: string;
   mergedInto?: string;
   created: number;
   phaseType?: string;
@@ -65,6 +66,12 @@ interface ChunkRecord {
 
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
+const explicitlyRetired = new Set(
+  args
+    .filter((arg) => arg.startsWith('--retire='))
+    .map((arg) => arg.slice('--retire='.length))
+    .filter(Boolean),
+);
 /**
  * --frontier-only: the zero-LLM micro-repair. Prunes ONLY stale L1
  * generations that are still UNMERGED (on the frontier) — the ones future
@@ -84,6 +91,7 @@ if (!storePath || !namespace) {
 const SUMS = `${namespace}/autobio:summaries`;
 const CHUNKS = `${namespace}/autobio:chunks`;
 const MERGEQ = `${namespace}/autobio:mergeQueue`;
+const RESOLUTIONS = `${namespace}/autobio:resolutions`;
 
 const store = JsStore.open({ path: storePath });
 
@@ -92,14 +100,17 @@ const rawSums = store.getStateJson(SUMS);
 const loaded: SummaryEntry[] = (Array.isArray(rawSums) ? rawSums : []).filter(
   (s: SummaryEntry | null) => s && typeof s.content === 'string' && s.content.trim().length > 0,
 );
+const parentOfForLoad = (summary: SummaryEntry): string | undefined =>
+  summary.parentId ?? summary.mergedInto;
 const byId = new Map<string, SummaryEntry>();
 for (const s of loaded) {
   const prev = byId.get(s.id);
   if (!prev) byId.set(s.id, s);
-  else if (!prev.mergedInto && s.mergedInto) byId.set(s.id, s);
+  else if (!parentOfForLoad(prev) && parentOfForLoad(s)) byId.set(s.id, s);
 }
 const summaries = [...byId.values()];
 const l1s = summaries.filter(s => s.level === 1 && Array.isArray(s.sourceIds) && s.sourceIds.length > 0);
+const parentOf = parentOfForLoad;
 
 const messages = store.getStateJson('messages');
 const msgIndex = new Map<string, number>();
@@ -129,6 +140,10 @@ const keepers = new Set<string>();
 const covered = new Set<string>();
 
 for (const r of chunkRecords) {
+  // Every record owns its span even before compression. If an uncompressed
+  // repair record did not seed coverage, the sweep below could resurrect the
+  // stale fused L1 that the record was created to replace.
+  for (const id of r.sourceIds ?? []) covered.add(id);
   if (typeof r.summaryId !== 'string') continue;
   if (!byId.has(r.summaryId)) {
     console.error(`FATAL: chunk record points at missing summary ${r.summaryId} — reconcile before repairing`);
@@ -137,7 +152,6 @@ for (const r of chunkRecords) {
   keepers.add(r.summaryId);
   const s = byId.get(r.summaryId)!;
   for (const id of s.sourceIds ?? []) covered.add(id);
-  for (const id of r.sourceIds ?? []) covered.add(id);
 }
 const recordKeepers = keepers.size;
 
@@ -170,38 +184,49 @@ for (const s of summaries.filter(x => x.level === 1 && !keepers.has(x.id))) prun
 if (frontierOnly) {
   for (const id of [...prunedL1]) {
     const s = byId.get(id);
-    if (s?.mergedInto && byId.has(s.mergedInto)) prunedL1.delete(id);
-  }
-}
-
-const children = new Map<string, SummaryEntry[]>();
-for (const s of summaries) {
-  if (s.mergedInto) {
-    const list = children.get(s.mergedInto) ?? [];
-    list.push(s);
-    children.set(s.mergedInto, list);
+    const parentId = s ? parentOf(s) : undefined;
+    if (parentId && byId.has(parentId)) prunedL1.delete(id);
   }
 }
 
 const wiped = new Set<string>();
 if (!frontierOnly) {
-  for (const l2 of summaries.filter(s => s.level === 2)) {
-    const kids = children.get(l2.id) ?? [];
-    if (kids.some(k => prunedL1.has(k.id))) wiped.add(l2.id);
+  for (const id of explicitlyRetired) {
+    const summary = byId.get(id);
+    if (!summary) {
+      console.error(`FATAL: --retire names missing summary ${id}`);
+      process.exit(3);
+    }
+    if (summary.level === 1) {
+      console.error(`FATAL: --retire=${id} is L1; replace its chunk ownership instead`);
+      process.exit(3);
+    }
+    wiped.add(id);
   }
-  for (const l3 of summaries.filter(s => s.level === 3)) {
-    const kids = children.get(l3.id) ?? [];
-    if (kids.some(k => wiped.has(k.id) || prunedL1.has(k.id))) wiped.add(l3.id);
-  }
-}
-// Cascade upward defensively for any deeper levels.
-let grew = true;
-while (grew) {
-  grew = false;
-  for (const s of summaries.filter(x => x.level > 3)) {
-    if (wiped.has(s.id)) continue;
-    const kids = children.get(s.id) ?? [];
-    if (kids.some(k => wiped.has(k.id) || prunedL1.has(k.id))) { wiped.add(s.id); grew = true; }
+  // Authored `sourceIds` are the provenance authority. Mutable child→parent
+  // pointers can be stale after an old partial merge/reparent race; following
+  // only those backlinks leaves a parent alive after one of the children it
+  // was actually authored from has been pruned. Close upward over BOTH edges.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const parent of summaries.filter((summary) => summary.level > 1)) {
+      if (wiped.has(parent.id)) continue;
+      const invalid = parent.sourceIds.some((childId) => {
+        const child = byId.get(childId);
+        return (
+          !child ||
+          prunedL1.has(childId) ||
+          wiped.has(childId) ||
+          child.level !== parent.level - 1 ||
+          parentOf(child) !== parent.id
+        );
+      });
+      if (invalid) {
+        wiped.add(parent.id);
+        grew = true;
+      }
+    }
   }
 }
 
@@ -209,13 +234,154 @@ const survivors: SummaryEntry[] = [];
 let unmerged = 0;
 for (const s of summaries) {
   if (prunedL1.has(s.id) || wiped.has(s.id)) continue;
-  if (s.mergedInto && (wiped.has(s.mergedInto) || prunedL1.has(s.mergedInto))) {
-    const { mergedInto: _drop, ...rest } = s;
-    survivors.push(rest as SummaryEntry);
+  const parentId = parentOf(s);
+  if (parentId && (!byId.has(parentId) || wiped.has(parentId) || prunedL1.has(parentId))) {
+    const copy = { ...s };
+    delete copy.parentId;
+    delete copy.mergedInto;
+    survivors.push(copy);
     unmerged++;
   } else {
     survivors.push(s);
   }
+}
+
+// ---- structural closure invariant ----
+// A full repair must leave one authored tree over the record-owned live
+// messages. Coverage alone is insufficient: a summary can retain all of its
+// raw messages while crossing an intervening live span, or its authored child
+// set can differ from the L1 generation selected by the chunk ledger.
+const structuralIssues: string[] = [];
+if (!frontierOnly) {
+  const survivorById = new Map(survivors.map((summary) => [summary.id, summary]));
+  const liveLeavesMemo = new Map<string, string[]>();
+  const expandLiveLeaves = (summary: SummaryEntry, visiting = new Set<string>()): string[] => {
+    const cached = liveLeavesMemo.get(summary.id);
+    if (cached) return cached;
+    if (visiting.has(summary.id)) {
+      structuralIssues.push(`${summary.id}: ownership cycle`);
+      return [];
+    }
+    visiting.add(summary.id);
+    let leaves: string[] = [];
+    if (summary.level === 1) {
+      leaves = summary.sourceIds.filter((id) => msgIndex.has(id));
+    } else {
+      for (const childId of summary.sourceIds) {
+        const child = survivorById.get(childId);
+        if (!child) {
+          structuralIssues.push(`${summary.id}: authored child ${childId} is absent`);
+          continue;
+        }
+        if (parentOf(child) !== summary.id) {
+          structuralIssues.push(
+            `${summary.id}: authored child ${childId} points to ${parentOf(child) ?? 'no parent'}`,
+          );
+        }
+        leaves.push(...expandLiveLeaves(child, visiting));
+      }
+    }
+    visiting.delete(summary.id);
+    liveLeavesMemo.set(summary.id, leaves);
+    return leaves;
+  };
+
+  for (const summary of survivors) {
+    const leaves = expandLiveLeaves(summary);
+    const positions = leaves.map((id) => msgIndex.get(id)!).filter((index) => index !== undefined);
+    if (new Set(leaves).size !== leaves.length) {
+      structuralIssues.push(`${summary.id}: authored live coverage overlaps itself`);
+    }
+    if (positions.some((position, index) => index > 0 && position <= positions[index - 1]!)) {
+      structuralIssues.push(`${summary.id}: authored live coverage is out of order`);
+    }
+    if (positions.some((position, index) => index > 0 && position !== positions[index - 1]! + 1)) {
+      structuralIssues.push(`${summary.id}: authored live coverage is non-contiguous`);
+    }
+  }
+
+  const ownedBySummary = new Map<string, Set<string>>();
+  const recordOwner = new Map<string, string>();
+  for (const record of chunkRecords) {
+    if (!record.summaryId || !survivorById.has(record.summaryId)) continue;
+    for (const messageId of record.sourceIds) {
+      if (!msgIndex.has(messageId)) continue;
+      const previous = recordOwner.get(messageId);
+      if (previous && previous !== record.id) {
+        structuralIssues.push(
+          `chunk records ${previous} and ${record.id} both own live message ${messageId}`,
+        );
+      }
+      recordOwner.set(messageId, record.id);
+      let summaryId: string | undefined = record.summaryId;
+      const seen = new Set<string>();
+      while (summaryId && survivorById.has(summaryId) && !seen.has(summaryId)) {
+        seen.add(summaryId);
+        const owned = ownedBySummary.get(summaryId) ?? new Set<string>();
+        owned.add(messageId);
+        ownedBySummary.set(summaryId, owned);
+        summaryId = parentOf(survivorById.get(summaryId)!);
+      }
+    }
+  }
+  for (const [summaryId, owned] of ownedBySummary) {
+    const semantic = new Set(expandLiveLeaves(survivorById.get(summaryId)!));
+    if (
+      owned.size !== semantic.size ||
+      [...owned].some((messageId) => !semantic.has(messageId))
+    ) {
+      structuralIssues.push(
+        `${summaryId}: record ownership (${owned.size}) differs from authored live coverage (${semantic.size})`,
+      );
+    }
+  }
+}
+
+// Reconcile carried working-frontier levels with the surviving authored
+// ancestry. The renderer falls back to raw for a missing L_k, but persisting
+// that impossible level makes the first post-repair compile report hundreds
+// of unrealizable targets and creates an avoidable continuity jump.
+const rawResolutions = store.getStateJson(RESOLUTIONS);
+const hasResolutionsState = rawResolutions !== null && rawResolutions !== undefined;
+const repairedResolutions: Record<string, number> = {
+  ...(
+    rawResolutions && typeof rawResolutions === 'object' && !Array.isArray(rawResolutions)
+      ? rawResolutions as Record<string, number>
+      : {}
+  ),
+};
+const survivingById = new Map(survivors.map((summary) => [summary.id, summary] as const));
+const l1ByMessage = new Map<string, string>();
+for (const record of chunkRecords) {
+  if (!record.summaryId || !survivingById.has(record.summaryId)) continue;
+  for (const messageId of record.sourceIds) l1ByMessage.set(messageId, record.summaryId);
+}
+for (const summary of survivors) {
+  if (summary.level !== 1) continue;
+  for (const messageId of summary.sourceIds) {
+    if (!l1ByMessage.has(messageId)) l1ByMessage.set(messageId, summary.id);
+  }
+}
+let resolutionsAdjusted = 0;
+for (const [messageId, requested] of Object.entries(repairedResolutions)) {
+  if (!Number.isSafeInteger(requested) || requested <= 0) {
+    delete repairedResolutions[messageId];
+    continue;
+  }
+  let summaryId = l1ByMessage.get(messageId);
+  let deepest = 0;
+  const seen = new Set<string>();
+  while (summaryId && !seen.has(summaryId)) {
+    seen.add(summaryId);
+    const summary = survivingById.get(summaryId);
+    if (!summary) break;
+    if (summary.level <= requested) deepest = Math.max(deepest, summary.level);
+    summaryId = parentOf(summary);
+  }
+  if (deepest === requested) continue;
+  resolutionsAdjusted++;
+  if (deepest > 0) repairedResolutions[messageId] = deepest;
+  else delete repairedResolutions[messageId];
 }
 
 // ---- coverage invariant (2026-07-12 guard) ----
@@ -234,7 +400,18 @@ const coverageOf = (ids: Iterable<string>): Set<string> => {
 const coverageBefore = coverageOf(l1s.map(s => s.id));
 const coverageAfter = coverageOf(l1s.filter(s => !prunedL1.has(s.id)).map(s => s.id));
 let coverageLost = 0;
-for (const id of coverageBefore) if (!coverageAfter.has(id)) coverageLost++;
+let coverageDeferred = 0;
+const uncompressedRecordMessages = new Set(
+  chunkRecords
+    .filter((record) => !record.compressed || !record.summaryId)
+    .flatMap((record) => record.sourceIds)
+    .filter((id) => msgIndex.has(id)),
+);
+for (const id of coverageBefore) {
+  if (coverageAfter.has(id)) continue;
+  if (uncompressedRecordMessages.has(id)) coverageDeferred++;
+  else coverageLost++;
+}
 
 // ---- fold-floor estimate (2026-07-12 guard #2) ----
 // The mythos 01:28Z backfire was NOT coverage loss (the pruned L1s were all
@@ -325,8 +502,19 @@ console.log(`L1: ${l1s.length} total → keep ${keepers.size}, prune ${prunedL1.
 console.log(`L2: ${summaries.filter(s => s.level === 2).length} total → wipe ${count(2, wiped)}`);
 console.log(`L3: ${summaries.filter(s => s.level === 3).length} total → wipe ${count(3, wiped)}`);
 console.log(`survivors:    ${survivors.length} (${unmerged} returned to unmerged frontier)`);
+if (explicitlyRetired.size > 0) {
+  console.log(`retired:      ${[...explicitlyRetired].sort().join(', ')}`);
+}
+console.log(`resolutions:  ${resolutionsAdjusted} impossible carried level(s) clamped/cleared`);
 console.log(`merge queue:  ${mergeQueue.length} → ${cleanQueue.length}`);
-console.log(`coverage:     ${coverageBefore.size} live messages L1-covered before → ${coverageAfter.size} after (${coverageLost} LOST)`);
+console.log(
+  `coverage:     ${coverageBefore.size} live messages L1-covered before → ${coverageAfter.size} after ` +
+    `(${coverageDeferred} deferred to explicit uncompressed records; ${coverageLost} LOST/UNOWNED)`,
+);
+console.log(
+  `structure:    ${structuralIssues.length === 0 ? 'canonical closure verified' : `${structuralIssues.length} issue(s)`}`,
+);
+for (const issue of structuralIssues) console.log(`  - ${issue}`);
 console.log(
   `fold floor:   ≥~${Math.round(floorBefore / 1000)}k tokens fully-folded before → ≥~${Math.round(floorAfter / 1000)}k after ` +
     `(OPTIMISTIC lower bound: group-consistency can force shallower renders — mythos 2026-07-12 measured 490k where this estimated ~134k)`,
@@ -351,6 +539,16 @@ if (coverageLost > 0) {
   process.exit(4);
 }
 
+if (!frontierOnly && structuralIssues.length > 0) {
+  console.error(
+    `\nFATAL: repaired projection is not a canonical authored ownership forest ` +
+      `(${structuralIssues.length} issue(s)); refusing to apply. Use a targeted ownership ` +
+      `surgery to split/retarget the listed spans first.`,
+  );
+  store.close();
+  process.exit(6);
+}
+
 if (!apply) {
   console.log('\nDRY RUN — nothing written. Pass --apply to write (back up first!).');
   store.close();
@@ -369,5 +567,6 @@ if (floorAfter > floorBefore * 1.25 && !allowFloorGrowth) {
 
 store.setStateJson(SUMS, survivors);
 store.setStateJson(MERGEQ, cleanQueue);
+if (hasResolutionsState) store.setStateJson(RESOLUTIONS, repairedResolutions);
 store.close();
 console.log('\nAPPLIED. Run the offline merge drain (or let the agent re-merge live).');

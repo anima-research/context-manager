@@ -33,6 +33,7 @@ export type {
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
 export { KvStableStrategy, type KvStableOptions } from './strategies/kv-stable.js';
+export { KvUnifiedStrategy, type KvUnifiedOptions } from './strategies/kv-unified.js';
 
 // Summary tree + rendered-unit accounting (shared substrate)
 export {
@@ -42,6 +43,57 @@ export {
   type LeafNode,
   type SummaryNode,
 } from './summary-tree.js';
+export {
+  CanonicalSummaryForest,
+  CanonicalForestError,
+  type CanonicalConstraintKind,
+  type CanonicalLeafConstraint,
+  type CanonicalForestOptions,
+  type CanonicalForestIssueCode,
+  type CanonicalForestIssue,
+  type CanonicalLeaf,
+  type CanonicalSummary,
+  type CanonicalRoot,
+  type ConstraintConflict,
+  type MinimumTokenCertificate,
+  type MinimumTokenResult,
+  type CanonicalSelectAction,
+  type CanonicalDecisionNode,
+  type CanonicalDecisionDag,
+  type ExactCutCandidate,
+  type ExactCutEnumerationStats,
+  type ExactCutEnumeration,
+  ExactEnumerationLimitError,
+  SparseLabelCeilingError,
+  type SparseLabelStats,
+  type SparseLabelResult,
+} from './kv-unified.js';
+export {
+  ExactKvUnifiedPolicySolver,
+  KvUnifiedPolicyError,
+  DEFAULT_KV_UNIFIED_WELFARE_POLICY,
+  type PresentedLeaf,
+  type AcceptedPresentationReference,
+  type ProviderCacheReference,
+  type KvUnifiedWelfarePolicy,
+  type ExactPolicySolveOptions,
+  type ExactPolicyCandidate,
+  type ExactPolicySolveResult,
+} from './kv-unified-policy.js';
+export {
+  ParetoKvUnifiedPolicySolver,
+  type ParetoPropagationStats,
+  type ParetoPolicySolveResult,
+} from './kv-unified-pareto.js';
+export {
+  KvUnifiedReceiptChain,
+  type PendingPresentationSubmission,
+  type PresentationDelta,
+  type PresentationReceipt,
+  type ReceiptChainSnapshot,
+  type SerializedReceiptChain,
+  type ObservedCacheWireReceipt,
+} from './kv-unified-receipts.js';
 export {
   renderLayout,
   kvCost,

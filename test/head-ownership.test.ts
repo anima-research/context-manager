@@ -356,6 +356,41 @@ describe('One-to-one representation: ownership vs head window', () => {
 
     await manager.close();
   });
+
+  it('never reparents a partially stale merge queue entry', async () => {
+    const path = freshPath();
+    let calls = 0;
+    const strategy = new ProbeStrategy({
+      compressionModel: 'test-compression-model',
+      autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({
+      path,
+      strategy,
+      membrane: {
+        complete: async () => {
+          calls++;
+          return { stopReason: 'end_turn', content: [{ type: 'text', text: 'must not run' }] };
+        },
+      } as never,
+    });
+    const parented = { ...summary('L1-900', 1, ['m-a']), mergedInto: 'L2-existing' };
+    const orphan = summary('L1-901', 1, ['m-b']);
+    strategy.seed(parented);
+    strategy.seed(orphan);
+
+    await strategy.runMerge(2, [parented.id, orphan.id], managerContext(manager));
+
+    assert.equal(calls, 0, 'stale partial group must not issue a merge request');
+    assert.equal(parented.mergedInto, 'L2-existing');
+    assert.equal(orphan.mergedInto, undefined, 'orphan remains available for clean regrouping');
+    assert.equal(
+      strategy.summariesView().some((entry) => entry.level === 2),
+      false,
+      'no crossed parent is authored',
+    );
+    await manager.close();
+  });
 });
 
 /** Follow mergedInto links up to the live frontier summary over `id`. */

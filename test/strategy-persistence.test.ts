@@ -103,11 +103,11 @@ describe('AutobiographicalStrategy — persistence', () => {
         strategy,
       });
 
-      manager.addMessage('User', textBlock('hello'));
+      const m1 = manager.addMessage('User', textBlock('hello'));
       const m2 = manager.addMessage('Claude', textBlock('hi back'));
 
-      strategy.seedL1('summary one', ['a', 'b']);
-      strategy.seedL1('summary two', ['c', 'd']);
+      strategy.seedL1('summary one', [m1]);
+      strategy.seedL1('summary two', [m2]);
       strategy.seedMerge(2, ['L1-0', 'L1-1']);
 
       assert.equal(strategy.getSummariesView().length, 2);
@@ -319,6 +319,10 @@ describe('AutobiographicalStrategy — persistence', () => {
         membrane: stubMembrane,
       });
 
+      const m1 = manager.addMessage('User', textBlock('source one'));
+      const m2 = manager.addMessage('Claude', textBlock('source two'));
+      strategy.seedL1('summary one', [m1]);
+      strategy.seedL1('summary two', [m2]);
       strategy.seedMerge(2, ['L1-0', 'L1-1']);
       assert.equal(strategy.getMergeQueueView().length, 1, 'merge enqueued');
 
