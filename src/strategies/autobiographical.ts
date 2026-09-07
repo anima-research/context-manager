@@ -5673,6 +5673,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      * compression log.
      */
     const attemptRequestsByHash = new Map<string, NormalizedRequest>();
+    /** Split-stitch only: the accepted request hash of every fold part, so a
+     *  stitched mint persists each leaf's preimage (its own `requestHash` is
+     *  a composite over the parts, not a request). */
+    let stitchedFoldRequestHashes: string[] | undefined;
 
     try {
       const runAttempt = async (
@@ -6133,7 +6137,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }
               const txt = textOf(assessment.response).trim();
               if (txt.length > 0) {
-                parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: sha256Json(sub), responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
+                parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: trace.requestHash, responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
                 return true;
               }
             } else {
@@ -6204,6 +6208,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             fallbackResponse = synthetic;
             response = synthetic;
             splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, leaves: { successful: successfulLeaves, modelReported: modelReportedLeaves, models: [...leafModels] }, compositeHash, contentHash, parts: partsMeta, placeholders };
+            stitchedFoldRequestHashes = parts.flatMap((p) => (p.kind === 'fold' && p.requestHash ? [p.requestHash] : []));
             successfulTrace = {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
@@ -6374,7 +6379,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Provenance the auditor can READ: store the accepted request under the
       // hash the entry carries, before the entry itself lands.
-      if (successfulTrace) {
+      if (successfulTrace && stitchedFoldRequestHashes) {
+        // A stitched mint's `requestHash` is a composite over its parts; the
+        // requests that authored it are the fold leaves, each accepted through
+        // `runAttempt` and readable under the hash its part records.
+        for (const foldHash of stitchedFoldRequestHashes) {
+          this.persistMintPreimage(ctx, attemptRequestsByHash.get(foldHash), foldHash);
+        }
+      } else if (successfulTrace) {
         this.persistMintPreimage(
           ctx,
           attemptRequestsByHash.get(successfulTrace.requestHash),

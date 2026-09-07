@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, getMintRequestPreimageBytes } from '../src/index.js';
+import { createHash } from 'node:crypto';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
@@ -59,13 +60,14 @@ function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
 
-async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number; participant2?: string; spoof2?: string } = {}) {
+async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number; participant2?: string; spoof2?: string; preimages?: boolean } = {}) {
   const strategy = new ProbeStrategy({
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
     compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
     compressionSplitFallback: opts.split, compressionSplitPlaceholder: opts.placeholder,
     ...(opts.windowCap !== undefined ? { compressionSplitMaxCallsPer10Min: opts.windowCap } : {}),
+    ...(opts.preimages ? { persistMintPreimages: true } : {}),
   } as never);
   const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
   const n = opts.n ?? 4;
@@ -144,6 +146,31 @@ describe('split-stitch L1 fallback', () => {
     const att = (e.stitched as { attempted: { calls: number; refused: number; inputTokens: number; outputTokens: number } }).attempted;
     assert.ok(att.calls >= 4 && att.refused >= 1, 'attempted spend includes refused leaves');
     assert.ok(att.inputTokens > 0);
+  });
+
+  it('with persistMintPreimages on, every fold part\'s accepted request is a readable preimage', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, preimages: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const e = fx.strategy.entries()[0]!;
+    const st = e.stitched as { compositeHash: string; parts: Array<{ kind: string; requestHash?: string }> };
+    const store = managerContext(fx.manager).store;
+    const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+    const folds = st.parts.filter((p) => p.kind === 'fold');
+    assert.equal(folds.length, 4);
+    for (const p of folds) {
+      const bytes = getMintRequestPreimageBytes(store, p.requestHash!);
+      assert.ok(bytes, `fold part ${p.requestHash} has a readable preimage`);
+      assert.equal(sha(bytes!), p.requestHash, 'and it hashes back to the part\'s requestHash');
+      const parsed = JSON.parse(bytes!.toString('utf8')) as NormalizedRequest;
+      assert.equal(texts(parsed).filter((t) => /^raw-\d+ /.test(t)).length, 1, 'the leaf request carried exactly its one message');
+      assert.ok(calls.some((c) => JSON.stringify(c) === bytes!.toString('utf8')), 'the preimage is byte-identical to a request the membrane accepted');
+    }
+    // The composite hash names a structure, not a request: absent, never a throw.
+    assert.equal(getMintRequestPreimageBytes(store, st.compositeHash), null);
+    // Refused whole-chunk attempts are not mints and leave no preimage.
+    const whole = calls.find((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 4)!;
+    assert.equal(getMintRequestPreimageBytes(store, sha(Buffer.from(JSON.stringify(whole), 'utf8'))), null);
   });
 
   it('a whole-chunk tool round is indivisible: refused pair installs nothing and sends no sub-request', async () => {
