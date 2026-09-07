@@ -62,6 +62,7 @@ export type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   RecallEnvelopeMode,
+  CarrierPolicy,
   SummaryLevel,
   SummaryEntry,
   PhaseType,
