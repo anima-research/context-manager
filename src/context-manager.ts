@@ -35,6 +35,7 @@ import {
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -67,6 +68,47 @@ interface ContextManagerBaseConfig {
    * When true, log the compiled context to stderr for debugging.
    */
   debugLogContext?: boolean;
+  /**
+   * Strategy-facing exclusion predicate: return true to keep a message
+   * visible. When set, the view handed to the strategy — for compile,
+   * preview, ticks, and onNewMessage context alike — contains only kept
+   * messages, so chunking, selection, emission, and coverage invariants
+   * all see the same excluded-free world. Excluded messages remain in the
+   * store: direct accessors (getMessage/getAllMessages/query) and the raw
+   * chronicle state are unaffected.
+   *
+   * The predicate MUST be deterministic per message (e.g. keyed on
+   * ingestion-stamped metadata, not wall-clock or external state):
+   * flapping visibility re-busts compiled-prefix stability and can
+   * confuse strategies that persist per-message bookkeeping.
+   *
+   * NOT retroactive, and NOT a confidentiality boundary. The filter governs
+   * what the strategy sees from now on. Derived state a strategy persisted
+   * earlier — autobiographical summaries written while a message was still
+   * visible — is neither invalidated nor re-filtered when a predicate is
+   * introduced on an existing store or tightened later; a summary whose
+   * sources are now hidden stays loadable and selectable. `removeMessage`
+   * has the same property. To excise content that may already have been
+   * folded into memory, branch the chronicle before it entered (strategy
+   * state follows the branch); do not reach for a filter. Predicates keyed
+   * on ingestion-time stamps that never change (tune-out's
+   * `metadata.tuneOut`) are unaffected by this caveat: such a message is
+   * hidden from its first instant and can never have been summarized.
+   */
+  viewFilter?: (message: StoredMessage) => boolean;
+  /**
+   * Additional message slots merged (read-only) into the strategy-facing
+   * view, ordered with this manager's own messages by chronicle sequence —
+   * which is branch-global across slots, so the interleaving is
+   * deterministic and append-only. `namespace` follows MessageStore
+   * conventions: omitted = the shared un-namespaced `messages` slot.
+   *
+   * Writes (`addMessage`) always target this manager's own slot; auxiliary
+   * slots are someone else's to write (e.g. a side-process agent reading
+   * the main agent's timeline alongside its own — issue #77).
+   * `viewFilter`, when also set, applies to the merged view.
+   */
+  auxiliaryMessageViews?: Array<{ namespace?: string }>;
 }
 
 /**
@@ -114,6 +156,10 @@ export class ContextManager {
   private debugLogContext: boolean;
   /** Namespace passed to strategies for scoping their persistent state slots. */
   private strategyNamespace: string;
+  /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
+  private viewFilter?: (message: StoredMessage) => boolean;
+  /** Read-only auxiliary stores merged into the strategy-facing view. */
+  private auxiliaryStores: MessageStore[];
 
   private constructor(
     store: JsStore,
@@ -124,6 +170,8 @@ export class ContextManager {
     strategyNamespace: string,
     membrane?: Membrane,
     debugLogContext = false,
+    viewFilter?: (message: StoredMessage) => boolean,
+    auxiliaryStores: MessageStore[] = [],
   ) {
     this.store = store;
     this.messageStore = messageStore;
@@ -133,9 +181,29 @@ export class ContextManager {
     this.strategyNamespace = strategyNamespace;
     this.membrane = membrane;
     this.debugLogContext = debugLogContext;
+    this.viewFilter = viewFilter;
+    this.auxiliaryStores = auxiliaryStores;
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
+  }
+
+  /**
+   * The strategy-facing message view — the single choke point through which
+   * every strategy read passes (compile, preview, render stats, and the
+   * tick/onNewMessage StrategyContext). Composition order: merge auxiliary
+   * slots into the timeline first, then apply the exclusion filter, so a
+   * filter sees (and can exclude from) the merged world.
+   */
+  private strategyMessageView() {
+    let view = mergeMessageStoreViews(
+      this.messageStore.createView(),
+      this.auxiliaryStores.map((s) => s.createView()),
+    );
+    if (this.viewFilter) {
+      view = filterMessageStoreView(view, this.viewFilter);
+    }
+    return view;
   }
 
   /**
@@ -219,6 +287,37 @@ export class ContextManager {
     });
     const strategy = config.strategy ?? new PassthroughStrategy();
 
+    // Auxiliary read-only slots for the strategy-facing merged view.
+    // Registration is idempotent and harmless when the slot's writer has
+    // not opened yet — an empty slot merges as nothing.
+    //
+    // Guard rails: an auxiliary entry that resolves to this manager's OWN
+    // slot would merge every message twice (doubling token accounting,
+    // silently), so it is refused; a slot listed twice is merged once.
+    const ownSlotId = MessageStore.registrationFor(messageNamespace).id;
+    const seenAuxSlots = new Set<string>();
+    const auxiliaryStores = (config.auxiliaryMessageViews ?? []).flatMap((aux) => {
+      const slotId = MessageStore.registrationFor(aux.namespace).id;
+      if (slotId === ownSlotId) {
+        throw new Error(
+          `ContextManagerConfig.auxiliaryMessageViews: "${slotId}" is this manager's own ` +
+          `message slot (namespace ${JSON.stringify(aux.namespace ?? null)}); merging it ` +
+          `would duplicate every message. Auxiliary views must name other writers' slots.`,
+        );
+      }
+      if (seenAuxSlots.has(slotId)) return [];
+      seenAuxSlots.add(slotId);
+      try {
+        MessageStore.register(store, aux.namespace);
+      } catch {
+        /* already registered */
+      }
+      return [new MessageStore(store, {
+        estimator: config.tokenEstimator,
+        namespace: aux.namespace,
+      })];
+    });
+
     // Namespace passed to strategies. Falls back to a stable per-store value
     // so strategies always have something to scope state IDs by, even when
     // the caller didn't supply a namespace.
@@ -233,6 +332,8 @@ export class ContextManager {
       strategyNamespace,
       config.membrane,
       config.debugLogContext ?? false,
+      config.viewFilter,
+      auxiliaryStores,
     );
 
     // Initialize strategy
@@ -556,7 +657,7 @@ export class ContextManager {
 
     // Get selected entries from strategy
     const entries = this.strategy.select(
-      this.messageStore.createView(),
+      this.strategyMessageView(),
       this.contextLog.createView(),
       effectiveBudget,
       opts
@@ -734,7 +835,7 @@ export class ContextManager {
     };
     if (typeof s.previewContext !== 'function') return null;
     return s.previewContext(
-      this.messageStore.createView(),
+      this.strategyMessageView(),
       this.contextLog.createView(),
       budget,
       overrides,
@@ -827,7 +928,7 @@ export class ContextManager {
    */
   getRenderStats(): RenderStats | null {
     if (!isRenderStatsCapable(this.strategy)) return null;
-    return this.strategy.getRenderStats(this.messageStore.createView());
+    return this.strategy.getRenderStats(this.strategyMessageView());
   }
 
   /**
@@ -938,7 +1039,7 @@ export class ContextManager {
   private createStrategyContext(): StrategyContext {
     const self = this;
     return {
-      messageStore: this.messageStore.createView(),
+      messageStore: this.strategyMessageView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
       currentSequence: this.store.currentSequence(),
