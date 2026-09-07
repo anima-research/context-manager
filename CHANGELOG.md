@@ -12,6 +12,114 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.8.0 — 2026-09-07
+
+### Added
+
+- **Strategy-view composition** (groundwork for tune-out,
+  anima-research/agent-framework#77; all three inert until configured):
+  `ContextManagerConfig.viewFilter` — strategy-facing exclusion applied at the
+  single view choke point, so chunking, selection, emission, and the coverage
+  invariants all see the same excluded-free world while the store and direct
+  accessors keep everything (documented as non-retroactive over persisted
+  summaries and not a confidentiality boundary — excise by branching);
+  `ContextManagerConfig.auxiliaryMessageViews` — additional message slots
+  merged read-only into the strategy view, interleaved by branch-global
+  chronicle sequence (writes still target only the manager's own slot; an
+  entry naming the manager's own slot is refused, repeats merge once);
+  standalone compositors `filterMessageStoreView` / `mergeMessageStoreViews`
+  (#54).
+- **`WindowedPassthroughStrategy`** — passthrough over a sequence-anchored
+  window with coarse re-anchoring (jump to ~`reAnchorFraction` of budget on
+  overflow, byte-stable prefix + appends between jumps, unlike a naively
+  sliding front). The anchor persists in a `{ns}/windowed:anchor` snapshot
+  slot, follows branches, and is re-derived whenever the store's branch is
+  observed to change (host undo/redo included); `setAnchor()` is the external
+  policy hook. Places ≤ 2 message-level cache markers (measured stable prefix
+  + end) under the shared ≤ 3 first-claim contract. Applies `maxMessageTokens`
+  truncation and the autobiographical live-image policy (`maxLiveImages`,
+  `imageStripDepthTokens`, `maxLiveImageBytes`) itself, and refuses with
+  `OverBudgetError` when the newest message alone exceeds the usable budget
+  (#54).
+
+- `compressionSplitFallback` (default off): a final L1 rung that, after every
+  existing rung is refused, folds the chunk in halves at message boundaries
+  (tool rounds indivisible) in source-only shape and installs the stitched
+  pieces as one L1 over the chunk, with per-piece request/response/content
+  hashes, aggregate usage, and per-chunk / sliding-window call caps; provider
+  errors abort it. `compressionSplitPlaceholder` (default off) allows an
+  operator-authored, structurally marked placeholder for a single message that
+  refuses alone. Cap knobs: `compressionSplitMaxCallsPerChunk`,
+  `compressionSplitMaxCallsPer10Min`.
+
+- `carrierPolicy: 'full' | 'live-strip'` (default `'full'`) chooses where a
+  summary's captured reasoning carriers replay. `'live-strip'` omits the
+  signed `thinking` / `redacted_thinking` blocks from the LIVE WINDOW only —
+  the surface where an agent reads its own memory back and inhabits the
+  archivist's task-cognition at the remembered span's slot. Mint and merge
+  recall pairs keep their carriers unconditionally under either value, whole
+  and byte-verbatim, because that is where the anti-refusal duty is measured.
+  Stripping omits whole blocks and never rewrites one, so signatures still
+  verify on the mint side; a carrier-only entry falls back to its `content`
+  prose rather than rendering an empty turn; and the fold planner prices a
+  recall pair for the render the policy will actually emit.
+
+- Add the fail-closed `kv-unified` context solver with exact feasibility certificates, bounded Pareto welfare selection, accepted-presentation/cache receipts, expiring continuity relaxation, score-ranked latent summary demand, and token-weighted 33/66/100 history markers plus a tail marker.
+- Add aggregate-only Fable replay tooling and canonical ownership repair/prevention for stale, crossed, and non-contiguous summary ancestry.
+
+- Mint request preimages can now be persisted, so
+  `provenance.requestHash` is readable and not merely verifiable. With the
+  option on, every accepted L1 and merge mint stores its authoring request in
+  the same Chronicle store as the summary, retrievable by the hash the summary
+  already carries. Read it with `getMintRequestByHash(store, hash)` or
+  `getMintRequestPreimageBytes(store, hash)`. Refused and quarantined attempts
+  are not mints and are not stored.
+- New option: `persistMintPreimages`, **opt-in, default `false`**. Absent
+  config means off — only an explicit `true` enables it. Preimage text is real
+  growth at mint cadence, and this library ships no retention knob for it yet,
+  so a fleet that deploys from a checkout would otherwise have every resident
+  begin writing preimages on the next pull. Turning it on is a deliberate act,
+  taken with an eye on store size.
+- Inline media is stored by reference, not re-embedded. Media-bearing
+  preimages store the request JSON as an envelope of literal spans and
+  content-addressed media blob references. Media already extracted by
+  `MessageStore` reuses its existing blob; other inline media is stored once.
+  Reads restore the exact original base64 spelling and verify the materialized
+  bytes against `requestHash`. Text-only preimages remain plain request blobs,
+  and a damaged envelope raises `MintPreimageMaterializationError`.
+- Preimages are persisted best-effort: a store failure never blocks the mint
+  and leaves no preimage, so a reader gets null — alongside pre-feature mints
+  and persistence left off. The hash on the entry stays verifiable either way.
+
+### Fixed
+
+- Compression is now deferred until the host has pushed tool definitions
+  when the summarizer is a Fable/Mythos-family model, not only when the
+  chunk itself contains tool blocks. On those models a summarizer request
+  with the memory marker and directive but no `tools` param is a
+  deterministic `reasoning_extraction` input-block regardless of chunk
+  content, so a pure-chat seeded agent's first speculative L1 — fired
+  before the first `setToolDefinitions` — burned a doomed call and landed
+  its opening slice in compression quarantine (Linn, 2026-09-05). Opus-family
+  summarizers keep minting tools-less; deferred chunks are re-examined on the
+  next ingestion/activation as before.
+
+- Preserve explicitly allowed gap-bearing summary ownership without regenerating
+  historical prose, while retaining exact chronological cache accounting.
+- Price replayed signed-thinking summaries from their stored provider output
+  counts instead of replacing exact measurements with the legacy fallback.
+
+- `provenance.requestHash` now identifies the request the transport actually
+  ACCEPTED. In the carrier-transport degraded path both mint sites sent a
+  reasoning-stripped copy of the request but hashed and persisted the
+  original, so a summary authored by the stripped retry carried the hash of
+  bytes the model never read: `sha256(preimage) === requestHash` verified
+  green while the stored request was not the authoring one. L1 attempts and
+  merges now hash, map and persist the accepted bytes. A split-stitched L1
+  (`compressionSplitFallback`) records each fold part's accepted request hash
+  and, with `persistMintPreimages: true`, persists every leaf's preimage — its
+  own `requestHash` is a composite over the parts, not a request.
+
 ## 0.7.0 — 2026-09-01
 
 ### Added
