@@ -727,7 +727,7 @@ export class ContextManager {
     // Insert beforeUser injections before last user message
     if (beforeUser.length > 0 && lastUserIdx >= 0) {
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
-        participant: `injection:${inj.namespace}`,
+        participant: `system_context:${inj.namespace}`,
         content: inj.content,
       }));
       messages.splice(lastUserIdx, 0, ...injectedMessages);
@@ -739,7 +739,7 @@ export class ContextManager {
     if (afterUser.length > 0) {
       const insertIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : messages.length;
       const injectedMessages: NormalizedMessage[] = afterUser.map((inj) => ({
-        participant: `injection:${inj.namespace}`,
+        participant: `system_context:${inj.namespace}`,
         content: inj.content,
       }));
       messages.splice(insertIdx, 0, ...injectedMessages);

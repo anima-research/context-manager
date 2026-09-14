@@ -1242,7 +1242,7 @@ describe('ContextManager', () => {
       assert.strictEqual(result.messages.length, 4);
       assert.strictEqual(result.messages[0].participant, 'User');
       assert.strictEqual(result.messages[1].participant, 'Claude');
-      assert.strictEqual(result.messages[2].participant, 'injection:rag');
+      assert.strictEqual(result.messages[2].participant, 'system_context:rag');
       assert.strictEqual(result.messages[3].participant, 'User');
 
       // Verify injection content
@@ -1277,7 +1277,7 @@ describe('ContextManager', () => {
       assert.strictEqual(result.messages[0].participant, 'User');
       assert.strictEqual(result.messages[1].participant, 'Claude');
       assert.strictEqual(result.messages[2].participant, 'User');
-      assert.strictEqual(result.messages[3].participant, 'injection:context');
+      assert.strictEqual(result.messages[3].participant, 'system_context:context');
     });
 
     it('should handle all three injection positions together', async () => {
@@ -1321,9 +1321,9 @@ describe('ContextManager', () => {
       assert.strictEqual(result.messages.length, 5);
       assert.strictEqual(result.messages[0].participant, 'User');
       assert.strictEqual(result.messages[1].participant, 'Claude');
-      assert.strictEqual(result.messages[2].participant, 'injection:rag');
+      assert.strictEqual(result.messages[2].participant, 'system_context:rag');
       assert.strictEqual(result.messages[3].participant, 'User');
-      assert.strictEqual(result.messages[4].participant, 'injection:tools');
+      assert.strictEqual(result.messages[4].participant, 'system_context:tools');
     });
 
     it('should handle multiple injections at the same position', async () => {
@@ -1365,8 +1365,8 @@ describe('ContextManager', () => {
 
       // Messages: injection:memory, injection:rag, User (both beforeUser injections before user)
       assert.strictEqual(result.messages.length, 3);
-      assert.strictEqual(result.messages[0].participant, 'injection:memory');
-      assert.strictEqual(result.messages[1].participant, 'injection:rag');
+      assert.strictEqual(result.messages[0].participant, 'system_context:memory');
+      assert.strictEqual(result.messages[1].participant, 'system_context:rag');
       assert.strictEqual(result.messages[2].participant, 'User');
     });
 
@@ -1407,7 +1407,7 @@ describe('ContextManager', () => {
       // afterUser has no user message — should append at end
       assert.strictEqual(result.messages.length, 2);
       assert.strictEqual(result.messages[0].participant, 'Claude');
-      assert.strictEqual(result.messages[1].participant, 'injection:tools');
+      assert.strictEqual(result.messages[1].participant, 'system_context:tools');
     });
 
     it('should handle injections with multimodal content', async () => {
@@ -1440,7 +1440,7 @@ describe('ContextManager', () => {
       const result = await manager.compile(undefined, injections);
 
       assert.strictEqual(result.messages.length, 2);
-      assert.strictEqual(result.messages[0].participant, 'injection:vision');
+      assert.strictEqual(result.messages[0].participant, 'system_context:vision');
       assert.strictEqual(result.messages[0].content.length, 2);
       assert.strictEqual(result.messages[0].content[0].type, 'text');
       assert.strictEqual(result.messages[0].content[1].type, 'image');
@@ -1477,9 +1477,9 @@ describe('ContextManager', () => {
 
       // Order should be preserved: User, first, second, third
       assert.strictEqual(result.messages.length, 4);
-      assert.strictEqual(result.messages[1].participant, 'injection:first');
-      assert.strictEqual(result.messages[2].participant, 'injection:second');
-      assert.strictEqual(result.messages[3].participant, 'injection:third');
+      assert.strictEqual(result.messages[1].participant, 'system_context:first');
+      assert.strictEqual(result.messages[2].participant, 'system_context:second');
+      assert.strictEqual(result.messages[3].participant, 'system_context:third');
     });
 
     it('should handle case-insensitive user participant matching', async () => {
@@ -1504,7 +1504,7 @@ describe('ContextManager', () => {
 
       // Should still find the user message despite lowercase
       assert.strictEqual(result.messages.length, 2);
-      assert.strictEqual(result.messages[0].participant, 'injection:test');
+      assert.strictEqual(result.messages[0].participant, 'system_context:test');
       assert.strictEqual(result.messages[1].participant, 'user');
     });
   });
