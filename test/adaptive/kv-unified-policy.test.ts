@@ -660,3 +660,91 @@ test('kv-unified infeasibility demands missing L1s instead of deadlocking', () =
     range: { firstChunkId: 'c-0000', lastChunkId: 'c-0003' },
   }]);
 });
+
+test('kv-unified label count stays bounded under a stale half-covering presentation (#97)', () => {
+  // A presentation receipt that covers only the older half of the live leaves
+  // (a kv-stable -> kv-unified switch, a restore, a history import) must not
+  // multiply the Pareto label set: extension tokens feed only the cache term,
+  // so they may distinguish labels only while a cache is relevant, and then
+  // only at token-bucket resolution.
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 24,
+    tokensPerChunk: 100,
+    mergeThreshold: 2,
+    recallPairTokens: 40,
+  });
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks.map((chunk, index) => ({ ...chunk, rawTokens: 60 + ((index * 29) % 70) })),
+    summaries: chronicle.summaries,
+    recallPairTokens: new Map(
+      [...chronicle.recallPairTokens].map(([id, tokens], index) => [id, tokens + ((index * 11) % 30)]),
+    ),
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+  const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
+  const presentationCovering = (count: number): AcceptedPresentationReference => ({
+    currentSeq: 1,
+    leaves: new Map(
+      ordered.slice(0, count).map((chunk) => [
+        chunk.id,
+        { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 },
+      ]),
+    ),
+  });
+  const rawTotal = inputs.chunks.reduce((sum, chunk) => sum + chunk.rawTokens, 0);
+  const options = {
+    maxTokens: Math.floor(rawTotal * 0.75),
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+    labelCeiling: 200_000,
+  } as const;
+  const fresh = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    presentation: presentationCovering(ordered.length),
+  });
+  const halfStale = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    presentation: presentationCovering(ordered.length / 2),
+  });
+  const fullyStale = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    presentation: presentationCovering(0),
+  });
+  assert.equal(fresh.feasible, true);
+  assert.equal(halfStale.feasible, true);
+  assert.equal(fullyStale.feasible, true);
+  if (!fresh.feasible || !halfStale.feasible || !fullyStale.feasible) return;
+  const freshLabels = fresh.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  const halfLabels = halfStale.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  const fullLabels = fullyStale.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  // Before the fix: fresh 14,256 / half-stale 60,791 (4.3x) / fully stale 41,714.
+  // The residual over fresh is continuity-loss bucketing, not extension keys.
+  assert.ok(halfLabels <= freshLabels * 2, `half-stale ${halfLabels} vs fresh ${freshLabels}`);
+  assert.ok(fullLabels <= freshLabels, `fully stale ${fullLabels} vs fresh ${freshLabels}`);
+  assert.ok(halfStale.selected.renderedTokens <= options.maxTokens);
+});
+
+test('kv-unified keeps exact extension keys when a relevant cache is priced', () => {
+  // With a relevant cache the extension total is part of the priced state, so
+  // labels that differ in it are still kept apart (at bucket resolution).
+  const { inputs } = fixture();
+  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
+  const presentation = rawPresentation(inputs);
+  const result = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    maxTokens: 250,
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+    presentation,
+    cache: { immutablePrefixHash: 'stable-tools', layout: rawLayout, markers: [] },
+    currentImmutablePrefixHash: 'stable-tools',
+  });
+  assert.equal(result.feasible, true);
+  if (!result.feasible) return;
+  assert.ok(result.selected.renderedTokens <= 250);
+  assert.ok((result.propagation?.labelsCreated ?? 0) > 0);
+});

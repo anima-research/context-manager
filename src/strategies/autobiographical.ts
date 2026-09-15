@@ -1834,14 +1834,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       } catch { /* already registered */ }
     }
-    if (this.config.foldingStrategy === 'kv-unified') {
-      try {
-        this.store.registerState({
-          id: this.kvUnifiedReceiptStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
-    }
+    // Registered for every folding strategy: a non-kv-unified presenter must
+    // be able to supersede a receipt left behind by kv-unified (see
+    // loadPersistedState), not just kv-unified itself.
+    try {
+      this.store.registerState({
+        id: this.kvUnifiedReceiptStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
     try {
       this.store.registerState({
         id: this.counterStateId,
@@ -2061,6 +2062,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedPendingLayout = null;
       this.kvUnifiedPendingMarkerUnitIndices = [];
       this.kvUnifiedPendingImmutablePrefixHash = null;
+    } else {
+      // A presentation receipt is kv-unified's record of the LAST accepted
+      // presentation. Once another folding strategy presents from this store
+      // the receipt no longer describes the previous turn, and a later switch
+      // back would measure continuity against a days-old baseline and, worse,
+      // treat everything folded since as "extension" — which made the Pareto
+      // label count superlinear and hard-downed a resident (#97). Supersede it
+      // now; the switch back then starts from an empty chain (one cold-cache
+      // turn, as the migration runbook already expects).
+      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+      if (receiptState && typeof receiptState === 'object') {
+        this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+        console.warn(
+          `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
+            `folding strategy is now ${String(this.config.foldingStrategy ?? 'default')}; ` +
+            `a later switch back to kv-unified starts from an empty receipt chain`,
+        );
+      }
+      this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
     }
   }
 

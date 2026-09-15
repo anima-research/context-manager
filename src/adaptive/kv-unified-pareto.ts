@@ -175,7 +175,7 @@ export class ParetoKvUnifiedPolicySolver {
     let maxLabelsPerState = 0;
     const insert = (label: ParetoLabel): void => {
       if (label.renderedTokens > options.maxTokens) return;
-      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
+      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize, cacheRelevant);
       const current = states.get(key) ?? [];
       for (const incumbent of current) {
         if (dominates(incumbent, label)) {
@@ -322,7 +322,7 @@ export class ParetoKvUnifiedPolicySolver {
       const groups = new Map<string, ParetoLabel[]>();
       for (const label of labels) {
         if (label.renderedTokens > options.maxTokens) continue;
-        const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
+        const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize, cacheRelevant);
         const current = groups.get(key);
         if (current) current.push(label);
         else groups.set(key, [label]);
@@ -774,14 +774,27 @@ function stateKey(
   tokenBucketSize: number,
   continuityBucketSize: number,
   fidelityBucketSize: number,
+  cacheRelevant: boolean,
 ): string {
   const tokenKey = tokenBucketSize > 0
     ? Math.ceil(label.renderedTokens / tokenBucketSize)
     : label.renderedTokens;
+  // Extension tokens feed only the cache-churn term (avoidable recompute =
+  // recomputed - extension), so they distinguish labels only while a provider
+  // cache is relevant, and then only at the token-bucket resolution. Keying
+  // on the exact value multiplied the live label set by the number of
+  // distinct extension sums: a presentation receipt that covers half of the
+  // live leaves (a kv-stable -> kv-unified switch) made the count superlinear
+  // in forest size and exhausted the ceiling (#97).
+  const extensionKey = !cacheRelevant
+    ? 'e*'
+    : tokenBucketSize > 0
+      ? Math.ceil(label.extensionTokens / tokenBucketSize)
+      : label.extensionTokens;
   return [
     label.remaining.toString(16),
     tokenKey,
-    label.extensionTokens,
+    extensionKey,
     label.cache.intact ? 1 : 0,
     label.cache.matchedUnits,
     label.cache.cachedTokens,

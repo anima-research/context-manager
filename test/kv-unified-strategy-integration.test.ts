@@ -256,3 +256,51 @@ test('kv-unified continuity relaxation is audited, expiring, and fail-closed', (
     expiresAt: Date.now() + 60_000,
   }), 1);
 });
+
+test('a non-kv-unified folding strategy supersedes a persisted kv-unified receipt (#97)', async () => {
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first });
+  manager.addMessage('user', [{ type: 'text', text: 'presented by kv-unified' }]);
+  await manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const markerCount = (
+    first as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
+  ).kvUnifiedPendingMarkerUnitIndices.length;
+  first.reportKvUnifiedAccepted({
+    submissionId: 's1',
+    acceptedAt: 123,
+    wireReceipt: {
+      requestHash: 'wire1',
+      markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+        ordinal,
+        prefixHash: `prefix-${ordinal}`,
+        estimatedOffset: ordinal + 1,
+      })),
+    },
+  });
+  assert.equal(receipts(first).head?.sequence, 1);
+  manager.close();
+
+  // kv-stable presents from the same store: the receipt no longer describes
+  // the previous turn and must not survive to a later switch back.
+  const stable = new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-stable',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+  });
+  const viaStable = await ContextManager.open({ path: STORE, strategy: stable });
+  viaStable.addMessage('user', [{ type: 'text', text: 'presented by kv-stable' }]);
+  await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  viaStable.close();
+
+  const back = strategy();
+  const reopened = await ContextManager.open({ path: STORE, strategy: back });
+  assert.equal(receipts(back).head, null, 'switching back starts from an empty receipt chain');
+  assert.equal(receipts(back).leaves.size, 0);
+  reopened.close();
+});
