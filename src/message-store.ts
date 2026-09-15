@@ -9,10 +9,78 @@ import type {
   MessageStoreView,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
+
+/**
+ * JSON-pointer field paths registered as native chronicle secondary indexes
+ * on the message slot (see MessageStore.registerHistoryIndexes). Shared
+ * constants so registration and every query call agree on the exact path.
+ */
+const TIMESTAMP_FIELD = '/timestamp';
+const CHANNEL_FIELD = '/metadata/external/channelId';
+
+/**
+ * Thrown by the query-by-time/channel methods when the underlying chronicle
+ * build predates the field-index capability (registerHistoryIndexes will
+ * have silently skipped registration at construction in that case — see its
+ * doc for why that's a silent skip rather than a throw). Unlike the
+ * point-lookup/slice feature-detects elsewhere in this file, there is no
+ * slow-scan fallback to degrade to here: a best-effort O(n)
+ * re-implementation would defeat the entire point of this API (callers
+ * reach for it specifically to avoid materializing/scanning the whole
+ * store), so callers need to know up front they can't rely on it.
+ */
+const HISTORY_INDEX_UNSUPPORTED_MSG = 'Chronicle history index unsupported — update @animalabs/chronicle';
+
+/**
+ * Thrown when a native index query returns `null` twice in a row — once on
+ * the original call, once again after a self-heal re-registration retry
+ * (see queryIndexOrHeal). Distinct from HISTORY_INDEX_UNSUPPORTED_MSG:
+ * that one means this chronicle build doesn't have the capability at all
+ * (checked once, up front, by each call site's own typeof guard); this one
+ * means the capability exists and the index WAS registered (at
+ * construction, via registerHistoryIndexes) but chronicle is reporting it
+ * as currently unqueryable — e.g. a cross-branch write on the same
+ * `stateId` poisoned it (chronicle drops an index rather than mix two
+ * branches' ordinals — see registerStateFieldIndex's doc in
+ * node_modules/@animalabs/chronicle/index.d.ts), or a parse failure. A
+ * single re-register-and-retry is chronicle's documented recovery path
+ * (registerStateFieldIndex is idempotent/cheap-when-fresh and does a full
+ * rebuild when needed); still-null after that means something is actually
+ * wrong and callers need to know they can't rely on the fast path right
+ * now, rather than silently getting an empty/degraded result.
+ */
+const HISTORY_INDEX_UNAVAILABLE_MSG = 'Chronicle history index unavailable (registered but not queryable — see logs)';
+
+/**
+ * Local mirrors of chronicle's JsIndexRangeQuery/JsIndexEqQuery (index.d.ts)
+ * — a plain inline object type can't be self-referenced via `typeof` inside
+ * a capability-checked method signature (TS2502), so these are named
+ * separately instead of importing the chronicle types directly (this
+ * package's chronicle dependency range doesn't guarantee they exist on
+ * every install — see HISTORY_INDEX_UNSUPPORTED_MSG).
+ */
+interface NativeIndexRangeOpts {
+  gte?: number;
+  lte?: number;
+  limit?: number;
+  offset?: number;
+  reverse?: boolean;
+}
+interface NativeIndexEqOpts {
+  limit?: number;
+  offset?: number;
+}
 
 /**
  * Cross-instance write versions, keyed by the shared JsStore object and
@@ -135,6 +203,38 @@ export class MessageStore {
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildIndex();
+    this.registerHistoryIndexes();
+  }
+
+  /**
+   * Register the native chronicle secondary indexes that back
+   * queryByTime/queryByChannel/queryByTimeAndChannel/getChannelCounts/
+   * getChannelTokenStats: `/timestamp` (numeric) and
+   * `/metadata/external/channelId` (string) on this store's message slot.
+   *
+   * Best-effort: `registerStateFieldIndex` is a NEW chronicle capability
+   * (2026-09) that may not exist on an older `@animalabs/chronicle` install
+   * — e.g. a resident whose native module hasn't been rebuilt/updated yet.
+   * Feature-detected exactly like getStateItemJson/getStateSlice elsewhere
+   * in this file: skip silently rather than throw, since registration is
+   * purely a setup step. The query methods above throw a clear, specific
+   * error if called against a store that never got indexes registered
+   * (HISTORY_INDEX_UNSUPPORTED_MSG) — callers need to know they can't rely
+   * on the fast path rather than have it silently degrade into a full scan
+   * that would defeat the reason for calling it.
+   *
+   * Safe to call unconditionally on every construction (including every
+   * sibling MessageStore sharing this JsStore): registration is idempotent
+   * and cheap once the persisted index is fresh — chronicle checks the
+   * slot's item count before doing any rebuild work.
+   */
+  private registerHistoryIndexes(): void {
+    const s = this.store as {
+      registerStateFieldIndex?: (stateId: string, field: string, kind: string) => void;
+    };
+    if (typeof s.registerStateFieldIndex !== 'function') return;
+    s.registerStateFieldIndex(this.stateId, TIMESTAMP_FIELD, 'number');
+    s.registerStateFieldIndex(this.stateId, CHANNEL_FIELD, 'string');
   }
 
   /**
@@ -879,6 +979,313 @@ export class MessageStore {
       limit: 1,
     });
     return result.messages[0] ?? null;
+  }
+
+  /**
+   * Re-register a single field index — the self-heal step `queryIndexOrHeal`
+   * takes on a `null` result, after `registerHistoryIndexes` already
+   * registered both indexes at construction. `registerStateFieldIndex` is
+   * documented idempotent/cheap when the persisted index is already fresh,
+   * and does a full rebuild when it isn't (e.g. after the cross-branch
+   * poisoning `queryStateIndexRange`'s doc describes) — so re-calling it
+   * with the exact same `(stateId, field, kind)` is chronicle's own
+   * prescribed recovery path, not a guess. No-ops defensively if the
+   * capability has vanished entirely, same as registerHistoryIndexes
+   * (shouldn't happen — queryIndexOrHeal is only reached after the caller's
+   * own typeof guard on the sibling query method already passed, and the
+   * two capabilities land together in one chronicle release).
+   */
+  private reregisterHistoryIndex(field: string, kind: 'number' | 'string'): void {
+    const s = this.store as {
+      registerStateFieldIndex?: (stateId: string, field: string, kind: string) => void;
+    };
+    if (typeof s.registerStateFieldIndex !== 'function') return;
+    s.registerStateFieldIndex(this.stateId, field, kind);
+  }
+
+  /**
+   * Run a native index query that can report `null` — "no such index
+   * currently registered" (unregistered, wrong kind, or poisoned by a
+   * cross-branch write / parse failure — see queryStateIndexRange's doc) —
+   * distinct from an empty array, which is a real "no matches" result and
+   * must pass through untouched.
+   *
+   * Since `registerHistoryIndexes` already registered this index at
+   * construction, a `null` here means something disturbed it since. Self-
+   * heal: re-register (reregisterHistoryIndex) and retry the query exactly
+   * once. If it's STILL `null`, the index is unusable right now — throw
+   * HISTORY_INDEX_UNAVAILABLE_MSG rather than let a `null` silently reach
+   * `.map()`/`.length` downstream (the bug this helper exists to prevent).
+   */
+  private queryIndexOrHeal<T>(query: () => T | null, field: string, kind: 'number' | 'string'): T {
+    const first = query();
+    if (first !== null) return first;
+    this.reregisterHistoryIndex(field, kind);
+    const second = query();
+    if (second !== null) return second;
+    throw new Error(HISTORY_INDEX_UNAVAILABLE_MSG);
+  }
+
+  /**
+   * Capability-checked wrapper over the native numeric-range query call
+   * against the `/timestamp` field index. Throws HISTORY_INDEX_UNSUPPORTED_MSG
+   * if this chronicle build never has the capability at all (see
+   * registerHistoryIndexes); throws HISTORY_INDEX_UNAVAILABLE_MSG if the
+   * capability exists but the specific index can't be queried right now
+   * even after a self-heal retry (see queryIndexOrHeal). Returns ordinals
+   * only — content is fetched separately via ordinalsToMessages.
+   */
+  private queryTimestampOrdinals(opts: NativeIndexRangeOpts): number[] {
+    const s = this.store as {
+      queryStateIndexRange?: (stateId: string, field: string, opts: NativeIndexRangeOpts) => number[] | null;
+    };
+    if (typeof s.queryStateIndexRange !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    return this.queryIndexOrHeal(
+      () => s.queryStateIndexRange!(this.stateId, TIMESTAMP_FIELD, opts),
+      TIMESTAMP_FIELD,
+      'number',
+    );
+  }
+
+  /**
+   * Capability-checked wrapper over the native equality query call against
+   * the `/metadata/external/channelId` field index. Same throw/ordinal-only
+   * contract as queryTimestampOrdinals (including the UNSUPPORTED vs
+   * UNAVAILABLE distinction and the self-heal retry).
+   */
+  private queryChannelOrdinals(channelId: string, opts: NativeIndexEqOpts): number[] {
+    const s = this.store as {
+      queryStateIndexEq?: (stateId: string, field: string, value: string, opts: NativeIndexEqOpts) => number[] | null;
+    };
+    if (typeof s.queryStateIndexEq !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    return this.queryIndexOrHeal(
+      () => s.queryStateIndexEq!(this.stateId, CHANNEL_FIELD, channelId, opts),
+      CHANNEL_FIELD,
+      'string',
+    );
+  }
+
+  /**
+   * Fetch content for a set of slot ordinals (as returned by the native
+   * index queries above) via point lookups — never materializes the whole
+   * slot for this. Preserves the input order. An ordinal that no longer
+   * resolves (e.g. a redact raced this read) is skipped rather than
+   * thrown, matching this file's other defensive-read behavior.
+   */
+  private ordinalsToMessages(ordinals: number[]): StoredMessage[] {
+    const out: StoredMessage[] = [];
+    for (const ordinal of ordinals) {
+      const internal = this.getInternal(ordinal);
+      if (!internal) continue;
+      out.push(this.internalToStored(internal, internal.id, ordinal));
+    }
+    return out;
+  }
+
+  /**
+   * Query messages by timestamp range — O(log n + k) via the native
+   * `/timestamp` index, not a full scan. Both bounds are inclusive; either
+   * (or both) may be omitted for an open-ended range.
+   *
+   * `matchedCount` here is just the returned page's size (`limit`/`offset`
+   * are applied natively, inside chronicle, before the ordinals ever cross
+   * the NAPI boundary) — NOT a store-wide total match count. Getting a true
+   * total would require a second, unbounded native call; queryByTime
+   * intentionally avoids that extra cost since most callers page through
+   * results and don't need it. Contrast with queryByTimeAndChannel, which
+   * already has the full matched set in hand and reports a true total.
+   */
+  queryByTime(opts: TimeRangeQueryOptions): IndexedMessageQueryResult {
+    const ordinals = this.queryTimestampOrdinals({
+      gte: opts.fromMs,
+      lte: opts.toMs,
+      limit: opts.limit,
+      offset: opts.offset,
+      reverse: opts.reverse,
+    });
+    return { messages: this.ordinalsToMessages(ordinals), matchedCount: ordinals.length };
+  }
+
+  /**
+   * Query messages by exact channel id — O(1) hash lookup + O(k) via the
+   * native `/metadata/external/channelId` index. A message with no
+   * channelId (system/autobio-injected messages, etc.) is never indexed
+   * for this field (see field_index.rs's `extract_indexed_value`: a
+   * missing/wrong-type field extracts to `None`, not the string
+   * `"undefined"`), so it can never match here.
+   *
+   * Same `matchedCount`-is-page-size caveat as queryByTime.
+   */
+  queryByChannel(channelId: string, opts: ChannelQueryOptions = {}): IndexedMessageQueryResult {
+    const ordinals = this.queryChannelOrdinals(channelId, opts);
+    return { messages: this.ordinalsToMessages(ordinals), matchedCount: ordinals.length };
+  }
+
+  /**
+   * Query messages matching BOTH a timestamp range and a channel. With only
+   * one filter given, delegates to queryByTime/queryByChannel above
+   * (including their page-size-only `matchedCount`).
+   *
+   * With BOTH given, this can NOT just pass limit/offset into either native
+   * call and filter the resulting page by the other criterion — that
+   * paginates against the wrong universe. (Example: page 2 of "channel X in
+   * the last hour" needs page 2 of the INTERSECTION of the two filters; a
+   * channel-only page 2 filtered down to the last hour would both drop
+   * legitimate matches that landed outside that page's channel-only
+   * position and include none of the matches that landed on channel-only
+   * pages 3+.) The only correct approach is to fetch the FULL, uncapped
+   * ordinal set from BOTH native queries — cheap, since these are plain
+   * integer arrays, not content — intersect them, and only THEN apply
+   * limit/offset to the intersection. This also means, unlike
+   * queryByTime/queryByChannel, we already hold the true total match count
+   * before slicing, so `matchedCount` here is exact, not page-size-only.
+   */
+  queryByTimeAndChannel(opts: TimeAndChannelQueryOptions): IndexedMessageQueryResult {
+    const hasTime = opts.fromMs !== undefined || opts.toMs !== undefined;
+    const hasChannel = opts.channelId !== undefined;
+
+    if (hasChannel && !hasTime) {
+      return this.queryByChannel(opts.channelId as string, { limit: opts.limit, offset: opts.offset });
+    }
+    if (hasTime && !hasChannel) {
+      return this.queryByTime({ fromMs: opts.fromMs, toMs: opts.toMs, limit: opts.limit, offset: opts.offset });
+    }
+    if (!hasTime && !hasChannel) {
+      // No filters at all: degenerate case, same shape as an unbounded
+      // queryByTime.
+      return this.queryByTime({ limit: opts.limit, offset: opts.offset });
+    }
+
+    const rangeOrdinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
+    const channelOrdinalSet = new Set(this.queryChannelOrdinals(opts.channelId as string, {}));
+    // Intersect, then re-sort ascending: rangeOrdinals comes back sorted by
+    // TIMESTAMP VALUE (not necessarily ordinal, if two messages ever share a
+    // timestamp or a timestamp were edited out of append order), so a plain
+    // filter() would inherit that value order instead of a stable,
+    // index-ascending page order. Sorting here keeps pagination
+    // deterministic and matches queryByTime/queryByChannel's default
+    // (non-reverse) ordinal-ascending order.
+    const intersected = rangeOrdinals.filter((o) => channelOrdinalSet.has(o)).sort((a, b) => a - b);
+
+    const start = Math.max(0, Math.min(opts.offset ?? 0, intersected.length));
+    const end =
+      opts.limit !== undefined
+        ? Math.min(start + Math.max(0, opts.limit), intersected.length)
+        : intersected.length;
+
+    return { messages: this.ordinalsToMessages(intersected.slice(start, end)), matchedCount: intersected.length };
+  }
+
+  /**
+   * Distinct channel ids and their message counts — thin wrapper over the
+   * native `/metadata/external/channelId` value-count index.
+   * O(index size), no content decoding. Messages with no channelId are
+   * unindexed for this field (see queryByChannel's doc) and so never
+   * appear here — they are excluded, not folded into some `"undefined"`
+   * bucket.
+   */
+  getChannelCounts(): ChannelCount[] {
+    const s = this.store as {
+      getStateIndexValueCounts?: (stateId: string, field: string) => Array<{ value: string; count: number }> | null;
+    };
+    if (typeof s.getStateIndexValueCounts !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    const counts = this.queryIndexOrHeal(
+      () => s.getStateIndexValueCounts!(this.stateId, CHANNEL_FIELD),
+      CHANNEL_FIELD,
+      'string',
+    );
+    return counts.map((vc) => ({ channelId: vc.value, messages: vc.count }));
+  }
+
+  /**
+   * Per-ordinal cache for getChannelTokenStats: `undefined` channelId means
+   * "looked up, has no channel" (still cached, so a range full of
+   * unchanneled messages doesn't get re-decoded every call) as distinct
+   * from "not yet looked up" (absent from the map).
+   *
+   * There is no native token-estimate index — token estimation isn't a
+   * field that exists on stored messages (see the design plan's "Scope
+   * decision": indexing it natively would mean either rewriting every
+   * historical message to stamp a field that predates the feature, or
+   * leaving the index blank for all existing history; neither is
+   * acceptable). This cache amortizes the one genuinely expensive part —
+   * decoding content and running estimateTokens — across repeated
+   * getChannelTokenStats calls over overlapping ranges, filled lazily only
+   * for ordinals actually requested.
+   *
+   * KNOWN SIMPLIFICATION, not a bug: entries are never evicted in this
+   * version. Each entry is two tiny scalars (a channel id string + a
+   * number), not message content, so this stays cheap even at hundreds of
+   * thousands of messages — nothing like the content-bearing allCache this
+   * file guards so carefully elsewhere. It also isn't write-through: an
+   * edit or remove of an already-cached ordinal leaves a stale entry
+   * (wrong token estimate, or a channelId/ordinal pairing that no longer
+   * exists) until process restart. Acceptable for a stats/reporting API;
+   * revisit if a caller ever needs exactness across live edits.
+   */
+  private tokenStatsCache = new Map<number, { channelId: string | undefined; tokenEstimate: number }>();
+
+  /**
+   * Aggregate message counts and token estimates by channel, optionally
+   * restricted to a timestamp range. `totalMessages`/`totalTokensEstimate`
+   * cover EVERY message in range, channeled or not; `byChannel` breaks down
+   * only the ones that have a channelId (so its entries' `messages` sum to
+   * <= totalMessages when unchanneled messages exist in range).
+   *
+   * Structural filtering rides the native `/timestamp` index (same call as
+   * queryByTime, unbounded — every matching ordinal is relevant to the
+   * aggregate, so no limit/offset here). Token estimates are computed
+   * client-side via the existing calibrated estimateTokens machinery (no
+   * native token index — see tokenStatsCache's doc) and cached per-ordinal
+   * across calls.
+   */
+  getChannelTokenStats(opts: ChannelTokenStatsOptions = {}): ChannelTokenStats {
+    const ordinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
+
+    const byChannel = new Map<string, { messages: number; tokensEstimate: number }>();
+    let totalMessages = 0;
+    let totalTokensEstimate = 0;
+
+    for (const ordinal of ordinals) {
+      let entry = this.tokenStatsCache.get(ordinal);
+      if (!entry) {
+        const internal = this.getInternal(ordinal);
+        if (!internal) continue; // stale ordinal (e.g. raced a redact); skip rather than throw
+        const external = internal.metadata?.external as { channelId?: string } | undefined;
+        // Resolve blobs: an un-resolved blob_ref block has no tokenEstimate
+        // of its own and would silently price as 0, undercounting any
+        // message carrying inline media — resolveBlobs:true matches how
+        // estimateTokens is used everywhere else in this file (getAll()'s
+        // default).
+        const stored = this.internalToStored(internal, internal.id, ordinal, true);
+        entry = { channelId: external?.channelId, tokenEstimate: this.estimateTokens(stored) };
+        this.tokenStatsCache.set(ordinal, entry);
+      }
+      totalMessages++;
+      totalTokensEstimate += entry.tokenEstimate;
+      if (entry.channelId !== undefined) {
+        const agg = byChannel.get(entry.channelId) ?? { messages: 0, tokensEstimate: 0 };
+        agg.messages++;
+        agg.tokensEstimate += entry.tokenEstimate;
+        byChannel.set(entry.channelId, agg);
+      }
+    }
+
+    return {
+      totalMessages,
+      totalTokensEstimate,
+      byChannel: Array.from(byChannel.entries()).map(([channelId, agg]) => ({
+        channelId,
+        messages: agg.messages,
+        tokensEstimate: agg.tokensEstimate,
+      })),
+    };
   }
 
   /**
