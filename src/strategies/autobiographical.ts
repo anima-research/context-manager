@@ -8267,7 +8267,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.foldingStrategy !== 'kv-unified' || !this.kvUnifiedDraft) {
       throw new Error('No kv-unified presentation draft is available for submission');
     }
-    this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    const { superseded } = this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    if (superseded) {
+      console.error(
+        `[kv-unified] submission ${superseded} was never settled (no usage event before the next ` +
+          `provider call); superseded by ${args.submissionId}`,
+      );
+    }
     this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
     this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
     this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;

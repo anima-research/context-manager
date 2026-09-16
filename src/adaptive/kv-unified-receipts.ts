@@ -81,10 +81,25 @@ export class KvUnifiedReceiptChain {
   get wireReceipt(): ObservedCacheWireReceipt | null { return this.wireReceiptValue; }
   get inFlightSubmissionId(): string | null { return this.pending?.submissionId ?? null; }
 
-  begin(submission: PendingPresentationSubmission): void {
-    if (this.pending) throw new Error(`kv-unified submission ${this.pending.submissionId} is still in flight`);
+  /** Bind a new provider submission. An unsettled earlier flight is
+   * superseded, not defended: the caller composes a new request only after
+   * the previous one is dead (transport error before any usage event, a
+   * provider or framework retry, a restart), and `accept` requires the
+   * matching in-flight id, so nothing could ever settle it. Throwing here
+   * turned every such transient into a second, self-inflicted failure of the
+   * retry ("… is still in flight", devops agent 2026-09-16). The superseded
+   * id is returned so the strategy can log it; a late accept/fail for it is a
+   * duplicate no-op, never a state change. */
+  begin(submission: PendingPresentationSubmission): { superseded: string | null } {
     if (!submission.submissionId) throw new Error('kv-unified submissionId must be non-empty');
+    let superseded: string | null = null;
+    if (this.pending) {
+      superseded = this.pending.submissionId;
+      this.settled.add(superseded);
+      this.pending = null;
+    }
     this.pending = { ...submission, leaves: new Map(submission.leaves) };
+    return { superseded };
   }
 
   accept(
