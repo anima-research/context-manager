@@ -12,6 +12,17 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.9.1 — 2026-09-17
+
+### Fixed
+
+- `queryByChannel`/`queryByTimeAndChannel`/`getChannelCounts`/
+  `getChannelTokenStats` now index and merge BOTH channel-id metadata
+  shapes: `metadata.channelId` (what agent-framework's real MCPL
+  ingestion actually writes) and `metadata.external.channelId` (the
+  pre-existing convention). 0.9.0 only indexed the latter, so these
+  methods silently found nothing for real framework-ingested history.
+
 ## 0.9.0 — 2026-09-17
 
 ### Added
