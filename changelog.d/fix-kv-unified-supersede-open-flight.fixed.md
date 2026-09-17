@@ -1,1 +1,0 @@
-- kv-unified: a new provider submission now supersedes an earlier flight that was never settled (a provider call that died before its usage event, then a retry) instead of throwing `kv-unified submission … is still in flight` and failing the retry as well. The superseded id is logged and later callbacks for it are no-ops.

@@ -12,6 +12,33 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.9.0 — 2026-09-17
+
+### Added
+
+- `MessageStore`/`ContextManager` gain `queryByTime`/`queryByChannel`/
+  `queryByTimeAndChannel`/`getChannelCounts`/`getChannelTokenStats`
+  (`queryMessagesBy*`/`getChannelMessageCounts`/`getChannelTokenStats` on
+  `ContextManager`), backed by chronicle's new native `/timestamp` and
+  `/metadata/external/channelId` secondary field indexes (#99). O(log n + k)
+  against the index, not a full-store scan; requires chronicle >= the
+  version that ships `registerStateFieldIndex` — degrades to a clear error
+  on an older chronicle build rather than a silent full scan.
+
+### Changed
+
+- `compile()` now tags synthesized context messages with participant
+  `system_context:{namespace}` instead of `injection:{namespace}`. The old
+  name leaked verbatim into the rendered prompt (membrane formats messages
+  as `{participant}: {text}`), and a speaker literally named "injection"
+  tripped models' prompt-injection wariness on benign ambient context.
+  Nothing keys off the prefix programmatically; transcripts and UI filters
+  that grep for `injection:` should switch to `system_context:`.
+
+### Fixed
+
+- kv-unified: a new provider submission now supersedes an earlier flight that was never settled (a provider call that died before its usage event, then a retry) instead of throwing `kv-unified submission … is still in flight` and failing the retry as well. The superseded id is logged and later callbacks for it are no-ops.
+
 ## 0.8.0 — 2026-09-07
 
 ### Added
