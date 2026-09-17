@@ -315,6 +315,85 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     store.close();
   });
 
+  it('getChannelTokenStats does not leak a cached ordinal→message mapping across a branch switch (P2 regression)', () => {
+    const { store, messages } = openStore();
+
+    // Shared base message on the common ancestor.
+    messages.append('user', textBlock('base'), { external: { channelId: 'shared' } });
+
+    // Branch off HERE (createBranch does not switch the active branch) —
+    // 'side' starts with only 'base' in its messages slot, same as main.
+    store.createBranch('side');
+
+    // main diverges: append a main-only message at ordinal 1.
+    messages.append('user', textBlock('main-only'), { external: { channelId: 'main-chan' } });
+
+    // Warm the token-stats cache on main — this caches ordinal 1 as
+    // 'main-only' / 'main-chan'.
+    const onMain = messages.getChannelTokenStats();
+    assert.equal(onMain.totalMessages, 2);
+
+    store.switchBranch('side');
+    // side diverges too: append a DIFFERENT message that lands at the SAME
+    // ordinal (1) main-only occupied — the exact ordinal-reuse hazard the
+    // cache must not be fooled by.
+    messages.append('user', textBlock('side-only'), { external: { channelId: 'side-chan' } });
+
+    // Native, always-fresh ground truth for the branch we're on now.
+    const counts = messages.getChannelCounts();
+    assert.deepEqual(
+      counts.map((c) => c.channelId).sort(),
+      ['shared', 'side-chan'],
+    );
+
+    // The cache warmed on main must be invalidated by the switch, not
+    // silently serve ordinal 1 as 'main-only'/'main-chan' here.
+    const onSide = messages.getChannelTokenStats();
+    assert.equal(onSide.totalMessages, 2);
+    const byChannel = new Map(onSide.byChannel.map((c) => [c.channelId, c]));
+    assert.ok(!byChannel.has('main-chan'), 'stale main-branch channel leaked into side-branch stats');
+    assert.ok(byChannel.has('side-chan'), 'current side-branch channel missing from stats');
+
+    store.close();
+  });
+
+  it('getChannelTokenStats reflects a calibration change on the very next call, no invalidation needed (P2 regression)', () => {
+    const { store, messages } = openStore();
+    const msg = messages.append('user', textBlock('0123456789'), { external: { channelId: 'c1' } });
+    const rawEstimate = messages.estimateTokens(msg); // calibration defaults to 1
+
+    // Warm the cache at calibration = 1.
+    const before = messages.getChannelTokenStats();
+    assert.equal(before.totalTokensEstimate, rawEstimate);
+    assert.equal(before.byChannel[0]?.tokensEstimate, rawEstimate);
+
+    messages.setTokenCalibration(2);
+    const after = messages.getChannelTokenStats();
+    assert.equal(after.totalTokensEstimate, rawEstimate * 2);
+    assert.equal(after.byChannel[0]?.tokensEstimate, rawEstimate * 2);
+
+    store.close();
+  });
+
+  it('getChannelTokenStats normalizes a non-string channelId to unchanneled, matching getChannelCounts (P3)', () => {
+    const { store, messages } = openStore();
+    messages.append('user', textBlock('has-string-channel'), { external: { channelId: 'a' } });
+    // A channelId that's present but not a string (e.g. `null`) — the
+    // native String-kind index excludes it; getChannelTokenStats must too.
+    messages.append('user', textBlock('has-null-channel'), { external: { channelId: null } });
+
+    const counts = messages.getChannelCounts();
+    assert.deepEqual(counts, [{ channelId: 'a', messages: 1 }]);
+
+    const stats = messages.getChannelTokenStats();
+    assert.equal(stats.totalMessages, 2); // both still contribute to the overall total
+    assert.equal(stats.byChannel.length, 1);
+    assert.equal(stats.byChannel[0].channelId, 'a');
+    assert.ok(stats.byChannel.every((c) => typeof c.channelId === 'string'));
+
+    store.close();
+  });
+
   it('registerHistoryIndexes at construction is a silent no-op on a chronicle build without the capability', () => {
     const { store, messages } = openStore();
     for (let i = 0; i < 3; i++) messages.append('user', textBlock(`m${i}`));

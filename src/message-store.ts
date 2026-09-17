@@ -1204,10 +1204,34 @@ export class MessageStore {
   }
 
   /**
-   * Per-ordinal cache for getChannelTokenStats: `undefined` channelId means
-   * "looked up, has no channel" (still cached, so a range full of
-   * unchanneled messages doesn't get re-decoded every call) as distinct
-   * from "not yet looked up" (absent from the map).
+   * Per-ordinal cache for getChannelTokenStats, keyed by ordinal (branch
+   * identity is tracked separately — see tokenStatsCacheBranch — rather
+   * than folded into the key, since this cache is cheap enough to just
+   * wipe wholesale on a branch change instead of carrying dead entries for
+   * branches no longer in use).
+   *
+   * Caches the RAW (calibration-independent) token estimate — mirroring
+   * the estimateBlockTokensRaw/estimateBlockTokens split above — NOT the
+   * calibrated one. `estimateTokens` bakes in the mutable
+   * `tokenCalibration` multiplier (see setTokenCalibration), and caching
+   * ITS output would freeze each entry at whatever calibration was in
+   * effect when first computed — silently mixing calibration generations
+   * within one aggregate response, since `setTokenCalibration` is called
+   * during normal operation (the autobiographical strategy's closed-loop
+   * calibration), not just in synthetic tests. Calibration is applied at
+   * READ time instead (see getChannelTokenStats), so every entry always
+   * reflects the CURRENT calibration with no invalidation needed when it
+   * changes.
+   *
+   * `channelId: undefined` means "looked up, has no (valid string)
+   * channel" (still cached, so a range full of unchanneled messages
+   * doesn't get re-decoded every call) as distinct from "not yet looked
+   * up" (absent from the map). A non-string channelId value (`null`, a
+   * number, …) is normalized to `undefined` here too — see
+   * extractChannelId — matching chronicle's native String-kind field
+   * index, which silently excludes non-string values rather than exposing
+   * them as their own bucket (so byChannel never disagrees with
+   * getChannelCounts about which messages are "channeled").
    *
    * There is no native token-estimate index — token estimation isn't a
    * field that exists on stored messages (see the design plan's "Scope
@@ -1215,37 +1239,80 @@ export class MessageStore {
    * historical message to stamp a field that predates the feature, or
    * leaving the index blank for all existing history; neither is
    * acceptable). This cache amortizes the one genuinely expensive part —
-   * decoding content and running estimateTokens — across repeated
-   * getChannelTokenStats calls over overlapping ranges, filled lazily only
-   * for ordinals actually requested.
+   * decoding content (blob resolution) and running raw token estimation —
+   * across repeated getChannelTokenStats calls over overlapping ranges,
+   * filled lazily only for ordinals actually requested.
    *
-   * KNOWN SIMPLIFICATION, not a bug: entries are never evicted in this
-   * version. Each entry is two tiny scalars (a channel id string + a
-   * number), not message content, so this stays cheap even at hundreds of
-   * thousands of messages — nothing like the content-bearing allCache this
-   * file guards so carefully elsewhere. It also isn't write-through: an
-   * edit or remove of an already-cached ordinal leaves a stale entry
-   * (wrong token estimate, or a channelId/ordinal pairing that no longer
-   * exists) until process restart. Acceptable for a stats/reporting API;
-   * revisit if a caller ever needs exactness across live edits.
+   * KNOWN SIMPLIFICATION, not a bug: entries are never evicted or
+   * write-through'd on edit/remove within a branch — each entry is two
+   * tiny scalars, not message content, so this stays cheap even at
+   * hundreds of thousands of messages, nothing like the content-bearing
+   * allCache this file guards so carefully elsewhere. Acceptable for a
+   * stats/reporting API; revisit if a caller ever needs exactness across
+   * live edits.
    */
-  private tokenStatsCache = new Map<number, { channelId: string | undefined; tokenEstimate: number }>();
+  private tokenStatsCache = new Map<number, { channelId: string | undefined; rawTokenEstimate: number }>();
+
+  /**
+   * Branch this cache was last warmed on — checked and enforced at the top
+   * of getChannelTokenStats. Ordinals are branch-relative (chronicle's
+   * native `/timestamp`/`/metadata/external/channelId` field indexes are
+   * branch-aware and self-heal across a `switchBranch` as of chronicle
+   * 0.4.0), so a cached ordinal→message mapping from one branch isn't just
+   * STALE on another, it's WRONG: a diverged branch can reuse the exact
+   * same ordinal for a completely different message. Wholesale-cleared on
+   * any detected branch change, mirroring lookupIndex/rebuildIndex's
+   * existing indexBranch pattern elsewhere in this file (comparing a
+   * tracked branch name against `store.currentBranch().name`) rather than
+   * keying every cache entry by branch.
+   */
+  private tokenStatsCacheBranch = '';
+
+  /**
+   * Runtime-validated channelId extraction for the token-stats cache: the
+   * TS cast on `metadata.external` only asserts a shape at compile time,
+   * it never checks the actual runtime value, so a `null`/number/etc.
+   * channelId would otherwise leak through as a truthy-looking
+   * `!== undefined` bucket key in getChannelTokenStats.byChannel — a
+   * result the exported `{ channelId: string }` type doesn't even allow.
+   * Chronicle's native `/metadata/external/channelId` index is
+   * String-kind and silently excludes non-string values (see
+   * field_index.rs's `extract_indexed_value`); this matches that so
+   * getChannelTokenStats never disagrees with getChannelCounts about
+   * which messages are "channeled".
+   */
+  private extractChannelId(internal: StoredMessageInternal): string | undefined {
+    const external = internal.metadata?.external as { channelId?: unknown } | undefined;
+    return typeof external?.channelId === 'string' ? external.channelId : undefined;
+  }
 
   /**
    * Aggregate message counts and token estimates by channel, optionally
    * restricted to a timestamp range. `totalMessages`/`totalTokensEstimate`
    * cover EVERY message in range, channeled or not; `byChannel` breaks down
-   * only the ones that have a channelId (so its entries' `messages` sum to
-   * <= totalMessages when unchanneled messages exist in range).
+   * only the ones that have a valid string channelId (so its entries'
+   * `messages` sum to <= totalMessages when unchanneled or non-string-
+   * channel messages exist in range).
    *
    * Structural filtering rides the native `/timestamp` index (same call as
    * queryByTime, unbounded — every matching ordinal is relevant to the
    * aggregate, so no limit/offset here). Token estimates are computed
-   * client-side via the existing calibrated estimateTokens machinery (no
-   * native token index — see tokenStatsCache's doc) and cached per-ordinal
-   * across calls.
+   * client-side via the existing raw block-estimation machinery (no native
+   * token index — see tokenStatsCache's doc) and cached per-ordinal RAW
+   * across calls, with the CURRENT calibration multiplier applied here at
+   * read time — see tokenStatsCache's doc for why.
    */
   getChannelTokenStats(opts: ChannelTokenStatsOptions = {}): ChannelTokenStats {
+    // Branch-scope the cache before touching it (see tokenStatsCacheBranch):
+    // a stale-branch cache is not just outdated but wrong (ordinal reuse
+    // across diverged branches), so this must be a hard wipe, not a lazy
+    // per-entry revalidation.
+    const currentBranch = this.store.currentBranch().name;
+    if (currentBranch !== this.tokenStatsCacheBranch) {
+      this.tokenStatsCache.clear();
+      this.tokenStatsCacheBranch = currentBranch;
+    }
+
     const ordinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
 
     const byChannel = new Map<string, { messages: number; tokensEstimate: number }>();
@@ -1253,27 +1320,35 @@ export class MessageStore {
     let totalTokensEstimate = 0;
 
     for (const ordinal of ordinals) {
-      let entry = this.tokenStatsCache.get(ordinal);
-      if (!entry) {
+      let cached = this.tokenStatsCache.get(ordinal);
+      if (!cached) {
         const internal = this.getInternal(ordinal);
         if (!internal) continue; // stale ordinal (e.g. raced a redact); skip rather than throw
-        const external = internal.metadata?.external as { channelId?: string } | undefined;
-        // Resolve blobs: an un-resolved blob_ref block has no tokenEstimate
+        const channelId = this.extractChannelId(internal);
+        // Resolve blobs: an un-resolved blob_ref block has no raw estimate
         // of its own and would silently price as 0, undercounting any
         // message carrying inline media — resolveBlobs:true matches how
         // estimateTokens is used everywhere else in this file (getAll()'s
         // default).
         const stored = this.internalToStored(internal, internal.id, ordinal, true);
-        entry = { channelId: external?.channelId, tokenEstimate: this.estimateTokens(stored) };
-        this.tokenStatsCache.set(ordinal, entry);
+        const rawTokenEstimate = stored.content.reduce(
+          (sum, block) => sum + this.estimateBlockTokensRaw(block),
+          0,
+        );
+        cached = { channelId, rawTokenEstimate };
+        this.tokenStatsCache.set(ordinal, cached);
       }
+      // Calibration applied HERE, every call, from the cached raw value —
+      // never baked into the cached number itself (see tokenStatsCache's
+      // doc). Matches estimateBlockTokens' own round(raw * calibration).
+      const tokenEstimate = Math.round(cached.rawTokenEstimate * this.tokenCalibration);
       totalMessages++;
-      totalTokensEstimate += entry.tokenEstimate;
-      if (entry.channelId !== undefined) {
-        const agg = byChannel.get(entry.channelId) ?? { messages: 0, tokensEstimate: 0 };
+      totalTokensEstimate += tokenEstimate;
+      if (cached.channelId !== undefined) {
+        const agg = byChannel.get(cached.channelId) ?? { messages: 0, tokensEstimate: 0 };
         agg.messages++;
-        agg.tokensEstimate += entry.tokenEstimate;
-        byChannel.set(entry.channelId, agg);
+        agg.tokensEstimate += tokenEstimate;
+        byChannel.set(cached.channelId, agg);
       }
     }
 
