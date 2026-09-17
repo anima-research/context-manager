@@ -230,7 +230,10 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     assert.deepEqual(shared.messages.map(textOf).sort(), ['direct', 'nested']);
     assert.equal(shared.matchedCount, 2);
 
-    // getChannelCounts: counts summed across both native indexes.
+    // getChannelCounts: true unique message counts across both schemas
+    // (no messages here carry BOTH fields, so counts == plain per-channel
+    // message totals — see the dedicated double-counting regression below
+    // for the case where a single message carries both).
     const counts = messages.getChannelCounts();
     const sortedCounts = [...counts].sort((a, b) => a.channelId.localeCompare(b.channelId));
     assert.deepEqual(sortedCounts, [
@@ -245,6 +248,49 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     const byChannel = new Map(stats.byChannel.map((c) => [c.channelId, c]));
     assert.equal(byChannel.get('shared')?.messages, 2);
     assert.equal(byChannel.get('other')?.messages, 1);
+
+    store.close();
+  });
+
+  it('getChannelCounts reports a dual-schema message ONCE, not twice (P2 regression)', () => {
+    const { store, messages } = openStore();
+    // Real, reachable shape: agent-framework's handleMcplChannelIncoming
+    // PRESERVES any incoming metadata.external object it's handed while
+    // ALSO adding its own top-level metadata.channelId — so a message
+    // ingested from a source that already carried legacy
+    // {external:{channelId}} metadata ends up with BOTH fields set to the
+    // SAME value on the SAME message.
+    messages.append('user', textBlock('dual-schema'), {
+      channelId: 'discord:g:c',
+      external: { channelId: 'discord:g:c' },
+    });
+    // A channel with a message under only ONE schema (top-level).
+    messages.append('user', textBlock('top-only'), { channelId: 'top-chan' });
+    // A channel with genuinely SEPARATE messages under each schema (no
+    // single message carries both) — must still sum to the right total.
+    messages.append('user', textBlock('separate-top'), { channelId: 'separate-chan' });
+    messages.append('user', textBlock('separate-external'), { external: { channelId: 'separate-chan' } });
+
+    const counts = messages.getChannelCounts();
+    const byChannel = new Map(counts.map((c) => [c.channelId, c.messages]));
+
+    // The dual-schema message must count ONCE, not twice.
+    assert.equal(byChannel.get('discord:g:c'), 1);
+    // Single-schema channel counts correctly.
+    assert.equal(byChannel.get('top-chan'), 1);
+    // Genuinely separate messages under each schema still sum correctly.
+    assert.equal(byChannel.get('separate-chan'), 2);
+
+    // Total across all channels: 1 (dual, counted once) + 1 (top-only) + 2
+    // (separate) = 4, matching the 4 messages actually appended.
+    const total = counts.reduce((sum, c) => sum + c.messages, 0);
+    assert.equal(total, 4);
+
+    // queryByChannel and getChannelTokenStats were already correct before
+    // this fix (per the reviewer's repro) — pin that here too so a future
+    // regression in either would be caught alongside getChannelCounts.
+    assert.equal(messages.queryByChannel('discord:g:c').matchedCount, 1);
+    assert.equal(messages.getChannelTokenStats().byChannel.find((c) => c.channelId === 'discord:g:c')?.messages, 1);
 
     store.close();
   });

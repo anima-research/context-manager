@@ -1251,16 +1251,34 @@ export class MessageStore {
   }
 
   /**
-   * Distinct channel ids and their message counts — thin wrapper over the
-   * native value-count index for BOTH channel-id schemas this store
-   * maintains (see the dual-schema block comment on
-   * CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL), merged into one
-   * `channelId -> count` map by SUMMING counts per channelId across both
-   * indexes — safe because a given message contributes to at most one of
-   * the two indexes in the realistic case (it has one schema or the
-   * other); a message with both fields set to the same channelId would be
-   * a genuine ingestion anomaly counted twice, not worth guarding against
-   * here. O(index size) for each of the two indexes, no content decoding.
+   * Distinct channel ids and their message counts across BOTH channel-id
+   * schemas this store maintains (see the dual-schema block comment on
+   * CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL).
+   *
+   * Does NOT simply sum the two native value-count indexes' counts per
+   * channelId — a real, reachable ingestion path double-counts under that
+   * approach: agent-framework's `handleMcplChannelIncoming` PRESERVES any
+   * incoming `metadata.external` object it's handed while ALSO adding its
+   * own top-level `metadata.channelId`, so a message ingested from a
+   * source that already carried legacy `{external:{channelId}}` metadata
+   * ends up indexed under BOTH `CHANNEL_FIELD_TOP` and
+   * `CHANNEL_FIELD_EXTERNAL` for the SAME channelId — one real message,
+   * two index entries. Summing the two indexes' counts would report that
+   * message twice (2026-09 downstream review finding).
+   *
+   * Correct approach, reusing already-verified logic rather than inventing
+   * new merge math: `queryChannelOrdinals` already unions both indexes'
+   * ordinal sets via a `Set` for the exact same reason (queryByChannel
+   * already relies on this to avoid double-listing a dual-schema message)
+   * — so for each distinct channelId VALUE seen across either index's
+   * `getStateIndexValueCounts` (values only, not counts, from this first
+   * pass), re-query via `queryChannelOrdinals` and use the de-duplicated
+   * ordinal set's length as the true unique message count. This costs one
+   * extra native eq-query round-trip per distinct channel value instead of
+   * O(1) native value-count calls — acceptable since distinct channel
+   * counts are realistically small (tens, not millions) even at
+   * Mythos/Sol message-volume scale.
+   *
    * Messages with no channelId under either schema are unindexed for both
    * fields (see queryByChannel's doc) and so never appear here — they are
    * excluded, not folded into some `"undefined"` bucket.
@@ -1282,10 +1300,17 @@ export class MessageStore {
       CHANNEL_FIELD_EXTERNAL,
       'string',
     );
-    const merged = new Map<string, number>();
-    for (const vc of topCounts) merged.set(vc.value, (merged.get(vc.value) ?? 0) + vc.count);
-    for (const vc of externalCounts) merged.set(vc.value, (merged.get(vc.value) ?? 0) + vc.count);
-    return Array.from(merged.entries()).map(([channelId, messages]) => ({ channelId, messages }));
+    const distinctChannelIds = new Set<string>();
+    for (const vc of topCounts) distinctChannelIds.add(vc.value);
+    for (const vc of externalCounts) distinctChannelIds.add(vc.value);
+
+    return Array.from(distinctChannelIds).map((channelId) => ({
+      channelId,
+      // queryChannelOrdinals already unions both indexes' ordinal sets via
+      // a Set (see its own doc) — its length is the true unique count for
+      // this channelId, immune to the double-count a raw count-sum hits.
+      messages: this.queryChannelOrdinals(channelId).length,
+    }));
   }
 
   /**
