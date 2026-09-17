@@ -1,18 +1,31 @@
 /**
  * Tests for MessageStore's query-by-time/channel methods
  * (queryByTime/queryByChannel/queryByTimeAndChannel/getChannelCounts/
- * getChannelTokenStats), backed by chronicle's native `/timestamp` and
- * `/metadata/external/channelId` secondary field indexes
- * (registerStateFieldIndex/queryStateIndexRange/queryStateIndexEq/
- * getStateIndexValueCounts, 2026-09).
+ * getChannelTokenStats), backed by chronicle's native `/timestamp` field
+ * index and TWO channel-id field indexes (registerStateFieldIndex/
+ * queryStateIndexRange/queryStateIndexEq/getStateIndexValueCounts, 2026-09).
+ *
+ * The channel indexing is dual-schema (2026-09, downstream agent-framework
+ * review): real agent-framework MCPL ingestion (`handleMcplChannelIncoming`,
+ * `agent-framework/src/framework.ts`) writes `metadata.channelId` directly
+ * with no `external` nesting, while this codebase's own `MessageQuery` type
+ * documents an older `metadata.external.channelId` convention some other
+ * consumer may still rely on — both are indexed and every channel-query
+ * method merges results across them, since real Mythos/Sol-scale history
+ * carries months of data under whichever shape was actually in effect at
+ * ingestion time.
  *
  * Covers:
  *  - queryByTime inclusive gte/lte boundaries, open-ended bounds, reverse
- *  - queryByChannel exact match + no-match
+ *  - queryByChannel exact match + no-match, under EACH channel-id schema
+ *    individually and merged across both in one call
  *  - queryByTimeAndChannel intersection correctness (a message matching
- *    only one of the two filters must never appear)
- *  - getChannelCounts against a small multi-channel fixture
- *  - getChannelTokenStats totals matching a manual sum
+ *    only one of the two filters must never appear), including a query
+ *    spanning both channel-id schemas at once
+ *  - getChannelCounts against a small multi-channel fixture, including
+ *    counts merged/summed across both schemas
+ *  - getChannelTokenStats totals matching a manual sum, and bucketing
+ *    correctly regardless of which channel-id schema a message used
  *  - a message with no channelId in metadata: doesn't crash indexing or
  *    querying, and is excluded from channel-keyed results
  *  - graceful, specific-error degradation when the native capability is
@@ -176,6 +189,66 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     store.close();
   });
 
+  it('queryByChannel finds a message under the direct metadata.channelId schema (real agent-framework ingestion shape)', () => {
+    const { store, messages } = openStore();
+    // agent-framework's real handleMcplChannelIncoming (framework.ts)
+    // writes channelId directly on metadata, with serverId/messageId
+    // alongside it — NO `external` nesting at all. This is the schema the
+    // dual-index fix exists for.
+    messages.append('user', textBlock('direct-schema'), {
+      channelId: 'c1',
+      serverId: 's1',
+      messageId: 'm1',
+    });
+
+    const result = messages.queryByChannel('c1');
+    assert.deepEqual(result.messages.map(textOf), ['direct-schema']);
+    assert.equal(result.matchedCount, 1);
+
+    store.close();
+  });
+
+  it('queryByChannel still finds a message under the older metadata.external.channelId schema (no regression)', () => {
+    const { store, messages } = openStore();
+    messages.append('user', textBlock('external-schema'), { external: { channelId: 'c1' } });
+
+    const result = messages.queryByChannel('c1');
+    assert.deepEqual(result.messages.map(textOf), ['external-schema']);
+    assert.equal(result.matchedCount, 1);
+
+    store.close();
+  });
+
+  it('queryByChannel/getChannelCounts/getChannelTokenStats merge messages across BOTH channel-id schemas', () => {
+    const { store, messages } = openStore();
+    messages.append('user', textBlock('direct'), { channelId: 'shared', serverId: 's1', messageId: 'm1' });
+    messages.append('user', textBlock('nested'), { external: { channelId: 'shared' } });
+    messages.append('user', textBlock('other-channel-direct'), { channelId: 'other' });
+
+    // queryByChannel: both 'shared' messages found regardless of schema.
+    const shared = messages.queryByChannel('shared');
+    assert.deepEqual(shared.messages.map(textOf).sort(), ['direct', 'nested']);
+    assert.equal(shared.matchedCount, 2);
+
+    // getChannelCounts: counts summed across both native indexes.
+    const counts = messages.getChannelCounts();
+    const sortedCounts = [...counts].sort((a, b) => a.channelId.localeCompare(b.channelId));
+    assert.deepEqual(sortedCounts, [
+      { channelId: 'other', messages: 1 },
+      { channelId: 'shared', messages: 2 },
+    ]);
+
+    // getChannelTokenStats: bucketed correctly regardless of which schema
+    // each message used.
+    const stats = messages.getChannelTokenStats();
+    assert.equal(stats.totalMessages, 3);
+    const byChannel = new Map(stats.byChannel.map((c) => [c.channelId, c]));
+    assert.equal(byChannel.get('shared')?.messages, 2);
+    assert.equal(byChannel.get('other')?.messages, 1);
+
+    store.close();
+  });
+
   it('a message with no channelId does not crash indexing/querying and is excluded from channel results', () => {
     const { store, messages } = openStore();
     messages.append('user', textBlock('has-channel'), { external: { channelId: 'c1' } });
@@ -244,6 +317,22 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     // [50,500] query above), m3 (t=200)]. offset:1 skips m0, limit:1 takes m2.
     assert.deepEqual(paged.messages.map(textOf), ['m2']);
     assert.equal(paged.matchedCount, 3); // true total, not page size
+
+    store.close();
+  });
+
+  it('queryByTimeAndChannel finds matches from BOTH channel-id schemas in one query', () => {
+    const { store, messages } = openStore();
+    messages.append('user', textBlock('direct-in-range'), { channelId: 'c1' });
+    messages.append('user', textBlock('nested-in-range'), { external: { channelId: 'c1' } });
+    messages.append('user', textBlock('direct-out-of-range'), { channelId: 'c1' });
+    setTimestamp(store, 'messages', 0, 100);
+    setTimestamp(store, 'messages', 1, 200);
+    setTimestamp(store, 'messages', 2, 9999);
+
+    const result = messages.queryByTimeAndChannel({ fromMs: 0, toMs: 500, channelId: 'c1' });
+    assert.deepEqual(result.messages.map(textOf).sort(), ['direct-in-range', 'nested-in-range']);
+    assert.equal(result.matchedCount, 2);
 
     store.close();
   });
