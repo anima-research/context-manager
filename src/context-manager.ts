@@ -13,6 +13,13 @@ import type {
   StrategyContext,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
   ContextInjection,
   CompileResult,
   ProtectedRange,
@@ -496,6 +503,51 @@ export class ContextManager {
   findMessageByExternalId(source: string, externalId: string): MessageId | null {
     const msg = this.messageStore.findByExternalId(source, externalId);
     return msg?.id ?? null;
+  }
+
+  /**
+   * Query messages by timestamp range — O(log n + k) via chronicle's native
+   * `/timestamp` secondary index, not a full scan. Throws if the underlying
+   * chronicle build predates the field-index capability. See
+   * MessageStore.queryByTime for the exact semantics (inclusive bounds,
+   * page-size-only `matchedCount`).
+   */
+  queryMessagesByTime(opts: TimeRangeQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByTime(opts);
+  }
+
+  /**
+   * Query messages by exact external channel id — via chronicle's native
+   * `/metadata/external/channelId` secondary index. See
+   * MessageStore.queryByChannel.
+   */
+  queryMessagesByChannel(channelId: string, opts?: ChannelQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByChannel(channelId, opts);
+  }
+
+  /**
+   * Query messages matching both a timestamp range and a channel. See
+   * MessageStore.queryByTimeAndChannel for why this needs the two native
+   * ordinal sets fetched uncapped and intersected before paginating.
+   */
+  queryMessagesByTimeAndChannel(opts: TimeAndChannelQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByTimeAndChannel(opts);
+  }
+
+  /**
+   * Distinct channel ids and their message counts, native and instant
+   * (O(index size), no content decoding). See MessageStore.getChannelCounts.
+   */
+  getChannelMessageCounts(): ChannelCount[] {
+    return this.messageStore.getChannelCounts();
+  }
+
+  /**
+   * Aggregate message counts and token estimates by channel, optionally
+   * restricted to a timestamp range. See MessageStore.getChannelTokenStats.
+   */
+  getChannelTokenStats(opts?: ChannelTokenStatsOptions): ChannelTokenStats {
+    return this.messageStore.getChannelTokenStats(opts);
   }
 
   // ==========================================================================

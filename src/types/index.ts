@@ -10,6 +10,14 @@ export type {
   StoredMessageInternal,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenBreakdown,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
 } from './message.js';
 
 // Context types
