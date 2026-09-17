@@ -1205,23 +1205,37 @@ export class MessageStore {
 
   /**
    * Per-ordinal cache for getChannelTokenStats, keyed by ordinal (branch
-   * identity is tracked separately — see tokenStatsCacheBranch — rather
+   * identity is tracked separately — see tokenStatsCacheBranchId — rather
    * than folded into the key, since this cache is cheap enough to just
    * wipe wholesale on a branch change instead of carrying dead entries for
    * branches no longer in use).
    *
-   * Caches the RAW (calibration-independent) token estimate — mirroring
-   * the estimateBlockTokensRaw/estimateBlockTokens split above — NOT the
-   * calibrated one. `estimateTokens` bakes in the mutable
-   * `tokenCalibration` multiplier (see setTokenCalibration), and caching
-   * ITS output would freeze each entry at whatever calibration was in
-   * effect when first computed — silently mixing calibration generations
-   * within one aggregate response, since `setTokenCalibration` is called
-   * during normal operation (the autobiographical strategy's closed-loop
-   * calibration), not just in synthetic tests. Calibration is applied at
-   * READ time instead (see getChannelTokenStats), so every entry always
-   * reflects the CURRENT calibration with no invalidation needed when it
-   * changes.
+   * Caches the RAW (calibration-independent) token estimate PER TOP-LEVEL
+   * CONTENT BLOCK, not pre-summed for the whole message — mirroring the
+   * estimateBlockTokensRaw/estimateBlockTokens split above, and critically
+   * matching `estimateTokens`' own per-block round-then-sum order: summing
+   * raw block values first and rounding once for the whole message
+   * (`round(sum(raw) * factor)`) is NOT generally equal to summing
+   * individually-rounded calibrated block estimates
+   * (`sum(round(raw * factor))`) for a fractional calibration factor and a
+   * multi-block message — e.g. two 1-token raw blocks at calibration 0.6:
+   * round(2 * 0.6) = 1, but round(1*0.6) + round(1*0.6) = 1 + 1 = 2, which
+   * is what a live `estimateTokens` call actually returns. Storing
+   * `rawBlockEstimates` and replaying the exact same per-block
+   * round-then-sum at read time (see getChannelTokenStats) keeps the
+   * cached and live paths in agreement for every message, not just
+   * single-block ones.
+   *
+   * Values are NOT the calibrated estimate either, for the same reason:
+   * `estimateTokens` bakes in the mutable `tokenCalibration` multiplier
+   * (see setTokenCalibration), and caching ITS output would freeze each
+   * entry at whatever calibration was in effect when first computed —
+   * silently mixing calibration generations within one aggregate response,
+   * since `setTokenCalibration` is called during normal operation (the
+   * autobiographical strategy's closed-loop calibration), not just in
+   * synthetic tests. Calibration is applied at READ time instead (see
+   * getChannelTokenStats), so every entry always reflects the CURRENT
+   * calibration with no invalidation needed when it changes.
    *
    * `channelId: undefined` means "looked up, has no (valid string)
    * channel" (still cached, so a range full of unchanneled messages
@@ -1244,29 +1258,35 @@ export class MessageStore {
    * filled lazily only for ordinals actually requested.
    *
    * KNOWN SIMPLIFICATION, not a bug: entries are never evicted or
-   * write-through'd on edit/remove within a branch — each entry is two
-   * tiny scalars, not message content, so this stays cheap even at
-   * hundreds of thousands of messages, nothing like the content-bearing
+   * write-through'd on edit/remove within a branch — each entry is a
+   * handful of tiny scalars, not message content, so this stays cheap even
+   * at hundreds of thousands of messages, nothing like the content-bearing
    * allCache this file guards so carefully elsewhere. Acceptable for a
    * stats/reporting API; revisit if a caller ever needs exactness across
    * live edits.
    */
-  private tokenStatsCache = new Map<number, { channelId: string | undefined; rawTokenEstimate: number }>();
+  private tokenStatsCache = new Map<number, { channelId: string | undefined; rawBlockEstimates: number[] }>();
 
   /**
-   * Branch this cache was last warmed on — checked and enforced at the top
-   * of getChannelTokenStats. Ordinals are branch-relative (chronicle's
-   * native `/timestamp`/`/metadata/external/channelId` field indexes are
-   * branch-aware and self-heal across a `switchBranch` as of chronicle
-   * 0.4.0), so a cached ordinal→message mapping from one branch isn't just
-   * STALE on another, it's WRONG: a diverged branch can reuse the exact
-   * same ordinal for a completely different message. Wholesale-cleared on
-   * any detected branch change, mirroring lookupIndex/rebuildIndex's
-   * existing indexBranch pattern elsewhere in this file (comparing a
-   * tracked branch name against `store.currentBranch().name`) rather than
-   * keying every cache entry by branch.
+   * Branch this cache was last warmed on, tracked by branch ID (NOT name)
+   * — checked and enforced at the top of getChannelTokenStats. Chronicle
+   * branch names are reusable: a non-current branch can be deleted and a
+   * different branch created under the SAME name afterward, but branch ids
+   * are never reused (same reasoning chronicle's own native field-index
+   * fix uses for its own branch scoping — see registerStateFieldIndex's
+   * doc in node_modules/@animalabs/chronicle/index.d.ts). A name-keyed
+   * check would miss exactly that delete-and-recreate-under-the-same-name
+   * case: the name comparison would see no change and never clear a cache
+   * that in fact belongs to a branch that no longer exists. Ordinals are
+   * branch-relative (chronicle's native `/timestamp`/
+   * `/metadata/external/channelId` field indexes are branch-aware and
+   * self-heal across a `switchBranch` as of chronicle 0.4.0), so a cached
+   * ordinal→message mapping from one branch isn't just STALE on another,
+   * it's WRONG: a diverged branch can reuse the exact same ordinal for a
+   * completely different message. Wholesale-cleared on any detected
+   * branch-id change rather than keying every cache entry by branch.
    */
-  private tokenStatsCacheBranch = '';
+  private tokenStatsCacheBranchId = '';
 
   /**
    * Runtime-validated channelId extraction for the token-stats cache: the
@@ -1303,14 +1323,15 @@ export class MessageStore {
    * read time — see tokenStatsCache's doc for why.
    */
   getChannelTokenStats(opts: ChannelTokenStatsOptions = {}): ChannelTokenStats {
-    // Branch-scope the cache before touching it (see tokenStatsCacheBranch):
-    // a stale-branch cache is not just outdated but wrong (ordinal reuse
-    // across diverged branches), so this must be a hard wipe, not a lazy
-    // per-entry revalidation.
-    const currentBranch = this.store.currentBranch().name;
-    if (currentBranch !== this.tokenStatsCacheBranch) {
+    // Branch-scope the cache before touching it, by ID (see
+    // tokenStatsCacheBranchId — NOT name, which chronicle allows reusing
+    // after a delete): a stale-branch cache is not just outdated but wrong
+    // (ordinal reuse across diverged branches), so this must be a hard
+    // wipe, not a lazy per-entry revalidation.
+    const currentBranchId = this.store.currentBranch().id;
+    if (currentBranchId !== this.tokenStatsCacheBranchId) {
       this.tokenStatsCache.clear();
-      this.tokenStatsCacheBranch = currentBranch;
+      this.tokenStatsCacheBranchId = currentBranchId;
     }
 
     const ordinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
@@ -1331,17 +1352,20 @@ export class MessageStore {
         // estimateTokens is used everywhere else in this file (getAll()'s
         // default).
         const stored = this.internalToStored(internal, internal.id, ordinal, true);
-        const rawTokenEstimate = stored.content.reduce(
-          (sum, block) => sum + this.estimateBlockTokensRaw(block),
-          0,
-        );
-        cached = { channelId, rawTokenEstimate };
+        const rawBlockEstimates = stored.content.map((block) => this.estimateBlockTokensRaw(block));
+        cached = { channelId, rawBlockEstimates };
         this.tokenStatsCache.set(ordinal, cached);
       }
-      // Calibration applied HERE, every call, from the cached raw value —
-      // never baked into the cached number itself (see tokenStatsCache's
-      // doc). Matches estimateBlockTokens' own round(raw * calibration).
-      const tokenEstimate = Math.round(cached.rawTokenEstimate * this.tokenCalibration);
+      // Calibration applied HERE, every call, PER BLOCK then summed — never
+      // baked into the cached numbers themselves (see tokenStatsCache's
+      // doc), and never pre-summed-then-rounded-once: this replays
+      // estimateBlockTokens' own round(raw * calibration) for each cached
+      // raw block value and sums the results, exactly matching what a live
+      // estimateTokens(message) call computes for the same content.
+      const tokenEstimate = cached.rawBlockEstimates.reduce(
+        (sum, raw) => sum + Math.round(raw * this.tokenCalibration),
+        0,
+      );
       totalMessages++;
       totalTokensEstimate += tokenEstimate;
       if (cached.channelId !== undefined) {

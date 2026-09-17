@@ -357,6 +357,50 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     store.close();
   });
 
+  it('getChannelTokenStats does not leak cached data across a branch DELETE + RECREATE under the same name (P2 regression)', () => {
+    const { store, messages } = openStore();
+    const mainName = store.currentBranch().name;
+
+    // Shared base message on main.
+    messages.append('user', textBlock('base'), { external: { channelId: 'shared' } });
+
+    // Create + switch to 'side' (branch id 2, say) and diverge it.
+    store.createBranch('side');
+    store.switchBranch('side');
+    messages.append('user', textBlock('deleted-branch-msg'), { external: { channelId: 'deleted-branch' } });
+
+    // Warm the cache on THIS 'side' — it's about to be deleted.
+    const warmed = messages.getChannelTokenStats();
+    assert.equal(warmed.totalMessages, 2);
+
+    // Back to main, diverge differently, then delete 'side' and create a
+    // DIFFERENT branch under the exact same name (a new branch id, forked
+    // from main's now-2-message state) — the name is reused, the id isn't.
+    store.switchBranch(mainName);
+    messages.append('user', textBlock('replacement-branch-msg'), { external: { channelId: 'replacement-branch' } });
+    store.deleteBranch('side');
+    store.createBranch('side');
+    store.switchBranch('side');
+
+    // Native, always-fresh ground truth for the CURRENT (new) 'side'.
+    const counts = messages.getChannelCounts();
+    assert.deepEqual(
+      counts.map((c) => c.channelId).sort(),
+      ['replacement-branch', 'shared'],
+    );
+
+    // A name-only branch check would see 'side' === 'side' and never
+    // invalidate — the cache must key off branch ID instead, so the OLD
+    // (deleted) branch's cached data must not leak here just because the
+    // new branch happens to share its name.
+    const stats = messages.getChannelTokenStats();
+    const byChannel = new Map(stats.byChannel.map((c) => [c.channelId, c]));
+    assert.ok(!byChannel.has('deleted-branch'), 'stale deleted-branch data leaked via branch-name reuse');
+    assert.ok(byChannel.has('replacement-branch'), 'current branch data missing');
+
+    store.close();
+  });
+
   it('getChannelTokenStats reflects a calibration change on the very next call, no invalidation needed (P2 regression)', () => {
     const { store, messages } = openStore();
     const msg = messages.append('user', textBlock('0123456789'), { external: { channelId: 'c1' } });
@@ -371,6 +415,34 @@ describe('MessageStore — native history index (time/channel queries)', () => {
     const after = messages.getChannelTokenStats();
     assert.equal(after.totalTokensEstimate, rawEstimate * 2);
     assert.equal(after.byChannel[0]?.tokensEstimate, rawEstimate * 2);
+
+    store.close();
+  });
+
+  it('getChannelTokenStats replays per-block round-then-sum, not sum-then-round-once, at a fractional calibration (P3 regression)', () => {
+    const { store, messages } = openStore();
+    // Two single-character text blocks: each estimates to raw ~1 token
+    // under the default estimator, so a 0.6 calibration exercises the
+    // exact round(1*0.6)+round(1*0.6)=2 vs round(2*0.6)=1 discrepancy the
+    // reviewer's repro relies on.
+    const msg = messages.append(
+      'user',
+      [
+        { type: 'text', text: 'a' },
+        { type: 'text', text: 'b' },
+      ],
+      { external: { channelId: 'c1' } },
+    );
+
+    // Warm the cache at the default calibration (1).
+    messages.getChannelTokenStats();
+
+    messages.setTokenCalibration(0.6);
+    const live = messages.estimateTokens(msg);
+    const stats = messages.getChannelTokenStats();
+
+    assert.equal(stats.totalTokensEstimate, live);
+    assert.equal(stats.byChannel[0]?.tokensEstimate, live);
 
     store.close();
   });
