@@ -729,3 +729,149 @@ test('kv-unified label count stays bounded under a stale half-covering presentat
   assert.ok(fullLabels <= freshLabels, `fully stale ${fullLabels} vs fresh ${freshLabels}`);
   assert.ok(halfStale.selected.renderedTokens <= options.maxTokens);
 });
+
+test('kv-unified keeps extension as a priced dominance dimension under a relevant cache (#98 review)', () => {
+  // Three chronological chunks a, b, c (100 raw tokens, 20-token L1 each).
+  // The accepted presentation and the relevant cache cover raw a and b with a
+  // marker after b; c is extension. a is constrained to L1, so every cut
+  // diverges from the cached layout at unit 0 and the whole render is
+  // recomputed; the cache term then differs between cuts only through how
+  // much of the recompute is unavoidable extension. [1,0,1] beats [1,1,0] on
+  // fidelity and continuity but folds the new chunk (20 extension tokens vs
+  // 100), so its cache churn is higher. Dominance that ignores extension
+  // prunes [1,1,0] and the solver returns [1,1,1] with a reported zero error.
+  const build = () => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    const b = chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    const c = chronicle.addChunk({ id: 'c', rawTokens: 100 });
+    a.salience = 0.2; b.salience = 0.4; c.salience = 0.2;
+    a.pinLevel = 1;
+    chronicle.produceL1(['a']);
+    chronicle.produceL1(['b']);
+    chronicle.produceL1(['c']);
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks,
+      summaries: chronicle.summaries,
+      recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0,
+      tailTokens: 0,
+      headChunkIds: new Set(),
+      tailChunkIds: new Set(),
+    };
+    return inputs;
+  };
+  const presentation: AcceptedPresentationReference = {
+    currentSeq: 1,
+    leaves: new Map([
+      ['a', { repHash: 'raw:a', level: 0, lastChangedSeq: 0 }],
+      ['b', { repHash: 'raw:b', level: 0, lastChangedSeq: 0 }],
+    ]),
+  };
+  const cache = {
+    immutablePrefixHash: 'tools-v1',
+    layout: {
+      units: [
+        { kind: 'raw' as const, key: 'a', tokens: 100, offset: 0 },
+        { kind: 'raw' as const, key: 'b', tokens: 100, offset: 100 },
+      ],
+      totalTokens: 200,
+    },
+    markers: [{ unitIndex: 2, offset: 200 }],
+  };
+  const base = {
+    maxTokens: 140,
+    presentation,
+    cache,
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 0,
+      continuityLambda: 0,
+      cacheLambda: 10_000,
+      cacheScale: 100,
+    },
+  } as const;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    ['a', 'b', 'c'].map((id) => `${id}:${candidate.frontier.get(id) ?? 0}`).join('|');
+  const oracle = new ExactKvUnifiedPolicySolver(build()).solve({ ...base, candidateSource: 'recursive' });
+  assert.equal(oracle.feasible, true);
+  if (!oracle.feasible) return;
+  assert.equal(signature(oracle.selected), 'a:1|b:1|c:0');
+  for (const buckets of [
+    { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 },
+    { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 },
+  ]) {
+    const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...buckets });
+    assert.equal(result.feasible, true);
+    if (!result.feasible) return;
+    assert.equal(
+      signature(result.selected),
+      signature(oracle.selected),
+      `buckets ${buckets.tokenBucketSize}: selected ${signature(result.selected)}`,
+    );
+    assert.equal(result.selected.score, oracle.selected.score);
+    assert.ok(
+      result.selected.score - oracle.selected.score <=
+        (result.propagation?.approximationScoreErrorBound ?? -1) + 1e-9,
+    );
+  }
+});
+
+test('kv-unified label count stays bounded under a stale presentation with a relevant cache (#97)', () => {
+  // Same forest as the no-cache growth test, but the stale receipt also
+  // carries a relevant provider cache, so extension is priced and is a
+  // dominance dimension. The count must still be bounded (representatives
+  // per bucket group cap it) and the reported error bound must be honest.
+  const chronicle = buildChronicleWithChain({
+    chunkCount: 24,
+    tokensPerChunk: 100,
+    mergeThreshold: 2,
+    recallPairTokens: 40,
+  });
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks.map((chunk, index) => ({ ...chunk, rawTokens: 60 + ((index * 29) % 70) })),
+    summaries: chronicle.summaries,
+    recallPairTokens: new Map(
+      [...chronicle.recallPairTokens].map(([id, tokens], index) => [id, tokens + ((index * 11) % 30)]),
+    ),
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+  const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
+  const older = ordered.slice(0, ordered.length / 2);
+  const presentation: AcceptedPresentationReference = {
+    currentSeq: 1,
+    leaves: new Map(older.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }])),
+  };
+  let offset = 0;
+  const units = older.map((chunk) => {
+    const unit = { kind: 'raw' as const, key: chunk.id, tokens: chunk.rawTokens, offset };
+    offset += chunk.rawTokens;
+    return unit;
+  });
+  const rawTotal = inputs.chunks.reduce((sum, chunk) => sum + chunk.rawTokens, 0);
+  const options = {
+    maxTokens: Math.floor(rawTotal * 0.75),
+    tokenBucketSize: 100,
+    continuityBucketSize: 100,
+    fidelityBucketSize: 100,
+    labelCeiling: 200_000,
+    presentation,
+    cache: { immutablePrefixHash: 'tools-v1', layout: { units, totalTokens: offset }, markers: [{ unitIndex: units.length, offset }] },
+  } as const;
+  const noCache = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
+  const withCache = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, currentImmutablePrefixHash: 'tools-v1' });
+  assert.equal(noCache.feasible, true);
+  assert.equal(withCache.feasible, true);
+  if (!noCache.feasible || !withCache.feasible) return;
+  const noCacheLabels = noCache.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  const withCacheLabels = withCache.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  assert.ok(withCacheLabels <= noCacheLabels * 3, `with cache ${withCacheLabels} vs without ${noCacheLabels}`);
+  assert.equal(withCache.cacheRelevant, true);
+  assert.ok((withCache.propagation?.approximationCacheErrorBound ?? -1) >= 0);
+  assert.ok((withCache.propagation?.approximationScoreErrorBound ?? -1) >= 0);
+});

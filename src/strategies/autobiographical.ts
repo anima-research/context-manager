@@ -7799,14 +7799,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (resolutionsChanged && !dryRun) {
       this.persistResolutions();
     }
-    // A real presentation by a non-kv-unified strategy: the persisted
-    // kv-unified receipt no longer describes the previous turn (#97). This is
-    // independent of whether any resolution changed — a no-op compile is
-    // still a presentation.
-    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
-      this.supersedeKvUnifiedReceipt();
-    }
-
     // Wire produce ops into the strategy's own production queues so that
     // requested-but-not-yet-existing summaries actually get built. The
     // speculative pre-producer covers most cases ambiently, but when it is
@@ -8237,6 +8229,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
       rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
     this._calibrationArmed = true; // exactly one sample per compile
+    // A real presentation by a non-kv-unified strategy has now succeeded (the
+    // hard-budget check, emission and structural repair above all throw on
+    // failure), so the persisted kv-unified receipt no longer describes the
+    // previous turn (#97). Independent of whether any resolution changed — a
+    // no-op compile is still a presentation. A failed compile keeps the
+    // receipt: nothing replaced it.
+    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
+      this.supersedeKvUnifiedReceipt();
+    }
     return merged;
   }
 
