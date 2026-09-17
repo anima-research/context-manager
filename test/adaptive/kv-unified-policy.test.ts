@@ -664,9 +664,10 @@ test('kv-unified infeasibility demands missing L1s instead of deadlocking', () =
 test('kv-unified label count stays bounded under a stale half-covering presentation (#97)', () => {
   // A presentation receipt that covers only the older half of the live leaves
   // (a kv-stable -> kv-unified switch, a restore, a history import) must not
-  // multiply the Pareto label set: extension tokens feed only the cache term,
-  // so they may distinguish labels only while a cache is relevant, and then
-  // only at token-bucket resolution.
+  // multiply the Pareto label set. Extension tokens are no longer part of the
+  // label state at all: nothing in dominance or pricing reads them from the
+  // label (the cache-churn term recomputes extension from the rendered
+  // layout), so keying on them only split labels that should have collapsed.
   const chronicle = buildChronicleWithChain({
     chunkCount: 24,
     tokensPerChunk: 100,
@@ -722,29 +723,9 @@ test('kv-unified label count stays bounded under a stale half-covering presentat
   const halfLabels = halfStale.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
   const fullLabels = fullyStale.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
   // Before the fix: fresh 14,256 / half-stale 60,791 (4.3x) / fully stale 41,714.
-  // The residual over fresh is continuity-loss bucketing, not extension keys.
+  // The residual over fresh is continuity-loss bucketing (the presentation
+  // still prices continuity), not extension keys.
   assert.ok(halfLabels <= freshLabels * 2, `half-stale ${halfLabels} vs fresh ${freshLabels}`);
   assert.ok(fullLabels <= freshLabels, `fully stale ${fullLabels} vs fresh ${freshLabels}`);
   assert.ok(halfStale.selected.renderedTokens <= options.maxTokens);
-});
-
-test('kv-unified keeps exact extension keys when a relevant cache is priced', () => {
-  // With a relevant cache the extension total is part of the priced state, so
-  // labels that differ in it are still kept apart (at bucket resolution).
-  const { inputs } = fixture();
-  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
-  const presentation = rawPresentation(inputs);
-  const result = new ParetoKvUnifiedPolicySolver(inputs).solve({
-    maxTokens: 250,
-    tokenBucketSize: 100,
-    continuityBucketSize: 100,
-    fidelityBucketSize: 100,
-    presentation,
-    cache: { immutablePrefixHash: 'stable-tools', layout: rawLayout, markers: [] },
-    currentImmutablePrefixHash: 'stable-tools',
-  });
-  assert.equal(result.feasible, true);
-  if (!result.feasible) return;
-  assert.ok(result.selected.renderedTokens <= 250);
-  assert.ok((result.propagation?.labelsCreated ?? 0) > 0);
 });

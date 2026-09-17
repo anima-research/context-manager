@@ -32,7 +32,6 @@ interface ParetoLabel {
   active: boolean;
   remaining: bigint;
   renderedTokens: number;
-  extensionTokens: number;
   continuityLoss: number;
   fidelityLoss: number;
   cache: CacheState;
@@ -151,7 +150,6 @@ export class ParetoKvUnifiedPolicySolver {
       active: true,
       remaining,
       renderedTokens: 0,
-      extensionTokens: 0,
       continuityLoss: 0,
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
@@ -160,7 +158,7 @@ export class ParetoKvUnifiedPolicySolver {
       approximation: ZERO_APPROXIMATION,
     };
     if (this.inputs.headTokens > 0) {
-      initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, false, options, markerByUnit);
+      initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, options, markerByUnit);
     }
 
     const ceiling = options.labelCeiling ?? 1_000_000;
@@ -175,7 +173,7 @@ export class ParetoKvUnifiedPolicySolver {
     let maxLabelsPerState = 0;
     const insert = (label: ParetoLabel): void => {
       if (label.renderedTokens > options.maxTokens) return;
-      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize, cacheRelevant);
+      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
       const current = states.get(key) ?? [];
       for (const incumbent of current) {
         if (dominates(incumbent, label)) {
@@ -206,7 +204,7 @@ export class ParetoKvUnifiedPolicySolver {
       if (label.remaining === 0n) {
         let finished = label;
         if (this.inputs.tailTokens > 0) {
-          finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, false, options, markerByUnit);
+          finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, options, markerByUnit);
         }
         if (finished.renderedTokens <= options.maxTokens) {
           terminal.push({ frontier: reconstructFrontier(finished.trace), renderedTokens: finished.renderedTokens });
@@ -218,7 +216,7 @@ export class ParetoKvUnifiedPolicySolver {
       const leaf = this.leaves[oldest];
       if (leaf.allowedLevels.includes(0)) {
         const next = this.assign(label, [leaf.id], 0, policy, options);
-        insert(this.emit(next, 'raw', leaf.id, leaf.rawTokens, this.isExtension([leaf.id], options), options, markerByUnit));
+        insert(this.emit(next, 'raw', leaf.id, leaf.rawTokens, options, markerByUnit));
       }
       for (const summaryId of leaf.summaryIds) {
         const summary = this.forest.summary(summaryId)!;
@@ -238,7 +236,7 @@ export class ParetoKvUnifiedPolicySolver {
         }
         if (overlap || (mask & bit(oldest)) === 0n) continue;
         const next = this.assign(label, participants, summary.level, policy, options);
-        insert(this.emit(next, 'recall', summary.id, summary.recallTokens, this.isExtension(summary.leafIds, options), options, markerByUnit));
+        insert(this.emit(next, 'recall', summary.id, summary.recallTokens, options, markerByUnit));
       }
     }
 
@@ -297,7 +295,6 @@ export class ParetoKvUnifiedPolicySolver {
       active: true,
       remaining: 0n,
       renderedTokens: 0,
-      extensionTokens: 0,
       continuityLoss: 0,
       fidelityLoss: 0,
       cache: { intact: cacheRelevant, matchedUnits: 0, cachedTokens: 0 },
@@ -306,7 +303,7 @@ export class ParetoKvUnifiedPolicySolver {
       approximation: ZERO_APPROXIMATION,
     };
     if (this.inputs.headTokens > 0) {
-      initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, false, options, markerByUnit);
+      initial = this.emit(initial, 'head', 'head', this.inputs.headTokens, options, markerByUnit);
     }
     const ceiling = options.labelCeiling ?? 1_000_000;
     const tokenBucketSize = Math.max(0, Math.floor(options.tokenBucketSize ?? 0));
@@ -322,7 +319,7 @@ export class ParetoKvUnifiedPolicySolver {
       const groups = new Map<string, ParetoLabel[]>();
       for (const label of labels) {
         if (label.renderedTokens > options.maxTokens) continue;
-        const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize, cacheRelevant);
+        const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
         const current = groups.get(key);
         if (current) current.push(label);
         else groups.set(key, [label]);
@@ -381,7 +378,6 @@ export class ParetoKvUnifiedPolicySolver {
             'recall',
             summary.id,
             summary.recallTokens,
-            this.isExtension(summary.leafIds, options),
             options,
             markerByUnit,
           );
@@ -433,7 +429,6 @@ export class ParetoKvUnifiedPolicySolver {
             'raw',
             leaf.id,
             leaf.rawTokens,
-            this.isExtension([leaf.id], options),
             options,
             markerByUnit,
           ));
@@ -455,7 +450,6 @@ export class ParetoKvUnifiedPolicySolver {
           'tail',
           'tail',
           this.inputs.tailTokens,
-          false,
           options,
           markerByUnit,
         );
@@ -631,9 +625,8 @@ export class ParetoKvUnifiedPolicySolver {
     };
   }
 
-  private emit(label: ParetoLabel, kind: 'head' | 'raw' | 'recall' | 'tail', key: string, tokens: number, extension: boolean, options: ExactPolicySolveOptions, markerByUnit: ReadonlyMap<number, number>): ParetoLabel {
+  private emit(label: ParetoLabel, kind: 'head' | 'raw' | 'recall' | 'tail', key: string, tokens: number, options: ExactPolicySolveOptions, markerByUnit: ReadonlyMap<number, number>): ParetoLabel {
     const renderedTokens = label.renderedTokens + tokens;
-    const extensionTokens = label.extensionTokens + (extension ? tokens : 0);
     if (
       this.bufferGapEmissions &&
       label.cache.intact &&
@@ -646,7 +639,6 @@ export class ParetoKvUnifiedPolicySolver {
         ...label,
         active: true,
         renderedTokens,
-        extensionTokens,
         pendingEmissions: [...label.pendingEmissions, { kind, key, tokens, sequence }],
       };
     }
@@ -659,7 +651,7 @@ export class ParetoKvUnifiedPolicySolver {
         if (marker !== undefined) cache.cachedTokens = marker;
       } else cache.intact = false;
     }
-    return { ...label, active: true, renderedTokens, extensionTokens, cache };
+    return { ...label, active: true, renderedTokens, cache };
   }
 
   private flushPendingEmissions(
@@ -742,7 +734,6 @@ export class ParetoKvUnifiedPolicySolver {
           'raw',
           id,
           leaf.rawTokens,
-          this.isExtension([id], options),
           options,
           markerByUnit,
         );
@@ -750,23 +741,14 @@ export class ParetoKvUnifiedPolicySolver {
       return next;
     }
     let tokens = 0;
-    let extensionTokens = 0;
-    for (const id of ids) {
-      const leafTokens = this.forest.leaf(id)!.rawTokens;
-      tokens += leafTokens;
-      if (this.isExtension([id], options)) extensionTokens += leafTokens;
-    }
+    for (const id of ids) tokens += this.forest.leaf(id)!.rawTokens;
     return {
       ...label,
       active: true,
       renderedTokens: label.renderedTokens + tokens,
-      extensionTokens: label.extensionTokens + extensionTokens,
     };
   }
 
-  private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {
-    return options.presentation !== undefined && ids.length > 0 && ids.every((id) => !options.presentation!.leaves.has(id));
-  }
 }
 
 function stateKey(
@@ -774,27 +756,21 @@ function stateKey(
   tokenBucketSize: number,
   continuityBucketSize: number,
   fidelityBucketSize: number,
-  cacheRelevant: boolean,
 ): string {
   const tokenKey = tokenBucketSize > 0
     ? Math.ceil(label.renderedTokens / tokenBucketSize)
     : label.renderedTokens;
-  // Extension tokens feed only the cache-churn term (avoidable recompute =
-  // recomputed - extension), so they distinguish labels only while a provider
-  // cache is relevant, and then only at the token-bucket resolution. Keying
-  // on the exact value multiplied the live label set by the number of
-  // distinct extension sums: a presentation receipt that covers half of the
-  // live leaves (a kv-stable -> kv-unified switch) made the count superlinear
-  // in forest size and exhausted the ceiling (#97).
-  const extensionKey = !cacheRelevant
-    ? 'e*'
-    : tokenBucketSize > 0
-      ? Math.ceil(label.extensionTokens / tokenBucketSize)
-      : label.extensionTokens;
+  // Only quantities that dominance or pricing consult belong in the key.
+  // Extension tokens (rendered tokens not covered by the accepted
+  // presentation) used to be keyed here exactly although nothing read them:
+  // the cache-churn term recomputes extension from the rendered layout, and
+  // dominates() never looked at them. A presentation receipt covering half of
+  // the live leaves (a kv-stable -> kv-unified switch) then multiplied the
+  // live label set by the number of distinct extension sums, superlinear in
+  // forest size, and exhausted the ceiling (#97).
   return [
     label.remaining.toString(16),
     tokenKey,
-    extensionKey,
     label.cache.intact ? 1 : 0,
     label.cache.matchedUnits,
     label.cache.cachedTokens,

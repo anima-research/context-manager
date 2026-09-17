@@ -1080,6 +1080,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
+  /** A persisted kv-unified receipt was found while loading under another
+   * folding strategy; superseded at this strategy's first presentation. */
+  private kvUnifiedReceiptSupersedePending = false;
   private kvUnifiedDraft: {
     leaves: Map<ChunkId, PresentedLeaf>;
     layout: RenderLayout;
@@ -1834,15 +1837,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       } catch { /* already registered */ }
     }
-    // Registered for every folding strategy: a non-kv-unified presenter must
-    // be able to supersede a receipt left behind by kv-unified (see
-    // loadPersistedState), not just kv-unified itself.
-    try {
-      this.store.registerState({
-        id: this.kvUnifiedReceiptStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
+    if (this.config.foldingStrategy === 'kv-unified') {
+      try {
+        this.store.registerState({
+          id: this.kvUnifiedReceiptStateId,
+          strategy: 'snapshot',
+        });
+      } catch { /* already registered */ }
+    }
     try {
       this.store.registerState({
         id: this.counterStateId,
@@ -2064,22 +2066,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedPendingImmutablePrefixHash = null;
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
-      // presentation. Once another folding strategy presents from this store
+      // presentation. Once another folding strategy PRESENTS from this store
       // the receipt no longer describes the previous turn, and a later switch
-      // back would measure continuity against a days-old baseline and, worse,
-      // treat everything folded since as "extension" — which made the Pareto
-      // label count superlinear and hard-downed a resident (#97). Supersede it
-      // now; the switch back then starts from an empty chain (one cold-cache
-      // turn, as the migration runbook already expects).
-      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
-      if (receiptState && typeof receiptState === 'object') {
-        this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
-        console.warn(
-          `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
-            `folding strategy is now ${String(this.config.foldingStrategy ?? 'default')}; ` +
-            `a later switch back to kv-unified starts from an empty receipt chain`,
-        );
-      }
+      // back would measure continuity against a days-old baseline and treat
+      // everything folded since as extension (#97). Loading is not
+      // presenting: an inspection tool, a preview, or a dry run that opens the
+      // store with a different strategy must leave the receipt alone. Only
+      // note here that a receipt exists; the first non-dry-run select by a
+      // non-kv-unified strategy (selectAdaptive, after the resolutions
+      // commit) supersedes it.
+      this.kvUnifiedReceiptSupersedePending =
+        this.store.listStates().some((state) => state.id === this.kvUnifiedReceiptStateId) &&
+        this.store.getStateJson(this.kvUnifiedReceiptStateId) != null;
       this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
     }
   }
@@ -2103,6 +2101,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level > 0) out[id] = level;
     }
     this.store.setStateJson(this.resolutionsStateId, out);
+  }
+
+  /** This strategy has just presented, so the persisted kv-unified receipt no
+   * longer describes the previous turn. Null it (the slot keeps its history in
+   * the record log) so a later switch back to kv-unified starts from an empty
+   * chain — one cold-cache turn, which the migration runbook already expects —
+   * instead of measuring against a stale baseline and treating everything
+   * folded since as extension (#97). */
+  protected supersedeKvUnifiedReceipt(): void {
+    if (!this.store) return;
+    this.requireBranchMutation('supersedeKvUnifiedReceipt');
+    this.kvUnifiedReceiptSupersedePending = false;
+    this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+    console.warn(
+      `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
+        `${String(this.config.foldingStrategy ?? 'default')} has presented from this store; ` +
+        `a later switch back to kv-unified starts from an empty receipt chain`,
+    );
   }
 
   /** Persist the current locked-id snapshot. */
@@ -7782,6 +7798,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (resolutionsChanged && !dryRun) {
       this.persistResolutions();
+    }
+    // A real presentation by a non-kv-unified strategy: the persisted
+    // kv-unified receipt no longer describes the previous turn (#97). This is
+    // independent of whether any resolution changed — a no-op compile is
+    // still a presentation.
+    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
+      this.supersedeKvUnifiedReceipt();
     }
 
     // Wire produce ops into the strategy's own production queues so that

@@ -257,7 +257,7 @@ test('kv-unified continuity relaxation is audited, expiring, and fail-closed', (
   }), 1);
 });
 
-test('a non-kv-unified folding strategy supersedes a persisted kv-unified receipt (#97)', async () => {
+test('a non-kv-unified folding strategy supersedes a persisted kv-unified receipt when it presents, not when it loads (#97)', async () => {
   const first = strategy();
   const manager = await ContextManager.open({ path: STORE, strategy: first });
   manager.addMessage('user', [{ type: 'text', text: 'presented by kv-unified' }]);
@@ -285,22 +285,46 @@ test('a non-kv-unified folding strategy supersedes a persisted kv-unified receip
   assert.equal(receipts(first).head?.sequence, 1);
   manager.close();
 
-  // kv-stable presents from the same store: the receipt no longer describes
-  // the previous turn and must not survive to a later switch back.
-  const stable = new AutobiographicalStrategy({
+  const stableStrategy = () => new AutobiographicalStrategy({
     adaptiveResolution: true,
     foldingStrategy: 'kv-stable',
     headWindowTokens: 0,
     recentWindowTokens: 100,
   });
-  const viaStable = await ContextManager.open({ path: STORE, strategy: stable });
-  viaStable.addMessage('user', [{ type: 'text', text: 'presented by kv-stable' }]);
-  await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
-  viaStable.close();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.includes('superseded a persisted kv-unified presentation receipt')) warnings.push(line);
+    else originalWarn(...args);
+  };
+  try {
+    // Opening (inspection, preview, dry run) is not presenting: the receipt
+    // must survive a load by another strategy untouched.
+    const inspector = await ContextManager.open({ path: STORE, strategy: stableStrategy() });
+    inspector.close();
+    assert.equal(warnings.length, 0, 'a load must not supersede');
+    const inspected = strategy();
+    const stillThere = await ContextManager.open({ path: STORE, strategy: inspected });
+    assert.equal(receipts(inspected).head?.sequence, 1, 'receipt intact after a kv-stable load');
+    stillThere.close();
 
-  const back = strategy();
-  const reopened = await ContextManager.open({ path: STORE, strategy: back });
-  assert.equal(receipts(back).head, null, 'switching back starts from an empty receipt chain');
-  assert.equal(receipts(back).leaves.size, 0);
-  reopened.close();
+    // Presenting is: the first kv-stable compile supersedes it, exactly once.
+    const viaStable = await ContextManager.open({ path: STORE, strategy: stableStrategy() });
+    viaStable.addMessage('user', [{ type: 'text', text: 'presented by kv-stable' }]);
+    await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    assert.equal(warnings.length, 1, 'first presentation supersedes');
+    viaStable.addMessage('user', [{ type: 'text', text: 'presented again by kv-stable' }]);
+    await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    assert.equal(warnings.length, 1, 'later presentations do not warn again');
+    viaStable.close();
+
+    const back = strategy();
+    const reopened = await ContextManager.open({ path: STORE, strategy: back });
+    assert.equal(receipts(back).head, null, 'switching back starts from an empty receipt chain');
+    assert.equal(receipts(back).leaves.size, 0);
+    reopened.close();
+  } finally {
+    console.warn = originalWarn;
+  }
 });
