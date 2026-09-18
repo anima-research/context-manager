@@ -422,6 +422,21 @@ export interface TimeRangeSummaryEntry {
   startMs: number;
   /** `sourceRange.last` message's `timestamp`, in epoch ms. */
   endMs: number;
+  /**
+   * Exact identity/order boundaries of the covered span, ALONGSIDE the
+   * millisecond timestamps above — a caller doing fine-grained boundary
+   * work (e.g. distinguishing which of several messages sharing this
+   * summary's boundary MILLISECOND actually belongs to it) needs these,
+   * not `startMs`/`endMs` alone: two distinct messages can share a
+   * timestamp (wall-clock ms resolution, rapid-fire appends), but
+   * `sequence` (chronicle's per-record sequence number) is strictly
+   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
+   * resolved `StoredMessage.id`/`.sequence`.
+   */
+  firstMessageId: string;
+  lastMessageId: string;
+  firstSequence: number;
+  lastSequence: number;
   /** Same as the source `SummaryEntry.created`. */
   createdMs: number;
   sourceIds: string[];
