@@ -21,6 +21,7 @@ import type {
   PinLevelOptions,
   SearchQuery,
   SearchResult,
+  TimeRangeSummaryEntry,
   RenderStats,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
@@ -2236,6 +2237,85 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
 
     return results.slice(0, limit);
+  }
+
+  /**
+   * List summaries whose source message span overlaps `[opts.fromMs, opts.toMs]`,
+   * for a "browse my history" table-of-contents (agent-framework consumer) —
+   * read-only, generates nothing.
+   *
+   * Deliberately channel-agnostic: `SummaryEntry` has no channel field — a
+   * summary is a fold over whatever messages landed in a chunk, which can span
+   * several channels. A caller that wants a per-channel breakdown should use
+   * the resolved `[startMs, endMs]` span against the message store's own
+   * channel/time index (e.g. `getChannelTokenStats`) — NOT the returned
+   * `sourceIds`: that field is message IDs only at L1, but is itself a list
+   * of CHILD SUMMARY IDs at L2+ (see `SummaryEntry.sourceIds`'s own doc), so
+   * it can't be used uniformly across levels the way the time span can.
+   *
+   * Linear scan over `this.summaries` — fine here (unlike raw-message
+   * queries): even a very large resident mints a few thousand summaries over
+   * its lifetime, and the whole array is already resident in memory.
+   *
+   * Can throw via `requireLoadedBranch` if called against a stale branch
+   * generation — same as every other method on this strategy; the
+   * `ContextManager.getSummariesInRange`/`getMaxSummaryLevel` passthroughs do
+   * NOT swallow that, only the "wrong strategy type" case returns `[]`/`0`.
+   */
+  listSummariesInRange(
+    store: MessageStoreView,
+    opts: { fromMs?: number; toMs?: number; level?: number },
+  ): TimeRangeSummaryEntry[] {
+    this.requireLoadedBranch('listSummariesInRange');
+    const fromMs = opts.fromMs ?? -Infinity;
+    const toMs = opts.toMs ?? Infinity;
+
+    const out: TimeRangeSummaryEntry[] = [];
+    for (const entry of this.summaries) {
+      if (opts.level !== undefined && entry.level !== opts.level) continue;
+
+      // Resolve the source span to wall-clock time via the message store.
+      // A source message can in principle be gone (redacted) by the time
+      // this runs; skip rather than throw so one stale entry doesn't blank
+      // the whole table-of-contents.
+      const firstMsg = store.get(entry.sourceRange.first);
+      const lastMsg = store.get(entry.sourceRange.last);
+      if (!firstMsg || !lastMsg) continue;
+      const startMs = firstMsg.timestamp.getTime();
+      const endMs = lastMsg.timestamp.getTime();
+
+      // Standard interval overlap test against the (possibly open) query range.
+      if (!(startMs <= toMs && endMs >= fromMs)) continue;
+
+      out.push({
+        id: entry.id,
+        level: entry.level,
+        content: entry.content,
+        tokens: entry.tokens,
+        startMs,
+        endMs,
+        createdMs: entry.created,
+        sourceIds: entry.sourceIds,
+        parentId: getSummaryParentId(entry),
+      });
+    }
+
+    out.sort((a, b) => a.startMs - b.startMs);
+    return out;
+  }
+
+  /**
+   * Cheap upper bound on the fold pyramid's depth: `max(level)` over every
+   * currently-minted summary. 0 when no summaries exist yet. Lets a caller
+   * (e.g. the browse-history tool) decide which levels are worth querying
+   * without first calling `listSummariesInRange` and inspecting the result.
+   */
+  getMaxSummaryLevel(): number {
+    this.requireLoadedBranch('getMaxSummaryLevel');
+    // Avoid Math.max(...array): spreading onto the call stack overflows well
+    // before real-world summary counts get anywhere close (review finding,
+    // 2026-09) — a plain reduce has the same O(n) cost with no such cliff.
+    return this.summaries.reduce((max, s) => Math.max(max, s.level), 0);
   }
 
   /**

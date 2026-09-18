@@ -27,6 +27,7 @@ import type {
   SearchQuery,
   SearchResult,
   SummaryEntry,
+  TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
   SelectOptions,
   PreviewResult,
@@ -36,6 +37,7 @@ import {
   isResettableStrategy,
   isPinnableStrategy,
   isSearchableStrategy,
+  isSummaryOverviewStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './types/index.js';
@@ -968,6 +970,31 @@ export class ContextManager {
   getSummary(id: string): SummaryEntry | null {
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
+  }
+
+  /**
+   * List existing summaries whose source span overlaps a time range, as a
+   * table-of-contents — no generation, purely a read over what compression
+   * has already produced. Returns `[]` only when the active strategy doesn't
+   * support this capability (e.g. `PassthroughStrategy`) — with a strategy
+   * that DOES support it, this can still throw (via `requireLoadedBranch`)
+   * against a stale branch generation, same as any other strategy method;
+   * this passthrough does not swallow that.
+   *
+   * Suitable for a "browse my history" agent tool at the framework layer —
+   * see e.g. agent-framework's MCPL host integration.
+   */
+  getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
+    if (!isSummaryOverviewStrategy(this.strategy)) return [];
+    return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
+  }
+
+  /**
+   * Cheap: max(level) over all currently-minted summaries. 0 if the strategy
+   * doesn't support the summary table-of-contents, or none exist yet.
+   */
+  getMaxSummaryLevel(): number {
+    return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
   /**
