@@ -86,10 +86,13 @@ export type {
   KnowledgeConfig,
   KnowledgeOptions,
   ResettableStrategy,
+  TimeRangeSummaryEntry,
+  SummaryOverviewStrategy,
 } from './types/index.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
   isResettableStrategy,
+  isSummaryOverviewStrategy,
   isHotConfigurableStrategy,
 } from './types/index.js';
