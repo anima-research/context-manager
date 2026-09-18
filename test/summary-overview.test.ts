@@ -208,6 +208,36 @@ describe('SummaryOverviewStrategy — listSummariesInRange / getMaxSummaryLevel'
     store.close();
   });
 
+  it('exposes exact message-id/sequence boundaries alongside the millisecond timestamps', async () => {
+    // startMs/endMs alone can't disambiguate two DISTINCT messages sharing a
+    // millisecond (wall-clock resolution, rapid-fire appends) — firstMessageId/
+    // lastMessageId/firstSequence/lastSequence give a caller an exact,
+    // tie-free way to determine which messages a summary's span truly
+    // covers, independent of what timestamp they happen to carry.
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const strategy = new SeedableStrategy();
+    const manager = await ContextManager.open({ store, strategy });
+
+    const m1 = manager.addMessage('User', textBlock('m1'));
+    const m2 = manager.addMessage('User', textBlock('m2'));
+    setTimestamp(store, 'messages', 0, 1_000);
+    setTimestamp(store, 'messages', 1, 1_000); // deliberately tied with m1
+
+    strategy.seedSummary('covers only m1', 1, { first: m1, last: m1 }, [m1]);
+
+    const [result] = manager.getSummariesInRange({});
+    assert.equal(result?.firstMessageId, m1);
+    assert.equal(result?.lastMessageId, m1);
+    assert.equal(typeof result?.firstSequence, 'number');
+    assert.equal(result?.firstSequence, result?.lastSequence, 'a single-message span has equal first/last sequence');
+
+    const m1Stored = manager.getMessage(m1);
+    assert.equal(result?.firstSequence, m1Stored?.sequence, 'sequence matches the actual stored message, not a derived/approximate value');
+
+    manager.close();
+    store.close();
+  });
+
   it('a non-autobiographical strategy returns [] / 0 rather than throwing', async () => {
     const manager = await ContextManager.open({
       path: TEST_STORE_PATH,
