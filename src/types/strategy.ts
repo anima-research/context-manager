@@ -406,6 +406,86 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 }
 
 /**
+ * A summary, projected to the flat shape a "browse my history" table-of-contents
+ * wants: a resolved wall-clock span (`startMs`/`endMs`, derived from the first
+ * and last source message's `timestamp`) instead of `SummaryEntry`'s message-ID
+ * `sourceRange`. Produced by `listSummariesInRange`; not persisted anywhere —
+ * this is a read-time view, not a new storage shape.
+ */
+export interface TimeRangeSummaryEntry {
+  /** Same as the source `SummaryEntry.id`. */
+  id: string;
+  level: number;
+  content: string;
+  tokens: number;
+  /** `sourceRange.first` message's `timestamp`, in epoch ms. */
+  startMs: number;
+  /** `sourceRange.last` message's `timestamp`, in epoch ms. */
+  endMs: number;
+  /**
+   * Exact identity/order boundaries of the covered span, ALONGSIDE the
+   * millisecond timestamps above — a caller doing fine-grained boundary
+   * work (e.g. distinguishing which of several messages sharing this
+   * summary's boundary MILLISECOND actually belongs to it) needs these,
+   * not `startMs`/`endMs` alone: two distinct messages can share a
+   * timestamp (wall-clock ms resolution, rapid-fire appends), but
+   * `sequence` (chronicle's per-record sequence number) is strictly
+   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
+   * resolved `StoredMessage.id`/`.sequence`.
+   */
+  firstMessageId: string;
+  lastMessageId: string;
+  firstSequence: number;
+  lastSequence: number;
+  /** Same as the source `SummaryEntry.created`. */
+  createdMs: number;
+  sourceIds: string[];
+  /**
+   * The summary this one was folded into, if any (see `getSummaryParentId`)
+   * — both a folded child AND its coarser parent can independently overlap
+   * the same query range and both come back from `listSummariesInRange`
+   * (this method does not filter by fold status). A caller building a
+   * non-redundant table of contents should treat an entry whose `parentId`
+   * is ALSO present in the same result set as superseded/skippable —
+   * its content is already covered by the parent.
+   */
+  parentId?: string;
+}
+
+/**
+ * Strategy capability for browsing the existing summary archive as a
+ * table-of-contents, without generating anything new. Distinct from
+ * `SearchableStrategy`: search matches summary *content*; this lists
+ * summaries by *time range*, for a downstream "browse my history" UI (see
+ * agent-framework) that wants to show what compression has already produced
+ * over a span, not search inside it. Implemented by AutobiographicalStrategy.
+ */
+export interface SummaryOverviewStrategy extends ContextStrategy {
+  /**
+   * List summaries whose source message span overlaps `[fromMs, toMs]`
+   * (both ends inclusive; either bound may be omitted for an open range).
+   * Requires a `MessageStoreView` to resolve each summary's source message
+   * IDs to timestamps — same reason `getRenderStats` takes one.
+   */
+  listSummariesInRange(
+    store: MessageStoreView,
+    opts: { fromMs?: number; toMs?: number; level?: number },
+  ): TimeRangeSummaryEntry[];
+  /** Cheap: max(level) over all currently-minted summaries. 0 if none exist yet. */
+  getMaxSummaryLevel(): number;
+}
+
+/** Type guard for strategies that support the summary table-of-contents. */
+export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverviewStrategy {
+  return (
+    'listSummariesInRange' in s &&
+    typeof (s as SummaryOverviewStrategy).listSummariesInRange === 'function' &&
+    'getMaxSummaryLevel' in s &&
+    typeof (s as SummaryOverviewStrategy).getMaxSummaryLevel === 'function'
+  );
+}
+
+/**
  * Per-render observability stats from a strategy. Counts and token sums for
  * head / tail / summaries / pending work, suitable for TUIs and dashboards
  * that want to display "how much of the context is folded vs raw" at a

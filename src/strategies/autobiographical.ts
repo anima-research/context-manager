@@ -21,6 +21,7 @@ import type {
   PinLevelOptions,
   SearchQuery,
   SearchResult,
+  TimeRangeSummaryEntry,
   RenderStats,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
@@ -2272,6 +2273,89 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
 
     return results.slice(0, limit);
+  }
+
+  /**
+   * List summaries whose source message span overlaps `[opts.fromMs, opts.toMs]`,
+   * for a "browse my history" table-of-contents (agent-framework consumer) —
+   * read-only, generates nothing.
+   *
+   * Deliberately channel-agnostic: `SummaryEntry` has no channel field — a
+   * summary is a fold over whatever messages landed in a chunk, which can span
+   * several channels. A caller that wants a per-channel breakdown should use
+   * the resolved `[startMs, endMs]` span against the message store's own
+   * channel/time index (e.g. `getChannelTokenStats`) — NOT the returned
+   * `sourceIds`: that field is message IDs only at L1, but is itself a list
+   * of CHILD SUMMARY IDs at L2+ (see `SummaryEntry.sourceIds`'s own doc), so
+   * it can't be used uniformly across levels the way the time span can.
+   *
+   * Linear scan over `this.summaries` — fine here (unlike raw-message
+   * queries): even a very large resident mints a few thousand summaries over
+   * its lifetime, and the whole array is already resident in memory.
+   *
+   * Can throw via `requireLoadedBranch` if called against a stale branch
+   * generation — same as every other method on this strategy; the
+   * `ContextManager.getSummariesInRange`/`getMaxSummaryLevel` passthroughs do
+   * NOT swallow that, only the "wrong strategy type" case returns `[]`/`0`.
+   */
+  listSummariesInRange(
+    store: MessageStoreView,
+    opts: { fromMs?: number; toMs?: number; level?: number },
+  ): TimeRangeSummaryEntry[] {
+    this.requireLoadedBranch('listSummariesInRange');
+    const fromMs = opts.fromMs ?? -Infinity;
+    const toMs = opts.toMs ?? Infinity;
+
+    const out: TimeRangeSummaryEntry[] = [];
+    for (const entry of this.summaries) {
+      if (opts.level !== undefined && entry.level !== opts.level) continue;
+
+      // Resolve the source span to wall-clock time via the message store.
+      // A source message can in principle be gone (redacted) by the time
+      // this runs; skip rather than throw so one stale entry doesn't blank
+      // the whole table-of-contents.
+      const firstMsg = store.get(entry.sourceRange.first);
+      const lastMsg = store.get(entry.sourceRange.last);
+      if (!firstMsg || !lastMsg) continue;
+      const startMs = firstMsg.timestamp.getTime();
+      const endMs = lastMsg.timestamp.getTime();
+
+      // Standard interval overlap test against the (possibly open) query range.
+      if (!(startMs <= toMs && endMs >= fromMs)) continue;
+
+      out.push({
+        id: entry.id,
+        level: entry.level,
+        content: entry.content,
+        tokens: entry.tokens,
+        startMs,
+        endMs,
+        firstMessageId: firstMsg.id,
+        lastMessageId: lastMsg.id,
+        firstSequence: firstMsg.sequence,
+        lastSequence: lastMsg.sequence,
+        createdMs: entry.created,
+        sourceIds: entry.sourceIds,
+        parentId: getSummaryParentId(entry),
+      });
+    }
+
+    out.sort((a, b) => a.startMs - b.startMs);
+    return out;
+  }
+
+  /**
+   * Cheap upper bound on the fold pyramid's depth: `max(level)` over every
+   * currently-minted summary. 0 when no summaries exist yet. Lets a caller
+   * (e.g. the browse-history tool) decide which levels are worth querying
+   * without first calling `listSummariesInRange` and inspecting the result.
+   */
+  getMaxSummaryLevel(): number {
+    this.requireLoadedBranch('getMaxSummaryLevel');
+    // Avoid Math.max(...array): spreading onto the call stack overflows well
+    // before real-world summary counts get anywhere close (review finding,
+    // 2026-09) — a plain reduce has the same O(n) cost with no such cliff.
+    return this.summaries.reduce((max, s) => Math.max(max, s.level), 0);
   }
 
   /**
@@ -7775,30 +7859,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
 
-    // Commit the new resolutions back to strategy state for next compile.
-    // Persist to chronicle only if anything actually changed — avoids
-    // unnecessary state-slot writes on no-op compiles (which is the common
-    // case in steady state with slack).
-    let resolutionsChanged = false;
+    // Stage resolution changes for the next compile, but do NOT commit them
+    // yet. The selected frontier is only authoritative if the whole render
+    // succeeds. Persisting here used to let a plan that later threw
+    // OverBudgetError (or failed coverage/emission checks) poison the carried
+    // frontier for every subsequent compile — exactly the Sill 2026-09-16
+    // outage shape. Produce/demand ops below intentionally remain allowed on
+    // a failed compile: they are recovery work, not presentation state.
+    const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
     for (const [id, level] of result.finalResolutions) {
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
-      if (prev !== level) {
-        // Dry run: compute deepestLevel for diagnostics but leave the live
-        // resolution map untouched — this is the fold plan, and a preview
-        // must not become the agent's next context.
-        if (!dryRun) {
-          this.resolutions.set(id, level);
-          resolutionsChanged = true;
-        }
-      }
+      if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
       if (level > deepestLevel) deepestLevel = level;
     }
-    if (resolutionsChanged && !dryRun) {
-      this.persistResolutions();
-    }
+
     // Wire produce ops into the strategy's own production queues so that
     // requested-but-not-yet-existing summaries actually get built. The
     // speculative pre-producer covers most cases ambiently, but when it is
@@ -8219,6 +8296,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
     this.assertMiddleCoverage();
+
+    // Commit the carried frontier only after EVERY refusal-capable stage has
+    // succeeded: plan budget, emission budget, tail reservation, structural
+    // repair, full coverage, tool pairing, and marker placement. A rejected
+    // compile may still enqueue demanded summaries above, but it cannot become
+    // the next compile's presentation state.
+    if (pendingResolutionChanges.length > 0 && !dryRun) {
+      for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
+      this.persistResolutions();
+    }
+    // Same commit point for the receipt left behind by kv-unified: a real
+    // presentation by a non-kv-unified strategy has now succeeded, so that
+    // receipt no longer describes the previous turn (#97). Independent of
+    // whether any resolution changed — a no-op compile is still a
+    // presentation. A rejected compile keeps it: nothing replaced it.
+    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
+      this.supersedeKvUnifiedReceipt();
+    }
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
@@ -8229,15 +8324,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
       rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
     this._calibrationArmed = true; // exactly one sample per compile
-    // A real presentation by a non-kv-unified strategy has now succeeded (the
-    // hard-budget check, emission and structural repair above all throw on
-    // failure), so the persisted kv-unified receipt no longer describes the
-    // previous turn (#97). Independent of whether any resolution changed — a
-    // no-op compile is still a presentation. A failed compile keeps the
-    // receipt: nothing replaced it.
-    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
-      this.supersedeKvUnifiedReceipt();
-    }
     return merged;
   }
 
@@ -8311,7 +8397,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.foldingStrategy !== 'kv-unified' || !this.kvUnifiedDraft) {
       throw new Error('No kv-unified presentation draft is available for submission');
     }
-    this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    const { superseded } = this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
+    if (superseded) {
+      console.error(
+        `[kv-unified] submission ${superseded} was never settled (no usage event before the next ` +
+          `provider call); superseded by ${args.submissionId}`,
+      );
+    }
     this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
     this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
     this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;

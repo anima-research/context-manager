@@ -181,3 +181,92 @@ export interface MessageQueryResult {
   /** Total count of matching messages (may be more than returned if limited) */
   totalCount: number;
 }
+
+/**
+ * Options for a native chronicle-indexed timestamp-range query (see
+ * MessageStore.queryByTime / ContextManager.queryMessagesByTime). Backed by
+ * `queryStateIndexRange` against the `/timestamp` field index —
+ * O(log n + k) ordinal lookup, not a full-store scan.
+ */
+export interface TimeRangeQueryOptions {
+  /** Inclusive lower bound, Unix ms. Omit for open-ended. */
+  fromMs?: number;
+  /** Inclusive upper bound, Unix ms. Omit for open-ended. */
+  toMs?: number;
+  limit?: number;
+  offset?: number;
+  /** Return newest-first when true. Default false (oldest first). */
+  reverse?: boolean;
+}
+
+/**
+ * Options for a native chronicle-indexed channel-equality query (see
+ * MessageStore.queryByChannel / ContextManager.queryMessagesByChannel).
+ * Backed by `queryStateIndexEq` against the `/metadata/external/channelId`
+ * field index.
+ */
+export interface ChannelQueryOptions {
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Options for a combined time-range + channel query (see
+ * MessageStore.queryByTimeAndChannel / ContextManager.queryMessagesByTimeAndChannel).
+ * When both a range and a channel are given, the two native ordinal sets
+ * are intersected before limit/offset is applied (see the method's own
+ * comment for why that ordering is the only correct one).
+ */
+export interface TimeAndChannelQueryOptions {
+  fromMs?: number;
+  toMs?: number;
+  channelId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Result of an index-backed message query (time/channel/both). Distinct
+ * from MessageQueryResult (whose `totalCount` is the size of a full-scan
+ * filter match) only in name, to keep the two query families visually
+ * distinguishable at call sites.
+ */
+export interface IndexedMessageQueryResult {
+  messages: StoredMessage[];
+  /** Total matching ordinals before limit/offset was applied. */
+  matchedCount: number;
+}
+
+/** One channel's message count, from MessageStore.getChannelCounts /
+ *  ContextManager.getChannelMessageCounts. Native — O(index size), no
+ *  content decoding. */
+export interface ChannelCount {
+  channelId: string;
+  messages: number;
+}
+
+/** Per-channel token-estimate breakdown, one entry of
+ *  ChannelTokenStats.byChannel. */
+export interface ChannelTokenBreakdown {
+  channelId: string;
+  messages: number;
+  tokensEstimate: number;
+}
+
+/**
+ * Result of MessageStore.getChannelTokenStats /
+ * ContextManager.getChannelTokenStats. Unlike getChannelCounts, this
+ * requires decoding message content (token estimation isn't stored in
+ * chronicle) — see MessageStore.tokenStatsCache for the amortizing cache.
+ */
+export interface ChannelTokenStats {
+  totalMessages: number;
+  totalTokensEstimate: number;
+  byChannel: ChannelTokenBreakdown[];
+}
+
+/** Options for MessageStore.getChannelTokenStats / ContextManager.getChannelTokenStats. */
+export interface ChannelTokenStatsOptions {
+  fromMs?: number;
+  toMs?: number;
+}

@@ -12,6 +12,77 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.10.0 — 2026-09-18
+
+### Added
+
+- `ContextManager.getSummariesInRange`/`getMaxSummaryLevel` list existing
+  compression summaries whose source span overlaps a time range — a
+  read-only "browse my history" primitive, no generation, for a downstream
+  agent-facing table-of-contents tool (see agent-framework's `HistoryModule`
+  `overview` tool).
+
+- `TimeRangeSummaryEntry` (from `getSummariesInRange`) now also exposes
+  `firstMessageId`/`lastMessageId`/`firstSequence`/`lastSequence` — exact,
+  tie-free identity/order boundaries for the covered span, alongside the
+  existing millisecond `startMs`/`endMs`. Wall-clock timestamps aren't
+  unique (two distinct messages can share a millisecond under rapid-fire
+  appends); chronicle's per-record `sequence` is strictly monotonic and
+  never ties, so a consumer doing fine-grained boundary work (e.g. a
+  downstream "overview" tool distinguishing which of several
+  same-millisecond messages actually belongs to a given summary) has an
+  exact way to do it.
+
+## 0.9.2 — 2026-09-17
+
+### Fixed
+
+- `getChannelCounts()` now reports the true unique message count per
+  channel instead of summing the two channel-id metadata schemas'
+  native index counts. A message that legitimately carries both
+  `metadata.channelId` and `metadata.external.channelId` (a real shape
+  produced by agent-framework's MCPL ingestion, which preserves an
+  incoming `metadata.external` while also adding its own top-level
+  `metadata.channelId`) was being counted twice.
+
+## 0.9.1 — 2026-09-17
+
+### Fixed
+
+- `queryByChannel`/`queryByTimeAndChannel`/`getChannelCounts`/
+  `getChannelTokenStats` now index and merge BOTH channel-id metadata
+  shapes: `metadata.channelId` (what agent-framework's real MCPL
+  ingestion actually writes) and `metadata.external.channelId` (the
+  pre-existing convention). 0.9.0 only indexed the latter, so these
+  methods silently found nothing for real framework-ingested history.
+
+## 0.9.0 — 2026-09-17
+
+### Added
+
+- `MessageStore`/`ContextManager` gain `queryByTime`/`queryByChannel`/
+  `queryByTimeAndChannel`/`getChannelCounts`/`getChannelTokenStats`
+  (`queryMessagesBy*`/`getChannelMessageCounts`/`getChannelTokenStats` on
+  `ContextManager`), backed by chronicle's new native `/timestamp` and
+  `/metadata/external/channelId` secondary field indexes (#99). O(log n + k)
+  against the index, not a full-store scan; requires chronicle >= the
+  version that ships `registerStateFieldIndex` — degrades to a clear error
+  on an older chronicle build rather than a silent full scan.
+
+### Changed
+
+- `compile()` now tags synthesized context messages with participant
+  `system_context:{namespace}` instead of `injection:{namespace}`. The old
+  name leaked verbatim into the rendered prompt (membrane formats messages
+  as `{participant}: {text}`), and a speaker literally named "injection"
+  tripped models' prompt-injection wariness on benign ambient context.
+  Nothing keys off the prefix programmatically; transcripts and UI filters
+  that grep for `injection:` should switch to `system_context:`.
+
+### Fixed
+
+- kv-unified: a new provider submission now supersedes an earlier flight that was never settled (a provider call that died before its usage event, then a retry) instead of throwing `kv-unified submission … is still in flight` and failing the retry as well. The superseded id is logged and later callbacks for it are no-ops.
+
 ## 0.8.0 — 2026-09-07
 
 ### Added

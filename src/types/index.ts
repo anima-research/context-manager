@@ -10,6 +10,14 @@ export type {
   StoredMessageInternal,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenBreakdown,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
 } from './message.js';
 
 // Context types
@@ -54,6 +62,8 @@ export type {
   SearchResult,
   SearchableStrategy,
   PinnableStrategy,
+  TimeRangeSummaryEntry,
+  SummaryOverviewStrategy,
   RenderStats,
   RenderStatsCapableStrategy,
 } from './strategy.js';
@@ -63,6 +73,7 @@ export {
   isResettableStrategy,
   isPinnableStrategy,
   isSearchableStrategy,
+  isSummaryOverviewStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './strategy.js';

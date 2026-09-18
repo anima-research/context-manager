@@ -7,17 +7,38 @@ const leaves = (rep: string) => new Map([
   ['a', { repHash: rep, level: rep === 'raw:a' ? 0 : 1, lastChangedSeq: 0 }],
 ]);
 
-test('kv-unified receipts enforce single flight and advance only on acceptance', () => {
+test('kv-unified receipts keep a single flight and advance only on acceptance', () => {
   const chain = new KvUnifiedReceiptChain();
-  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
-  assert.throws(
-    () => chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') }),
-    /still in flight/,
-  );
+  const first = chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  assert.equal(first.superseded, null);
+  assert.equal(chain.inFlightSubmissionId, 's1');
+  assert.equal(chain.head?.sequence ?? null, null, 'submission is not acceptance');
   const accepted = chain.accept('s1', 100, null);
   assert.equal(accepted.presentationAdvanced, true);
   assert.equal(chain.head?.sequence, 1);
   assert.equal(chain.leaves.get('a')?.repHash, 'raw:a');
+});
+
+test('kv-unified receipts supersede an unsettled flight instead of wedging the next submission', () => {
+  // A provider call that died before its usage event (transport error, retry,
+  // restart) leaves s1 open; the retry's submission must not fail on it.
+  const chain = new KvUnifiedReceiptChain();
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  const second = chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
+  assert.equal(second.superseded, 's1');
+  assert.equal(chain.inFlightSubmissionId, 's2');
+  assert.equal(chain.head?.sequence ?? null, null, 'superseding never advances presentation');
+  // Late callbacks for the superseded flight are duplicates, never state changes.
+  assert.deepEqual(chain.accept('s1', 50, null), { presentationAdvanced: false, duplicate: true });
+  chain.fail('s1');
+  assert.equal(chain.inFlightSubmissionId, 's2');
+  const accepted = chain.accept('s2', 100, null);
+  assert.equal(accepted.presentationAdvanced, true);
+  assert.equal(chain.head?.sequence, 1);
+  assert.equal(chain.leaves.get('a')?.repHash, 'summary:L1');
+  // A superseded id is remembered as settled across persistence too.
+  const reloaded = KvUnifiedReceiptChain.deserialize(chain.serialize());
+  assert.deepEqual(reloaded.accept('s1', 51, null), { presentationAdvanced: false, duplicate: true });
 });
 
 test('kv-unified receipts clear single flight on failure without changing baselines', () => {

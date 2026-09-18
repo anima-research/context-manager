@@ -13,6 +13,13 @@ import type {
   StrategyContext,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
   ContextInjection,
   CompileResult,
   ProtectedRange,
@@ -20,6 +27,7 @@ import type {
   SearchQuery,
   SearchResult,
   SummaryEntry,
+  TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
   SelectOptions,
   PreviewResult,
@@ -29,6 +37,7 @@ import {
   isResettableStrategy,
   isPinnableStrategy,
   isSearchableStrategy,
+  isSummaryOverviewStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './types/index.js';
@@ -498,6 +507,51 @@ export class ContextManager {
     return msg?.id ?? null;
   }
 
+  /**
+   * Query messages by timestamp range — O(log n + k) via chronicle's native
+   * `/timestamp` secondary index, not a full scan. Throws if the underlying
+   * chronicle build predates the field-index capability. See
+   * MessageStore.queryByTime for the exact semantics (inclusive bounds,
+   * page-size-only `matchedCount`).
+   */
+  queryMessagesByTime(opts: TimeRangeQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByTime(opts);
+  }
+
+  /**
+   * Query messages by exact external channel id — via chronicle's native
+   * `/metadata/external/channelId` secondary index. See
+   * MessageStore.queryByChannel.
+   */
+  queryMessagesByChannel(channelId: string, opts?: ChannelQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByChannel(channelId, opts);
+  }
+
+  /**
+   * Query messages matching both a timestamp range and a channel. See
+   * MessageStore.queryByTimeAndChannel for why this needs the two native
+   * ordinal sets fetched uncapped and intersected before paginating.
+   */
+  queryMessagesByTimeAndChannel(opts: TimeAndChannelQueryOptions): IndexedMessageQueryResult {
+    return this.messageStore.queryByTimeAndChannel(opts);
+  }
+
+  /**
+   * Distinct channel ids and their message counts, native and instant
+   * (O(index size), no content decoding). See MessageStore.getChannelCounts.
+   */
+  getChannelMessageCounts(): ChannelCount[] {
+    return this.messageStore.getChannelCounts();
+  }
+
+  /**
+   * Aggregate message counts and token estimates by channel, optionally
+   * restricted to a timestamp range. See MessageStore.getChannelTokenStats.
+   */
+  getChannelTokenStats(opts?: ChannelTokenStatsOptions): ChannelTokenStats {
+    return this.messageStore.getChannelTokenStats(opts);
+  }
+
   // ==========================================================================
   // Branching
   // ==========================================================================
@@ -916,6 +970,31 @@ export class ContextManager {
   getSummary(id: string): SummaryEntry | null {
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
+  }
+
+  /**
+   * List existing summaries whose source span overlaps a time range, as a
+   * table-of-contents — no generation, purely a read over what compression
+   * has already produced. Returns `[]` only when the active strategy doesn't
+   * support this capability (e.g. `PassthroughStrategy`) — with a strategy
+   * that DOES support it, this can still throw (via `requireLoadedBranch`)
+   * against a stale branch generation, same as any other strategy method;
+   * this passthrough does not swallow that.
+   *
+   * Suitable for a "browse my history" agent tool at the framework layer —
+   * see e.g. agent-framework's MCPL host integration.
+   */
+  getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
+    if (!isSummaryOverviewStrategy(this.strategy)) return [];
+    return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
+  }
+
+  /**
+   * Cheap: max(level) over all currently-minted summaries. 0 if the strategy
+   * doesn't support the summary table-of-contents, or none exist yet.
+   */
+  getMaxSummaryLevel(): number {
+    return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
   /**
