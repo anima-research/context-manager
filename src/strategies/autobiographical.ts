@@ -7739,29 +7739,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
 
-    // Commit the new resolutions back to strategy state for next compile.
-    // Persist to chronicle only if anything actually changed — avoids
-    // unnecessary state-slot writes on no-op compiles (which is the common
-    // case in steady state with slack).
-    let resolutionsChanged = false;
+    // Stage resolution changes for the next compile, but do NOT commit them
+    // yet. The selected frontier is only authoritative if the whole render
+    // succeeds. Persisting here used to let a plan that later threw
+    // OverBudgetError (or failed coverage/emission checks) poison the carried
+    // frontier for every subsequent compile — exactly the Sill 2026-09-16
+    // outage shape. Produce/demand ops below intentionally remain allowed on
+    // a failed compile: they are recovery work, not presentation state.
+    const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
     for (const [id, level] of result.finalResolutions) {
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
-      if (prev !== level) {
-        // Dry run: compute deepestLevel for diagnostics but leave the live
-        // resolution map untouched — this is the fold plan, and a preview
-        // must not become the agent's next context.
-        if (!dryRun) {
-          this.resolutions.set(id, level);
-          resolutionsChanged = true;
-        }
-      }
+      if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
       if (level > deepestLevel) deepestLevel = level;
-    }
-    if (resolutionsChanged && !dryRun) {
-      this.persistResolutions();
     }
 
     // Wire produce ops into the strategy's own production queues so that
@@ -8184,6 +8176,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
     this.assertMiddleCoverage();
+
+    // Commit the carried frontier only after EVERY refusal-capable stage has
+    // succeeded: plan budget, emission budget, tail reservation, structural
+    // repair, full coverage, tool pairing, and marker placement. A rejected
+    // compile may still enqueue demanded summaries above, but it cannot become
+    // the next compile's presentation state.
+    if (pendingResolutionChanges.length > 0 && !dryRun) {
+      for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
+      this.persistResolutions();
+    }
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
