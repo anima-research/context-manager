@@ -1,7 +1,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
 import type { ContextEntry } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
 
@@ -255,4 +255,127 @@ test('kv-unified continuity relaxation is audited, expiring, and fail-closed', (
     multiplier: Number.NaN,
     expiresAt: Date.now() + 60_000,
   }), 1);
+});
+
+test('a non-kv-unified folding strategy supersedes a persisted kv-unified receipt when it presents, not when it loads (#97)', async () => {
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first });
+  manager.addMessage('user', [{ type: 'text', text: 'presented by kv-unified' }]);
+  await manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const markerCount = (
+    first as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
+  ).kvUnifiedPendingMarkerUnitIndices.length;
+  first.reportKvUnifiedAccepted({
+    submissionId: 's1',
+    acceptedAt: 123,
+    wireReceipt: {
+      requestHash: 'wire1',
+      markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+        ordinal,
+        prefixHash: `prefix-${ordinal}`,
+        estimatedOffset: ordinal + 1,
+      })),
+    },
+  });
+  assert.equal(receipts(first).head?.sequence, 1);
+  manager.close();
+
+  const stableStrategy = () => new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-stable',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+  });
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.includes('superseded a persisted kv-unified presentation receipt')) warnings.push(line);
+    else originalWarn(...args);
+  };
+  try {
+    // Opening (inspection, preview, dry run) is not presenting: the receipt
+    // must survive a load by another strategy untouched.
+    const inspector = await ContextManager.open({ path: STORE, strategy: stableStrategy() });
+    inspector.close();
+    assert.equal(warnings.length, 0, 'a load must not supersede');
+    const inspected = strategy();
+    const stillThere = await ContextManager.open({ path: STORE, strategy: inspected });
+    assert.equal(receipts(inspected).head?.sequence, 1, 'receipt intact after a kv-stable load');
+    stillThere.close();
+
+    // Presenting is: the first kv-stable compile supersedes it, exactly once.
+    const viaStable = await ContextManager.open({ path: STORE, strategy: stableStrategy() });
+    viaStable.addMessage('user', [{ type: 'text', text: 'presented by kv-stable' }]);
+    await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    assert.equal(warnings.length, 1, 'first presentation supersedes');
+    viaStable.addMessage('user', [{ type: 'text', text: 'presented again by kv-stable' }]);
+    await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    assert.equal(warnings.length, 1, 'later presentations do not warn again');
+    viaStable.close();
+
+    const back = strategy();
+    const reopened = await ContextManager.open({ path: STORE, strategy: back });
+    assert.equal(receipts(back).head, null, 'switching back starts from an empty receipt chain');
+    assert.equal(receipts(back).leaves.size, 0);
+    reopened.close();
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('a failed compile by a non-kv-unified strategy keeps the persisted kv-unified receipt (#98 review)', async () => {
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first });
+  manager.addMessage('user', [{ type: 'text', text: 'presented by kv-unified' }]);
+  await manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const markerCount = (
+    first as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
+  ).kvUnifiedPendingMarkerUnitIndices.length;
+  first.reportKvUnifiedAccepted({
+    submissionId: 's1',
+    acceptedAt: 123,
+    wireReceipt: {
+      requestHash: 'wire1',
+      markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+        ordinal,
+        prefixHash: `prefix-${ordinal}`,
+        estimatedOffset: ordinal + 1,
+      })),
+    },
+  });
+  assert.equal(receipts(first).head?.sequence, 1);
+  manager.close();
+
+  const stable = new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-stable',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+  });
+  const viaStable = await ContextManager.open({ path: STORE, strategy: stable });
+  for (let i = 0; i < 4; i++) {
+    viaStable.addMessage('user', [{ type: 'text', text: `unsummarized filler ${i} ${'x'.repeat(1200)}` }]);
+  }
+  await assert.rejects(
+    viaStable.compile({ maxTokens: 300, reserveForResponse: 0 }),
+    (error: unknown) => error instanceof OverBudgetError,
+    'an over-budget compile must fail, not present',
+  );
+  viaStable.close();
+
+  const back = strategy();
+  const reopened = await ContextManager.open({ path: STORE, strategy: back });
+  assert.equal(receipts(back).head?.sequence, 1, 'no presentation replaced the receipt, so it survives');
+  reopened.close();
 });
