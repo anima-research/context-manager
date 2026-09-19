@@ -30,6 +30,26 @@ export { KnowledgeStrategy } from './strategies/knowledge.js';
 export { splitMixedToolMessages, stripUnpairedToolBlocks } from './normalize-tool-messages.js';
 export { resolveEffectiveConfig } from './config-provenance.js';
 export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } from './config-provenance.js';
+export {
+  discoverAutobioNamespaces,
+  readFlavor,
+  validateStoreForKvUnified,
+  synthesizePresentation,
+  buildSyntheticChain,
+  migrateToUnified,
+  migrateToStable,
+  slotIds as migrationSlotIds,
+} from './migration/folding-migration.js';
+export type {
+  StoreFlavor,
+  TreeificationPolicy,
+  PolicyOutcome,
+  ValidateResult,
+  MigrationLeafWarning,
+  SynthesizedPresentation,
+  ToUnifiedResult,
+  ToStableResult,
+} from './migration/folding-migration.js';
 
 // Errors — cross-package behavioral surface. agent-framework gates its
 // OverBudget drain breaker on these errors (AF PR #58, framework.ts
