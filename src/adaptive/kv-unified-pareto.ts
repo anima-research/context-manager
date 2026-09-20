@@ -1,5 +1,6 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
@@ -84,6 +85,7 @@ export interface ParetoPropagationStats {
 
 export type ParetoPolicySolveResult = ExactPolicySolveResult & {
   readonly propagation?: ParetoPropagationStats;
+  readonly certificate?: HysteresisCertificate;
 };
 
 export type ParetoSolveOptions = ExactPolicySolveOptions & {
@@ -92,6 +94,8 @@ export type ParetoSolveOptions = ExactPolicySolveOptions & {
   continuityBucketSize?: number;
   fidelityBucketSize?: number;
   engine?: 'auto' | 'leaf' | 'dag';
+  /** Opt-in prototype: prove the hysteresis selection before propagating labels. */
+  hysteresisCertificate?: boolean;
 };
 
 /** Exact sparse Pareto propagation. R bucketing is added only after this
@@ -126,6 +130,10 @@ export class ParetoKvUnifiedPolicySolver {
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.engine === 'dag' && internalHoles) {
       throw new Error('recursive DAG engine does not yet support internal protected holes');
+    }
+    if (options.hysteresisCertificate) {
+      const certified = certifyCarriedLayout(this.inputs, this.forest, options);
+      if (certified) return certified;
     }
     if (options.engine !== 'leaf' && !internalHoles) {
       this.bufferGapEmissions = gapBearingOwnership;

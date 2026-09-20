@@ -437,7 +437,7 @@ export function continuityLeafLoss(
   return salience * chunk.rawTokens * recency * stability * representationDistance;
 }
 
-function budgetPenalty(
+export function budgetPenalty(
   renderedTokens: number,
   maxTokens: number,
   policy: KvUnifiedWelfarePolicy,
