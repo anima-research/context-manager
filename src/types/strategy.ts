@@ -138,6 +138,12 @@ export interface ContextStrategy {
   tick?(ctx: StrategyContext): Promise<void>;
 
   /**
+   * Primary render hoist options (see `primaryToolProseHoist`), or undefined
+   * when off. Optional: strategies without the option simply omit it.
+   */
+  getPrimaryToolProseHoist?(): import('../tool-prose-hoist.js').ToolProseHoistOptions | undefined;
+
+  /**
    * React to new messages.
    * Called after a message is added to the store.
    */
@@ -1010,6 +1016,30 @@ export interface AutobiographicalConfig {
     /** tool_result content for the inserted calls (default: journal receipt). */
     result?: string;
     /** Rewrite string arguments longer than this many chars (default 100). */
+    minChars?: number;
+  };
+  /**
+   * Primary render hoist (2026-09-20, sill). Same option shape and the same
+   * rewrite as `compressionToolProseFallback`, applied to EVERY primary compile
+   * (recent turns included), not only on a refusal.
+   *
+   * The diary carrier blocks primary turns too: five `skip_reply` reasons of
+   * 400–570 chars in the raw tail got every primary wake refused
+   * `reasoning_extraction`; shortening them, or moving them into `journal`
+   * rounds, passed on the exact refused request. Always-on rather than
+   * refusal-triggered because the render must be deterministic turn over turn
+   * (a stable cached prefix) and a refusal-first design pays a refused attempt
+   * on every affected turn. The store is never touched — this is a view. The
+   * agent sees itself journaling, which is the habit the tool exists for.
+   *
+   * Skipped (canonical render) unless `intoTool` is among the declared tools.
+   * Off unless set.
+   */
+  primaryToolProseHoist?: {
+    intoTool: string;
+    fromTools: string[];
+    field?: string;
+    result?: string;
     minChars?: number;
   };
   /**

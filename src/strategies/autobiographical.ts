@@ -35,9 +35,7 @@ import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import {
   hoistToolProse,
-  DEFAULT_TOOL_PROSE_FIELD,
-  DEFAULT_TOOL_PROSE_MIN_CHARS,
-  DEFAULT_TOOL_PROSE_RESULT,
+  normalizeToolProseHoist,
   type ToolProseHoistOptions,
 } from '../tool-prose-hoist.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
@@ -3526,18 +3524,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
   private toolProseHoistOptions(): ToolProseHoistOptions | undefined {
-    const raw = this.config.compressionToolProseFallback;
-    if (!raw || typeof raw.intoTool !== 'string' || !raw.intoTool) return undefined;
-    if (!Array.isArray(raw.fromTools) || raw.fromTools.length === 0) return undefined;
-    return {
-      intoTool: raw.intoTool,
-      field: raw.field || DEFAULT_TOOL_PROSE_FIELD,
-      result: raw.result || DEFAULT_TOOL_PROSE_RESULT,
-      minChars: typeof raw.minChars === 'number' && raw.minChars >= 0
-        ? raw.minChars
-        : DEFAULT_TOOL_PROSE_MIN_CHARS,
-      fromTools: [...raw.fromTools],
-    };
+    return normalizeToolProseHoist(this.config.compressionToolProseFallback);
+  }
+
+  /**
+   * Options for the PRIMARY render hoist (`primaryToolProseHoist`), or
+   * undefined when off. Read by ContextManager.compile, which owns the final
+   * wire-shape message list and the declared tools.
+   */
+  getPrimaryToolProseHoist(): ToolProseHoistOptions | undefined {
+    return normalizeToolProseHoist(this.config.primaryToolProseHoist);
   }
 
   /**

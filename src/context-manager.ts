@@ -47,6 +47,7 @@ import { ContextLog } from './context-log.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
+import { hoistToolProse } from './tool-prose-hoist.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
 
@@ -741,6 +742,18 @@ export class ContextManager {
           ...(entry.cacheMarker && isLast ? { cacheBreakpoint: true } : {}),
         });
       }
+    }
+
+    // Primary render hoist (`primaryToolProseHoist`): long private-reasoning
+    // tool arguments (skip_reply.reason, think.content) become calls to a
+    // note-taking tool the agent really has. A VIEW — the store is untouched.
+    // Only when that tool is declared: never show the agent a tool it lacks.
+    // Inserted rounds carry no cache breakpoint; a rewritten message keeps its
+    // own (object spread in hoistToolProse), so seam placement is unchanged.
+    const primaryHoist = this.strategy.getPrimaryToolProseHoist?.();
+    if (primaryHoist && this.toolDefinitions?.some((tool) => tool.name === primaryHoist.intoTool)) {
+      const hoisted = hoistToolProse(messages, primaryHoist);
+      if (hoisted.hoisted > 0) messages.splice(0, messages.length, ...(hoisted.messages as NormalizedMessage[]));
     }
 
     // If no injections, log and return early

@@ -26,6 +26,9 @@ import type { ContentBlock } from '@animalabs/membrane';
  * that never happened) teaches a habit that leaks or fails. The caller is
  * responsible for checking `intoTool` is among the declared tools.
  *
+ * Used on refused L1 compression requests (fallback rung) and, when
+ * `primaryToolProseHoist` is set, on every primary compile.
+ *
  * Pure function over wire-shape messages. Only top-level string arguments are
  * considered. A call whose tool_result cannot be found is left untouched.
  * Inserted tool ids are derived from the original id, so the rewritten request
@@ -90,13 +93,17 @@ export function hoistToolProse<T extends WireMessage>(
       if (resultSide === undefined) return block;
       if (!use.input || typeof use.input !== 'object' || Array.isArray(use.input)) return block;
       let changed = false;
+      let argIndex = 0;
       const input: Record<string, unknown> = {};
       for (const [field, value] of Object.entries(use.input as Record<string, unknown>)) {
         if (typeof value !== 'string' || value.length <= options.minChars) {
           input[field] = value;
           continue;
         }
-        const id = `${use.id}_${hoisted}`;
+        // Indexed per CALL, not per request: in a live render an earlier hoisted
+        // call leaves the window when its chunk folds, and ids that counted
+        // across the request would all shift (breaking the cached prefix).
+        const id = `${use.id}_${argIndex++}`;
         rounds.push(
           {
             participant: message.participant,
@@ -120,4 +127,26 @@ export function hoistToolProse<T extends WireMessage>(
     out.push(...rounds, { ...message, content });
   }
   return { messages: out, hoisted };
+}
+
+/** Raw option shape accepted from strategy config (both hoist options share it). */
+export interface ToolProseHoistConfig {
+  intoTool: string;
+  fromTools: string[];
+  field?: string;
+  result?: string;
+  minChars?: number;
+}
+
+/** Normalize a config value; undefined when absent or unusable (treated as "off"). */
+export function normalizeToolProseHoist(raw: ToolProseHoistConfig | undefined): ToolProseHoistOptions | undefined {
+  if (!raw || typeof raw.intoTool !== 'string' || !raw.intoTool) return undefined;
+  if (!Array.isArray(raw.fromTools) || raw.fromTools.length === 0) return undefined;
+  return {
+    intoTool: raw.intoTool,
+    field: raw.field || DEFAULT_TOOL_PROSE_FIELD,
+    result: raw.result || DEFAULT_TOOL_PROSE_RESULT,
+    minChars: typeof raw.minChars === 'number' && raw.minChars >= 0 ? raw.minChars : DEFAULT_TOOL_PROSE_MIN_CHARS,
+    fromTools: [...raw.fromTools],
+  };
 }
