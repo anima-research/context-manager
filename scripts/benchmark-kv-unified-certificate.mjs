@@ -89,7 +89,9 @@ const { inputs, options, forestOptions } = fixture;
 const digest = (frontier) => createHash('sha256')
   .update(JSON.stringify([...frontier].sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
 const report = { chunks: inputs.chunks.length, summaries: inputs.summaries.size,
-  maxTokens: options.maxTokens, runs: [] };
+  maxTokens: options.maxTokens,
+  savedFrontierHash: digest(new Map(inputs.chunks.map((chunk) => [chunk.id, chunk.currentResolution ?? 0]))),
+  runs: [] };
 for (let repeat = 0; repeat < 3; repeat++) {
   const started = performance.now();
   const forest = new CanonicalSummaryForest(inputs, forestOptions);
@@ -104,6 +106,10 @@ for (let repeat = 0; repeat < 3; repeat++) {
     ...result.certificate,
   });
 }
+report.matchesSavedFrontier = report.runs.every((run) => run.frontierHash === report.savedFrontierHash);
+// Preserve completed certificate measurements even if an optional expensive
+// baseline is interrupted. Its final result is appended only on completion.
+if (arg('--report')) fs.writeFileSync(arg('--report'), JSON.stringify(report, null, 2));
 if (process.argv.includes('--baseline')) {
   const started = performance.now();
   const forest = new CanonicalSummaryForest(inputs, forestOptions);
