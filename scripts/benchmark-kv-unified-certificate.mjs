@@ -50,9 +50,12 @@ if (process.argv.includes('--capture') || compiling) {
   PinnedSolver.prototype.solve = function (options) {
     if (compiling) {
       const started = performance.now();
-      const result = certifyCarriedLayout(this.inputs, this.forest, options);
+      const result = process.argv.includes('--general')
+        ? new ParetoKvUnifiedPolicySolver(this.inputs, this.forest).solve({ ...options, hysteresisCertificate: false })
+        : certifyCarriedLayout(this.inputs, this.forest, options);
       if (!result) throw new Error('compile reached an uncertified solve; expensive fallback was not run');
-      compileSolves.push({ ms: performance.now() - started, ...result.certificate });
+      compileSolves.push({ ms: performance.now() - started,
+        certificate: result.certificate ?? null, propagation: result.propagation ?? null });
       return result;
     }
     fixture = {

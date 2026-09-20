@@ -1,5 +1,9 @@
 # Hysteresis certificate prototype
 
+The certificate alone is insufficient for normal-operation latency. General
+solver work and measurements, with this certificate disabled, are documented
+in [General kv-unified solver performance](kv-unified-general-solver-performance.md).
+
 This opt-in prototype avoids Pareto label propagation when the existing
 `adoptEpsilon` rule provably selects the unchanged accepted presentation.
 Enable it with `hysteresisCertificate: true` in `ParetoSolveOptions` or
