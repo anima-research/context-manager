@@ -665,9 +665,10 @@ test('kv-unified label count stays bounded under a stale half-covering presentat
   // A presentation receipt that covers only the older half of the live leaves
   // (a kv-stable -> kv-unified switch, a restore, a history import) must not
   // multiply the Pareto label set. Extension tokens are no longer part of the
-  // label state at all: nothing in dominance or pricing reads them from the
-  // label (the cache-churn term recomputes extension from the rendered
-  // layout), so keying on them only split labels that should have collapsed.
+  // state key. No provider cache is relevant here, so nothing prices them and
+  // they are inert in dominance too; keying on them only split labels that
+  // should have collapsed. (The relevant-cache case, where extension is a
+  // priced dominance dimension, is covered by the two tests below.)
   const chronicle = buildChronicleWithChain({
     chunkCount: 24,
     tokensPerChunk: 100,
@@ -820,10 +821,14 @@ test('kv-unified keeps extension as a priced dominance dimension under a relevan
 });
 
 test('kv-unified label count stays bounded under a stale presentation with a relevant cache (#97)', () => {
-  // Same forest as the no-cache growth test, but the stale receipt also
-  // carries a relevant provider cache, so extension is priced and is a
-  // dominance dimension. The count must still be bounded (representatives
-  // per bucket group cap it) and the reported error bound must be honest.
+  // Same forest as the no-cache growth test, but every receipt also carries a
+  // relevant provider cache, so extension is priced and is a dominance
+  // dimension. The comparison is half-stale against FRESH with the cache
+  // relevant in both: comparing against a no-cache solve at the same
+  // staleness does not discriminate (that ratio was already 1.5 before the
+  // fix). The count must stay bounded (representatives per bucket group cap
+  // it) and the reported error bound must cover the regret against an
+  // unbucketed solve of the same forest.
   const chronicle = buildChronicleWithChain({
     chunkCount: 24,
     tokensPerChunk: 100,
@@ -842,17 +847,28 @@ test('kv-unified label count stays bounded under a stale presentation with a rel
     tailChunkIds: new Set(),
   };
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
-  const older = ordered.slice(0, ordered.length / 2);
-  const presentation: AcceptedPresentationReference = {
-    currentSeq: 1,
-    leaves: new Map(older.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }])),
+  const receiptCovering = (count: number) => {
+    const covered = ordered.slice(0, count);
+    const presentation: AcceptedPresentationReference = {
+      currentSeq: 1,
+      leaves: new Map(covered.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }])),
+    };
+    let offset = 0;
+    const units = covered.map((chunk) => {
+      const unit = { kind: 'raw' as const, key: chunk.id, tokens: chunk.rawTokens, offset };
+      offset += chunk.rawTokens;
+      return unit;
+    });
+    return {
+      presentation,
+      cache: {
+        immutablePrefixHash: 'tools-v1',
+        layout: { units, totalTokens: offset },
+        markers: [{ unitIndex: units.length, offset }],
+      },
+      currentImmutablePrefixHash: 'tools-v1',
+    };
   };
-  let offset = 0;
-  const units = older.map((chunk) => {
-    const unit = { kind: 'raw' as const, key: chunk.id, tokens: chunk.rawTokens, offset };
-    offset += chunk.rawTokens;
-    return unit;
-  });
   const rawTotal = inputs.chunks.reduce((sum, chunk) => sum + chunk.rawTokens, 0);
   const options = {
     maxTokens: Math.floor(rawTotal * 0.75),
@@ -860,18 +876,38 @@ test('kv-unified label count stays bounded under a stale presentation with a rel
     continuityBucketSize: 100,
     fidelityBucketSize: 100,
     labelCeiling: 200_000,
-    presentation,
-    cache: { immutablePrefixHash: 'tools-v1', layout: { units, totalTokens: offset }, markers: [{ unitIndex: units.length, offset }] },
   } as const;
-  const noCache = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
-  const withCache = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, currentImmutablePrefixHash: 'tools-v1' });
-  assert.equal(noCache.feasible, true);
-  assert.equal(withCache.feasible, true);
-  if (!noCache.feasible || !withCache.feasible) return;
-  const noCacheLabels = noCache.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
-  const withCacheLabels = withCache.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
-  assert.ok(withCacheLabels <= noCacheLabels * 3, `with cache ${withCacheLabels} vs without ${noCacheLabels}`);
-  assert.equal(withCache.cacheRelevant, true);
-  assert.ok((withCache.propagation?.approximationCacheErrorBound ?? -1) >= 0);
-  assert.ok((withCache.propagation?.approximationScoreErrorBound ?? -1) >= 0);
+  const fresh = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, ...receiptCovering(ordered.length) });
+  const halfStale = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, ...receiptCovering(ordered.length / 2) });
+  assert.equal(fresh.feasible, true);
+  assert.equal(halfStale.feasible, true);
+  if (!fresh.feasible || !halfStale.feasible) return;
+  assert.equal(fresh.cacheRelevant, true);
+  assert.equal(halfStale.cacheRelevant, true);
+  const freshLabels = fresh.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  const halfLabels = halfStale.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+  // Before the fix: fresh 29,620 / half-stale 91,356 (3.1x, and growing with
+  // the forest). After: 1.44x, flat.
+  assert.ok(halfLabels <= freshLabels * 2, `half-stale ${halfLabels} vs fresh ${freshLabels}`);
+
+  // Honesty of the reported bound: an all-zero-bucket solve of the same
+  // half-stale forest is exact, so the bucketed selection's regret against it
+  // must sit inside the a-posteriori score bound (which includes the cache
+  // envelope component).
+  const exact = new ParetoKvUnifiedPolicySolver(inputs).solve({
+    ...options,
+    ...receiptCovering(ordered.length / 2),
+    tokenBucketSize: 0,
+    continuityBucketSize: 0,
+    fidelityBucketSize: 0,
+    labelCeiling: 2_000_000,
+  });
+  assert.equal(exact.feasible, true);
+  if (!exact.feasible) return;
+  const cacheBound = halfStale.propagation?.approximationCacheErrorBound;
+  const scoreBound = halfStale.propagation?.approximationScoreErrorBound;
+  assert.ok(cacheBound !== undefined && cacheBound >= 0, `cache bound ${cacheBound}`);
+  assert.ok(scoreBound !== undefined && scoreBound >= 0, `score bound ${scoreBound}`);
+  const regret = halfStale.selected.score - exact.selected.score;
+  assert.ok(regret <= (scoreBound ?? -1) + 1e-9, `regret ${regret} vs bound ${scoreBound}`);
 });

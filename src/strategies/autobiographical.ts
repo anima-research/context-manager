@@ -2071,11 +2071,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the receipt no longer describes the previous turn, and a later switch
       // back would measure continuity against a days-old baseline and treat
       // everything folded since as extension (#97). Loading is not
-      // presenting: an inspection tool, a preview, or a dry run that opens the
-      // store with a different strategy must leave the receipt alone. Only
-      // note here that a receipt exists; the first non-dry-run select by a
-      // non-kv-unified strategy (selectAdaptive, after the resolutions
-      // commit) supersedes it.
+      // presenting: an inspection tool that opens the store with a different
+      // strategy, or a compile with `dryRun: true`, must leave the receipt
+      // alone. Only note here that a receipt exists; the first non-dry-run
+      // ADAPTIVE select by a non-kv-unified strategy (selectAdaptive, after
+      // the resolutions commit) supersedes it. A caller that previews through
+      // a non-dry-run compile is presenting as far as this class can tell,
+      // and `adaptiveResolution: false` (selectHierarchical writes nothing by
+      // design) never supersedes.
       this.kvUnifiedReceiptSupersedePending =
         this.store.listStates().some((state) => state.id === this.kvUnifiedReceiptStateId) &&
         this.store.getStateJson(this.kvUnifiedReceiptStateId) != null;
@@ -2113,8 +2116,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected supersedeKvUnifiedReceipt(): void {
     if (!this.store) return;
     this.requireBranchMutation('supersedeKvUnifiedReceipt');
-    this.kvUnifiedReceiptSupersedePending = false;
     this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+    // Cleared only after the write: if it throws, a later compile retries.
+    this.kvUnifiedReceiptSupersedePending = false;
     console.warn(
       `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
         `${String(this.config.foldingStrategy ?? 'default')} has presented from this store; ` +

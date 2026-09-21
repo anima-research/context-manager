@@ -299,14 +299,16 @@ test('a non-kv-unified folding strategy supersedes a persisted kv-unified receip
     else originalWarn(...args);
   };
   try {
-    // Opening (inspection, preview, dry run) is not presenting: the receipt
-    // must survive a load by another strategy untouched.
+    // Opening is not presenting, and neither is a `dryRun` compile: the
+    // receipt must survive both untouched. (A preview that goes through a
+    // NON-dry-run compile is a presentation as far as the strategy can tell.)
     const inspector = await ContextManager.open({ path: STORE, strategy: stableStrategy() });
+    await inspector.compile({ maxTokens: 10_000, reserveForResponse: 0 }, undefined, { dryRun: true });
     inspector.close();
-    assert.equal(warnings.length, 0, 'a load must not supersede');
+    assert.equal(warnings.length, 0, 'a load or a dry-run compile must not supersede');
     const inspected = strategy();
     const stillThere = await ContextManager.open({ path: STORE, strategy: inspected });
-    assert.equal(receipts(inspected).head?.sequence, 1, 'receipt intact after a kv-stable load');
+    assert.equal(receipts(inspected).head?.sequence, 1, 'receipt intact after a kv-stable load and dry run');
     stillThere.close();
 
     // Presenting is: the first kv-stable compile supersedes it, exactly once.
@@ -377,5 +379,77 @@ test('a failed compile by a non-kv-unified strategy keeps the persisted kv-unifi
   const back = strategy();
   const reopened = await ContextManager.open({ path: STORE, strategy: back });
   assert.equal(receipts(back).head?.sequence, 1, 'no presentation replaced the receipt, so it survives');
+  reopened.close();
+});
+
+test('a failed supersede write is retried by the next presentation (#98 review)', async () => {
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first });
+  manager.addMessage('user', [{ type: 'text', text: 'presented by kv-unified' }]);
+  await manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const markerCount = (
+    first as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
+  ).kvUnifiedPendingMarkerUnitIndices.length;
+  first.reportKvUnifiedAccepted({
+    submissionId: 's1',
+    acceptedAt: 123,
+    wireReceipt: {
+      requestHash: 'wire1',
+      markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+        ordinal,
+        prefixHash: `prefix-${ordinal}`,
+        estimatedOffset: ordinal + 1,
+      })),
+    },
+  });
+  assert.equal(receipts(first).head?.sequence, 1);
+  manager.close();
+
+  const stable = new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-stable',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+  });
+  const viaStable = await ContextManager.open({ path: STORE, strategy: stable });
+  const store = (stable as unknown as { store: { setStateJson(id: string, value: unknown): void } }).store;
+  const originalSet = store.setStateJson.bind(store);
+  let failures = 0;
+  store.setStateJson = (id: string, value: unknown) => {
+    if (id.endsWith('/kvunified:presentation-receipt') && failures === 0) {
+      failures++;
+      throw new Error('injected receipt write failure');
+    }
+    originalSet(id, value);
+  };
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    if (!args.map(String).join(' ').includes('superseded a persisted kv-unified presentation receipt')) {
+      originalWarn(...args);
+    }
+  };
+  try {
+    viaStable.addMessage('user', [{ type: 'text', text: 'presented by kv-stable' }]);
+    await assert.rejects(
+      viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 }),
+      /injected receipt write failure/,
+    );
+    // The flag must still be raised: the same instance retries and succeeds.
+    await viaStable.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    assert.equal(failures, 1);
+  } finally {
+    console.warn = originalWarn;
+    store.setStateJson = originalSet;
+  }
+  viaStable.close();
+
+  const back = strategy();
+  const reopened = await ContextManager.open({ path: STORE, strategy: back });
+  assert.equal(receipts(back).head, null, 'the retried supersede emptied the chain');
   reopened.close();
 });
