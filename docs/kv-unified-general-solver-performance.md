@@ -13,9 +13,11 @@ been changed.
 
 ## Implementation
 
-- Bucketed propagation selects the same three lexicographic extrema in one
-  linear scan. Each extremum is necessarily nondominated, so quadratic
-  dominance filtering and three sorts are unnecessary in grid mode. Exact
+- Bucketed propagation selects the lexicographic extrema in one linear scan:
+  fidelity, continuity, tokens, and maximum extension when a cache is relevant.
+  Every priced dimension participates in tie-breaking, so each extremum is
+  necessarily nondominated. Quadratic dominance filtering and repeated sorts
+  are unnecessary in grid mode. Exact
   non-grid propagation still retains nondominated labels.
 - Raw-run metrics are computed once per structural action. Select and emit
   are fused for broken/cold cache prefixes; immutable cache/envelope objects
@@ -24,9 +26,11 @@ been changed.
   performs giant BigInt leaf-mask operations for forced raw roots.
 - Grid states use lossless numeric keys when the entire key range is safely
   representable; otherwise they use strings. An irrelevant cache has no state
-  dimension. A broken relevant prefix retains its last matched marker and
-  extension-token count, because unmarked matches beyond that marker cannot
-  affect future cache cost. Intact prefixes retain their full state.
+  dimension. A broken relevant prefix retains its last matched marker because
+  unmarked matches beyond that marker cannot affect future cache cost. Intact
+  prefixes retain their full state. Following upstream #98, extension tokens
+  are a priced dominance/envelope dimension and an extra warm-cache extremum,
+  never an exact state-key dimension.
 - Terminal evaluation precomputes per-leaf/per-level fidelity and continuity
   terms. Compact frontier ranges fill one reusable level vector. Sums follow
   exactly the oracle's forward-fidelity/reverse-continuity order. Cache pricing
@@ -55,6 +59,8 @@ solves no longer select it for protected holes.
 Fixture: 73,918 leaves, 3,345 summaries. Bun 1.3.14 on this Mac. Policy and
 10k/50k/100k token/continuity/fidelity buckets come from the recorded recipe.
 RSS is measured process resident memory at completion, not a peak guarantee.
+These measurements were collected at local revision `5c55a26`, before rebasing
+onto the 0.10.1 release and incorporating #98's extension accounting.
 
 | Scenario, certificate disabled | Time | RSS | Changed leaf resolutions |
 | --- | ---: | ---: | ---: |
@@ -82,6 +88,34 @@ compression/model calls, cross-platform performance, and deployment have not
 been tested. The optional serialized-input baseline from the certificate-only
 work was interrupted without a result; it is not used for a fresh speedup ratio.
 
+## 500-message replay (pre-rebase)
+
+The same benchmark revision completed 500/500 sequential message-prefix solves
+with no failures and with the certificate disabled:
+
+| Statistic | Seconds |
+| --- | ---: |
+| Minimum | 2.69 |
+| Mean | 3.12 |
+| Median | 2.84 |
+| p90 | 3.54 |
+| p95 | 4.96 |
+| p99 | 8.07 |
+| Maximum | 9.49 |
+
+Nearest-rank percentiles exclude one initial warm-up. 475 solves were below
+five seconds; the other 25 were the first 25 measured solves. Four solves
+changed layout, taking 2.76–3.04 seconds.
+
+This controlled replay covers the last 500 messages of the saved snapshot
+(September 12–19): a 528k wall, moving 100k tail, snapshot summary catalogue
+with future-source summaries excluded, and acceptance of each selected layout
+before the next message. It does not reconstruct historical compression calls,
+provider traffic, or cache TTL expiration. Timings include forest/solver
+construction and selected-frontier materialization, not input preparation or
+receipt generation. Raw data remains local under `replay-500/` in the receipt
+directory. The full 500-message run has not been repeated after the rebase.
+
 ## Verification and reproduction
 
 Tests compare prepared metrics, selected frontiers, scores, and both floors
@@ -91,8 +125,15 @@ policy, receipt, and integration tests also pass. A deterministic work-count
 regression generates 22,435 candidates from 64 leaves: the original solver
 reads source token costs 5,384,010 times, while the new solver reads them 2,112
 times, with the same selected score. Lazy-layout snapshot behavior is also
-tested. The TypeScript build and full Node test suite pass: **807 passed, 0
-failed**. The full test transcript is in the local receipt directory.
+tested. After rebasing onto `b272434` (0.10.1), the TypeScript build and typecheck
+pass. The full Node suite passes: **813 passed, 0 failed**, compared with
+**802 passed, 0 failed** on that `main` baseline. This includes upstream's
+stale-receipt growth, extension-dominance, and cache-error-envelope tests.
+
+A fresh post-rebase check of the saved fixture with a relevant cache and a
+500k hard wall took **8.740 seconds**, at **1.278 GB RSS**, changing 1,158 leaf
+resolutions. The selected frontier, score, cache floor, and continuity floor
+all exactly match the pre-rebase run of that case.
 
 All local fixtures and receipts are under:
 `/Users/antra/sill-cm/data/solver-fixtures/hysteresis-20260920.yXh4p1/`.
