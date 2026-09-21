@@ -974,8 +974,8 @@ test('kv-unified label count stays flat under a relevant cache once cuts diverge
   // at stayed in its state key although nothing reads it after the break, so
   // labels that diverged at different units never competed and the
   // relevant-cache label set grew with the forest: over the no-cache count,
-  // 1.3x at 12 chunks, 2.7x at 24 and 3.6x at 32 (bucketed); 2.1x at 24
-  // (exact). After: 1.2-1.3x at every size.
+  // 1.1x at 12 chunks, 2.1x at 24 and 3.1x at 32 (bucketed); 1.8x at 24
+  // (exact). After: 1.1-1.25x at every size.
   const buckets = { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 };
   const exact = { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 };
   for (const [chunkCount, grid, limit] of [[32, buckets, 1.6], [24, exact, 1.5]] as const) {
@@ -1135,6 +1135,73 @@ test('kv-unified keeps the warm-prefix length of a cut that broke the cache in i
     ['exact dag', { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 }],
     ['bucketed dag', { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 }],
     ['leaf', { engine: 'leaf' as const }],
+  ] as const) {
+    const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra });
+    assert.equal(result.feasible, true, name);
+    if (!result.feasible) return;
+    assert.equal(signature(result.selected), signature(oracle.selected), `${name}: selected ${signature(result.selected)}`);
+    assert.equal(result.selected.score, oracle.selected.score, name);
+  }
+});
+
+test('kv-unified resolves a representative tie between broken cuts the way terminal selection does (#105)', () => {
+  // Four chronological 100-token chunks of equal salience, a 20-token L1 each
+  // for a and b; c and d are pinned raw. The receipt and the relevant cache
+  // are the all-raw layout with its only breakpoint at the end, so folding a
+  // and folding b both break the cache with nothing warm, at unit 0 and unit
+  // 1. With alpha 0 and both continuity floors at 1 the two folds tie on every
+  // metric and on score, and terminal selection takes the earlier frontier
+  // signature, a:0|b:1. Once the key stops splitting them by divergence unit
+  // they share one pool, and under buckets only one representative survives
+  // the tie; it must be the same cut, since the two render different layouts
+  // and so leave different receipts for the next turn.
+  const build = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    chronicle.addChunk({ id: 'c', rawTokens: 100, pinned: true });
+    chronicle.addChunk({ id: 'd', rawTokens: 100, pinned: true });
+    chronicle.produceL1(['a']);
+    chronicle.produceL1(['b']);
+    return {
+      chunks: chronicle.chunks,
+      summaries: chronicle.summaries,
+      recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0,
+      tailTokens: 0,
+      headChunkIds: new Set(),
+      tailChunkIds: new Set(),
+    };
+  };
+  const allRaw = new Map(['a', 'b', 'c', 'd'].map((id) => [id, 0]));
+  const receipt = steadyReceipt(build(), allRaw, 1);
+  const base = {
+    maxTokens: 320,
+    presentation: receipt.presentation,
+    cache: { ...receipt.cache, markers: [{ unitIndex: 4, offset: 400 }] },
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 0,
+      continuityRecencyFloor: 1,
+      continuityStableFloor: 1,
+      continuityLambda: 100,
+      continuityScale: 100,
+      cacheLambda: 1,
+      cacheScale: 100,
+    },
+  } as const;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    ['a', 'b', 'c', 'd'].map((id) => `${id}:${candidate.frontier.get(id) ?? 0}`).join('|');
+  const oracle = new ExactKvUnifiedPolicySolver(build()).solve(base);
+  assert.equal(oracle.feasible, true);
+  if (!oracle.feasible) return;
+  const tied = oracle.candidates.filter((candidate) => candidate.score === oracle.selected.score);
+  assert.deepEqual(tied.map(signature), ['a:0|b:1|c:0|d:0', 'a:1|b:0|c:0|d:0'], 'the two folds tie on score');
+  for (const [name, extra] of [
+    ['exact dag', { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 }],
+    ['bucketed dag', { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 }],
   ] as const) {
     const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra });
     assert.equal(result.feasible, true, name);
