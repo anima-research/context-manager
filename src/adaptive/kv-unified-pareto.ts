@@ -32,6 +32,10 @@ interface ParetoLabel {
   active: boolean;
   remaining: bigint;
   renderedTokens: number;
+  /** Rendered tokens not covered by the accepted presentation. Priced by the
+   * cache term (avoidable recompute = recomputed - extension), so it is a
+   * dominance dimension while a provider cache is relevant — never a state-key
+   * dimension (#97). */
   extensionTokens: number;
   continuityLoss: number;
   fidelityLoss: number;
@@ -47,6 +51,9 @@ interface ApproximationEnvelope {
   token: number;
   continuity: number;
   fidelity: number;
+  /** Extension tokens a covered label had beyond its representative: the
+   * cache term may be overstated by this many tokens times the cache price. */
+  cache: number;
 }
 
 interface AssignmentTrace {
@@ -71,6 +78,8 @@ export interface ParetoPropagationStats {
   readonly approximationTokenErrorBound: number;
   readonly approximationContinuityErrorBound: number;
   readonly approximationFidelityErrorBound: number;
+  /** Extension tokens the cache term may have been overstated by. */
+  readonly approximationCacheErrorBound: number;
 }
 
 export type ParetoPolicySolveResult = ExactPolicySolveResult & {
@@ -178,14 +187,14 @@ export class ParetoKvUnifiedPolicySolver {
       const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
       const current = states.get(key) ?? [];
       for (const incumbent of current) {
-        if (dominates(incumbent, label)) {
+        if (dominates(incumbent, label, cacheRelevant)) {
           labelsDominated++;
           return;
         }
       }
       const survivors: ParetoLabel[] = [];
       for (const incumbent of current) {
-        if (dominates(label, incumbent)) {
+        if (dominates(label, incumbent, cacheRelevant)) {
           incumbent.active = false;
           labelsDominated++;
         } else survivors.push(incumbent);
@@ -277,6 +286,7 @@ export class ParetoKvUnifiedPolicySolver {
         approximationTokenErrorBound: 0,
         approximationContinuityErrorBound: 0,
         approximationFidelityErrorBound: 0,
+        approximationCacheErrorBound: 0,
       },
     };
   }
@@ -331,7 +341,7 @@ export class ParetoKvUnifiedPolicySolver {
       for (const pool of groups.values()) {
         const nondominated = pool.filter(
           (candidate, index) => !pool.some(
-            (other, otherIndex) => otherIndex !== index && dominates(other, candidate),
+            (other, otherIndex) => otherIndex !== index && dominates(other, candidate, cacheRelevant),
           ),
         );
         const representatives = continuityBucketSize > 0 && fidelityBucketSize > 0
@@ -343,9 +353,14 @@ export class ParetoKvUnifiedPolicySolver {
               [...nondominated].sort((a, b) =>
                 a.renderedTokens - b.renderedTokens || representativeOrder(a, b),
               )[0],
+              ...(cacheRelevant
+                ? [[...nondominated].sort((a, b) =>
+                    b.extensionTokens - a.extensionTokens || representativeOrder(a, b),
+                  )[0]]
+                : []),
             ])
           : nondominated;
-        const covered = coverApproximationPool(pool, representatives);
+        const covered = coverApproximationPool(pool, representatives, cacheRelevant);
         labelsDominated += pool.length - covered.length;
         result.push(...covered);
       }
@@ -497,6 +512,7 @@ export class ParetoKvUnifiedPolicySolver {
         approximationTokenErrorBound: approximation.token,
         approximationContinuityErrorBound: approximation.continuity,
         approximationFidelityErrorBound: approximation.fidelity,
+        approximationCacheErrorBound: approximation.cache,
       },
     };
   }
@@ -555,7 +571,7 @@ export class ParetoKvUnifiedPolicySolver {
     return (
       fidelityError +
       budgetSlope * tokenError +
-      cacheSlope * tokenError * cachePrice +
+      cacheSlope * (tokenError + approximation.cache) * cachePrice +
       rho * continuitySlope * continuityError +
       hysteresis
     );
@@ -696,6 +712,10 @@ export class ParetoKvUnifiedPolicySolver {
     };
   }
 
+  private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {
+    return options.presentation !== undefined && ids.length > 0 && ids.every((id) => !options.presentation!.leaves.has(id));
+  }
+
   private assignRawRun(
     label: ParetoLabel,
     ids: readonly ChunkId[],
@@ -764,9 +784,6 @@ export class ParetoKvUnifiedPolicySolver {
     };
   }
 
-  private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {
-    return options.presentation !== undefined && ids.length > 0 && ids.every((id) => !options.presentation!.leaves.has(id));
-  }
 }
 
 function stateKey(
@@ -778,10 +795,15 @@ function stateKey(
   const tokenKey = tokenBucketSize > 0
     ? Math.ceil(label.renderedTokens / tokenBucketSize)
     : label.renderedTokens;
+  // Extension tokens are deliberately NOT a key dimension. They are priced
+  // (cache term), so they are a dominance dimension while a cache is relevant
+  // and a cover-envelope term when bucketed; keying on their exact value
+  // multiplied the live label set by the number of distinct extension sums —
+  // superlinear in forest size once a stale receipt covered half the leaves
+  // (#97).
   return [
     label.remaining.toString(16),
     tokenKey,
-    label.extensionTokens,
     label.cache.intact ? 1 : 0,
     label.cache.matchedUnits,
     label.cache.cachedTokens,
@@ -797,6 +819,7 @@ const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
   token: 0,
   continuity: 0,
   fidelity: 0,
+  cache: 0,
 });
 
 /** Attach every discarded path to one retained representative.  The
@@ -807,6 +830,7 @@ const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
 function coverApproximationPool(
   pool: readonly ParetoLabel[],
   representatives: readonly ParetoLabel[],
+  cacheRelevant: boolean,
 ): ParetoLabel[] {
   const covered = representatives.map((label) => ({
     ...label,
@@ -820,7 +844,8 @@ function coverApproximationPool(
       const cost =
         Math.abs(candidate.renderedTokens - source.renderedTokens) +
         Math.max(0, candidate.continuityLoss - source.continuityLoss) +
-        Math.max(0, candidate.fidelityLoss - source.fidelityLoss);
+        Math.max(0, candidate.fidelityLoss - source.fidelityLoss) +
+        (cacheRelevant ? Math.max(0, source.extensionTokens - candidate.extensionTokens) : 0);
       if (cost < chosenCost) {
         chosen = i;
         chosenCost = cost;
@@ -839,28 +864,40 @@ function coverApproximationPool(
       target.approximation.fidelity,
       source.approximation.fidelity + Math.max(0, target.fidelityLoss - source.fidelityLoss),
     );
+    if (cacheRelevant) {
+      target.approximation.cache = Math.max(
+        target.approximation.cache,
+        source.approximation.cache + Math.max(0, source.extensionTokens - target.extensionTokens),
+      );
+    }
   }
   return covered;
 }
 
 function maxApproximation(labels: readonly ParetoLabel[]): ApproximationEnvelope {
-  const result = { token: 0, continuity: 0, fidelity: 0 };
+  const result = { token: 0, continuity: 0, fidelity: 0, cache: 0 };
   for (const label of labels) {
     result.token = Math.max(result.token, label.approximation.token);
     result.continuity = Math.max(result.continuity, label.approximation.continuity);
     result.fidelity = Math.max(result.fidelity, label.approximation.fidelity);
+    result.cache = Math.max(result.cache, label.approximation.cache);
   }
   return result;
 }
 
-function dominates(a: ParetoLabel, b: ParetoLabel): boolean {
+function dominates(a: ParetoLabel, b: ParetoLabel, cacheRelevant: boolean): boolean {
+  // Extension is priced only through the cache term (avoidable recompute =
+  // recomputed - extension), so more extension is better exactly when a
+  // provider cache is relevant. Without one it is not a dimension at all.
+  if (cacheRelevant && a.extensionTokens < b.extensionTokens) return false;
   return (
     a.renderedTokens <= b.renderedTokens &&
     a.continuityLoss <= b.continuityLoss &&
     a.fidelityLoss <= b.fidelityLoss &&
     (a.renderedTokens < b.renderedTokens ||
       a.continuityLoss < b.continuityLoss ||
-      a.fidelityLoss < b.fidelityLoss)
+      a.fidelityLoss < b.fidelityLoss ||
+      (cacheRelevant && a.extensionTokens > b.extensionTokens))
   );
 }
 
