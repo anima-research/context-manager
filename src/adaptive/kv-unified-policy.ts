@@ -231,12 +231,8 @@ export class ExactKvUnifiedPolicySolver {
     const candidates: ExactPolicyCandidate[] = unscored.map((candidate) => {
       const cacheExcess = Math.max(0, candidate.cacheChurn - cacheFloor);
       const continuityExcess = Math.max(0, candidate.continuityLoss - continuityFloor);
-      const score =
-        candidate.fidelityLoss +
-        candidate.budgetPenalty +
-        quadratic(cacheExcess, policy.cacheScale, policy.cacheLambda) +
-        continuityMultiplier *
-          quadratic(continuityExcess, policy.continuityScale, policy.continuityLambda);
+      const score = policyScore(candidate.fidelityLoss, candidate.budgetPenalty,
+        candidate.cacheChurn, candidate.continuityLoss, cacheFloor, continuityFloor, policy, continuityMultiplier);
       const result = {
         get frontier() { return candidate.frontier; },
         get layout() { return candidate.layout; },
@@ -248,13 +244,8 @@ export class ExactKvUnifiedPolicySolver {
       matching.set(result, candidate.matchesPresentation);
       return result;
     });
-    candidates.sort((a, b) =>
-      a.score - b.score ||
-      a.renderedTokens - b.renderedTokens ||
-      frontierSignature(a.frontier, this.orderedChunks.map((chunk) => chunk.id)).localeCompare(
-        frontierSignature(b.frontier, this.orderedChunks.map((chunk) => chunk.id)),
-      ),
-    );
+    const leafIds = this.orderedChunks.map((chunk) => chunk.id);
+    candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     let selected = candidates[0];
     const epsilon =
       Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
@@ -488,11 +479,23 @@ function clamp(value: number, low: number, high: number): number {
   return Math.min(high, Math.max(low, value));
 }
 
-function normalizeContinuityMultiplier(value: number | undefined): number {
+export function normalizeContinuityMultiplier(value: number | undefined): number {
   if (value === undefined) return 1;
   // Malformed relaxation fails closed: it must never make continuity cheaper.
   if (!Number.isFinite(value) || value < 0 || value > 1) return 1;
   return value;
+}
+
+export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyCandidate,
+  leafIds: readonly ChunkId[]): number {
+  return a.score - b.score || a.renderedTokens - b.renderedTokens ||
+    frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds));
+}
+
+export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,
+  cacheFloor: number, continuityFloor: number, policy: KvUnifiedWelfarePolicy, multiplier: number): number {
+  return fidelity + budget + quadratic(Math.max(0, cache - cacheFloor), policy.cacheScale, policy.cacheLambda) +
+    multiplier * quadratic(Math.max(0, continuity - continuityFloor), policy.continuityScale, policy.continuityLambda);
 }
 
 function frontierSignature(

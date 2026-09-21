@@ -6,11 +6,33 @@ import {
   type ExactPolicySolveOptions, type UnscoredCandidate,
 } from './kv-unified-policy.js';
 import type { RenderLayout, RenderedUnit } from './render-offsets.js';
+import { nonnegativeSumInterval, type BoundedPolicyCandidate } from './kv-unified-selective.js';
 
 export interface FrontierTrace {
   readonly parent: FrontierTrace | null;
   readonly ids: readonly ChunkId[];
   readonly level: number;
+}
+
+export interface FrontierTraceSource {
+  forEachAssignment(visit: (ids: readonly ChunkId[], level: number) => void): void;
+}
+
+export type FrontierTraceReference = FrontierTrace | FrontierTraceSource | null;
+
+interface CompiledAction {
+  readonly fidelity: number;
+  readonly continuity: number;
+  readonly matches: boolean;
+  readonly leaves: number;
+  /** Pairs: emitted unit code, earliest assigned leaf index. */
+  readonly emissions: Uint32Array;
+}
+
+export function visitFrontierTrace(trace: FrontierTraceReference,
+  visit: (ids: readonly ChunkId[], level: number) => void): void {
+  if (trace && 'forEachAssignment' in trace) trace.forEachAssignment(visit);
+  else for (let cursor = trace; cursor; cursor = cursor.parent) visit(cursor.ids, cursor.level);
 }
 
 /** Precompute per-leaf terms once, then sum in exactly the oracle's order.
@@ -22,6 +44,7 @@ export class TerminalPolicyEvaluator {
   private readonly ids: readonly string[];
   private readonly index: Map<string, number>;
   private readonly ranges = new WeakMap<readonly string[], Uint32Array>();
+  private readonly actions = new WeakMap<readonly string[], Map<number, CompiledAction>>();
   private readonly stride: number;
   private readonly fidelity: Float64Array;
   private readonly continuity: Float64Array;
@@ -33,17 +56,23 @@ export class TerminalPolicyEvaluator {
   private readonly unitKinds: RenderedUnit['kind'][];
   private readonly unitExtension: Uint8Array;
   private readonly emitted: Uint32Array;
+  private readonly firstEmission: Uint32Array;
+  private readonly orderedEmissions: Uint32Array;
+  private readonly emissionAtLeaf: Uint32Array;
   private readonly previousUnits: Uint32Array;
   private readonly markerUnits: ReadonlySet<number>;
   private readonly headCode: number;
   private readonly tailCode: number;
   private generation = 0;
   private readonly policy;
+  private readonly maxTokens: number;
+  private evaluations = 0;
   readonly cacheRelevant: boolean;
 
   constructor(private readonly inputs: PickerInputs, private readonly forest: CanonicalSummaryForest,
     private readonly options: ExactPolicySolveOptions) {
     this.policy = normalizePolicy(options.policy);
+    this.maxTokens = options.maxTokens;
     this.chunks = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
     this.ids = this.chunks.map((chunk) => chunk.id);
     this.index = new Map(this.chunks.map((chunk, index) => [chunk.id, index]));
@@ -62,6 +91,9 @@ export class TerminalPolicyEvaluator {
     this.unitKinds = new Array(this.tailCode + 1);
     this.unitExtension = new Uint8Array(this.tailCode + 1);
     this.emitted = new Uint32Array(this.tailCode + 1);
+    this.firstEmission = new Uint32Array(this.tailCode + 1);
+    this.orderedEmissions = new Uint32Array(this.tailCode + 1);
+    this.emissionAtLeaf = new Uint32Array(this.chunks.length);
     const presentation = options.presentation;
     for (const summary of summaries) {
       const code = summaryCode.get(summary.id)!;
@@ -108,27 +140,119 @@ export class TerminalPolicyEvaluator {
     }
   }
 
-  private fill(trace: FrontierTrace | null): void {
+  get orderedLeafIds(): readonly string[] { return this.ids; }
+  get exactEvaluations(): number { return this.evaluations; }
+
+  private compileAction(ids: readonly string[], level: number): CompiledAction {
+    let levels = this.actions.get(ids);
+    const cached = levels?.get(level);
+    if (cached) return cached;
+    let fidelity = 0, continuity = 0, matches = true;
+    const units = new Map<number, number>();
+    for (const id of ids) {
+      const index = this.index.get(id)!;
+      const at = index * this.stride + level;
+      fidelity += this.fidelity[at]; continuity += this.continuity[at];
+      matches &&= this.matches[at] === 1;
+      const code = this.representations[at];
+      if (code) units.set(code, Math.min(units.get(code) ?? Infinity, index));
+    }
+    const emissions = new Uint32Array(units.size * 2);
+    let cursor = 0;
+    for (const [code, index] of units) { emissions[cursor++] = code; emissions[cursor++] = index; }
+    const result = { fidelity, continuity, matches, leaves: ids.length, emissions };
+    if (!levels) { levels = new Map(); this.actions.set(ids, levels); }
+    levels.set(level, result);
+    return result;
+  }
+
+  /** Sum compiled action terms instead of scanning every leaf for every cut.
+   * Cache is exact: deduplicate emitted units, sort their first assigned leaf
+   * indices, and perform the same chronological offset/extension arithmetic.
+   * No cache-prefix estimate from propagation is trusted here. */
+  estimate(trace: FrontierTraceReference, renderedTokens: number): BoundedPolicyCandidate {
+    let exact: UnscoredCandidate | undefined;
+    const refine = () => exact ??= this.candidate(trace, renderedTokens);
+    let fidelity = 0, continuity = 0, matches = true, leaves = 0, unitCount = 0;
+    const generation = ++this.generation;
+    visitFrontierTrace(trace, (ids, level) => {
+      const action = this.compileAction(ids, level);
+      fidelity += action.fidelity; continuity += action.continuity;
+      matches &&= action.matches; leaves += action.leaves;
+      if (!this.cacheRelevant) return;
+      for (let i = 0; i < action.emissions.length; i += 2) {
+        const code = action.emissions[i], index = action.emissions[i + 1];
+        if (this.emitted[code] !== generation) {
+          this.emitted[code] = generation; this.firstEmission[code] = index;
+          this.orderedEmissions[unitCount++] = code;
+        } else this.firstEmission[code] = Math.min(this.firstEmission[code], index);
+      }
+    });
+    // Internal solver traces are complete disjoint cuts. Partial diagnostic
+    // traces keep the old default-raw behavior by using the exact evaluator.
+    if (leaves !== this.ids.length || !Number.isFinite(fidelity) || !Number.isFinite(continuity)) {
+      const c = refine();
+      return { renderedTokens, budgetPenalty: c.budgetPenalty, cacheChurn: c.cacheChurn,
+        fidelity: { lower: c.fidelityLoss, upper: c.fidelityLoss },
+        continuity: { lower: c.continuityLoss, upper: c.continuityLoss },
+        matchesPresentation: c.matchesPresentation!, exact: refine };
+    }
+    let cacheChurn = 0;
+    if (this.cacheRelevant) {
+      // Convert to first-leaf indices so TypedArray's native numeric sort can
+      // be used without a JS comparator or per-emission objects.
+      for (let i = 0; i < unitCount; i++) {
+        const code = this.orderedEmissions[i], index = this.firstEmission[code];
+        this.emissionAtLeaf[index] = code; this.orderedEmissions[i] = index;
+      }
+      const ordered = this.orderedEmissions.subarray(0, unitCount);
+      ordered.sort();
+      let offset = 0, cached = 0, prefix = 0, extension = 0;
+      let intact = true;
+      const emit = (code: number) => {
+        const tokens = this.unitTokens[code]; offset += tokens;
+        if (this.unitExtension[code]) extension += tokens;
+        if (intact) {
+          if (this.previousUnits[prefix] === code) {
+            prefix++;
+            if (this.markerUnits.has(prefix)) cached = offset;
+          } else intact = false;
+        }
+      };
+      if (this.unitTokens[this.headCode] > 0) emit(this.headCode);
+      for (const index of ordered) emit(this.emissionAtLeaf[index]);
+      if (this.unitTokens[this.tailCode] > 0) emit(this.tailCode);
+      cacheChurn = Math.max(0, offset - cached - extension) * Math.max(0, this.policy.cacheWritePrice - this.policy.cacheReadPrice);
+    }
+    return {
+      renderedTokens, budgetPenalty: budgetPenalty(renderedTokens, this.maxTokens, this.policy),
+      cacheChurn, fidelity: nonnegativeSumInterval(fidelity, leaves), continuity: nonnegativeSumInterval(continuity, leaves),
+      matchesPresentation: matches, exact: refine,
+    };
+  }
+
+  private fill(trace: FrontierTraceReference): void {
     this.levels.fill(0);
     // Valid cut traces assign each leaf exactly once, so traversal direction
     // is immaterial. Reuse numeric indices for shared summary/raw-run actions.
-    for (let cursor = trace; cursor; cursor = cursor.parent) {
-      let ranges = this.ranges.get(cursor.ids);
+    visitFrontierTrace(trace, (ids, level) => {
+      let ranges = this.ranges.get(ids);
       if (!ranges) {
-        const indices = cursor.ids.map((id) => this.index.get(id)!).sort((a, b) => a - b);
+        const indices = ids.map((id) => this.index.get(id)!).sort((a, b) => a - b);
         const spans: number[] = [];
         for (const index of indices) {
           if (spans.length > 0 && spans[spans.length - 1] === index) spans[spans.length - 1]++;
           else spans.push(index, index + 1);
         }
         ranges = Uint32Array.from(spans);
-        this.ranges.set(cursor.ids, ranges);
+        this.ranges.set(ids, ranges);
       }
-      for (let i = 0; i < ranges.length; i += 2) this.levels.fill(cursor.level, ranges[i], ranges[i + 1]);
-    }
+      for (let i = 0; i < ranges.length; i += 2) this.levels.fill(level, ranges[i], ranges[i + 1]);
+    });
   }
 
-  candidate(trace: FrontierTrace | null, renderedTokens: number): UnscoredCandidate {
+  candidate(trace: FrontierTraceReference, renderedTokens: number): UnscoredCandidate {
+    this.evaluations++;
     this.fill(trace);
     let fidelityLoss = 0;
     let continuityLoss = 0;
@@ -207,7 +331,7 @@ export class TerminalPolicyEvaluator {
       get frontier() { return getFrontier(); },
       get layout() { return getLayout(); },
       fidelityLoss, continuityLoss, renderedTokens, cacheChurn, matchesPresentation,
-      budgetPenalty: budgetPenalty(renderedTokens, this.options.maxTokens, this.policy),
+      budgetPenalty: budgetPenalty(renderedTokens, this.maxTokens, this.policy),
     };
   }
 }

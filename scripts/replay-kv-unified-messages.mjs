@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.ts';
 import { ParetoKvUnifiedPolicySolver } from '../src/adaptive/kv-unified-pareto.ts';
 import { SummaryTree } from '../src/adaptive/summary-tree.ts';
@@ -19,6 +20,8 @@ const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
 const full = [...fixture.inputs.chunks].sort((a, b) => a.sequence - b.sequence);
 const count = Number(arg('--count') ?? 500);
 const limit = Number(arg('--limit') ?? count);
+const verifyEvery = Number(arg('--verify-every') ?? 0);
+if (!Number.isInteger(verifyEvery) || verifyEvery < 0) throw new Error('invalid verify-every');
 if (!Number.isInteger(count) || count < 1 || count >= full.length || !Number.isInteger(limit) || limit < 1 || limit > count) {
   throw new Error('invalid count/limit');
 }
@@ -128,6 +131,7 @@ const config = {
   toTimestamp: new Date(metadata.messages[first + limit - 1].timestamp).toISOString(),
   prefixMessages: first, snapshotMessages: full.length, maxTokens: fixture.options.maxTokens,
   tailWindowTokens: metadata.recentWindowTokens, certificateEnabled: false,
+  referenceVerification: verifyEvery > 0 ? `object engine every ${verifyEvery} samples, at warm-up, and on every movement; outside solve timing` : 'disabled',
   presentation: 'one initial warm-up excluded; each successful message-prefix solve accepted before the next',
   cache: 'previous accepted atomic layout; fresh token-weighted markers; stable immutable prefix; no wall-clock TTL simulation',
   summaries: 'snapshot catalogue, exclude future-source summaries; not historical compression-time reconstruction',
@@ -160,6 +164,7 @@ function summary() {
     medianMs: quantile(0.5), p90Ms: quantile(0.9), p95Ms: quantile(0.95), p99Ms: quantile(0.99), maxMs: times.at(-1) ?? null,
     histogram, maxRssMB: Math.max(0, ...rows.map((row) => row.rssMB)),
     movementSolves: rows.filter((row) => row.ok && row.moves > 0).length,
+    referenceChecks: rows.filter((row) => row.referenceVerified).length,
     slowest: rows.filter((row) => row.ok).sort((a, b) => b.solveMs - a.solveMs).slice(0, 10),
     updatedAt: new Date().toISOString(),
   };
@@ -173,7 +178,7 @@ for (let step = 0; step <= limit; step++) {
   const solveStarted = performance.now();
   try {
     const forest = new CanonicalSummaryForest(inputs, fixture.forestOptions);
-    const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({
+    const solveOptions = {
       ...fixture.options, hysteresisCertificate: false, presentation, cache,
       currentImmutablePrefixHash: cache ? prefixHash : undefined,
       onProgress: (event) => {
@@ -182,7 +187,8 @@ for (let step = 0; step <= limit; step++) {
           lastProgress = performance.now();
         }
       },
-    });
+    };
+    const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve(solveOptions);
     if (!result.feasible) throw new Error(`infeasible: ${JSON.stringify(result.feasibility)}`);
     const frontier = result.selected.frontier;
     row.solveMs = performance.now() - solveStarted;
@@ -191,6 +197,24 @@ for (let step = 0; step <= limit; step++) {
     row.moves = inputs.chunks.filter((chunk) => (frontier.get(chunk.id) ?? 0) !== chunk.currentResolution).length;
     row.labels = result.propagation?.terminalLabels;
     row.maxLabelsPerState = result.propagation?.maxLabelsPerState;
+    row.exactTerminalEvaluations = result.propagation?.exactTerminalEvaluations;
+    const decision = (solved) => ({
+      tokens: solved.selected.renderedTokens, score: solved.selected.score,
+      fidelityLoss: solved.selected.fidelityLoss, continuityLoss: solved.selected.continuityLoss,
+      cacheChurn: solved.selected.cacheChurn, cacheFloor: solved.cacheFloor, continuityFloor: solved.continuityFloor,
+      frontierHash: createHash('sha256').update(JSON.stringify([...solved.selected.frontier]
+        .sort(([a], [b]) => a.localeCompare(b)))).digest('hex'),
+    });
+    Object.assign(row, decision(result));
+    if (verifyEvery > 0 && (step % verifyEvery === 0 || row.moves > 0)) {
+      const referenceStarted = performance.now();
+      const reference = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...solveOptions, storage: 'objects', onProgress: undefined });
+      if (!reference.feasible || JSON.stringify(decision(reference)) !== JSON.stringify(decision(result))) {
+        throw new Error(`object-engine decision mismatch at step ${step}`);
+      }
+      row.referenceVerified = true;
+      row.referenceMs = performance.now() - referenceStarted;
+    }
     sequence++;
     const leaves = new Map();
     for (const chunk of inputs.chunks) {

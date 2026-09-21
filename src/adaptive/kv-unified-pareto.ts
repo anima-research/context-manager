@@ -2,6 +2,7 @@ import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
+import { PackedDagSolver } from './kv-unified-packed.js';
 import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
@@ -51,7 +52,7 @@ interface ParetoLabel {
   approximation: ApproximationEnvelope;
 }
 
-interface ApproximationEnvelope {
+export interface ApproximationEnvelope {
   token: number;
   continuity: number;
   fidelity: number;
@@ -67,6 +68,11 @@ interface AssignmentTrace {
 }
 
 export interface ParetoPropagationStats {
+  readonly storageMode?: 'packed' | 'objects';
+  readonly packedLabelSlots?: number;
+  readonly packedTraceNodes?: number;
+  readonly terminalEvaluationMode?: 'full' | 'selective';
+  readonly exactTerminalEvaluations?: number;
   readonly labelsCreated: number;
   readonly labelsExpanded: number;
   readonly labelsDominated: number;
@@ -99,6 +105,10 @@ export type ParetoSolveOptions = ExactPolicySolveOptions & {
   engine?: 'auto' | 'leaf' | 'dag';
   /** Opt-in prototype: prove the hysteresis selection before propagating labels. */
   hysteresisCertificate?: boolean;
+  /** Diagnostic reference path; the normal DAG path uses packed storage. */
+  storage?: 'packed' | 'objects';
+  /** Diagnostic exhaustive rescoring; selection otherwise uses exact bounds. */
+  terminalEvaluation?: 'full' | 'selective';
   /** Optional diagnostic observer; never used to choose a cut or stop a solve. */
   onProgress?: (event: { phase: string; elapsedMs: number; states: number; labels: number }) => void;
 };
@@ -139,6 +149,12 @@ export class ParetoKvUnifiedPolicySolver {
       if (certified) return certified;
     }
     if (options.engine !== 'leaf') {
+      if (options.storage !== 'objects') {
+        const feasibility = this.forest.minimumTokens(options.maxTokens);
+        if (!feasibility.feasible) return { feasible: false, feasibility };
+        return new PackedDagSolver(this.inputs, this.forest, options, gapBearingOwnership || internalHoles,
+          (error) => this.approximationBound(options, normalizePolicy(options.policy), error), feasibility).solve();
+      }
       this.bufferGapEmissions = gapBearingOwnership || internalHoles;
       try {
         return this.solveDag(options);
