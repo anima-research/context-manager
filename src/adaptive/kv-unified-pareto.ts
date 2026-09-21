@@ -801,11 +801,20 @@ function stateKey(
   // multiplied the live label set by the number of distinct extension sums —
   // superlinear in forest size once a stale receipt covered half the leaves
   // (#97).
+  //
+  // matchedUnits is keyed only while the cache is intact. Once a label has
+  // diverged from the cached layout nothing reads it again (emit() and
+  // flushPendingEmissions() advance it only while intact, and terminals are
+  // scored from their frontier), while cachedTokens, which the cache term does
+  // price, stays in the key. Keying the dead value kept every label whose
+  // cache broke at a different unit in its own group, so none of them ever
+  // competed, and the label set grew with the forest under any relevant
+  // cache (#105).
   return [
     label.remaining.toString(16),
     tokenKey,
     label.cache.intact ? 1 : 0,
-    label.cache.matchedUnits,
+    label.cache.intact ? label.cache.matchedUnits : -1,
     label.cache.cachedTokens,
     label.pendingEmissions
       .map((emission) => `${emission.sequence}/${emission.kind}/${emission.key}`)
