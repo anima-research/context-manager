@@ -1,5 +1,10 @@
 # General kv-unified solver performance
 
+PR #110 also includes the packed-storage and selective-scoring optimizations
+originally proposed in #112. The measurements below document the first stage;
+see [the combined implementation's latest results](kv-unified-packed-selective.md)
+for the 822-test validation and the repeated 500-message replay.
+
 The previous solver propagated tens of millions of labels and eagerly rebuilt
 and rescored thousands of complete frontiers. Sill's recorded compile took
 244–286 seconds and 53–84 GB. A hysteresis certificate alone did not address
@@ -114,7 +119,8 @@ before the next message. It does not reconstruct historical compression calls,
 provider traffic, or cache TTL expiration. Timings include forest/solver
 construction and selected-frontier materialization, not input preparation or
 receipt generation. Raw data remains local under `replay-500/` in the receipt
-directory. The full 500-message run has not been repeated after the rebase.
+directory. A later full 500-message run, after the rebase and packed/selective
+optimizations, is recorded in [the follow-on measurements](kv-unified-packed-selective.md).
 
 ## Verification and reproduction
 

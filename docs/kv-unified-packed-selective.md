@@ -1,7 +1,7 @@
 # Packed propagation and selective exact scoring
 
-This follow-up to PR #110 targets the two remaining measured costs: label
-storage/grouping and repeated terminal leaf scans. It does not change policy
+These optimizations, originally developed in PR #112 and now combined into
+PR #110, target label storage/grouping and repeated terminal leaf scans. They do not change policy
 weights, grids, hard budgets, adoption thresholds, or label ceilings, and it
 does not introduce a solve deadline. The certificate remains disabled in the
 performance checks.
@@ -174,5 +174,5 @@ Local receipts: `/Users/antra/sill-cm/data/solver-fixtures/packed-selective-2026
 The `replay-500/` directory contains `config.json`, `rows.jsonl`, and
 `summary.json`. CI also passed on macOS and Ubuntu with Node 20 and 24.
 
-The implementation is on a separate follow-up branch; no live runtime or
+The implementation is included in the combined PR #110; no live runtime or
 resident configuration was changed.
