@@ -31,6 +31,10 @@ interface LinearNode {
   readonly children: readonly number[];
   readonly canExpand: boolean;
   readonly matches: boolean;
+  readonly id: string;
+  readonly level: number;
+  readonly leafIds: readonly string[];
+  readonly canSelect: boolean;
 }
 
 /** Try to prove that the existing hysteresis rule selects the carried cut.
@@ -57,21 +61,24 @@ export function certifyCarriedLayout(
   const leaves = forest.orderedLeaves();
   const chunks = new Map(inputs.chunks.map((chunk) => [chunk.id, chunk]));
   const newest = Math.max(0, ...inputs.chunks.map((chunk) => chunk.sequence));
-  const frontier = new Map<ChunkId, number>();
+  // Old leaves are fixed at their accepted level. New leaves (no accepted
+  // representation — appended since the presentation) are free: hysteresis
+  // keeps the accepted layout under the BEST extension over them, so every
+  // valid extension is enumerated below and scored exactly. A fresh L1 over
+  // appended messages is the common case (one solve per mint otherwise).
+  const fixed = new Map<ChunkId, number>();
   const leafFidelity = new Map<ChunkId, number>();
   for (const leaf of leaves) {
     const previous = options.presentation.leaves.get(leaf.id);
-    // Hysteresis chooses the best matching extension. Only certify when the
-    // unchanged presentation has a unique extension (new leaves forced raw).
-    if (!previous && leaf.allowedLevels.some((level) => level !== 0)) return null;
-    const level = previous?.level ?? 0;
-    if (!leaf.allowedLevels.includes(level)) return null;
-    const summaryId = level === 0 ? undefined : leaf.summaryIds.find(
-      (id) => forest.summary(id)!.level === level,
-    );
-    const hash = level === 0 ? `raw:${leaf.id}` : `summary:${summaryId}`;
-    if (previous && hash !== previous.repHash) return null;
-    frontier.set(leaf.id, level);
+    if (previous) {
+      if (!leaf.allowedLevels.includes(previous.level)) return null;
+      const summaryId = previous.level === 0 ? undefined : leaf.summaryIds.find(
+        (id) => forest.summary(id)!.level === previous.level,
+      );
+      const hash = previous.level === 0 ? `raw:${leaf.id}` : `summary:${summaryId}`;
+      if (hash !== previous.repHash) return null;
+      fixed.set(leaf.id, previous.level);
+    } else if (!leaf.allowedLevels.includes(0) && leaf.allowedLevels.length === 0) return null;
     leafFidelity.set(leaf.id, leaf.externallyAccounted ? 0 :
       fidelityLeafLoss(chunks.get(leaf.id)!, 1, newest, policy));
   }
@@ -85,7 +92,8 @@ export function certifyCarriedLayout(
       tokens: leaf.allowedLevels.includes(0)
         ? (leaf.externallyAccounted ? 0 : leaf.rawTokens) : Infinity,
       fidelity: 0, children: [], canExpand: false,
-      matches: frontier.get(id) === 0,
+      matches: (fixed.get(id) ?? 0) === 0,
+      id, level: 0, leafIds: [id], canSelect: leaf.allowedLevels.includes(0),
     });
     return nodes.length - 1;
   };
@@ -107,7 +115,7 @@ export function certifyCarriedLayout(
       if (leaf.allowedLevels.includes(summary.level)) {
         participants++;
         fidelity += leafFidelity.get(leafId)! * summary.level;
-        matches &&= frontier.get(leafId) === summary.level;
+        matches &&= fixed.get(leafId) === summary.level;
       }
     }
     if (participants > 0 && participants < live) unsupported = true;
@@ -116,25 +124,83 @@ export function certifyCarriedLayout(
       tokens: canSelect ? summary.recallTokens : Infinity,
       fidelity, children, canExpand: true,
       matches: (canSelect && matches) || children.every((index) => nodes[index].matches),
+      id: summary.id, level: summary.level, leafIds: summary.leafIds, canSelect,
     });
     return nodes.length - 1;
   };
   const roots = forest.roots.map((root) =>
     root.kind === 'leaf' ? addLeaf(root.id) : addSummary(root.id),
   );
-  if (unsupported || roots.some((index) => !nodes[index].matches)) return null;
-  const renderedTokens = forest.tokensForFrontier(frontier);
-  if (renderedTokens > options.maxTokens) return null;
+  if (unsupported) return null;
+
+  // Enumerate every cut that keeps each old leaf at its accepted level. A node
+  // may be selected only when all of its old leaves are accepted at exactly
+  // its level (and every new leaf allows it); otherwise it must expand.
+  const EXTENSION_CAP = 256;
+  type Assignment = Array<[ChunkId, number]>;
+  const cuts = (index: number): Assignment[] | null => {
+    const node = nodes[index];
+    if (!node.canExpand) {
+      const id = node.leafIds[0]!;
+      const level = fixed.get(id);
+      if (level !== undefined) return level === 0 ? [[[id, 0]]] : [];
+      return forest.leaf(id)!.allowedLevels.includes(0) ? [[[id, 0]]] : [];
+    }
+    const out: Assignment[] = [];
+    const selectable = node.canSelect && node.leafIds.every((id) => {
+      const leaf = forest.leaf(id)!;
+      if (leaf.externallyAccounted) return true;
+      const level = fixed.get(id);
+      return level === undefined ? leaf.allowedLevels.includes(node.level) : level === node.level;
+    });
+    if (selectable) out.push(node.leafIds.filter((id) => !forest.leaf(id)!.externallyAccounted).map((id) => [id, node.level] as [ChunkId, number]));
+    let expanded: Assignment[] = [[]];
+    for (const child of node.children) {
+      const childCuts = cuts(child);
+      if (childCuts === null) return null;
+      const next: Assignment[] = [];
+      for (const prefix of expanded) for (const suffix of childCuts) {
+        next.push([...prefix, ...suffix]);
+        if (next.length > EXTENSION_CAP) return null;
+      }
+      expanded = next;
+    }
+    out.push(...expanded);
+    return out.length > EXTENSION_CAP ? null : out;
+  };
+  let extensions: Assignment[] = [[]];
+  for (const root of roots) {
+    const rootCuts = cuts(root);
+    if (rootCuts === null) return null;
+    const next: Assignment[] = [];
+    for (const prefix of extensions) for (const suffix of rootCuts) {
+      next.push([...prefix, ...suffix]);
+      if (next.length > EXTENSION_CAP) return null;
+    }
+    extensions = next;
+  }
+  const candidates = extensions.map((assignment) => {
+    const frontier = new Map<ChunkId, number>(assignment);
+    for (const leaf of leaves) if (!frontier.has(leaf.id)) frontier.set(leaf.id, 0);
+    return { frontier, renderedTokens: forest.tokensForFrontier(frontier) };
+  }).filter((candidate) => candidate.renderedTokens <= options.maxTokens);
+  if (candidates.length === 0) return null;
+  const witness = candidates.reduce((best, candidate) => candidate.renderedTokens < best.renderedTokens ? candidate : best);
 
   const scored = new ExactKvUnifiedPolicySolver(inputs, forest).scoreCandidates(
-    [{ frontier, renderedTokens }], options,
-    { statesVisited: 0, candidatesGenerated: 1, maxCandidatesAtState: 1, terminalCandidates: 1 },
-    // The structurally checked carried cut is a feasibility witness. The
-    // scorer only checks feasible; it does not use the minimum-token floor.
-    { feasible: true, floorTokens: renderedTokens, frontier },
+    candidates, options,
+    { statesVisited: 0, candidatesGenerated: candidates.length, maxCandidatesAtState: candidates.length, terminalCandidates: candidates.length },
+    // Every enumerated cut is structurally valid under the wall; the scorer
+    // only checks feasible and does not use the minimum-token floor.
+    { feasible: true, floorTokens: witness.renderedTokens, frontier: witness.frontier },
   );
+  // Every enumerated cut matches the accepted presentation, so the policy's
+  // carried candidate is exactly `scored.selected`. Carried continuity is zero
+  // by construction; churn must be zero too, else the global floors are not
+  // proven zero and this single-family scoring could renormalize.
   if (!scored.feasible || scored.selected.continuityLoss !== 0 ||
-      scored.selected.cacheChurn !== 0) return null;
+      scored.candidates.some((candidate) => candidate.cacheChurn !== 0)) return null;
+  const renderedTokens = scored.selected.renderedTokens;
   // Both true floors are now exactly zero. Scoring this one candidate cannot
   // renormalize either penalty or hide a floor witness.
 
