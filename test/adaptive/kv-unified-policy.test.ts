@@ -911,3 +911,302 @@ test('kv-unified label count stays bounded under a stale presentation with a rel
   const regret = halfStale.selected.score - exact.selected.score;
   assert.ok(regret <= (scoreBound ?? -1) + 1e-9, `regret ${regret} vs bound ${scoreBound}`);
 });
+
+// A chain forest with per-seed token and salience variation.
+function variedChain(chunkCount: number, seed: number): PickerInputs {
+  const chronicle = buildChronicleWithChain({
+    chunkCount,
+    tokensPerChunk: 100,
+    mergeThreshold: 2,
+    recallPairTokens: 40,
+  });
+  return {
+    chunks: chronicle.chunks.map((chunk, index) => ({
+      ...chunk,
+      rawTokens: 60 + ((index * 29 + seed * 13) % 70),
+      salience: 0.2 + (((index * 13 + seed * 7) % 9) / 10),
+    })),
+    summaries: chronicle.summaries,
+    recallPairTokens: new Map(
+      [...chronicle.recallPairTokens].map(([id, tokens], index) => [
+        id,
+        tokens + ((index * 11 + seed * 7) % 30),
+      ]),
+    ),
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+}
+
+// The receipt a live host holds after an accepted call: the presentation and
+// the provider-cache layout are the cut that call rendered, with breakpoints
+// spread across its units.
+function steadyReceipt(
+  inputs: PickerInputs,
+  frontier: ReadonlyMap<string, number>,
+  markerCount: number,
+) {
+  const forest = new CanonicalSummaryForest(inputs);
+  const layout = renderLayout(inputs, new SummaryTree(inputs), frontier);
+  const leaves = new Map(inputs.chunks.map((chunk) => {
+    const level = frontier.get(chunk.id) ?? 0;
+    const repHash = level === 0
+      ? `raw:${chunk.id}`
+      : `summary:${forest.leaf(chunk.id)!.summaryIds.find((id) => forest.summary(id)!.level === level)}`;
+    return [chunk.id, { repHash, level, lastChangedSeq: 0 }] as const;
+  }));
+  const markers = Array.from({ length: markerCount }, (_, index) => {
+    const unitIndex = Math.round((layout.units.length * (index + 1)) / markerCount);
+    return { unitIndex, offset: layout.units[unitIndex]?.offset ?? layout.totalTokens };
+  });
+  return {
+    presentation: { currentSeq: 1, leaves } satisfies AcceptedPresentationReference,
+    cache: { immutablePrefixHash: 'tools-v1', layout, markers },
+  };
+}
+
+test('kv-unified label count stays flat under a relevant cache once cuts diverge from it (#105)', () => {
+  // Steady state: turn 2 re-solves against the receipt of the cut turn 1
+  // rendered, with the provider cache relevant. Candidate cuts diverge from the
+  // cached layout at different units. Before the fix the unit a label diverged
+  // at stayed in its state key although nothing reads it after the break, so
+  // labels that diverged at different units never competed and the
+  // relevant-cache label set grew with the forest: over the no-cache count,
+  // 1.1x at 12 chunks, 2.1x at 24 and 3.1x at 32 (bucketed); 1.8x at 24
+  // (exact). After: 1.1-1.25x at every size.
+  const buckets = { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 };
+  const exact = { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 };
+  for (const [chunkCount, grid, limit] of [[32, buckets, 1.6], [24, exact, 1.5]] as const) {
+    const inputs = variedChain(chunkCount, 0);
+    const rawTotal = inputs.chunks.reduce((sum, chunk) => sum + chunk.rawTokens, 0);
+    const maxTokens = Math.floor(rawTotal * 0.6);
+    const turn1 = new ParetoKvUnifiedPolicySolver(inputs).solve({ maxTokens, ...buckets });
+    assert.equal(turn1.feasible, true);
+    if (!turn1.feasible) return;
+    const receipt = steadyReceipt(inputs, turn1.selected.frontier, 4);
+    const solve = (currentImmutablePrefixHash: string) =>
+      new ParetoKvUnifiedPolicySolver(inputs).solve({
+        maxTokens,
+        ...grid,
+        ...receipt,
+        currentImmutablePrefixHash,
+        labelCeiling: 2_000_000,
+      });
+    const relevant = solve('tools-v1');
+    const irrelevant = solve('tools-v2');
+    assert.equal(relevant.feasible, true);
+    assert.equal(irrelevant.feasible, true);
+    if (!relevant.feasible || !irrelevant.feasible) return;
+    assert.equal(relevant.cacheRelevant, true);
+    assert.equal(irrelevant.cacheRelevant, false);
+    const withCache = relevant.propagation?.labelsCreated ?? Number.POSITIVE_INFINITY;
+    const withoutCache = irrelevant.propagation?.labelsCreated ?? 0;
+    assert.ok(
+      withCache <= withoutCache * limit,
+      `${chunkCount} chunks, bucket ${grid.tokenBucketSize}: ${withCache} labels with a relevant cache vs ${withoutCache} without`,
+    );
+  }
+});
+
+test('kv-unified relevant-cache selection agrees with the exhaustive oracle across divergence points (#105)', () => {
+  // Broad agreement sweep on steady-state receipts whose cache the new cut
+  // breaks at varied units: the unbucketed DAG and the leaf engine must select
+  // a cut of the exhaustive oracle's score, and the bucketed DAG's regret must
+  // sit inside its reported bound. (Small random forests rarely put two broken
+  // labels with different warm prefixes in one dominance contest, so this
+  // sweep does not catch an over-merged key; the warm-prefix test below does.)
+  let diverged = 0;
+  for (let caseIndex = 0; caseIndex < 18; caseIndex++) {
+    const inputs = variedChain(7 + (caseIndex % 2), caseIndex);
+    const rawTotal = inputs.chunks.reduce((sum, chunk) => sum + chunk.rawTokens, 0);
+    const turn1 = new ParetoKvUnifiedPolicySolver(inputs).solve({
+      maxTokens: Math.floor(rawTotal * (0.9 - (caseIndex % 3) * 0.1)),
+    });
+    assert.equal(turn1.feasible, true, `turn 1 case ${caseIndex}`);
+    if (!turn1.feasible) continue;
+    const options = {
+      maxTokens: Math.floor(rawTotal * (0.5 + (caseIndex % 4) * 0.08)),
+      ...steadyReceipt(inputs, turn1.selected.frontier, 2 + (caseIndex % 3)),
+      currentImmutablePrefixHash: 'tools-v1',
+      policy: {
+        alpha: 0.3 + (caseIndex % 3) * 0.3,
+        budgetLowRatio: 0.5,
+        budgetHighRatio: 0.9,
+        budgetUnderLambda: 200 + caseIndex * 10,
+        budgetOverLambda: 600,
+        cacheLambda: caseIndex % 2 === 0 ? 10_000 : 800,
+        cacheScale: 100,
+        continuityLambda: 300 + caseIndex * 20,
+        continuityScale: 200,
+        continuityRecencyHalfLifeTokens: 150,
+        continuityRecencyFloor: 0.2,
+        continuityStableFloor: 1,
+      },
+    } as const;
+    const oracle = new ExactKvUnifiedPolicySolver(inputs).solve(options);
+    const dag = new ParetoKvUnifiedPolicySolver(inputs).solve(options);
+    const leaf = new ParetoKvUnifiedPolicySolver(inputs).solve({ ...options, engine: 'leaf' });
+    const grid = new ParetoKvUnifiedPolicySolver(inputs).solve({
+      ...options,
+      tokenBucketSize: 80,
+      continuityBucketSize: 100,
+      fidelityBucketSize: 100,
+    });
+    assert.equal(oracle.feasible, true, `oracle case ${caseIndex}`);
+    assert.equal(dag.feasible, true, `dag case ${caseIndex}`);
+    assert.equal(leaf.feasible, true, `leaf case ${caseIndex}`);
+    assert.equal(grid.feasible, true, `grid case ${caseIndex}`);
+    if (!oracle.feasible || !dag.feasible || !leaf.feasible || !grid.feasible) continue;
+    assert.equal(oracle.cacheRelevant, true);
+    if (oracle.selected.cacheChurn > 0) diverged++;
+    assert.ok(
+      Math.abs(dag.selected.score - oracle.selected.score) <= 1e-9,
+      `case ${caseIndex}: dag ${dag.selected.score} vs oracle ${oracle.selected.score}`,
+    );
+    assert.ok(
+      Math.abs(leaf.selected.score - oracle.selected.score) <= 1e-9,
+      `case ${caseIndex}: leaf ${leaf.selected.score} vs oracle ${oracle.selected.score}`,
+    );
+    const regret = grid.selected.score - oracle.selected.score;
+    const bound = grid.propagation?.approximationScoreErrorBound ?? -1;
+    assert.ok(regret <= bound + 1e-9, `case ${caseIndex}: regret ${regret} > bound ${bound}`);
+  }
+  // The receipts must actually make the new cut break the cache somewhere,
+  // or this compares nothing the fix touches.
+  assert.ok(diverged >= 6, `only ${diverged} cases diverged from the cached layout`);
+});
+
+test('kv-unified keeps the warm-prefix length of a cut that broke the cache in its state (#105)', () => {
+  // Four chronological chunks, 100 raw tokens each, a 20-token L1 each; c and
+  // d are pinned raw. The receipt and the relevant cache are the all-raw
+  // layout with a breakpoint after a. One fold is needed. Folding a breaks
+  // the cache at unit 0 (nothing warm); folding b breaks it at unit 1, after
+  // the breakpoint, so 100 tokens stay warm. Folding a is better on fidelity
+  // and continuity (a is older and less salient), so at the point after b the
+  // fold-b label is dominated unless the warm-prefix length it keeps is part
+  // of its state. Only the unit a broken label diverged at may leave the key;
+  // cachedTokens must not.
+  const build = () => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    const b = chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    chronicle.addChunk({ id: 'c', rawTokens: 100, pinned: true });
+    chronicle.addChunk({ id: 'd', rawTokens: 100, pinned: true });
+    a.salience = 0.2; b.salience = 0.8;
+    chronicle.produceL1(['a']);
+    chronicle.produceL1(['b']);
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks,
+      summaries: chronicle.summaries,
+      recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0,
+      tailTokens: 0,
+      headChunkIds: new Set(),
+      tailChunkIds: new Set(),
+    };
+    return inputs;
+  };
+  const allRaw = new Map(['a', 'b', 'c', 'd'].map((id) => [id, 0]));
+  const receipt = steadyReceipt(build(), allRaw, 1);
+  const base = {
+    maxTokens: 320,
+    presentation: receipt.presentation,
+    cache: { ...receipt.cache, markers: [{ unitIndex: 1, offset: 100 }] },
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0.5,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 0,
+      continuityLambda: 100,
+      continuityScale: 100,
+      cacheLambda: 10_000,
+      cacheScale: 100,
+    },
+  } as const;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    ['a', 'b', 'c', 'd'].map((id) => `${id}:${candidate.frontier.get(id) ?? 0}`).join('|');
+  const oracle = new ExactKvUnifiedPolicySolver(build()).solve(base);
+  assert.equal(oracle.feasible, true);
+  if (!oracle.feasible) return;
+  assert.equal(signature(oracle.selected), 'a:0|b:1|c:0|d:0', 'the warm prefix is worth the fidelity');
+  for (const [name, extra] of [
+    ['exact dag', { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 }],
+    ['bucketed dag', { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 }],
+    ['leaf', { engine: 'leaf' as const }],
+  ] as const) {
+    const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra });
+    assert.equal(result.feasible, true, name);
+    if (!result.feasible) return;
+    assert.equal(signature(result.selected), signature(oracle.selected), `${name}: selected ${signature(result.selected)}`);
+    assert.equal(result.selected.score, oracle.selected.score, name);
+  }
+});
+
+test('kv-unified resolves a representative tie between broken cuts the way terminal selection does (#105)', () => {
+  // Four chronological 100-token chunks of equal salience, a 20-token L1 each
+  // for a and b; c and d are pinned raw. The receipt and the relevant cache
+  // are the all-raw layout with its only breakpoint at the end, so folding a
+  // and folding b both break the cache with nothing warm, at unit 0 and unit
+  // 1. With alpha 0 and both continuity floors at 1 the two folds tie on every
+  // metric and on score, and terminal selection takes the earlier frontier
+  // signature, a:0|b:1. Once the key stops splitting them by divergence unit
+  // they share one pool, and under buckets only one representative survives
+  // the tie; it must be the same cut, since the two render different layouts
+  // and so leave different receipts for the next turn.
+  const build = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    chronicle.addChunk({ id: 'c', rawTokens: 100, pinned: true });
+    chronicle.addChunk({ id: 'd', rawTokens: 100, pinned: true });
+    chronicle.produceL1(['a']);
+    chronicle.produceL1(['b']);
+    return {
+      chunks: chronicle.chunks,
+      summaries: chronicle.summaries,
+      recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0,
+      tailTokens: 0,
+      headChunkIds: new Set(),
+      tailChunkIds: new Set(),
+    };
+  };
+  const allRaw = new Map(['a', 'b', 'c', 'd'].map((id) => [id, 0]));
+  const receipt = steadyReceipt(build(), allRaw, 1);
+  const base = {
+    maxTokens: 320,
+    presentation: receipt.presentation,
+    cache: { ...receipt.cache, markers: [{ unitIndex: 4, offset: 400 }] },
+    currentImmutablePrefixHash: 'tools-v1',
+    policy: {
+      alpha: 0,
+      budgetUnderLambda: 0,
+      budgetOverLambda: 0,
+      continuityRecencyFloor: 1,
+      continuityStableFloor: 1,
+      continuityLambda: 100,
+      continuityScale: 100,
+      cacheLambda: 1,
+      cacheScale: 100,
+    },
+  } as const;
+  const signature = (candidate: ExactPolicyCandidate): string =>
+    ['a', 'b', 'c', 'd'].map((id) => `${id}:${candidate.frontier.get(id) ?? 0}`).join('|');
+  const oracle = new ExactKvUnifiedPolicySolver(build()).solve(base);
+  assert.equal(oracle.feasible, true);
+  if (!oracle.feasible) return;
+  const tied = oracle.candidates.filter((candidate) => candidate.score === oracle.selected.score);
+  assert.deepEqual(tied.map(signature), ['a:0|b:1|c:0|d:0', 'a:1|b:0|c:0|d:0'], 'the two folds tie on score');
+  for (const [name, extra] of [
+    ['exact dag', { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 }],
+    ['bucketed dag', { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 }],
+  ] as const) {
+    const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra });
+    assert.equal(result.feasible, true, name);
+    if (!result.feasible) return;
+    assert.equal(signature(result.selected), signature(oracle.selected), `${name}: selected ${signature(result.selected)}`);
+    assert.equal(result.selected.score, oracle.selected.score, name);
+  }
+});

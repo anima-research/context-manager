@@ -472,7 +472,7 @@ function normalizeContinuityMultiplier(value: number | undefined): number {
   return value;
 }
 
-function frontierSignature(
+export function frontierSignature(
   frontier: ReadonlyMap<ChunkId, number>,
   leafIds: readonly ChunkId[],
 ): string {
