@@ -8692,11 +8692,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const entry of entries) {
       if (!entry.cacheMarker) continue;
       const sourceId = entry.sourceMessageId;
-      const layoutKey = sourceId && tailMessageIds.has(sourceId)
-        ? 'tail'
-        : sourceId && headMessageIds.has(sourceId)
-          ? 'head'
-          : entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      const atomicKey = entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      // A tail message is its own raw unit (render-offsets `tailUnits`); the
+      // opaque 'tail' block only carries tail tokens no chunk accounts for.
+      const layoutKey = sourceId && headMessageIds.has(sourceId)
+        ? 'head'
+        : sourceId && tailMessageIds.has(sourceId)
+          ? (atomicKey && layout.units.some((unit) => unit.key === atomicKey) ? atomicKey : 'tail')
+          : atomicKey;
       if (!layoutKey) {
         throw new Error('kv-unified cache marker has no atomic layout identity');
       }

@@ -5,7 +5,7 @@ import {
   budgetPenalty, continuityLeafLoss, fidelityLeafLoss, normalizePolicy,
   type ExactPolicySolveOptions, type UnscoredCandidate,
 } from './kv-unified-policy.js';
-import type { RenderLayout, RenderedUnit } from './render-offsets.js';
+import { tailUnits, type RenderLayout, type RenderedUnit } from './render-offsets.js';
 import { nonnegativeSumInterval, type BoundedPolicyCandidate } from './kv-unified-selective.js';
 
 export interface FrontierTrace {
@@ -63,6 +63,7 @@ export class TerminalPolicyEvaluator {
   private readonly markerUnits: ReadonlySet<number>;
   private readonly headCode: number;
   private readonly tailCode: number;
+  private readonly tailCodes: readonly number[];
   private generation = 0;
   private readonly policy;
   private readonly maxTokens: number;
@@ -104,7 +105,11 @@ export class TerminalPolicyEvaluator {
         summary.leafIds.every((id) => !presentation.leaves.has(id)) ? 1 : 0;
     }
     this.unitTokens[this.headCode] = inputs.headTokens;
-    this.unitTokens[this.tailCode] = inputs.tailTokens;
+    // Per-message tail (see render-offsets `tailUnits`): tail chunks emit as
+    // their own raw codes, in wire order, after the middle; only unattributed
+    // tail tokens remain on the opaque tail code.
+    this.tailCodes = tailUnits(inputs).flatMap((unit) => unit.chunkId ? [this.index.get(unit.chunkId)! + 1] : []);
+    this.unitTokens[this.tailCode] = tailUnits(inputs).find((unit) => unit.kind === 'tail')?.tokens ?? 0;
     this.unitKeys[this.headCode] = this.unitKinds[this.headCode] = 'head';
     this.unitKeys[this.tailCode] = this.unitKinds[this.tailCode] = 'tail';
     this.previousUnits = Uint32Array.from(options.cache?.layout.units ?? [], (unit) =>
@@ -221,6 +226,7 @@ export class TerminalPolicyEvaluator {
       };
       if (this.unitTokens[this.headCode] > 0) emit(this.headCode);
       for (const index of ordered) emit(this.emissionAtLeaf[index]);
+      for (const code of this.tailCodes) emit(code);
       if (this.unitTokens[this.tailCode] > 0) emit(this.tailCode);
       cacheChurn = Math.max(0, offset - cached - extension) * Math.max(0, this.policy.cacheWritePrice - this.policy.cacheReadPrice);
     }
@@ -293,6 +299,7 @@ export class TerminalPolicyEvaluator {
         }
       }
     }
+    if (warm) for (const code of this.tailCodes) emit(code);
     if (warm && this.unitTokens[this.tailCode] > 0) emit(this.tailCode);
     const cacheChurn = warm ? Math.max(0, offset - cachedTokens - extensionTokens) *
       Math.max(0, this.policy.cacheWritePrice - this.policy.cacheReadPrice) : 0;
@@ -324,6 +331,7 @@ export class TerminalPolicyEvaluator {
         this.emitted[code] = generation;
         append(code);
       }
+      for (const code of this.tailCodes) append(code);
       if (this.unitTokens[this.tailCode] > 0) append(this.tailCode);
       return layout = { units, totalTokens: offset };
     };

@@ -84,9 +84,40 @@ export function renderLayout(
     push('recall', ancestor.id, ancestor.recallTokens);
   }
 
-  if (inputs.tailTokens > 0) push('tail', 'tail', inputs.tailTokens);
+  for (const unit of tailUnits(inputs)) push(unit.kind, unit.key, unit.tokens);
 
   return { units, totalTokens: offset };
+}
+
+/**
+ * The raw tail as rendered units, in wire order.
+ *
+ * Each tail chunk is its own `raw` unit keyed by chunk id — the SAME identity
+ * it has once it slides out of the tail into the middle. Until 2026-09-21 the
+ * whole tail was one opaque `('tail','tail')` unit, so every append shifted
+ * that unit's position (the messages leaving the tail became new raw units in
+ * front of it) and the end-of-tail cache marker fell outside the "identical"
+ * prefix: an unchanged layout was priced as ~100k tokens of cache churn on
+ * every turn although the wire bytes were identical (sill, kv-unified
+ * certificate never fired). Tail tokens not attributed to any tail chunk
+ * (synthetic inputs; in production `tailTokens` is exactly the chunk sum)
+ * still render as the opaque block, so token totals are unchanged.
+ */
+export function tailUnits(
+  inputs: Pick<PickerInputs, 'chunks' | 'tailChunkIds' | 'tailTokens'>,
+): Array<{ kind: 'raw' | 'tail'; key: string; tokens: number; chunkId?: ChunkId }> {
+  const units: Array<{ kind: 'raw' | 'tail'; key: string; tokens: number; chunkId?: ChunkId }> = [];
+  let attributed = 0;
+  const tail = inputs.chunks
+    .filter((chunk) => inputs.tailChunkIds.has(chunk.id))
+    .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
+  for (const chunk of tail) {
+    units.push({ kind: 'raw', key: chunk.id, tokens: chunk.rawTokens, chunkId: chunk.id });
+    attributed += chunk.rawTokens;
+  }
+  const residual = inputs.tailTokens - attributed;
+  if (residual > 0) units.push({ kind: 'tail', key: 'tail', tokens: residual });
+  return units;
 }
 
 /**

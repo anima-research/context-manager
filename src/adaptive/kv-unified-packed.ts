@@ -1,5 +1,6 @@
 import type { PickerInputs } from './picker.js';
 import { CanonicalSummaryForest, SparseLabelCeilingError, type MinimumTokenResult } from './kv-unified.js';
+import { tailUnits } from './render-offsets.js';
 import {
   ExactKvUnifiedPolicySolver, continuityLeafLoss, fidelityLeafLoss, frontierSignature, normalizePolicy,
 } from './kv-unified-policy.js';
@@ -32,6 +33,7 @@ export class PackedDagSolver {
   private readonly policy;
   private readonly cacheRelevant: boolean;
   private readonly markers: Map<number, number>;
+  private readonly tail: Array<{ kind: 'raw' | 'tail'; key: string; tokens: number; sequence: number }>;
   private readonly cacheClasses: Map<number, number>;
   private readonly buckets: PackedBuckets;
   private readonly tBucket: number;
@@ -68,6 +70,7 @@ export class PackedDagSolver {
     this.cacheRelevant = options.cache !== undefined && options.currentImmutablePrefixHash !== undefined &&
       options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
     this.markers = new Map((options.cache?.markers ?? []).map((marker) => [marker.unitIndex, marker.offset]));
+    this.tail = tailUnits(inputs).map((unit) => ({ ...unit, sequence: unit.chunkId ? forest.leaf(unit.chunkId)?.sequence ?? Infinity : Infinity }));
     this.cacheClasses = new Map([...this.markers.keys()].filter((index) => index > 0).sort((a, b) => a - b)
       .map((index, i) => [index, i + 1]));
     this.tBucket = Math.max(0, Math.floor(options.tokenBucketSize ?? 0));
@@ -365,7 +368,12 @@ export class PackedDagSolver {
       error.token = Math.max(error.token, s.data[(id) * LABEL_STRIDE + LabelField.TokenError]); error.continuity = Math.max(error.continuity, s.data[(id) * LABEL_STRIDE + LabelField.ContinuityError]);
       error.fidelity = Math.max(error.fidelity, s.data[(id) * LABEL_STRIDE + LabelField.FidelityError]); error.cache = Math.max(error.cache, s.data[(id) * LABEL_STRIDE + LabelField.CacheError]);
       this.flush(id, Infinity);
-      if (this.inputs.tailTokens > 0) this.emit(id, 'tail', 'tail', this.inputs.tailTokens, false);
+      for (const unit of this.tail) {
+        if (unit.kind === 'raw') this.emit(id, 'raw', unit.key, unit.tokens,
+          this.options.presentation !== undefined && !this.options.presentation.leaves.has(unit.key), unit.sequence);
+        else this.emit(id, 'tail', unit.key, unit.tokens, false);
+      }
+      this.flush(id, Infinity);
       if (s.data[(id) * LABEL_STRIDE + LabelField.Tokens] <= this.options.maxTokens) terminal.push({
         trace: s.traces.reference(s.finishTrace(id)), tokens: s.data[(id) * LABEL_STRIDE + LabelField.Tokens],
       });
