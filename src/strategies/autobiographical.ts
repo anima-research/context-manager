@@ -8830,8 +8830,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and THIS compile is about to run under the wrong cache policy. The
     // 2026-08-07 fable investigation found exactly one such compile
     // ([picker-unrealizable] solver=flat-profile in a kv-stable agent) with
-    // no way to attribute it; this line is the attribution.
-    if (this.config.foldingStrategy !== this._constructedFoldingStrategy) {
+    // no way to attribute it; this line is the attribution. The one
+    // sanctioned exception is a previewContext override: previews swap the
+    // config deliberately (and restore it in `finally`), so a mid-preview
+    // mismatch is the caller's requested what-if, not drift.
+    if (
+      this.config.foldingStrategy !== this._constructedFoldingStrategy &&
+      !this._previewInFlight
+    ) {
       console.error(
         `[picker-config-drift] foldingStrategy=${JSON.stringify(this.config.foldingStrategy)} ` +
           `differs from constructed=${JSON.stringify(this._constructedFoldingStrategy)} — ` +
