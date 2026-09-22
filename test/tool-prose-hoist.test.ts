@@ -183,6 +183,26 @@ describe('tool-prose hoist rung', () => {
     assert.ok(fx.strategy.getCompressionQuarantineStatus().count >= 1);
   });
 
+  it('GATE: the source-only hoist runs only after a source-only REFUSAL — a provider error or a truncated generation there ends the ladder at three calls', async () => {
+    // a provider error thrown by the source-only final attempt (Sol, #106
+    // review: the reviewed head still made a fourth, hoisted call)
+    const thrown = (() => {
+      const calls: NormalizedRequest[] = []; let n = 0;
+      const plan: Array<typeof REFUSAL | { throw: unknown }> = [REFUSAL, REFUSAL, { throw: { type: 'server_error' } }];
+      return { calls, membrane: { complete: async (request: NormalizedRequest) => { calls.push(structuredClone(request)); const r = plan[Math.min(n++, plan.length - 1)]!; if ('throw' in r) throw r.throw; return r; } } as never };
+    })();
+    const a = await build(thrown.membrane, { hoist: true, sourceOnlyFallback: true });
+    await a.strategy.run(a.target(), managerContext(a.manager));
+    assert.deepEqual(thrown.calls.map(names), ['skip_reply', 'journal+skip_reply', 'skip_reply'],
+      'no source-only hoist after a provider error: the rewrite cannot address it');
+    // a truncated source-only generation is not a refusal either
+    const truncated = scripted([REFUSAL, REFUSAL, { content: [text('a partial mem')], stopReason: 'max_tokens', usage: { inputTokens: 80, outputTokens: 20 } } as ReturnType<typeof OK>]);
+    const b = await build(truncated.membrane, { hoist: true, sourceOnlyFallback: true });
+    await b.strategy.run(b.target(), managerContext(b.manager));
+    assert.deepEqual(truncated.calls.map(names), ['skip_reply', 'journal+skip_reply', 'skip_reply'],
+      'no source-only hoist after a truncated source-only generation');
+  });
+
   it('FAMILY: enabling the rung gives an already-quarantined chunk a fresh attempt without a manual clear', async () => {
     const path = freshPath();
     const first = scripted([REFUSAL]);

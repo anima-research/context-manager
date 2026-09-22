@@ -6195,6 +6195,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           break;
         }
 
+        // How the source-only final rung ended, for the hoist below: only a
+        // REFUSAL is a carrier problem the rewrite can address. A provider
+        // error, a truncated or empty generation is not, and a paid retry on
+        // top of one would contradict "provider errors never escalate"
+        // (Sol, #106 review: a thrown server_error on source-only-final still
+        // bought a fourth call).
+        let sourceOnlyOutcome: CompressionAttemptOutcome | 'incomplete' | undefined;
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
@@ -6211,6 +6218,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               response = assessment.response;
               successfulTrace = trace;
             } else {
+              sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
               outcomes.push({
                 curveLabel, requestHash, outcome: assessment.outcome,
@@ -6227,12 +6235,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const trace = attemptTraces[attemptTraces.length - 1];
             if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
             outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+            sourceOnlyOutcome = 'provider_error';
           }
         }
 
-        // Source-only final refused too: the same carrier sits in the target
+        // Source-only final REFUSED too: the same carrier sits in the target
         // chunk itself, so give the source-only shape the same rewrite once.
-        if (!fallbackResponse && sourceOnlyFallbackRequest) {
+        // Refusal-gated like the canonical hoist: any other way that attempt
+        // ended is not this rung's problem.
+        if (!fallbackResponse && sourceOnlyFallbackRequest && sourceOnlyOutcome === 'refusal') {
           const hoistedSourceOnly = this.toolProseHoistedRequest(sourceOnlyFallbackRequest);
           if (hoistedSourceOnly) {
             await runToolProseRung(
