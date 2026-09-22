@@ -34,7 +34,7 @@ import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } 
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
-import { MessageStore } from '../message-store.js';
+import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -8360,10 +8360,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationArmed = false;
 
     const ratio = realTotal / est;
+    const current = this._calibration;
+    const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
     // provider quirk) — never evidence about chars-per-token. Log, don't learn.
-    if (ratio < 0.6 || ratio > 1.8) {
+    // The band is also checked on the IMPLIED raw multiplier: when the
+    // multiplier sits at a clamp edge because the per-class rates were wrong
+    // (signed thinking at a flat 600) and the rates are then fixed, every
+    // honest sample reads real/est ≈ 1/1.8 = 0.56 — out of band on the ratio
+    // alone, so the multiplier could never come back down. A sample whose
+    // implied multiplier is inside the clamp range is window-shaped by
+    // construction and must be learned from.
+    const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
+    const observedInBand = observed >= 0.6 && observed <= 1.8;
+    if (!ratioInBand && !observedInBand) {
       console.error(
         `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
           `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
@@ -8372,8 +8383,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const current = this._calibration;
-    const observed = ratio * current; // back out the multiplier already applied
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const next = current + alpha * (observed - current);
     const clamped = Math.min(1.8, Math.max(0.6, next));
@@ -9007,7 +9016,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
     const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
-    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy]);
+    const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
+    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._pairCostCache.get(key);
     if (cached !== undefined) return cached;
     const estimatedAnswer = this.estimateTokens(this.liveWindowAnswerContent(s));
@@ -10885,27 +10895,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return tokens;
   }
 
+  /**
+   * Price a rendered body the way the store prices it. The plan and the
+   * emission must agree: every recall pair, envelope and merged entry this
+   * strategy prices here is later emitted and measured against the same
+   * budget the store's calibrated estimate feeds, so the store's view is the
+   * authority whenever one is bound (per-class chars/token rates, the signed-
+   * thinking rule, the closed-loop calibration multiplier). Before a view is
+   * bound the fallback mirrors the store's raw rules. The old local rule
+   * priced text at a flat chars/4 — under `carrierPolicy: 'live-strip'`,
+   * where the exact mint `tokens` no longer floors the recall-pair price,
+   * that under-priced dense summary prose by ~25-30% (2026-09-21, measured
+   * against count_tokens on a 500-summary window: 526k planned, 728k real).
+   */
   protected estimateTokens(content: ContentBlock[]): number {
+    const view = this._storeView;
+    if (view && typeof view.estimateTokens === 'function') {
+      return view.estimateTokens({ content } as unknown as StoredMessage);
+    }
     let tokens = 0;
     for (const block of content) {
       if (block.type === 'text') {
-        tokens += Math.ceil(block.text.length / 4);
+        tokens += defaultTokenEstimator(block.text);
       } else if (block.type === 'thinking') {
-        // Replayed summary reasoning (responseContent) must be priced or
-        // fold/recall budgets silently overrun. Mirrors message-store: a
-        // stamped estimate wins; a signed-but-empty block is a hidden full
-        // CoT priced at the measured default; else price the visible text.
+        // Mirrors MessageStore.computeBlockTokensRaw: a stamped estimate
+        // wins; a signed block is a full hidden chain of thought priced by
+        // the larger of its visible text and its signature length.
         const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
         if (typeof stamped === 'number') {
           tokens += stamped;
         } else {
           const sig = (block as { signature?: string }).signature;
-          const hasSignature = typeof sig === 'string' && sig.length > 0;
-          if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
-            tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
-          } else {
-            tokens += Math.ceil((block.thinking ?? '').length / 4);
-          }
+          const textTokens = defaultTokenEstimator(block.thinking ?? '');
+          tokens += typeof sig === 'string' && sig.length > 0
+            ? Math.max(textTokens, MessageStore.signedThinkingTokens(sig))
+            : textTokens;
         }
       } else if (block.type === 'redacted_thinking') {
         // Encrypted reasoning carrier: stamped estimate wins, else price the
