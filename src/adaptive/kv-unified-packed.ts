@@ -1,7 +1,7 @@
 import type { PickerInputs } from './picker.js';
 import { CanonicalSummaryForest, SparseLabelCeilingError, type MinimumTokenResult } from './kv-unified.js';
 import {
-  ExactKvUnifiedPolicySolver, continuityLeafLoss, fidelityLeafLoss, normalizePolicy,
+  ExactKvUnifiedPolicySolver, continuityLeafLoss, fidelityLeafLoss, frontierSignature, normalizePolicy,
 } from './kv-unified-policy.js';
 import { TerminalPolicyEvaluator, type FrontierTraceReference } from './kv-unified-terminal.js';
 import { scoreBoundedCandidates } from './kv-unified-selective.js';
@@ -25,6 +25,7 @@ interface Action {
 export class PackedDagSolver {
   private readonly s = new PackedLabels();
   private readonly leaves;
+  private readonly leafIds: readonly string[];
   private readonly chunks;
   private readonly age = new Map<string, number>();
   private readonly newest: number;
@@ -49,6 +50,7 @@ export class PackedDagSolver {
   private errorScratch = new Float64Array(16);
   private readonly members: number[] = [];
   private readonly representatives: number[] = [];
+  private readonly signatures = new Map<number, string>();
 
   constructor(private readonly inputs: PickerInputs, private readonly forest: CanonicalSummaryForest,
     private readonly options: ParetoSolveOptions, private readonly buffered: boolean,
@@ -56,6 +58,7 @@ export class PackedDagSolver {
     private readonly knownFeasibility: Extract<MinimumTokenResult, { feasible: true }>) {
     this.policy = normalizePolicy(options.policy);
     this.leaves = forest.orderedLeaves();
+    this.leafIds = this.leaves.map((leaf) => leaf.id);
     this.chunks = new Map(inputs.chunks.map((chunk) => [chunk.id, chunk]));
     this.newest = inputs.chunks.reduce((value, chunk) => Math.max(value, chunk.sequence), 0);
     let age = 0;
@@ -109,7 +112,22 @@ export class PackedDagSolver {
   private order(a: number, b: number): number {
     const s = this.s;
     return s.data[(a) * LABEL_STRIDE + LabelField.Fidelity] - s.data[(b) * LABEL_STRIDE + LabelField.Fidelity] || s.data[(a) * LABEL_STRIDE + LabelField.Continuity] - s.data[(b) * LABEL_STRIDE + LabelField.Continuity] || s.data[(a) * LABEL_STRIDE + LabelField.Tokens] - s.data[(b) * LABEL_STRIDE + LabelField.Tokens] ||
-      (this.cacheRelevant ? s.data[(b) * LABEL_STRIDE + LabelField.Extension] - s.data[(a) * LABEL_STRIDE + LabelField.Extension] : 0) || s.data[(a) * LABEL_STRIDE + LabelField.Matched] - s.data[(b) * LABEL_STRIDE + LabelField.Matched];
+      (this.cacheRelevant ? s.data[(b) * LABEL_STRIDE + LabelField.Extension] - s.data[(a) * LABEL_STRIDE + LabelField.Extension] : 0) ||
+      this.signature(a).localeCompare(this.signature(b));
+  }
+
+  /** Only full metric ties need a frontier. The cursor of a broken cache
+   * prefix is no longer priced and must not decide which layout survives. */
+  private signature(id: number): string {
+    let value = this.signatures.get(id);
+    if (value !== undefined) return value;
+    const frontier = new Map<string, number>();
+    this.s.traces.reference(this.s.finishTrace(id)).forEachAssignment((ids, level) => {
+      for (const leafId of ids) frontier.set(leafId, level);
+    });
+    value = frontierSignature(frontier, this.leafIds);
+    this.signatures.set(id, value);
+    return value;
   }
 
   private dominates(a: number, b: number): boolean {
@@ -123,6 +141,7 @@ export class PackedDagSolver {
   private prune(incoming: number[]): number[] {
     const s = this.s, b = this.buckets;
     this.states++;
+    this.signatures.clear();
     b.begin(incoming.length);
     const grid = this.kBucket > 0 && this.fBucket > 0;
     for (let pos = 0; pos < incoming.length; pos++) {

@@ -277,17 +277,17 @@ export class ContextLog {
       case 'text':
         return this.tokenEstimator(block.text);
       case 'thinking': {
+        // Mirrors MessageStore.computeBlockTokensRaw: stamped price wins;
+        // a signed block is a full hidden chain of thought, priced by the
+        // larger of its visible text and its signature length.
         const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
         if (typeof stamped === 'number') return stamped;
         const signature = (block as { signature?: string }).signature;
-        if (
-          typeof signature === 'string' &&
-          signature.length > 0 &&
-          (!block.thinking || block.thinking.length === 0)
-        ) {
-          return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        const textTokens = this.tokenEstimator(block.thinking ?? '');
+        if (typeof signature === 'string' && signature.length > 0) {
+          return Math.max(textTokens, MessageStore.signedThinkingTokens(signature));
         }
-        return this.tokenEstimator(block.thinking ?? '');
+        return textTokens;
       }
       case 'redacted_thinking': {
         // Encrypted reasoning payload, round-tripped verbatim — rough

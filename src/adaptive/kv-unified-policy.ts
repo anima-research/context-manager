@@ -498,7 +498,7 @@ export function policyScore(fidelity: number, budget: number, cache: number, con
     multiplier * quadratic(Math.max(0, continuity - continuityFloor), policy.continuityScale, policy.continuityLambda);
 }
 
-function frontierSignature(
+export function frontierSignature(
   frontier: ReadonlyMap<ChunkId, number>,
   leafIds: readonly ChunkId[],
 ): string {

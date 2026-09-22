@@ -858,6 +858,31 @@ export class MessageStore {
   static readonly HIDDEN_THINKING_TOKENS_DEFAULT = 600;
 
   /**
+   * Fallback price for a SIGNED thinking block that carries no stamped
+   * `tokenEstimate`: `signature.length / SIGNATURE_CHARS_PER_TOKEN`. On
+   * keep-all models (Opus >= 4.5, Sonnet >= 4.6, Fable/Mythos) every prior
+   * thinking block is replayed as input and billed at the full hidden chain
+   * of thought; the signature encodes that chain, so its length is the only
+   * client-side trace of the size. Measured 2026-09-21 on Opus 4.8 with
+   * `count_tokens` deltas (signed block in vs out of an assistant turn):
+   * 2.8-3.4 chars/token for blocks over ~3k tokens, up to ~5-9 for tiny
+   * blocks (fixed header dominates). The rate is NOT constant (+-25% at any
+   * size), so this is a floor-level estimate for unstamped history only —
+   * the exact price is the per-block `tokenEstimate` stamped at creation
+   * from the response's `usage.output_tokens` residual (agent-framework).
+   * The old flat 600 under-priced agentic history ~10x (a 128-block, ~790k-
+   * token replay estimated as 77k), which pinned the calibration multiplier
+   * at its ceiling and left the agent at the context ceiling with dead
+   * `max_tokens` turns.
+   */
+  static readonly SIGNATURE_CHARS_PER_TOKEN = 3.3;
+
+  /** Price of a signed thinking block from its signature length alone. */
+  static signedThinkingTokens(signature: string): number {
+    return Math.round(signature.length / MessageStore.SIGNATURE_CHARS_PER_TOKEN);
+  }
+
+  /**
    * Billed-token rate for encrypted reasoning carriers (`redacted_thinking`
    * blocks round-tripped to OpenAI Responses as `reasoning.encrypted_content`).
    * The ciphertext is base64 over an encrypted serialization of the CoT, so
@@ -899,17 +924,19 @@ export class MessageStore {
       case 'text':
         return this.tokenEstimator(block.text);
       case 'thinking': {
-        // Stamped price wins; a signed-but-empty block is a HIDDEN full CoT
-        // (never "no thinking") — price it at the measured default.
+        // Stamped price wins. Otherwise a signed block is a FULL chain of
+        // thought whatever its visible text says (empty under
+        // display:"omitted", a short summary under "summarized", the full
+        // text on older models): price it by whichever of the text and the
+        // signature is larger — never by a flat constant.
         const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
         if (typeof stamped === 'number') return stamped;
-        const hasSignature =
-          typeof (block as { signature?: string }).signature === 'string' &&
-          ((block as { signature?: string }).signature as string).length > 0;
-        if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
-          return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        const signature = (block as { signature?: string }).signature;
+        const textTokens = this.tokenEstimator(block.thinking ?? '');
+        if (typeof signature === 'string' && signature.length > 0) {
+          return Math.max(textTokens, MessageStore.signedThinkingTokens(signature));
         }
-        return this.tokenEstimator(block.thinking);
+        return textTokens;
       }
       case 'redacted_thinking': {
         // Encrypted reasoning carrier: billed in full when replayed. A per-
@@ -1723,7 +1750,7 @@ export class MessageStore {
 const PROSE_CHARS_PER_TOKEN = 2.9;
 const DENSE_CHARS_PER_TOKEN = 2.3;
 
-function defaultTokenEstimator(text: string): number {
+export function defaultTokenEstimator(text: string): number {
   if (!text) return 0;
   // Cheap density probe: JSON/code punctuation and non-ASCII share.
   let dense = 0;
@@ -1739,7 +1766,7 @@ function defaultTokenEstimator(text: string): number {
 }
 
 /** JSON-ish payloads (tool inputs/results) always use the dense rate. */
-function jsonTokenEstimator(text: string): number {
+export function jsonTokenEstimator(text: string): number {
   if (!text) return 0;
   return Math.ceil(text.length / DENSE_CHARS_PER_TOKEN);
 }

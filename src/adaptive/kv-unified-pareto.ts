@@ -12,6 +12,7 @@ import {
   ExactKvUnifiedPolicySolver,
   continuityLeafLoss,
   fidelityLeafLoss,
+  frontierSignature,
   normalizePolicy,
   type ExactPolicySolveOptions,
   type ExactPolicySolveResult,
@@ -402,8 +403,29 @@ export class ParetoKvUnifiedPolicySolver {
         ? cacheClass * gridKeys + grid
         : `broken:${cacheClass}:${grid}`;
     };
+    const leafIds = this.leaves.map((leaf) => leaf.id);
     const prune = (labels: ParetoLabel[]): ParetoLabel[] => {
       states++;
+      // Labels in one pool cover the same leaves. A full tie on the metrics
+      // below resolves the way terminal selection breaks a score tie
+      // (renderedTokens, then frontierSignature): the partial cut with the
+      // earlier signature, which the terminal order would also prefer had both
+      // been completed the same way. Signatures are built for ties only.
+      const signatures = new Map<ParetoLabel, string>();
+      const signature = (label: ParetoLabel): string => {
+        let value = signatures.get(label);
+        if (value === undefined) {
+          value = frontierSignature(reconstructFrontier(label.trace), leafIds);
+          signatures.set(label, value);
+        }
+        return value;
+      };
+      const representativeOrder = (a: ParetoLabel, b: ParetoLabel): number =>
+        a.fidelityLoss - b.fidelityLoss ||
+        a.continuityLoss - b.continuityLoss ||
+        a.renderedTokens - b.renderedTokens ||
+        (cacheRelevant ? b.extensionTokens - a.extensionTokens : 0) ||
+        signature(a).localeCompare(signature(b));
       const groups = new Map<string | number, ParetoLabel | ParetoLabel[]>();
       for (const label of labels) {
         if (label.renderedTokens > options.maxTokens) continue;
@@ -419,7 +441,7 @@ export class ParetoKvUnifiedPolicySolver {
         // changes its approximation envelope, so it needs no clone or array.
         if (!Array.isArray(pool)) { result.push(pool); continue; }
         const representatives = continuityBucketSize > 0 && fidelityBucketSize > 0
-          ? bucketRepresentatives(pool, cacheRelevant)
+          ? bucketRepresentatives(pool, cacheRelevant, representativeOrder)
           : pool.filter((candidate, index) => !pool.some(
               (other, otherIndex) => otherIndex !== index && dominates(other, candidate, cacheRelevant),
             ));
@@ -946,11 +968,20 @@ function stateKey(
   // multiplied the live label set by the number of distinct extension sums —
   // superlinear in forest size once a stale receipt covered half the leaves
   // (#97).
+  //
+  // matchedUnits is keyed only while the cache is intact. Once a label has
+  // diverged from the cached layout nothing reads it again (emit() and
+  // flushPendingEmissions() advance it only while intact, representatives
+  // tie-break on the frontier, and terminals are scored from their frontier),
+  // while cachedTokens, which the cache term does price, stays in the key.
+  // Keying the dead value kept every label whose cache broke at a different
+  // unit in its own group, so none of them ever competed, and the label set
+  // grew with the forest under any relevant cache (#105).
   return [
     label.remaining.toString(16),
     tokenKey,
     label.cache.intact ? 1 : 0,
-    label.cache.matchedUnits,
+    label.cache.intact ? label.cache.matchedUnits : -1,
     label.cache.cachedTokens,
     label.pendingEmissions
       .map((emission) => `${emission.sequence}/${emission.kind}/${emission.key}`)
@@ -1068,30 +1099,21 @@ function sameFrontier(a: ReadonlyMap<ChunkId, number>, b: ReadonlyMap<ChunkId, n
   return true;
 }
 
-function representativeOrder(a: ParetoLabel, b: ParetoLabel, cacheRelevant: boolean): number {
-  return (
-    a.fidelityLoss - b.fidelityLoss ||
-    a.continuityLoss - b.continuityLoss ||
-    a.renderedTokens - b.renderedTokens ||
-    (cacheRelevant ? b.extensionTokens - a.extensionTokens : 0) ||
-    a.cache.matchedUnits - b.cache.matchedUnits
-  );
-}
-
 /** Each lexicographic minimum is necessarily nondominated when its ordering
  * includes every priced dimension. Extension breaks F/K/T ties before the
- * unpriced matched-unit tie-breaker, and supplies a fourth extremum when warm. */
-function bucketRepresentatives(pool: readonly ParetoLabel[], cacheRelevant: boolean): ParetoLabel[] {
+ * frontier signature tie-breaker, and supplies a fourth extremum when warm. */
+function bucketRepresentatives(pool: readonly ParetoLabel[], cacheRelevant: boolean,
+  representativeOrder: (a: ParetoLabel, b: ParetoLabel) => number): ParetoLabel[] {
   let fidelity = pool[0];
   let continuity = pool[0];
   let tokens = pool[0];
   let extension = pool[0];
   for (let i = 1; i < pool.length; i++) {
     const label = pool[i];
-    if (representativeOrder(label, fidelity, cacheRelevant) < 0) fidelity = label;
-    if ((label.continuityLoss - continuity.continuityLoss || representativeOrder(label, continuity, cacheRelevant)) < 0) continuity = label;
-    if ((label.renderedTokens - tokens.renderedTokens || representativeOrder(label, tokens, cacheRelevant)) < 0) tokens = label;
-    if (cacheRelevant && (extension.extensionTokens - label.extensionTokens || representativeOrder(label, extension, cacheRelevant)) < 0) extension = label;
+    if (representativeOrder(label, fidelity) < 0) fidelity = label;
+    if ((label.continuityLoss - continuity.continuityLoss || representativeOrder(label, continuity)) < 0) continuity = label;
+    if ((label.renderedTokens - tokens.renderedTokens || representativeOrder(label, tokens)) < 0) tokens = label;
+    if (cacheRelevant && (extension.extensionTokens - label.extensionTokens || representativeOrder(label, extension)) < 0) extension = label;
   }
   const result = [fidelity];
   if (continuity !== fidelity) result.push(continuity);

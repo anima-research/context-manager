@@ -434,11 +434,18 @@ describe('carrierPolicy', () => {
       recallPairCost(summary: SummaryEntry): number;
     };
 
-    assert.strictEqual(pricingProbe.recallPairCost(carrierEntry), 313);
+    // Prices are the strategy's own estimate (the store's rules), not a
+    // constant: pin the RELATION, and that the memo is keyed by policy.
+    const fullPrice = pricingProbe.recallPairCost(carrierEntry);
+    const freshStripped = new AutobiographicalStrategy({ carrierPolicy: 'live-strip' }) as unknown as {
+      recallPairCost(summary: SummaryEntry): number;
+    };
+    const strippedPrice = freshStripped.recallPairCost(carrierEntry);
+    assert.ok(fullPrice > strippedPrice, `full ${fullPrice} must price above stripped ${strippedPrice}`);
     pricingProbe.config.carrierPolicy = 'live-strip';
     assert.strictEqual(
       pricingProbe.recallPairCost(carrierEntry),
-      13,
+      strippedPrice,
       'a scoped policy swap must not reuse the full render price',
     );
   });
