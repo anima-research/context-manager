@@ -42,7 +42,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
-import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type LatentDemandEvaluation } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import {
@@ -8734,17 +8734,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // duration of this pass. Entries reference the same messages repeatedly
     // (run-extension checks + the shardIndex sort comparator below), and
     // store.get() also resolves blobs — fetch each message at most once.
+    // Read the metadata off the store's cached full listing instead of one
+    // `store.get()` per raw entry: each get re-fetched the record from
+    // chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
+    // store (2026-09-21 profile), for two scalar fields. Only sharded
+    // messages carry a bodyGroupId, so the index stays small.
     const shardMeta = new Map<string, { groupId?: string; shardIndex?: number }>();
-    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined => {
-      if (!sourceMessageId) return undefined;
-      let meta = shardMeta.get(sourceMessageId);
-      if (!meta) {
-        const m = store.get(sourceMessageId);
-        meta = { groupId: m?.bodyGroupId, shardIndex: m?.shardIndex };
-        shardMeta.set(sourceMessageId, meta);
-      }
-      return meta;
-    };
+    for (const m of store.getAll()) {
+      if (m.bodyGroupId) shardMeta.set(m.id, { groupId: m.bodyGroupId, shardIndex: m.shardIndex });
+    }
+    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined =>
+      sourceMessageId ? shardMeta.get(sourceMessageId) : undefined;
     const groupOf = (sourceMessageId?: string): string | undefined =>
       metaOf(sourceMessageId)?.groupId;
 
@@ -8878,6 +8878,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           mergeThreshold: this.config.mergeThreshold ?? 6,
           fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
           maxCandidates: 16,
+          cache: this.kvUnifiedLatentDemandCache,
         },
         ...(this.kvUnifiedReceipts.head
           ? {
@@ -8932,6 +8933,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
+  /** See KvUnifiedOptions.latentDemand.cache — reused while the root set is unchanged. */
+  private readonly kvUnifiedLatentDemandCache: { signature?: string; evaluations?: LatentDemandEvaluation[]; produced?: ProduceRequest[] } = {};
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
