@@ -1121,7 +1121,7 @@ export class MessageStore {
 const PROSE_CHARS_PER_TOKEN = 2.9;
 const DENSE_CHARS_PER_TOKEN = 2.3;
 
-function defaultTokenEstimator(text: string): number {
+export function defaultTokenEstimator(text: string): number {
   if (!text) return 0;
   // Cheap density probe: JSON/code punctuation and non-ASCII share.
   let dense = 0;
@@ -1137,7 +1137,7 @@ function defaultTokenEstimator(text: string): number {
 }
 
 /** JSON-ish payloads (tool inputs/results) always use the dense rate. */
-function jsonTokenEstimator(text: string): number {
+export function jsonTokenEstimator(text: string): number {
   if (!text) return 0;
   return Math.ceil(text.length / DENSE_CHARS_PER_TOKEN);
 }
