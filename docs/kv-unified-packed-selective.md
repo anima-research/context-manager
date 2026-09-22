@@ -115,9 +115,11 @@ An additional diagnostic run checked every one of the 6,538 pinned-case
 estimates against its exact evaluation. These are single-run local timings,
 not a cross-machine latency guarantee.
 
-Validation: build and typecheck pass; **822 tests pass / 0 fail**, versus
-813 / 0 on the PR #110 parent (9 additional tests). The tests and benchmarks
-do not exercise provider calls or a live resident compile.
+After merging `main` through #108 and #113, build and typecheck pass;
+**838 tests pass / 0 fail**, versus **818 / 0** on that `main` head. The
+four-chunk equal-score regression from #108 now checks both object and packed
+storage (packed full and selective scoring). The tests and benchmarks do not
+exercise provider calls or a live resident compile.
 
 For a controlled sequential replay with differential decision checks:
 
@@ -169,6 +171,13 @@ a fresh 500-sample run of the #110 parent. The paired large-fixture table
 above uses the current object backend. Replay high-water observed RSS was
 3.285 GB, including the additional object-reference solves in the same
 process; it is not a packed-only memory comparison.
+
+After incorporating #108's frontier-based tie-break and extending it to packed
+storage, a fresh forced-500k check took **8.686 s** with object storage and
+**5.133 s** with packed/selective. Both selected the same 471,837-token
+frontier, score, floors, and existing propagation statistics as each other
+and as the earlier run. This is one fresh paired check; the 500-message replay
+above predates the #108 merge.
 
 Local receipts: `/Users/antra/sill-cm/data/solver-fixtures/packed-selective-20260921.t0hKsG/`.
 The `replay-500/` directory contains `config.json`, `rows.jsonl`, and

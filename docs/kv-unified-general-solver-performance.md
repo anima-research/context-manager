@@ -3,7 +3,7 @@
 PR #110 also includes the packed-storage and selective-scoring optimizations
 originally proposed in #112. The measurements below document the first stage;
 see [the combined implementation's latest results](kv-unified-packed-selective.md)
-for the 822-test validation and the repeated 500-message replay.
+for the latest validation and the repeated 500-message replay.
 
 The previous solver propagated tens of millions of labels and eagerly rebuilt
 and rescored thousands of complete frontiers. Sill's recorded compile took
