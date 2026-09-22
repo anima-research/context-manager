@@ -8226,10 +8226,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationArmed = false;
 
     const ratio = realTotal / est;
+    const current = this._calibration;
+    const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
     // provider quirk) — never evidence about chars-per-token. Log, don't learn.
-    if (ratio < 0.6 || ratio > 1.8) {
+    // The band is also checked on the IMPLIED raw multiplier: when the
+    // multiplier sits at a clamp edge because the per-class rates were wrong
+    // (signed thinking at a flat 600) and the rates are then fixed, every
+    // honest sample reads real/est ≈ 1/1.8 = 0.56 — out of band on the ratio
+    // alone, so the multiplier could never come back down. A sample whose
+    // implied multiplier is inside the clamp range is window-shaped by
+    // construction and must be learned from.
+    const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
+    const observedInBand = observed >= 0.6 && observed <= 1.8;
+    if (!ratioInBand && !observedInBand) {
       console.error(
         `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
           `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
@@ -8238,8 +8249,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const current = this._calibration;
-    const observed = ratio * current; // back out the multiplier already applied
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const next = current + alpha * (observed - current);
     const clamped = Math.min(1.8, Math.max(0.6, next));
