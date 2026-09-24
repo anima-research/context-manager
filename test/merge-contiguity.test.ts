@@ -189,3 +189,30 @@ test('persisted merge queues from the old gap grammar are discarded', () => {
 
   assert.equal(p.mergeQueueLength(), 0);
 });
+
+test('a quarantined oldest group does not block later history from merging', () => {
+  // Librarian 2026-09-08 → 09-24: the oldest six L1s were refused and
+  // quarantined; the selector re-offered exactly that group on every pass,
+  // enqueueMerge declined it, and 322 newer L1s were never attempted.
+  const p = new QuarantineProbe({ adaptiveResolution: true, autoTickOnNewMessage: false });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const oldest = Array.from({ length: 6 }, (_, i) => summary(`q${i}`, i * 10, i * 10 + 9));
+  const later = Array.from({ length: 7 }, (_, i) => summary(`n${i}`, 60 + i * 10, 60 + i * 10 + 9));
+  p.seedQuarantine(oldest.map((s) => s.id));
+  const run = p.pick([...oldest, ...later], 6);
+  assert.deepEqual(run?.map((s) => s.id), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5']);
+});
+
+test('operator merge holds split the frontier like a hole', () => {
+  const p = new Probe({
+    adaptiveResolution: true,
+    autoTickOnNewMessage: false,
+    mergeHoldSummaryIds: ['h2'],
+  });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const all = Array.from({ length: 9 }, (_, i) => summary(`h${i}`, i * 10, i * 10 + 9));
+  // h0,h1 are an interior run (consolidates at 2); the held h2 is never offered.
+  assert.deepEqual(p.pick(all, 6)?.map((s) => s.id), ['h0', 'h1']);
+  const withoutInterior = all.slice(3);
+  assert.deepEqual(p.pick(withoutInterior, 6)?.map((s) => s.id), ['h3', 'h4', 'h5', 'h6', 'h7', 'h8']);
+});

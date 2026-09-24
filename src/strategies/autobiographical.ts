@@ -6649,10 +6649,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     console.warn(`[autobiographical] merge-candidate excluded: ${detail}`);
   }
 
+  /**
+   * Summaries that must not be offered as merge sources: every source of a
+   * quarantined merge, plus operator holds (`mergeHoldSummaryIds`). They are
+   * removed BEFORE contiguity is computed, so they split the frontier into
+   * runs like any other hole and later history merges around them.
+   *
+   * Without this, a quarantined group that happens to be the OLDEST
+   * contiguous run is re-offered on every threshold pass, `enqueueMerge`
+   * silently declines it, and no later group is ever considered: one refused
+   * merge froze a resident's whole pyramid for 16 days (322 L1s never
+   * attempted, zero merge calls).
+   */
+  protected mergeHeldSourceIds(): Set<string> {
+    const held = new Set<string>(this.config.mergeHoldSummaryIds ?? []);
+    for (const record of this.mergeQuarantine.values()) {
+      for (const id of record.sourceIds) held.add(id);
+    }
+    return held;
+  }
+
   protected contiguousMergeCandidates(
     unmerged: SummaryEntry[],
     threshold: number,
   ): SummaryEntry[] | null {
+    const held = this.mergeHeldSourceIds();
+    if (held.size > 0) unmerged = unmerged.filter((s) => !held.has(s.id));
     if (unmerged.length < threshold) return null;
     const messageOrder = new Map<MessageId, number>();
     let seq = 0;

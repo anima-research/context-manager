@@ -1,0 +1,1 @@
+- `mergeHoldSummaryIds`: operator merge holds. Listed summaries are never offered as merge sources and stay on the frontier at their own level (e.g. while awaiting review); like quarantined sources, they split the frontier into runs so later history still merges around them.
