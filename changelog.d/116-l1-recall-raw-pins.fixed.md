@@ -1,0 +1,1 @@
+- The L1 compression prompt honors raw (level-0) pins. The live selector already did, but the prompt still recalled the summary covering a pinned span. Frontier summaries that transitively cover a force-raw message are now excluded, so the pinned span renders raw instead of disappearing.
