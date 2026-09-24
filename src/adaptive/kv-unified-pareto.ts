@@ -201,6 +201,7 @@ export class ParetoKvUnifiedPolicySolver {
     }
 
     const ceiling = options.labelCeiling ?? 1_000_000;
+    const tokenBucketSize = Math.max(0, Math.floor(options.tokenBucketSize ?? 0));
     const continuityBucketSize = Math.max(0, options.continuityBucketSize ?? 0);
     const fidelityBucketSize = Math.max(0, options.fidelityBucketSize ?? 0);
     const stack: ParetoLabel[] = [];
@@ -307,7 +308,7 @@ export class ParetoKvUnifiedPolicySolver {
         states: states.size,
         maxLabelsPerState,
         terminalLabels: terminal.length,
-        tokenBucketSize: 0, // effective: insert() keys tokens exactly
+        tokenBucketSize,
         continuityBucketSize,
         fidelityBucketSize,
         approximationBounded: true,

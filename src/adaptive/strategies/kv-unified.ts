@@ -125,12 +125,13 @@ export class KvUnifiedStrategy implements FoldingSolver {
         conservativeRecallTokens: candidate.conservativeRecallTokens,
         expectedImprovement: baseline.selected.score - expected.selected.score,
         conservativeImprovement: baseline.selected.score - conservative.selected.score,
+        // Approximate only when pruning could have cost score: a bucket that
+        // merged nothing, or an exact engine, reports a zero bound.
         approximate: Boolean(
           conservative.propagation &&
           (
-            conservative.propagation.tokenBucketSize > 0 ||
-            conservative.propagation.continuityBucketSize > 0 ||
-            conservative.propagation.fidelityBucketSize > 0
+            !conservative.propagation.approximationBounded ||
+            conservative.propagation.approximationScoreErrorBound > 0
           ),
         ),
       });
