@@ -1202,11 +1202,14 @@ test('kv-unified resolves a representative tie between broken cuts the way termi
   for (const [name, extra] of [
     ['exact dag', { tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0 }],
     ['bucketed dag', { tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 }],
-  ] as const) {
-    const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra });
-    assert.equal(result.feasible, true, name);
-    if (!result.feasible) return;
-    assert.equal(signature(result.selected), signature(oracle.selected), `${name}: selected ${signature(result.selected)}`);
-    assert.equal(result.selected.score, oracle.selected.score, name);
+  ] as const) for (const storage of ['objects', 'packed'] as const) {
+    for (const terminalEvaluation of storage === 'packed' ? ['full', 'selective'] as const : ['full'] as const) {
+      const mode = `${name}/${storage}/${terminalEvaluation}`;
+      const result = new ParetoKvUnifiedPolicySolver(build()).solve({ ...base, ...extra, storage, terminalEvaluation });
+      assert.equal(result.feasible, true, mode);
+      if (!result.feasible) return;
+      assert.equal(signature(result.selected), signature(oracle.selected), `${mode}: selected ${signature(result.selected)}`);
+      assert.equal(result.selected.score, oracle.selected.score, mode);
+    }
   }
 });
