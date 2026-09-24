@@ -5318,12 +5318,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messageOrder = new Map<MessageId, number>(
       allMessages.map((message, index) => [message.id, index]),
     );
+    // A raw pin is a promise about every model-facing view, including this
+    // internal compression call. The main selector honors it, but recall here
+    // used to include the summary covering a pinned span anyway. Exclude any
+    // frontier summary that transitively covers a force-raw message.
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const pinnedPositionsSet = this.pinnedPositions(allMessages);
+    const pinBounds = this.pinLevelBounds(allMessages);
+    const rawPinnedMessageIds = new Set<MessageId>();
+    for (let i = 0; i < allMessages.length; i++) {
+      if (!pinnedPositionsSet.has(i)) continue;
+      const bound = pinBounds.get(i);
+      if (bound === undefined || bound.level === 0 || bound.maxLevel === 0) {
+        rawPinnedMessageIds.add(allMessages[i].id);
+      }
+    }
+    const summaryTouchesRawPin = (summary: SummaryEntry): boolean => {
+      if (rawPinnedMessageIds.size === 0) return false;
+      const leaves = new Set<MessageId>();
+      this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+      for (const id of leaves) if (rawPinnedMessageIds.has(id)) return true;
+      return false;
+    };
     const priorSummaries = this.summaries
       // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
       // recall pair triggers Anthropic 400 "text content blocks must be
       // non-empty", which stalls ALL compression (mirrors the render-path guard
       // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
+      .filter((s) =>
+        !s.mergedInto && !!s.content && s.content.trim().length > 0 && !summaryTouchesRawPin(s))
       .sort((a, b) => {
         const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
         const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
@@ -5337,14 +5361,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a budget-dropped summary doesn't make its raw messages reappear.
     // Expand summary sourceIds down to leaf message IDs — an L2's
     // sourceIds are L1 IDs, not message IDs; a flat walk would miss
-    // every message it transitively covers (Bug 10). Also expand merged
-    // L1s as defense in depth.
-    const summariesById = new Map<string, SummaryEntry>();
-    for (const s of this.summaries) summariesById.set(s.id, s);
+    // every message it transitively covers (Bug 10). The frontier is the
+    // authority here: a second pass expanding every merged L1 would hide the
+    // raw source of a frontier summary excluded by the pin rule above.
+    // (summariesById is built above, for that pin-aware recall filter.)
     const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
     for (const s of priorSummaries) {
       this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
