@@ -1,0 +1,1 @@
+- kv-unified leaf engine: token buckets no longer let it drop a label with a different token count while reporting a zero error bound. It now keys labels on exact tokens, so the zero bound holds (#109).

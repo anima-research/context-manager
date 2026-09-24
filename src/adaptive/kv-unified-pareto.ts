@@ -212,7 +212,11 @@ export class ParetoKvUnifiedPolicySolver {
     let maxLabelsPerState = 0;
     const insert = (label: ParetoLabel): void => {
       if (label.renderedTokens > options.maxTokens) return;
-      const key = stateKey(label, tokenBucketSize, continuityBucketSize, fidelityBucketSize);
+      // Tokens stay exact: fewer tokens is not always better (budgetPenalty
+      // rewards filling up to budgetLowRatio), and this engine has no envelope
+      // to charge a cross-token prune to (#109). Continuity and fidelity are
+      // monotone in the score, so their buckets stay sound.
+      const key = stateKey(label, 0, continuityBucketSize, fidelityBucketSize);
       const current = states.get(key) ?? [];
       for (const incumbent of current) {
         if (dominates(incumbent, label, cacheRelevant)) {

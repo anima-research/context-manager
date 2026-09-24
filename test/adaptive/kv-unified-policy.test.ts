@@ -1213,3 +1213,49 @@ test('kv-unified resolves a representative tie between broken cuts the way termi
     }
   }
 });
+
+test('bucketed leaf engine keeps the oracle cut when fewer tokens score worse (#109)', () => {
+  const build = (pinHole: boolean): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 100, pinned: id === 'c' });
+    chronicle.produceL1(['a']);
+    chronicle.recallPairTokens.set(chronicle.produceL1(['b']).id, 30);
+    if (pinHole) chronicle.recallPairTokens.set(chronicle.produceL1(['c', 'd']).id, 220);
+    return { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() };
+  };
+  const allRaw = new Map(['a', 'b', 'c', 'd'].map((id) => [id, 0]));
+  const base = build(false);
+  const layout = renderLayout(base, new SummaryTree(base), allRaw);
+  const leaves = new Map(base.chunks.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }]));
+  const policy = { alpha: 0, budgetLowRatio: 1, budgetHighRatio: 1, budgetUnderLambda: 10000, budgetOverLambda: 0,
+    continuityRecencyFloor: 1, continuityStableFloor: 1, continuityLambda: 100, continuityScale: 100, cacheLambda: 1, cacheScale: 100 };
+  for (const pinHole of [false, true]) {
+    for (const prefix of ['tools-v1', 'tools-v2']) {
+      const options = { maxTokens: 330, presentation: { currentSeq: 1, leaves }, policy,
+        cache: { immutablePrefixHash: 'tools-v1', layout, markers: [{ unitIndex: 4, offset: 400 }] },
+        currentImmutablePrefixHash: prefix, tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 };
+      const oracle = new ExactKvUnifiedPolicySolver(build(pinHole)).solve(options);
+      assert.ok(oracle.feasible);
+      const leaf = new ParetoKvUnifiedPolicySolver(build(pinHole)).solve({ ...options, engine: 'leaf' });
+      assert.ok(leaf.feasible);
+      assert.equal(leaf.propagation?.approximationScoreErrorBound, 0);
+      assert.deepEqual(leaf.selected.frontier, oracle.selected.frontier, `leaf, hole=${pinHole}, prefix=${prefix}`);
+      assert.equal(leaf.selected.score, oracle.selected.score);
+      const auto = new ParetoKvUnifiedPolicySolver(build(pinHole)).solve(options);
+      assert.ok(auto.feasible);
+      assert.ok(auto.selected.score - oracle.selected.score <= auto.propagation!.approximationScoreErrorBound + 1e-9,
+        `auto regret is covered by its bound, hole=${pinHole}, prefix=${prefix}`);
+    }
+  }
+});
+
+test('packed and object DAG storage both enforce the label ceiling', () => {
+  const { inputs } = fixture();
+  for (const storage of ['packed', 'objects'] as const) {
+    assert.throws(() => new ParetoKvUnifiedPolicySolver(inputs).solve({
+      maxTokens: 10_000, engine: 'dag', storage, labelCeiling: 1,
+      tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0,
+    }), { name: 'SparseLabelCeilingError' }, storage);
+  }
+});

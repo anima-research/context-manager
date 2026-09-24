@@ -7,7 +7,7 @@ import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { MockChronicle, buildChronicleWithChain } from './harness.js';
-import { PackedLabels, PackedBuckets, LABEL_STRIDE, LabelField } from '../../src/adaptive/kv-unified-packed-storage.js';
+import { PackedLabels, PackedBuckets, PackedTraceArena, LABEL_STRIDE, LabelField } from '../../src/adaptive/kv-unified-packed-storage.js';
 
 test('packed label growth, reuse, and branching preserve immutable trace ancestry', () => {
   const labels = new PackedLabels();
@@ -139,4 +139,17 @@ test('packed/full and packed/selective agree with object storage, including ever
       assert.equal(estimate.matchesPresentation, exact.matchesPresentation);
     }
   }
+});
+
+test('trace ancestry survives the 2^18 trace page boundary', () => {
+  const arena = new PackedTraceArena();
+  const actions = [arena.action(['a'], 0), arena.action(['b'], 1)];
+  let node = 0;
+  for (let i = 0; i < (1 << 18) + 2; i++) node = arena.append(node, actions[i % 2]);
+  assert.equal(arena.nodes, (1 << 18) + 2);
+  let visited = 0;
+  let last: [string, number] | undefined;
+  arena.reference(node).forEachAssignment((ids, level) => { if (!last) last = [ids[0], level]; visited++; });
+  assert.equal(visited, (1 << 18) + 2);
+  assert.deepEqual(last, ['b', 1]);
 });
