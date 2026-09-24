@@ -21,6 +21,8 @@ after(() => rmSync(dir, { recursive: true, force: true }));
 
 type Internals = {
   _calibration: number;
+  calibrationStateId: string;
+  store: { setStateJson(id: string, value: unknown): void; getStateJson(id: string): unknown } | null;
   _lastCompileEstimate: number;
   applyCalibration(): void;
 };
@@ -73,5 +75,36 @@ describe('estimator calibration band', () => {
     strategy.reportRealInputTokens(est * 1.5);
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
     cm.close();
+  });
+
+  it('a multiplier persisted under an older pricing epoch is discarded on reopen', async () => {
+    // The startup wedge: a store that pinned 1.8 under flat-600 thinking
+    // pricing reopens estimating ~1.8x its real size; if that is over the
+    // hard budget the first compile throws and no sample can ever decay it.
+    const first = await openManager('stale-epoch');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.8, at: Date.now() });
+    first.cm.close();
+
+    const reopened = await openManager('stale-epoch');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, 1);
+    reopened.cm.close();
+  });
+
+  it('a multiplier learned under the current pricing epoch survives reopen', async () => {
+    const first = await openManager('current-epoch');
+    await first.cm.compile(BUDGET);
+    first.strategy.reportRealInputTokens(first.internals._lastCompileEstimate * 1.5);
+    const learned = first.internals._calibration;
+    assert.ok(learned > 1);
+    const saved = first.internals.store!.getStateJson(first.internals.calibrationStateId) as { pricing?: number };
+    assert.equal(saved.pricing, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH);
+    first.cm.close();
+
+    const reopened = await openManager('current-epoch');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, learned);
+    reopened.cm.close();
   });
 });

@@ -8403,7 +8403,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = clamped;
     this.applyCalibration();
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -8491,15 +8495,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape.
+   *
+   *   0: unstamped (flat HIDDEN_THINKING_TOKENS_DEFAULT for signed thinking)
+   *   1: signed thinking priced by signature length
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 1;
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from another pricing epoch is discarded (start at 1). */
   protected loadCalibration(store: MessageStoreView): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          if ((saved.pricing ?? 0) === AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          } else {
+            console.error(
+              `[estimator-calibration] discarding multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
+                `pricing epoch ${saved.pricing ?? 0} (current ${AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH}); ` +
+                `restarting from 1.00`,
+            );
+          }
         }
       } catch { /* absent slot is fine */ }
     }
