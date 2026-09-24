@@ -5585,6 +5585,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // image ... kept 0MB" logged while the mint still 400'd on
     // image_input_not_supported). The merge builder has always capped its
     // post-split list; this aligns the L1 builder with it.
+    // Imported tool output can carry a whole `data:<mime>;base64,...` URL as
+    // TEXT, invisible to the image-byte cap below; replace it (prompt only).
+    this.stripSerializedCompressionMedia(
+      llmMessages as Array<{ content: ContentBlock[] }>,
+    );
     this.capCompressionImageBytes(
       cleaned as Array<{ content: ContentBlock[] }>,
       this.config.maxCompressionImageBytes ??
@@ -5650,6 +5655,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
     if (sourceOnlyFallbackMessages) {
+      // Imported tool output can carry a whole `data:<mime>;base64,...` URL as
+      // TEXT, invisible to the image-byte cap below; replace it (prompt only).
+      this.stripSerializedCompressionMedia(
+        sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
+      );
       this.capCompressionImageBytes(
         sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
         this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
@@ -7261,6 +7271,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // messages under its L1s, images and all (including screenshots nested in
     // tool_results). This is the path that kept tripping membrane's transport
     // shed at 27MB after the L1 site was already capped. Own it here.
+    // Imported tool output can carry a whole `data:<mime>;base64,...` URL as
+    // TEXT, invisible to the image-byte cap below; replace it (prompt only).
+    this.stripSerializedCompressionMedia(
+      cleaned as Array<{ content: ContentBlock[] }>,
+    );
     this.capCompressionImageBytes(
       cleaned as Array<{ content: ContentBlock[] }>,
       this.config.maxCompressionImageBytes ??
@@ -10424,6 +10439,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected static imageBlockBytes(b: unknown): number {
     const src = (b as { source?: { data?: string } }).source;
     return typeof src?.data === 'string' ? src.data.length : 0;
+  }
+
+  /** Ignore short data-URL examples while catching actual serialized media. */
+  protected static readonly SERIALIZED_DATA_URL_MIN_CHARS = 4096;
+
+  /**
+   * Replace large base64 data URLs that arrived inside TEXT blocks of a
+   * compression prompt — e.g. an imported tool result that serialized a
+   * foreign harness's image JSON instead of a native image block. The image
+   * byte cap cannot see those bytes and the tokenizer treats them as prose
+   * (one image can become hundreds of thousands of tokens). Prompt-only:
+   * stored Chronicle messages are never mutated; the marker keeps the media
+   * type and size.
+   */
+  protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
+    const minChars = AutobiographicalStrategy.SERIALIZED_DATA_URL_MIN_CHARS;
+    const dataUrl = new RegExp(
+      'data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*);base64,' +
+        `([A-Za-z0-9+/_=-]{${minChars},})`,
+      'g',
+    );
+    let replaced = 0;
+    const strip = (blocks: ContentBlock[]): ContentBlock[] =>
+      blocks.map((block) => {
+        if (block.type === 'text') {
+          const text = block.text.replace(dataUrl, (_m, mediaType: string, payload: string) => {
+            replaced++;
+            return `[embedded ${mediaType} data URL omitted from compression prompt: ` +
+              `${payload.length} base64 characters; original preserved in Chronicle]`;
+          });
+          return text === block.text ? block : ({ ...block, text } as ContentBlock);
+        }
+        const nested = (block as { type: string; content?: unknown }).content;
+        if (block.type === 'tool_result' && Array.isArray(nested)) {
+          return { ...block, content: strip(nested as ContentBlock[]) } as ContentBlock;
+        }
+        return block;
+      });
+    for (const message of messages) message.content = strip(message.content);
+    return replaced;
   }
 
   /**
