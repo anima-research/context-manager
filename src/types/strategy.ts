@@ -990,6 +990,36 @@ export interface AutobiographicalConfig {
   /** Final bounded source-only L1 attempt after canonical + recall variants. */
   compressionSourceOnlyFallback?: boolean;
   /**
+   * Tool-prose hoist rung (2026-09-19, sill). Off unless set.
+   *
+   * Long prose in an argument of a private-reasoning tool (`skip_reply.reason`,
+   * `think.content`) makes the replayed history read as a reasoning trace and
+   * the L1 request is refused `reasoning_extraction` regardless of content. On
+   * a canonical REFUSAL (only then) the request is retried once with each such
+   * argument moved into a call to `intoTool` — a note-taking tool the agent
+   * really has — placed as its own round just before the original call, a short
+   * stub left behind. If the source-only final rung is enabled and also refuses,
+   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   *
+   * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
+   * the summarizer is the agent, and it must never be shown itself using a tool
+   * it does not have. Enabling (or changing) this is a new request regime, so
+   * already-quarantined chunks earn a fresh bounded attempt without a manual
+   * clear. See `tool-prose-hoist.ts` for the canary record.
+   */
+  compressionToolProseFallback?: {
+    /** Declared name of the real note-taking tool that receives the prose. */
+    intoTool: string;
+    /** Tools to rewrite from (exact name or final `--` segment). Required. */
+    fromTools: string[];
+    /** Argument of `intoTool` that receives the prose (default `content`). */
+    field?: string;
+    /** tool_result content for the inserted calls (default: journal receipt). */
+    result?: string;
+    /** Rewrite string arguments longer than this many chars (default 100). */
+    minChars?: number;
+  };
+  /**
    * Split-stitch rung (2026-09-05, princess): when every L1 rung (canonical, recall
    * expansions, source-only-final) is refused, fold the chunk in halves recursively
    * at message boundaries with the same instruction/model, source-only, and install

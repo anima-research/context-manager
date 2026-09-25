@@ -33,6 +33,13 @@ import { getSummaryParentId } from '../types/strategy.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import {
+  hoistToolProse,
+  DEFAULT_TOOL_PROSE_FIELD,
+  DEFAULT_TOOL_PROSE_MIN_CHARS,
+  DEFAULT_TOOL_PROSE_RESULT,
+  type ToolProseHoistOptions,
+} from '../tool-prose-hoist.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
@@ -468,6 +475,8 @@ interface CompressionRefusalNormalizedConfig {
   requestConfig: NormalizedRequest['config'];
   sourceOnlyFallbackEnabled?: boolean;
   sourceOnlyFallbackRequestHash?: string;
+  /** Normalized tool-prose hoist options; absent when the rung is off. */
+  toolProseFallback?: ToolProseHoistOptions;
 }
 
 type CompressionAttemptOutcome =
@@ -3555,6 +3564,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
+  /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
+  private toolProseHoistOptions(): ToolProseHoistOptions | undefined {
+    const raw = this.config.compressionToolProseFallback;
+    if (!raw || typeof raw.intoTool !== 'string' || !raw.intoTool) return undefined;
+    if (!Array.isArray(raw.fromTools) || raw.fromTools.length === 0) return undefined;
+    return {
+      intoTool: raw.intoTool,
+      field: raw.field || DEFAULT_TOOL_PROSE_FIELD,
+      result: raw.result || DEFAULT_TOOL_PROSE_RESULT,
+      minChars: typeof raw.minChars === 'number' && raw.minChars >= 0
+        ? raw.minChars
+        : DEFAULT_TOOL_PROSE_MIN_CHARS,
+      fromTools: [...raw.fromTools],
+    };
+  }
+
+  /**
+   * The request with long private-reasoning tool arguments moved into calls to
+   * the configured real tool, or undefined when the rung is off, the target
+   * tool is not among the declared tools (never show the summarizer a tool the
+   * agent does not have), or nothing qualifies (an identical retry is a burned
+   * call). See `tool-prose-hoist.ts`.
+   */
+  private toolProseHoistedRequest(request: NormalizedRequest): NormalizedRequest | undefined {
+    const options = this.toolProseHoistOptions();
+    if (!options) return undefined;
+    if (!request.tools?.some((tool) => tool.name === options.intoTool)) return undefined;
+    const { messages, hoisted } = hoistToolProse(request.messages, options);
+    if (hoisted === 0) return undefined;
+    return { ...request, messages: messages as NormalizedRequest['messages'] };
+  }
+
   private compressionRefusalQuarantineRecord(
     chunk: Chunk,
     model: string,
@@ -3573,6 +3614,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
+    const toolProseFallback = this.toolProseHoistOptions();
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
       accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
       fallbackLimit,
@@ -3584,6 +3626,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(sourceOnlyFallbackRequestHash !== undefined
         ? { sourceOnlyFallbackRequestHash }
         : {}),
+      // Conditionally spread: with the rung off the record, its key and its
+      // family stay byte-identical to what they were before the rung existed.
+      ...(toolProseFallback ? { toolProseFallback } : {}),
     };
     const familyKey = sha256Json({
       model,
@@ -5723,7 +5768,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
         quarantineRecord.normalizedConfig.sourceOnlyFallbackEnabled &&
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
-        quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash,
+        quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash &&
+      // Same rule for the tool-prose rung: enabling or re-pointing it is a
+      // request-family change (sha of undefined-vs-options differs).
+      sha256Json(active.record.normalizedConfig?.toolProseFallback ?? null) ===
+        sha256Json(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
       ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
@@ -5990,7 +6039,69 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           metadata: attemptTraces[0],
         });
         let fallbackResponse: NormalizedResponse | undefined;
+
+        // One bounded attempt of a tool-prose-hoisted request. Same receipts
+        // as the source-only final rung; provider errors never escalate.
+        const runToolProseRung = async (
+          hoistedRequest: NormalizedRequest,
+          curveLabel: string,
+          recallIds: string[],
+          recallLevels: number[],
+          coverageHash: string,
+        ): Promise<void> => {
+          const requestHash = sha256Json(hoistedRequest);
+          try {
+            const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
+            const trace = attemptTraces[attemptTraces.length - 1]!;
+            const assessment = this.assessFallbackCompressionResponse(rungResponse);
+            if (assessment.outcome === 'valid') {
+              trace.outcome = 'success';
+              fallbackResponse = assessment.response;
+              response = assessment.response;
+              successfulTrace = trace;
+            } else {
+              trace.outcome = assessment.outcome;
+              outcomes.push({
+                curveLabel, requestHash, outcome: assessment.outcome,
+                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+              });
+            }
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+          } catch (error) {
+            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            const errorType = error && typeof error === 'object' && 'type' in error
+              ? String((error as { type: unknown }).type)
+              : error instanceof Error ? error.name : typeof error;
+            const trace = attemptTraces[attemptTraces.length - 1];
+            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
+            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+          }
+        };
+
+        // ---- tool-prose hoist rung (compressionToolProseFallback) ----
+        // FIRST after a canonical refusal, ahead of the recall variants: the
+        // variants vary the recall frontier and cannot dodge a carrier that
+        // lives in the chunk's own tool calls, so each would be a burned call
+        // (sill 2026-09-19: canonical AND source-only refused on every chunk;
+        // 22/22 passed with only this rewrite). Keeps the full canonical
+        // context, so a win here costs no voice. Refusal-gated: a truncated or
+        // tool_use canonical is not this rung's problem.
+        if (canonicalOutcome === 'refusal') {
+          const hoistedCanonical = this.toolProseHoistedRequest(request);
+          if (hoistedCanonical) {
+            await runToolProseRung(
+              hoistedCanonical,
+              'tool-prose-hoist',
+              keptSummaries.map((summary) => summary.id),
+              keptSummaries.map((summary) => summary.level),
+              canonicalCoverageHash,
+            );
+          }
+        }
+
         for (const planned of fallbackPlan) {
+          if (fallbackResponse) break;
           const variant = variants.find((candidate) =>
             candidate.parent.id === planned.parentId && candidate.requestHash === planned.requestHash,
           );
@@ -6133,6 +6244,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           break;
         }
 
+        // How the source-only final rung ended, for the hoist below: only a
+        // REFUSAL is a carrier problem the rewrite can address. A provider
+        // error, a truncated or empty generation is not, and a paid retry on
+        // top of one would contradict "provider errors never escalate"
+        // (Sol, #106 review: a thrown server_error on source-only-final still
+        // bought a fourth call).
+        let sourceOnlyOutcome: CompressionAttemptOutcome | 'incomplete' | undefined;
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
@@ -6149,6 +6267,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               response = assessment.response;
               successfulTrace = trace;
             } else {
+              sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
               outcomes.push({
                 curveLabel, requestHash, outcome: assessment.outcome,
@@ -6165,6 +6284,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const trace = attemptTraces[attemptTraces.length - 1];
             if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
             outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+            sourceOnlyOutcome = 'provider_error';
+          }
+        }
+
+        // Source-only final REFUSED too: the same carrier sits in the target
+        // chunk itself, so give the source-only shape the same rewrite once.
+        // Refusal-gated like the canonical hoist: any other way that attempt
+        // ended is not this rung's problem.
+        if (!fallbackResponse && sourceOnlyFallbackRequest && sourceOnlyOutcome === 'refusal') {
+          const hoistedSourceOnly = this.toolProseHoistedRequest(sourceOnlyFallbackRequest);
+          if (hoistedSourceOnly) {
+            await runToolProseRung(
+              hoistedSourceOnly,
+              'source-only-tool-prose-hoist',
+              [], [],
+              sha256Json(chunk.messages.map((message) => message.id)),
+            );
           }
         }
 
@@ -6398,7 +6534,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
       const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
-      if (!summaryText.trim() && !sourceOnlyFinalWon) {
+      // A tool-prose rung only runs after the canonical request was REFUSED, so
+      // the canonical plain-prose retry below would be a guaranteed burned call.
+      const toolProseWonTrace =
+        successfulTrace?.curveLabel === 'tool-prose-hoist' ||
+        successfulTrace?.curveLabel === 'source-only-tool-prose-hoist'
+          ? successfulTrace
+          : undefined;
+      if (!summaryText.trim() && !sourceOnlyFinalWon && !toolProseWonTrace) {
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
@@ -6434,7 +6577,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // exhaustion path as the refusal curves; the record is sticky by
         // chunk hash and clears via success-clear / sweep / operator.
         if (this.isCompressionBranchCurrent(sourceBranch)) {
-          const emptyOutcomes: CompressionRefusalOutcomeRecord[] = sourceOnlyFinalWon
+          const emptyOutcomes: CompressionRefusalOutcomeRecord[] = toolProseWonTrace
+            ? [{
+                curveLabel: toolProseWonTrace.curveLabel,
+                outcome: 'unusable_empty',
+                requestHash: toolProseWonTrace.requestHash,
+              }]
+            : sourceOnlyFinalWon
             ? [{
                 curveLabel: 'source-only-final',
                 outcome: 'unusable_empty',
