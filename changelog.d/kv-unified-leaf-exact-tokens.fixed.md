@@ -1,0 +1,2 @@
+- kv-unified leaf engine: token buckets no longer let it drop a label with a different token count while reporting a zero error bound (#109). Reached only through an explicit `engine: 'leaf'`; the default route is unchanged. Such callers may need a larger `labelCeiling`, since the leaf engine now keeps more labels.
+- kv-unified latent demand: `approximate` is now true only when the solve reports a nonzero score error bound, instead of whenever a bucket size is configured.

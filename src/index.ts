@@ -6,7 +6,7 @@ export type { ContextManagerConfig } from './context-manager.js';
 export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-channel.js';
 
 // Storage
-export { MessageStore } from './message-store.js';
+export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 export { concatBodyGroups } from './adaptive/render.js';
 export { ContextLog } from './context-log.js';

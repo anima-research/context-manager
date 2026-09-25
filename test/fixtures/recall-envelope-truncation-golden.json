@@ -463,38 +463,20 @@
       ]
     },
     {
-      "participant": "User",
+      "participant": "Context Manager",
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "What do you remember from earlier?"
         }
       ]
     },
     {
-      "participant": "User",
+      "participant": "Claude",
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "zz-a\n\n[truncated — original was 14 tokens]"
         }
       ]
     },

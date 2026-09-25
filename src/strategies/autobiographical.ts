@@ -41,7 +41,7 @@ import {
   type ToolProseHoistOptions,
 } from '../tool-prose-hoist.js';
 import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
-import { MessageStore } from '../message-store.js';
+import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -49,7 +49,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
-import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type LatentDemandEvaluation } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import {
@@ -1090,6 +1090,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
+  /** A persisted kv-unified receipt was found while loading under another
+   * folding strategy; superseded at this strategy's first presentation. */
+  private kvUnifiedReceiptSupersedePending = false;
   private kvUnifiedDraft: {
     leaves: Map<ChunkId, PresentedLeaf>;
     layout: RenderLayout;
@@ -2071,6 +2074,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedPendingLayout = null;
       this.kvUnifiedPendingMarkerUnitIndices = [];
       this.kvUnifiedPendingImmutablePrefixHash = null;
+    } else {
+      // A presentation receipt is kv-unified's record of the LAST accepted
+      // presentation. Once another folding strategy PRESENTS from this store
+      // the receipt no longer describes the previous turn, and a later switch
+      // back would measure continuity against a days-old baseline and treat
+      // everything folded since as extension (#97). Loading is not
+      // presenting: an inspection tool that opens the store with a different
+      // strategy, or a compile with `dryRun: true`, must leave the receipt
+      // alone. Only note here that a receipt exists; the first non-dry-run
+      // ADAPTIVE select by a non-kv-unified strategy (selectAdaptive, after
+      // the resolutions commit) supersedes it. A caller that previews through
+      // a non-dry-run compile is presenting as far as this class can tell,
+      // and `adaptiveResolution: false` (selectHierarchical writes nothing by
+      // design) never supersedes.
+      this.kvUnifiedReceiptSupersedePending =
+        this.store.listStates().some((state) => state.id === this.kvUnifiedReceiptStateId) &&
+        this.store.getStateJson(this.kvUnifiedReceiptStateId) != null;
+      this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
     }
   }
 
@@ -2093,6 +2114,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level > 0) out[id] = level;
     }
     this.store.setStateJson(this.resolutionsStateId, out);
+  }
+
+  /** This strategy has just presented, so the persisted kv-unified receipt no
+   * longer describes the previous turn. Null it (the slot keeps its history in
+   * the record log) so a later switch back to kv-unified starts from an empty
+   * chain — one cold-cache turn, which the migration runbook already expects —
+   * instead of measuring against a stale baseline and treating everything
+   * folded since as extension (#97). */
+  protected supersedeKvUnifiedReceipt(): void {
+    if (!this.store) return;
+    this.requireBranchMutation('supersedeKvUnifiedReceipt');
+    this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+    // Cleared only after the write: if it throws, a later compile retries.
+    this.kvUnifiedReceiptSupersedePending = false;
+    console.warn(
+      `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
+        `${String(this.config.foldingStrategy ?? 'default')} has presented from this store; ` +
+        `a later switch back to kv-unified starts from an empty receipt chain`,
+    );
   }
 
   /** Persist the current locked-id snapshot. */
@@ -5582,8 +5622,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A tighter budget than the live window's: a compression prompt also
     // carries the head, the whole recall frontier and the raw chunk, so the
     // image share must leave room for all of it under the API's 32MB cap.
+    //
+    // Cap `cleaned` — the list the wire messages are derived from — not
+    // `llmMessages`: splitMixedToolMessages/collapse REBUILD message objects,
+    // so a cap applied to the pre-split list logs its strips against copies
+    // the request never ships (field repro 2026-09-21: "replaced 1 older
+    // image ... kept 0MB" logged while the mint still 400'd on
+    // image_input_not_supported). The merge builder has always capped its
+    // post-split list; this aligns the L1 builder with it.
     this.capCompressionImageBytes(
-      llmMessages as Array<{ content: ContentBlock[] }>,
+      cleaned as Array<{ content: ContentBlock[] }>,
       this.config.maxCompressionImageBytes ??
         AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
     );
@@ -8419,6 +8467,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
     }
+    // Same commit point for the receipt left behind by kv-unified: a real
+    // presentation by a non-kv-unified strategy has now succeeded, so that
+    // receipt no longer describes the previous turn (#97). Independent of
+    // whether any resolution changed — a no-op compile is still a
+    // presentation. A rejected compile keeps it: nothing replaced it.
+    if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
+      this.supersedeKvUnifiedReceipt();
+    }
     this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
@@ -8461,10 +8517,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationArmed = false;
 
     const ratio = realTotal / est;
+    const current = this._calibration;
+    const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
     // provider quirk) — never evidence about chars-per-token. Log, don't learn.
-    if (ratio < 0.6 || ratio > 1.8) {
+    // The band is also checked on the IMPLIED raw multiplier: when the
+    // multiplier sits at a clamp edge because the per-class rates were wrong
+    // (signed thinking at a flat 600) and the rates are then fixed, every
+    // honest sample reads real/est ≈ 1/1.8 = 0.56 — out of band on the ratio
+    // alone, so the multiplier could never come back down. A sample whose
+    // implied multiplier is inside the clamp range is window-shaped by
+    // construction and must be learned from.
+    const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
+    const observedInBand = observed >= 0.6 && observed <= 1.8;
+    if (!ratioInBand && !observedInBand) {
       console.error(
         `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
           `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
@@ -8473,8 +8540,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const current = this._calibration;
-    const observed = ratio * current; // back out the multiplier already applied
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const next = current + alpha * (observed - current);
     const clamped = Math.min(1.8, Math.max(0.6, next));
@@ -8776,11 +8841,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const entry of entries) {
       if (!entry.cacheMarker) continue;
       const sourceId = entry.sourceMessageId;
-      const layoutKey = sourceId && tailMessageIds.has(sourceId)
-        ? 'tail'
-        : sourceId && headMessageIds.has(sourceId)
-          ? 'head'
-          : entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      const atomicKey = entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      // A tail message is its own raw unit (render-offsets `tailUnits`); the
+      // opaque 'tail' block only carries tail tokens no chunk accounts for.
+      const layoutKey = sourceId && headMessageIds.has(sourceId)
+        ? 'head'
+        : sourceId && tailMessageIds.has(sourceId)
+          ? (atomicKey && layout.units.some((unit) => unit.key === atomicKey) ? atomicKey : 'tail')
+          : atomicKey;
       if (!layoutKey) {
         throw new Error('kv-unified cache marker has no atomic layout identity');
       }
@@ -8815,17 +8883,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // duration of this pass. Entries reference the same messages repeatedly
     // (run-extension checks + the shardIndex sort comparator below), and
     // store.get() also resolves blobs — fetch each message at most once.
+    // Read the metadata off the store's cached full listing instead of one
+    // `store.get()` per raw entry: each get re-fetched the record from
+    // chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
+    // store (2026-09-21 profile), for two scalar fields. Only sharded
+    // messages carry a bodyGroupId, so the index stays small.
     const shardMeta = new Map<string, { groupId?: string; shardIndex?: number }>();
-    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined => {
-      if (!sourceMessageId) return undefined;
-      let meta = shardMeta.get(sourceMessageId);
-      if (!meta) {
-        const m = store.get(sourceMessageId);
-        meta = { groupId: m?.bodyGroupId, shardIndex: m?.shardIndex };
-        shardMeta.set(sourceMessageId, meta);
-      }
-      return meta;
-    };
+    for (const m of store.getAll()) {
+      if (m.bodyGroupId) shardMeta.set(m.id, { groupId: m.bodyGroupId, shardIndex: m.shardIndex });
+    }
+    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined =>
+      sourceMessageId ? shardMeta.get(sourceMessageId) : undefined;
     const groupOf = (sourceMessageId?: string): string | undefined =>
       metaOf(sourceMessageId)?.groupId;
 
@@ -8959,6 +9027,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           mergeThreshold: this.config.mergeThreshold ?? 6,
           fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
           maxCandidates: 16,
+          cache: this.kvUnifiedLatentDemandCache,
         },
         ...(this.kvUnifiedReceipts.head
           ? {
@@ -9013,6 +9082,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
+  /** See KvUnifiedOptions.latentDemand.cache — reused while the root set is unchanged. */
+  private readonly kvUnifiedLatentDemandCache: { signature?: string; evaluations?: LatentDemandEvaluation[]; produced?: ProduceRequest[] } = {};
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
@@ -9108,7 +9179,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
     const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
-    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy]);
+    const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
+    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._pairCostCache.get(key);
     if (cached !== undefined) return cached;
     const estimatedAnswer = this.estimateTokens(this.liveWindowAnswerContent(s));
@@ -10986,27 +11058,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return tokens;
   }
 
+  /**
+   * Price a rendered body the way the store prices it. The plan and the
+   * emission must agree: every recall pair, envelope and merged entry this
+   * strategy prices here is later emitted and measured against the same
+   * budget the store's calibrated estimate feeds, so the store's view is the
+   * authority whenever one is bound (per-class chars/token rates, the signed-
+   * thinking rule, the closed-loop calibration multiplier). Before a view is
+   * bound the fallback mirrors the store's raw rules. The old local rule
+   * priced text at a flat chars/4 — under `carrierPolicy: 'live-strip'`,
+   * where the exact mint `tokens` no longer floors the recall-pair price,
+   * that under-priced dense summary prose by ~25-30% (2026-09-21, measured
+   * against count_tokens on a 500-summary window: 526k planned, 728k real).
+   */
   protected estimateTokens(content: ContentBlock[]): number {
+    const view = this._storeView;
+    if (view && typeof view.estimateTokens === 'function') {
+      return view.estimateTokens({ content } as unknown as StoredMessage);
+    }
     let tokens = 0;
     for (const block of content) {
       if (block.type === 'text') {
-        tokens += Math.ceil(block.text.length / 4);
+        tokens += defaultTokenEstimator(block.text);
       } else if (block.type === 'thinking') {
-        // Replayed summary reasoning (responseContent) must be priced or
-        // fold/recall budgets silently overrun. Mirrors message-store: a
-        // stamped estimate wins; a signed-but-empty block is a hidden full
-        // CoT priced at the measured default; else price the visible text.
+        // Mirrors MessageStore.computeBlockTokensRaw: a stamped estimate
+        // wins; a signed block is a full hidden chain of thought priced by
+        // the larger of its visible text and its signature length.
         const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
         if (typeof stamped === 'number') {
           tokens += stamped;
         } else {
           const sig = (block as { signature?: string }).signature;
-          const hasSignature = typeof sig === 'string' && sig.length > 0;
-          if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
-            tokens += MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
-          } else {
-            tokens += Math.ceil((block.thinking ?? '').length / 4);
-          }
+          const textTokens = defaultTokenEstimator(block.thinking ?? '');
+          tokens += typeof sig === 'string' && sig.length > 0
+            ? Math.max(textTokens, MessageStore.signedThinkingTokens(sig))
+            : textTokens;
         }
       } else if (block.type === 'redacted_thinking') {
         // Encrypted reasoning carrier: stamped estimate wins, else price the

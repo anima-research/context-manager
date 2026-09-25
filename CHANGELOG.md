@@ -12,6 +12,74 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.11.0 — 2026-09-25
+
+### Changed
+
+- Use reusable packed label records and bucket tables in the kv-unified DAG
+  solver. Preserve the object implementation as a diagnostic reference.
+- Select terminal candidates with conservative rounding bounds and exact cache
+  accounting, refining all possible winners, ties, and normalization-floor
+  witnesses. Keep the selected result exact and defer remaining diagnostic
+  candidate-list evaluations until requested, without changing policy or grids.
+
+### Fixed
+
+- kv-unified: a relevant provider cache no longer multiplies the Pareto label
+  set. A label's state key kept the unit at which it diverged from the cached
+  layout after the divergence, though nothing prices that value, so labels
+  that diverged at different units never competed and every compile from the
+  second turn on grew with the forest. The key now carries it only while the
+  cache is intact; the warm-prefix length a diverged label keeps, which the
+  cache term prices, stays in the key. Bucketed representative ties now break
+  on the frontier signature, as terminal selection does, instead of on that
+  unit. Exact-mode selected scores are unchanged (an equal-score tie can
+  resolve to a different cut, as it already could with no cache); bucketed
+  selections stay within the reported bound. On a production store
+  (≈270 chunks, 260k tokens) turns 2–4 select bit-identical scores in
+  1.7–1.9 s and under 2 GB, down from 20–21 s and 12–23 GB (7.2M → 0.57M
+  labels per compile). (#105)
+
+- Reduce kv-unified solve time and memory for existing presentations and forced
+  transitions by using linear bucket selection, equivalent broken-cache-prefix
+  states, precomputed action costs, and lazy frontier materialization. Preserve
+  the configured welfare policy, hard token wall, continuity pricing, and grids;
+  no solve deadline is introduced.
+- Handle internal protected holes in the automatic DAG solver and preserve
+  chronological cache emissions across nested ownership gaps.
+- Add an optional certified hysteresis exit for provable unchanged selections
+  and phase diagnostics for offline solver profiling.
+
+- Signed `thinking` blocks are priced by signature length (`MessageStore.SIGNATURE_CHARS_PER_TOKEN`, measured on Opus 4.8 via `count_tokens`) or the larger visible text, never by the flat 600-token default. On keep-all models (Opus ≥ 4.5, Sonnet ≥ 4.6, Fable/Mythos) prior thinking is replayed and billed as input at the full hidden chain of thought; the flat default under-priced long agentic histories ~10×, which pinned the calibration multiplier at its ceiling and left the compiled request far over budget. A per-block `tokenEstimate` stamped at creation still wins.
+- Estimator calibration also accepts a sample whose implied raw multiplier is inside the clamp range, so a multiplier pinned at 1.8 by a wrong per-class rate can come back down once the rate is fixed (on the ratio alone every honest sample read 0.56 and was rejected forever).
+
+- The autobiographical strategy prices rendered bodies (recall pairs, envelopes, merged entries, `maxMessageTokens` truncation) with the store's calibrated estimator instead of a strategy-local flat chars/4. Under `carrierPolicy: 'live-strip'`, where the exact mint `tokens` no longer floors the recall-pair price, the local rule under-priced dense summary prose by ~28% against `count_tokens` (526k planned vs 728k real on a 500-summary window); with parity the plan prices what it emits (real/est 1.02). The recall-pair price memo is also keyed by the calibration multiplier. `defaultTokenEstimator` / `jsonTokenEstimator` are now exported.
+
+## 0.10.1 — 2026-09-21
+
+### Fixed
+
+- kv-unified: a stale presentation receipt no longer makes the Pareto label
+  count superlinear in the DAG engine. Extension tokens (rendered tokens not
+  covered by the accepted presentation) are no longer a state-key dimension;
+  they are a dominance dimension while a provider cache is relevant (the
+  cache term prices them) and a cover-envelope term reported in the
+  a-posteriori error bound (`approximationCacheErrorBound`). The leaf engine
+  (auto-selected when a pin or lock leaves a protected hole inside a summary)
+  is fixed only while no provider cache is relevant; with one it has no
+  representative cap and is barely improved (#107). Separately, the first
+  successful non-dry-run adaptive presentation by a non-kv-unified folding
+  strategy supersedes a persisted `kvunified:presentation-receipt`, so a
+  switch back to kv-unified starts from an empty chain instead of measuring
+  against a days-old baseline. Loading, a `dryRun` compile and a failed
+  compile leave the receipt untouched; a host preview that runs a
+  non-dry-run compile counts as a presentation, and
+  `adaptiveResolution: false` never supersedes. A kv-stable → kv-unified
+  switch on a production store went from "exceeded ceiling 100000 at 125796"
+  (and >5 GB at a 1M ceiling) to a 332 ms / 436 MB solve under the same
+  ceiling, measured with no relevant provider cache; with one, the same
+  solve is dominated by #105, which this change does not address. (#97)
+
 ## 0.10.0 — 2026-09-18
 
 ### Added

@@ -121,7 +121,7 @@ export type ExactPolicySolveResult =
       readonly enumeration: ExactCutEnumerationStats;
     };
 
-interface UnscoredCandidate {
+export interface UnscoredCandidate {
   frontier: ReadonlyMap<ChunkId, number>;
   layout: RenderLayout;
   renderedTokens: number;
@@ -129,6 +129,8 @@ interface UnscoredCandidate {
   continuityLoss: number;
   fidelityLoss: number;
   budgetPenalty: number;
+  /** Optional exact identity check supplied by a prepared evaluator. */
+  matchesPresentation?: boolean;
 }
 
 export class ExactKvUnifiedPolicySolver {
@@ -207,6 +209,17 @@ export class ExactKvUnifiedPolicySolver {
         budgetPenalty: budgetPenalty(candidate.renderedTokens, options.maxTokens, policy),
       };
     });
+    return this.scorePreparedCandidates(unscored, options, stats, cacheRelevant);
+  }
+
+  /** Score exact prepared metrics without eagerly materializing each frontier. */
+  scorePreparedCandidates(
+    unscored: readonly UnscoredCandidate[],
+    options: ExactPolicySolveOptions,
+    stats: ExactCutEnumerationStats,
+    cacheRelevant: boolean,
+  ): Extract<ExactPolicySolveResult, { feasible: true }> {
+    const policy = normalizePolicy(options.policy);
     if (unscored.length === 0) {
       // The exact feasibility witness must always survive the exact enumerator.
       throw new Error('kv-unified exact oracle produced no candidate under a feasible hard wall');
@@ -214,24 +227,25 @@ export class ExactKvUnifiedPolicySolver {
     const cacheFloor = Math.min(...unscored.map((candidate) => candidate.cacheChurn));
     const continuityFloor = Math.min(...unscored.map((candidate) => candidate.continuityLoss));
     const continuityMultiplier = normalizeContinuityMultiplier(options.continuityMultiplier);
+    const matching = new Map<ExactPolicyCandidate, boolean | undefined>();
     const candidates: ExactPolicyCandidate[] = unscored.map((candidate) => {
       const cacheExcess = Math.max(0, candidate.cacheChurn - cacheFloor);
       const continuityExcess = Math.max(0, candidate.continuityLoss - continuityFloor);
-      const score =
-        candidate.fidelityLoss +
-        candidate.budgetPenalty +
-        quadratic(cacheExcess, policy.cacheScale, policy.cacheLambda) +
-        continuityMultiplier *
-          quadratic(continuityExcess, policy.continuityScale, policy.continuityLambda);
-      return { ...candidate, cacheExcess, continuityExcess, score };
+      const score = policyScore(candidate.fidelityLoss, candidate.budgetPenalty,
+        candidate.cacheChurn, candidate.continuityLoss, cacheFloor, continuityFloor, policy, continuityMultiplier);
+      const result = {
+        get frontier() { return candidate.frontier; },
+        get layout() { return candidate.layout; },
+        renderedTokens: candidate.renderedTokens,
+        cacheChurn: candidate.cacheChurn, continuityLoss: candidate.continuityLoss,
+        fidelityLoss: candidate.fidelityLoss, budgetPenalty: candidate.budgetPenalty,
+        cacheExcess, continuityExcess, score,
+      };
+      matching.set(result, candidate.matchesPresentation);
+      return result;
     });
-    candidates.sort((a, b) =>
-      a.score - b.score ||
-      a.renderedTokens - b.renderedTokens ||
-      frontierSignature(a.frontier, this.orderedChunks.map((chunk) => chunk.id)).localeCompare(
-        frontierSignature(b.frontier, this.orderedChunks.map((chunk) => chunk.id)),
-      ),
-    );
+    const leafIds = this.orderedChunks.map((chunk) => chunk.id);
+    candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     let selected = candidates[0];
     const epsilon =
       Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
@@ -239,7 +253,7 @@ export class ExactKvUnifiedPolicySolver {
         : 0;
     if (epsilon > 0 && options.presentation) {
       const carried = candidates.find((candidate) =>
-        this.matchesPresentation(candidate.frontier, options.presentation!),
+        matching.get(candidate) ?? this.matchesPresentation(candidate.frontier, options.presentation!),
       );
       if (carried && carried.score <= selected.score + epsilon) selected = carried;
     }
@@ -437,7 +451,7 @@ export function continuityLeafLoss(
   return salience * chunk.rawTokens * recency * stability * representationDistance;
 }
 
-function budgetPenalty(
+export function budgetPenalty(
   renderedTokens: number,
   maxTokens: number,
   policy: KvUnifiedWelfarePolicy,
@@ -465,14 +479,26 @@ function clamp(value: number, low: number, high: number): number {
   return Math.min(high, Math.max(low, value));
 }
 
-function normalizeContinuityMultiplier(value: number | undefined): number {
+export function normalizeContinuityMultiplier(value: number | undefined): number {
   if (value === undefined) return 1;
   // Malformed relaxation fails closed: it must never make continuity cheaper.
   if (!Number.isFinite(value) || value < 0 || value > 1) return 1;
   return value;
 }
 
-function frontierSignature(
+export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyCandidate,
+  leafIds: readonly ChunkId[]): number {
+  return a.score - b.score || a.renderedTokens - b.renderedTokens ||
+    frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds));
+}
+
+export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,
+  cacheFloor: number, continuityFloor: number, policy: KvUnifiedWelfarePolicy, multiplier: number): number {
+  return fidelity + budget + quadratic(Math.max(0, cache - cacheFloor), policy.cacheScale, policy.cacheLambda) +
+    multiplier * quadratic(Math.max(0, continuity - continuityFloor), policy.continuityScale, policy.continuityLambda);
+}
+
+export function frontierSignature(
   frontier: ReadonlyMap<ChunkId, number>,
   leafIds: readonly ChunkId[],
 ): string {

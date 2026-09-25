@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { AutobiographicalStrategy } from '../src/index.js';
+import { defaultTokenEstimator, AutobiographicalStrategy } from '../src/index.js';
 import {
   buildRecallEnvelopeTags,
   recallEnvelopeAddedText,
@@ -264,7 +264,7 @@ describe('recallEnvelope: token accounting', () => {
     );
 
     const envelopeTokens = summaries.reduce(
-      (total, s) => total + Math.ceil(recallEnvelopeAddedText(s, 'xml').length / 4),
+      (total, s) => total + defaultTokenEstimator(recallEnvelopeAddedText(s, 'xml')),
       0,
     );
     assert.equal(

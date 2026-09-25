@@ -596,6 +596,13 @@ export interface KvUnifiedConfig {
   adoptEpsilon: number;
   treeifyNonContiguousSummaries: boolean;
   preserveGapBearingSummaries: boolean;
+  /**
+   * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
+   * when the accepted presentation provably remains the policy's selection,
+   * skip label propagation. Exact — never chooses a different layout than the
+   * full solve would. Off unless set.
+   */
+  hysteresisCertificate?: boolean;
 }
 
 export interface AutobiographicalConfig {
