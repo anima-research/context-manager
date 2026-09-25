@@ -11,7 +11,7 @@ afterEach(() => {
   if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
 });
 
-function strategy(): AutobiographicalStrategy {
+function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
   return new AutobiographicalStrategy({
     adaptiveResolution: true,
     foldingStrategy: 'kv-unified',
@@ -43,6 +43,7 @@ function strategy(): AutobiographicalStrategy {
       treeifyNonContiguousSummaries: false,
       preserveGapBearingSummaries: false,
     },
+    ...overrides,
   });
 }
 
@@ -452,4 +453,40 @@ test('a failed supersede write is retried by the next presentation (#98 review)'
   const reopened = await ContextManager.open({ path: STORE, strategy: back });
   assert.equal(receipts(back).head, null, 'the retried supersede emptied the chain');
   reopened.close();
+});
+
+test('kv-unified tail markers resolve through selectAdaptive to per-message tail units, including a sharded tail message', async () => {
+  const selected = strategy({ targetChunkTokens: 200, recentWindowTokens: 100_000 });
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'first question' }]);
+  manager.addMessage('assistant', [{ type: 'text', text: 'paragraph. '.repeat(1000) }]);
+  const all = manager.getAllMessages();
+  const shards = all.filter((message) => message.bodyGroupId);
+  assert.ok(shards.length > 1, 'the last message is sharded');
+  await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'v1' });
+  const draft = (selected as unknown as {
+    kvUnifiedDraft: { layout: { units: Array<{ kind: string; key: string }> }; markerUnitIndices: number[] };
+  }).kvUnifiedDraft;
+  // Every tail message, each shard included, is its own unit; nothing falls
+  // back to the opaque 'tail' block.
+  assert.deepEqual(draft.layout.units.map((unit) => unit.key), all.map((message) => message.id));
+  assert.ok(draft.layout.units.every((unit) => unit.kind !== 'tail'));
+  // The marker on the merged sharded entry lands on its last shard's unit.
+  const markedKeys = draft.markerUnitIndices.map((index) => draft.layout.units[index - 1].key);
+  assert.ok(markedKeys.includes(shards.at(-1)!.id), `markers on ${markedKeys.join(',')}`);
+  manager.close();
+});
+
+test('kv-unified latent demand keeps no ranking between compiles', async () => {
+  // A cross-compile ranking cache replayed stale demand after appends and
+  // policy changes, shared one slot with the production-budget shadow pick, and
+  // survived branch switches. The host passes none.
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: Record<string, unknown> } } })._lastKvUnified;
+  assert.ok(solver.options.latentDemand, 'the live adapter ranks latent demand');
+  assert.deepEqual(Object.keys(solver.options.latentDemand).sort(), ['fallbackRecallTokens', 'maxCandidates', 'mergeThreshold']);
+  manager.close();
 });

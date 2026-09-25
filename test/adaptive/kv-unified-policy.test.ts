@@ -1325,7 +1325,7 @@ test('bucketed leaf engine matches the oracle score on tie-heavy uniform forests
   assert.ok(checked >= 50);
 });
 
-test('latent demand: the ranking is reused while the summary-root runs are unchanged and recomputed on a new root', () => {
+test('latent demand is re-ranked on every solve: appended messages and policy changes reach it on the same roots', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 20 });
   for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 60 });
   const l1s = [['c0', 'c1'], ['c2', 'c3'], ['c4', 'c5']].map((ids) => chronicle.produceL1(ids));
@@ -1336,35 +1336,42 @@ test('latent demand: the ranking is reused while the summary-root runs are uncha
   const leaves = new Map(inputs.chunks.map((chunk, i) => [chunk.id, {
     level: i < 6 ? 1 : 0, repHash: i < 6 ? `summary:${l1s[Math.floor(i / 2)].id}` : `raw:${chunk.id}`, lastChangedSeq: 1,
   }]));
-  const cache: { signature?: string; evaluations?: unknown[]; produced?: unknown[] } = {};
-  const options = {
-    // The carried layout (3 recall pairs + 2 raw = 180 tokens) sits above the
-    // high band with a steep over-budget price, so a merge that shrinks the
-    // render strictly improves the score and is demanded.
-    policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 1_000_000,
-      cacheLambda: 0, continuityLambda: 0 },
-    tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000, adoptEpsilon: 1,
+  // The carried layout (3 recall pairs + 2 raw = 180 tokens) sits above the
+  // high band with a steep over-budget price, so a merge that shrinks the
+  // render strictly improves the score and is demanded.
+  const policy = { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 1_000_000,
+    cacheLambda: 0, continuityLambda: 0 };
+  // One options object shared across solves, as the host shares its config.
+  const shared = {
+    policy, tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000, adoptEpsilon: 1,
     presentation: { currentSeq: 9, leaves }, hysteresisCertificate: true,
-    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, cache },
-  } as never;
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4 },
+  };
   const budget = { totalBudget: 300, targetBudget: 270, slack: 0.1 };
-  const first = new KvUnifiedStrategy(options);
-  first.solve(inputs, budget);
-  assert.ok(first.lastDemandEvaluations.length > 0, 'candidates were evaluated');
+  const rank = (options: typeof shared, turnInputs: PickerInputs) => {
+    const strategy = new KvUnifiedStrategy(options as never);
+    const result = strategy.solve(turnInputs, budget);
+    return { produced: result.produced, evaluations: strategy.lastDemandEvaluations };
+  };
+  const fresh = (turnInputs: PickerInputs, override: Partial<typeof policy> = {}) =>
+    rank(structuredClone({ ...shared, policy: { ...policy, ...override } }), turnInputs);
+
+  const first = rank(shared, inputs);
   // A certified what-if would return the carried layout and score every merge at 0 improvement.
-  assert.ok(first.lastDemandEvaluations.some((e) => e.expectedImprovement > 0), 'what-if measured a real improvement');
-  assert.ok(cache.produced!.length > 0, 'the improving merge is demanded');
-  assert.equal(cache.signature !== undefined, true);
-  const signature = cache.signature;
-  // appended raw messages only: same root set → cached ranking reused (no new evaluations object)
+  assert.ok(first.evaluations.some((e) => e.expectedImprovement > 0), 'what-if measured a real improvement');
+  assert.ok(first.produced.length > 0, 'the improving merge is demanded');
+
+  // Same summary roots, one appended raw message: the scores move with it.
   chronicle.addChunk({ id: 'c8', rawTokens: 60 });
-  const second = new KvUnifiedStrategy(options);
-  second.solve({ ...inputs, chunks: chronicle.chunks }, budget);
-  assert.equal(cache.signature, signature);
-  assert.equal(second.lastDemandEvaluations, cache.evaluations);
-  // a new L1 root changes the candidates → recomputed
-  chronicle.produceL1(['c6', 'c7']);
-  const third = new KvUnifiedStrategy(options);
-  third.solve({ ...inputs, chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens }, budget);
-  assert.notEqual(cache.signature, signature);
+  const appended = { ...inputs, chunks: chronicle.chunks };
+  const second = rank(shared, appended);
+  assert.deepEqual(second.evaluations, fresh(appended).evaluations);
+  assert.notDeepEqual(second.evaluations.map((e) => e.conservativeImprovement),
+    first.evaluations.map((e) => e.conservativeImprovement), 'the append changed the what-if scores');
+
+  // Same roots and budget, over-budget price removed: nothing is demanded any more.
+  shared.policy = { ...policy, budgetOverLambda: 0 };
+  const third = rank(shared, appended);
+  assert.deepEqual(third.produced, fresh(appended, { budgetOverLambda: 0 }).produced);
+  assert.equal(third.produced.length, 0);
 });
