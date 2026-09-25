@@ -189,3 +189,104 @@ test('persisted merge queues from the old gap grammar are discarded', () => {
 
   assert.equal(p.mergeQueueLength(), 0);
 });
+
+test('a quarantined oldest group does not block later history from merging', () => {
+  // Librarian 2026-09-08 → 09-24: the oldest six L1s were refused and
+  // quarantined; the selector re-offered exactly that group on every pass,
+  // enqueueMerge declined it, and 322 newer L1s were never attempted.
+  const p = new QuarantineProbe({ adaptiveResolution: true, autoTickOnNewMessage: false });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const oldest = Array.from({ length: 6 }, (_, i) => summary(`q${i}`, i * 10, i * 10 + 9));
+  const later = Array.from({ length: 7 }, (_, i) => summary(`n${i}`, 60 + i * 10, 60 + i * 10 + 9));
+  p.seedQuarantine(oldest.map((s) => s.id));
+  const run = p.pick([...oldest, ...later], 6);
+  assert.deepEqual(run?.map((s) => s.id), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5']);
+});
+
+test('operator merge holds split the frontier like a hole', () => {
+  const p = new Probe({
+    adaptiveResolution: true,
+    autoTickOnNewMessage: false,
+    mergeHoldSummaryIds: ['h2'],
+  });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const all = Array.from({ length: 9 }, (_, i) => summary(`h${i}`, i * 10, i * 10 + 9));
+  // h0,h1 are an interior run (consolidates at 2); the held h2 is never offered.
+  assert.deepEqual(p.pick(all, 6)?.map((s) => s.id), ['h0', 'h1']);
+  const withoutInterior = all.slice(3);
+  assert.deepEqual(p.pick(withoutInterior, 6)?.map((s) => s.id), ['h3', 'h4', 'h5', 'h6', 'h7', 'h8']);
+});
+
+// ---- Review follow-ups (#117): one eligibility gate for every scheduler ----
+
+/** Probe that can drive the enqueue paths without a loaded store branch. */
+class GateProbe extends QuarantineProbe {
+  constructor(config: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
+    super(config);
+    // Unit harness only: the branch guard is exercised by the integration suites.
+    (this as unknown as { requireBranchMutation: () => void }).requireBranchMutation = () => {};
+  }
+  produce(level: number, first: string, last: string): void {
+    this.handleProducedOps([{ level, range: { firstChunkId: first, lastChunkId: last } }] as never);
+  }
+  enqueue(level: number, sourceIds: string[]): void { this.enqueueMerge({ level: level as never, sourceIds }); }
+  queue(): Array<{ level: number; sourceIds: string[] }> {
+    return (this as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[] }> }).mergeQueue;
+  }
+}
+
+function l1(id: string, first: number, last: number): SummaryEntry {
+  return { ...summary(id, first, last), level: 1, sourceLevel: 0 } as SummaryEntry;
+}
+
+function gateProbe(extra: Record<string, unknown> = {}): GateProbe {
+  const p = new GateProbe({ adaptiveResolution: true, autoTickOnNewMessage: false, mergeThreshold: 6, ...extra });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  return p;
+}
+
+test('adaptive produce ops never merge a held source, nor span one', () => {
+  const p = gateProbe({ mergeHoldSummaryIds: ['h2'] });
+  p.setSummaries(Array.from({ length: 9 }, (_, i) => l1(`h${i}`, i * 10, i * 10 + 9)));
+  p.produce(2, 'm-0', 'm-89');
+  assert.deepEqual(p.queue().map((m) => m.sourceIds), [['h0', 'h1']], 'first eligible run before the hold');
+});
+
+test('adaptive produce ops cannot re-request a quarantined group or a superset of it', () => {
+  const p = gateProbe();
+  const q = Array.from({ length: 6 }, (_, i) => l1(`q${i}`, i * 10, i * 10 + 9));
+  const n = Array.from({ length: 6 }, (_, i) => l1(`n${i}`, 60 + i * 10, 69 + i * 10));
+  p.setSummaries([...q, ...n]);
+  p.seedQuarantine(q.map((s) => s.id));
+  p.enqueue(2, ['q0', 'q1', 'q2', 'q3', 'q4', 'q5', 'n0']); // superset: refused at the gate
+  assert.equal(p.queue().length, 0);
+  p.produce(2, 'm-0', 'm-119'); // the picker asks for the whole range
+  assert.deepEqual(p.queue().map((m) => m.sourceIds), [['n0', 'n1', 'n2', 'n3', 'n4', 'n5']]);
+});
+
+test('a persisted queue entry that now contains a held source is dropped on load', () => {
+  const held = gateProbe({ mergeHoldSummaryIds: ['b'] });
+  const kept = gateProbe();
+  for (const p of [held, kept]) {
+    p.setSummaries([summary('a', 0, 50), summary('b', 51, 100)]);
+    p.setMergeQueue([{ level: 3, sourceIds: ['a', 'b'] }]);
+    p.sanitizeQueue(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  }
+  assert.equal(held.mergeQueueLength(), 0, 'held source → entry dropped');
+  assert.equal(kept.mergeQueueLength(), 1, 'control: the same contiguous entry survives without the hold');
+});
+
+test('an interior run merges at 2 even when fewer than threshold are eligible overall', () => {
+  const p = new Probe({ adaptiveResolution: true, autoTickOnNewMessage: false, mergeHoldSummaryIds: ['H'] });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const six = ['h0', 'h1', 'H', 'h3', 'h4', 'h5'].map((id, i) => summary(id, i * 10, i * 10 + 9));
+  assert.deepEqual(p.pick(six, 6)?.map((s) => s.id), ['h0', 'h1'], 'five eligible, but [h0,h1] is interior');
+});
+
+test('the compression-debt report names held ids and quarantine keys', () => {
+  const p = gateProbe({ mergeHoldSummaryIds: ['h1'] });
+  p.seedQuarantine(['x', 'y']);
+  const debt = p.getCompressionDebt();
+  assert.deepEqual(debt.mergeHeldIds, ['h1']);
+  assert.deepEqual(debt.mergeQuarantineKeys, ['q']);
+});

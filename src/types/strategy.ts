@@ -878,6 +878,14 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /**
+   * Operator merge holds: summary ids that are never offered as merge
+   * sources (they stay on the frontier and render at their own level).
+   * Held ids split the frontier into runs like a hole, so later history
+   * still merges around them. Sources of a quarantined merge are held the
+   * same way automatically. Use for summaries awaiting review.
+   */
+  mergeHoldSummaryIds?: string[];
   /** Legacy first-choice target-only merge request. Default false. */
   compressionMergeSourceOnly?: boolean;
   /** Use target-only merge request only on the final persisted merge attempt. Default false. */
