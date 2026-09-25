@@ -242,8 +242,9 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
       protected mergeAdjacentBodyGroupRaw(
         entries: ContextEntry[],
         store: MessageStoreView,
+        messages?: ReturnType<MessageStoreView['getAll']>,
       ): ContextEntry[] {
-        const merged = super.mergeAdjacentBodyGroupRaw(entries, store);
+        const merged = super.mergeAdjacentBodyGroupRaw(entries, store, messages);
         if (merged.length >= 2) {
           merged.splice(1, 0, {
             index: 1,

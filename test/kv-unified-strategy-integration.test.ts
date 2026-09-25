@@ -498,6 +498,11 @@ test('kv-unified latent demand keeps no ranking between compiles', async () => {
   await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
   const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: Record<string, unknown> } } })._lastKvUnified;
   assert.ok(solver.options.latentDemand, 'the live adapter ranks latent demand');
-  assert.deepEqual(Object.keys(solver.options.latentDemand).sort(), ['fallbackRecallTokens', 'maxCandidates', 'mergeThreshold']);
+  // Stateless knobs may be added; a ranking cache needs somewhere to hold state.
+  const latent = solver.options.latentDemand;
+  assert.ok(!('cache' in latent), 'latent demand must not carry a ranking cache between compiles');
+  for (const [key, value] of Object.entries(latent)) {
+    assert.ok(value === null || typeof value !== 'object', `latentDemand.${key} holds state across compiles`);
+  }
   manager.close();
 });

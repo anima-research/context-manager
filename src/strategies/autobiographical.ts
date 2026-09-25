@@ -8871,6 +8871,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * merge them into one composite entry whose body is the byte-faithful
    * concatenation of their text content. Other entries pass through.
    *
+   * `messages` is the caller's `store.getAll()` listing; overrides should
+   * forward it, since a filtered view re-lists the whole history per call.
+   *
    * Reindexes the returned array.
    */
   protected mergeAdjacentBodyGroupRaw(

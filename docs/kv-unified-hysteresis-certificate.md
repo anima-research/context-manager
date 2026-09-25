@@ -54,8 +54,8 @@ A conservative floating-point allowance is subtracted from each bound.
   certificates retain the existing solver. This does not implement cost-to-go
   pruning for real transitions.
 
-Successful results list every enumerated extension as `candidates` (one when
-no new leaf can fold) and carry a `certificate` with the bound, carried score,
+Successful results list every enumerated extension that fits the hard token
+wall as `candidates` (one when no new leaf can fold) and carry a `certificate` with the bound, carried score,
 improvement bound, epsilon, pass count, and roundoff allowance.
 They have no Pareto `propagation` statistics. This is a proof of the exact
 hysteresis policy, not an assertion that bucketed Pareto labels are exhaustive.
