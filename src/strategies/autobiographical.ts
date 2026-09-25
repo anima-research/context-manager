@@ -5577,8 +5577,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A tighter budget than the live window's: a compression prompt also
     // carries the head, the whole recall frontier and the raw chunk, so the
     // image share must leave room for all of it under the API's 32MB cap.
+    //
+    // Cap `cleaned` — the list the wire messages are derived from — not
+    // `llmMessages`: splitMixedToolMessages/collapse REBUILD message objects,
+    // so a cap applied to the pre-split list logs its strips against copies
+    // the request never ships (field repro 2026-09-21: "replaced 1 older
+    // image ... kept 0MB" logged while the mint still 400'd on
+    // image_input_not_supported). The merge builder has always capped its
+    // post-split list; this aligns the L1 builder with it.
     this.capCompressionImageBytes(
-      llmMessages as Array<{ content: ContentBlock[] }>,
+      cleaned as Array<{ content: ContentBlock[] }>,
       this.config.maxCompressionImageBytes ??
         AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
     );
