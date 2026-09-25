@@ -83,3 +83,14 @@ test('non-finite score arithmetic uses the complete original sort instead of int
   assert.deepEqual(result.selected, reference.selected);
   assert.deepEqual(result.candidates, reference.candidates);
 });
+
+test('a candidate whose lower bound equals the best upper bound is still evaluated', () => {
+  // Zero-width bounds: both tie on score, and the signature order must pick x=0
+  // even though x=1 comes first in source order.
+  const values = [row(1, 1), row(0, 1)];
+  const options: ExactPolicySolveOptions = { maxTokens: 200 };
+  const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, options, stats, false);
+  const result = scoreBoundedCandidates(values.map((value) => bounds(value, new Set(), 0)), options, stats, false, ['x']);
+  assert.equal(result.selected.frontier.get('x'), 0);
+  assert.deepEqual(result.selected, reference.selected);
+});

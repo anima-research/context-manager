@@ -1213,3 +1213,114 @@ test('kv-unified resolves a representative tie between broken cuts the way termi
     }
   }
 });
+
+test('bucketed leaf engine keeps the oracle cut when fewer tokens score worse (#109)', () => {
+  const build = (pinHole: boolean): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 20 });
+    for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 100, pinned: id === 'c' });
+    chronicle.produceL1(['a']);
+    chronicle.recallPairTokens.set(chronicle.produceL1(['b']).id, 30);
+    if (pinHole) chronicle.recallPairTokens.set(chronicle.produceL1(['c', 'd']).id, 220);
+    return { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() };
+  };
+  const allRaw = new Map(['a', 'b', 'c', 'd'].map((id) => [id, 0]));
+  const base = build(false);
+  const layout = renderLayout(base, new SummaryTree(base), allRaw);
+  const leaves = new Map(base.chunks.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }]));
+  const policy = { alpha: 0, budgetLowRatio: 1, budgetHighRatio: 1, budgetUnderLambda: 10000, budgetOverLambda: 0,
+    continuityRecencyFloor: 1, continuityStableFloor: 1, continuityLambda: 100, continuityScale: 100, cacheLambda: 1, cacheScale: 100 };
+  for (const pinHole of [false, true]) {
+    for (const prefix of ['tools-v1', 'tools-v2']) {
+      const options = { maxTokens: 330, presentation: { currentSeq: 1, leaves }, policy,
+        cache: { immutablePrefixHash: 'tools-v1', layout, markers: [{ unitIndex: 4, offset: 400 }] },
+        currentImmutablePrefixHash: prefix, tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100 };
+      const oracle = new ExactKvUnifiedPolicySolver(build(pinHole)).solve(options);
+      assert.ok(oracle.feasible);
+      const leaf = new ParetoKvUnifiedPolicySolver(build(pinHole)).solve({ ...options, engine: 'leaf' });
+      assert.ok(leaf.feasible);
+      assert.equal(leaf.propagation?.approximationScoreErrorBound, 0);
+      assert.deepEqual(leaf.selected.frontier, oracle.selected.frontier, `leaf, hole=${pinHole}, prefix=${prefix}`);
+      assert.equal(leaf.selected.score, oracle.selected.score);
+      const auto = new ParetoKvUnifiedPolicySolver(build(pinHole)).solve(options);
+      assert.ok(auto.feasible);
+      assert.ok(auto.selected.score - oracle.selected.score <= auto.propagation!.approximationScoreErrorBound + 1e-9,
+        `auto regret is covered by its bound, hole=${pinHole}, prefix=${prefix}`);
+    }
+  }
+});
+
+test('packed and object DAG storage both enforce the label ceiling', () => {
+  const { inputs } = fixture();
+  for (const storage of ['packed', 'objects'] as const) {
+    assert.throws(() => new ParetoKvUnifiedPolicySolver(inputs).solve({
+      maxTokens: 10_000, engine: 'dag', storage, labelCeiling: 1,
+      tokenBucketSize: 0, continuityBucketSize: 0, fidelityBucketSize: 0,
+    }), { name: 'SparseLabelCeilingError' }, storage);
+  }
+});
+
+test('latent-demand evaluations are approximate only when the reported bound is nonzero', () => {
+  for (const engine of ['auto', 'leaf'] as const) {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    for (let index = 0; index < 4; index++) {
+      chronicle.addChunk({ id: `latent-${index}`, rawTokens: 100 });
+      chronicle.produceL1([`latent-${index}`]);
+    }
+    const inputs: PickerInputs = { chunks: chronicle.chunks, summaries: chronicle.summaries,
+      recallPairTokens: chronicle.recallPairTokens, headTokens: 0, tailTokens: 0,
+      headChunkIds: new Set(), tailChunkIds: new Set() };
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0,
+        budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      engine, tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4 },
+    });
+    strategy.solve(inputs, { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    assert.equal(strategy.lastDemandEvaluations.length, 2, engine);
+    assert.ok(strategy.lastDemandEvaluations.every((item) => !item.approximate), engine);
+  }
+});
+
+test('bucketed leaf engine matches the oracle score on tie-heavy uniform forests (#109)', () => {
+  // Equal chunk sizes make fidelity/continuity ties inside one token bucket
+  // common, which is what the bucketed token key used to prune wrongly.
+  let state = 109;
+  const random = () => ((state = (Math.imul(state, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+  let checked = 0;
+  for (let run = 0; run < 60; run++) {
+    const n = 4 + (run % 3);
+    const build = (): PickerInputs => {
+      const chronicle = new MockChronicle({ recallPairTokens: 20 });
+      for (let i = 0; i < n; i++) chronicle.addChunk({ id: `u${i}`, rawTokens: 100, pinned: (run + i) % 4 === 0 });
+      for (let i = 0; i < n; i++) chronicle.recallPairTokens.set(chronicle.produceL1([`u${i}`]).id, 10 + ((run * 7 + i * 13) % 50));
+      return { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+        headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() };
+    };
+    const base = build();
+    const floor = new CanonicalSummaryForest(base).minimumTokens();
+    assert.ok(floor.feasible);
+    const allRaw = new Map(base.chunks.map((chunk) => [chunk.id, 0]));
+    const layout = renderLayout(base, new SummaryTree(base), allRaw);
+    const leaves = new Map(base.chunks.map((chunk) => [chunk.id, { repHash: `raw:${chunk.id}`, level: 0, lastChangedSeq: 0 }]));
+    const options = {
+      maxTokens: Math.floor(floor.floorTokens + random() * (n * 100 - floor.floorTokens)),
+      presentation: { currentSeq: 1, leaves },
+      cache: { immutablePrefixHash: 'p', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] },
+      currentImmutablePrefixHash: run % 2 ? 'p' : 'q',
+      tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100,
+      policy: { alpha: 0, budgetLowRatio: 1, budgetHighRatio: 1, budgetUnderLambda: 10_000, budgetOverLambda: 0,
+        continuityRecencyFloor: 1, continuityStableFloor: 1, continuityLambda: run % 3 ? 100 : 0,
+        continuityScale: 100, cacheLambda: 1, cacheScale: 100 },
+    };
+    const oracle = new ExactKvUnifiedPolicySolver(build()).solve(options);
+    const leaf = new ParetoKvUnifiedPolicySolver(build()).solve({ ...options, engine: 'leaf' });
+    assert.equal(leaf.feasible, oracle.feasible);
+    if (!oracle.feasible || !leaf.feasible) continue;
+    assert.equal(leaf.propagation?.approximationScoreErrorBound, 0);
+    assert.ok(Math.abs(leaf.selected.score - oracle.selected.score) <= 1e-9 * Math.max(1, oracle.selected.score),
+      `run ${run}: leaf ${leaf.selected.score} vs oracle ${oracle.selected.score}`);
+    checked++;
+  }
+  assert.ok(checked >= 50);
+});

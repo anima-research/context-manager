@@ -7,7 +7,7 @@ import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { MockChronicle, buildChronicleWithChain } from './harness.js';
-import { PackedLabels, PackedBuckets, LABEL_STRIDE, LabelField } from '../../src/adaptive/kv-unified-packed-storage.js';
+import { PackedLabels, PackedBuckets, PackedTraceArena, LABEL_STRIDE, LabelField } from '../../src/adaptive/kv-unified-packed-storage.js';
 
 test('packed label growth, reuse, and branching preserve immutable trace ancestry', () => {
   const labels = new PackedLabels();
@@ -139,4 +139,23 @@ test('packed/full and packed/selective agree with object storage, including ever
       assert.equal(estimate.matchesPresentation, exact.matchesPresentation);
     }
   }
+});
+
+test('trace ancestry survives the 2^18 trace page boundary', () => {
+  const arena = new PackedTraceArena();
+  const actions = [arena.action(['a'], 0), arena.action(['b'], 1), arena.action(['c'], 2)];
+  let node = 0;
+  const expected: string[] = [];
+  // Three actions: 2^18 is not a multiple of 3, so reading the wrong page shows.
+  for (let i = 0; i < (1 << 18) + 2; i++) {
+    node = arena.append(node, actions[i % 3]);
+    expected.push(['a', 'b', 'c'][i % 3]);
+  }
+  assert.equal(arena.nodes, (1 << 18) + 2);
+  const visited: string[] = [];
+  arena.reference(node).forEachAssignment((ids, level) => {
+    assert.equal(level, ['a', 'b', 'c'].indexOf(ids[0]));
+    visited.push(ids[0]);
+  });
+  assert.deepEqual(visited, expected.reverse());
 });
