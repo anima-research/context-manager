@@ -463,6 +463,10 @@ test('kv-unified tail markers resolve through selectAdaptive to per-message tail
   const all = manager.getAllMessages();
   const shards = all.filter((message) => message.bodyGroupId);
   assert.ok(shards.length > 1, 'the last message is sharded');
+  const host = selected as unknown as { mergeAdjacentBodyGroupRaw: (...args: unknown[]) => ContextEntry[] };
+  const merge = host.mergeAdjacentBodyGroupRaw.bind(selected);
+  let emitted: ContextEntry[] = [];
+  host.mergeAdjacentBodyGroupRaw = (...args) => (emitted = merge(...args));
   await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'v1' });
   const draft = (selected as unknown as {
     kvUnifiedDraft: { layout: { units: Array<{ kind: string; key: string }> }; markerUnitIndices: number[] };
@@ -471,7 +475,14 @@ test('kv-unified tail markers resolve through selectAdaptive to per-message tail
   // back to the opaque 'tail' block.
   assert.deepEqual(draft.layout.units.map((unit) => unit.key), all.map((message) => message.id));
   assert.ok(draft.layout.units.every((unit) => unit.kind !== 'tail'));
-  // The marker on the merged sharded entry lands on its last shard's unit.
+  // The shards render as ONE entry, which carries the marker...
+  const shardIds = shards.map((message) => message.id);
+  const composite = emitted.filter((entry) => entry.sourceMessageIds?.some((id) => shardIds.includes(id)) ||
+    (entry.sourceMessageId !== undefined && shardIds.includes(entry.sourceMessageId)));
+  assert.equal(composite.length, 1, 'the sharded message is one emitted entry');
+  assert.deepEqual(composite[0].sourceMessageIds, shardIds);
+  assert.equal(composite[0].cacheMarker, true);
+  // ...and that marker lands on the last shard's unit.
   const markedKeys = draft.markerUnitIndices.map((index) => draft.layout.units[index - 1].key);
   assert.ok(markedKeys.includes(shards.at(-1)!.id), `markers on ${markedKeys.join(',')}`);
   manager.close();
