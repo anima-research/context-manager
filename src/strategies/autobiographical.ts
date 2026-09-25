@@ -2402,6 +2402,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
    * solely by the KV-stable controller — see `ProtectedRange`.
    */
+  /**
+   * Whether a pin bound forces a message raw, with the same precedence as the
+   * kv-stable selector: a fixed `level` wins over `maxLevel`, so
+   * `{level: 2, maxLevel: 0}` is held at L2 (not raw). A pinned position with
+   * no level bound is a classic raw pin.
+   */
+  static isForceRawPinBound(bound: { level?: number; maxLevel?: number } | undefined): boolean {
+    if (bound === undefined) return true;
+    if (bound.level !== undefined) return bound.level === 0;
+    return bound.maxLevel === 0;
+  }
+
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
@@ -5318,12 +5330,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messageOrder = new Map<MessageId, number>(
       allMessages.map((message, index) => [message.id, index]),
     );
-    const priorSummaries = this.summaries
-      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
-      // recall pair triggers Anthropic 400 "text content blocks must be
-      // non-empty", which stalls ALL compression (mirrors the render-path guard
-      // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
+    // Raw pins in the canonical L1 prompt's recall. The live view shows a
+    // force-raw message raw; recall here used to include the summary covering
+    // it anyway. A frontier summary that can't be shown as a recall pair (it
+    // covers a force-raw message, or its content is empty) is DESCENDED, not
+    // dropped: its children take its place, so only the branch containing the
+    // pin opens up, sibling branches stay folded, and the raw added to the
+    // prompt is just the pinned L1 chunks. This mirrors the live selector
+    // (kv-control keeps protected raw leaves beside their group's recall).
+    // Dropping the whole frontier summary instead expanded an entire L3/L4 to
+    // raw on every L1 while one pin existed (#116 review).
+    //
+    // Scope: the canonical L1 prompt. Merge recall, L3+ merge inputs,
+    // transition summaries and the source-only L1 do not consult pins.
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const pinnedPositionsSet = this.pinnedPositions(allMessages);
+    const pinBounds = this.pinLevelBounds(allMessages);
+    const rawPinnedMessageIds = new Set<MessageId>();
+    for (let i = 0; i < allMessages.length; i++) {
+      if (!pinnedPositionsSet.has(i)) continue;
+      if (AutobiographicalStrategy.isForceRawPinBound(pinBounds.get(i))) {
+        rawPinnedMessageIds.add(allMessages[i].id);
+      }
+    }
+    const summaryTouchesRawPin = (summary: SummaryEntry): boolean => {
+      if (rawPinnedMessageIds.size === 0) return false;
+      const leaves = new Set<MessageId>();
+      this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+      for (const id of leaves) if (rawPinnedMessageIds.has(id)) return true;
+      return false;
+    };
+    // Skip empty-content summaries as recall pairs: emitting `{type:'text',
+    // text:''}` triggers Anthropic 400 "text content blocks must be
+    // non-empty", which stalls ALL compression (mirrors the render-path guard
+    // + load-drop). They are descended like pinned ones, so their children
+    // still represent the span instead of all of it going raw.
+    const recallable = (s: SummaryEntry): boolean =>
+      !!s.content && s.content.trim().length > 0 && !summaryTouchesRawPin(s);
+    const mixedFrontier: SummaryEntry[] = [];
+    const descend = (s: SummaryEntry): void => {
+      if (recallable(s)) { mixedFrontier.push(s); return; }
+      if (s.level <= 1) return; // an L1 that can't be shown: its chunk stays raw
+      for (const childId of s.sourceIds) {
+        const child = summariesById.get(childId);
+        if (child) descend(child);
+      }
+    };
+    for (const s of this.summaries) if (!s.mergedInto) descend(s);
+    const priorSummaries = mixedFrontier
       .sort((a, b) => {
         const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
         const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
@@ -5337,14 +5392,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a budget-dropped summary doesn't make its raw messages reappear.
     // Expand summary sourceIds down to leaf message IDs — an L2's
     // sourceIds are L1 IDs, not message IDs; a flat walk would miss
-    // every message it transitively covers (Bug 10). Also expand merged
-    // L1s as defense in depth.
-    const summariesById = new Map<string, SummaryEntry>();
-    for (const s of this.summaries) summariesById.set(s.id, s);
+    // every message it transitively covers (Bug 10). The frontier is the
+    // authority here: a second pass expanding every merged L1 would hide the
+    // raw source of a frontier summary excluded by the pin rule above.
+    // (summariesById is built above, for that pin-aware recall filter.)
     const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
     for (const s of priorSummaries) {
       this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
