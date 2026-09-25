@@ -77,18 +77,66 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
-  it('a multiplier persisted under an older pricing epoch is discarded on reopen', async () => {
-    // The startup wedge: a store that pinned 1.8 under flat-600 thinking
-    // pricing reopens estimating ~1.8x its real size; if that is over the
-    // hard budget the first compile throws and no sample can ever decay it.
-    const first = await openManager('stale-epoch');
+  it('the startup wedge: a stale-epoch 1.8 no longer makes the first compile throw', async () => {
+    // A store that pinned 1.8 under flat-600 thinking pricing reopens
+    // estimating ~1.8x its real size; if that is over the hard budget the
+    // first compile throws OverBudgetError, so no inference runs and no sample
+    // can ever decay it. Size a budget that fits at 1.0 but not at 1.8.
+    // Measure what the hard-budget check counts at 1.0 (the OverBudgetError's
+    // `actual`), rather than inferring it from the estimator's own fields.
+    // (openManager appends six messages per open, so the probe goes through the
+    // same open → close → reopen as the stores under test, to hold the same content.)
+    const probeFirst = await openManager('wedge-probe');
+    await probeFirst.cm.compile(BUDGET);
+    probeFirst.cm.close();
+    const probe = await openManager('wedge-probe');
+    const reserve = 500;
+    const raw = await probe.cm.compile({ maxTokens: reserve + 1, reserveForResponse: reserve }).then(
+      () => { throw new Error('probe budget unexpectedly fit'); },
+      (e: { actual?: number }) => e.actual!,
+    );
+    probe.cm.close();
+    assert.ok(raw > 0);
+    const tight = { maxTokens: Math.ceil(raw * 1.35) + reserve, reserveForResponse: reserve };
+
+    // Control: the SAME budget with a current-epoch 1.8 does throw, so the
+    // assertion below can't pass vacuously.
+    const control = await openManager('wedge-control');
+    await control.cm.compile(BUDGET);
+    control.internals.store!.setStateJson(control.internals.calibrationStateId, {
+      multiplier: 1.8, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+    });
+    control.cm.close();
+    const controlReopened = await openManager('wedge-control');
+    await assert.rejects(controlReopened.cm.compile(tight), /budget/i);
+    controlReopened.cm.close();
+
+    // The wedge case: an unstamped (epoch 0) 1.8 is discarded and the first
+    // compile resolves; the reset is persisted, so a rollback can't reload 1.8.
+    const first = await openManager('wedge');
     await first.cm.compile(BUDGET);
     first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.8, at: Date.now() });
     first.cm.close();
+    const reopened = await openManager('wedge');
+    await reopened.cm.compile(tight);
+    assert.equal(reopened.internals._calibration, 1);
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.equal(saved.multiplier, 1, 'the reset must be persisted');
+    assert.equal(saved.pricing, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH);
+    reopened.cm.close();
+  });
 
-    const reopened = await openManager('stale-epoch');
+  it('a record from a newer pricing epoch is not used, and is left on disk', async () => {
+    const first = await openManager('newer-epoch');
+    await first.cm.compile(BUDGET);
+    const future = { multiplier: 1.4, at: 123, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH + 1 };
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
+    first.cm.close();
+
+    const reopened = await openManager('newer-epoch');
     await reopened.cm.compile(BUDGET);
     assert.equal(reopened.internals._calibration, 1);
+    assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), future);
     reopened.cm.close();
   });
 

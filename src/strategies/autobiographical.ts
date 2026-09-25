@@ -8522,14 +8522,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const saved = this.store?.getStateJson(this.calibrationStateId) as
           { multiplier?: number; pricing?: number } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          if ((saved.pricing ?? 0) === AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH) {
+          const epoch = saved.pricing ?? 0;
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
           } else {
             console.error(
               `[estimator-calibration] discarding multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
-                `pricing epoch ${saved.pricing ?? 0} (current ${AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH}); ` +
-                `restarting from 1.00`,
+                `pricing epoch ${epoch} (current ${current}); restarting from 1.00`,
             );
+            // Persist the reset for records from an OLDER (or unstamped) epoch, so a
+            // rollback to a binary that ignores the stamp can't reload the stale
+            // multiplier and re-arm the wedge, and the discard isn't re-logged on
+            // every restart. A record from a NEWER epoch belongs to a later binary:
+            // leave it on disk and just don't use it here.
+            if (epoch < current) {
+              try {
+                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current });
+              } catch { /* persistence is best-effort */ }
+            }
           }
         }
       } catch { /* absent slot is fine */ }
