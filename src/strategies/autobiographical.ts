@@ -1666,6 +1666,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // are skipped.
       if (abortIfStale()) return;
       if (this.config.hierarchical && !this.chunkRecordsOrphaned) {
+        // Clear quarantine records whose sources were merged or repaired while
+        // the store was closed. A stale record now holds every one of its
+        // sources, and the alarm-driven sweep may not run for a long time.
+        this.sweepPaidOffMergeQuarantine();
         this.checkMergeThreshold();
       }
       if (abortIfStale()) return;
@@ -3671,14 +3675,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Push to the merge queue and persist the new queue snapshot.
    *
-   * Quarantined source sets are refused: after a merge exhausts its bounded
-   * retry policy, `checkMergeThreshold`/`enqueueMergeForRange` would
-   * otherwise re-discover the same unmerged run and re-enqueue it forever.
-   * The merge-quarantine klaxon owns visibility; this guard stays silent.
+   * The single eligibility gate for every scheduler (threshold pass, adaptive
+   * produce ops, recursive speculative pass): a group containing ANY held or
+   * quarantined source (`mergeHeldSourceIds`) is refused, not only an exact
+   * quarantined set. After a merge exhausts its bounded retry policy the
+   * schedulers would otherwise re-discover the same run, or a superset of it,
+   * and re-enqueue it forever. The merge-quarantine klaxon owns visibility;
+   * this guard stays silent.
    */
   protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
-    if (this.mergeQuarantine.has(sha256Json(merge.sourceIds))) return;
+    const held = this.mergeHeldSourceIds();
+    if (merge.sourceIds.some((id) => held.has(id))) return;
     this.mergeQueue.push(merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
   }
@@ -3702,10 +3710,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.mergeQueue.length === 0) return;
     const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
+    const held = this.mergeHeldSourceIds();
     const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
       if (merge.sourceIds.length < 2) return false;
       let previousEnd: number | null = null;
       for (const sourceId of merge.sourceIds) {
+        if (held.has(sourceId)) return false; // held or quarantined since it was queued
         const source = byId.get(sourceId);
         if (
           !source ||
@@ -4045,12 +4055,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return s >= lo && s <= hi;
     };
 
-    const sources: SummaryEntry[] = [];
+    // In-range unmerged candidates in history order. Held or quarantined
+    // summaries are not sources, but they still split the range: a merge must
+    // never span one, so take the first run of >= 2 eligible neighbours.
+    const held = this.mergeHeldSourceIds();
+    const inRangeCandidates: SummaryEntry[] = [];
     for (const s of this.summaries) {
       if (s.level !== sourceLevel) continue;
       if (getSummaryParentId(s)) continue;
       if (queuedAtLevel.has(s.id)) continue;
       if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
+      inRangeCandidates.push(s);
+    }
+    const pos = (s: SummaryEntry) => messageOrder.get(s.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+    inRangeCandidates.sort((a, b) => pos(a) - pos(b));
+    let sources: SummaryEntry[] = [];
+    for (const s of inRangeCandidates) {
+      if (held.has(s.id)) {
+        if (sources.length >= 2) break;
+        sources = [];
+        continue;
+      }
       sources.push(s);
     }
     if (sources.length < 2) return;
@@ -4429,6 +4454,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     mergeQueueDepth: number;
     mergeQueueMaxAttempts: number;
     mergeQuarantineCount: number;
+    /** Keys of quarantined merges (sha256 of their source ids). */
+    mergeQuarantineKeys: string[];
+    /** Operator holds (`mergeHoldSummaryIds`): deliberate, so they don't change `state`,
+     *  but they constrain the scheduler and must be visible when the frontier grows. */
+    mergeHeldIds: string[];
     compressionQuarantineCount: number;
     unmergedFrontier: { l1: number; l2: number; l3: number };
     lastMintAt: number | null;
@@ -4442,6 +4472,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       mergeQueueDepth: 0,
       mergeQueueMaxAttempts: 0,
       mergeQuarantineCount: 0,
+      mergeQuarantineKeys: [] as string[],
+      mergeHeldIds: [] as string[],
       compressionQuarantineCount: 0,
       unmergedFrontier: { l1: 0, l2: 0, l3: 0 },
       lastMintAt: null,
@@ -4497,6 +4529,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         mergeQueueDepth: this.mergeQueue.length,
         mergeQueueMaxAttempts: Math.max(0, ...this.mergeQueue.map((m) => m.attempts ?? 0)),
         mergeQuarantineCount,
+        mergeQuarantineKeys: [...this.mergeQuarantine.keys()],
+        mergeHeldIds: [...(this.config.mergeHoldSummaryIds ?? [])],
         compressionQuarantineCount,
         unmergedFrontier: {
           l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto).length,
@@ -6675,7 +6709,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): SummaryEntry[] | null {
     const held = this.mergeHeldSourceIds();
     if (held.size > 0) unmerged = unmerged.filter((s) => !held.has(s.id));
-    if (unmerged.length < threshold) return null;
+    // No total-count guard here: an interior run may consolidate at 2 members
+    // (the rule below) even when fewer than `threshold` summaries are eligible
+    // overall, which holds and quarantine make common. The run loop applies
+    // both limits.
+    if (unmerged.length === 0) return null;
     const messageOrder = new Map<MessageId, number>();
     let seq = 0;
     for (const ch of this.chunks) {
