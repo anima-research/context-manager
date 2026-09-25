@@ -23,6 +23,14 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
     mergeThreshold: number;
     fallbackRecallTokens: number;
     maxCandidates: number;
+    /**
+     * Host-owned cache. Latent demand is an advisory ranking of producible
+     * merges; its candidates depend on the forest's summary roots and its
+     * scores on what-if solves. The ranking is reused while the summary-root
+     * runs and the budget are unchanged, so the what-if solves run once per
+     * mint/merge rather than once per turn.
+     */
+    cache?: { signature?: string; evaluations?: LatentDemandEvaluation[]; produced?: ProduceRequest[] };
   };
 }
 
@@ -105,6 +113,22 @@ export class KvUnifiedStrategy implements FoldingSolver {
     budget: FoldingBudget,
   ): ProduceRequest[] {
     const config = this.options.latentDemand!;
+    // Candidates depend on the contiguous runs of same-level summary roots;
+    // a raw root only breaks a run. Trailing raw roots (the messages appended
+    // since the last mint) are exactly what changes every turn, and they
+    // change no candidate, so they are left out of the key.
+    const rootKeys: string[] = [];
+    let pendingBreak = false;
+    for (const root of forest.roots) {
+      if (root.kind !== 'summary') { pendingBreak = rootKeys.length > 0; continue; }
+      if (pendingBreak) { rootKeys.push('|'); pendingBreak = false; }
+      rootKeys.push(`${root.id}@${forest.summary(root.id)!.level}`);
+    }
+    const signature = JSON.stringify([rootKeys, budget.totalBudget, config.mergeThreshold, config.maxCandidates]);
+    if (config.cache && config.cache.signature === signature && config.cache.evaluations && config.cache.produced) {
+      this.demandEvaluations = config.cache.evaluations;
+      return config.cache.produced;
+    }
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
     const evaluations: LatentDemandEvaluation[] = [];
@@ -143,9 +167,11 @@ export class KvUnifiedStrategy implements FoldingSolver {
       a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
     );
     this.demandEvaluations = evaluations;
-    return evaluations
+    const produced = evaluations
       .filter((evaluation) => evaluation.conservativeImprovement > 0)
       .map((evaluation) => evaluation.request);
+    if (config.cache) Object.assign(config.cache, { signature, evaluations, produced });
+    return produced;
   }
 }
 
@@ -261,6 +287,11 @@ function solveWithLatentCandidate(
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
     preserveGapBearingSummaries: options.preserveGapBearingSummaries,
   });
+  // The certificate stays on for what-ifs: its bound is over the what-if
+  // forest (latent parent included), so certifying proves the merge cannot
+  // improve the selection by more than adoptEpsilon — a true "≈0" answer at
+  // ~0.4 s instead of a full solve. Merges worth less than epsilon are not
+  // demanded; that is the hysteresis policy's own tolerance.
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,

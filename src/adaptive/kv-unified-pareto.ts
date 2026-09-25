@@ -1,5 +1,6 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import { tailUnits } from './render-offsets.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import { PackedDagSolver } from './kv-unified-packed.js';
@@ -245,10 +246,7 @@ export class ParetoKvUnifiedPolicySolver {
       const label = stack.pop()!;
       if (!label.active) continue;
       if (label.remaining === 0n) {
-        let finished = label;
-        if (this.inputs.tailTokens > 0) {
-          finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, false, options, markerByUnit);
-        }
+        const finished = this.emitTail(label, options, markerByUnit);
         if (finished.renderedTokens <= options.maxTokens) {
           terminal.push({ frontier: reconstructFrontier(finished.trace), renderedTokens: finished.renderedTokens });
         }
@@ -583,17 +581,7 @@ export class ParetoKvUnifiedPolicySolver {
         options,
         markerByUnit,
       );
-      if (this.inputs.tailTokens > 0) {
-        finished = this.emit(
-          finished,
-          'tail',
-          'tail',
-          this.inputs.tailTokens,
-          false,
-          options,
-          markerByUnit,
-        );
-      }
+      finished = this.emitTail(finished, options, markerByUnit);
       if (finished.renderedTokens <= options.maxTokens) {
         terminal.push(evaluator.candidate(finished.trace, finished.renderedTokens));
       }
@@ -847,6 +835,22 @@ export class ParetoKvUnifiedPolicySolver {
       cache,
       pendingEmissions: ordered.slice(consumed),
     };
+  }
+
+  /** Emit the raw tail as per-message units (see `tailUnits`), then flush so
+   * gap-buffered emissions never strand behind the tail. */
+  private emitTail(
+    label: ParetoLabel,
+    options: ExactPolicySolveOptions,
+    markerByUnit: ReadonlyMap<number, number>,
+  ): ParetoLabel {
+    let finished = label;
+    for (const unit of tailUnits(this.inputs)) {
+      finished = unit.kind === 'raw'
+        ? this.emit(finished, 'raw', unit.key, unit.tokens, this.isExtension([unit.key], options), options, markerByUnit, this.forest.leaf(unit.key)?.sequence ?? Number.POSITIVE_INFINITY)
+        : this.emit(finished, 'tail', unit.key, unit.tokens, false, options, markerByUnit);
+    }
+    return this.flushPendingEmissions(finished, Number.POSITIVE_INFINITY, options, markerByUnit);
   }
 
   private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {

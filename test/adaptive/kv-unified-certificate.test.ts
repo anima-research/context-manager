@@ -143,7 +143,7 @@ test('declines changed representation hashes, mixed summary cuts, and absent/dis
   assert.equal(certifyCarriedLayout(inputs, forest, { ...base, presentation: mixed }), null);
 });
 
-test('new raw-only leaves extend the certificate, but foldable extensions are ambiguous', () => {
+test('new raw-only leaves extend the certificate; a foldable extension is enumerated and scored, not declined', () => {
   const inputs = fixture();
   const before = new CanonicalSummaryForest(inputs);
   const previous = presentation(before);
@@ -152,10 +152,18 @@ test('new raw-only leaves extend the certificate, but foldable extensions are am
   const forest = new CanonicalSummaryForest(inputs);
   const options = { maxTokens: 450, presentation: previous, adoptEpsilon: 2000 };
   assert.ok(certifyCarriedLayout(inputs, forest, options));
+  // c0 is now "new" and its L1 gives it a fold option: hysteresis keeps the
+  // accepted layout under the BEST extension, which the certificate now
+  // enumerates exactly and must agree with the oracle on.
   const missing = new Map(previous.leaves);
   missing.delete('c0');
-  assert.equal(certifyCarriedLayout(inputs, forest, { ...options,
-    presentation: { currentSeq: 3, leaves: missing } }), null);
+  const ambiguous = { ...options, presentation: { currentSeq: 3, leaves: missing } };
+  const result = certifyCarriedLayout(inputs, forest, ambiguous);
+  assert.ok(result, 'foldable extension certifies');
+  const oracle = new ExactKvUnifiedPolicySolver(inputs, forest).solve(ambiguous);
+  assert.ok(oracle.feasible);
+  assert.deepEqual(result.selected.frontier, oracle.selected.frontier);
+  assert.equal(result.selected.score, oracle.selected.score);
 });
 
 test('protected internal holes fall back, while externally accounted holes have exact bounds', () => {
