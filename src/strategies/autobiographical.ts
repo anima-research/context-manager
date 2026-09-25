@@ -3574,6 +3574,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
+    const toolProseFallback = this.toolProseHoistOptions();
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
       accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
       fallbackLimit,
@@ -3587,7 +3588,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : {}),
       // Conditionally spread: with the rung off the record, its key and its
       // family stay byte-identical to what they were before the rung existed.
-      ...(this.toolProseHoistOptions() ? { toolProseFallback: this.toolProseHoistOptions()! } : {}),
+      ...(toolProseFallback ? { toolProseFallback } : {}),
     };
     const familyKey = sha256Json({
       model,
