@@ -4,6 +4,7 @@ import type {
   MessageId,
   Sequence,
   MessageMetadata,
+  AddMessageOptions,
   StoredMessage,
   ContextEntry,
   TokenBudget,
@@ -167,6 +168,15 @@ export class ContextManager {
   private strategyNamespace: string;
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
+  /**
+   * Compression holds (see holdCompression). Transient by design: never
+   * persisted, so a restart can never leave compression permanently stalled.
+   */
+  private compressionHolds = new Set<MessageId>();
+  /** Sharded adds held on ingress: first-shard id -> every shard id. */
+  private compressionHoldGroups = new Map<MessageId, MessageId[]>();
+  /** Set while addMessage(..., { holdCompression: true }) appends. */
+  private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
 
@@ -212,6 +222,10 @@ export class ContextManager {
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    // Live predicate (strategies capture views across long drains). Every
+    // view built above is a fresh object, so this never leaks into a store.
+    const holds = this.compressionHolds;
+    view.isCompressionHeld = (id: MessageId) => holds.has(id);
     return view;
   }
 
@@ -364,8 +378,35 @@ export class ContextManager {
    * a non-null sharding decision, the message is stored as multiple records
    * sharing a `bodyGroupId` (per the adaptive-resolution design §3.6). The
    * returned MessageId is the first shard's id.
+   *
+   * `options.holdCompression` places a compression hold (see
+   * holdCompression) on the new message BEFORE the strategy's onNewMessage
+   * fires, so not even the ingress chunk rebuild can fold it. Release it
+   * with releaseCompression([returnedId]) (releases every shard).
    */
   addMessage(
+    participant: string,
+    content: ContentBlock[],
+    metadata?: MessageMetadata,
+    causedBy?: MessageId[],
+    options?: AddMessageOptions
+  ): MessageId {
+    if (!options?.holdCompression) {
+      return this.appendMessage(participant, content, metadata, causedBy);
+    }
+    const held: MessageId[] = [];
+    this.holdingAdds = held;
+    let id: MessageId;
+    try {
+      id = this.appendMessage(participant, content, metadata, causedBy);
+    } finally {
+      this.holdingAdds = null;
+    }
+    if (held.length > 1) this.compressionHoldGroups.set(id, held);
+    return id;
+  }
+
+  private appendMessage(
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
@@ -404,10 +445,67 @@ export class ContextManager {
 
   /**
    * Edit a message in the store. Propagates to context log based on source relation.
+   *
+   * Edits do not reach `derived` entries and do not notify the strategy: a
+   * summary already built from the old content keeps it. To replace content
+   * that must reach compressed memory, hold the message (holdCompression /
+   * addMessage `holdCompression`) until after the edit.
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
     this.messageStore.edit(messageId, content);
     // Propagation handled by event listener
+  }
+
+  // ==========================================================================
+  // Compression holds
+  // ==========================================================================
+
+  /**
+   * Keep messages out of compression until released.
+   *
+   * While any message is held, strategies that compress (Autobiographical and
+   * subclasses) treat the earliest held message as the start of the protected
+   * recent window: it, everything after it, and the tool_use it answers stay
+   * raw and are never cut into a compressible chunk. History before it
+   * compresses normally. Rendering is unaffected apart from that longer raw
+   * tail.
+   *
+   * Intended for content that is provisional and will be replaced with
+   * editMessage (e.g. a tool_result staged with a placeholder): edits never
+   * reach `derived` context entries or summaries, so an edit is only safe
+   * while the message is held — edit first, then release.
+   *
+   * Holds are in-memory only and are not persisted; a reopened manager starts
+   * with none. Unknown ids are ignored. Removing a message drops its hold.
+   * A hold that is never released stalls compression of everything after it,
+   * so callers must release on every settle path.
+   */
+  holdCompression(messageIds: Iterable<MessageId>): void {
+    for (const id of messageIds) {
+      if (this.messageStore.get(id)) this.compressionHolds.add(id);
+    }
+  }
+
+  /**
+   * Release compression holds. Idempotent; unknown ids are ignored. Releasing
+   * the id returned by a sharded addMessage releases every shard. Compression
+   * of the now-final content proceeds on the strategy's next rebuild (next
+   * addMessage, compile, or tick).
+   */
+  releaseCompression(messageIds: Iterable<MessageId>): void {
+    for (const id of messageIds) {
+      const group = this.compressionHoldGroups.get(id);
+      if (group) {
+        for (const member of group) this.compressionHolds.delete(member);
+        this.compressionHoldGroups.delete(id);
+      }
+      this.compressionHolds.delete(id);
+    }
+  }
+
+  /** Currently held message ids (snapshot). */
+  getCompressionHolds(): ReadonlySet<MessageId> {
+    return new Set(this.compressionHolds);
   }
 
   /**
@@ -1157,6 +1255,10 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
+    if (this.holdingAdds) {
+      this.holdingAdds.push(message.id);
+      this.compressionHolds.add(message.id);
+    }
     // Notify strategy of new message
     if (this.strategy.onNewMessage) {
       // Fire and forget - don't block on strategy processing
@@ -1193,6 +1295,7 @@ export class ContextManager {
   }
 
   private handleMessageRemove(messageId: MessageId): void {
+    this.compressionHolds.delete(messageId);
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 

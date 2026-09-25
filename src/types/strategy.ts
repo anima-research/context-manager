@@ -26,6 +26,13 @@ export interface MessageStoreView {
   /** Closed-loop estimator calibration (optional — MessageStore provides it). */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
+  /**
+   * Whether a message is under a compression hold (ContextManager
+   * holdCompression / addMessage `holdCompression`). Compressing strategies
+   * must not fold a held message, anything after it, or the tool_use it
+   * answers. Absent on views not built by a ContextManager ⇒ nothing held.
+   */
+  isCompressionHeld?(id: MessageId): boolean;
 }
 
 /**

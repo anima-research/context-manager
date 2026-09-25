@@ -88,6 +88,7 @@ export type {
   ResettableStrategy,
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
+  AddMessageOptions,
 } from './types/index.js';
 
 export {

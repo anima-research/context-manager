@@ -29,6 +29,17 @@ export interface MessageMetadata {
 }
 
 /**
+ * Options for ContextManager.addMessage.
+ */
+export interface AddMessageOptions {
+  /**
+   * Place a transient compression hold on the new message before strategies
+   * are notified. See ContextManager.holdCompression.
+   */
+  holdCompression?: boolean;
+}
+
+/**
  * A message stored in the message store.
  * This is the source of truth for all conversation history.
  */

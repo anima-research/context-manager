@@ -4263,6 +4263,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const chunk = this.chunks[chunkIndex];
 
       if (!chunk || chunk.compressed) return;
+      // A chunk that closed before a hold was placed (holdCompression after
+      // the fact) waits; the rebuild after release re-queues it.
+      if (this.chunkHasHeldMessage(chunk, ctx.messageStore)) return;
 
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
@@ -10219,7 +10222,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Queue uncompressed record-backed chunks (crash-recovery: record was
     // appended but the process died before its L1 landed).
     for (const chunk of this.chunks) {
-      if (!chunk.compressed && !(chunk.recordId && this._overlapBlocked.has(chunk.recordId))) {
+      if (
+        !chunk.compressed &&
+        !(chunk.recordId && this._overlapBlocked.has(chunk.recordId)) &&
+        !this.chunkHasHeldMessage(chunk, store)
+      ) {
         this.compressionQueue.push(chunk.index);
       }
     }
@@ -10634,6 +10641,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected getRecentWindowStart(store: MessageStoreView): number {
+    return this.clampRecentStartToHolds(store, this.getUnheldRecentWindowStart(store));
+  }
+
+  /**
+   * Compression holds (ContextManager.holdCompression): the earliest held
+   * message starts the protected recent window, so neither it, anything after
+   * it, nor the tool_use it answers can enter a compressible chunk. With no
+   * holds (or a view without the predicate) this returns `start` unchanged.
+   */
+  protected clampRecentStartToHolds(store: MessageStoreView, start: number): number {
+    const isHeld = store.isCompressionHeld;
+    if (!isHeld) return start;
+    const messages = store.getAll();
+    let boundary = start;
+    for (let i = 0; i < start; i++) {
+      if (isHeld.call(store, messages[i].id)) { boundary = i; break; }
+    }
+    if (boundary === start) return start;
+    // Same pairing rule as the token boundary: a held tool_result keeps its
+    // tool_use with it.
+    if (boundary > 0 && this.hasToolResult(messages[boundary])) boundary--;
+    return boundary;
+  }
+
+  /**
+   * Whether a chunk reaches the hold boundary: any of its messages is held,
+   * follows a held message, or is the tool_use a held tool_result answers.
+   * Only reachable for chunks that closed before the hold was placed; the
+   * compression request would otherwise carry the provisional content (as
+   * the chunk itself or as its lead-in context).
+   */
+  protected chunkHasHeldMessage(chunk: Chunk, store: MessageStoreView): boolean {
+    if (!store.isCompressionHeld) return false;
+    const messages = store.getAll();
+    const boundary = this.clampRecentStartToHolds(store, messages.length);
+    if (boundary >= messages.length) return false;
+    const blocked = new Set<string>();
+    for (let i = boundary; i < messages.length; i++) blocked.add(messages[i].id);
+    return chunk.messages.some((m) => blocked.has(m.id));
+  }
+
+  protected getUnheldRecentWindowStart(store: MessageStoreView): number {
     const messages = store.getAll();
     const pse = this.postStripEstimates(store);
     let tokens = 0;
