@@ -10677,6 +10677,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Index of the first message AFTER the head window.
    * Messages [headStart, headEnd) are preserved verbatim.
+   *
+   * The token-derived boundary is priced with the live calibration multiplier,
+   * so it moves whenever calibration does. Moving it DOWN used to be a ratchet:
+   * the message that fell out of the head was not covered by any chunk, so it
+   * became compressible middle, got its own tiny chunk + L1, and from then on
+   * was owned, so the head could never grow back over it. Repeated per
+   * calibration rise, this peels the head one message at a time into
+   * one-message L1s that sit at the start of the chronicle but are created
+   * late, so they merge with whatever frontier is open (merge adjacency follows
+   * chunk-record order), yielding L2/L3s that mix the opening with weeks-later
+   * material (issue #122). See anchorHeadToCoverage.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
     if (this.config.headWindowTokens <= 0) return 0;
@@ -10694,11 +10705,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
-        return boundary;
+        return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
     }
 
     return messages.length;
+  }
+
+  /**
+   * Head-boundary ratchet guard. When the token boundary lands on an UNOWNED
+   * message and chunk coverage resumes later, the messages in between are the
+   * head's own tail that a calibration rise pushed out. They were never
+   * chunked, and chunking them now would mint out-of-order L1s. Keep them in
+   * the head: extend the boundary to the first owned message after it.
+   *
+   * Only this direction is touched. A boundary already on an owned message,
+   * a store with no coverage after the boundary (fresh session, or the
+   * uncovered run is the live frontier), and a head that grew over owned
+   * messages ("ownership wins", issue #42) all keep the stock boundary. The
+   * extension is bounded: the head is a hard reservation in selectAdaptive,
+   * so if reaching coverage would take more than 2× headWindowTokens, the
+   * gap is not the head's tail and the stock boundary stands.
+   */
+  private anchorHeadToCoverage(
+    store: MessageStoreView,
+    messages: StoredMessage[],
+    boundary: number,
+    tokensThroughBoundary: number,
+  ): number {
+    if (boundary >= messages.length) return boundary;
+    const owned = this.ownedMessageIds();
+    if (owned.size === 0 || owned.has(messages[boundary].id)) return boundary;
+    const cap = 2 * this.config.headWindowTokens;
+    let tokens = tokensThroughBoundary;
+    for (let j = boundary + 1; j < messages.length; j++) {
+      if (owned.has(messages[j].id)) return j;
+      tokens += store.estimateTokens(messages[j]);
+      if (tokens > cap) return boundary;
+    }
+    return boundary;
+  }
+
+  /** Ids of every message a chunk record or live L1 owns (L1 `sourceIds` is the
+   *  coverage authority when a chunk record has no summary pointer — see the
+   *  fold-path fallback in selectAdaptive). Rebuilt when either list changes. */
+  private _ownedIdsCache: { key: string; ids: Set<MessageId> } | null = null;
+  private ownedMessageIds(): Set<MessageId> {
+    const lastChunk = this.chunks[this.chunks.length - 1];
+    const key = `${this.chunks.length}:${lastChunk?.messages.length ?? 0}:${this.summaries.length}`;
+    if (this._ownedIdsCache?.key === key) return this._ownedIdsCache.ids;
+    const ids = new Set<MessageId>();
+    for (const ch of this.chunks) for (const m of ch.messages) ids.add(m.id);
+    for (const s of this.summaries) if (s.level === 1) for (const id of s.sourceIds) ids.add(id);
+    this._ownedIdsCache = { key, ids };
+    return ids;
   }
 
   protected hasToolUse(message: StoredMessage): boolean {
