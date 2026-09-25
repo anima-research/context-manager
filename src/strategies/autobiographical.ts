@@ -5585,11 +5585,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // image ... kept 0MB" logged while the mint still 400'd on
     // image_input_not_supported). The merge builder has always capped its
     // post-split list; this aligns the L1 builder with it.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-    );
+    this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
 
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
@@ -5650,13 +5646,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
     if (sourceOnlyFallbackMessages) {
-      this.capCompressionImageBytes(
-        sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
-        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-      );
       const sourceOnlyCleaned = stripUnpairedToolBlocks(
         this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
       );
+      this.projectCompressionWireMessages(sourceOnlyCleaned as Array<{ content: ContentBlock[] }>);
       const sourceOnlyFallbackWireMessages = sourceOnlyCleaned
         .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
         .filter(m => m.content.length > 0);
@@ -6197,6 +6190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
+            this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
             return {
               ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
               shedOversizeImages: true,
@@ -7261,11 +7255,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // messages under its L1s, images and all (including screenshots nested in
     // tool_results). This is the path that kept tripping membrane's transport
     // shed at 27MB after the L1 site was already capped. Own it here.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-    );
+    this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
 
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
@@ -10424,6 +10414,79 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected static imageBlockBytes(b: unknown): number {
     const src = (b as { source?: { data?: string } }).source;
     return typeof src?.data === 'string' ? src.data.length : 0;
+  }
+
+  /**
+   * The ONE final projection of a compression prompt's wire messages: replace
+   * serialized base64 media carried as text, then cap inline image bytes.
+   * Every compression request builder (L1 canonical, L1 source-only, merge,
+   * split-stitch) calls this on the post-split list it actually ships; a
+   * projection applied to a pre-split list lands on copies the request never
+   * sends. Prompt-only: Chronicle messages are never mutated (copy-on-write).
+   */
+  protected projectCompressionWireMessages(messages: Array<{ content: ContentBlock[] }>): void {
+    this.stripSerializedCompressionMedia(messages);
+    this.capCompressionImageBytes(
+      messages,
+      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    );
+  }
+
+  /** Ignore short data-URL examples while catching actual serialized media. */
+  protected static readonly SERIALIZED_DATA_URL_MIN_CHARS = 4096;
+
+  /**
+   * Replace large base64 data URLs that arrived inside TEXT blocks of a
+   * compression prompt — e.g. an imported tool result that serialized a
+   * foreign harness's image JSON instead of a native image block. The image
+   * byte cap cannot see those bytes and the tokenizer treats them as prose
+   * (one image can become hundreds of thousands of tokens). Prompt-only:
+   * stored Chronicle messages are never mutated; the marker keeps the media
+   * type and size.
+   */
+  protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
+    const minChars = AutobiographicalStrategy.SERIALIZED_DATA_URL_MIN_CHARS;
+    // `+`, not `{minChars,}`: V8's irregexp overflows the stack on a counted
+    // quantifier once a MATCHING run reaches ~8M characters (node 22), which
+    // is exactly the media size this targets. The length floor is applied in
+    // the replacer instead.
+    // Also matches MIME parameters before `;base64` (`;charset=…`, `;name=…`)
+    // and JSON-escaped slashes (`image\/png`, `\/` inside the payload), the
+    // forms serializers actually emit. Line-wrapped base64 and bare base64
+    // under a JSON key (Anthropic `"source":{"data":…}`) are out of scope.
+    const dataUrl =
+      /data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(?:\\?\/)[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,"\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/g;
+    let replaced = 0;
+    const stripText = (text: string): string =>
+      text.replace(dataUrl, (match: string, mediaType: string, payload: string) => {
+        if (payload.length < minChars) return match;
+        replaced++;
+        return `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
+          `${payload.length} base64 characters; original preserved in Chronicle]`;
+      });
+    const strip = (blocks: ContentBlock[]): ContentBlock[] =>
+      blocks.map((block) => {
+        if (block.type === 'text') {
+          const text = stripText(block.text);
+          return text === block.text ? block : ({ ...block, text } as ContentBlock);
+        }
+        const nested = (block as { type: string; content?: unknown }).content;
+        if (block.type === 'tool_result') {
+          // Both shapes: membrane's ToolResultContent.content is string | ContentBlock[],
+          // and the string form is the common carrier (importers and AF's direct
+          // path stringify tool output).
+          if (typeof nested === 'string') {
+            const text = stripText(nested);
+            return text === nested ? block : ({ ...block, content: text } as ContentBlock);
+          }
+          if (Array.isArray(nested)) {
+            return { ...block, content: strip(nested as ContentBlock[]) } as ContentBlock;
+          }
+        }
+        return block;
+      });
+    for (const message of messages) message.content = strip(message.content);
+    return replaced;
   }
 
   /**
