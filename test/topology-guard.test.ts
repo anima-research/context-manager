@@ -291,3 +291,32 @@ describe('ContextManager.open fails closed on a crossed store', () => {
     }
   });
 });
+
+describe('auditOnly opens never mutate the store', () => {
+  const STORE = './test-topology-guard-auditonly';
+  const wipe = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
+  before(wipe);
+  after(wipe);
+  test('a plain open chunks the frontier; an audit-only open leaves records and queue untouched', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) };
+    const cfg = { adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 50, recentWindowTokens: 0, targetChunkTokens: 200 };
+    const seed = new AutobiographicalStrategy(cfg);
+    const manager = await ContextManager.open({ path: STORE, strategy: seed, membrane: membrane as never });
+    for (let i = 0; i < 60; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i} ` + 'w '.repeat(30) }]);
+    manager.close();
+    const records = (s: AutobiographicalStrategy) => (s as unknown as { chunkRecords: unknown[] }).chunkRecords.length;
+    const audit = new AutobiographicalStrategy({ ...cfg, headWindowTokens: 0, auditOnly: true, topologyPolicy: 'report' });
+    const a = await ContextManager.open({ path: STORE, strategy: audit, membrane: membrane as never });
+    const auditRecords = records(audit);
+    a.close();
+    const plain = new AutobiographicalStrategy({ ...cfg, headWindowTokens: 0 });
+    const p = await ContextManager.open({ path: STORE, strategy: plain, membrane: membrane as never });
+    const plainRecords = records(plain);
+    p.close();
+    assert.ok(plainRecords > auditRecords, `a plain open under a foreign config mints records (${plainRecords} > ${auditRecords})`);
+    const again = new AutobiographicalStrategy({ ...cfg, headWindowTokens: 0, auditOnly: true, topologyPolicy: 'report' });
+    const b = await ContextManager.open({ path: STORE, strategy: again, membrane: membrane as never });
+    assert.equal(records(again), plainRecords, 'audit-only reads what the plain open wrote and adds nothing');
+    b.close();
+  });
+});

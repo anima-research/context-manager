@@ -902,6 +902,14 @@ export interface AutobiographicalConfig {
    * never executed: it is refused into the merge quarantine.
    */
   topologyPolicy?: 'reject' | 'report';
+  /**
+   * Open for inspection only: `initialize` still loads and audits the store,
+   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
+   * persisted merge queue. Audit and repair tooling opens stores this way; a
+   * plain open under a config that is not the resident's own would otherwise
+   * mint chunk records with the wrong head window and chunk size.
+   */
+  auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
   compressionMergeSourceOnly?: boolean;
   /** Use target-only merge request only on the final persisted merge attempt. Default false. */
