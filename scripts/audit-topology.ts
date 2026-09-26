@@ -8,8 +8,9 @@
  *   node dist/scripts/audit-topology.js <store-path> [--namespace <ns>] [--json]
  *
  * Exit code 0 = clean, 2 = violations found, 1 = could not open.
- * Run it on a stopped resident's store or a copy: opening a chronicle store
- * takes its lock and may rewrite its state index.
+ * Opens the store audit-only (no frontier chunking, no merge enqueue, no
+ * queue rewrite). Run it on a stopped resident's store or a copy: opening a
+ * chronicle store takes its lock and may rewrite its state index.
  */
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
@@ -29,6 +30,7 @@ async function main(): Promise<void> {
     hierarchical: true,
     autoTickOnNewMessage: false,
     topologyPolicy: 'report',
+    auditOnly: true,
   });
   const membrane = { complete: async () => ({ content: [{ type: 'text', text: '[audit]' }] }) };
   const manager = await ContextManager.open({

@@ -4,7 +4,12 @@
  * on-disk state lags its process.
  *
  * Usage:
- *   node dist/scripts/repair-topology.js <store-path> --namespace <ns> [--apply] [--release-head] [--mode lossless|compact] [--json]
+ *   node dist/scripts/repair-topology.js <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--mode lossless|compact] [--json]
+ *
+ * Both opens (verification, and the audit) are audit-only: they never mint
+ * chunk records or enqueue merges. --release-head=all also releases
+ * pre-existing unparented root L1s at the prefix (the head must be able to
+ * take them back: CM ≥ #123 anchors it to coverage, bounded at 2× headWindowTokens).
  *
  * lossless (default) only detaches: no prose ever claims content it did not
  * see, but the pyramid unravels around each fragment (reported as leaves that
@@ -26,12 +31,14 @@ const storePath = args.find((a) => !a.startsWith('--'));
 const flag = (name: string): string | undefined => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const namespace = flag('--namespace');
 if (!storePath || !namespace) {
-  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head] [--mode lossless|compact] [--json] [--messages-state <id>]');
+  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--release-head-limit <n>] [--mode lossless|compact] [--json] [--messages-state <id>]');
   process.exit(1);
 }
 const apply = args.includes('--apply');
 const json = args.includes('--json');
-const releaseHead = args.includes('--release-head');
+const releaseHead: false | 'moved' | 'all' = args.includes('--release-head=all') ? 'all' : (args.includes('--release-head') || args.includes('--release-head=moved')) ? 'moved' : false;
+const releaseHeadLimit = flag('--release-head-limit') !== undefined ? Number(flag('--release-head-limit')) : undefined;
+if (releaseHeadLimit !== undefined && !(releaseHeadLimit > 0)) { console.error('--release-head-limit must be a positive number of messages'); process.exit(1); }
 const mode = (flag('--mode') ?? 'lossless') as 'lossless' | 'compact';
 if (mode !== 'lossless' && mode !== 'compact') { console.error(`--mode must be lossless or compact, got ${mode}`); process.exit(1); }
 const messagesState = flag('--messages-state') ?? 'messages';
@@ -50,7 +57,7 @@ if (messages.length === 0 || summaries.length === 0) {
   process.exit(1);
 }
 
-const plan = planTopologyRepair({ summaries, records, messages, resolutions }, { releaseHead, mode });
+const plan = planTopologyRepair({ summaries, records, messages, resolutions }, { releaseHead, releaseHeadLimit, mode });
 const summary = {
   store: storePath, namespace, run: apply ? 'apply' : 'dry-run', mode, releaseHead,
   messages: messages.length, summaries: summaries.length, records: records.length,
@@ -78,7 +85,8 @@ else {
   for (const c of plan.remaining) console.log(`  STILL CROSSED L${c.level} ${c.id}: ${c.holes} hole(s)`);
 }
 if (plan.remaining.length > 0) { console.error('plan does not reach a clean store; nothing written'); store.close(); process.exit(2); }
-if (plan.before.length === 0) { console.error('store is clean; nothing to do'); store.close(); process.exit(0); }
+const changes = plan.detached.length + plan.adopted.length + plan.rehomed.length + plan.splitL1.length + plan.dissolved.length + plan.released.length + plan.rangeChanges.length;
+if (changes === 0) { console.error(plan.before.length === 0 ? 'store is clean; nothing to do' : 'nothing to change'); store.close(); process.exit(0); }
 if (!apply) { console.error('DRY RUN — nothing written (add --apply)'); store.close(); process.exit(0); }
 store.setStateJson(sumsState, plan.result.summaries);
 store.setStateJson(chunksState, plan.result.records);
@@ -86,7 +94,7 @@ store.setStateJson(resolutionsState, plan.result.resolutions);
 store.close();
 console.error('APPLIED; verifying with the load-time audit (topologyPolicy reject)…');
 try {
-  const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, topologyPolicy: 'reject' });
+  const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, topologyPolicy: 'reject', auditOnly: true });
   const manager = await ContextManager.open({ path: storePath, strategy, namespace, membrane: { complete: async () => ({ content: [] }) } as never });
   manager.close();
   console.error('VERIFIED: the store opens under topologyPolicy reject.');

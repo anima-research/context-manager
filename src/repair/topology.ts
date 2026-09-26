@@ -59,8 +59,15 @@ export interface RepairInputs {
   resolutions?: Record<string, number> | null;
 }
 export interface RepairOptions {
-  /** Remove detached opening L1s / uncompressed prefix records so the head takes the messages back. */
-  releaseHead?: boolean;
+  /**
+   * Remove prefix records (and their L1s) so the head window takes the
+   * messages back: `'moved'` releases uncompressed prefix records and L1s this
+   * plan detached or re-homed; `'all'` also releases pre-existing unparented
+   * root L1s at the prefix. `true` means `'moved'`.
+   */
+  releaseHead?: boolean | 'moved' | 'all';
+  /** With releaseHead, stop the prefix walk before releasing more than this many messages. */
+  releaseHeadLimit?: number;
   /**
    * `lossless` (default): only detach; fragments become roots and keep their
    * prose, but every ancestor whose span they sit inside is detached in turn
@@ -366,12 +373,23 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     const recordOf = new Map<string, RepairRecord>();
     for (const r of records) for (const id of r.sourceIds) recordOf.set(id, r);
     const movedIds = new Set([...detachedIds, ...plan.rehomed.map((r) => r.id)]);
+    const all = options.releaseHead === 'all';
+    const limit = options.releaseHeadLimit ?? Number.POSITIVE_INFINITY;
     const release = new Set<RepairRecord>();
+    let releasedMessages = 0;
     for (const id of v.byPosition) {
       const r = recordOf.get(id);
       if (!r) break; // an L1-only owner (legacy) ends the prefix
-      const releasable = !r.compressed || (r.summaryId !== undefined && movedIds.has(r.summaryId));
+      if (release.has(r)) continue;
+      const l1 = r.summaryId !== undefined ? v.byId.get(r.summaryId) : undefined;
+      // 'all' releases any prefix L1, parented or not: its parent is detached
+      // from it and dissolves below if left with a single source.
+      const releasable = !r.compressed ||
+        (r.summaryId !== undefined && movedIds.has(r.summaryId)) ||
+        (all && l1 !== undefined && l1.level === 1);
       if (!releasable) break;
+      if (releasedMessages + r.sourceIds.length > limit) break;
+      releasedMessages += r.sourceIds.length;
       release.add(r);
     }
     for (const r of release) {

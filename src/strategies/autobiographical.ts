@@ -1704,7 +1704,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.rebuildChunks(ctx.messageStore);
       if (abortIfStale()) return;
-      this.sanitizePersistedMergeQueue(ctx.messageStore);
+      if (!this.config.auditOnly) this.sanitizePersistedMergeQueue(ctx.messageStore);
       if (abortIfStale()) return;
       this.assertStoreTopology(messages);
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
@@ -1714,7 +1714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // never start consolidating. Idempotent: already-queued/merged sources
       // are skipped.
       if (abortIfStale()) return;
-      if (this.config.hierarchical && !this.chunkRecordsOrphaned) {
+      if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
         this.checkMergeThreshold();
       }
       if (abortIfStale()) return;
@@ -10571,6 +10571,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ---- 3. Chunk the frontier: compressible messages not owned by any record. ----
+    // An audit-only open never mints records: its head window and chunk size
+    // are not the resident's, and a record written here would be compressed
+    // by the resident at its next boot.
+    if (this.config.auditOnly) return;
     const messagesToChunk = this.getCompressibleMessages(store)
       .filter(m => !consumed.has(m.id));
     const livePosition = new Map<string, number>();

@@ -10,3 +10,10 @@
   verbatim. Dry-run by default; `--apply` writes and re-opens the store under
   `'reject'` to verify. `scripts/audit-topology.ts` now prints summary,
   chunk and chunk→L1 link counts and warns when it has nothing to audit.
+- `auditOnly` strategy config: `initialize` loads and audits the store but
+  never chunks the uncovered frontier, enqueues merges, or rewrites the
+  persisted merge queue. The audit and repair scripts open stores this way;
+  a plain open under a config that is not the resident's own mints chunk
+  records with the wrong head window and chunk size, which the resident then
+  compresses at its next boot. `--release-head=all` (with
+  `--release-head-limit <n>`) also releases pre-existing prefix L1s.
