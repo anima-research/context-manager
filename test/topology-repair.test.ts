@@ -153,6 +153,29 @@ describe('planTopologyRepair', () => {
     assert.equal(plan.detached.length + plan.adopted.length + plan.rehomed.length, 0);
   });
 
+  test('rebuild-since rebuilds crossed summaries after the cutoff and compacts the older ones', () => {
+    // Two #95-shaped crossed L2s: an old one (0..69) and a recent one (100..169).
+    const mk = (base: number, tag: string) => {
+      const l1s = [0, 1, 2, 3, 4, 5, 6].map((i) => l1(`L1-${tag}${i}`, base + i * 10, base + i * 10 + 9));
+      const l2 = up(`L2-${tag}`, 2, [0, 2, 3, 4, 6].map((i) => `L1-${tag}${i}`), base, base + 69);
+      for (const i of [0, 2, 3, 4, 6]) l1s[i].mergedInto = `L2-${tag}`;
+      const recs = [0, 1, 2, 3, 4, 5, 6].map((i) => rec(`c-${tag}${i}`, base + i * 10, base + i * 10 + 9, `L1-${tag}${i}`));
+      return { l1s, l2, recs };
+    };
+    const old = mk(0, 'o'), recent = mk(100, 'r');
+    const summaries = [...old.l1s, old.l2, ...recent.l1s, recent.l2];
+    const records = [...old.recs, ...recent.recs];
+    const messages = ids(0, 199).map((id, i) => ({ id, timestamp: Date.UTC(2026, 0, 1) + i * 3600_000 }));
+    const byId = planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: 'm-100' });
+    assert.deepEqual(byId.rebuildSince, { id: 'm-100', position: 100, rebuilt: 1, compacted: 1 });
+    assert.deepEqual(byId.dissolvedForRebuild.map((d) => d.id), ['L2-r'], 'only the recent tower is rebuilt');
+    assert.deepEqual(byId.adopted.map((a) => a.id).sort(), ['L1-o1', 'L1-o5'], 'the old one adopts its hole owners instead');
+    assert.equal(byId.remaining.length, 0);
+    const byDate = planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: new Date(Date.UTC(2026, 0, 1) + 100 * 3600_000).toISOString() });
+    assert.deepEqual(byDate.rebuildSince, byId.rebuildSince, 'an ISO date resolves to the first message at or after it');
+    assert.throws(() => planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: 'm-999' }), /no message matches/);
+  });
+
   test('a crossed L1 keeps its largest run and releases the stray messages from its record', () => {
     const stray = { ...l1('L1-x', 40, 43), sourceIds: ['m-3', ...ids(40, 43)], sourceRange: { first: 'm-3', last: 'm-43' } };
     const summaries = [l1('L1-0', 4, 19), l1('L1-1', 20, 39), stray];

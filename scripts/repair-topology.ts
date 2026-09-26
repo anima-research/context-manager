@@ -18,6 +18,9 @@
  * summary whose span touches a crossed region (and their ancestors) back to
  * L1s so the merge ladder re-folds the region with real summarizer calls —
  * run scripts/drain-autobiographical.ts on the stopped store afterwards.
+ * --rebuild-since <messageId|ISO date> rebuilds only crossed summaries whose
+ * span starts at or after that message and compacts the older ones, so
+ * regions repaired by hand are never re-summarized.
  * None of the modes makes model calls itself.
  *
  * After --apply the store is reopened with topologyPolicy 'reject'; the run
@@ -35,12 +38,13 @@ const storePath = args.find((a) => !a.startsWith('--'));
 const flag = (name: string): string | undefined => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const namespace = flag('--namespace');
 if (!storePath || !namespace) {
-  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--release-head-limit <n>] [--mode lossless|compact|rebuild] [--json] [--messages-state <id>]');
+  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--release-head-limit <n>] [--mode lossless|compact|rebuild] [--rebuild-since <messageId|ISO date>] [--json] [--messages-state <id>]');
   process.exit(1);
 }
 const apply = args.includes('--apply');
 const json = args.includes('--json');
 const releaseHead: false | 'moved' | 'all' = args.includes('--release-head=all') ? 'all' : (args.includes('--release-head') || args.includes('--release-head=moved')) ? 'moved' : false;
+const rebuildSince = flag('--rebuild-since');
 const releaseHeadLimit = flag('--release-head-limit') !== undefined ? Number(flag('--release-head-limit')) : undefined;
 if (releaseHeadLimit !== undefined && !(releaseHeadLimit > 0)) { console.error('--release-head-limit must be a positive number of messages'); process.exit(1); }
 const mode = (flag('--mode') ?? 'lossless') as 'lossless' | 'compact' | 'rebuild';
@@ -61,14 +65,14 @@ if (messages.length === 0 || summaries.length === 0) {
   process.exit(1);
 }
 
-const plan = planTopologyRepair({ summaries, records, messages, resolutions }, { releaseHead, releaseHeadLimit, mode });
+const plan = planTopologyRepair({ summaries, records, messages, resolutions }, { releaseHead, releaseHeadLimit, mode, ...(rebuildSince !== undefined ? { rebuildSince } : {}) });
 const summary = {
   store: storePath, namespace, run: apply ? 'apply' : 'dry-run', mode, releaseHead,
   messages: messages.length, summaries: summaries.length, records: records.length,
   crossedBefore: plan.before.length, iterations: plan.iterations,
   adopted: plan.adopted, detached: plan.detached, rehomed: plan.rehomed, splitL1: plan.splitL1, dissolved: plan.dissolved, released: plan.released,
   rangeChanges: plan.rangeChanges, resolutionsClamped: plan.resolutionsClamped, resolutionsCleared: plan.resolutionsCleared,
-  proseGapLeaves: plan.proseGapLeaves, depthLostLeaves: plan.depthLostLeaves, dissolvedForRebuild: plan.dissolvedForRebuild, exposedL1Leaves: plan.exposedL1Leaves,
+  proseGapLeaves: plan.proseGapLeaves, depthLostLeaves: plan.depthLostLeaves, dissolvedForRebuild: plan.dissolvedForRebuild, exposedL1Leaves: plan.exposedL1Leaves, rebuildSince: plan.rebuildSince,
   remaining: plan.remaining,
   after: { summaries: plan.result.summaries.length, records: plan.result.records.length },
 };
@@ -82,6 +86,7 @@ else {
   for (const r of plan.rehomed) console.log(`  re-home ${r.id} (${r.leaves} leaves) from ${r.from} into ${r.into}`);
   for (const s of plan.splitL1) console.log(`  split L1 ${s.id}: keep ${s.kept}, release ${s.released.join(',')}`);
   for (const d of plan.dissolved) console.log(`  dissolve L${d.level} ${d.id} (single source ${d.child})`);
+  if (plan.rebuildSince) console.log(`  rebuild-since: message ${plan.rebuildSince.id} (store position ${plan.rebuildSince.position}) — ${plan.rebuildSince.rebuilt} crossed rebuilt, ${plan.rebuildSince.compacted} older ones compacted`);
   if (plan.dissolvedForRebuild.length) {
     const byLevel: Record<string, number> = {};
     for (const d of plan.dissolvedForRebuild) byLevel[`L${d.level}`] = (byLevel[`L${d.level}`] ?? 0) + 1;
