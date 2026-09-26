@@ -481,6 +481,8 @@ interface CompressionRefusalNormalizedConfig {
 
 type CompressionAttemptOutcome =
   | 'refusal'
+  /** The merge group is not contiguous in store order; refused before any model call. */
+  | 'topology_violation'
   | 'unusable_empty'
   | 'provider_error'
   | 'admission_rejected'
@@ -544,6 +546,42 @@ interface MergeQuarantineRecord {
   lastErrorType?: string;
   lastRequestHash?: string;
   quarantinedAt: number;
+}
+
+/** One summary whose leaves are not contiguous among chunk-owned messages. */
+export interface TopologyViolation {
+  id: string;
+  level: number;
+  leafCount: number;
+  /** First/last leaf message id in store order. */
+  span: { first: string; last: string };
+  /** Chunk-owned messages inside the span that the summary does not own. */
+  holes: number;
+  /** Up to five hole message ids. */
+  holeSample: string[];
+  /** Up to five L1 summaries that own the holes (the interleaved representation). */
+  holeOwners: string[];
+}
+
+/**
+ * Thrown by `initialize` (so by `ContextManager.open`) when the summary
+ * archive carries crossed ownership and `topologyPolicy` is `'reject'`.
+ * The store is intact; nothing was written. Repair it (or open with
+ * `topologyPolicy: 'report'` to inspect) before running a resident on it.
+ */
+export class StoreTopologyError extends Error {
+  constructor(readonly violations: TopologyViolation[]) {
+    super(
+      `store topology rejected: ${violations.length} summar${violations.length === 1 ? 'y owns' : 'ies own'} ` +
+        `non-contiguous leaves — ` +
+        violations.slice(0, 8).map((v) =>
+          `L${v.level} ${v.id} (${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
+          `${v.holeOwners.length ? ` owned by ${v.holeOwners.join('/')}` : ''})`).join('; ') +
+        (violations.length > 8 ? `; +${violations.length - 8} more` : '') +
+        `. Repair the store or set topologyPolicy: 'report' to open it for inspection.`,
+    );
+    this.name = 'StoreTopologyError';
+  }
 }
 
 interface CompressionRefusalOutcomeRecord {
@@ -1667,6 +1705,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.rebuildChunks(ctx.messageStore);
       if (abortIfStale()) return;
       this.sanitizePersistedMergeQueue(ctx.messageStore);
+      if (abortIfStale()) return;
+      this.assertStoreTopology(messages);
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
       // compression/merge completion does this, but a store that boots with a
       // backlog above threshold and an empty queue (e.g. after a pyramid
@@ -3738,6 +3778,272 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return merge;
   }
 
+  // ===========================================================================
+  // Store topology: contiguity of ownership in STORE order.
+  //
+  // Merge adjacency used to be judged in chunk-record order. Records are
+  // appended when a chunk is minted, so a chunk minted late over an early
+  // message (issue #122: the head ratchet peeling opening messages into
+  // one-message L1s days later) sat next to the open frontier and merged with
+  // it, producing L2/L3s that mix the chronicle's opening with weeks-later
+  // material. The demand path (#95) never checked adjacency at all. Every
+  // grouping decision and the mint itself now use one index: chunk-owned
+  // messages, positioned by the store listing. Messages no chunk owns (head,
+  // never-chunked) occupy no position, so they never split a run; a hole is
+  // always another live representation.
+  // ===========================================================================
+
+  /** Store position per message id, refreshed from every listing we see. */
+  private _storeOrder = new Map<MessageId, number>();
+  /** Load-time audit result (see assertStoreTopology). */
+  private topologyViolations: TopologyViolation[] = [];
+  /** Merges refused by executeMerge because they would have minted a crossed node. */
+  private topologyRefusals = 0;
+
+  protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
+    if (messages.length === 0) return;
+    const order = new Map<MessageId, number>();
+    for (let i = 0; i < messages.length; i++) order.set(messages[i].id, i);
+    this._storeOrder = order;
+  }
+
+  /**
+   * Position per owned message id (chunk records ∪ live L1 sourceIds): store
+   * order where known, then any owned id the last listing did not contain
+   * (messages appended since) after it, in record order. Without any listing
+   * (hosts that drive the grouping without a store view) this degrades to
+   * record order.
+   */
+  protected mergePositionIndex(): Map<MessageId, number> {
+    // Ownership authority = chunk members ∪ live L1 sourceIds (an L1 is
+    // coverage even where its chunk record is missing; see ownedMessageIds).
+    const chunkMember = new Set<MessageId>();
+    const members: MessageId[] = [];
+    for (const ch of this.chunks) for (const m of ch.messages) if (!chunkMember.has(m.id)) { chunkMember.add(m.id); members.push(m.id); }
+    const seen = new Set(chunkMember);
+    for (const id of this.liveL1Ids()) {
+      const s = this.summaryById(id);
+      if (!s) continue;
+      for (const leaf of s.sourceIds) if (!seen.has(leaf)) { seen.add(leaf); members.push(leaf); }
+    }
+    const order = this._storeOrder;
+    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    const known = members.filter((id) => order.has(id)).sort((a, b) => order.get(a)! - order.get(b)!);
+    const index = new Map<MessageId, number>();
+    let position = 0;
+    for (const id of known) index.set(id, position++);
+    // A chunk member the listing lacks was appended since that listing: it
+    // is newer than everything listed. An L1 source the listing lacks is
+    // hidden (viewFilter) or pruned: it occupies no position at all.
+    for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
+    return index;
+  }
+
+  private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
+  private summaryById(id: string): SummaryEntry | undefined {
+    const cached = this._summaryIndex;
+    if (!cached || cached.source !== this.summaries || cached.length !== this.summaries.length) {
+      this._summaryIndex = { source: this.summaries, length: this.summaries.length, byId: new Map(this.summaries.map((s) => [s.id, s] as const)) };
+    }
+    return this._summaryIndex!.byId.get(id);
+  }
+
+  /**
+   * The L1s that are ownership: those a chunk record points at. Legacy
+   * archives keep superseded L1 generations (prefix families the migration
+   * sweep skipped); they are prose, not coverage. Without any chunk→L1 link
+   * (a strategy driven without records) every L1 counts.
+   */
+  protected liveL1Ids(): Set<string> {
+    const linked = new Set<string>();
+    for (const ch of this.chunks) if (ch.summaryId) linked.add(ch.summaryId);
+    if (linked.size > 0) return linked;
+    const all = new Set<string>();
+    for (const s of this.summaries) if (s.level === 1) all.add(s.id);
+    return all;
+  }
+
+  /** Split same-level sources into strictly adjacent runs (store order). Sources
+   *  whose range endpoints have no position are left out of every run. */
+  protected contiguousSourceRuns(
+    sources: readonly SummaryEntry[],
+    position: ReadonlyMap<MessageId, number>,
+  ): SummaryEntry[][] {
+    const placed: Array<{ s: SummaryEntry; first: number; last: number }> = [];
+    for (const s of sources) {
+      const a = position.get(s.sourceRange.first);
+      const b = position.get(s.sourceRange.last);
+      if (a === undefined || b === undefined) continue;
+      placed.push({ s, first: Math.min(a, b), last: Math.max(a, b) });
+    }
+    placed.sort((x, y) => x.first - y.first);
+    const runs: SummaryEntry[][] = [];
+    let run: SummaryEntry[] = [];
+    let end = -Infinity;
+    for (const p of placed) {
+      if (run.length > 0 && p.first !== end + 1) { runs.push(run); run = []; }
+      run.push(p.s);
+      end = Math.max(end, p.last);
+    }
+    if (run.length > 0) runs.push(run);
+    return runs;
+  }
+
+  /** Why this group must not be merged into an L{targetLevel}, or null when it may. */
+  protected mergeTopologyProblem(
+    targetLevel: number,
+    sources: readonly SummaryEntry[],
+    position: ReadonlyMap<MessageId, number>,
+  ): string | null {
+    if (sources.length < 2) return `${sources.length} source(s); a merge needs at least two`;
+    const wrongLevel = sources.filter((s) => s.level !== targetLevel - 1);
+    if (wrongLevel.length > 0) {
+      return `source level mismatch: ${wrongLevel.map((s) => `${s.id}=L${s.level}`).join(',')} for an L${targetLevel} merge`;
+    }
+    const unplaced = sources.filter((s) =>
+      position.get(s.sourceRange.first) === undefined || position.get(s.sourceRange.last) === undefined);
+    if (unplaced.length > 0) {
+      return `source position unresolved (pruned or unowned range endpoints): ${unplaced.map((s) => s.id).join(',')}`;
+    }
+    const runs = this.contiguousSourceRuns(sources, position);
+    if (runs.length !== 1) {
+      return `sources are not adjacent in store order: ` +
+        runs.map((r) => `[${r.map((s) => `${s.id}(${s.sourceRange.first}..${s.sourceRange.last})`).join(',')}]`).join(' | ');
+    }
+    return null;
+  }
+
+  /** The merge is never executed: no model call, sources stay unmerged, the
+   *  entry moves into the durable merge quarantine, health goes critical. */
+  protected refuseCrossedMerge(targetLevel: SummaryLevel, sourceIds: string[], reason: string): void {
+    this.requireBranchMutation('refuseCrossedMerge');
+    this.topologyRefusals++;
+    const head = this.mergeQueue[0];
+    const entry = head && head.sourceIds === sourceIds ? head : { level: targetLevel, sourceIds, attempts: 0 };
+    if (entry === head) this.dequeueMerge();
+    const record: MergeQuarantineRecord = {
+      key: sha256Json(sourceIds),
+      level: targetLevel,
+      sourceIds: [...sourceIds],
+      attempts: entry.attempts ?? 0,
+      lastOutcome: 'topology_violation',
+      lastErrorType: reason,
+      quarantinedAt: Date.now(),
+    };
+    this.mergeQuarantine.set(record.key, record);
+    this.persistMergeQuarantine();
+    console.error(
+      `[merge-topology] ⛔ refused L${targetLevel} merge over ${sourceIds.length} source(s) ` +
+        `(${sourceIds.join(', ')}): ${reason}. The node was NOT minted; entry quarantined ` +
+        `(key=${record.key.slice(0, 12)}). Inspect the store, then clearMergeQuarantine.`,
+    );
+    logCompressionCall({
+      event: 'merge:topology-refused',
+      operation: `merge_l${targetLevel}`,
+      metadata: { ...record },
+    });
+  }
+
+  /**
+   * Leaf-level ownership audit over the whole summary archive: every summary
+   * whose leaves are not contiguous among chunk-owned messages in store
+   * order. Read-only; safe to call on any loaded strategy.
+   */
+  auditStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): TopologyViolation[] {
+    this.refreshStoreOrder(messages);
+    const position = this.mergePositionIndex();
+    if (position.size === 0) return [];
+    const byPosition: MessageId[] = [];
+    for (const [id, p] of position) byPosition[p] = id;
+    const byId = new Map(this.summaries.map((s) => [s.id, s] as const));
+    const live = this.liveL1Ids();
+    const l1Owner = new Map<MessageId, string>();
+    for (const s of this.summaries) if (s.level === 1 && live.has(s.id)) for (const id of s.sourceIds) l1Owner.set(id, s.id);
+    const leaves = new Map<string, MessageId[]>();
+    const collect = (s: SummaryEntry, trail: Set<string>): MessageId[] => {
+      const cached = leaves.get(s.id);
+      if (cached) return cached;
+      if (trail.has(s.id)) return []; // cyclic sourceIds: reported by the pyramid checks, not here
+      trail.add(s.id);
+      let out: MessageId[];
+      // A superseded L1 generation owns nothing (see liveL1Ids).
+      if (s.sourceLevel === 0 || s.level === 1) out = live.has(s.id) ? [...s.sourceIds] : [];
+      else {
+        out = [];
+        for (const childId of s.sourceIds) {
+          const child = byId.get(childId);
+          if (child) out.push(...collect(child, trail));
+        }
+      }
+      trail.delete(s.id);
+      leaves.set(s.id, out);
+      return out;
+    };
+    const violations: TopologyViolation[] = [];
+    for (const s of this.summaries) {
+      const owned = new Set<number>();
+      for (const id of collect(s, new Set())) {
+        const p = position.get(id);
+        if (p !== undefined) owned.add(p);
+      }
+      if (owned.size < 2) continue;
+      let min = Infinity, max = -Infinity;
+      for (const p of owned) { if (p < min) min = p; if (p > max) max = p; }
+      const holes = max - min + 1 - owned.size;
+      if (holes === 0) continue;
+      const holeSample: string[] = [];
+      const holeOwners = new Set<string>();
+      for (let p = min; p <= max && (holeSample.length < 5 || holeOwners.size < 5); p++) {
+        if (owned.has(p)) continue;
+        const id = byPosition[p];
+        if (holeSample.length < 5) holeSample.push(id);
+        const owner = l1Owner.get(id);
+        if (owner && holeOwners.size < 5) holeOwners.add(owner);
+      }
+      violations.push({
+        id: s.id, level: s.level, leafCount: owned.size,
+        span: { first: byPosition[min], last: byPosition[max] },
+        holes, holeSample, holeOwners: [...holeOwners],
+      });
+    }
+    return violations;
+  }
+
+  /** Violations found by the load-time audit (empty under 'reject', which throws instead). */
+  getTopologyViolations(): readonly TopologyViolation[] {
+    return this.topologyViolations;
+  }
+
+  protected resolvedTopologyPolicy(): 'reject' | 'report' {
+    if (this.config.topologyPolicy) return this.config.topologyPolicy;
+    const kv = this.config.kvUnified;
+    if (kv && (kv.preserveGapBearingSummaries || kv.treeifyNonContiguousSummaries)) return 'report';
+    return 'reject';
+  }
+
+  /** Load-time gate: audit, then throw (reject) or record + shout (report). */
+  protected assertStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): void {
+    const violations = this.auditStoreTopology(messages);
+    this.topologyViolations = violations;
+    if (violations.length === 0) return;
+    const policy = this.resolvedTopologyPolicy();
+    const detail = violations.slice(0, 20).map((v) =>
+      `  L${v.level} ${v.id}: ${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
+      ` e.g. ${v.holeSample.join(',')}${v.holeOwners.length ? ` owned by ${v.holeOwners.join(',')}` : ''}`).join('\n');
+    console.error(
+      `[store-topology] ⛔ ${violations.length} summar${violations.length === 1 ? 'y owns' : 'ies own'} ` +
+        `non-contiguous leaves (policy=${policy}):\n${detail}` +
+        (violations.length > 20 ? `\n  … +${violations.length - 20} more` : ''),
+    );
+    logCompressionCall({
+      event: 'store-topology-violation',
+      policy,
+      count: violations.length,
+      violations: violations.slice(0, 50),
+    });
+    if (policy === 'reject') throw new StoreTopologyError(violations);
+  }
+
   /** Drop persisted queue entries authored under an older grouping grammar.
    * A queue is intent, not memory: if its sources are now parented, missing,
    * out of order, or separated by another live representation, replaying it
@@ -4070,15 +4376,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Sequence index per message id, for "within range" tests. Use the
-    // current chunk store as the ordering source.
-    const messageOrder = new Map<MessageId, number>();
-    let seq = 0;
-    for (const ch of this.chunks) {
-      for (const m of ch.messages) {
-        messageOrder.set(m.id, seq++);
-      }
-    }
+    // Position per chunk-owned message id in store order (see
+    // mergePositionIndex), for "within range" and contiguity tests.
+    const messageOrder = this.mergePositionIndex();
     const firstSeq = messageOrder.get(firstMsgId);
     const lastSeq = messageOrder.get(lastMsgId);
 
@@ -4100,8 +4400,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (sources.length < 2) return;
 
+    // The demand path used to take whatever unmerged sources fell inside the
+    // range, holes included (issue #95): a source whose neighbour's L1 had
+    // not landed yet was folded across it, minting a crossed node. Group by
+    // the same strict-adjacency grammar as the threshold path and take the
+    // longest contiguous run; the rest waits for its neighbours.
+    const runs = this.contiguousSourceRuns(sources, messageOrder);
+    const run = runs.reduce<SummaryEntry[]>((best, r) => (r.length > best.length ? r : best), []);
+    if (run.length < 2) {
+      console.warn(
+        `[autobiographical] demand L${targetLevel} merge over ${sources.length} source(s) in ` +
+          `${firstMsgId}..${lastMsgId} has no contiguous pair; nothing enqueued`,
+      );
+      return;
+    }
+    if (run.length !== sources.length) {
+      const left = sources.filter((s) => !run.includes(s)).map((s) => s.id);
+      console.warn(
+        `[autobiographical] demand L${targetLevel} merge split by a hole: enqueuing ` +
+          `${run.map((s) => s.id).join(',')}; ${left.join(',')} wait for contiguous neighbours`,
+      );
+    }
     const N = this.config.mergeThreshold ?? 6;
-    const toMerge = sources.slice(0, N);
+    const toMerge = run.slice(0, N);
     this.enqueueMerge({
       level: targetLevel as SummaryLevel,
       sourceIds: toMerge.map((s) => s.id),
@@ -4477,6 +4798,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     compressionQuarantineCount: number;
     unmergedFrontier: { l1: number; l2: number; l3: number };
     lastMintAt: number | null;
+    /** Summaries with crossed ownership found by the load-time audit (topologyPolicy 'report'). */
+    topologyViolations: number;
+    /** Merges refused this process because they would have minted a crossed node. */
+    topologyRefusals: number;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
@@ -4490,6 +4815,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       compressionQuarantineCount: 0,
       unmergedFrontier: { l1: 0, l2: 0, l3: 0 },
       lastMintAt: null,
+      topologyViolations: 0,
+      topologyRefusals: 0,
     };
     try {
       // Exclude the trailing open chunk: it is life, not debt.
@@ -4535,6 +4862,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ) {
         state = 'critical';
       }
+      // Crossed ownership is never a matter of waiting: it is critical until
+      // an operator repairs the store (or the refused merge group).
+      if (this.topologyViolations.length > 0 || this.topologyRefusals > 0) state = 'critical';
       return {
         state,
         pendingChunks: pending.length,
@@ -4549,6 +4879,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           l3: this.summaries.filter((s) => s.level === 3 && !s.mergedInto).length,
         },
         lastMintAt,
+        topologyViolations: this.topologyViolations.length,
+        topologyRefusals: this.topologyRefusals,
       };
     } catch {
       return empty;
@@ -6803,11 +7135,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     threshold: number,
   ): SummaryEntry[] | null {
     if (unmerged.length < threshold) return null;
-    const messageOrder = new Map<MessageId, number>();
-    let seq = 0;
-    for (const ch of this.chunks) {
-      for (const m of ch.messages) messageOrder.set(m.id, seq++);
-    }
+    // Store order, not chunk-record order: a chunk minted late over an early
+    // message (issue #122's head ratchet) is adjacent to the frontier in
+    // record order and to the chronicle's opening in store order.
+    const messageOrder = this.mergePositionIndex();
     const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
     const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
@@ -7009,6 +7340,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
           `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
       );
+      return;
+    }
+
+    // Last line of defence: a crossed node is never minted. Whatever enqueued
+    // this group (threshold pass, demand path, a persisted queue from an older
+    // grammar, an operator), the sources must be one level below the target
+    // and strictly adjacent among chunk-owned messages in store order.
+    this.refreshStoreOrder(ctx.messageStore.getAll());
+    const topology = this.mergeTopologyProblem(targetLevel, sources, this.mergePositionIndex());
+    if (topology) {
+      this.refuseCrossedMerge(targetLevel, sourceIds, topology);
       return;
     }
 
@@ -7713,6 +8055,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store);
     const messages = store.getAll();
+    this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
     const msgCap = this.config.maxMessageTokens;
     // Post-strip estimates (see postStripEstimates): every budgeting site in
@@ -10167,7 +10510,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
     const byId = new Map<string, StoredMessage>();
-    for (const m of store.getAll()) byId.set(m.id, m);
+    const listing = store.getAll();
+    this.refreshStoreOrder(listing);
+    for (const m of listing) byId.set(m.id, m);
 
     const consumed = new Set<string>();
     let orphaned = 0;

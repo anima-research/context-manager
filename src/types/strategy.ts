@@ -885,6 +885,23 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /**
+   * Store-topology policy. On every load the summary archive is audited for
+   * crossed ownership: a summary whose leaves are not contiguous among the
+   * chunk-owned messages in store order (an interleaved live representation
+   * sits inside its span — issue #122's cross-era merges, restore/branch
+   * interleavings, hand surgery). `'reject'` (default) throws
+   * `StoreTopologyError` from `initialize`, so `ContextManager.open` fails
+   * and the operator repairs the store before the resident runs on it.
+   * `'report'` logs the violations at error level and reports them through
+   * `getCompressionDebt().topologyViolations` (state `critical`).
+   * A kv-unified config that explicitly opts into gap handling
+   * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
+   * defaults to `'report'`: those stores are known to carry gaps.
+   * Independent of this policy, a merge that WOULD mint a crossed node is
+   * never executed: it is refused into the merge quarantine.
+   */
+  topologyPolicy?: 'reject' | 'report';
   /** Legacy first-choice target-only merge request. Default false. */
   compressionMergeSourceOnly?: boolean;
   /** Use target-only merge request only on the final persisted merge attempt. Default false. */

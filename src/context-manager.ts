@@ -345,9 +345,18 @@ export class ContextManager {
       auxiliaryStores,
     );
 
-    // Initialize strategy
+    // Initialize strategy. A strategy that refuses the store (e.g.
+    // StoreTopologyError) must not leave a store we opened locked behind a
+    // rejected promise: release it, then rethrow.
     const openingBranch = observeStoreBranch(store);
-    await manager.initializeStrategy(openingBranch);
+    try {
+      await manager.initializeStrategy(openingBranch);
+    } catch (error) {
+      if (ownsStore) {
+        try { store.close(); } catch { /* the initialize error is the one to report */ }
+      }
+      throw error;
+    }
     manager.initialized = true;
 
     return manager;
