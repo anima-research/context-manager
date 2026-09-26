@@ -4265,7 +4265,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!chunk || chunk.compressed) return;
       // A chunk that closed before a hold was placed (holdCompression after
       // the fact) waits; the rebuild after release re-queues it.
-      if (this.chunkHasHeldMessage(chunk, ctx.messageStore)) return;
+      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
@@ -5344,7 +5344,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const allMessages = ctx.messageStore.getAll();
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    // Compression holds: provisional content never enters a prompt, not even
+    // as head context (a reset head can sit past the hold boundary).
+    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
 
     // ---- Prior recall set (the unmerged frontier) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -7137,7 +7139,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // covered by a live summary renders via its recall pair; one inside
     // the merge tree renders in the TARGET expansion. Never raw here too.
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    // Compression holds: provisional content never enters a prompt, not even
+    // as head context (a reset head can sit past the hold boundary).
+    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -10054,7 +10058,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const messages = ctx.messageStore.getAll();
     const headStart = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEnd = this.getHeadWindowEnd(ctx.messageStore);
+    const headEnd = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
     const headMessages = messages.slice(headStart, headEnd);
 
     // Format head content, truncated to ~2000 tokens (~8000 chars)
@@ -10221,11 +10225,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Queue uncompressed record-backed chunks (crash-recovery: record was
     // appended but the process died before its L1 landed).
+    const holdBlocked = this.holdBlockedIds(store);
     for (const chunk of this.chunks) {
       if (
         !chunk.compressed &&
         !(chunk.recordId && this._overlapBlocked.has(chunk.recordId)) &&
-        !this.chunkHasHeldMessage(chunk, store)
+        !this.chunkHasHeldMessage(chunk, holdBlocked)
       ) {
         this.compressionQueue.push(chunk.index);
       }
@@ -10651,18 +10656,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * holds (or a view without the predicate) this returns `start` unchanged.
    */
   protected clampRecentStartToHolds(store: MessageStoreView, start: number): number {
+    return Math.min(start, this.holdBoundary(store));
+  }
+
+  /** Timeline scans performed by holdBoundary (test instrumentation). */
+  protected holdBoundaryScans = 0;
+
+  /**
+   * Index where the hold region begins: the earliest held message, stepped
+   * back onto the tool_use a held tool_result answers. `store.length()` when
+   * nothing is held — and then without scanning the timeline.
+   */
+  protected holdBoundary(store: MessageStoreView): number {
     const isHeld = store.isCompressionHeld;
-    if (!isHeld) return start;
-    const messages = store.getAll();
-    let boundary = start;
-    for (let i = 0; i < start; i++) {
-      if (isHeld.call(store, messages[i].id)) { boundary = i; break; }
+    if (!isHeld || (store.hasCompressionHolds && !store.hasCompressionHolds())) {
+      return store.length();
     }
-    if (boundary === start) return start;
-    // Same pairing rule as the token boundary: a held tool_result keeps its
-    // tool_use with it.
-    if (boundary > 0 && this.hasToolResult(messages[boundary])) boundary--;
-    return boundary;
+    this.holdBoundaryScans++;
+    const messages = store.getAll();
+    for (let i = 0; i < messages.length; i++) {
+      if (isHeld.call(store, messages[i].id)) {
+        return i > 0 && this.hasToolResult(messages[i]) ? i - 1 : i;
+      }
+    }
+    return messages.length;
+  }
+
+  /**
+   * Ids at or after the hold boundary (null when nothing is held). Compute
+   * once per pass and test chunks against it with chunkHasHeldMessage.
+   */
+  protected holdBlockedIds(store: MessageStoreView): Set<string> | null {
+    const boundary = this.holdBoundary(store);
+    if (boundary >= store.length()) return null;
+    const messages = store.getAll();
+    const blocked = new Set<string>();
+    for (let i = boundary; i < messages.length; i++) blocked.add(messages[i].id);
+    return blocked;
   }
 
   /**
@@ -10672,13 +10702,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * compression request would otherwise carry the provisional content (as
    * the chunk itself or as its lead-in context).
    */
-  protected chunkHasHeldMessage(chunk: Chunk, store: MessageStoreView): boolean {
-    if (!store.isCompressionHeld) return false;
-    const messages = store.getAll();
-    const boundary = this.clampRecentStartToHolds(store, messages.length);
-    if (boundary >= messages.length) return false;
-    const blocked = new Set<string>();
-    for (let i = boundary; i < messages.length; i++) blocked.add(messages[i].id);
+  protected chunkHasHeldMessage(chunk: Chunk, blocked: Set<string> | null): boolean {
+    if (!blocked) return false;
     return chunk.messages.some((m) => blocked.has(m.id));
   }
 

@@ -10,3 +10,7 @@
   summaries, so edit while held, then release. Holds are in-memory only; a
   reopened manager starts with none. With no holds, chunking, compression
   requests and compiled context are unchanged.
+  Held content is also kept out of compression, merge and transition-summary
+  prompts' head context (a reset head window can sit past the hold), and
+  hold checks cost nothing when no hold exists (one timeline scan per pass
+  otherwise).

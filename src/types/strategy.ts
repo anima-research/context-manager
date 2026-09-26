@@ -33,6 +33,8 @@ export interface MessageStoreView {
    * answers. Absent on views not built by a ContextManager ⇒ nothing held.
    */
   isCompressionHeld?(id: MessageId): boolean;
+  /** Fast path: whether any hold exists (lets strategies skip scanning). */
+  hasCompressionHolds?(): boolean;
 }
 
 /**

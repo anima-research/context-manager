@@ -201,4 +201,67 @@ describe('compression holds', () => {
     assert.strictEqual(manager.getCompressionHolds().size, 0);
     manager.close();
   });
+
+  it('moved head window: a held result inside the head never reaches compression prompts', async () => {
+    const { prompts, membrane } = recordingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 50,
+      headWindowTokens: 200,
+      recentWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      l1HoldbackChunks: 0,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    manager.setToolDefinitions([
+      { name: 'search', description: 'search', inputSchema: { type: 'object', properties: {} } },
+    ]);
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: filler(30) }]);
+    }
+    const useId = manager.addMessage('Claude', [
+      { type: 'text', text: filler(20) },
+      { type: 'tool_use', id: 'tu-1', name: 'search', input: { q: filler(10) } },
+    ]);
+    strategy.resetHeadWindow(useId);
+    const resultId = manager.addMessage(
+      'User',
+      [{ type: 'tool_result', toolUseId: 'tu-1', content: PLACEHOLDER }],
+      undefined,
+      undefined,
+      { holdCompression: true },
+    );
+    for (let i = 0; i < 4; i++) {
+      manager.addMessage(i % 2 === 0 ? 'Claude' : 'User', [{ type: 'text', text: filler(30) }]);
+    }
+    await drain(manager, strategy);
+    assert.ok(prompts.length > 0, 'setup: older chunks compressed');
+    assert.ok(manager.getCompressionHolds().has(resultId));
+    assert.ok(!prompts.some((p) => p.includes(PLACEHOLDER)), 'held placeholder leaked via head context');
+    // Pairing: the tool_use must not appear without its result either.
+    assert.ok(!prompts.some((p) => p.includes('tu-1')), 'orphan tool_use in head context');
+    manager.close();
+  });
+
+  it('rebuild does not rescan the timeline per chunk (and not at all with no holds)', async () => {
+    const { membrane } = recordingMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    for (let i = 0; i < 80; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: filler(30) }]);
+    }
+    const s = strategy as unknown as { holdBoundaryScans: number; chunks: unknown[] };
+    await manager.compile();
+    assert.ok(s.chunks.length >= 10, 'setup: many uncompressed chunks');
+    assert.strictEqual(s.holdBoundaryScans, 0, 'no holds → no hold scans');
+
+    const lastId = manager.getAllMessages().at(-1)!.id;
+    manager.holdCompression([lastId]);
+    const before = s.holdBoundaryScans;
+    await manager.compile();
+    const scans = s.holdBoundaryScans - before;
+    assert.ok(scans > 0 && scans <= 4, `bounded scans per compile, got ${scans} for ${s.chunks.length} chunks`);
+    manager.close();
+  });
 });

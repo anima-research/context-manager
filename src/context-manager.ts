@@ -226,6 +226,7 @@ export class ContextManager {
     // view built above is a fresh object, so this never leaks into a store.
     const holds = this.compressionHolds;
     view.isCompressionHeld = (id: MessageId) => holds.has(id);
+    view.hasCompressionHolds = () => holds.size > 0;
     return view;
   }
 
