@@ -105,6 +105,24 @@ describe('planTopologyRepair', () => {
     assert.equal(detachOnly.remaining.length, 0);
   });
 
+  test('a small hole deep inside a tower is closed by adopting its owner downward', () => {
+    // L3 over L2-a (L1-0..L1-2) and L2-b (L1-4..L1-6); L1-3 is an unmerged root
+    // sitting between them. The L3 (and only the L3) is crossed.
+    const l1s = [0, 1, 2, 3, 4, 5, 6].map((i) => l1(`L1-${i}`, i * 10, i * 10 + 9));
+    const summaries = [...l1s, up('L2-a', 2, ['L1-0', 'L1-1', 'L1-2'], 0, 29, 'L3'), up('L2-b', 2, ['L1-4', 'L1-5', 'L1-6'], 40, 69, 'L3'), up('L3', 3, ['L2-a', 'L2-b'], 0, 69)];
+    for (const i of [0, 1, 2]) l1s[i].mergedInto = 'L2-a';
+    for (const i of [4, 5, 6]) l1s[i].mergedInto = 'L2-b';
+    const records = [0, 1, 2, 3, 4, 5, 6].map((i) => rec(`c-${i}`, i * 10, i * 10 + 9, `L1-${i}`));
+    const plan = planTopologyRepair({ summaries, records, messages: msgs(70) }, { mode: 'compact' });
+    assert.deepEqual(plan.adopted, [{ id: 'L1-3', level: 1, into: 'L2-a', leaves: 10 }], 'adopted into the adjacent L2, not the L3');
+    assert.equal(plan.detached.length, 0);
+    assert.equal(plan.depthLostLeaves, 0);
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L2-a')!.sourceIds, ['L1-0', 'L1-1', 'L1-2', 'L1-3']);
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L2-a')!.sourceRange, { first: 'm-0', last: 'm-39' });
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L3')!.sourceRange, { first: 'm-0', last: 'm-69' });
+    assert.equal(plan.remaining.length, 0);
+  });
+
   test('a detached fragment is re-homed under the adjacent sibling so the ancestor keeps no hole', () => {
     // L2-a owns L1-0..L1-2 plus the stray L1-9 (leaves 90..99) — stray for L2-a,
     // but adjacent to L2-c (L1-6..L1-8). L3 over a,b,c must stay contiguous.

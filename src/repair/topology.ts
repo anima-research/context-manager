@@ -397,29 +397,66 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       // compared by leaves moved — unless some fragment has no home, in which
       // case detaching would unravel every ancestor and adoption wins.
       if (compact) {
-        const owners = ownerAtLevel().get(level - 1) ?? new Map<number, string>();
+        // Every hole must be owned by a root (any level below this summary,
+        // not under it). Each such root is adopted DOWNWARD: into the
+        // descendant of this summary one level above the root whose span is
+        // adjacent to it (the crossed summary itself when the root is one
+        // level down). The hole closes where it is; nothing above unravels.
+        const allOwners = ownerAtLevel();
         const have = new Set(ps);
-        const candidates = new Set<string>();
+        const candidates = new Map<string, RepairSummary>();
         let adoptable = true;
         for (let p = ps[0]; p <= ps[ps.length - 1]; p++) {
           if (have.has(p)) continue;
-          const owner = owners.get(p);
-          const o = owner ? v.byId.get(owner) : undefined;
-          if (!o || parentOf(o) !== undefined || o.id === s.id) { adoptable = false; break; }
-          candidates.add(o.id);
+          let top: RepairSummary | undefined;
+          for (let lv = level - 1; lv >= 1 && !top; lv--) {
+            const id = allOwners.get(lv)?.get(p);
+            const o = id ? v.byId.get(id) : undefined;
+            if (o && parentOf(o) === undefined) top = o;
+          }
+          if (!top || top.id === s.id) { adoptable = false; break; }
+          candidates.set(top.id, top);
         }
+        // The adopter for a root R at level j: the descendant of S at level j+1
+        // whose span is adjacent to R (S itself when j+1 === S.level).
+        const adopterFor = (root: RepairSummary): RepairSummary | undefined => {
+          const rp = positions(v, root);
+          if (rp.length === 0) return undefined;
+          const rmin = rp[0], rmax = rp[rp.length - 1];
+          let frontier: RepairSummary[] = [s];
+          for (let lv = level; lv > root.level + 1; lv--) {
+            const next: RepairSummary[] = [];
+            for (const f of frontier) for (const cid of f.sourceIds) { const c = v.byId.get(cid); if (c) next.push(c); }
+            frontier = next;
+          }
+          let best: RepairSummary | undefined;
+          for (const c of frontier) {
+            if (c.level !== root.level + 1) continue;
+            if (c.id === s.id) { best = c; break; } // the hole is inside S by definition
+            const cp = positions(v, c);
+            if (cp.length === 0) continue;
+            if (cp[cp.length - 1] + 1 === rmin || rmax + 1 === cp[0]) { best = c; break; }
+          }
+          return best;
+        };
         if (adoptable && candidates.size > 0) {
-          let adoptedLeaves = 0;
-          for (const id of candidates) adoptedLeaves += positions(v, v.byId.get(id)!).length;
-          const exclude = new Set([s.id]);
-          const allHomeable = fragments.every((x) => homeFor(x, exclude) !== undefined);
-          if (adoptedLeaves <= fragmentLeaves || !allHomeable) {
-            for (const id of candidates) {
-              const o = v.byId.get(id)!;
-              insertChild(s, id);
-              plan.adopted.push({ id, level: o.level, into: s.id, leaves: positions(v, o).length });
+          const targets = new Map<string, RepairSummary>();
+          for (const [id, root] of candidates) { const t = adopterFor(root); if (!t) { adoptable = false; break; } targets.set(id, t); }
+          if (adoptable) {
+            let adoptedLeaves = 0;
+            for (const [, root] of candidates) adoptedLeaves += positions(v, root).length;
+            const exclude = new Set([s.id]);
+            const allHomeable = fragments.every((x) => homeFor(x, exclude) !== undefined);
+            if (adoptedLeaves <= fragmentLeaves || !allHomeable) {
+              for (const [id, root] of candidates) {
+                const t = targets.get(id)!;
+                const leaves = positions(v, root).length;
+                insertChild(t, id);
+                plan.adopted.push({ id, level: root.level, into: t.id, leaves });
+                v = view(summaries, records, storeOrder);
+              }
+              continue;
             }
-            continue;
           }
         }
       }
