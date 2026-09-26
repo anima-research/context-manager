@@ -8528,8 +8528,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   static readonly CALIBRATION_PRICING_EPOCH = 1;
 
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0;
+    })),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
   /** Load the persisted multiplier once and push it into the store view.
-   *  A multiplier from another pricing epoch is discarded (start at 1). */
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a newer epoch is not used. */
   protected loadCalibration(store: MessageStoreView): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
@@ -8543,6 +8571,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+          } else if (epoch < current && !this.calibrationRepricedSince(epoch, store.getAll())) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            console.warn(
+              `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                `(current ${current}): this store holds no content repriced since then; re-stamped`,
+            );
+            try {
+              this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now(), pricing: current });
+            } catch { /* persistence is best-effort */ }
           } else {
             const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch: epoch, at: Date.now() };
             console.warn(
