@@ -128,6 +128,31 @@ describe('planTopologyRepair', () => {
     assert.equal(plan.remaining.length, 0);
   });
 
+  test('rebuild dissolves the crossed summary, everything overlapping its region, and their ancestors', () => {
+    // L2-x skipped L1-1 and L1-5 (roots). L2-y (L1-7..L1-9) is clean; both L2s sit under L3.
+    const summaries = [
+      ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => l1(`L1-${i}`, i * 10, i * 10 + 9)),
+      up('L2-x', 2, ['L1-0', 'L1-2', 'L1-3', 'L1-4', 'L1-6'], 0, 69, 'L3'),
+      up('L2-y', 2, ['L1-7', 'L1-8', 'L1-9'], 70, 99, 'L3'),
+      up('L3', 3, ['L2-x', 'L2-y'], 0, 99),
+    ];
+    for (const id of ['L1-0', 'L1-2', 'L1-3', 'L1-4', 'L1-6']) summaries.find((s) => s.id === id)!.mergedInto = 'L2-x';
+    for (const id of ['L1-7', 'L1-8', 'L1-9']) summaries.find((s) => s.id === id)!.mergedInto = 'L2-y';
+    const records = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => rec(`c-${i}`, i * 10, i * 10 + 9, `L1-${i}`));
+    const resolutions = Object.fromEntries(ids(0, 99).map((id) => [id, 3]));
+    const plan = planTopologyRepair({ summaries, records, messages: msgs(100), resolutions }, { mode: 'rebuild' });
+    assert.deepEqual(plan.dissolvedForRebuild.map((d) => d.id).sort(), ['L2-x', 'L3'], 'the crossed L2 and its ancestor; the clean sibling L2-y survives as a root');
+    const left = plan.result.summaries;
+    assert.ok(!left.some((s) => s.id === 'L2-x' || s.id === 'L3'));
+    for (const id of ['L1-0', 'L1-1', 'L1-2', 'L1-3', 'L1-4', 'L1-5', 'L1-6', 'L2-y']) assert.equal(left.find((s) => s.id === id)!.mergedInto, undefined, `${id} is a root`);
+    assert.equal(left.find((s) => s.id === 'L1-7')!.mergedInto, 'L2-y');
+    assert.equal(plan.exposedL1Leaves, 50, 'the five children of L2-x drop to L1; the two hole owners already were');
+    assert.equal(plan.result.resolutions['m-0'], 1, 'a rebuilt region renders at L1');
+    assert.equal(plan.result.resolutions['m-70'], 2, 'the surviving L2 keeps its depth');
+    assert.equal(plan.remaining.length, 0);
+    assert.equal(plan.detached.length + plan.adopted.length + plan.rehomed.length, 0);
+  });
+
   test('a crossed L1 keeps its largest run and releases the stray messages from its record', () => {
     const stray = { ...l1('L1-x', 40, 43), sourceIds: ['m-3', ...ids(40, 43)], sourceRange: { first: 'm-3', last: 'm-43' } };
     const summaries = [l1('L1-0', 4, 19), l1('L1-1', 20, 39), stray];

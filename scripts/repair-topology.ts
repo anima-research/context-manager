@@ -14,7 +14,11 @@
  * lossless (default) only detaches: no prose ever claims content it did not
  * see, but the pyramid unravels around each fragment (reported as leaves that
  * lost a fold level). compact adopts and re-homes as well: depth is kept, at
- * the price of prose gaps (reported as leaves). Neither makes model calls.
+ * the price of prose gaps (reported as leaves). rebuild dissolves every
+ * summary whose span touches a crossed region (and their ancestors) back to
+ * L1s so the merge ladder re-folds the region with real summarizer calls —
+ * run scripts/drain-autobiographical.ts on the stopped store afterwards.
+ * None of the modes makes model calls itself.
  *
  * After --apply the store is reopened with topologyPolicy 'reject'; the run
  * fails if the audit still finds a crossed summary.
@@ -31,7 +35,7 @@ const storePath = args.find((a) => !a.startsWith('--'));
 const flag = (name: string): string | undefined => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const namespace = flag('--namespace');
 if (!storePath || !namespace) {
-  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--release-head-limit <n>] [--mode lossless|compact] [--json] [--messages-state <id>]');
+  console.error('usage: repair-topology <store-path> --namespace <ns> [--apply] [--release-head[=moved|all]] [--release-head-limit <n>] [--mode lossless|compact|rebuild] [--json] [--messages-state <id>]');
   process.exit(1);
 }
 const apply = args.includes('--apply');
@@ -39,8 +43,8 @@ const json = args.includes('--json');
 const releaseHead: false | 'moved' | 'all' = args.includes('--release-head=all') ? 'all' : (args.includes('--release-head') || args.includes('--release-head=moved')) ? 'moved' : false;
 const releaseHeadLimit = flag('--release-head-limit') !== undefined ? Number(flag('--release-head-limit')) : undefined;
 if (releaseHeadLimit !== undefined && !(releaseHeadLimit > 0)) { console.error('--release-head-limit must be a positive number of messages'); process.exit(1); }
-const mode = (flag('--mode') ?? 'lossless') as 'lossless' | 'compact';
-if (mode !== 'lossless' && mode !== 'compact') { console.error(`--mode must be lossless or compact, got ${mode}`); process.exit(1); }
+const mode = (flag('--mode') ?? 'lossless') as 'lossless' | 'compact' | 'rebuild';
+if (mode !== 'lossless' && mode !== 'compact' && mode !== 'rebuild') { console.error(`--mode must be lossless, compact or rebuild, got ${mode}`); process.exit(1); }
 const messagesState = flag('--messages-state') ?? 'messages';
 
 const store = JsStore.open({ path: storePath });
@@ -64,7 +68,7 @@ const summary = {
   crossedBefore: plan.before.length, iterations: plan.iterations,
   adopted: plan.adopted, detached: plan.detached, rehomed: plan.rehomed, splitL1: plan.splitL1, dissolved: plan.dissolved, released: plan.released,
   rangeChanges: plan.rangeChanges, resolutionsClamped: plan.resolutionsClamped, resolutionsCleared: plan.resolutionsCleared,
-  proseGapLeaves: plan.proseGapLeaves, depthLostLeaves: plan.depthLostLeaves,
+  proseGapLeaves: plan.proseGapLeaves, depthLostLeaves: plan.depthLostLeaves, dissolvedForRebuild: plan.dissolvedForRebuild, exposedL1Leaves: plan.exposedL1Leaves,
   remaining: plan.remaining,
   after: { summaries: plan.result.summaries.length, records: plan.result.records.length },
 };
@@ -78,6 +82,11 @@ else {
   for (const r of plan.rehomed) console.log(`  re-home ${r.id} (${r.leaves} leaves) from ${r.from} into ${r.into}`);
   for (const s of plan.splitL1) console.log(`  split L1 ${s.id}: keep ${s.kept}, release ${s.released.join(',')}`);
   for (const d of plan.dissolved) console.log(`  dissolve L${d.level} ${d.id} (single source ${d.child})`);
+  if (plan.dissolvedForRebuild.length) {
+    const byLevel: Record<string, number> = {};
+    for (const d of plan.dissolvedForRebuild) byLevel[`L${d.level}`] = (byLevel[`L${d.level}`] ?? 0) + 1;
+    console.log(`  rebuild: dissolve ${plan.dissolvedForRebuild.length} summaries (${Object.entries(byLevel).map(([k, n]) => `${k}:${n}`).join(' ')}) — ${plan.exposedL1Leaves} leaves exposed at L1 until re-folded; ≈${plan.dissolvedForRebuild.length} summarizer merges to regenerate`);
+  }
   for (const r of plan.released) console.log(`  release head record ${r.record}${r.summaryId ? ` + ${r.summaryId}` : ''}: ${r.leaves.join(',')}`);
   for (const r of plan.rangeChanges) console.log(`  range ${r.id}: ${r.from.first}..${r.from.last} → ${r.to.first}..${r.to.last}`);
   console.log(`  cost: ${plan.proseGapLeaves} leaves under prose that never covered them; ${plan.depthLostLeaves} leaves lost a fold level; resolutions ${plan.resolutionsClamped} clamped, ${plan.resolutionsCleared} cleared`);
@@ -92,6 +101,7 @@ store.setStateJson(sumsState, plan.result.summaries);
 store.setStateJson(chunksState, plan.result.records);
 store.setStateJson(resolutionsState, plan.result.resolutions);
 store.close();
+if (mode === 'rebuild') console.error(`APPLIED (rebuild): ${plan.dissolvedForRebuild.length} summaries dissolved, ${plan.exposedL1Leaves} leaves at L1. Re-fold offline before restarting the resident:\n  node dist/scripts/drain-autobiographical.js ${storePath} ${namespace} --apply --model=<resident-model> --participant=<resident> --recipe=<recipe.json>`);
 console.error('APPLIED; verifying with the load-time audit (topologyPolicy reject)…');
 try {
   const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, topologyPolicy: 'reject', auditOnly: true });

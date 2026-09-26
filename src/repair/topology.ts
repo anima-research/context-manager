@@ -76,8 +76,13 @@ export interface RepairOptions {
    * `compact`: also adopt unparented hole owners and re-home fragments under
    * adjacent summaries, which keeps the pyramid's depth at the price of
    * prose that does not cover the moved content (`proseGapLeaves`).
+   * `rebuild`: dissolve every summary above L1 whose span touches a crossed
+   * region, and their ancestors, back to unparented L1s (`dissolvedForRebuild`,
+   * `exposedL1Leaves`); the merge ladder then re-folds the region bottom-up
+   * with real summarizer calls — run `drain-autobiographical` on the stopped
+   * store before restarting, or the resident pays the token spike live.
    */
-  mode?: 'lossless' | 'compact';
+  mode?: 'lossless' | 'compact' | 'rebuild';
   maxIterations?: number;
 }
 export interface Crossed {
@@ -105,6 +110,10 @@ export interface RepairPlan {
   proseGapLeaves: number;
   /** Leaves whose deepest available fold level dropped (ancestors unravelled). */
   depthLostLeaves: number;
+  /** rebuild: summaries dissolved so the ladder re-folds their regions (≈ merges to regenerate). */
+  dissolvedForRebuild: Array<{ id: string; level: number; leaves: number }>;
+  /** rebuild: leaves now exposed at L1 until the ladder re-folds them. */
+  exposedL1Leaves: number;
   /** Crossed summaries the plan could not resolve (empty on success). */
   remaining: Crossed[];
   result: { summaries: RepairSummary[]; records: RepairRecord[]; resolutions: Record<string, number> };
@@ -186,13 +195,16 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
   const storeOrder = new Map(inputs.messages.map((m, i) => [String(m.id), i] as const));
   const plan: RepairPlan = {
     iterations: 0, before: [], adopted: [], detached: [], rehomed: [], splitL1: [], dissolved: [], released: [], rangeChanges: [],
-    resolutionsClamped: 0, resolutionsCleared: 0, proseGapLeaves: 0, depthLostLeaves: 0, remaining: [], result: { summaries, records, resolutions },
+    resolutionsClamped: 0, resolutionsCleared: 0, proseGapLeaves: 0, depthLostLeaves: 0, dissolvedForRebuild: [], exposedL1Leaves: 0,
+    remaining: [], result: { summaries, records, resolutions },
   };
   const depthBefore = leafDepths(view(inputs.summaries as RepairSummary[], inputs.records as RepairRecord[], storeOrder));
   const originalRange = new Map(summaries.map((s) => [s.id, { ...s.sourceRange }] as const));
   const touched = new Set<string>();
   const detachedIds = new Set<string>();
-  const compact = (options.mode ?? 'lossless') === 'compact';
+  const mode = options.mode ?? 'lossless';
+  const compact = mode === 'compact';
+  const rebuild = mode === 'rebuild';
   const maxIterations = options.maxIterations ?? 32;
 
   let v = view(summaries, records, storeOrder);
@@ -227,11 +239,77 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     touched.add(parent.id);
   };
 
+  if (rebuild) {
+    // Dissolve each crossed summary (level ≥ 2) and its ancestors, so its
+    // children and the owners of its holes become roots. A child run that is
+    // then a lone node with no unparented same-level neighbour would never
+    // fold again (the ladder merges adjacent unparented runs only), so the
+    // tower over one adjacent neighbour is dissolved down to that neighbour's
+    // level as well — the side with fewer leaves. Everything else stands; the
+    // ladder re-folds the affected regions bottom-up with real summaries.
+    // Crossed L1s are handled by the ordinary split below.
+    v = view(summaries, records, storeOrder);
+    const crossed = crossedOf(v, alive()).filter((c) => c.level >= 2);
+    if (crossed.length > 0) {
+      plan.iterations = 1;
+      const dissolve = new Set<string>();
+      const closeUp = (id: string): void => {
+        let cur = v.byId.get(id);
+        const trail = new Set<string>();
+        while (cur && !trail.has(cur.id)) { trail.add(cur.id); const p = parentOf(cur); if (!p || !v.byId.has(p)) break; dissolve.add(p); cur = v.byId.get(p); }
+      };
+      for (const c of crossed) { dissolve.add(c.id); closeUp(c.id); }
+      // Partners: for each crossed summary's child runs, ensure a neighbour.
+      const owners = ownerAtLevel();
+      const willBeRoot = (id: string): boolean => {
+        const s = v.byId.get(id);
+        if (!s) return false;
+        const p = parentOf(s);
+        return p === undefined || dissolve.has(p);
+      };
+      for (const c of crossed) {
+        const s = v.byId.get(c.id)!;
+        const childLevel = s.level - 1;
+        const spans = s.sourceIds.map((childId) => { const ch = v.byId.get(childId); const ps = ch ? positions(v, ch) : []; return { childId, min: ps[0], max: ps[ps.length - 1], count: ps.length }; })
+          .filter((x) => x.count > 0).sort((a, b) => a.min - b.min);
+        const runs: Array<typeof spans> = [];
+        let run: typeof spans = []; let end = -Infinity;
+        for (const x of spans) { if (run.length && x.min !== end + 1) { runs.push(run); run = []; } run.push(x); end = Math.max(end, x.max); }
+        if (run.length) runs.push(run);
+        const atLevel = owners.get(childLevel) ?? new Map<number, string>();
+        for (const r of runs) {
+          if (r.length >= 2) continue; // merges by itself once its parent is gone
+          const lo = r[0].min - 1, hi = r[r.length - 1].max + 1;
+          const sides = [lo, hi].map((p) => atLevel.get(p)).filter((id): id is string => id !== undefined && id !== s.id);
+          if (sides.some((id) => willBeRoot(id))) continue; // an unparented neighbour (or a sibling child of S) is a partner
+          if (sides.length === 0) continue; // store edge or unowned: nothing to fold with; stays a root
+          // Free the smaller neighbour by dissolving its parent chain.
+          const pick = sides.map((id) => ({ id, leaves: positions(v, v.byId.get(id)!).length })).sort((a, b) => a.leaves - b.leaves)[0].id;
+          const parent = parentOf(v.byId.get(pick)!);
+          if (parent && v.byId.has(parent)) { dissolve.add(parent); closeUp(parent); }
+        }
+      }
+      for (const id of dissolve) {
+        const s = v.byId.get(id);
+        if (!s) continue;
+        const leaves = positions(v, s).length;
+        for (const childId of s.sourceIds) { const ch = v.byId.get(childId); if (ch && !dissolve.has(ch.id)) setParent(ch, undefined); }
+        const parent = parentOf(s);
+        if (parent && !dissolve.has(parent)) { const p = v.byId.get(parent); if (p) { p.sourceIds = p.sourceIds.filter((x) => x !== id); touched.add(p.id); } }
+        plan.dissolvedForRebuild.push({ id, level: s.level, leaves });
+      }
+      for (const id of dissolve) remove(id);
+      v = view(summaries, records, storeOrder);
+      const depthNow = leafDepths(v);
+      for (const [leaf, d] of depthBefore) if (d > 1 && (depthNow.get(leaf) ?? 0) === 1) plan.exposedL1Leaves++;
+    }
+  }
+
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
     v = view(summaries, records, storeOrder);
     const crossed = crossedOf(v, alive());
     if (crossed.length === 0) break;
-    plan.iterations = iteration;
+    plan.iterations = Math.max(plan.iterations, iteration);
     const level = Math.min(...crossed.map((c) => c.level));
     for (const c of crossed.filter((x) => x.level === level)) {
       v = view(summaries, records, storeOrder);
