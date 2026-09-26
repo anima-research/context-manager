@@ -105,6 +105,24 @@ describe('planTopologyRepair', () => {
     assert.equal(detachOnly.remaining.length, 0);
   });
 
+  test('a small hole deep inside a tower is closed by adopting its owner downward', () => {
+    // L3 over L2-a (L1-0..L1-2) and L2-b (L1-4..L1-6); L1-3 is an unmerged root
+    // sitting between them. The L3 (and only the L3) is crossed.
+    const l1s = [0, 1, 2, 3, 4, 5, 6].map((i) => l1(`L1-${i}`, i * 10, i * 10 + 9));
+    const summaries = [...l1s, up('L2-a', 2, ['L1-0', 'L1-1', 'L1-2'], 0, 29, 'L3'), up('L2-b', 2, ['L1-4', 'L1-5', 'L1-6'], 40, 69, 'L3'), up('L3', 3, ['L2-a', 'L2-b'], 0, 69)];
+    for (const i of [0, 1, 2]) l1s[i].mergedInto = 'L2-a';
+    for (const i of [4, 5, 6]) l1s[i].mergedInto = 'L2-b';
+    const records = [0, 1, 2, 3, 4, 5, 6].map((i) => rec(`c-${i}`, i * 10, i * 10 + 9, `L1-${i}`));
+    const plan = planTopologyRepair({ summaries, records, messages: msgs(70) }, { mode: 'compact' });
+    assert.deepEqual(plan.adopted, [{ id: 'L1-3', level: 1, into: 'L2-a', leaves: 10 }], 'adopted into the adjacent L2, not the L3');
+    assert.equal(plan.detached.length, 0);
+    assert.equal(plan.depthLostLeaves, 0);
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L2-a')!.sourceIds, ['L1-0', 'L1-1', 'L1-2', 'L1-3']);
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L2-a')!.sourceRange, { first: 'm-0', last: 'm-39' });
+    assert.deepEqual(plan.result.summaries.find((s) => s.id === 'L3')!.sourceRange, { first: 'm-0', last: 'm-69' });
+    assert.equal(plan.remaining.length, 0);
+  });
+
   test('a detached fragment is re-homed under the adjacent sibling so the ancestor keeps no hole', () => {
     // L2-a owns L1-0..L1-2 plus the stray L1-9 (leaves 90..99) — stray for L2-a,
     // but adjacent to L2-c (L1-6..L1-8). L3 over a,b,c must stay contiguous.
@@ -151,6 +169,29 @@ describe('planTopologyRepair', () => {
     assert.equal(plan.result.resolutions['m-70'], 2, 'the surviving L2 keeps its depth');
     assert.equal(plan.remaining.length, 0);
     assert.equal(plan.detached.length + plan.adopted.length + plan.rehomed.length, 0);
+  });
+
+  test('rebuild-since rebuilds crossed summaries after the cutoff and compacts the older ones', () => {
+    // Two #95-shaped crossed L2s: an old one (0..69) and a recent one (100..169).
+    const mk = (base: number, tag: string) => {
+      const l1s = [0, 1, 2, 3, 4, 5, 6].map((i) => l1(`L1-${tag}${i}`, base + i * 10, base + i * 10 + 9));
+      const l2 = up(`L2-${tag}`, 2, [0, 2, 3, 4, 6].map((i) => `L1-${tag}${i}`), base, base + 69);
+      for (const i of [0, 2, 3, 4, 6]) l1s[i].mergedInto = `L2-${tag}`;
+      const recs = [0, 1, 2, 3, 4, 5, 6].map((i) => rec(`c-${tag}${i}`, base + i * 10, base + i * 10 + 9, `L1-${tag}${i}`));
+      return { l1s, l2, recs };
+    };
+    const old = mk(0, 'o'), recent = mk(100, 'r');
+    const summaries = [...old.l1s, old.l2, ...recent.l1s, recent.l2];
+    const records = [...old.recs, ...recent.recs];
+    const messages = ids(0, 199).map((id, i) => ({ id, timestamp: Date.UTC(2026, 0, 1) + i * 3600_000 }));
+    const byId = planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: 'm-100' });
+    assert.deepEqual(byId.rebuildSince, { id: 'm-100', position: 100, rebuilt: 1, compacted: 1 });
+    assert.deepEqual(byId.dissolvedForRebuild.map((d) => d.id), ['L2-r'], 'only the recent tower is rebuilt');
+    assert.deepEqual(byId.adopted.map((a) => a.id).sort(), ['L1-o1', 'L1-o5'], 'the old one adopts its hole owners instead');
+    assert.equal(byId.remaining.length, 0);
+    const byDate = planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: new Date(Date.UTC(2026, 0, 1) + 100 * 3600_000).toISOString() });
+    assert.deepEqual(byDate.rebuildSince, byId.rebuildSince, 'an ISO date resolves to the first message at or after it');
+    assert.throws(() => planTopologyRepair({ summaries, records, messages }, { mode: 'rebuild', rebuildSince: 'm-999' }), /no message matches/);
   });
 
   test('a crossed L1 keeps its largest run and releases the stray messages from its record', () => {

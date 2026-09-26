@@ -54,8 +54,8 @@ export interface RepairRecord {
 export interface RepairInputs {
   summaries: RepairSummary[];
   records: RepairRecord[];
-  /** Store listing in store order (ids only are used). */
-  messages: ReadonlyArray<{ id: string }>;
+  /** Store listing in store order (ids; timestamps only for a date cutoff). */
+  messages: ReadonlyArray<{ id: string; timestamp?: number | string | Date }>;
   resolutions?: Record<string, number> | null;
 }
 export interface RepairOptions {
@@ -83,6 +83,13 @@ export interface RepairOptions {
    * store before restarting, or the resident pays the token spike live.
    */
   mode?: 'lossless' | 'compact' | 'rebuild';
+  /**
+   * rebuild only: crossed summaries whose span starts at or after this
+   * message (an id, or an ISO date resolved to the first message at or after
+   * it) are rebuilt; older ones get the compact treatment, so regions that
+   * were repaired by hand are not re-summarized.
+   */
+  rebuildSince?: string;
   maxIterations?: number;
 }
 export interface Crossed {
@@ -114,6 +121,8 @@ export interface RepairPlan {
   dissolvedForRebuild: Array<{ id: string; level: number; leaves: number }>;
   /** rebuild: leaves now exposed at L1 until the ladder re-folds them. */
   exposedL1Leaves: number;
+  /** rebuild with rebuildSince: where the cutoff landed and how the crossed set split. */
+  rebuildSince?: { id: string; position: number; rebuilt: number; compacted: number };
   /** Crossed summaries the plan could not resolve (empty on success). */
   remaining: Crossed[];
   result: { summaries: RepairSummary[]; records: RepairRecord[]; resolutions: Record<string, number> };
@@ -203,8 +212,21 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
   const touched = new Set<string>();
   const detachedIds = new Set<string>();
   const mode = options.mode ?? 'lossless';
-  const compact = mode === 'compact';
   const rebuild = mode === 'rebuild';
+  // A rebuild with a cutoff treats the older crossed summaries compactly.
+  const compact = mode === 'compact' || (rebuild && options.rebuildSince !== undefined);
+  let cutoffStorePos: number | undefined;
+  if (rebuild && options.rebuildSince !== undefined) {
+    const since = options.rebuildSince;
+    let idx = inputs.messages.findIndex((m) => String(m.id) === since);
+    if (idx < 0 && /^\d{4}-\d{2}-\d{2}/.test(since)) {
+      const at = Date.parse(since);
+      const toMs = (t: number | string | Date | undefined): number => t instanceof Date ? t.getTime() : typeof t === 'string' ? Date.parse(t) : typeof t === 'number' ? (t > 1e14 ? t / 1000 : t) : NaN;
+      idx = inputs.messages.findIndex((m) => toMs(m.timestamp) >= at);
+    }
+    if (idx < 0) throw new Error(`rebuildSince: no message matches ${since}`);
+    cutoffStorePos = idx;
+  }
   const maxIterations = options.maxIterations ?? 32;
 
   let v = view(summaries, records, storeOrder);
@@ -249,7 +271,13 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     // ladder re-folds the affected regions bottom-up with real summaries.
     // Crossed L1s are handled by the ordinary split below.
     v = view(summaries, records, storeOrder);
-    const crossed = crossedOf(v, alive()).filter((c) => c.level >= 2);
+    let crossed = crossedOf(v, alive()).filter((c) => c.level >= 2);
+    if (cutoffStorePos !== undefined) {
+      const startsAfter = (c: Crossed): boolean => (storeOrder.get(c.span.first) ?? -1) >= cutoffStorePos!;
+      const rebuilt = crossed.filter(startsAfter);
+      plan.rebuildSince = { id: String(inputs.messages[cutoffStorePos].id), position: cutoffStorePos, rebuilt: rebuilt.length, compacted: crossed.length - rebuilt.length };
+      crossed = rebuilt;
+    }
     if (crossed.length > 0) {
       plan.iterations = 1;
       const dissolve = new Set<string>();
@@ -369,29 +397,66 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       // compared by leaves moved — unless some fragment has no home, in which
       // case detaching would unravel every ancestor and adoption wins.
       if (compact) {
-        const owners = ownerAtLevel().get(level - 1) ?? new Map<number, string>();
+        // Every hole must be owned by a root (any level below this summary,
+        // not under it). Each such root is adopted DOWNWARD: into the
+        // descendant of this summary one level above the root whose span is
+        // adjacent to it (the crossed summary itself when the root is one
+        // level down). The hole closes where it is; nothing above unravels.
+        const allOwners = ownerAtLevel();
         const have = new Set(ps);
-        const candidates = new Set<string>();
+        const candidates = new Map<string, RepairSummary>();
         let adoptable = true;
         for (let p = ps[0]; p <= ps[ps.length - 1]; p++) {
           if (have.has(p)) continue;
-          const owner = owners.get(p);
-          const o = owner ? v.byId.get(owner) : undefined;
-          if (!o || parentOf(o) !== undefined || o.id === s.id) { adoptable = false; break; }
-          candidates.add(o.id);
+          let top: RepairSummary | undefined;
+          for (let lv = level - 1; lv >= 1 && !top; lv--) {
+            const id = allOwners.get(lv)?.get(p);
+            const o = id ? v.byId.get(id) : undefined;
+            if (o && parentOf(o) === undefined) top = o;
+          }
+          if (!top || top.id === s.id) { adoptable = false; break; }
+          candidates.set(top.id, top);
         }
+        // The adopter for a root R at level j: the descendant of S at level j+1
+        // whose span is adjacent to R (S itself when j+1 === S.level).
+        const adopterFor = (root: RepairSummary): RepairSummary | undefined => {
+          const rp = positions(v, root);
+          if (rp.length === 0) return undefined;
+          const rmin = rp[0], rmax = rp[rp.length - 1];
+          let frontier: RepairSummary[] = [s];
+          for (let lv = level; lv > root.level + 1; lv--) {
+            const next: RepairSummary[] = [];
+            for (const f of frontier) for (const cid of f.sourceIds) { const c = v.byId.get(cid); if (c) next.push(c); }
+            frontier = next;
+          }
+          let best: RepairSummary | undefined;
+          for (const c of frontier) {
+            if (c.level !== root.level + 1) continue;
+            if (c.id === s.id) { best = c; break; } // the hole is inside S by definition
+            const cp = positions(v, c);
+            if (cp.length === 0) continue;
+            if (cp[cp.length - 1] + 1 === rmin || rmax + 1 === cp[0]) { best = c; break; }
+          }
+          return best;
+        };
         if (adoptable && candidates.size > 0) {
-          let adoptedLeaves = 0;
-          for (const id of candidates) adoptedLeaves += positions(v, v.byId.get(id)!).length;
-          const exclude = new Set([s.id]);
-          const allHomeable = fragments.every((x) => homeFor(x, exclude) !== undefined);
-          if (adoptedLeaves <= fragmentLeaves || !allHomeable) {
-            for (const id of candidates) {
-              const o = v.byId.get(id)!;
-              insertChild(s, id);
-              plan.adopted.push({ id, level: o.level, into: s.id, leaves: positions(v, o).length });
+          const targets = new Map<string, RepairSummary>();
+          for (const [id, root] of candidates) { const t = adopterFor(root); if (!t) { adoptable = false; break; } targets.set(id, t); }
+          if (adoptable) {
+            let adoptedLeaves = 0;
+            for (const [, root] of candidates) adoptedLeaves += positions(v, root).length;
+            const exclude = new Set([s.id]);
+            const allHomeable = fragments.every((x) => homeFor(x, exclude) !== undefined);
+            if (adoptedLeaves <= fragmentLeaves || !allHomeable) {
+              for (const [id, root] of candidates) {
+                const t = targets.get(id)!;
+                const leaves = positions(v, root).length;
+                insertChild(t, id);
+                plan.adopted.push({ id, level: root.level, into: t.id, leaves });
+                v = view(summaries, records, storeOrder);
+              }
+              continue;
             }
-            continue;
           }
         }
       }
