@@ -65,6 +65,7 @@ export type {
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
   RenderStats,
+  CalibrationReset,
   RenderStatsCapableStrategy,
 } from './strategy.js';
 

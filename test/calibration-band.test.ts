@@ -155,4 +155,51 @@ describe('estimator calibration band', () => {
     assert.equal(reopened.internals._calibration, learned);
     reopened.cm.close();
   });
+
+  it('a discard is visible in render stats and survives restarts and learning, until re-stamped', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    // An unstamped 0.6: e.g. a store on another provider's tokenizer, where
+    // the old value was still accurate. The discard must not be silent.
+    const first = await openManager('visible');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 0.6, at: 1 });
+    first.cm.close();
+
+    const reopened = await openManager('visible');
+    await reopened.cm.compile(BUDGET);
+    const cal = reopened.cm.getRenderStats()!.calibration!;
+    assert.equal(cal.multiplier, 1);
+    assert.equal(cal.pricingEpoch, epoch);
+    assert.equal(cal.reset?.discardedMultiplier, 0.6);
+    assert.equal(cal.reset?.fromEpoch, 0);
+    const resetAt = cal.reset!.at;
+    // Learning after the reset keeps the record (it is a fact about this
+    // store's history, not about the current value).
+    reopened.strategy.reportRealInputTokens(reopened.internals._lastCompileEstimate * 1.5);
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { reset?: { at: number } };
+    assert.equal(saved.reset?.at, resetAt);
+    reopened.cm.close();
+
+    // Still visible after another restart, with no second discard.
+    const again = await openManager('visible');
+    await again.cm.compile(BUDGET);
+    assert.equal(again.cm.getRenderStats()!.calibration!.reset?.at, resetAt);
+    // An operator re-stamp (the old value, checked against provider billing)
+    // clears it.
+    again.internals.store!.setStateJson(again.internals.calibrationStateId, { multiplier: 0.6, at: Date.now(), pricing: epoch });
+    again.cm.close();
+    const restamped = await openManager('visible');
+    await restamped.cm.compile(BUDGET);
+    const after = restamped.cm.getRenderStats()!.calibration!;
+    assert.equal(after.multiplier, 0.6);
+    assert.equal(after.reset, undefined);
+    restamped.cm.close();
+  });
+
+  it('a store with no calibration history reports its multiplier and no reset', async () => {
+    const { cm } = await openManager('no-history');
+    await cm.compile(BUDGET);
+    assert.deepEqual(cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    cm.close();
+  });
 });
