@@ -41,9 +41,10 @@ A conservative floating-point allowance is subtracted from each bound.
 
 - The carried cut must obey current constraints and be structurally realizable
   under the hard token wall, with unchanged representation hashes.
-- New leaves must have only raw available under current constraints. Otherwise
-  there can be multiple matching extensions and the original policy chooses
-  the best one; this prototype declines to choose between them.
+- Old leaves stay at their accepted levels. New leaves (and summaries over
+  them, such as a fresh L1) may take any level they allow, so every matching
+  extension is enumerated and scored exactly, and the policy's carried
+  candidate is the best of them. More than 256 extensions fall back.
 - Carried continuity loss and actual cache churn must both be zero. These
   witnesses prove the global normalization floors are zero. In particular,
   checking the cache *excess* of a singleton candidate would be insufficient.
@@ -53,8 +54,9 @@ A conservative floating-point allowance is subtracted from each bound.
   certificates retain the existing solver. This does not implement cost-to-go
   pruning for real transitions.
 
-Successful results contain one candidate and a `certificate` with the bound,
-carried score, improvement bound, epsilon, pass count, and roundoff allowance.
+Successful results list every enumerated extension that fits the hard token
+wall as `candidates` (one when no new leaf can fold) and carry a `certificate` with the bound, carried score,
+improvement bound, epsilon, pass count, and roundoff allowance.
 They have no Pareto `propagation` statistics. This is a proof of the exact
 hysteresis policy, not an assertion that bucketed Pareto labels are exhaustive.
 

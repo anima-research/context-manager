@@ -1,0 +1,1 @@
+- kv-unified latent demand keeps no ranking state between compiles: it is ranked on every compile, so appended messages, policy changes and branch switches always reach it. It has no candidates, and costs nothing, while fewer than `mergeThreshold` same-level summaries line up.
