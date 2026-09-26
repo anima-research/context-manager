@@ -4,6 +4,7 @@ export type {
   Sequence,
   BranchId,
   MessageMetadata,
+  AddMessageOptions,
   StoredMessage,
   BlobReference,
   StoredContentBlock,
