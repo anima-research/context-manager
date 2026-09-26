@@ -492,6 +492,16 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
  * glance. Token sums use the strategy's own estimates so they line up with
  * the numbers `select()` uses for budget math.
  */
+/** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
+export interface CalibrationReset {
+  /** The multiplier that was discarded. */
+  discardedMultiplier: number;
+  /** The pricing epoch it was learned under (0 = unstamped). */
+  fromEpoch: number;
+  /** When it was discarded (ms since epoch). */
+  at: number;
+}
+
 export interface RenderStats {
   head: { messages: number; tokens: number };
   tail: { messages: number; tokens: number };
@@ -523,6 +533,21 @@ export interface RenderStats {
    * window — which is how tail eviction becomes reachable despite the picker
    * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
    */
+  /**
+   * Estimator calibration in force for this compile: the multiplier applied
+   * to every token estimate and the pricing epoch it was learned under.
+   * `reset` is present when a multiplier from an older (or unstamped) epoch
+   * was discarded on load. It is kept in the persisted calibration state, so
+   * it stays visible across restarts until an operator re-stamps the record.
+   * A discard shrinks (or grows) the window by the old multiplier's ratio,
+   * so it should be seen, not only logged once.
+   */
+  calibration?: {
+    multiplier: number;
+    pricingEpoch: number;
+    reset?: CalibrationReset;
+  };
+
   planVsActual?: {
     planned: number;
     actual: number;

@@ -23,6 +23,7 @@ import type {
   SearchResult,
   TimeRangeSummaryEntry,
   RenderStats,
+  CalibrationReset,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -30,6 +31,12 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && Number.isFinite(r.fromEpoch) && Number.isFinite(r.at);
+}
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
@@ -1772,6 +1779,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationArmed = false;
     this._calibration = 1;
     this._calibrationLoaded = false;
+    this._calibrationReset = null;
     this._lastKvStable = null;
   }
 
@@ -5273,6 +5281,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    r.calibration = {
+      multiplier: this._calibration,
+      pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+    };
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -8895,7 +8908,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = clamped;
     this.applyCalibration();
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+        ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -8978,20 +8996,107 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _calibration = 1;
   private _calibrationLoaded = false;
+  /** Set when an older-epoch multiplier was discarded; persisted with the record. */
+  private _calibrationReset: CalibrationReset | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape.
+   *
+   *   0: unstamped (flat HIDDEN_THINKING_TOKENS_DEFAULT for signed thinking)
+   *   1: signed thinking priced by signature length
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 1;
+
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0;
+    })),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a newer epoch is not used. */
   protected loadCalibration(store: MessageStoreView): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          const epoch = saved.pricing ?? 0;
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          if (epoch === current) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+          } else if (epoch < current && !this.calibrationRepricedSince(epoch, store.getAll())) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            console.warn(
+              `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                `(current ${current}): this store holds no content repriced since then; re-stamped`,
+            );
+            try {
+              this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now(), pricing: current });
+            } catch { /* persistence is best-effort */ }
+          } else {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch: epoch, at: Date.now() };
+            console.warn(
+              `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
+                `pricing epoch ${epoch} (current ${current}); restarting from 1.00. Every token estimate ` +
+                `changes by ${(1 / saved.multiplier!).toFixed(2)}x, and the window refolds to match. If the ` +
+                `old value is still accurate for this store (e.g. it mostly corrects for a non-Anthropic ` +
+                `tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                `Shown as calibration.reset in render stats until then.`,
+            );
+            // Persist the reset for records from an OLDER (or unstamped) epoch, so a
+            // rollback to a binary that ignores the stamp can't reload the stale
+            // multiplier and re-arm the wedge, and the discard isn't re-logged on
+            // every restart. A record from a NEWER epoch belongs to a later binary:
+            // leave it on disk and just don't use it here.
+            if (epoch < current) {
+              this._calibrationReset = reset;
+              try {
+                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
+              } catch { /* persistence is best-effort */ }
+            }
+          }
         }
       } catch { /* absent slot is fine */ }
     }
