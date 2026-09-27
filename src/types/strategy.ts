@@ -831,6 +831,19 @@ export interface AutobiographicalConfig {
   maxLiveImageBytes?: number;
 
   /**
+   * Opt-in, cost-conscious image trimming (default off). Without it the live
+   * image window slides one image at a time: once a limit binds
+   * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
+   * image strips the oldest live one, a change mid-history that invalidates
+   * the prompt cache from that message on, on every image. With a ratio in
+   * (0, 1), a binding limit instead trims down to ratio × each limit and
+   * records a watermark (a message sequence, persisted): every image at or
+   * before it stays stripped, so the stripped set changes once per trim, not
+   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   */
+  imageStripHysteresisRatio?: number;
+
+  /**
    * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the
    * live window's: the prompt also carries the head, the recall frontier and
    * the raw chunk. Newest-first; older images become loud placeholders.

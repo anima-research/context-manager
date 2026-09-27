@@ -1126,6 +1126,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get imageWatermarkStateId(): string { return `${this.ns}/autobio:imageStripWatermark`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
   /** A persisted kv-unified receipt was found while loading under another
@@ -1772,6 +1773,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationArmed = false;
     this._calibration = 1;
     this._calibrationLoaded = false;
+    this._imageWatermark = undefined;
+    this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
   }
 
@@ -10848,13 +10851,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
+      const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
       const bucket = bucketAt(pos);
       entry.content = entry.content.map((block) => {
         if (block.type !== 'image') return block;
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        if (tooDeep || overCount || overBytes) {
+        if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
           // charged this image at full weight — reclaiming here would
@@ -10868,6 +10872,83 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return block;
       });
     }
+  }
+
+  /** imageStripHysteresisRatio: images in messages at or before this
+   *  sequence stay stripped (undefined = none). Loaded lazily, persisted. */
+  private _imageWatermark: number | undefined;
+  private _imageWatermarkLoaded = false;
+
+  protected imageWatermark(): number | undefined {
+    if (!this._imageWatermarkLoaded) {
+      this._imageWatermarkLoaded = true;
+      try {
+        const saved = this.store?.getStateJson(this.imageWatermarkStateId) as { sequence?: number } | null;
+        if (saved && Number.isFinite(saved.sequence)) this._imageWatermark = saved.sequence;
+      } catch { /* absent slot is fine */ }
+    }
+    return this._imageWatermark;
+  }
+
+  /** Hysteresis ratio in (0, 1), or undefined when the option is off. */
+  private imageHysteresisRatio(): number | undefined {
+    const r = this.config.imageStripHysteresisRatio;
+    return typeof r === 'number' && r > 0 && r < 1 ? r : undefined;
+  }
+
+  /**
+   * imageStripHysteresisRatio: if any image newer than the watermark would be
+   * stripped by the live-image limits, advance the watermark so that what
+   * remains fits within ratio × each limit. Deterministic in the store's
+   * content, and persisted, so a restart renders the same stripped set.
+   */
+  protected maybeAdvanceImageWatermark(store: MessageStoreView): void {
+    const ratio = this.imageHysteresisRatio();
+    if (ratio === undefined) return;
+    const stripDepth = this.config.imageStripDepthTokens ?? 0;
+    const maxLive = this.config.maxLiveImages ?? 0;
+    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    if (stripDepth === 0 && maxLive === 0 && maxLiveBytes === 0) return;
+    const messages = store.getAll();
+    const w = this.imageWatermark();
+    // Walk newest-first with the given limits; return the sequence of the
+    // first message holding an image that does not fit (or undefined).
+    const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
+      let depth = 0, count = 0, bytes = 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]!;
+        if (w !== undefined && m.sequence <= w) break;
+        for (const b of m.content) {
+          if (b.type !== 'image') continue;
+          const size = AutobiographicalStrategy.imageBlockBytes(b);
+          const misfit = (depthCap > 0 && depth > depthCap) || (countCap > 0 && count >= countCap) ||
+            (bytesCap > 0 && bytes + size > bytesCap);
+          if (misfit) return m.sequence;
+          count++;
+          bytes += size;
+        }
+        depth += store.estimateTokens(m);
+      }
+      return undefined;
+    };
+    if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
+    const next = firstMisfit(
+      stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
+      maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
+      maxLiveBytes > 0 ? Math.floor(maxLiveBytes * ratio) : 0,
+    );
+    if (next === undefined || (w !== undefined && next <= w)) return;
+    this._imageWatermark = next;
+    try {
+      this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
+    } catch { /* persistence is best-effort */ }
+  }
+
+  /** True when an image in the message with this sequence is below the watermark. */
+  protected belowImageWatermark(sequence: number | undefined): boolean {
+    if (this.imageHysteresisRatio() === undefined) return false;
+    const w = this.imageWatermark();
+    return w !== undefined && sequence !== undefined && sequence <= w;
   }
 
   /**
@@ -10889,6 +10970,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLive = this.config.maxLiveImages ?? 0;
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
+    if (stripActive) this.maybeAdvanceImageWatermark(store);
     const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
     let liveImagesSeen = 0;
     let liveImageBytes = 0;
@@ -10903,7 +10985,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
           const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
           const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
-          if (beyondDepth || beyondCount || beyondBytes) {
+          const belowMark = this.belowImageWatermark(messages[i].sequence);
+          if (belowMark || beyondDepth || beyondCount || beyondBytes) {
             const imgEst = (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
             est -= Math.max(0, imgEst - placeholderTokens);
           } else {
