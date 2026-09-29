@@ -264,4 +264,132 @@ describe('compression holds', () => {
     assert.ok(scans > 0 && scans <= 4, `bounded scans per compile, got ${scans} for ${s.chunks.length} chunks`);
     manager.close();
   });
+
+  // ---- Greptile review on #120 ----
+
+  it('G1: a hold placed while an L1 request is in flight discards the result', async () => {
+    const prompts: string[] = [];
+    let manager!: ContextManager;
+    let holdTarget: string | undefined;
+    const membrane = {
+      complete: async (req: unknown) => {
+        prompts.push(JSON.stringify(req));
+        if (holdTarget) { manager.holdCompression([holdTarget]); holdTarget = undefined; }
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${prompts.length}` }] };
+      },
+    };
+    const strategy = newStrategy();
+    manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      ids.push(manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: filler(30) }]));
+    }
+    await manager.compile();
+    holdTarget = ids[0]; // first chunk's first message, held mid-request
+    await manager.tick();
+    const s = strategy as unknown as S;
+    assert.strictEqual(prompts.length, 1);
+    assert.ok(!s.summaries.some((x) => x.sourceIds.includes(ids[0])), 'in-flight L1 persisted over a held message');
+    manager.releaseCompression([ids[0]]);
+    for (let i = 0; i < 10; i++) await manager.tick();
+    assert.ok(s.summaries.some((x) => x.sourceIds.includes(ids[0])), 'recompressed after release');
+    manager.close();
+  });
+
+  it('G2: sharded tool_use message stays with its held tool_result', async () => {
+    const { prompts, membrane } = recordingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 50,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      l1HoldbackChunks: 0,
+      adaptiveResolution: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    manager.setToolDefinitions([
+      { name: 'search', description: 'search', inputSchema: { type: 'object', properties: {} } },
+    ]);
+    for (let i = 0; i < 6; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: filler(30) }]);
+    }
+    const before = manager.getAllMessages().length;
+    const useId = manager.addMessage('Claude', [
+      { type: 'text', text: 'long reasoning sentence here. '.repeat(80) },
+      { type: 'tool_use', id: 'tu-1', name: 'search', input: { q: 'x' } },
+    ]);
+    const shards = manager.getAllMessages().length - before;
+    assert.ok(shards > 1, `setup: tool_use message was sharded (${shards})`);
+    manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu-1', content: PLACEHOLDER }],
+      undefined, undefined, { holdCompression: true });
+    for (let i = 0; i < 4; i++) {
+      manager.addMessage(i % 2 === 0 ? 'Claude' : 'User', [{ type: 'text', text: filler(30) }]);
+    }
+    await drain(manager, strategy);
+    const s = strategy as unknown as S;
+    assert.ok(prompts.length > 0 && s.summaries.length > 0, 'setup: earlier history compressed');
+    assert.ok(!s.summaries.some((x) => x.sourceIds.includes(useId)), 'tool_use shard compressed without its held result');
+    manager.close();
+  });
+
+  it('G3: release alone lets tick() resume compression (no new message or compile)', async () => {
+    const { prompts, membrane } = recordingMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    const { resultId } = seed(manager, { holdOnAdd: true });
+    await drain(manager, strategy);
+    manager.editMessage(resultId, [{ type: 'tool_result', toolUseId: 'tu-1', content: REAL }]);
+    manager.releaseCompression([resultId]);
+    for (let i = 0; i < 10; i++) await manager.tick();
+    assert.ok(prompts.some((p) => p.includes(REAL)), 'released content compressed by tick alone');
+    manager.close();
+  });
+
+  it('G4: a late hold on an L1-covered message pauses merges over it', async () => {
+    const { prompts, membrane } = recordingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 50,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      l1HoldbackChunks: 0,
+      hierarchical: true,
+      mergeThreshold: 2,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    const ids: string[] = [];
+    for (let i = 0; i < 16; i++) {
+      ids.push(manager.addMessage(i % 2 === 0 ? 'User' : 'Claude',
+        [{ type: 'text', text: (i === 1 ? 'MARKER-late-held ' : '') + filler(30) }]));
+    }
+    await manager.compile();
+    const s = strategy as unknown as S & { mergeQueue: unknown[] };
+    let guard = 0;
+    while (s.compressionQueue.length > 0 && guard++ < 50) await manager.tick();
+    assert.ok(s.mergeQueue.length > 0, 'setup: merge queued');
+    const n = prompts.length;
+    manager.holdCompression([ids[1]]);
+    for (let i = 0; i < 5; i++) { try { await manager.tick(); } catch { /* retried */ } }
+    assert.ok(!prompts.slice(n).some((p) => p.includes('MARKER-late-held')), 'merge replayed held content');
+    manager.releaseCompression([ids[1]]);
+    const m = prompts.length;
+    for (let i = 0; i < 5; i++) await manager.tick();
+    assert.ok(prompts.length > m, 'merges resume after release');
+    manager.close();
+  });
+
+  it('G5: removeMessages (range) drops holds on removed messages', async () => {
+    const { membrane } = recordingMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    const a = manager.addMessage('User', [{ type: 'text', text: 'a' }]);
+    const b = manager.addMessage('Claude', [{ type: 'text', text: 'b' }], undefined, undefined, { holdCompression: true });
+    manager.removeMessages(a, b);
+    assert.strictEqual(manager.getCompressionHolds().size, 0);
+    manager.close();
+  });
 });

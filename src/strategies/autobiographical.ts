@@ -4288,6 +4288,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the next tick() retries it.
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
       const merge = this.mergeQueue[0]!;
+      // A late hold (placed on a message some L1 already covers) pauses
+      // merges reaching it: the merge prompt replays raw sources. No progress
+      // is recorded, so the drain stops; release resumes it.
+      if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
@@ -6608,6 +6612,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // A compression hold placed while the request was in flight: the
+      // summary may be built from provisional content. Discard it; the chunk
+      // stays uncompressed and is re-queued when the hold is released.
+      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) {
+        console.warn('[autobiographical] discarding L1: a compression hold was placed on its span mid-request');
+        return;
+      }
+
       // Re-check the dedup guard AFTER the await: summary state may have
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
@@ -7636,6 +7648,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
       };
       logNewSummaryId = newEntry.id;
+
+      // Hold placed mid-request: throw (not a disposition rejection) so the
+      // merge stays queued and retries after release.
+      if (this.mergeBlockedByHold(sourceIds, ctx.messageStore)) {
+        throw new Error(`merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request`);
+      }
 
       // Provenance the auditor can READ: store the accepted request under the
       // hash the entry carries, before the entry itself lands.
@@ -10676,7 +10694,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messages = store.getAll();
     for (let i = 0; i < messages.length; i++) {
       if (isHeld.call(store, messages[i].id)) {
-        return i > 0 && this.hasToolResult(messages[i]) ? i - 1 : i;
+        let b = i;
+        if (b > 0 && this.hasToolResult(messages[b])) {
+          b--;
+          // Adaptive-resolution ingress puts a sharded message's tool_use on
+          // its FIRST shard: step back over the whole body group.
+          const group = messages[b].bodyGroupId;
+          if (group) while (b > 0 && messages[b - 1].bodyGroupId === group) b--;
+        }
+        return b;
       }
     }
     return messages.length;
@@ -10693,6 +10719,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const blocked = new Set<string>();
     for (let i = boundary; i < messages.length; i++) blocked.add(messages[i].id);
     return blocked;
+  }
+
+  /** Whether any merge source's span reaches the hold boundary. */
+  protected mergeBlockedByHold(sourceIds: string[], store: MessageStoreView): boolean {
+    const blocked = this.holdBlockedIds(store);
+    if (!blocked) return false;
+    return sourceIds.some((id) => {
+      const s = this.summaries.find((x) => x.id === id);
+      return s !== undefined && (blocked.has(s.sourceRange.last) || blocked.has(s.sourceRange.first));
+    });
+  }
+
+  /**
+   * Compression holds were released: re-queue the chunks they deferred and,
+   * when auto-tick is on, resume the background drain.
+   */
+  onCompressionHoldsReleased(ctx: StrategyContext): void {
+    this.requireLoadedBranch('onCompressionHoldsReleased');
+    this.rebuildChunks(ctx.messageStore);
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
+    }
   }
 
   /**

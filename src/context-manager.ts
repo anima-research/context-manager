@@ -489,11 +489,13 @@ export class ContextManager {
 
   /**
    * Release compression holds. Idempotent; unknown ids are ignored. Releasing
-   * the id returned by a sharded addMessage releases every shard. Compression
-   * of the now-final content proceeds on the strategy's next rebuild (next
-   * addMessage, compile, or tick).
+   * the id returned by a sharded addMessage releases every shard. Releasing
+   * notifies the strategy (onCompressionHoldsReleased), which re-queues the
+   * deferred chunks so the next tick — or the auto-tick drain — compresses
+   * the now-final content.
    */
   releaseCompression(messageIds: Iterable<MessageId>): void {
+    const before = this.compressionHolds.size;
     for (const id of messageIds) {
       const group = this.compressionHoldGroups.get(id);
       if (group) {
@@ -501,6 +503,9 @@ export class ContextManager {
         this.compressionHoldGroups.delete(id);
       }
       this.compressionHolds.delete(id);
+    }
+    if (this.compressionHolds.size !== before && this.strategy.onCompressionHoldsReleased) {
+      this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
     }
   }
 
@@ -1249,6 +1254,14 @@ export class ContextManager {
         this.handleMessageRemove(event.messageId);
         break;
       case 'removeRange':
+        // Ids of the removed span aren't in the event; prune holds whose
+        // message no longer exists.
+        for (const id of [...this.compressionHolds]) {
+          if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
+        }
+        for (const [key, members] of [...this.compressionHoldGroups]) {
+          if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+        }
         // For range removes, we need to check all affected messages
         // This is a simplification - in practice we'd need to track the IDs
         break;

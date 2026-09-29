@@ -14,3 +14,9 @@
   prompts' head context (a reset head window can sit past the hold), and
   hold checks cost nothing when no hold exists (one timeline scan per pass
   otherwise).
+  Releasing a hold notifies the strategy (`onCompressionHoldsReleased`), which
+  re-queues deferred chunks so `tick()` resumes without a new message. An L1
+  or merge whose span gains a hold mid-request is discarded and retried after
+  release; queued merges reaching a hold wait. A held tool_result keeps a
+  sharded (adaptive-resolution) tool_use message's whole body group with it.
+  Range removals drop holds on removed messages.

@@ -153,6 +153,12 @@ export interface ContextStrategy {
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
   /**
+   * Called when ContextManager.releaseCompression actually released a hold.
+   * Compressing strategies should re-queue work the hold deferred.
+   */
+  onCompressionHoldsReleased?(ctx: StrategyContext): void;
+
+  /**
    * Check if strategy is ready to compile.
    * Returns pending work info if not ready.
    */
