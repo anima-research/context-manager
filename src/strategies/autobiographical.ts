@@ -5227,6 +5227,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Commit the accumulated stats as the last-render snapshot. */
+  /**
+   * See RenderStats.nesting. `overlapLeaves` is the topology invariant (one
+   * L1 per message); `renderedTwice` / `extraTokens` are what this compile's
+   * emitted summaries actually did with the overlap. Cost: one pass over the
+   * L1 source lists plus the leaf sets of the emitted summaries (memoised per
+   * summary id for the compile).
+   */
+  protected computeNestingStats(): { overlapLeaves: number; renderedTwice: number; extraTokens: number } {
+    const l1Count = new Map<string, number>();
+    for (const s of this.summaries) {
+      if (s.level !== 1) continue;
+      for (const mid of s.sourceIds) l1Count.set(mid, (l1Count.get(mid) ?? 0) + 1);
+    }
+    let overlapLeaves = 0;
+    for (const n of l1Count.values()) if (n > 1) overlapLeaves++;
+
+    const byId = new Map(this.summaries.map((s) => [s.id, s] as const));
+    const memo = new Map<string, Set<string>>();
+    const leavesUnder = (id: string, seen = new Set<string>()): Set<string> => {
+      const cached = memo.get(id);
+      if (cached) return cached;
+      const out = new Set<string>();
+      const s = byId.get(id);
+      if (s && !seen.has(id)) {
+        seen.add(id);
+        if (s.sourceLevel === 0) for (const m of s.sourceIds) out.add(m);
+        else for (const child of s.sourceIds) for (const m of leavesUnder(child, seen)) out.add(m);
+      }
+      memo.set(id, out);
+      return out;
+    };
+    const coveredBy = new Map<string, string[]>();
+    for (const id of this._emittedSummaryIds) {
+      for (const m of leavesUnder(id)) {
+        const arr = coveredBy.get(m);
+        if (arr) arr.push(id); else coveredBy.set(m, [id]);
+      }
+    }
+    let renderedTwice = 0;
+    const extra = new Set<string>();
+    for (const ids of coveredBy.values()) {
+      if (ids.length < 2) continue;
+      renderedTwice++;
+      for (const id of ids.slice(1)) extra.add(id);
+    }
+    let extraTokens = 0;
+    for (const id of extra) extraTokens += byId.get(id)?.tokens ?? 0;
+    return { overlapLeaves, renderedTwice, extraTokens };
+  }
+
   protected rsEnd(): void {
     const r = this._rs;
     if (!r) return;
@@ -5273,6 +5323,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    if (this.summaries.length > 0) r.nesting = this.computeNestingStats();
     this._lastRenderStats = r;
     this._rs = null;
   }

@@ -491,17 +491,23 @@ function relevanceCut(
   if (tokens <= windowTokens || tokens >= projTokens || round >= 2) {
     // NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
     // feature — every exempted leaf means the store's summary tree is
-    // NON-NESTED (two live lineages over one span), and its messages are
-    // now SEMANTICALLY DOUBLE-REPRESENTED in the window (rendered raw or
-    // via their own chain WHILE a covering recall also renders). The solve
-    // proceeding is the mitigation; the topology is the disease. Surface it
-    // on every affected compile until the store is repaired (nesting
-    // reconciler — see the 2026-08-03 opus4 incident).
+    // NON-NESTED (one span listed under two lineages: overlapping L1
+    // production, store surgery). Exempt leaves keep their own fold level
+    // and are excluded from group unanimity, so the fold decision around them
+    // can differ between compiles (plan re-layout, cache rewrite). Whether
+    // anything is actually rendered twice is a separate question answered by
+    // RenderStats.nesting.renderedTwice — this line must not claim it
+    // (2026-09-30: a 594-message overlap rendered as ONE L4, nothing twice,
+    // and the old wording sent a reader hunting for a memory defect). Surface
+    // the topology on every affected compile until the store is repaired
+    // (nesting reconciler — see the 2026-08-03 opus4 incident).
     if (overlapExempt.size > 0) {
       console.error(
-        `[kv-overlap] ⚠️ non-nested summary tree: ${overlapExempt.size} leaf(s) with ` +
-          `conflicting lineage tolerated this compile (double-representation in window). ` +
-          `Store needs nesting repair. sample=${[...overlapExempt].slice(0, 5).join(',')}`,
+        `[kv-overlap] ⚠️ non-nested summary tree: ${overlapExempt.size} leaf(s) listed under two ` +
+          `lineages; each keeps its own fold level (ownership wins) and skips group unanimity, so the ` +
+          `plan around them may re-lay between compiles. Not a double render by itself — see ` +
+          `RenderStats.nesting.renderedTwice. Repair: nesting reconciler. ` +
+          `sample=${[...overlapExempt].slice(0, 5).join(',')}`,
       );
     }
     return { F, tokens };
