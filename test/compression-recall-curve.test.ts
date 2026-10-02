@@ -190,11 +190,11 @@ class ProbeStrategy extends AutobiographicalStrategy {
     return [...this.compressionQueue];
   }
 
-  afterCompression(action: () => void | Promise<void>): void {
+  afterCompression(action: (chunk: Chunk) => void | Promise<void>): void {
     const compress = this.compressChunkHierarchical.bind(this);
     this.compressChunkHierarchical = async (...args: Parameters<ProbeStrategy['compressChunkHierarchical']>) => {
       await compress(...args);
-      await action();
+      await action(args[0]);
     };
   }
 
@@ -342,6 +342,36 @@ async function fixture(
     compressed: false,
   };
   return { manager, strategy, ids, target, parents: [older, newer], children };
+}
+
+/** Real persisted raw chunks, so onNewMessage can rebuild the queue without test-only boundaries. */
+async function queuedRawFixture() {
+  const mock = scriptedMembrane(['refusal', 'end_turn']);
+  const strategy = new ProbeStrategy({
+    compressionModel: MODEL,
+    targetChunkTokens: 50,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    l1HoldbackChunks: 0,
+    minChunkCharsForLLM: 0,
+    mergeThreshold: 99,
+    compressionRefusalCurveFallbacks: 0,
+  });
+  const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: mock.membrane });
+  try {
+    for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(manager);
+    const chunks = strategy.chunksView();
+    assert.equal(chunks.length, 2);
+    assert.deepEqual(strategy.compressionQueueView(), [0, 1]);
+    await strategy.run(chunks[0], ctx);
+    assert.equal(mock.calls.length, 1, 'first raw chunk has a persisted quarantine family');
+    return { mock, strategy, manager, ctx, chunks };
+  } catch (error) {
+    manager.close();
+    throw error;
+  }
 }
 
 function recallIds(request: NormalizedRequest): string[] {
@@ -1450,6 +1480,90 @@ describe('compression refusal recall curves', () => {
       assert.equal(next.compressed, true);
     } finally {
       await event;
+      fx.manager.close();
+    }
+  });
+
+  it('an inbound queue rebuild cannot spend the scan twice on the same quarantined chunk (#55)', async () => {
+    const fx = await queuedRawFixture();
+    const rebuilds: Promise<void>[] = [];
+    const replacedObjects: boolean[] = [];
+    const inspected: string[][] = [];
+    try {
+      fx.strategy.afterCompression((chunk) => {
+        inspected.push(chunk.messages.map((m) => m.id));
+        if (chunk.compressed) return;
+        // This event runs during tick's cooperative yield. The real manager
+        // invokes onNewMessage, replacing chunk objects and restoring [0, 1].
+        rebuilds.push(new Promise<void>((resolve) => setTimeout(() => {
+          fx.manager.addMessage('User', [text('inbound while the quarantined chunk yields')]);
+          replacedObjects.push(fx.strategy.chunksView()[0] !== chunk);
+          resolve();
+        }, 0)));
+      });
+      await fx.strategy.tick(fx.ctx);
+      await Promise.all(rebuilds);
+      assert.equal(fx.mock.calls.length, 2, 'one tick reaches the eligible raw chunk despite the rebuilt head');
+      assert.ok(replacedObjects.length > 0 && replacedObjects.every(Boolean));
+      assert.deepEqual(inspected, fx.chunks.map((c) => c.messages.map((m) => m.id)));
+      assert.ok(fx.strategy.summariesView().some((s) => s.sourceIds.join(':') === fx.chunks[1].messages.map((m) => m.id).join(':')));
+    } finally {
+      await Promise.all(rebuilds);
+      fx.manager.close();
+    }
+  });
+
+  it('a rebuilt scan resolves original source identities at their current queue indexes (#55)', async () => {
+    const fx = await queuedRawFixture();
+    const rebuilt = fx.chunks.map((chunk, index) => ({ ...chunk, index: 1 - index })).reverse();
+    try {
+      let visited = 0;
+      fx.strategy.afterCompression((chunk) => {
+        visited++;
+        if (!chunk.compressed) fx.strategy.setTickWork(rebuilt, [1, 0]);
+      });
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(visited, 2);
+      assert.equal(fx.mock.calls.length, 2);
+      assert.equal(rebuilt[0].compressed, true, 'the relocated eligible chunk, not a stale object, is compressed');
+      assert.equal(rebuilt[1].compressed, false);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a rebuilt queue can withdraw an original candidate without the scan resurrecting it (#55)', async () => {
+    const fx = await queuedRawFixture();
+    try {
+      let inspected = 0;
+      fx.strategy.afterCompression(() => {
+        inspected++;
+        fx.strategy.setTickWork(fx.chunks.map((chunk) => ({ ...chunk })), [0]);
+      });
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(inspected, 1, 'each original source is inspected at most once');
+      assert.equal(fx.mock.calls.length, 1, 'withdrawn eligible work must stay withdrawn');
+      assert.deepEqual(fx.strategy.compressionQueueView(), [0]);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('an all-stale compression queue clears readiness with no candidate identities (#55)', async () => {
+    const mock = scriptedMembrane(['end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(fx.target.compressed, true);
+      fx.strategy.setTickWork([fx.target], [999, 0]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'stale cleanup does not call the provider');
+      assert.deepEqual(fx.strategy.compressionQueueView(), []);
+      assert.equal(fx.strategy.checkReadiness().ready, true);
+    } finally {
       fx.manager.close();
     }
   });

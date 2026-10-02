@@ -4581,15 +4581,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
     // priority below still runs to consolidate existing L1s and relieve the cap.
     // No cap configured → isAtSpeculativeCap() is always false → unchanged.
-    // A durable quarantine skip is not attempted compression. Walk past it
-    // to eligible L1 work or the merge queue, but inspect at most the initial
-    // queue length: an await can rebuild/replenish the queue (issue #55).
-    for (
-      let remaining = this.compressionQueue.length;
-      remaining > 0 && this.compressionQueue.length > 0 && !this.isAtSpeculativeCap();
-      remaining--
-    ) {
-      const chunkIndex = this.compressionQueue.shift()!;
+    // A durable quarantine skip is not attempted compression. Bound this
+    // scan by the distinct source identities initially queued, not by shifts:
+    // an inbound rebuild during a yield can reinsert an already-skipped head
+    // and replace every chunk object/index (issue #55, PR #138 review).
+    const candidates = new Set<string>();
+    this.compressionQueue = this.compressionQueue.filter((index) => {
+      const chunk = this.chunks[index];
+      if (!chunk || chunk.compressed) {
+        this._drainProgress++; // stale queue cleanup
+        return false;
+      }
+      candidates.add(this.chunkKey(chunk));
+      return true;
+    });
+    for (const key of candidates) {
+      if (this.isAtSpeculativeCap()) break;
+      // Resolve against the current queue: a rebuild may renumber chunks or
+      // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
+      // stale chunk object. Newly queued source identities wait for next tick.
+      const queueIndex = this.compressionQueue.findIndex((index) => {
+        const chunk = this.chunks[index];
+        return chunk !== undefined && this.chunkKey(chunk) === key;
+      });
+      if (queueIndex < 0) continue;
+      const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
 
