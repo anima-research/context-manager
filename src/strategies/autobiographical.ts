@@ -11140,6 +11140,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private static readonly STUB_TOOL_RESULT_TEXT =
     '[tool result unavailable — omitted during context compression]';
 
+  // Track generated objects, not their text: genuine tool output can quote
+  // the same marker. Weak keys avoid retaining previous rendered contexts.
+  private readonly generatedToolResultStubs = new WeakSet<ContentBlock>();
+
+  private createToolResultStub(toolUseId: string): ContentBlock {
+    const stub: ContentBlock = {
+      type: 'tool_result',
+      toolUseId,
+      content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
+    };
+    this.generatedToolResultStubs.add(stub);
+    return stub;
+  }
+
   /**
    * Final post-selection tool-pairing validator (bug 6.7).
    *
@@ -11253,11 +11267,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         index: entries.length,
         participant: 'user',
         sourceRelation: 'derived',
-        content: [...prevUseIds].map(id => ({
-          type: 'tool_result' as const,
-          toolUseId: id,
-          content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
-        })),
+        content: [...prevUseIds].map(id => this.createToolResultStub(id)),
       });
     }
 
@@ -11302,11 +11312,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : [{ type: 'text', text: '[tool call omitted]' }];
         return real;
       }
-      return {
-        type: 'tool_result',
-        toolUseId: id,
-        content: AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT,
-      } as ContentBlock;
+      return this.createToolResultStub(id);
     });
   }
 
@@ -11360,7 +11366,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (let i = 0; i < entry.content.length; i++) {
         const block = entry.content[i];
         if (block.type !== 'tool_result') continue;
-        if (block.content === AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT) continue;
+        if (this.generatedToolResultStubs.has(block)) continue;
         const toolName = toolUseIdToName.get(block.toolUseId);
         if (!toolName) continue;
         let arr = occurrencesByTool.get(toolName);

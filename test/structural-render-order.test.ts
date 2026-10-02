@@ -8,7 +8,8 @@ import type { ContentBlock } from '@animalabs/membrane';
 
 const text = (body: string): ContentBlock => ({ type: 'text', text: body });
 const use = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'read', input: { payload: 'x'.repeat(200) } });
-const result = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: `real result ${id}` });
+const result = (id: string, body = `real result ${id}`): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: body });
+const missingResultText = '[tool result unavailable — omitted during context compression]';
 type Message = { participant: string; content: ContentBlock[] };
 const agent = (...content: ContentBlock[]): Message => ({ participant: 'agent', content });
 const user = (...content: ContentBlock[]): Message => ({ participant: 'user', content });
@@ -40,8 +41,29 @@ async function render(messages: Message[], adaptiveResolution: boolean): Promise
 const paired = [agent(use('A')), user(result('A')), agent(use('B')), user(result('B'))];
 
 describe('structural render ordering across adaptive and hierarchical selectors', () => {
+  for (const markerId of ['A', 'B']) {
+    it(`counts genuine result ${markerId} whose text matches the missing-result marker`, async () => {
+      const messages = [
+        agent(use('A')), user(result('A', markerId === 'A' ? missingResultText : 'real result A')),
+        agent(use('B')), user(result('B', markerId === 'B' ? missingResultText : 'real result B')),
+        agent(use('MISSING')), user(text('continue without a result')),
+      ];
+      for (const adaptiveResolution of [true, false]) {
+        const results = (await render(messages, adaptiveResolution))
+          .flatMap(message => message.content).filter(block => block.type === 'tool_result');
+        assert.match(String(results.find(block => block.toolUseId === 'A')?.content), /Result truncated/,
+          'the older genuine result must be truncated even when one result matches the marker');
+        assert.equal(results.find(block => block.toolUseId === 'B')?.content,
+          markerId === 'B' ? missingResultText : 'real result B');
+        assert.equal(results.find(block => block.toolUseId === 'MISSING')?.content, missingResultText,
+          'the generated stub remains distinct from identically worded real output');
+      }
+    });
+  }
+
   for (const [name, messages] of [
     ['missing result stub', [...paired, agent(use('MISSING')), user(text('continue without that result'))]],
+    ['tail result stub', [agent(use('A')), user(result('A')), agent(use('B')), user(result('B'), use('TAIL'))]],
     ['duplicate result removed by pairing', [...paired, user(result('B')), agent(text('done'))]],
     ['displaced result relocated before pruning', [agent(use('A')), agent(use('B')), user(result('B')), user(result('A')), agent(text('done'))]],
   ] satisfies Array<[string, Message[]]>) {
@@ -54,8 +76,11 @@ describe('structural render ordering across adaptive and hierarchical selectors'
       assert.equal(results.find(block => block.toolUseId === 'B')?.content, 'real result B');
       assert.match(String(results.find(block => block.toolUseId === 'A')?.content), /Result truncated/);
       assert.equal(results.filter(block => block.toolUseId === 'B').length, 1, 'repair removes duplicate results before counting');
-      if (name === 'missing result stub') {
-        assert.equal(results.find(block => block.toolUseId === 'MISSING')?.content, '[tool result unavailable — omitted during context compression]');
+      if (name === 'missing result stub' || name === 'tail result stub') {
+        const id = name === 'tail result stub' ? 'TAIL' : 'MISSING';
+        const stub = results.find(block => block.toolUseId === id);
+        assert.equal(stub?.content, missingResultText);
+        assert.deepEqual(Object.keys(stub!).sort(), ['content', 'toolUseId', 'type'], 'provenance must not add wire fields');
       }
       for (const block of blocks) {
         if (block.type === 'tool_use') assert.equal(block.input._truncated, true, 'input caps apply on both paths');

@@ -1,1 +1,1 @@
-- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Missing-result placeholders no longer consume last-N retention slots, and displaced or duplicate results are counted only after repair.
+- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Generated missing-result placeholders no longer consume last-N retention slots, while genuine output with identical text still counts. Displaced or duplicate results are counted only after repair.
