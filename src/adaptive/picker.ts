@@ -33,8 +33,19 @@ export interface OverBudgetDiagnostics {
   headTokens: number;
   tailTokens: number;
   middleTokens: number;
+  /** Render units in the middle (per-message picker chunks on the adaptive path), not authored chunk records. */
   middleChunkCount: number;
+  /** Deepest planned adaptive level; rejecting representation's level on the hierarchical path. */
   deepestLevel: number;
+  /** Deepest level in the loaded summary inventory, before pin/lock/geometry eligibility checks; 0 if empty. */
+  deepestAvailableLevel?: number;
+  /** Distinct loaded summaries per level, including merged children. */
+  summaryCountsByLevel?: Record<number, number>;
+  /** Configured total window, including the response reserve. */
+  configuredBudget?: number;
+  reserveForResponse?: number;
+  /** Configured window minus the response reserve, before over-budget grace. */
+  inputBudget?: number;
 }
 
 /**
@@ -72,8 +83,18 @@ export class OverBudgetError extends Error {
     super(
       `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
-        ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} chunks,` +
-        ` deepest fold level=L${opts.diagnostics.deepestLevel})`
+        ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} render units,` +
+        ` deepest fold level=L${opts.diagnostics.deepestLevel}` +
+        (opts.diagnostics.deepestAvailableLevel === undefined ? '' :
+          `, deepest available level=L${opts.diagnostics.deepestAvailableLevel}`) +
+        (opts.diagnostics.summaryCountsByLevel === undefined ? '' :
+          `, summary inventory: ${Object.entries(opts.diagnostics.summaryCountsByLevel)
+            .sort(([a], [b]) => Number(a) - Number(b))
+            .map(([level, count]) => `L${level}=${count}`).join(' ') || 'empty'}`) +
+        (opts.diagnostics.configuredBudget === undefined ? '' : `, configured=${opts.diagnostics.configuredBudget}`) +
+        (opts.diagnostics.reserveForResponse === undefined ? '' : `, response reserve=${opts.diagnostics.reserveForResponse}`) +
+        (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
+        ')'
     );
     // Writable per Error convention so instanceof-by-name works across
     // iframe / vm boundaries; the field stays writable on the prototype.

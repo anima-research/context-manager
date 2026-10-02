@@ -8023,6 +8023,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
+  /** Inventory, not solver eligibility: pins, locks, and geometry can prevent using these summaries. */
+  protected summaryInventoryDiagnostics(): {
+    deepestAvailableLevel: number;
+    summaryCountsByLevel: Record<number, number>;
+  } {
+    const summaries = new Map(this.summaries.map(summary => [summary.id, summary]));
+    const summaryCountsByLevel: Record<number, number> = {};
+    let deepestAvailableLevel = 0;
+    for (const summary of summaries.values()) {
+      summaryCountsByLevel[summary.level] = (summaryCountsByLevel[summary.level] ?? 0) + 1;
+      deepestAvailableLevel = Math.max(deepestAvailableLevel, summary.level);
+    }
+    return { deepestAvailableLevel, summaryCountsByLevel };
+  }
+
+  /** Attach the same inventory and budget metadata at every refusal stage. */
+  protected overBudgetError(
+    budget: TokenBudget,
+    opts: ConstructorParameters<typeof OverBudgetError>[0],
+  ): OverBudgetError {
+    return new OverBudgetError({
+      ...opts,
+      diagnostics: {
+        ...opts.diagnostics,
+        ...this.summaryInventoryDiagnostics(),
+        configuredBudget: budget.maxTokens,
+        reserveForResponse: budget.reserveForResponse,
+        inputBudget: budget.maxTokens - budget.reserveForResponse,
+      },
+    });
+  }
+
   // ============================================================================
   // Adaptive resolution (picker-driven) path
   // ============================================================================
@@ -8091,7 +8123,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     if (headTokens + tailTokens > rejectionBudget) {
-      throw new OverBudgetError({
+      throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: headTokens + tailTokens,
         diagnostics: {
@@ -8355,13 +8387,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : plan?.blocked === 'target-floor'
         ? 'prepared-window-floor'
         : undefined;
-    if (plan?.override) {
-      console.error(
-        `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
-          ` tokens=${plan.tokens} budget=${foldingBudget.totalBudget}` +
-          ` (see adaptive-resolution-design.md §13.4)`,
-      );
-    }
 
     // Stage resolution changes for the next compile, but do NOT commit them
     // yet. The selected frontier is only authoritative if the whole render
@@ -8374,10 +8399,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let deepestLevel = 0;
     for (const [id, level] of result.finalResolutions) {
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
+      if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
-      if (level > deepestLevel) deepestLevel = level;
+    }
+    if (plan?.override) {
+      console.error(
+        `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
+          ` tokens=${plan.tokens} budget=${foldingBudget.totalBudget}` +
+          ` deepestPlannedLevel=L${deepestLevel}` +
+          ` deepestAvailableLevel=L${this.summaryInventoryDiagnostics().deepestAvailableLevel}` +
+          ` (see adaptive-resolution-design.md §13.4)`,
+      );
     }
 
     // Wire produce ops into the strategy's own production queues so that
@@ -8460,7 +8494,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // whole point of previewing an aggressive budget is to learn it won't fit
     // without taking the outage that learning it live would cause.
     if (result.finalTokens > rejectionBudget && !dryRun) {
-      throw new OverBudgetError({
+      throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
         diagnostics: {
@@ -8491,8 +8525,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const middleChunkCountDiag = pickerChunks.filter(
       c => !headMessageIds.has(c.id) && !tailMessageIds.has(c.id),
     ).length;
-    const emissionOverBudget = (attempted: number, level: number): OverBudgetError =>
-      new OverBudgetError({
+    const emissionOverBudget = (attempted: number): OverBudgetError =>
+      this.overBudgetError(budget, {
         stage: 'Emission overran the plan (planner/emitter estimator drift)',
         budget: rejectionBudget,
         actual: attempted + tailTokens,
@@ -8501,7 +8535,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           tailTokens,
           middleTokens: Math.max(0, attempted - headTokens),
           middleChunkCount: middleChunkCountDiag,
-          deepestLevel: level,
+          deepestLevel,
         },
       });
 
@@ -8556,7 +8590,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // results, not for sharded bodyGroup composites.)
             const tokens = this.estimateTokens(content);
             if (totalTokens + tokens > prefixBudget) {
-              throw emissionOverBudget(totalTokens + tokens, 0);
+              throw emissionOverBudget(totalTokens + tokens);
             }
             entries.push({
               index: entries.length,
@@ -8597,7 +8631,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // fall back to 600 tokens and make plan-vs-actual lie low.
               const pairTokens = this.recallPairCost(ancestor);
               if (totalTokens + pairTokens > prefixBudget) {
-                throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
+                throw emissionOverBudget(totalTokens + pairTokens);
               }
               entries.push(questionEntry);
               entries.push(answerEntry);
@@ -8654,7 +8688,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
         const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
         if (totalTokens + tokens > prefixBudget) {
-          throw emissionOverBudget(totalTokens + tokens, 0);
+          throw emissionOverBudget(totalTokens + tokens);
         }
         entries.push({
           index: entries.length,
@@ -8672,7 +8706,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
           if (totalTokens + tokens > prefixBudget) {
-            throw emissionOverBudget(totalTokens + tokens, 0);
+            throw emissionOverBudget(totalTokens + tokens);
           }
           entries.push({
             index: entries.length,
@@ -8706,7 +8740,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
         const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
-          throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
+          throw emissionOverBudget(totalTokens + pairTokens);
         }
         entries.push(questionEntry);
         entries.push(answerEntry);
@@ -8720,7 +8754,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ----- 6. Emit the fully-reserved tail -----
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, rejectionBudget, totalTokens, pse);
     if (tailStats.messages !== messages.length - effectiveRecentStart) {
-      throw new OverBudgetError({
+      throw this.overBudgetError(budget, {
         stage: 'Tail emission dropped reserved recent-window messages',
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
@@ -8774,7 +8808,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entry => entry.sourceMessageId && newestGroupIds.has(entry.sourceMessageId),
       );
       if (!newestRetained) {
-        throw new OverBudgetError({
+        throw this.overBudgetError(budget, {
           stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
@@ -9667,7 +9701,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The head is verbatim by definition — truncating it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
-        throw new OverBudgetError({
+        throw this.overBudgetError(budget, {
           budget: graceLimit,
           actual: totalTokens + tokens,
           diagnostics: {
@@ -10001,7 +10035,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // history (pins / uncompressed / frontier raw). Emit within
             // grace; refuse the turn beyond it.
             if (totalTokens + pairTokens > graceLimit) {
-              throw new OverBudgetError({
+              throw this.overBudgetError(budget, {
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
                 diagnostics: {
@@ -10024,7 +10058,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? Math.min(store.estimateTokens(msg), msgCap + 50)
               : store.estimateTokens(msg);
             if (totalTokens + tokens > graceLimit) {
-              throw new OverBudgetError({
+              throw this.overBudgetError(budget, {
                 budget: graceLimit,
                 actual: totalTokens + tokens,
                 diagnostics: {
@@ -10098,7 +10132,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // removes them from the agent's context with no representation at
             // all, so beyond the grace window the select refuses the turn
             // rather than returning a plausible-looking window.
-            throw new OverBudgetError({
+            throw this.overBudgetError(budget, {
               budget: graceLimit,
               actual: totalTokens + tokens,
               diagnostics: {

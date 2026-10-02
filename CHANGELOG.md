@@ -12,6 +12,10 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Budget refusals report the configured window, response reserve, and input budget alongside the effective hard limit. Diagnostics distinguish middle render units from authored summary inventory and show available summary depth beside planned depth; KV escalation logs include both depths.
+
 ## 0.11.0 — 2026-09-25
 
 ### Changed
