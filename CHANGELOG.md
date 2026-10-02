@@ -12,10 +12,6 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
-### Fixed
-
-- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Missing-result placeholders no longer consume last-N retention slots, and displaced or duplicate results are counted only after repair.
-
 ## 0.11.0 — 2026-09-25
 
 ### Changed
