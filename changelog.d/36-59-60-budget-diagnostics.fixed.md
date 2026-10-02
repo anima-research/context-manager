@@ -1,0 +1,1 @@
+- Budget refusals report the configured window, response reserve, and input budget alongside the effective hard limit. Diagnostics distinguish middle render units from authored summary inventory and show available summary depth beside planned depth; KV escalation logs include both depths.
