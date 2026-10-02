@@ -1,0 +1,1 @@
+- Autobiographical strategy initialization propagates Chronicle state registration failures instead of treating every error as an existing state. Reinitialization still preserves already-registered slots.
