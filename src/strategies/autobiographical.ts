@@ -8748,15 +8748,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headEnd,
       recentStart: effectiveRecentStart,
     });
-    this.pruneToolEntries(merged);
-    this.trimOrphanedToolUse(merged);
-    // Full pairing invariant over the final rendered context — catches the
-    // mid-list orphans the trailing/leading trims can't (bug 6.7). The adaptive
-    // path has the same mid-list orphan producers as hierarchical (budget
-    // `break`s between pair members, raw emission interleaved with recall
-    // pairs), and FKM defaults autobiographical strategies onto this path — so
-    // the guard has to run here too. It's a no-op on already-valid output.
-    this.enforceToolPairing(merged);
+    this.postProcessToolEntries(merged);
     // Strip stale images BEFORE placing markers and committing stats, so both
     // describe the post-strip context the agent actually receives.
     this.applyImageStripping(merged, store);
@@ -10134,11 +10126,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
-    this.trimOrphanedToolUse(entries);
-    // Full pairing invariant over the final rendered context — catches the
-    // mid-list orphans the trailing/leading trims can't (bug 6.7).
-    this.enforceToolPairing(entries);
-    this.pruneToolEntries(entries);
+    this.postProcessToolEntries(entries);
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
     this.applyImageStripping(entries, store);
@@ -11120,6 +11108,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Shared structural passes for both selectors. Repair pairing before
+   * pruning so duplicate/orphan results are removed and displaced results
+   * occupy their final positions before the per-tool last-N tally.
+   */
+  private postProcessToolEntries(entries: ContextEntry[]): void {
+    this.trimOrphanedToolUse(entries);
+    this.enforceToolPairing(entries);
+    this.pruneToolEntries(entries);
+  }
+
+  /**
    * Remove trailing entries that contain tool_use without a following tool_result.
    * This prevents orphaned tool_use blocks when a budget break cuts between
    * a tool_use message and its tool_result response.
@@ -11247,8 +11246,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Tail: an entry that mixes tool_use with other blocks can survive
-    // trimOrphanedToolUse (which only pops pure use-without-result tails).
+    // Tail: an entry containing both tool_use and tool_result can survive
+    // trimOrphanedToolUse, which only pops entries with uses but no results.
     if (prevUseIds.size > 0) {
       entries.push({
         index: entries.length,
@@ -11353,12 +11352,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Pass 2: collect tool_result occurrences per tool name, in order
+    // Pass 2: collect real tool_result occurrences per tool name, in order.
+    // Pairing stubs carry no tool output and must neither consume a last-N
+    // slot nor lose their explanation to a truncation marker.
     const occurrencesByTool = new Map<string, Array<{ entry: ContextEntry; blockIndex: number }>>();
     for (const entry of entries) {
       for (let i = 0; i < entry.content.length; i++) {
         const block = entry.content[i];
         if (block.type !== 'tool_result') continue;
+        if (block.content === AutobiographicalStrategy.STUB_TOOL_RESULT_TEXT) continue;
         const toolName = toolUseIdToName.get(block.toolUseId);
         if (!toolName) continue;
         let arr = occurrencesByTool.get(toolName);
