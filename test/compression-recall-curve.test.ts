@@ -1558,11 +1558,18 @@ describe('compression refusal recall curves', () => {
       fx.strategy.setTickWork([fx.target], []);
       await fx.strategy.run(fx.target, ctx);
       assert.equal(fx.target.compressed, true);
-      fx.strategy.setTickWork([fx.target], [999, 0]);
+      const unqueued: Chunk = {
+        index: 1, startIndex: 12, endIndex: 14,
+        messages: ctx.messageStore.getAll().slice(12, 14),
+        tokens: 100, compressed: false,
+      };
+      fx.strategy.setTickWork([fx.target, unqueued], [999, 0]);
+      assert.equal(fx.strategy.checkReadiness().ready, false, 'raw work plus stale queued entries blocks readiness');
       await fx.strategy.tick(ctx);
       assert.equal(mock.calls.length, 1, 'stale cleanup does not call the provider');
       assert.deepEqual(fx.strategy.compressionQueueView(), []);
-      assert.equal(fx.strategy.checkReadiness().ready, true);
+      assert.equal(unqueued.compressed, false, 'unqueued raw work stays raw');
+      assert.equal(fx.strategy.checkReadiness().ready, true, 'removing the stale entries clears readiness');
     } finally {
       fx.manager.close();
     }
