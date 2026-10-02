@@ -12,6 +12,10 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Recognize Bedrock-prefixed Fable/Mythos summarizer model IDs when deferring compression until the host supplies tool definitions.
+
 ## 0.11.0 — 2026-09-25
 
 ### Changed

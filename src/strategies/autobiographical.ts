@@ -184,10 +184,11 @@ const withPlainProseLine = (request: NormalizedRequest): NormalizedRequest =>
  * input-block regardless of chunk content (measured: claude-fable-5-1 and
  * claude-fable-5, 2026-09-05 — bare marker+directive IB 3/3, identical bytes
  * with the live tool set end_turn 3/3). Prefix-matched; gateway-prefixed ids
- * ('anthropic/claude-fable-5') and dated snapshots are covered.
+ * ('anthropic/claude-fable-5'), Bedrock dot/colon-prefixed ids, and dated
+ * snapshots are covered.
  */
 export function isToolsLessRefusingSummarizer(model: string): boolean {
-  return /(?:^|\/)claude-(?:fable|mythos)-/.test(model);
+  return /(?:^|[\/.:])claude-(?:fable|mythos)-/.test(model);
 }
 
 function withoutToolsParam(request: NormalizedRequest): NormalizedRequest {
