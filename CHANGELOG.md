@@ -12,10 +12,6 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
-### Fixed
-
-- Key MessageStore message-ID indexes and materialized caches by native Chronicle branch ID, so deleting and recreating a branch under the same name cannot return stale content or edit/remove the wrong message.
-
 ## 0.11.0 — 2026-09-25
 
 ### Changed
