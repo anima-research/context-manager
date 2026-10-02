@@ -12,6 +12,10 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Autobiographical strategy initialization propagates Chronicle state registration failures instead of treating every error as an existing state. Reinitialization still preserves already-registered slots.
+
 ## 0.11.0 — 2026-09-25
 
 ### Changed
