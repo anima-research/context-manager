@@ -1407,6 +1407,53 @@ describe('compression refusal recall curves', () => {
     }
   });
 
+  it('quarantine scanning yields to inbound events while keeping pending work owned (#55)', async () => {
+    const events: string[] = [];
+    let calls = 0;
+    const membrane = {
+      complete: async () => {
+        events.push(`provider-${++calls}`);
+        return calls === 1 ? response('refusal') : response('end_turn', 'a successful next memory');
+      },
+    };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    let event: Promise<void> | undefined;
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target, next], [0, 1]);
+      let pendingAtEvent = false;
+      let callsAfterReentrantTick = 0;
+      fx.strategy.afterCompression(() => {
+        if (event) return;
+        // Schedule an event after the quarantine check, before the next raw
+        // chunk. A resolved-promise loop would starve it until the tick ends.
+        event = new Promise<void>((resolve, reject) => {
+          setTimeout(() => {
+            events.push('inbound-event');
+            pendingAtEvent = !!fx.strategy.checkReadiness().pendingWork;
+            fx.strategy.tick(ctx).then(() => {
+              callsAfterReentrantTick = calls;
+              resolve();
+            }, reject);
+          }, 0);
+        });
+      });
+      await fx.strategy.tick(ctx);
+      await event;
+      assert.deepEqual(events, ['provider-1', 'inbound-event', 'provider-2']);
+      assert.equal(pendingAtEvent, true, 'the cooperative yield remains owned pending work');
+      assert.equal(callsAfterReentrantTick, 1, 'an inbound tick cannot start competing compression');
+      assert.equal(next.compressed, true);
+    } finally {
+      await event;
+      fx.manager.close();
+    }
+  });
+
   it('all-refused persists quarantine, stores nothing, and restart skips every provider call', async () => {
     const path = freshPath();
     const firstMock = scriptedMembrane(['refusal']);

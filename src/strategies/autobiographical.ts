@@ -4598,6 +4598,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let quarantineSkipped = false;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
         quarantineSkipped = true;
+      }).then(async () => {
+        // Quarantine checks build compression contexts too. As in the
+        // speculative drain, a macrotask hop keeps those builds from starving
+        // inbound events. Keep the hop inside pendingCompression so another
+        // tick cannot start auxiliary work while this scan yields.
+        if (quarantineSkipped) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       });
       this.pendingCompression = compression;
 
