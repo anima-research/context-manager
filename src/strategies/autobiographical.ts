@@ -1025,10 +1025,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
+  /** Once per source chunk for this strategy instance, across queue rebuilds. */
+  private warnedQuarantineSkips = new Set<string>();
   protected _compressionCount = 0;
   /**
-   * Monotonic counter of tick() operations that actually processed a queue item
-   * (compressed a chunk or executed a merge). `driveSpeculativeDrain` recurses
+   * Monotonic counter of queue items consumed by tick(): compression, merges,
+   * or stale/quarantined queue cleanup. `driveSpeculativeDrain` recurses
    * while this advances — a length-delta check would falsely read "no progress"
    * when a productive tick also enqueues a follow-on item (net queue length
    * unchanged), halting the drain with work still queued.
@@ -4566,6 +4568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the alarm on every interval for as long as ANY chunk is quarantined
     // (after sweeping records whose debt is already paid).
     await this.soundQuarantineAlarmIfNeeded();
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
@@ -4578,21 +4581,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
     // priority below still runs to consolidate existing L1s and relieve the cap.
     // No cap configured → isAtSpeculativeCap() is always false → unchanged.
-    if (this.compressionQueue.length > 0 && !this.isAtSpeculativeCap()) {
+    // A durable quarantine skip is not attempted compression. Walk past it
+    // to eligible L1 work or the merge queue, but inspect at most the initial
+    // queue length: an await can rebuild/replenish the queue (issue #55).
+    for (
+      let remaining = this.compressionQueue.length;
+      remaining > 0 && this.compressionQueue.length > 0 && !this.isAtSpeculativeCap();
+      remaining--
+    ) {
       const chunkIndex = this.compressionQueue.shift()!;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
 
-      if (!chunk || chunk.compressed) return;
+      if (!chunk || chunk.compressed) continue;
 
-      this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
+      let quarantineSkipped = false;
+      const compression = this.compressChunkHierarchical(chunk, ctx, () => {
+        quarantineSkipped = true;
+      });
+      this.pendingCompression = compression;
 
       try {
-        await this.pendingCompression;
+        await compression;
       } finally {
-        this.pendingCompression = null;
+        // A branch switch may have installed different pending work.
+        if (this.pendingCompression === compression) this.pendingCompression = null;
       }
-      return;
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      // Attempts, including fresh refusals, still consume the tick. Existing
+      // overrides that omit the optional notification keep that behavior.
+      if (!quarantineSkipped) return;
     }
 
     // Priority 2: Execute pending merges (hierarchical only)
@@ -5506,7 +5524,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * rationale, and the currency caveat on the declared path, at the request
    * builder below.
    */
-  protected async compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext): Promise<void> {
+  protected async compressChunkHierarchical(
+    chunk: Chunk,
+    ctx: StrategyContext,
+    // Only the authoritative durable-family gate reports a no-op skip. This
+    // optional notification preserves the Promise<void> subclass contract.
+    onQuarantineSkip?: () => void,
+  ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
     if (!ctx.membrane) {
@@ -6111,6 +6135,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
+      if (!this.warnedQuarantineSkips.has(quarantineRecord.chunkSourceHash)) {
+        this.warnedQuarantineSkips.add(quarantineRecord.chunkSourceHash);
+        console.warn(
+          `[autobiographical] compression quarantine skipped chunk ${chunk.recordId ?? `#${chunk.index}`} ` +
+            `(hash=${quarantineRecord.chunkSourceHash.slice(0, 12)}, key=${durableActive.record.key.slice(0, 12)}): ` +
+            `provider call skipped; chunk remains raw`,
+        );
+      }
+      onQuarantineSkip?.();
       logCompressionCall({
         event: 'compression:quarantine-skipped',
         operation: 'compress_l1',

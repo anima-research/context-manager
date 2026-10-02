@@ -1,0 +1,1 @@
+- Quarantine-skipped raw chunks no longer consume a maintenance tick ahead of eligible compression or merges. The scan is bounded by the initial queue length, attempted work still consumes the tick, and each skipped source chunk warns once per strategy instance. Existing quarantine-family matching and retry policy are unchanged.

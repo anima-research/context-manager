@@ -171,6 +171,39 @@ class ProbeStrategy extends AutobiographicalStrategy {
     this.mergeQueue = [];
   }
 
+  setTickWork(chunks: Chunk[], queued: number[], merges: Array<{ level: number; sourceIds: string[] }> = []): void {
+    for (const chunk of chunks) {
+      if (chunk.recordId) continue;
+      chunk.recordId = `tick-${chunk.index}`;
+      this.appendChunkRecord({
+        id: chunk.recordId,
+        sourceIds: chunk.messages.map((m) => m.id),
+        compressed: chunk.compressed,
+      });
+    }
+    this.chunks = chunks;
+    this.compressionQueue = [...queued];
+    this.mergeQueue = merges;
+  }
+
+  compressionQueueView(): number[] {
+    return [...this.compressionQueue];
+  }
+
+  afterCompression(action: () => void | Promise<void>): void {
+    const compress = this.compressChunkHierarchical.bind(this);
+    this.compressChunkHierarchical = async (...args: Parameters<ProbeStrategy['compressChunkHierarchical']>) => {
+      await compress(...args);
+      await action();
+    };
+  }
+
+  installLegacyCompressionOverride(): void {
+    const compress = this.compressChunkHierarchical.bind(this);
+    // A pre-existing override may only forward the original two arguments.
+    this.compressChunkHierarchical = (chunk: Chunk, ctx: StrategyContext): Promise<void> => compress(chunk, ctx);
+  }
+
   mergeQueueView(): Array<{ level: number; sourceIds: string[] }> {
     return this.mergeQueue.map((item) => ({ level: item.level, sourceIds: [...item.sourceIds] }));
   }
@@ -1204,6 +1237,172 @@ describe('compression refusal recall curves', () => {
       await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
       await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
       assert.equal(mock.calls.length, 2, 'canonical errors remain retryable and are not quarantined');
+      fx.manager.close();
+    }
+  });
+
+  it('tick skips an already-quarantined chunk and compresses the next eligible chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(mock.calls.length, 1, 'the first attempt creates real durable quarantine');
+      fx.strategy.setTickWork([fx.target, next], [0, 1]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 2, 'one tick must reach the eligible chunk behind quarantine');
+      assert.equal(fx.target.compressed, false);
+      assert.equal(next.compressed, true);
+      assert.deepEqual(fx.strategy.compressionQueueView(), []);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('tick reaches a queued merge after an already-quarantined raw chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(mock.calls.length, 1);
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 2, 'the merge must run in the same tick as the no-op skip');
+      assert.deepEqual(fx.strategy.mergeQueueView(), []);
+      assert.equal(fx.target.compressed, false);
+      assert.ok(fx.strategy.summariesView().some((s) => s.level === 3));
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('one tick exhausts an all-quarantined queue without provider calls, warning once per chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      await fx.strategy.run(next, ctx);
+      assert.equal(mock.calls.length, 2);
+      const warnings: string[] = [];
+      const previous = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        for (let repeat = 0; repeat < 2; repeat++) {
+          fx.strategy.setTickWork([{ ...fx.target }, { ...next }], [0, 1]);
+          await fx.strategy.tick(ctx);
+          assert.deepEqual(fx.strategy.compressionQueueView(), []);
+        }
+      } finally {
+        console.warn = previous;
+      }
+      assert.equal(mock.calls.length, 2, 'quarantine skip must not attempt the provider');
+      assert.equal(warnings.filter((w) => w.includes('compression quarantine skipped')).length, 2);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a newly refused compression still consumes the tick (#55)', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'a paid attempt must not fall through into a second work item');
+      assert.equal(fx.strategy.mergeQueueView().length, 1);
+      assert.equal(fx.target.compressed, false);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a tick bounds quarantine scanning even if an await replenishes the queue (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      const merges = [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }];
+      fx.strategy.setTickWork([fx.target], [0], merges);
+      let visited = 0;
+      fx.strategy.afterCompression(() => {
+        assert.equal(++visited, 1, 'a re-enqueued skip must not extend this tick indefinitely');
+        fx.strategy.setTickWork([fx.target], [0], merges);
+      });
+      await fx.strategy.tick(ctx);
+      assert.equal(visited, 1);
+      assert.equal(mock.calls.length, 2, 'the bounded scan must still reach a pending merge');
+      assert.deepEqual(fx.strategy.compressionQueueView(), [0], 'replenished work belongs to a later tick');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a legacy two-argument compression override still consumes at most one item per tick (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      fx.strategy.installLegacyCompressionOverride();
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1);
+      assert.equal(fx.strategy.mergeQueueView().length, 1, 'without a skip notification retain the prior scheduling contract');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a branch switch during a quarantine skip stops the old tick before it can merge (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target], [0]);
+      fx.strategy.afterCompression(async () => {
+        await fx.manager.fork('after-quarantine-skip');
+        fx.strategy.setTickWork([fx.target], [], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      });
+      await fx.strategy.tick(ctx);
+      assert.equal(fx.manager.currentBranch().name, 'after-quarantine-skip');
+      assert.equal(mock.calls.length, 1, 'old branch work must not consume the new branch merge queue');
+      assert.equal(fx.strategy.mergeQueueView().length, 1);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('stale compression indexes do not block the next queued chunk (#55)', async () => {
+    const mock = scriptedMembrane(['end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], [999, 0]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1);
+      assert.equal(fx.target.compressed, true);
+    } finally {
       fx.manager.close();
     }
   });
