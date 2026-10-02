@@ -99,12 +99,70 @@ describe('OverBudgetError diagnostics', () => {
         assert.equal(Reflect.get(error.diagnostics, 'deepestAvailableLevel'), 0);
         assert.deepEqual(Reflect.get(error.diagnostics, 'summaryCountsByLevel'), {});
         assert.match(error.message, /summary inventory: empty/);
+        if (adaptiveResolution) {
+          assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+          assert.match(error.message, /fold plan=not computed/);
+          assert.doesNotMatch(error.message, /deepest planned level/);
+        } else {
+          assert.match(error.message, /^Hierarchical emission overran the budget/);
+          assert.match(error.message, /attempted representation level=L0/);
+        }
+      });
+    });
+  }
+
+  it('counts pre-head middle messages in a refusal before planning after a head reset', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 100_000,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 12 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      strategy.resetHeadWindow(ids[4]);
+      const error = await refusal(manager);
+      assert.equal(error.diagnostics.middleChunkCount, 4, 'the four messages before the reset head are middle too');
+      assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'unplanned');
+      assert.match(error.message, /middle picker chunks=4/);
+      assert.match(error.message, /fold plan=not computed/);
+      assert.doesNotMatch(error.message, /deepest planned level/);
+    });
+  });
+
+  for (const positionedRecallPairs of [true, false]) {
+    it(`labels hierarchical ${positionedRecallPairs ? 'selection items' : 'raw-message fallback'} and attempted depth`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        positionedRecallPairs,
+        targetChunkTokens: 100_000,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 2 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
+        const error = await refusal(manager);
+        assert.equal(error.diagnostics.middleChunkCount, 1);
+        assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'attempted');
+        assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages');
+        assert.match(error.message, positionedRecallPairs
+          ? /selected middle representations=1, attempted representation level=L1/
+          : /middle raw messages=1, attempted representation level=L0/);
+        assert.doesNotMatch(error.message, /deepest planned level|picker chunks/);
       });
     });
   }
 
   for (const level of [1, 5]) {
-    it(`distinguishes planned L${level} from available L5 and render units from summaries`, async () => {
+    it(`distinguishes planned L${level} from available L5 and picker chunks from summaries`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: true,
         headWindowTokens: 0,
@@ -126,8 +184,10 @@ describe('OverBudgetError diagnostics', () => {
         assert.equal(Reflect.get(error.diagnostics, 'deepestAvailableLevel'), 5);
         assert.deepEqual(Reflect.get(error.diagnostics, 'summaryCountsByLevel'), { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1 });
         assert.equal(error.diagnostics.middleChunkCount, 12);
-        assert.match(error.message, /across 12 render units/);
-        assert.match(error.message, new RegExp(`deepest fold level=L${level}, deepest available level=L5`));
+        assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), 'picker-chunks');
+        assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'planned');
+        assert.match(error.message, /middle picker chunks=12/);
+        assert.match(error.message, new RegExp(`deepest planned level=L${level}, deepest available level=L5`));
         assert.match(error.message, /summary inventory: L1=1 L2=1 L3=1 L4=1 L5=1/);
       });
     });
@@ -152,6 +212,9 @@ describe('OverBudgetError diagnostics', () => {
       assert.match(error.message, /^Emission overran the plan/);
       checkBudget(error);
       assert.equal(error.diagnostics.deepestLevel, 5, 'the first raw emission fails, but the complete plan reaches L5');
+      assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'planned');
+      assert.match(error.message, /deepest planned level=L5/);
+      assert.doesNotMatch(error.message, /attempted representation level/);
       assert.equal(Reflect.get(error.diagnostics, 'deepestAvailableLevel'), 5);
       assert.deepEqual(Reflect.get(error.diagnostics, 'summaryCountsByLevel'), { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1 });
     });
@@ -187,7 +250,9 @@ describe('OverBudgetError diagnostics', () => {
     const error = new OverBudgetError({ actual: 6, budget: 5, diagnostics });
     assert.strictEqual(error.diagnostics, diagnostics);
     assert.equal(error.name, 'OverBudgetError');
-    assert.match(error.message, /across 4 render units/);
+    assert.match(error.message, /across 4 chunks/);
+    assert.match(error.message, /deepest fold level=L0/);
+    assert.doesNotMatch(error.message, /planned|attempted|picker chunks/);
     assert.doesNotMatch(error.message, /available|inventory|configured|undefined/);
   });
 });

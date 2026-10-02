@@ -8038,10 +8038,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { deepestAvailableLevel, summaryCountsByLevel };
   }
 
-  /** Attach the same inventory and budget metadata at every refusal stage. */
+  /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
   protected overBudgetError(
     budget: TokenBudget,
-    opts: ConstructorParameters<typeof OverBudgetError>[0],
+    opts: ConstructorParameters<typeof OverBudgetError>[0] & {
+      diagnostics: Required<Pick<OverBudgetError['diagnostics'], 'middleCountUnit' | 'deepestLevelKind'>>;
+    },
   ): OverBudgetError {
     return new OverBudgetError({
       ...opts,
@@ -8124,13 +8126,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (headTokens + tailTokens > rejectionBudget) {
       throw this.overBudgetError(budget, {
+        stage: 'Head/tail reservation exceeded budget',
         budget: rejectionBudget,
         actual: headTokens + tailTokens,
         diagnostics: {
+          middleCountUnit: 'picker-chunks',
+          deepestLevelKind: 'unplanned',
           headTokens,
           tailTokens,
           middleTokens: 0,
-          middleChunkCount: Math.max(0, effectiveRecentStart - headEnd),
+          // Include pre-head history after a reset, as middleSegments does below.
+          middleChunkCount: messages.length - headMessageIds.size - tailMessageIds.size,
           deepestLevel: 0,
         },
       });
@@ -8498,6 +8504,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budget: rejectionBudget,
         actual: result.finalTokens,
         diagnostics: {
+          middleCountUnit: 'picker-chunks',
+          deepestLevelKind: 'planned',
           headTokens,
           tailTokens,
           middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
@@ -8531,6 +8539,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budget: rejectionBudget,
         actual: attempted + tailTokens,
         diagnostics: {
+          middleCountUnit: 'picker-chunks',
+          deepestLevelKind: 'planned',
           headTokens,
           tailTokens,
           middleTokens: Math.max(0, attempted - headTokens),
@@ -8759,6 +8769,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
         diagnostics: {
+          middleCountUnit: 'picker-chunks',
+          deepestLevelKind: 'planned',
           headTokens,
           tailTokens,
           middleTokens: totalTokens - headTokens,
@@ -8813,6 +8825,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
           diagnostics: {
+            middleCountUnit: 'picker-chunks',
+            deepestLevelKind: 'planned',
             headTokens,
             tailTokens,
             middleTokens: totalTokens - headTokens,
@@ -9702,9 +9716,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
         throw this.overBudgetError(budget, {
+          stage: 'Hierarchical emission overran the budget',
           budget: graceLimit,
           actual: totalTokens + tokens,
           diagnostics: {
+            middleCountUnit: 'selection-items',
+            deepestLevelKind: 'attempted',
             headTokens: totalTokens + tokens,
             tailTokens: 0,
             middleTokens: 0,
@@ -10036,9 +10053,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // grace; refuse the turn beyond it.
             if (totalTokens + pairTokens > graceLimit) {
               throw this.overBudgetError(budget, {
+                stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
                 diagnostics: {
+                  middleCountUnit: 'selection-items',
+                  deepestLevelKind: 'attempted',
                   headTokens: 0,
                   tailTokens: 0,
                   middleTokens: totalTokens + pairTokens,
@@ -10059,9 +10079,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               : store.estimateTokens(msg);
             if (totalTokens + tokens > graceLimit) {
               throw this.overBudgetError(budget, {
+                stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + tokens,
                 diagnostics: {
+                  middleCountUnit: 'selection-items',
+                  deepestLevelKind: 'attempted',
                   headTokens: 0,
                   tailTokens: 0,
                   middleTokens: totalTokens + tokens,
@@ -10133,9 +10156,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // all, so beyond the grace window the select refuses the turn
             // rather than returning a plausible-looking window.
             throw this.overBudgetError(budget, {
+              stage: 'Hierarchical emission overran the budget',
               budget: graceLimit,
               actual: totalTokens + tokens,
               diagnostics: {
+                middleCountUnit: 'raw-messages',
+                deepestLevelKind: 'attempted',
                 headTokens: 0,
                 tailTokens: 0,
                 middleTokens: totalTokens + tokens,

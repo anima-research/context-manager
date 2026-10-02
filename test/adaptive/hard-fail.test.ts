@@ -288,7 +288,8 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
     assert.equal(typeof caught.diagnostics.middleTokens, 'number');
     assert.equal(typeof caught.diagnostics.deepestLevel, 'number');
     // The error message should be informative
-    assert.ok(caught.message.includes('exhausted'));
+    assert.ok(caught.message.includes('Head/tail reservation exceeded budget'));
+    assert.ok(caught.message.includes('fold plan=not computed'));
     assert.ok(caught.message.includes('hard budget'));
     manager.close();
   });
