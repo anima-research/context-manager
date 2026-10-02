@@ -9759,15 +9759,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // beats perfect dedup here.
     //
     // Repairs are additionally bounded by a per-level ALLOWANCE (a fraction of
-    // that level's budget), not just the overall context budget. The
-    // excluded-with-partially-dropped-children state only arises from a store
-    // damaged mid-merge (the crash window at compressChunkHierarchical, or the
-    // legacy setMergedInto index-desync). On such a store MANY L2s can be in
-    // this state at once; without a cap, re-including all of them at full size
-    // would starve the recent window via Phase 4's newest-first eviction. When
-    // repairs exceed the allowance we stop re-including and warn — a corrupted
-    // store announces itself instead of silently trading recent messages for
-    // redundant summaries.
+    // that level's budget), not just the overall context budget. Healthy
+    // stores reach this state when budget selection drops children of an
+    // excluded parent. Interrupted merges can leave many overlapping parents,
+    // increasing the repair demand. The allowance bounds redundant summaries
+    // competing with the recent window. Exceeding it is a budget observation,
+    // not a corruption diagnosis; Phase 3c still completes coverage, and
+    // emission refuses the turn if the resulting context cannot fit.
     {
       // Allowance = a fraction of the level budget, with a floor tied to the
       // overall budget so a strategy that zeroes a level budget (e.g.
@@ -9813,8 +9811,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         console.warn(
           `[AutobiographicalStrategy] coverage-repair allowance exceeded — ` +
           `skipped ${l2RepairsSkipped} L2 and ${l3RepairsSkipped} L3 re-inclusions ` +
-          `(store likely corrupted mid-merge). Some covered history may render at ` +
-          `no summary level this pass.`,
+          `(possible causes: tight per-level budgets or overlapping summaries ` +
+          `from interrupted merges). Continuing with coverage completion.`,
         );
       }
     }
@@ -11300,7 +11298,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const rest = src.content.filter((_, k) => k !== bi);
         src.content = rest.length > 0
           ? rest
-          : [{ type: 'text', text: '[tool call omitted]' }];
+          : [{ type: 'text', text: '[tool result moved during context repair]' }];
         return real;
       }
       return {
