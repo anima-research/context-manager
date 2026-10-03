@@ -8,3 +8,7 @@
   `getCompressionHoldDetails()` reports `heldAt`/`expiresAt` per hold; the
   manager clock is injectable via `ContextManager.open({ now })`. Holds
   without a timeout behave exactly as before.
+  Deadlines are per message id; one call or one sharded `addMessage` reads
+  the clock once, so its ids share a deadline, and expiry releases only the
+  ids past their own deadline (never the rest of a shard group). Expiry is
+  also checked on `addMessage`.

@@ -116,4 +116,57 @@ describe('compression hold timeouts', () => {
     }
     m.close();
   });
+
+  // ---- Greptile review on #141 ----
+
+  async function shardedHeld(clock: { t: number; step?: number }, timeoutMs: number) {
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'm', targetChunkTokens: 50, adaptiveResolution: true, autoTickOnNewMessage: false,
+    });
+    const m = await ContextManager.open({
+      path: PATH, strategy, now: () => { const t = clock.t; clock.t += clock.step ?? 0; return t; },
+    });
+    const before = m.getAllMessages().length;
+    m.addMessage('Claude', [{ type: 'text', text: 'long sentence. '.repeat(200) }], undefined, undefined,
+      { holdCompression: { timeoutMs } });
+    const shardIds = m.getAllMessages().slice(before).map((x) => x.id);
+    assert.ok(shardIds.length > 2, 'setup: sharded');
+    return { m, shardIds };
+  }
+
+  it('G1: every shard of one add shares a single deadline even if the clock advances mid-add', async () => {
+    const clock = { t: 0, step: 1 };
+    const { m, shardIds } = await shardedHeld(clock, 100);
+    clock.step = 0;
+    const details = m.getCompressionHoldDetails();
+    const deadlines = new Set(shardIds.map((id) => details.get(id)?.expiresAt));
+    assert.strictEqual(deadlines.size, 1, `deadlines: ${[...deadlines].join(',')}`);
+    m.close();
+  });
+
+  it('G2: extending one shard keeps it held after the rest of its group expires', async () => {
+    const clock = { t: 0 };
+    const { m, shardIds } = await shardedHeld(clock, 100);
+    clock.t = 50;
+    m.holdCompression([shardIds[1]], { timeoutMs: 1_000 });
+    clock.t = 100;
+    const held = m.getCompressionHolds();
+    assert.ok(held.has(shardIds[1]), 'extended shard still held');
+    assert.ok(!held.has(shardIds[0]) && !held.has(shardIds[2]), 'unextended shards expired');
+    m.close();
+  });
+
+  it('expiry is also checked on addMessage', async () => {
+    const clock = { t: 0 };
+    let notified = 0;
+    const strategy = new (class extends PassthroughStrategy {
+      onCompressionHoldsReleased(_ctx: StrategyContext): void { notified++; }
+    })();
+    const m = await open(clock, strategy);
+    m.addMessage('User', [{ type: 'text', text: 'a' }], undefined, undefined, { holdCompression: { timeoutMs: 10 } });
+    clock.t = 10;
+    m.addMessage('User', [{ type: 'text', text: 'b' }]);
+    assert.strictEqual(notified, 1);
+    m.close();
+  });
 });

@@ -185,8 +185,9 @@ export class ContextManager {
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
   private compressionHoldInfo = new Map<MessageId, CompressionHoldInfo>();
   private now: () => number = Date.now;
-  /** Hold options for the addMessage currently appending. */
+  /** Hold options + shared heldAt for the addMessage currently appending. */
   private holdingAddOptions: CompressionHoldOptions | undefined;
+  private holdingAddAt = 0;
   /** Set while addMessage(..., { holdCompression: true }) appends. */
   private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
@@ -414,6 +415,7 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    this.expireCompressionHolds();
     if (!options?.holdCompression) {
       return this.appendMessage(participant, content, metadata, causedBy);
     }
@@ -422,6 +424,8 @@ export class ContextManager {
     const held: MessageId[] = [];
     this.holdingAdds = held;
     this.holdingAddOptions = holdOptions;
+    // One clock read per add: every shard shares heldAt and expiresAt.
+    this.holdingAddAt = this.now();
     let id: MessageId;
     try {
       id = this.appendMessage(participant, content, metadata, causedBy);
@@ -513,14 +517,20 @@ export class ContextManager {
    * the strategy is notified — and logs a warning naming the ids and how
    * long they were held. Without `timeoutMs` a hold never expires.
    *
+   * Deadlines are per message id. One call (or one sharded addMessage) reads
+   * the clock once, so every id it holds shares one deadline; expiry releases
+   * only the ids whose own deadline passed (it never expands to a shard
+   * group, unlike an explicit releaseCompression of the add's id).
+   *
    * Re-holding an already-held id REPLACES its hold: `heldAt` resets to now
    * and the new options apply — a timeout restarts (refresh/extend/shorten),
    * and re-holding without `timeoutMs` makes it indefinite.
    */
   holdCompression(messageIds: Iterable<MessageId>, options?: CompressionHoldOptions): void {
     this.validateHoldOptions(options);
+    const heldAt = this.now(); // one deadline per call
     for (const id of messageIds) {
-      if (this.messageStore.get(id)) this.placeHold(id, options);
+      if (this.messageStore.get(id)) this.placeHold(id, options, heldAt);
     }
   }
 
@@ -531,8 +541,7 @@ export class ContextManager {
     }
   }
 
-  private placeHold(id: MessageId, options?: CompressionHoldOptions): void {
-    const heldAt = this.now();
+  private placeHold(id: MessageId, options: CompressionHoldOptions | undefined, heldAt: number): void {
     this.compressionHolds.add(id);
     this.compressionHoldInfo.set(id, options?.timeoutMs !== undefined
       ? { heldAt, expiresAt: heldAt + options.timeoutMs }
@@ -558,7 +567,18 @@ export class ContextManager {
       `[context-manager] compression hold timeout: releasing ${expired.length} hold(s) — ` +
         expired.map((e) => `${e.id} (held ${e.heldFor}ms)`).join(', '),
     );
-    this.releaseCompression(expired.map((e) => e.id));
+    // Per-id deadlines: release exactly the expired ids. Unlike an explicit
+    // releaseCompression of a sharded add's id, this does NOT expand to the
+    // whole shard group — a shard whose hold was re-placed (extended) keeps
+    // it. Shards of one add share a deadline, so they expire together.
+    for (const { id } of expired) {
+      this.compressionHolds.delete(id);
+      this.compressionHoldInfo.delete(id);
+    }
+    for (const [key, members] of [...this.compressionHoldGroups]) {
+      if (!members.some((mid) => this.compressionHolds.has(mid))) this.compressionHoldGroups.delete(key);
+    }
+    this.notifyHoldsReleased();
   }
 
   /**
@@ -1394,7 +1414,7 @@ export class ContextManager {
   private handleMessageAdd(message: StoredMessage): void {
     if (this.holdingAdds) {
       this.holdingAdds.push(message.id);
-      this.placeHold(message.id, this.holdingAddOptions);
+      this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
     }
     // Notify strategy of new message
     if (this.strategy.onNewMessage) {
