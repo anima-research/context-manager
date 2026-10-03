@@ -5,6 +5,8 @@ export type {
   BranchId,
   MessageMetadata,
   AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
   StoredMessage,
   BlobReference,
   StoredContentBlock,
