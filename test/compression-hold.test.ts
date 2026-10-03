@@ -392,4 +392,37 @@ describe('compression holds', () => {
     assert.strictEqual(manager.getCompressionHolds().size, 0);
     manager.close();
   });
+
+  // ---- Greptile re-review (32f1a4f) ----
+
+  for (const mode of ['single', 'range'] as const) {
+    it(`G2-1 (${mode}): removing a held message resumes deferred compression on tick()`, async () => {
+      const { prompts, membrane } = recordingMembrane();
+      const strategy = newStrategy();
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+      const { useId, resultId } = seed(manager, { holdOnAdd: true });
+      await drain(manager, strategy);
+      const n = prompts.length;
+      if (mode === 'single') manager.removeMessage(resultId);
+      else manager.removeMessages(useId, resultId);
+      for (let i = 0; i < 10; i++) await manager.tick();
+      assert.ok(prompts.length > n, 'deferred chunks compressed after removal');
+      manager.close();
+    });
+  }
+
+  it('G2-2: release during branch initialization neither throws nor loses the resume', async () => {
+    const { prompts, membrane } = recordingMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    const { resultId } = seed(manager, { holdOnAdd: true });
+    await drain(manager, strategy);
+    manager.editMessage(resultId, [{ type: 'tool_result', toolUseId: 'tu-1', content: REAL }]);
+    const switching = manager.switchBranch(manager.currentBranch().name);
+    assert.doesNotThrow(() => manager.releaseCompression([resultId]));
+    await switching;
+    for (let i = 0; i < 10; i++) await manager.tick();
+    assert.ok(prompts.some((p) => p.includes(REAL)), 'released content compressed after init');
+    manager.close();
+  });
 });

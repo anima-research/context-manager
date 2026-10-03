@@ -20,3 +20,6 @@
   release; queued merges reaching a hold wait. A held tool_result keeps a
   sharded (adaptive-resolution) tool_use message's whole body group with it.
   Range removals drop holds on removed messages.
+  Removing a held message also resumes deferred compression, and a release
+  during branch (re)initialization never throws into the caller — the
+  strategy is notified once initialization completes.

@@ -504,8 +504,31 @@ export class ContextManager {
       }
       this.compressionHolds.delete(id);
     }
-    if (this.compressionHolds.size !== before && this.strategy.onCompressionHoldsReleased) {
+    if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+  }
+
+  /** Set when a hold went away while the strategy was (re)initializing. */
+  private holdReleaseNotifyPending = false;
+
+  /**
+   * Tell the strategy holds went away (release or removal) so it re-queues
+   * deferred work. Never throws into the caller (a settle path); while the
+   * strategy is initializing, the notification is deferred until it is
+   * ready rather than dropped.
+   */
+  private notifyHoldsReleased(): void {
+    if (!this.strategy.onCompressionHoldsReleased) return;
+    if (!this.initialized) {
+      this.holdReleaseNotifyPending = true;
+      return;
+    }
+    this.holdReleaseNotifyPending = false;
+    try {
       this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
+    } catch (err) {
+      // Holds are already gone; the strategy's next rebuild (addMessage,
+      // compile) re-queues the work.
+      console.error('Strategy onCompressionHoldsReleased failed:', err);
     }
   }
 
@@ -1178,6 +1201,7 @@ export class ContextManager {
       );
     }
     this.initialized = true;
+    if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
   }
 
   /**
@@ -1256,11 +1280,15 @@ export class ContextManager {
       case 'removeRange':
         // Ids of the removed span aren't in the event; prune holds whose
         // message no longer exists.
-        for (const id of [...this.compressionHolds]) {
-          if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
-        }
-        for (const [key, members] of [...this.compressionHoldGroups]) {
-          if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+        {
+          const before = this.compressionHolds.size;
+          for (const id of [...this.compressionHolds]) {
+            if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
+          }
+          for (const [key, members] of [...this.compressionHoldGroups]) {
+            if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+          }
+          if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
         }
         // For range removes, we need to check all affected messages
         // This is a simplification - in practice we'd need to track the IDs
@@ -1309,7 +1337,12 @@ export class ContextManager {
   }
 
   private handleMessageRemove(messageId: MessageId): void {
-    this.compressionHolds.delete(messageId);
+    if (this.compressionHolds.delete(messageId)) {
+      for (const [key, members] of [...this.compressionHoldGroups]) {
+        if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+      }
+      this.notifyHoldsReleased();
+    }
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 
