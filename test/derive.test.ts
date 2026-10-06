@@ -127,6 +127,7 @@ describe('ContextManager.derive', () => {
       atSequence: child.getDerivation()!.atSequence,
       solve: 'reuse',
       inherited: { stateIds: ['messages', 'context', 'mint-preimage-envelopes'], statePrefixes: ['default/'] },
+      slots: { messageNamespace: null, contextNamespace: null, auxiliaryNamespaces: [] },
     });
     assert.equal(parent.getDerivation(), null);
 
@@ -329,6 +330,23 @@ describe('ContextManager.derive', () => {
       stateIds: ['messages', 'agents/mira/context', 'mint-preimage-envelopes'],
       statePrefixes: ['agents/mira/'],
     });
+    assert.deepEqual(child.getDerivation()!.slots, {
+      messageNamespace: null, // a resident's messages are in the shared slot
+      contextNamespace: 'agents/mira',
+      auxiliaryNamespaces: [],
+    });
+    const reopenedChild = await ContextManager.reopenDerived({
+      store: root,
+      derivation: child.getDerivation()!,
+      strategy: folding(),
+      membrane: mockMembrane() as never,
+    });
+    assert.equal(reopenedChild.getAllMessages().length, HISTORY);
+    assert.equal(
+      (reopenedChild.getStrategy() as unknown as { summaries: unknown[] }).summaries.length,
+      (strategy as unknown as { summaries: unknown[] }).summaries.length,
+      'reopened under the same namespace: the inherited memory tree is found',
+    );
     assert.equal(
       (childStrategy as unknown as { summaries: unknown[] }).summaries.length,
       (strategy as unknown as { summaries: unknown[] }).summaries.length,
@@ -348,6 +366,7 @@ describe('ContextManager.derive', () => {
     await settle(parent);
     await parent.compile(BUDGET);
     const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
+    const derivation = child.getDerivation()!;
     const childOnly = child.addMessage('User', turn(200, 'Child-only'));
     parent.addMessage('User', turn(100, 'Parent-only'));
     parent.close();
@@ -355,11 +374,15 @@ describe('ContextManager.derive', () => {
     const reopened = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
     managers.push(reopened);
     assert.equal(reopened.getAllMessages().length, HISTORY + 1);
-    const resumed = await ContextManager.open({
-      store: (reopened.getStore() as ViewStore).view('dendrite/child'),
+    // The derivation record is plain data: it survives being persisted.
+    const resumed = await ContextManager.reopenDerived({
+      store: reopened.getStore(),
+      derivation: JSON.parse(JSON.stringify(derivation)),
       strategy: folding(),
       membrane: mockMembrane() as never,
     });
+    assert.deepEqual(resumed.getDerivation(), derivation);
+    assert.equal(resumed.currentBranch().name, 'dendrite/child');
     const messages = resumed.getAllMessages();
     assert.equal(messages.length, HISTORY + 1);
     assert.equal(messages[HISTORY]!.id, childOnly);

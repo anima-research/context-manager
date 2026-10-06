@@ -200,6 +200,30 @@ export interface ContextDerivation {
   solve: 'reuse' | 'fresh';
   /** The states it inherited; anything else reads as empty on its branch. */
   inherited: { stateIds: string[]; statePrefixes: string[] };
+  /**
+   * How the manager's slots are named — with `branch`, everything needed to
+   * reopen the derived context later (see {@link ContextManager.reopenDerived}).
+   * `null` stands for "no namespace" so the record survives JSON.
+   */
+  slots: {
+    messageNamespace: string | null;
+    contextNamespace: string | null;
+    auxiliaryNamespaces: Array<string | null>;
+  };
+}
+
+/** Options for {@link ContextManager.reopenDerived}. */
+export interface ReopenDerivedOptions {
+  /** Any handle on the store that holds the derived branch. */
+  store: JsStore;
+  /** The record `getDerivation()` returned when the context was derived. */
+  derivation: ContextDerivation;
+  strategy?: ContextStrategy;
+  membrane?: Membrane;
+  tokenEstimator?: (text: string) => number;
+  /** The same exclusion predicate the parent manager used, if it had one. */
+  viewFilter?: (message: StoredMessage) => boolean;
+  debugLogContext?: boolean;
 }
 
 /** Thrown when the installed Chronicle cannot bind a handle to a branch. */
@@ -984,8 +1008,8 @@ export class ContextManager {
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.
    *
-   * The derived context persists. After a restart, reopen it with
-   * `ContextManager.open({ store: store.view(branch), ...sameSlotConfig })`.
+   * The derived context persists. Keep `getDerivation()` and reopen it
+   * later with {@link ContextManager.reopenDerived}.
    */
   async derive(options: DeriveContextOptions): Promise<ContextManager> {
     if (!ContextManager.supportsDerivation(this.store)) {
@@ -1062,7 +1086,18 @@ export class ContextManager {
     derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
     derived.toolDefinitions = this.toolDefinitions;
     derived.systemPrompt = this.systemPrompt;
-    derived.derivation = { parentBranch, branch: options.branch, atSequence, solve, inherited: filter };
+    derived.derivation = {
+      parentBranch,
+      branch: options.branch,
+      atSequence,
+      solve,
+      inherited: filter,
+      slots: {
+        messageNamespace: this.slots.messageNamespace ?? null,
+        contextNamespace: this.slots.contextNamespace ?? null,
+        auxiliaryNamespaces: this.slots.auxiliaryNamespaces.map((ns) => ns ?? null),
+      },
+    };
 
     await derived.initializeStrategy(observeStoreBranch(view));
     derived.initialized = true;
@@ -1079,15 +1114,42 @@ export class ContextManager {
 
   /** How this manager was derived, or null if it was opened directly. */
   getDerivation(): ContextDerivation | null {
-    return this.derivation
-      ? {
-          ...this.derivation,
-          inherited: {
-            stateIds: [...this.derivation.inherited.stateIds],
-            statePrefixes: [...this.derivation.inherited.statePrefixes],
-          },
-        }
-      : null;
+    return this.derivation ? structuredClone(this.derivation) : null;
+  }
+
+  /**
+   * Reopen a derived context on its own branch — after a restart, to resume
+   * the agent that owned it, or to inspect what it left. The branch is the
+   * derived context's durable state: this reads it cold, as any reopened
+   * store is read, and neither creates a branch nor touches the parent.
+   */
+  static async reopenDerived(options: ReopenDerivedOptions): Promise<ContextManager> {
+    if (!ContextManager.supportsDerivation(options.store)) {
+      throw new ContextDerivationUnsupportedError();
+    }
+    const { derivation } = options;
+    const view = (options.store as unknown as DerivableStore).view(derivation.branch);
+    const namespace = derivation.slots.contextNamespace ?? undefined;
+    const manager = await ContextManager.open({
+      store: view,
+      ...(namespace !== undefined ? { namespace } : {}),
+      // Isolated iff the message slot carried the namespace too.
+      ...(derivation.slots.messageNamespace !== null ? { isolate: true } : {}),
+      ...(derivation.slots.auxiliaryNamespaces.length > 0
+        ? {
+            auxiliaryMessageViews: derivation.slots.auxiliaryNamespaces.map((ns) =>
+              ns === null ? {} : { namespace: ns },
+            ),
+          }
+        : {}),
+      ...(options.strategy ? { strategy: options.strategy } : {}),
+      ...(options.membrane ? { membrane: options.membrane } : {}),
+      ...(options.tokenEstimator ? { tokenEstimator: options.tokenEstimator } : {}),
+      ...(options.viewFilter ? { viewFilter: options.viewFilter } : {}),
+      ...(options.debugLogContext !== undefined ? { debugLogContext: options.debugLogContext } : {}),
+    });
+    manager.derivation = structuredClone(derivation);
+    return manager;
   }
 
   /**
