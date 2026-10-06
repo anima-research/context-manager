@@ -52,6 +52,7 @@ import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
+import { describeFoldDiff, formatFoldDiff, type FoldDiff } from '../adaptive/fold-diff.js';
 import {
   KvUnifiedReceiptChain,
   type SerializedReceiptChain,
@@ -5224,6 +5225,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
+  /** Fold diff of the most recent non-dry-run adaptive compile that moved at
+   *  least one chunk; null after a quiet compile. */
+  private _lastFoldDiff: FoldDiff | null = null;
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -5270,6 +5274,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         exhausted: m?.exhausted ?? false,
         moves: m?.moves ?? 0,
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
+        ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -8435,6 +8440,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
+    }
+    // What moved, between which levels, and how deep into the carried layout
+    // the first change lands — the figure that sets this turn's cache
+    // re-read. `[plan-vs-actual]` only counts moves. Computed from the picker
+    // inputs' carried resolutions (the frontier the previous request was
+    // rendered from), never from `this.resolutions`, which may already hold
+    // staged-but-uncommitted changes. Quiet compiles cost nothing here.
+    this._lastFoldDiff = null;
+    if (!dryRun && result.moves > 0) {
+      try {
+        const carried = new Map<ChunkId, number>(
+          pickerChunks.map((c) => [c.id, c.currentResolution]),
+        );
+        const diff = describeFoldDiff(
+          pickerInputs,
+          new SummaryTree(pickerInputs),
+          carried,
+          result.finalResolutions,
+        );
+        this._lastFoldDiff = diff;
+        console.error(formatFoldDiff(diff));
+      } catch (err) {
+        // Observability must never fail a compile.
+        console.warn('[fold-diff] unavailable for this compile:', err);
+      }
     }
     if (plan?.override) {
       console.error(
