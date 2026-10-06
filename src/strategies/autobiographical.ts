@@ -998,6 +998,23 @@ function defaultsForKeysLeftNullish(
 }
 
 /**
+ * What {@link AutobiographicalStrategy.exportRenderingFrontier} hands a
+ * fresh instance over a derived context: the frontier state a restart
+ * would lose. Opaque to callers.
+ */
+export interface AutobiographicalRenderingFrontier {
+  strategy: 'autobiographical';
+  /** Previous compile's per-entry cache identities (marker placement). */
+  prevCacheKeys?: string[];
+  /** The live tail size, which hot settings may have moved off the config value. */
+  recentWindowTokens?: number;
+  runtimeTransitionPaceTokens?: number;
+  preparedWindowTokens?: number;
+  lastFrontierTokens?: number;
+  transitionBlocked?: HotContextSettingsStatus['blocked'];
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -1512,6 +1529,65 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.lastFrontierTokens <= this.preparedWindowTokens),
       ...(this.transitionBlocked ? { blocked: this.transitionBlocked } : {}),
     };
+  }
+
+  // --------------------------------------------------------------------------
+  // Rendering frontier hand-over (RenderingFrontierStrategy)
+  // --------------------------------------------------------------------------
+
+  /**
+   * The in-memory remainder of the rendering frontier. Everything else a
+   * derived context needs — summaries, resolutions, locks, pins, the
+   * kv-unified receipt — is persisted and arrives through the store.
+   */
+  exportRenderingFrontier(): AutobiographicalRenderingFrontier {
+    this.requireLoadedBranch('exportRenderingFrontier');
+    return {
+      strategy: 'autobiographical',
+      // Strings are immutable; the array is copied so the two instances'
+      // later compiles never share it.
+      ...(this._prevCacheKeys ? { prevCacheKeys: [...this._prevCacheKeys] } : {}),
+      recentWindowTokens: this.config.recentWindowTokens,
+      ...(this.runtimeTransitionPaceTokens !== undefined
+        ? { runtimeTransitionPaceTokens: this.runtimeTransitionPaceTokens }
+        : {}),
+      ...(this.preparedWindowTokens !== undefined ? { preparedWindowTokens: this.preparedWindowTokens } : {}),
+      ...(this.lastFrontierTokens !== undefined ? { lastFrontierTokens: this.lastFrontierTokens } : {}),
+      ...(this.transitionBlocked ? { transitionBlocked: this.transitionBlocked } : {}),
+    };
+  }
+
+  adoptRenderingFrontier(frontier: unknown): void {
+    this.requireLoadedBranch('adoptRenderingFrontier');
+    const f = frontier as Partial<AutobiographicalRenderingFrontier> | null | undefined;
+    if (!f || f.strategy !== 'autobiographical') return;
+    this._prevCacheKeys = Array.isArray(f.prevCacheKeys) ? [...f.prevCacheKeys] : undefined;
+    if (typeof f.recentWindowTokens === 'number') this.config.recentWindowTokens = f.recentWindowTokens;
+    this.runtimeTransitionPaceTokens = f.runtimeTransitionPaceTokens;
+    this.preparedWindowTokens = f.preparedWindowTokens;
+    this.lastFrontierTokens = f.lastFrontierTokens;
+    this.transitionBlocked = f.transitionBlocked;
+  }
+
+  discardRenderingFrontier(): void {
+    this.requireLoadedBranch('discardRenderingFrontier');
+    this._prevCacheKeys = undefined;
+    this.preparedWindowTokens = undefined;
+    this.lastFrontierTokens = undefined;
+    this.transitionBlocked = undefined;
+    if (this.config.adaptiveResolution) {
+      this.resolutions.clear();
+      this.persistResolutions();
+    }
+    if (this.config.foldingStrategy === 'kv-unified' && this.store) {
+      this.requireBranchMutation('discardRenderingFrontier');
+      this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
+      this.kvUnifiedDraft = null;
+      this.kvUnifiedPendingLayout = null;
+      this.kvUnifiedPendingMarkerUnitIndices = [];
+      this.kvUnifiedPendingImmutablePrefixHash = null;
+      this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+    }
   }
 
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {

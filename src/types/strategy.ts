@@ -317,6 +317,44 @@ export function isHotConfigurableStrategy(s: ContextStrategy): s is HotConfigura
 }
 
 /**
+ * Strategy that can hand over the part of its rendering frontier that lives
+ * only in memory.
+ *
+ * A derived context (see `ContextManager.derive`) inherits everything a
+ * strategy PERSISTS — summaries, resolutions, pins, receipts — through the
+ * store. What it would lose is what a restart also loses: the previous
+ * compile's cache identities, an in-flight budget transition, a hot-tuned
+ * tail. Without those the child's first compile is correct but places its
+ * cache markers as a cold start does, and the provider prefix the parent
+ * just paid for is not reused. These hooks carry that remainder across.
+ *
+ * The frontier value is opaque to callers and only meaningful between two
+ * instances of the same strategy class with compatible configuration; an
+ * instance must ignore a frontier it does not recognise.
+ */
+export interface RenderingFrontierStrategy extends ContextStrategy {
+  /** Snapshot the in-memory frontier. Must not alias mutable strategy state. */
+  exportRenderingFrontier(): unknown;
+  /** Take over a frontier exported by another instance. Called after initialize. */
+  adoptRenderingFrontier(frontier: unknown): void;
+  /**
+   * Forget the inherited frontier, persisted part included, so the next
+   * compile solves from scratch — a deliberate fresh solve, e.g. at another
+   * budget. The presentation changes and the provider cache misses.
+   */
+  discardRenderingFrontier(): void;
+}
+
+export function isRenderingFrontierStrategy(s: ContextStrategy): s is RenderingFrontierStrategy {
+  const candidate = s as Partial<RenderingFrontierStrategy>;
+  return (
+    typeof candidate.exportRenderingFrontier === 'function' &&
+    typeof candidate.adoptRenderingFrontier === 'function' &&
+    typeof candidate.discardRenderingFrontier === 'function'
+  );
+}
+
+/**
  * Result of a strategy's ingestion-time chunking decision.
  */
 export interface IngressChunkResult {

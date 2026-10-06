@@ -145,6 +145,38 @@ function cacheDiag(msg: string): void {
 }
 
 /**
+ * Memo of the caller-facing view of each materialized message, keyed by the
+ * identity of its internal (chronicle round-trip) object.
+ *
+ * `getAll()` maps every internal to a StoredMessage — a wrapper object, a
+ * Date, and blob-resolved content. That mapping used to be redone for the
+ * whole history after every append, and it is redone per MessageStore
+ * instance. Keying on the internal object makes it once per message per
+ * materialization: an append converts only the new message, and two stores
+ * holding the SAME internal objects — a store and the derived stores seeded
+ * from it (see deriveOnto) — share one wrapper and one resolved copy of
+ * every inherited message instead of each holding their own.
+ *
+ * Safe because the wrapper depends only on the internal's own fields, an
+ * edit replaces the internal object rather than mutating it, and both the
+ * internals and the mapped messages are immutable to callers (see
+ * allCache). WeakMap: entries die with the materialization that owns them.
+ */
+const storedViews = new WeakMap<object, StoredMessage>();
+
+/**
+ * Internal: what a derived MessageStore starts from instead of
+ * re-materializing its slot. See MessageStore.deriveOnto.
+ */
+interface MessageStoreSeed {
+  namespace: string | undefined;
+  stateId: string;
+  internals: unknown[];
+  blobManager: BlobManager;
+  tokenCalibration: number;
+}
+
+/**
  * Event emitted when the message store changes.
  */
 export type MessageStoreEvent =
@@ -209,21 +241,88 @@ export class MessageStore {
   private idToIndex: Map<MessageId, number> = new Map();
   private tokenEstimator: (text: string) => number;
   private stateId: string;
+  /** The slot's namespace as configured (undefined = the shared slot). */
+  private namespace: string | undefined;
 
   constructor(
     private store: JsStore,
     options: TokenEstimatorOptions & {
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/messages` */
       namespace?: string;
+      /** @internal Seed for a derived store; use {@link deriveOnto}. */
+      seed?: MessageStoreSeed;
     } = {}
   ) {
+    this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
+    const seed = options.seed;
+    if (seed) {
+      this.namespace = seed.namespace;
+      this.stateId = seed.stateId;
+      // Blobs are content-addressed and global to the store, so the parent's
+      // resolve cache is valid here and must not be rebuilt per child.
+      this.blobManager = seed.blobManager;
+      this.tokenCalibration = seed.tokenCalibration;
+      this.allCache = {
+        branchId: store.currentBranch().id,
+        sequence: store.currentSequence(),
+        internals: seed.internals as StoredMessageInternal[],
+        writeVersion: currentWriteVersion(store, this.stateId),
+      };
+      // The id index is rebuilt from the seeded array on first lookup
+      // (indexBranchId starts unset), and the native history indexes are
+      // registered on first query (queryIndexOrHeal). Neither is paid for a
+      // child that never asks.
+      return;
+    }
+    this.namespace = options.namespace;
     this.stateId = options.namespace
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
     this.blobManager = new BlobManager(store);
-    this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildIndex();
     this.registerHistoryIndexes();
+  }
+
+  /**
+   * A MessageStore over `view`, a branch-bound handle on a branch forked from
+   * this store's branch AT ITS CURRENT HEAD, for the same message slot.
+   *
+   * The derived store starts from this instance's already-materialized
+   * messages instead of asking chronicle to rebuild and re-parse the slot:
+   * an array of references is copied, the message objects themselves are
+   * shared, and so are their caller-facing views and resolved blobs. Reads
+   * are shared; writes go to `view`'s branch and are never seen here.
+   *
+   * Call synchronously after creating the branch — the seed is this store's
+   * state right now, which is the branch's state only until either side
+   * writes. If the seed does not match the branch (it was not forked at
+   * this store's head), the derived store falls back to a cold load.
+   */
+  deriveOnto(view: JsStore): MessageStore {
+    const internals = this.getAllInternal();
+    const length = view.getStateLen(this.stateId) ?? 0;
+    let coherent = length === internals.length;
+    if (coherent && length > 0) {
+      const last = (view as { getStateItemJson?: (id: string, index: number) => unknown })
+        .getStateItemJson?.(this.stateId, length - 1) as StoredMessageInternal | null | undefined;
+      const mine = internals[length - 1]!;
+      coherent = !!last && last.id === mine.id && last.sequence === mine.sequence;
+    }
+    if (!coherent) {
+      const cold = new MessageStore(view, { estimator: this.tokenEstimator, namespace: this.namespace });
+      cold.tokenCalibration = this.tokenCalibration;
+      return cold;
+    }
+    return new MessageStore(view, {
+      estimator: this.tokenEstimator,
+      seed: {
+        namespace: this.namespace,
+        stateId: this.stateId,
+        internals: internals.slice(),
+        blobManager: this.blobManager,
+        tokenCalibration: this.tokenCalibration,
+      },
+    });
   }
 
   /**
@@ -335,6 +434,15 @@ export class MessageStore {
       this.rebuildIndex();
     }
     return this.idToIndex.get(messageId);
+  }
+
+  /** Whether the materialized cache reflects every write made so far on this branch. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
   }
 
   private rebuildIndex(): void {
@@ -522,6 +630,7 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
@@ -539,6 +648,14 @@ export class MessageStore {
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the new write version, as append does. Otherwise the next read sees
+      // a version mismatch and re-materializes the whole slot for a
+      // one-message edit — and a store sharing its messages with others
+      // (see deriveOnto) would stop sharing them. Only when the cache was
+      // current before the write: a sibling instance's earlier edit must
+      // still force the rebuild it is owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
     } else {
       this.allCache = null;
     }
@@ -568,6 +685,7 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
@@ -579,6 +697,8 @@ export class MessageStore {
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full rebuild.
+      if (cacheWasCurrent) this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
     } else {
       this.allCache = null;
     }
@@ -731,9 +851,16 @@ export class MessageStore {
     ) {
       return c.stored;
     }
-    const stored = internals.map((internal, i) =>
-      this.internalToStored(internal, internal.id, i)
-    );
+    // Per-message memo (see storedViews): after an append only the new
+    // message is converted, and stores sharing internals share the views.
+    const stored = internals.map((internal, i) => {
+      let view = storedViews.get(internal);
+      if (!view) {
+        view = this.internalToStored(internal, internal.id, i);
+        storedViews.set(internal, view);
+      }
+      return view;
+    });
     this.allStoredCache = { branchId, sequence, writeVersion, stored };
     return stored;
   }

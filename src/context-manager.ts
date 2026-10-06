@@ -43,6 +43,7 @@ import {
   isSummaryOverviewStrategy,
   isRenderStatsCapable,
   isHotConfigurableStrategy,
+  isRenderingFrontierStrategy,
 } from './types/index.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
@@ -51,6 +52,7 @@ import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.j
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
+import { MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID } from './mint-preimage.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
 
 /**
@@ -156,6 +158,78 @@ interface ContextManagerStoreConfig extends ContextManagerBaseConfig {
 export type ContextManagerConfig = ContextManagerPathConfig | ContextManagerStoreConfig;
 
 /**
+ * Options for {@link ContextManager.derive}.
+ */
+export interface DeriveContextOptions {
+  /** Name of the Chronicle branch to create for the derived context. Must be unused. */
+  branch: string;
+  /**
+   * Strategy for the derived manager. Strategy instances hold state and are
+   * never shared: pass a fresh one. To reuse the parent's rendering, it must
+   * be the same class with compatible configuration.
+   */
+  strategy: ContextStrategy;
+  /** Membrane for the derived manager's own compression calls. Default: the parent's. */
+  membrane?: Membrane;
+  /**
+   * - `'reuse'` (default): keep the parent's rendering frontier — persisted
+   *   fold state arrives through the store, and the in-memory remainder is
+   *   handed from the parent's strategy to the child's — so the child's
+   *   first compile reproduces the parent's presentation and cache markers.
+   * - `'fresh'`: discard the inherited frontier and solve from scratch, e.g.
+   *   at another budget. Presentation changes; the provider cache misses.
+   */
+  solve?: 'reuse' | 'fresh';
+  /**
+   * Derive from an earlier point: a sequence on the parent's branch. The
+   * child then starts from history as it was, loaded cold (the parent's
+   * live caches describe the head, not the past). Default: the current head.
+   */
+  atSequence?: number;
+  debugLogContext?: boolean;
+}
+
+/** Where a derived context came from. */
+export interface ContextDerivation {
+  /** The branch it was derived from. */
+  parentBranch: string;
+  /** Its own branch: every write it makes lands here. */
+  branch: string;
+  /** The checkpoint on the parent's branch. */
+  atSequence: number;
+  solve: 'reuse' | 'fresh';
+  /** The states it inherited; anything else reads as empty on its branch. */
+  inherited: { stateIds: string[]; statePrefixes: string[] };
+}
+
+/** Thrown when the installed Chronicle cannot bind a handle to a branch. */
+export class ContextDerivationUnsupportedError extends Error {
+  constructor() {
+    super(
+      'Context derivation needs branch-bound store handles (JsStore.view), ' +
+        'which this @animalabs/chronicle build does not provide',
+    );
+    this.name = 'ContextDerivationUnsupportedError';
+  }
+}
+
+/** Chronicle surface derivation depends on; absent on builds without views. */
+interface DerivableStore {
+  view(branch: string): JsStore;
+  createBranchWithStates?(
+    name: string,
+    from: string | undefined | null,
+    filter: { stateIds?: string[]; statePrefixes?: string[] },
+  ): unknown;
+  createBranchAtWithStates?(
+    name: string,
+    from: string,
+    atSequence: number,
+    filter: { stateIds?: string[]; statePrefixes?: string[] },
+  ): unknown;
+}
+
+/**
  * Context Manager - the main interface for managing conversation context.
  *
  * Sits between the application/agent layer and Membrane, managing what goes
@@ -192,6 +266,15 @@ export class ContextManager {
   private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
+  /** How this manager's slots are named — what a derived context inherits. */
+  private slots: {
+    messageNamespace: string | undefined;
+    contextNamespace: string | undefined;
+    auxiliaryNamespaces: Array<string | undefined>;
+    tokenEstimator: ((text: string) => number) | undefined;
+  } = { messageNamespace: undefined, contextNamespace: undefined, auxiliaryNamespaces: [], tokenEstimator: undefined };
+  /** Set on a manager created by {@link derive}. */
+  private derivation: ContextDerivation | null = null;
 
   private constructor(
     store: JsStore,
@@ -373,6 +456,16 @@ export class ContextManager {
       auxiliaryStores,
     );
     if (config.now) manager.now = config.now;
+    manager.slots = {
+      messageNamespace,
+      contextNamespace: config.namespace,
+      auxiliaryNamespaces: [...seenAuxSlots].map((slotId) =>
+        (config.auxiliaryMessageViews ?? []).find(
+          (aux) => MessageStore.registrationFor(aux.namespace).id === slotId,
+        )?.namespace,
+      ),
+      tokenEstimator: config.tokenEstimator,
+    };
 
     // Initialize strategy. A strategy that refuses the store (e.g.
     // StoreTopologyError) must not leave a store we opened locked behind a
@@ -857,6 +950,144 @@ export class ContextManager {
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
     await this.switchBranch(branch.name);
     return branch.name;
+  }
+
+  // ==========================================================================
+  // Derivation: shared reads, separate writes
+  // ==========================================================================
+
+  /** Whether `store` can bind handles to branches, which derivation requires. */
+  static supportsDerivation(store: JsStore): boolean {
+    return typeof (store as unknown as Partial<DerivableStore>).view === 'function';
+  }
+
+  /**
+   * Derive a second context manager from this one.
+   *
+   * The derived manager starts from this manager's state at a checkpoint —
+   * its messages, and everything its strategy persists (the memory tree and
+   * its alternative resolutions, pins, the solver's carried frontier) — and
+   * from then on the two diverge. Reads of the inherited past are SHARED:
+   * no log record is copied and the materialized messages are the same
+   * objects in memory. Writes are SEPARATE: each manager writes only its own
+   * Chronicle branch, so this manager's later folding cannot change what the
+   * derived one inherited, and nothing the derived one does — background
+   * compression included — is visible here. This manager keeps running.
+   *
+   * Unlike {@link fork}, the store's branch cursor is not touched: the
+   * derived manager holds a handle bound to its own branch.
+   *
+   * What is inherited is the set of states this manager owns: its message
+   * slot, its auxiliary slots, its context log and its strategy's states.
+   * Other states in the store are not carried onto the derived branch.
+   * Compression holds, and compression work in flight here, are not
+   * inherited: the derived strategy re-derives its queue from what is
+   * persisted, as after a restart.
+   *
+   * The derived context persists. After a restart, reopen it with
+   * `ContextManager.open({ store: store.view(branch), ...sameSlotConfig })`.
+   */
+  async derive(options: DeriveContextOptions): Promise<ContextManager> {
+    if (!ContextManager.supportsDerivation(this.store)) {
+      throw new ContextDerivationUnsupportedError();
+    }
+    const source = this.store as unknown as JsStore & DerivableStore;
+    const solve = options.solve ?? 'reuse';
+    const parentBranch = this.store.currentBranch().name;
+    const head = this.store.currentSequence();
+    const atHead = options.atSequence === undefined || options.atSequence === head;
+    const atSequence = atHead ? head : options.atSequence!;
+
+    const stateIds = [
+      MessageStore.registrationFor(this.slots.messageNamespace).id,
+      ...this.slots.auxiliaryNamespaces.map((ns) => MessageStore.registrationFor(ns).id),
+      ContextLog.stateIdFor(this.slots.contextNamespace),
+      // Authoring-request preimages are keyed by hash in one store-wide
+      // tree; inherited so the child can still resolve a memory's origin.
+      // Ignored by the store when the tree was never created.
+      MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID,
+    ];
+    // Strategy state is registered under the strategy namespace
+    // (`{namespace}/autobio:*`, `{namespace}/windowed:anchor`, ...).
+    const statePrefixes = [`${this.strategyNamespace}/`];
+    const filter = { stateIds: [...new Set(stateIds)], statePrefixes };
+
+    // ---- Synchronous from here to the seeded stores: the checkpoint is ----
+    // ---- this manager's state at one instant, with no turn in between. ----
+    const frontier =
+      solve === 'reuse' && atHead && isRenderingFrontierStrategy(this.strategy)
+        ? this.strategy.exportRenderingFrontier()
+        : undefined;
+
+    if (atHead) {
+      if (typeof source.createBranchWithStates === 'function') {
+        source.createBranchWithStates(options.branch, parentBranch, filter);
+      } else {
+        this.store.createBranch(options.branch, parentBranch);
+      }
+    } else if (typeof source.createBranchAtWithStates === 'function') {
+      source.createBranchAtWithStates(options.branch, parentBranch, atSequence, filter);
+    } else {
+      this.store.createBranchAt(options.branch, parentBranch, atSequence);
+    }
+    const view = source.view(options.branch);
+
+    const coldStore = (namespace: string | undefined) =>
+      new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
+    const messageStore = atHead
+      ? this.messageStore.deriveOnto(view)
+      : coldStore(this.slots.messageNamespace);
+    const auxiliaryStores = this.auxiliaryStores.map((aux, i) =>
+      atHead ? aux.deriveOnto(view) : coldStore(this.slots.auxiliaryNamespaces[i]),
+    );
+    // ---- End of the synchronous section. ----
+
+    const contextLog = new ContextLog(view, {
+      estimator: this.slots.tokenEstimator,
+      namespace: this.slots.contextNamespace,
+    });
+    const derived = new ContextManager(
+      view,
+      messageStore,
+      contextLog,
+      options.strategy,
+      false, // the app owns the store; a derived manager never closes it
+      this.strategyNamespace,
+      options.membrane ?? this.membrane,
+      options.debugLogContext ?? this.debugLogContext,
+      this.viewFilter,
+      auxiliaryStores,
+    );
+    derived.now = this.now;
+    derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
+    derived.toolDefinitions = this.toolDefinitions;
+    derived.systemPrompt = this.systemPrompt;
+    derived.derivation = { parentBranch, branch: options.branch, atSequence, solve, inherited: filter };
+
+    await derived.initializeStrategy(observeStoreBranch(view));
+    derived.initialized = true;
+
+    if (isRenderingFrontierStrategy(derived.strategy)) {
+      if (solve === 'fresh') {
+        derived.strategy.discardRenderingFrontier();
+      } else if (frontier !== undefined) {
+        derived.strategy.adoptRenderingFrontier(frontier);
+      }
+    }
+    return derived;
+  }
+
+  /** How this manager was derived, or null if it was opened directly. */
+  getDerivation(): ContextDerivation | null {
+    return this.derivation
+      ? {
+          ...this.derivation,
+          inherited: {
+            stateIds: [...this.derivation.inherited.stateIds],
+            statePrefixes: [...this.derivation.inherited.statePrefixes],
+          },
+        }
+      : null;
   }
 
   /**

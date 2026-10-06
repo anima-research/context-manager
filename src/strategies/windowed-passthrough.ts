@@ -386,6 +386,27 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   }
 
   // --------------------------------------------------------------------------
+  // Rendering frontier hand-over (RenderingFrontierStrategy)
+  // --------------------------------------------------------------------------
+
+  /** The anchor is persisted and inherited through the store; only the
+   *  previous compile's cache identities live in memory. */
+  exportRenderingFrontier(): unknown {
+    return { strategy: 'windowed-passthrough', prevCacheKeys: this.prevCacheKeys ? [...this.prevCacheKeys] : null };
+  }
+
+  adoptRenderingFrontier(frontier: unknown): void {
+    const f = frontier as { strategy?: string; prevCacheKeys?: string[] | null } | null | undefined;
+    if (!f || f.strategy !== 'windowed-passthrough') return;
+    this.prevCacheKeys = Array.isArray(f.prevCacheKeys) ? [...f.prevCacheKeys] : null;
+  }
+
+  /** A fresh solve re-marks from a cold start; the anchor is a position, not a solve. */
+  discardRenderingFrontier(): void {
+    this.prevCacheKeys = null;
+  }
+
+  // --------------------------------------------------------------------------
   // Cache markers (first-claim ≤ 3; this strategy uses ≤ 2)
   // --------------------------------------------------------------------------
 

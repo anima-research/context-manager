@@ -44,7 +44,7 @@ const MINT_REQUEST_PREIMAGE_CONTENT_TYPE = 'application/json';
  * preimages never touch it — they stay keyed by their own digest, exactly as
  * before, so the common path carries no envelope overhead at all.
  */
-const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
+export const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
 
 const MINT_PREIMAGE_ENVELOPE_VERSION = 1;
 

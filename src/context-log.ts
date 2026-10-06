@@ -48,8 +48,13 @@ export class ContextLog {
    * @param store The Chronicle store
    * @param namespace Optional namespace for multi-agent support
    */
+  /** The Chronicle state id of the context log for `namespace`. */
+  static stateIdFor(namespace?: string): string {
+    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
+  }
+
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
+    const stateId = ContextLog.stateIdFor(namespace);
     store.registerState({
       id: stateId,
       strategy: 'append_log',
