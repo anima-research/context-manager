@@ -79,6 +79,8 @@ export type {
   HotContextSettingsStatus,
   HotConfigurableStrategy,
   RenderingFrontierStrategy,
+  DerivationManifest,
+  DerivationManifestStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
   RecallEnvelopeMode,
@@ -102,4 +104,5 @@ export {
   isSummaryOverviewStrategy,
   isHotConfigurableStrategy,
   isRenderingFrontierStrategy,
+  isDerivationManifestStrategy,
 } from './types/index.js';

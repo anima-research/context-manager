@@ -49,6 +49,8 @@ export type {
   PreviewResult,
   HotConfigurableStrategy,
   RenderingFrontierStrategy,
+  DerivationManifest,
+  DerivationManifestStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
@@ -81,4 +83,5 @@ export {
   isRenderStatsCapable,
   isHotConfigurableStrategy,
   isRenderingFrontierStrategy,
+  isDerivationManifestStrategy,
 } from './strategy.js';

@@ -9,6 +9,7 @@ import type {
   StoredMessage,
   SelectOptions,
   Sequence,
+  DerivationManifest,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -383,6 +384,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         return block;
       });
     }
+  }
+
+  /** A derived context inherits the anchor; nothing else is persisted. */
+  derivationManifest(namespace: string): DerivationManifest {
+    return { stateIds: [this.anchorStateIdOverride ?? `${namespace}/windowed:anchor`], statePrefixes: [] };
   }
 
   // --------------------------------------------------------------------------

@@ -44,6 +44,7 @@ import {
   isRenderStatsCapable,
   isHotConfigurableStrategy,
   isRenderingFrontierStrategy,
+  isDerivationManifestStrategy,
 } from './types/index.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
@@ -1031,10 +1032,17 @@ export class ContextManager {
       // Ignored by the store when the tree was never created.
       MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID,
     ];
-    // Strategy state is registered under the strategy namespace
-    // (`{namespace}/autobio:*`, `{namespace}/windowed:anchor`, ...).
-    const statePrefixes = [`${this.strategyNamespace}/`];
-    const filter = { stateIds: [...new Set(stateIds)], statePrefixes };
+    // Strategy state: what the strategy names (DerivationManifestStrategy),
+    // else everything under its namespace prefix (`{namespace}/autobio:*`,
+    // `{namespace}/windowed:anchor`, ...). A manifest lets a strategy leave
+    // its work queues and failure ledgers behind.
+    const manifest = isDerivationManifestStrategy(this.strategy)
+      ? this.strategy.derivationManifest(this.strategyNamespace)
+      : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] };
+    const filter = {
+      stateIds: [...new Set([...stateIds, ...manifest.stateIds])],
+      statePrefixes: [...manifest.statePrefixes],
+    };
 
     // ---- Synchronous from here to the seeded stores: the checkpoint is ----
     // ---- this manager's state at one instant, with no turn in between. ----

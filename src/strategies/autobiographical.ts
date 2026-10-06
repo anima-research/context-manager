@@ -27,6 +27,7 @@ import type {
   HotContextSettingsStatus,
   SelectOptions,
   PreviewResult,
+  DerivationManifest,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -1528,6 +1529,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (this.lastFrontierTokens !== undefined &&
           this.lastFrontierTokens <= this.preparedWindowTokens),
       ...(this.transitionBlocked ? { blocked: this.transitionBlocked } : {}),
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Inherited-state manifest (DerivationManifestStrategy)
+  // --------------------------------------------------------------------------
+
+  /**
+   * What a derived context starts from: the memory tree and everything that
+   * describes how it is presented — summaries, chunk records, the id
+   * counter, pins, resolutions, locks, calibration, the kv-unified receipt
+   * and the merge quarantine (dispositions about specific merges). Left
+   * empty on the child's branch: the merge queue, which `initialize`
+   * rebuilds from the inherited summaries, and the compression-refusal
+   * ledger, which records this instance's own refusals and alerts. Ids the
+   * configuration never registered are ignored by the store.
+   */
+  derivationManifest(namespace: string): DerivationManifest {
+    const ns = namespace;
+    return {
+      stateIds: [
+        `${ns}/autobio:summaries`,
+        `${ns}/autobio:chunks`,
+        `${ns}/autobio:counter`,
+        `${ns}/autobio:pins`,
+        `${ns}/autobio:resolutions`,
+        `${ns}/autobio:locks`,
+        `${ns}/autobio:calibration`,
+        `${ns}/autobio:merge-quarantine`,
+        `${ns}/kvunified:presentation-receipt`,
+      ],
+      statePrefixes: [],
     };
   }
 

@@ -121,14 +121,27 @@ describe('ContextManager.derive', () => {
     assert.deepEqual(child.getAllMessages().map((m) => m.id), ids);
     assert.equal(root.currentBranch().name, cursor, 'deriving leaves the store cursor where it was');
     assert.equal(child.currentBranch().name, 'dendrite/child');
-    assert.deepEqual(child.getDerivation(), {
-      parentBranch: cursor,
-      branch: 'dendrite/child',
-      atSequence: child.getDerivation()!.atSequence,
-      solve: 'reuse',
-      inherited: { stateIds: ['messages', 'context', 'mint-preimage-envelopes'], statePrefixes: ['default/'] },
-      slots: { messageNamespace: null, contextNamespace: null, auxiliaryNamespaces: [] },
-    });
+    const derivation = child.getDerivation()!;
+    assert.deepEqual(
+      { ...derivation, inherited: undefined },
+      {
+        parentBranch: cursor,
+        branch: 'dendrite/child',
+        atSequence: derivation.atSequence,
+        solve: 'reuse',
+        inherited: undefined,
+        slots: { messageNamespace: null, contextNamespace: null, auxiliaryNamespaces: [] },
+      },
+    );
+    // The strategy names what the child inherits: its memory and how it is
+    // presented, not its work queue or its own refusal ledger.
+    assert.deepEqual(derivation.inherited.statePrefixes, []);
+    for (const id of ['messages', 'context', 'mint-preimage-envelopes', 'default/autobio:summaries', 'default/autobio:resolutions', 'default/autobio:merge-quarantine']) {
+      assert.ok(derivation.inherited.stateIds.includes(id), `inherits ${id}`);
+    }
+    for (const id of ['default/autobio:mergeQueue', 'default/autobio:compression-refusal-quarantine-events']) {
+      assert.equal(derivation.inherited.stateIds.includes(id), false, `does not inherit ${id}`);
+    }
     assert.equal(parent.getDerivation(), null);
 
     // Appends.
@@ -290,6 +303,31 @@ describe('ContextManager.derive', () => {
     assert.equal(child.getAllMessages().length, HISTORY);
   });
 
+  it('leaves the parent\'s merge queue and refusal ledger behind, by the strategy\'s manifest', { skip }, async () => {
+    const { parent, strategy } = await foldedParent();
+    const root = parent.getStore();
+    const ledger = 'default/autobio:compression-refusal-quarantine-events';
+    const queue = 'default/autobio:mergeQueue';
+    // Give the parent a ledger entry and a queued merge to NOT inherit.
+    root.appendToStateJson(ledger, { kind: 'checkpoint', at: 1, note: 'parent-only' });
+    const sentinel = [{ level: 2, sourceIds: ['parent-only-a', 'parent-only-b'] }];
+    root.setStateJson(queue, sentinel);
+
+    const childStrategy = folding();
+    const child = await parent.derive({ branch: 'dendrite/child', strategy: childStrategy });
+    const view = child.getStore();
+    assert.equal(view.getStateLen(ledger) ?? 0, 0, 'the refusal ledger is the parent\'s own history');
+    assert.notDeepEqual(view.getStateJson(queue), sentinel, 'the merge queue is rebuilt from inherited memory, not carried');
+    assert.equal(
+      (childStrategy as unknown as { summaries: unknown[] }).summaries.length,
+      (strategy as unknown as { summaries: unknown[] }).summaries.length,
+      'the memory tree itself is inherited',
+    );
+    // And the parent still has both.
+    assert.equal(root.getStateLen(ledger), 1);
+    assert.deepEqual(root.getStateJson(queue), sentinel);
+  });
+
   it('a fresh solve discards the inherited frontier on the child only', { skip }, async () => {
     const { parent, strategy } = await foldedParent();
     const parentResolutions = [...(strategy as unknown as { resolutions: Map<string, number> }).resolutions];
@@ -326,10 +364,10 @@ describe('ContextManager.derive', () => {
 
     const childStrategy = folding();
     const child = await parent.derive({ branch: 'dendrite/child', strategy: childStrategy });
-    assert.deepEqual(child.getDerivation()!.inherited, {
-      stateIds: ['messages', 'agents/mira/context', 'mint-preimage-envelopes'],
-      statePrefixes: ['agents/mira/'],
-    });
+    assert.deepEqual(child.getDerivation()!.inherited.statePrefixes, []);
+    assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/mira/autobio:summaries'));
+    assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/mira/context'));
+    assert.equal(child.getDerivation()!.inherited.stateIds.includes('agents/mira/autobio:mergeQueue'), false);
     assert.deepEqual(child.getDerivation()!.slots, {
       messageNamespace: null, // a resident's messages are in the shared slot
       contextNamespace: 'agents/mira',

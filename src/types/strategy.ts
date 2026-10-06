@@ -345,6 +345,31 @@ export interface RenderingFrontierStrategy extends ContextStrategy {
   discardRenderingFrontier(): void;
 }
 
+/** Which Chronicle states a derived context inherits from its parent. */
+export interface DerivationManifest {
+  /** Exact state ids. Ids that name no registered state are ignored. */
+  stateIds: string[];
+  /** Plain string prefixes of state ids. */
+  statePrefixes: string[];
+}
+
+/**
+ * Strategy that names which of its persisted states a derived context
+ * inherits (see `ContextManager.derive`). Without this, every state under
+ * the strategy's namespace prefix is inherited, which carries work queues
+ * and failure ledgers along with the memory they describe. A strategy that
+ * implements it lists what the child should start from and leaves the
+ * rest empty on the child's branch — a queue to be rebuilt from inherited
+ * state, a ledger of the parent's own refusals.
+ */
+export interface DerivationManifestStrategy extends ContextStrategy {
+  derivationManifest(namespace: string): DerivationManifest;
+}
+
+export function isDerivationManifestStrategy(s: ContextStrategy): s is DerivationManifestStrategy {
+  return typeof (s as Partial<DerivationManifestStrategy>).derivationManifest === 'function';
+}
+
 export function isRenderingFrontierStrategy(s: ContextStrategy): s is RenderingFrontierStrategy {
   const candidate = s as Partial<RenderingFrontierStrategy>;
   return (
