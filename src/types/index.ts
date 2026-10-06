@@ -50,6 +50,7 @@ export type {
   HotConfigurableStrategy,
   RenderingFrontierStrategy,
   DerivationManifest,
+  DerivationManifestOptions,
   DerivationManifestStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,

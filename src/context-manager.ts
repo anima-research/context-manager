@@ -46,6 +46,7 @@ import {
   isRenderingFrontierStrategy,
   isDerivationManifestStrategy,
 } from './types/index.js';
+import type { DerivationManifestOptions } from './types/index.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -181,6 +182,8 @@ export interface DeriveContextOptions {
    *   at another budget. Presentation changes; the provider cache misses.
    */
   solve?: 'reuse' | 'fresh';
+  /** Passed to the strategy's derivation manifest (e.g. `{ refusals: true }`). */
+  inherit?: DerivationManifestOptions;
   /**
    * Derive from an earlier point: a sequence on the parent's branch. The
    * child then starts from history as it was, loaded cold (the parent's
@@ -1037,7 +1040,7 @@ export class ContextManager {
     // `{namespace}/windowed:anchor`, ...). A manifest lets a strategy leave
     // its work queues and failure ledgers behind.
     const manifest = isDerivationManifestStrategy(this.strategy)
-      ? this.strategy.derivationManifest(this.strategyNamespace)
+      ? this.strategy.derivationManifest(this.strategyNamespace, options.inherit ?? {})
       : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] };
     const filter = {
       stateIds: [...new Set([...stateIds, ...manifest.stateIds])],

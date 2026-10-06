@@ -28,6 +28,7 @@ import type {
   SelectOptions,
   PreviewResult,
   DerivationManifest,
+  DerivationManifestOptions,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -1542,14 +1543,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * counter, pins, resolutions, locks, calibration, the kv-unified receipt
    * and the merge quarantine (dispositions about specific merges). Left
    * empty on the child's branch: the merge queue, which `initialize`
-   * rebuilds from the inherited summaries, and the compression-refusal
-   * ledger, which records this instance's own refusals and alerts. Ids the
-   * configuration never registered are ignored by the store.
+   * rebuilds from the inherited summaries, and — unless `refusals` is
+   * asked for — the compression-refusal ledger, which records this
+   * instance's own refusals and alerts. Ids the configuration never
+   * registered are ignored by the store.
    */
-  derivationManifest(namespace: string): DerivationManifest {
+  derivationManifest(namespace: string, options: DerivationManifestOptions = {}): DerivationManifest {
     const ns = namespace;
     return {
       stateIds: [
+        ...(options.refusals
+          ? [`${ns}/autobio:compression-refusal-quarantine-events`, `${ns}/autobio:compression-refusal-quarantine`]
+          : []),
         `${ns}/autobio:summaries`,
         `${ns}/autobio:chunks`,
         `${ns}/autobio:counter`,

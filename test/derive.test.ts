@@ -326,6 +326,13 @@ describe('ContextManager.derive', () => {
     // And the parent still has both.
     assert.equal(root.getStateLen(ledger), 1);
     assert.deepEqual(root.getStateJson(queue), sentinel);
+
+    // Asked for, the refusals come along — the parent's entries, read on
+    // the child's branch; the child's own refusals would append after them.
+    const withRefusals = await parent.derive({ branch: 'dendrite/reader', strategy: folding(), inherit: { refusals: true } });
+    assert.equal(withRefusals.getStore().getStateLen(ledger), 1, 'the parent\'s refusal is known to the child');
+    assert.ok(withRefusals.getDerivation()!.inherited.stateIds.includes(ledger));
+    assert.notDeepEqual(withRefusals.getStore().getStateJson(queue), sentinel, 'the queue is still rebuilt, not carried');
   });
 
   it('a fresh solve discards the inherited frontier on the child only', { skip }, async () => {
