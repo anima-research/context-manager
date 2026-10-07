@@ -504,10 +504,35 @@ describe('MessageStore coherence across handles on one branch', () => {
       // And the other way round: an append through the root is seen by the view's store.
       resident.append('user', [{ type: 'text', text: 'after' }]);
       assert.equal(surgeon.getAll().length, 3);
+
       // Same-handle control, as before.
       const sibling = new MessageStore(root);
       sibling.edit(first.id, [{ type: 'text', text: 'same-handle' }]);
       assert.equal(text(resident), 'same-handle');
+
+      // A local append must not re-certify caches that were stale going in
+      // (Astra's second reproducer): the surgeon removes an earlier message,
+      // the resident appends, and then looks up by id.
+      const all = resident.getAll();
+      surgeon.remove(all[0]!.id);
+      resident.append('user', [{ type: 'text', text: 'after-removal' }]);
+      const stillThere = all[1]!;
+      assert.equal(
+        (resident.get(stillThere.id)!.content[0] as { text: string }).text,
+        (stillThere.content[0] as { text: string }).text,
+        'the id index was not certified by the local append',
+      );
+      assert.deepEqual(
+        resident.getAll().map((m) => (m.content[0] as { text: string }).text),
+        root.getStateJson('messages').map((m: { content: Array<{ text: string }> }) => m.content[0]!.text),
+        'the materialized view matches the slot',
+      );
+      // Same for a count-preserving edit followed by a local append.
+      const target = resident.getAll()[0]!;
+      surgeon.edit(target.id, [{ type: 'text', text: 'edited-by-surgeon' }]);
+      resident.append('user', [{ type: 'text', text: 'after-edit' }]);
+      assert.equal((resident.getAll()[0]!.content[0] as { text: string }).text, 'edited-by-surgeon');
+      assert.equal((resident.get(target.id)!.content[0] as { text: string }).text, 'edited-by-surgeon');
     } finally {
       root.close();
       rmSync(dir, { recursive: true, force: true });

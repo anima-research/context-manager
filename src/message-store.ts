@@ -559,6 +559,19 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
+    //
+    // Whether this instance's caches reflected every write to the slot
+    // BEFORE this append, including writes made through other handles to
+    // the same branch. A local write may re-certify only state that was
+    // current going in: a stale id index or materialized cache stays
+    // stale and is rebuilt on the next lookup (Astra's reproducer,
+    // 2026-10-07 — another handle removed an earlier message, this one
+    // appended, and the stamped-but-stale index returned the wrong
+    // message under the right id).
+    const indexWasCurrent =
+      this.indexBranchId === this.store.currentBranch().id &&
+      this.indexWriteVersion === slotRevision(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
     bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
@@ -598,6 +611,7 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
       this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
@@ -612,15 +626,18 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
-    // This instance made the write and the index reflects it.
-    this.indexWriteVersion = slotRevision(this.store, this.stateId);
+    if (indexWasCurrent) {
+      // This instance made the write and the index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = slotRevision(this.store, this.stateId);
+    }
+    // Else: leave the index stale; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
