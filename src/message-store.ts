@@ -135,6 +135,34 @@ function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
 }
 
+/**
+ * The slot's revision: current exactly while this number is unchanged.
+ *
+ * With a chronicle that exposes `stateHeadOffset` (branch-bound handles,
+ * 2026-10), this is the log offset of the slot's newest chain record on the
+ * handle's branch — changed by every write to the slot on that branch
+ * (append, edit, redact, set, the store's own snapshots) and by nothing
+ * else. It is the same number for every handle on the same branch, which
+ * is what the process-local write version above cannot be: that map is
+ * keyed by handle object, so a write through a second handle to the same
+ * branch (a hospital tool holding `root.view('main')` while the resident
+ * runs on the root) left the first handle's cache serving the old value
+ * when the edit preserved the item count — the count-and-tail
+ * revalidation could not see it. Field indexes already key freshness on
+ * this offset for the same reason.
+ *
+ * On an older chronicle the write version is the best available token.
+ */
+function slotRevision(store: JsStore, stateId: string): number {
+  const s = store as { stateHeadOffset?: (id: string) => number | null };
+  if (typeof s.stateHeadOffset === 'function') return s.stateHeadOffset(stateId) ?? -1;
+  return currentWriteVersion(store, stateId);
+}
+
+function hasSlotRevision(store: JsStore): boolean {
+  return typeof (store as { stateHeadOffset?: unknown }).stateHeadOffset === 'function';
+}
+
 /** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
  *  cost, every invalidating mutation, and every write-through fallback. The
  *  full rebuild is ~20s of CPU on a large store on production hardware —
@@ -266,7 +294,7 @@ export class MessageStore {
         branchId: store.currentBranch().id,
         sequence: store.currentSequence(),
         internals: seed.internals as StoredMessageInternal[],
-        writeVersion: currentWriteVersion(store, this.stateId),
+        writeVersion: slotRevision(store, this.stateId),
       };
       // The id index is rebuilt from the seeded array on first lookup
       // (indexBranchId starts unset), and the native history indexes are
@@ -429,7 +457,7 @@ export class MessageStore {
   private lookupIndex(messageId: MessageId): number | undefined {
     if (
       this.indexBranchId !== this.store.currentBranch().id ||
-      this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
+      this.indexWriteVersion !== slotRevision(this.store, this.stateId)
     ) {
       this.rebuildIndex();
     }
@@ -441,13 +469,13 @@ export class MessageStore {
     return (
       this.allCache !== null &&
       this.allCache.branchId === this.store.currentBranch().id &&
-      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+      this.allCache.writeVersion === slotRevision(this.store, this.stateId)
     );
   }
 
   private rebuildIndex(): void {
     this.indexBranchId = this.store.currentBranch().id;
-    this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = slotRevision(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
     for (let i = 0; i < messages.length; i++) {
@@ -531,7 +559,7 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -580,7 +608,7 @@ export class MessageStore {
       // and the cache now reflects it. Without this, the next getAllInternal
       // sees a version mismatch and full-rebuilds on EVERY append — the
       // quadratic ingest this write-through exists to prevent.
-      this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+      this.allCache.writeVersion = slotRevision(this.store, this.stateId);
     } else {
       if (this.allCache) {
         cacheDiag(
@@ -591,6 +619,8 @@ export class MessageStore {
     }
 
     this.idToIndex.set(message.id, index);
+    // This instance made the write and the index reflects it.
+    this.indexWriteVersion = slotRevision(this.store, this.stateId);
     this.emit({ type: 'add', message });
     return message;
   }
@@ -631,8 +661,9 @@ export class MessageStore {
     };
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    this.indexWriteVersion = slotRevision(this.store, this.stateId);
 
     // Write-through the materialized cache (see append — the cached entry
     // must be the chronicle round-trip form, so re-fetch it canonically).
@@ -655,7 +686,7 @@ export class MessageStore {
       // (see deriveOnto) would stop sharing them. Only when the cache was
       // current before the write: a sibling instance's earlier edit must
       // still force the rebuild it is owed.
-      if (cacheWasCurrent) this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+      if (cacheWasCurrent) this.allCache.writeVersion = slotRevision(this.store, this.stateId);
     } else {
       this.allCache = null;
     }
@@ -686,7 +717,7 @@ export class MessageStore {
     }
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
@@ -698,7 +729,7 @@ export class MessageStore {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
       // See edit(): stamp our own write so it does not cost a full rebuild.
-      if (cacheWasCurrent) this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+      if (cacheWasCurrent) this.allCache.writeVersion = slotRevision(this.store, this.stateId);
     } else {
       this.allCache = null;
     }
@@ -721,7 +752,7 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+      bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
@@ -739,7 +770,7 @@ export class MessageStore {
     while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
     const firstId = all[from].id;
     const lastId = all[to].id;
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -779,7 +810,7 @@ export class MessageStore {
       );
     }
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -840,7 +871,7 @@ export class MessageStore {
     // getAllInternal's contract.
     const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
-    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const writeVersion = slotRevision(this.store, this.stateId);
     const c = this.allStoredCache;
     if (
       c &&
@@ -1731,7 +1762,7 @@ export class MessageStore {
   private getAllInternal(): StoredMessageInternal[] {
     const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
-    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const writeVersion = slotRevision(this.store, this.stateId);
     let missReason = 'no-cache';
     if (this.allCache) {
       missReason =
@@ -1743,6 +1774,13 @@ export class MessageStore {
     }
     if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
+        return this.allCache.internals;
+      }
+      // With a slot revision from the store, an unchanged revision IS
+      // currency: no write to this slot on this branch happened through
+      // any handle. The sequence moved because other states were written.
+      if (hasSlotRevision(this.store)) {
+        this.allCache.sequence = sequence;
         return this.allCache.internals;
       }
       // The store-global sequence moved, but that may be writes to OTHER

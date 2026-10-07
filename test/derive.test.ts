@@ -24,6 +24,7 @@ import {
   AutobiographicalStrategy,
   ContextDerivationUnsupportedError,
   ContextManager,
+  MessageStore,
   PassthroughStrategy,
 } from '../src/index.js';
 
@@ -471,6 +472,46 @@ describe('ContextManager.derive', () => {
       parent.derive({ branch: 'x', strategy: new PassthroughStrategy() }),
       ContextDerivationUnsupportedError,
     );
+  });
+});
+
+describe('MessageStore coherence across handles on one branch', () => {
+  // Astra's reproducer (2026-10-07): a second handle to the SAME branch —
+  // a hospital tool holding root.view('main') while the resident runs on
+  // the root — edits an earlier message in place. The resident's own store
+  // must serve the edit, although the item count did not change.
+  it('a count-preserving edit through another handle is served by a warm cache', { skip }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-coherence-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const resident = new MessageStore(root);
+      const first = resident.append('user', [{ type: 'text', text: 'old' }]);
+      resident.append('user', [{ type: 'text', text: 'tail' }]);
+      resident.getAll(); // warm
+
+      const surgeon = new MessageStore((root as ViewStore).view('main'));
+      surgeon.getAll();
+      surgeon.edit(first.id, [{ type: 'text', text: 'new' }]);
+
+      const text = (store: MessageStore) => (store.getAll()[0]!.content[0] as { text: string }).text;
+      assert.equal(text(surgeon), 'new');
+      assert.equal(text(resident), 'new', 'the resident serves the edit made through the other handle');
+      assert.equal((root.getStateItemJson('messages', 0) as { content: Array<{ text: string }> }).content[0]!.text, 'new');
+      assert.equal(resident.get(first.id)!.content[0]!.type, 'text');
+      assert.equal((resident.get(first.id)!.content[0] as { text: string }).text, 'new', 'point reads too');
+
+      // And the other way round: an append through the root is seen by the view's store.
+      resident.append('user', [{ type: 'text', text: 'after' }]);
+      assert.equal(surgeon.getAll().length, 3);
+      // Same-handle control, as before.
+      const sibling = new MessageStore(root);
+      sibling.edit(first.id, [{ type: 'text', text: 'same-handle' }]);
+      assert.equal(text(resident), 'same-handle');
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
