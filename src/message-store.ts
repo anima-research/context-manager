@@ -337,6 +337,15 @@ export class MessageStore {
     return this.idToIndex.get(messageId);
   }
 
+  /** Whether the materialized cache reflects every write to the slot so far, through any instance. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
     this.indexBranchId = this.store.currentBranch().id;
     this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
@@ -435,10 +444,7 @@ export class MessageStore {
     const indexWasCurrent =
       this.indexBranchId === branchId &&
       this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
-    const cacheWasCurrent =
-      this.allCache !== null &&
-      this.allCache.branchId === branchId &&
-      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
     const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
@@ -544,6 +550,7 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
@@ -561,6 +568,12 @@ export class MessageStore {
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the version, as append does, so the next read is a hit rather than
+      // a whole-slot reload — but only if the cache was current before the
+      // write, so a sibling's earlier edit still forces the rebuild it is
+      // owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -590,6 +603,7 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
@@ -601,6 +615,8 @@ export class MessageStore {
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full reload.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
