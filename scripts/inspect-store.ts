@@ -20,10 +20,11 @@
  * and may rewrite its state index, so run this on a stopped resident's store
  * or on a copy.
  *
- * `--sample-compile <tokens>` additionally opens the store as a resident
- * would (an audit-only strategy under a ContextManager) and writes one compile
- * at that budget. That open registers the namespace's states and may migrate
- * legacy chunk records: use it on a copy.
+ * `--sample-compile <tokens>` additionally writes one compile at that
+ * budget from a live, audit-only open using this tool's default strategy
+ * configuration (not the resident's own, so it is a sample, not a
+ * reproduction of the resident's view). That open registers the namespace's
+ * states and may migrate legacy chunk records: use it on a copy.
  *
  * Exit code 0 = inspected, 2 = the namespace has no strategy state, 1 = could
  * not open or bad arguments.
@@ -47,13 +48,23 @@ interface SummaryEntry {
 
 const USAGE = 'Usage: inspect-store <store-path> [--namespace <ns>] [--output <dir>] [--sample-compile <tokens>]';
 
+/**
+ * The value of a named option, undefined when it is absent. A name given
+ * without a value (last, or followed by another option) is an error, never
+ * "absent": a malformed selection must not fall back to a default.
+ */
 function option(args: string[], ...names: string[]): string | undefined {
   for (const name of names) {
     const at = args.indexOf(name);
-    if (at >= 0) return args[at + 1];
+    if (at < 0) continue;
+    const value = args[at + 1];
+    if (value === undefined || value.startsWith('--')) throw new UsageError(`${name} needs a value`);
+    return value;
   }
   return undefined;
 }
+
+class UsageError extends Error {}
 
 function textOf(content: Array<{ type?: string; text?: string }>): string {
   return content.filter((block) => block.type === 'text').map((block) => block.text ?? '').join('');
@@ -66,9 +77,18 @@ async function main(): Promise<number> {
     console.error(USAGE);
     return 1;
   }
-  const namespace = option(args, '--namespace', '--ns') ?? 'default';
-  const outputDir = option(args, '--output') ?? './inspection-output';
-  const sampleRaw = option(args, '--sample-compile');
+  let namespace: string;
+  let outputDir: string;
+  let sampleRaw: string | undefined;
+  try {
+    namespace = option(args, '--namespace', '--ns') ?? 'default';
+    outputDir = option(args, '--output') ?? './inspection-output';
+    sampleRaw = option(args, '--sample-compile');
+  } catch (error) {
+    if (!(error instanceof UsageError)) throw error;
+    console.error(`${error.message}\n${USAGE}`);
+    return 1;
+  }
   const sampleTokens = sampleRaw === undefined ? undefined : Number(sampleRaw);
   if (sampleTokens !== undefined && !(Number.isInteger(sampleTokens) && sampleTokens > 0)) {
     console.error(`--sample-compile takes a positive whole number of tokens, not ${JSON.stringify(sampleRaw)}\n${USAGE}`);
@@ -180,8 +200,8 @@ async function main(): Promise<number> {
     // === Optional sample compile: a live, audit-only open ===
     if (sampleTokens !== undefined) {
       console.error(
-        `--sample-compile: opening "${namespace}" as a resident would (audit-only); ` +
-          'this registers the namespace\'s states and may migrate legacy chunk records',
+        `--sample-compile: a live, audit-only sample of "${namespace}" using this tool's default strategy ` +
+          'configuration (not the resident\'s); this open registers the namespace\'s states and may migrate legacy chunk records',
       );
       const strategy = new AutobiographicalStrategy({
         adaptiveResolution: true,
@@ -199,7 +219,11 @@ async function main(): Promise<number> {
           maxTokens: sampleTokens,
           reserveForResponse: Math.min(4_000, Math.floor(sampleTokens / 10)),
         });
-        const lines: string[] = [`# Sample compile (${sampleTokens}-token budget)\n`, `Entries: ${compiled.messages.length}\n`];
+        const lines: string[] = [
+          `# Sample compile (${sampleTokens}-token budget)\n`,
+          "A live, audit-only sample using inspect-store's default strategy configuration, not the resident's own.\n",
+          `Entries: ${compiled.messages.length}\n`,
+        ];
         compiled.messages.forEach((m, i) => {
           const text = textOf(m.content as Array<{ type?: string; text?: string }>);
           lines.push(`\n## [${i}] ${m.participant} (${Math.ceil(text.length / 4)} tokens)`, '', text, '', '---');

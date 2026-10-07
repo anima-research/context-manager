@@ -1,7 +1,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,12 +97,31 @@ describe('inspect-store', () => {
     assert.match(stdout, /Overview \(agents\/Ada\)/);
   });
 
-  it('--sample-compile writes one compile at that budget (a live, audit-only open)', async () => {
+  it('--sample-compile writes one compile at that budget, labelled a sample using tool defaults', async () => {
     const path = await residentStore();
     const out = join(path, '..', 'out-sample');
     const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out, '--sample-compile', '20000']);
     assert.equal(code, 0, stderr);
     assert.ok(existsSync(join(out, 'sample-compile-20000.md')));
+    assert.match(readFileSync(join(out, 'sample-compile-20000.md'), 'utf8'), /default strategy configuration, not the resident's own/);
+  });
+
+  it('a named option without its value is refused before anything is opened or written (#48901)', async () => {
+    const path = await residentStore();
+    // A store that also has a "default" namespace, which a missing value must not fall back to.
+    const strategy = new Seeder({ autoTickOnNewMessage: false } as never);
+    const manager = await ContextManager.open({ path, strategy, membrane: { complete: async () => ({ content: [] }) } as never });
+    strategy.seed({ id: 'L1-9', level: 1, content: 'zz default memory', tokens: 5, sourceLevel: 0, sourceIds: ['x'], sourceRange: { first: 'x', last: 'x' }, created: 1 });
+    manager.close();
+    const before = snapshot(path);
+    for (const args of [['--namespace'], ['--ns'], ['--namespace', '--output', 'x'], ['--sample-compile'], ['--output']]) {
+      const out = join(path, '..', `out-missing-${args.join('')}`);
+      const { code, stderr } = run([path, ...args, ...(args.includes('--output') ? [] : ['--output', out])]);
+      assert.equal(code, 1, args.join(' '));
+      assert.match(stderr, /needs a value/, args.join(' '));
+      assert.equal(existsSync(out), false, `${args.join(' ')}: nothing written`);
+    }
+    assert.equal(snapshot(path), before);
   });
 
   it('never creates a store that does not exist', () => {
