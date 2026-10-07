@@ -467,6 +467,62 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it('announces the branch\'s newest receipt to a journal that missed it, across later records without a receipt', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    let landThenThrow = false;
+    const flaky = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            const written = target.appendJson(type, payload);
+            if (landThenThrow) {
+              landThenThrow = false;
+              throw new Error('write reported failure after landing');
+            }
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const a = new FoldJournal(flaky, 'agents/tester');
+    const heard: string[] = [];
+    a.onReceipt((r) => heard.push(r.id));
+    const baseline = a.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    assert.equal(baseline?.kind, 'baseline');
+
+    // A's change lands, but its append reports failure: A announces nothing.
+    strategy.plan.set(ids[0]!, 'omit');
+    const folded = (await cm.compile(BUDGET)).provenance!;
+    landThenThrow = true;
+    assert.throws(() => a.accept(folded, Date.now(), undefined), /after landing/);
+    const change = cm.listFoldReceipts({ limit: 1 }).receipts[0]!;
+    assert.equal(change.kind, 'change');
+
+    // Another journal, with no listener, then records an unchanged layout
+    // and an arrival: two newer records, neither with a receipt.
+    const b = new FoldJournal(real, 'agents/tester');
+    assert.equal(b.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
+    add(cm, 1, 'late');
+    assert.equal(b.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
+
+    assert.equal(a.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
+    assert.deepEqual(heard, [baseline!.id, change.id], 'A hears the change its own write left unannounced, once');
+    assert.equal(a.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
+    assert.deepEqual(heard, [baseline!.id, change.id]);
+
+    // A journal opened later hears the branch's newest receipt too.
+    const later = new FoldJournal(real, 'agents/tester');
+    const laterHeard: string[] = [];
+    later.onReceipt((r) => laterHeard.push(r.id));
+    assert.equal(later.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
+    assert.deepEqual(laterHeard, [change.id]);
+    cm.close();
+  });
+
   it('compares with the branch\'s newest record, whichever manager on the store wrote it', async () => {
     const { cm: a } = await open();
     const ids = add(a, 4);
@@ -508,7 +564,10 @@ describe('fold journal', () => {
     cm.close();
   });
 
-  it('finds a retried compile whose layout names no record id: none at all, or ids that are not record numbers', async () => {
+  it('finds a retried compile whatever ids its layout names, even ids newer than its acceptance', async () => {
+    // A compile can name messages a crash then lost; after Chronicle truncates
+    // the torn tail it reissues their ids to later records, so the compile's
+    // acceptance can be older than ids its layout names.
     const { cm } = await open();
     const store = cm.getStore();
     const branch = cm.currentBranchRef();
@@ -516,15 +575,16 @@ describe('fold journal', () => {
     const handMade = (compileId: string, units: LayoutUnit[]): CompileProvenance => ({
       compileId, namespace: 'agents/tester', branch, messages: [], strategy: 'hand', layout: { v: 1, units, totalTokens: 0, calibration: 1 },
     });
-    const empty = handMade('empty', []);
-    const named = handMade('named', [{ k: 'r', s: 1, id: 'not-a-record-number', t: 3 }]);
+    const lost = '999999';
+    const raw = handMade('before-crash', [{ k: 'r', s: 1, id: lost, t: 3 }]);
+    const omitted = handMade('after-crash', [{ k: 'o', a: 1, ai: lost, b: 1, bi: lost, m: [[1, lost, 1, lost]] }]);
     const journal = new FoldJournal(store, 'agents/tester');
-    assert.equal(journal.accept(empty, Date.now(), undefined)?.kind, 'baseline');
-    assert.equal(journal.accept(named, Date.now(), undefined), null, 'an arrival');
+    assert.equal(journal.accept(raw, Date.now(), undefined)?.kind, 'baseline');
+    assert.deepEqual(journal.accept(omitted, Date.now(), undefined)?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']]);
     assert.equal(records(), 2);
     const fresh = new FoldJournal(store, 'agents/tester');
-    assert.equal(fresh.accept(empty, Date.now(), undefined), null);
-    assert.equal(fresh.accept(named, Date.now(), undefined), null);
+    assert.equal(fresh.accept(raw, Date.now(), undefined), null, 'no false omitted-to-raw receipt');
+    assert.equal(fresh.accept(omitted, Date.now(), undefined), null);
     assert.equal(records(), 2, 'both retries found their acceptance and wrote nothing');
     cm.close();
   });
