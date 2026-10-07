@@ -426,12 +426,18 @@ describe('fold journal', () => {
 
     strategy.plan.set(ids[0]!, 'omit');
     const second = (await cm.compile(BUDGET)).provenance!;
+    const announced: string[] = [];
+    journal.onReceipt((r) => announced.push(r.id));
     mode = 'landed';
     assert.throws(() => journal.accept(second, Date.now(), undefined), /after landing/);
+    assert.deepEqual(announced, [], 'nothing announced while the write is uncertain');
     mode = 'ok';
     const retry = new FoldJournal(flaky, 'agents/tester');
     assert.equal(journal.accept(second, Date.now(), undefined), null, 'the landed record is found on reread');
-    assert.equal(retry.accept(second, Date.now(), undefined), null, 'and by a fresh journal');
+    assert.equal(announced.length, 1, 'and its receipt is announced once, so a projection converges');
+    assert.equal(journal.accept(second, Date.now(), undefined), null);
+    assert.equal(announced.length, 1, 'never twice');
+    assert.equal(retry.accept(second, Date.now(), undefined), null, 'a fresh journal finds it too');
     const kinds = cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind);
     assert.deepEqual(kinds, ['change', 'baseline']);
     cm.close();

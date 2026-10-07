@@ -177,6 +177,8 @@ interface AcceptedLayoutRecord {
 interface LatestLayout {
   recordId: string;
   compileId: string;
+  /** The receipt this record embedded, if any (its id is the record id). */
+  receipt?: FoldReceipt;
   units: LayoutUnit[];
   totalTokens: number;
   chain: number;
@@ -227,6 +229,8 @@ export class FoldJournal {
   private readonly latest = new Map<string, LatestLayout | null>();
   private readonly acceptedCompiles = new Set<string>();
   private readonly listeners = new Set<(receipt: FoldReceipt) => void>();
+  /** Receipt ids this journal has announced to its listeners. */
+  private readonly notified = new Set<string>();
   /** Parsed receipts of this namespace by record id, and how far the global
    *  receipt list has been read. */
   private readonly receipts = new Map<string, FoldReceipt>();
@@ -265,7 +269,12 @@ export class FoldJournal {
     const key = branchKey(provenance.branch);
     const prev = this.loadLatest(key);
     if (prev && prev.compileId === provenance.compileId) {
+      // Already committed: by an earlier call whose write reported failure
+      // after landing, or by another journal on this store. Announce its
+      // receipt if this journal never did, so listeners (a projection)
+      // converge on the canonical record.
       this.acceptedCompiles.add(provenance.compileId);
+      if (prev.receipt) this.announce(prev.receipt);
       return null;
     }
 
@@ -278,16 +287,22 @@ export class FoldJournal {
     }
     const receipt = this.commit(provenance, layout, prev, draft);
     this.acceptedCompiles.add(provenance.compileId);
-    if (receipt) {
-      for (const listener of this.listeners) {
-        try {
-          listener(receipt);
-        } catch (err) {
-          console.error('[fold-journal] receipt listener failed:', err);
-        }
+    if (receipt) this.announce(receipt);
+    return receipt;
+  }
+
+  /** Tell listeners about a receipt, once per receipt per journal. */
+  private announce(receipt: FoldReceipt): void {
+    if (this.notified.has(receipt.id)) return;
+    this.notified.add(receipt.id);
+    this.receipts.set(receipt.id, receipt);
+    for (const listener of this.listeners) {
+      try {
+        listener(receipt);
+      } catch (err) {
+        console.error('[fold-journal] receipt listener failed:', err);
       }
     }
-    return receipt;
   }
 
   /** Receipts of one branch, newest first, filtered per `query`. */
@@ -455,7 +470,9 @@ export class FoldJournal {
     if (prev && delta) {
       const identical = delta.drop === 0 && delta.ins.length === 0 && delta.app.length === 0 && prev.totalTokens === layout.totalTokens;
       if (identical && !draft) {
-        this.latest.set(key, { ...prev, compileId: provenance.compileId });
+        // Nothing new to remember. This compile produced no receipt of its own.
+        const { receipt: _previousReceipt, ...unchanged } = prev;
+        this.latest.set(key, { ...unchanged, compileId: provenance.compileId });
         return null;
       }
       record = { ...base, kind: 'delta', prev: prev.recordId, ...delta, chain: prev.chain + 1 };
@@ -474,15 +491,16 @@ export class FoldJournal {
       this.latest.delete(key);
       throw err;
     }
+    const receipt = draft ? ({ ...draft, id: written.id } as FoldReceipt) : undefined;
     this.latest.set(key, {
       recordId: written.id,
       compileId: provenance.compileId,
+      ...(receipt ? { receipt } : {}),
       units: layout.units,
       totalTokens: layout.totalTokens,
       chain: record.chain,
     });
-    if (!draft) return null;
-    const receipt = { ...draft, id: written.id } as FoldReceipt;
+    if (!receipt) return null;
     this.receipts.set(written.id, receipt);
     return receipt;
   }
@@ -499,6 +517,7 @@ export class FoldJournal {
       const latest: LatestLayout = {
         recordId: ids[i]!,
         compileId: record.compileId,
+        ...(record.receipt ? { receipt: { ...record.receipt, id: ids[i]! } as FoldReceipt } : {}),
         units,
         totalTokens: record.totalTokens,
         chain: record.chain,
