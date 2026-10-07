@@ -592,6 +592,12 @@ interface CompressionLanePause {
    * provider's wait leaves the lane's own pacing in place.
    */
   statedUntil: number | null;
+  /**
+   * Whose word `statedUntil` is: the provider's (a failed call's stated
+   * wait), or the caller's provider admission (it deferred the call, so no
+   * call was made). Null with `statedUntil`.
+   */
+  statedBy: 'provider' | 'admission' | null;
   /** Consecutive paused failures; resets on any provider answer. */
   failures: number;
   membrane: unknown;
@@ -607,10 +613,15 @@ const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backo
 /** Which constraint binds: the provider's stated wait only when it outlasts the backoff. */
 const pauseSource = (pause: CompressionLanePause): 'retry-after' | 'backoff' =>
   pause.statedUntil !== null && pause.statedUntil > pause.backoffUntil ? 'retry-after' : 'backoff';
+const pauseSourceText = (pause: CompressionLanePause): string =>
+  pauseSource(pause) === 'retry-after'
+    ? (pause.statedBy === 'admission' ? "the caller's provider admission" : "the provider's stated wait")
+    : 'backoff';
 const pauseUntilText = (pause: CompressionLanePause): string => {
   const until = pauseUntil(pause);
-  return Number.isFinite(until)
-    ? `until ${new Date(until).toISOString()}`
+  if (Number.isFinite(until)) return `until ${new Date(until).toISOString()}`;
+  return pause.statedBy === 'admission'
+    ? "until the caller's provider admission releases it (it gave no deadline), a restart, or a change of model"
     : 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
 };
 /**
@@ -3923,6 +3934,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * when an operator releases a provider wait; the release is recorded
    * there). Only the provider-derived constraint goes: the lane's own
    * backoff still paces it, and with it gone too the lane resumes at once.
+   * The failure count is kept (a release is not an answer).
    * `model` limits the release to a pause on that model. True when a stated
    * wait was released.
    */
@@ -3931,9 +3943,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!pause || pause.statedUntil === null) return false;
     if (model !== undefined && pause.model !== model) return false;
     pause.statedUntil = null;
+    pause.statedBy = null;
+    // A release is the caller's word on the wait, not an answer from the
+    // provider: the failure count stays, so a failure after it keeps doubling
+    // the backoff from the genuine count (only an answer resets it).
     if (Date.now() >= pause.backoffUntil) {
-      console.warn(`[autobiographical] compression resumed: the provider's stated wait was released`);
-      this.compressionPause = null;
+      console.warn(`[autobiographical] compression resumed: the provider's stated wait was released (failure count ${pause.failures} kept)`);
     } else {
       console.warn(`[autobiographical] the provider's stated wait was released; compression stays paused by its backoff ${pauseUntilText(pause)}`);
     }
@@ -3977,15 +3992,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const instant = now + stated;
       statedUntil = Number.isFinite(instant) && instant <= MAX_DATE_MS ? instant : Number.POSITIVE_INFINITY;
     }
-    // A stated wait still standing from an earlier failure on this model is
-    // not shortened by this one.
-    if (previous?.statedUntil != null && (statedUntil === null || previous.statedUntil > statedUntil)) {
-      statedUntil = previous.statedUntil;
+    // The caller's provider admission deferred this call (agent-framework's
+    // refusal of a held model: `providerAdmission: 'deferred'`). No call was
+    // made, so nothing failed here: keep the external wait as the stated
+    // constraint (one without a deadline holds until it is released), and
+    // leave the failure count and the lane's own backoff as they were.
+    if ((error as { providerAdmission?: unknown } | null)?.providerAdmission === 'deferred') {
+      const held = statedUntil ?? Number.POSITIVE_INFINITY;
+      const pause: CompressionLanePause = previous
+        ? { ...previous }
+        : { backoffUntil: 0, statedUntil: null, statedBy: null, failures: 0, membrane: ctx.membrane, model, reason: '' };
+      if (pause.statedUntil === null || held > pause.statedUntil) {
+        pause.statedUntil = held;
+        pause.statedBy = 'admission';
+      }
+      pause.reason = describeCompressionFailure(error);
+      this.compressionPause = pause;
+      console.warn(
+        `[autobiographical] compression held ${pauseUntilText(pause)} by the caller's provider admission ` +
+          `(no call was made; model ${model ?? 'unset'}, failure count ${pause.failures}): ${pause.reason}`,
+      );
+      const heldUntil = pauseUntil(pause);
+      logCompressionCall({
+        event: 'compression:lane-held-by-admission',
+        operation: lane === 'l1' ? 'compress_l1' : 'merge',
+        metadata: { until: Number.isFinite(heldUntil) ? new Date(heldUntil).toISOString() : null, failures: pause.failures, model: model ?? null },
+      });
+      return;
     }
+    // A stated wait still standing from an earlier failure (or deferral) on
+    // this model is not shortened by this one (see the construction below).
     const reason = describeCompressionFailure(error);
+    let statedBy: CompressionLanePause['statedBy'] = statedUntil === null ? null : 'provider';
+    if (previous?.statedUntil != null && (statedUntil === null || previous.statedUntil > statedUntil)) {
+      statedBy = previous.statedBy;
+    }
     const pause: CompressionLanePause = {
       backoffUntil: now + backoff,
-      statedUntil,
+      statedUntil: previous?.statedUntil != null && (statedUntil === null || previous.statedUntil > statedUntil)
+        ? previous.statedUntil
+        : statedUntil,
+      statedBy,
       failures,
       membrane: ctx.membrane,
       model,
@@ -3995,7 +4042,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sourceLabel = pauseSource(pause);
     console.warn(
       `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
-        `(${sourceLabel === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${failures}, model ${model ?? 'unset'}); ` +
+        `(${pauseSourceText(pause)}, failure ${failures}, model ${model ?? 'unset'}); ` +
         `no compression call and no further queue item until then: ${reason}`,
     );
     const until = pauseUntil(pause);
@@ -4866,7 +4913,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const pause = this.compressionPause && Date.now() < pauseUntil(this.compressionPause) ? this.compressionPause : null;
       const paused = pause
         ? `; compression paused ${pauseUntilText(pause)} ` +
-          `(${pauseSource(pause) === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${pause.failures})`
+          `(${pauseSourceText(pause)}, failure ${pause.failures})`
         : '';
       return {
         ready: false,
@@ -6704,19 +6751,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        // The transport's rejection of this exact request's reasoning carriers
+        // is a deterministic answer like any rung's, kept under its own
+        // identity: a resumed ladder goes straight to the stripped request.
+        const carrierLabel = `${curveLabel}:carrier-rejected`;
+        const attemptHash = sha256Json(attemptRequest);
+        const carrierKnownRejected = knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
+          requestCarriesReasoning(attemptRequest);
         try {
+          if (carrierKnownRejected) {
+            throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
+          }
           response = await ctx.membrane!.complete(
             attemptRequest,
             { formatter: this.nativeFormatter },
           );
           if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         } catch (error) {
-          noteDispatchedModel(error, attemptRequest);
+          const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
+          if (!known) noteDispatchedModel(error, attemptRequest);
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
-          // Retry this attempt once with text-only recall pairs, loudly.
-          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
+          // Retry this attempt once with text-only recall pairs, loudly. Only a
+          // failure classified as a request-attributable rejection qualifies:
+          // a transient one that merely mentions thinking interrupts the ladder.
+          if (!known && (
+            compressionFailureKind(error) !== 'rejection' ||
+            !isCarrierTransportRejection(error) ||
+            !requestCarriesReasoning(attemptRequest)
+          )) {
             throw error;
+          }
+          if (!known) {
+            noteOutcome({
+              curveLabel: carrierLabel,
+              requestHash: attemptHash,
+              outcome: 'provider_error',
+              errorType: compressionErrorType(error) ?? 'invalid_request',
+            });
           }
           console.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
@@ -6883,6 +6955,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * different request, source-only-final, and exhausts if that fails.
        */
       let canonicalRejection: CompressionRefusalOutcomeRecord | undefined;
+      /**
+       * The canonical-stage rung (canonical, no-tools or tools-less) whose
+       * end_turn answer the summary is extracted from, or whose answer is known
+       * from progress to have stripped to empty. The plain-prose retry records
+       * an empty answer against this rung's own identity, so a resumed ladder
+       * reuses it rather than paying for it again.
+       */
+      let answeredRung: { curveLabel: string; requestHash: string } | undefined;
       const canonicalStep = await ladderStep('canonical', canonicalRequestHash, () => runAttempt(
         request,
         'canonical',
@@ -6894,6 +6974,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response = canonicalStep.response;
         successfulTrace = attemptTraces[attemptTraces.length - 1];
         canonicalStopReason = this.compressionResponseStopReason(response);
+        if (canonicalStopReason === 'end_turn') answeredRung = { curveLabel: 'canonical', requestHash: canonicalRequestHash };
         if (canonicalStopReason !== 'end_turn') {
           progressCanonicalInputTokens = this.compressionResponseInputTokens(response);
           noteOutcome({
@@ -6907,6 +6988,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         canonicalRejection = canonicalStep.outcome;
       } else {
         canonicalStopReason = canonicalStep.outcome.stopReason;
+        if (canonicalStep.outcome.outcome === 'unusable_empty') {
+          answeredRung = { curveLabel: 'canonical', requestHash: canonicalRequestHash };
+        }
       }
 
       // Terminal-disposition gate (2026-08-01): only a complete `end_turn`
@@ -6944,6 +7028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             response = retryStep.response;
             canonicalStopReason = retryStopReason;
             successfulTrace = attemptTraces[attemptTraces.length - 1];
+            answeredRung = { curveLabel: 'canonical-no-tools', requestHash: noToolsHash };
           } else {
             noteOutcome({
               curveLabel: 'canonical-no-tools',
@@ -6956,6 +7041,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           canonicalRejection = retryStep.outcome;
         } else {
           retryStopReason = retryStep.outcome.stopReason;
+          if (retryStep.outcome.outcome === 'unusable_empty') {
+            // Known from progress: it answered, with nothing usable. Resume at
+            // the plain-prose retry, not at this rung.
+            canonicalStopReason = 'end_turn';
+            answeredRung = { curveLabel: 'canonical-no-tools', requestHash: noToolsHash };
+          }
         }
         if (retryStopReason === 'tool_use' && !canonicalRejection) {
           // The span out-pulls the sentence — remove the tools param so a
@@ -6978,6 +7069,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               response = toolslessStep.response;
               canonicalStopReason = 'end_turn';
               successfulTrace = attemptTraces[attemptTraces.length - 1];
+              answeredRung = { curveLabel: 'canonical-toolless', requestHash: toolslessHash };
             } else {
               noteOutcome({
                 curveLabel: 'canonical-toolless',
@@ -6988,6 +7080,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
           } else if (toolslessStep.outcome.outcome === 'provider_error') {
             canonicalRejection = toolslessStep.outcome;
+          } else if (toolslessStep.outcome.outcome === 'unusable_empty') {
+            canonicalStopReason = 'end_turn';
+            answeredRung = { curveLabel: 'canonical-toolless', requestHash: toolslessHash };
           }
         }
       }
@@ -7536,6 +7631,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let summaryText = acceptedResponse ? extractSummaryText(acceptedResponse) : '';
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
       let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
+      /** The rung whose answer stripped to empty, as recorded before the plain-prose retry. */
+      let emptyRung: { curveLabel: string; requestHash: string } | undefined;
 
       // A generation whose whole text was a literal <thinking> wrapper strips
       // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
@@ -7557,7 +7654,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // again. The plain-prose retry is then a rung of the same ladder: its
         // known answer is reused, a rejection is its outcome, a transient
         // failure interrupts here and a later tick resumes at it.
-        noteOutcome({ curveLabel: 'canonical', requestHash: canonicalRequestHash, outcome: 'unusable_empty', stopReason: 'end_turn' });
+        emptyRung = answeredRung
+          ?? (successfulTrace ? { curveLabel: successfulTrace.curveLabel, requestHash: successfulTrace.requestHash } : undefined)
+          ?? { curveLabel: 'canonical', requestHash: canonicalRequestHash };
+        noteOutcome({ ...emptyRung, outcome: 'unusable_empty', stopReason: 'end_turn' });
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
@@ -7617,7 +7717,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 requestHash: sourceOnlyFallbackRequestHash!,
               }]
             : [
-                { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+                { ...(emptyRung ?? { curveLabel: 'canonical', requestHash: canonicalRequestHash }), outcome: 'unusable_empty' },
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
@@ -8570,8 +8670,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       } catch (error) {
         noteDispatchedModel(error, dispatchRequest);
         // Same degraded-mode fallback as the L1 ladder: transport rejected
-        // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
+        // the carrier blocks → retry once text-only, loudly. Only a failure
+        // classified as a request-attributable rejection qualifies.
+        if (
+          compressionFailureKind(error) !== 'rejection' ||
+          !isCarrierTransportRejection(error) ||
+          !requestCarriesReasoning(dispatchRequest)
+        ) throw error;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,

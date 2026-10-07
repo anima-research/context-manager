@@ -74,6 +74,11 @@ class ProbeStrategy extends AutobiographicalStrategy {
     const source = pause.statedUntil !== null && pause.statedUntil > pause.backoffUntil ? 'retry-after' : 'backoff';
     return { ...pause, until, source };
   }
+  /** Whether the lane is paused now (a pause whose constraints have all passed binds nothing). */
+  paused(): boolean {
+    const pause = this.pause();
+    return pause !== null && pause.until > Date.now();
+  }
   /** Stand for time passing: every finite constraint has elapsed. */
   expirePause(): void {
     const pause = this.lanePause();
@@ -441,7 +446,7 @@ describe("releasing the provider's wait keeps the lane's own backoff (#46385)", 
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(mock.calls.length, 1, 'held by the stated wait');
     assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
-    assert.equal(fx.strategy.pause(), null, 'nothing left to pace it');
+    assert.equal(fx.strategy.paused(), false, 'nothing left to pace it');
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(mock.calls.length, 2);
     fx.manager.close();
@@ -497,5 +502,148 @@ describe('the log bound never splits a surrogate pair at either cut', () => {
       const omitted = Number(/…\[(\d+) of \d+ characters omitted\]…/.exec(out)![1]);
       assert.equal(out.length - ` …[${omitted} of ${n} characters omitted]… `.length + omitted, n, `the omission count is exact at ${at}`);
     }
+  });
+});
+
+describe('every rung keeps its own identity across a resume (#47653)', () => {
+  const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+  const TOOL_USE = { content: [use('t9', 'skip_reply', { reason: 'later' })], stopReason: 'tool_use', usage: { inputTokens: 80, outputTokens: 5 } };
+  it('an empty no-tools answer is recorded as no-tools: a resume pays only for the prose retry', async () => {
+    const mock = scripted([TOOL_USE as never, THINKING as never, { throw: failure('network') }, OK('prose memory')]);
+    const fx = await build(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz network failure/);
+    assert.equal(mock.calls.length, 3);
+    const outcomes = (progressSlot(fx.manager) as Array<{ outcomes: Array<{ curveLabel: string; outcome: string }> }>)[0]!.outcomes;
+    assert.deepEqual(outcomes.map((o) => [o.curveLabel, o.outcome]), [['canonical', 'incomplete'], ['canonical-no-tools', 'unusable_empty']]);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 4, 'neither the canonical nor the no-tools request is paid again');
+    assert.ok(JSON.stringify(mock.calls[3]).includes('plain prose'));
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'prose memory'));
+    fx.manager.close();
+  });
+
+  it('the same for an empty tools-less answer', async () => {
+    const mock = scripted([TOOL_USE as never, TOOL_USE as never, THINKING as never, { throw: failure('network') }, OK('prose memory')]);
+    const fx = await build(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz network failure/);
+    assert.equal(mock.calls.length, 4);
+    const outcomes = (progressSlot(fx.manager) as Array<{ outcomes: Array<{ curveLabel: string; outcome: string }> }>)[0]!.outcomes;
+    assert.deepEqual(outcomes.map((o) => o.curveLabel), ['canonical', 'canonical-no-tools', 'canonical-toolless']);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 5, 'only the prose retry');
+    assert.ok(JSON.stringify(mock.calls[4]).includes('plain prose'));
+    fx.manager.close();
+  });
+
+  /** The fixture, with L1-100 carrying signed reasoning, so its recall pair carries it. */
+  async function withCarriers(membrane: unknown) {
+    const fx = await build(membrane);
+    const internals = fx.strategy as unknown as { summaries: SummaryEntry[] };
+    const l1 = internals.summaries.find((s) => s.id === 'L1-100')!;
+    l1.responseContent = [
+      { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
+      text('authored L1-100'),
+    ];
+    return fx;
+  }
+  const carriesThinking = (request: NormalizedRequest): boolean =>
+    request.messages.some((m) => m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'));
+
+  it('a genuine carrier rejection is recorded under its own identity: a resume goes straight to the stripped request', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    const mock = scripted([{ throw: rejected }, { throw: failure('network') }, OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz network failure/);
+    assert.equal(mock.calls.length, 2);
+    assert.ok(carriesThinking(mock.calls[0]!), 'the canonical carried reasoning');
+    assert.ok(!carriesThinking(mock.calls[1]!), 'the degraded retry did not');
+    const outcomes = (progressSlot(fx.manager) as Array<{ outcomes: Array<{ curveLabel: string }> }>)[0]!.outcomes;
+    assert.deepEqual(outcomes.map((o) => o.curveLabel), ['canonical:carrier-rejected']);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'the known-rejected carrier request is not sent again');
+    assert.ok(!carriesThinking(mock.calls[2]!));
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'stripped memory'));
+    fx.manager.close();
+  });
+
+  it('a transient failure that merely mentions thinking interrupts the ladder; no degraded retry', async () => {
+    const network = Object.assign(new Error('zz upstream: invalid_request while reading thinking blocks'), { type: 'network', retryable: true });
+    const mock = scripted([{ throw: network }]);
+    const fx = await withCarriers(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz upstream/);
+    assert.equal(mock.calls.length, 1, 'no stripped retry');
+    assert.equal(progressSlot(fx.manager).length, 1);
+    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[] }>)[0]!.outcomes, [], 'nothing recorded for it');
+    fx.manager.close();
+  });
+});
+
+describe("a caller's admission deferral is an external wait, not a failed call (#47927)", () => {
+  /** agent-framework's refusal of a held model: no provider call was made. */
+  const deferred = (retryAfterMs?: number) => Object.assign(
+    new Error('Provider wait: same-model is held for resident (recorded earlier: zz 429); no call was made'),
+    { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+  );
+  const requeue = (fx: Awaited<ReturnType<typeof queued>>) =>
+    fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+
+  it('on a fresh lane: the wait is kept, no failure is counted, no backoff is invented; a release resumes at once', async () => {
+    const mock = scripted([{ throw: deferred(120_000) }, OK('after the release')]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.failures, 0, 'nothing failed here');
+    assert.ok(pause.backoffUntil <= Date.now(), 'no local backoff');
+    assert.ok(pause.statedUntil! > Date.now() + 119_000, "the caller's wait is kept");
+    assert.match(fx.strategy.checkReadiness().description ?? '', /the caller's provider admission, failure 0/);
+    assert.equal(progressSlot(fx.manager).length, 1);
+    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; serverErrorStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
+
+    // The operator releases the wait through agent-framework 10 s later: no
+    // invented 20 s of failure pacing remain.
+    assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
+    assert.equal(fx.strategy.paused(), false);
+    await requeue(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    fx.manager.close();
+  });
+
+  it('after a genuine failure: the deferral leaves its count and backoff as they were, and the next failure doubles from it', async () => {
+    const mock = scripted([{ throw: failure('network') }, { throw: deferred(120_000) }, { throw: failure('network') }]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    assert.equal(fx.strategy.pause()!.failures, 1);
+    fx.strategy.expirePause();
+    const backoffBefore = fx.strategy.pause()!.backoffUntil;
+    await requeue(fx);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
+    const held = fx.strategy.pause()!;
+    assert.equal(held.failures, 1, 'not incremented');
+    assert.equal(held.backoffUntil, backoffBefore, 'the backoff deadline is untouched');
+    assert.equal(fx.strategy.releaseCompressionPause(), true);
+    await requeue(fx);
+    const start = Date.now();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    assert.equal(fx.strategy.pause()!.failures, 2);
+    assert.equal(Math.round((fx.strategy.pause()!.backoffUntil - start) / 1_000), 60, 'doubling continues from the genuine count');
+    fx.manager.close();
+  });
+
+  it('a deferral with no deadline holds until it is released', async () => {
+    const mock = scripted([{ throw: deferred() }, OK('x')]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
+    assert.equal(fx.strategy.pause()!.statedUntil, Number.POSITIVE_INFINITY);
+    assert.match(fx.strategy.checkReadiness().description ?? '', /until the caller's provider admission releases it/);
+    fx.strategy.expirePause();
+    await requeue(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'time passing does not end it');
+    assert.equal(fx.strategy.releaseCompressionPause(), true);
+    await requeue(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    fx.manager.close();
   });
 });
