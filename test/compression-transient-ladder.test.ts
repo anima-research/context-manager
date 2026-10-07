@@ -4,6 +4,7 @@ import { existsSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { boundFailureLogText } from '../src/strategies/autobiographical.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
@@ -53,6 +54,8 @@ function scripted(steps: Step[]) {
   };
 }
 
+interface RawPause { backoffUntil: number; statedUntil: number | null; failures: number; model: string | undefined; reason: string }
+
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void { this.pushSummary(entry); }
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
@@ -60,12 +63,29 @@ class ProbeStrategy extends AutobiographicalStrategy {
   chunksView(): Chunk[] { return [...this.chunks]; }
   compressionQueueView(): number[] { return [...this.compressionQueue]; }
   setCompressionModel(model: string): void { this.config.compressionModel = model; }
-  pause(): { until: number; failures: number; source: string } | null {
-    return (this as unknown as { compressionPause: { until: number; failures: number; source: string } | null }).compressionPause;
+  private lanePause(): RawPause | null {
+    return (this as unknown as { compressionPause: RawPause | null }).compressionPause;
   }
+  /** The lane's pause as it binds: the later of its backoff and the provider's stated wait. */
+  pause(): (RawPause & { until: number; source: 'retry-after' | 'backoff' }) | null {
+    const pause = this.lanePause();
+    if (!pause) return null;
+    const until = Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
+    const source = pause.statedUntil !== null && pause.statedUntil > pause.backoffUntil ? 'retry-after' : 'backoff';
+    return { ...pause, until, source };
+  }
+  /** Stand for time passing: every finite constraint has elapsed. */
   expirePause(): void {
-    const pause = (this as unknown as { compressionPause: { until: number } | null }).compressionPause;
-    if (pause) pause.until = 0;
+    const pause = this.lanePause();
+    if (!pause) return;
+    pause.backoffUntil = 0;
+    if (pause.statedUntil !== null && Number.isFinite(pause.statedUntil)) pause.statedUntil = 0;
+  }
+  /** Set the pause's constraints relative to now (white-box clock for the release seam). */
+  shiftPause(backoffFromNow: number, statedFromNow: number | null): void {
+    const pause = this.lanePause()!;
+    pause.backoffUntil = Date.now() + backoffFromNow;
+    pause.statedUntil = statedFromNow === null ? null : Date.now() + statedFromNow;
   }
 }
 function managerContext(manager: ContextManager): StrategyContext {
@@ -285,5 +305,197 @@ describe('compression lane pacing', () => {
     assert.ok((line![0] as string).length < 2_500);
     assert.match(line![0] as string, /Error \(network, retryable=true\): zz short network failure/);
     fx.manager.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Corrective round (Wren-1021's review of 3398926, room-225 #46214, #46271,
+// #46345, #46385; Ruth-1049's surrogate-cut gap).
+// ---------------------------------------------------------------------------
+
+describe('progress is a shared record, not an instance snapshot (#46214 #1)', () => {
+  /** A second strategy and manager on the same JsStore and namespace. */
+  async function sibling(store: ReturnType<ContextManager['getStore']>, membrane: unknown, opts: Opts = {}) {
+    const strategy = new ProbeStrategy(config(opts));
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    manager.setToolDefinitions(['skip_reply', 'journal'].map(tool));
+    return { strategy, manager };
+  }
+
+  it("a sibling strategy resumes at the rung another one was interrupted at, without paying the canonical again", async () => {
+    const first = scripted([{ throw: failure('context_length') }, { throw: failure('server', { httpStatus: 503 }) }]);
+    const a = await build(first.membrane, { sourceOnlyFallback: true });
+    // B is initialized BEFORE A records anything: an instance snapshot taken
+    // at initialize would be stale by the time B runs.
+    const second = scripted([OK('memory from the sibling')]);
+    const b = await sibling(a.manager.getStore(), second.membrane, { sourceOnlyFallback: true });
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
+    assert.equal(first.calls.length, 2);
+
+    const bChunk = { ...a.target(), messages: a.target().messages.map((m) => managerContext(b.manager).messageStore.get(m.id)!) };
+    await b.strategy.run(bChunk, managerContext(b.manager));
+    assert.equal(second.calls.length, 1, 'the sibling read the durable canonical rejection');
+    assert.ok(!isCanonical(second.calls[0]!), 'and went straight to source-only-final');
+    a.manager.close();
+  });
+
+  it("each strategy's write keeps the other's families, and one's cleanup leaves the other's", async () => {
+    const first = scripted([{ throw: failure('network') }]);
+    const a = await build(first.membrane);
+    // Both siblings are initialized before either records anything.
+    const second = scripted([REFUSAL, { throw: failure('network') }]);
+    const b = await sibling(a.manager.getStore(), second.membrane, { hoist: true });
+    const third = scripted([OK('A minted')]);
+    const a2 = await sibling(a.manager.getStore(), third.membrane);
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz network failure/);
+    assert.equal(progressSlot(a.manager).length, 1);
+
+    const want = new Set(a.ids.slice(6, 9));
+    const other: Chunk = { index: 998, startIndex: 6, endIndex: 9, messages: managerContext(b.manager).messageStore.getAll().filter((m) => want.has(m.id)), tokens: 100, compressed: false };
+    await assert.rejects(b.strategy.run(other, managerContext(b.manager)), /zz network failure/);
+    assert.equal(progressSlot(a.manager).length, 2, "B's write kept A's family");
+
+    // A's family mints (through a third sibling): its cleanup removes only its own entry.
+    const aChunk = { ...a.target(), messages: a.target().messages.map((m) => managerContext(a2.manager).messageStore.get(m.id)!) };
+    await a2.strategy.run(aChunk, managerContext(a2.manager));
+    const left = progressSlot(a.manager) as Array<{ chunkSourceHash: string; outcomes: Array<{ curveLabel: string }> }>;
+    assert.equal(left.length, 1, "A's cleanup left B's family");
+    assert.deepEqual(left[0]!.outcomes.map((o) => o.curveLabel), ['canonical'], "B's canonical refusal is still known");
+    a.manager.close();
+  });
+});
+
+describe('the pause holds an unusable deadline explicitly (#46214 #2)', () => {
+  it('a finite retry-after past the last Date instant is an indefinite hold: the provider error is what throws, and readiness says so', async () => {
+    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 1e20 }) }, OK('after the release')]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz rate_limit failure/);
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.statedUntil, Number.POSITIVE_INFINITY);
+    assert.equal(pause.source, 'retry-after');
+    assert.match(fx.strategy.checkReadiness().description ?? '', /cannot be held as an instant/);
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'time passing does not end it');
+    assert.equal(fx.strategy.releaseCompressionPause(), true, 'an explicit release does');
+    await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    fx.manager.close();
+  });
+});
+
+describe('the pause belongs to the call that failed (#46271 #3)', () => {
+  it('a failure dispatched to model A, landing after the model changed to B, pauses A, not B', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('B memory')]);
+    const fx = await queued(mock.membrane);
+    const tick = fx.strategy.tick(managerContext(fx.manager));
+    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(mock.calls[0]!.config.model, 'same-model');
+    fx.strategy.setCompressionModel('zz-model-b');
+    release();
+    await assert.rejects(tick, /zz network failure/);
+    assert.equal(fx.strategy.pause()?.model, 'same-model', 'the pause names the dispatched model');
+    await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'model B is not held by A\'s failure');
+    assert.equal(mock.calls[1]!.config.model, 'zz-model-b');
+    fx.manager.close();
+  });
+});
+
+describe("releasing the provider's wait keeps the lane's own backoff (#46385)", () => {
+  async function pausedByStatedWait() {
+    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 120_000 }) }, OK('after')]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz rate_limit failure/);
+    return { mock, fx };
+  }
+  const requeue = (fx: Awaited<ReturnType<typeof queued>>) =>
+    fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+
+  it('wait 120 s, backoff 30 s, release at 10 s: the remaining 20 s of backoff still pace the lane', async () => {
+    const { mock, fx } = await pausedByStatedWait();
+    fx.strategy.shiftPause(20_000, 110_000); // 10 s have passed
+    assert.equal(fx.strategy.releaseCompressionPause('zz-other-model'), false, 'a release for another model leaves it');
+    assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.statedUntil, null, 'only the provider-derived constraint is gone');
+    assert.ok(pause.until > Date.now() + 19_000 && pause.until <= Date.now() + 20_000);
+    await requeue(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'still paced by the backoff');
+    assert.equal(fx.strategy.releaseCompressionPause(), false, 'nothing provider-derived left to release');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'and calls once the backoff has passed');
+    fx.manager.close();
+  });
+
+  it('release after the backoff has elapsed: the lane resumes at once', async () => {
+    const { mock, fx } = await pausedByStatedWait();
+    fx.strategy.shiftPause(-1, 60_000); // the backoff passed; the stated wait still binds
+    await requeue(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'held by the stated wait');
+    assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
+    assert.equal(fx.strategy.pause(), null, 'nothing left to pace it');
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    fx.manager.close();
+  });
+});
+
+describe('the plain-prose retry is a rung of the durable ladder (#46345 #6)', () => {
+  const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+  const isProse = (request: NormalizedRequest): boolean => JSON.stringify(request).includes('plain prose');
+
+  it('a transient failure of the retry interrupts there; the next run pays only for the retry', async () => {
+    const mock = scripted([THINKING as never, { throw: failure('network') }, OK('prose memory')]);
+    const fx = await build(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz network failure/);
+    assert.equal(mock.calls.length, 2);
+    const recorded = progressSlot(fx.manager) as Array<{ outcomes: Array<{ curveLabel: string; outcome: string }> }>;
+    assert.deepEqual(recorded[0]!.outcomes.map((o) => [o.curveLabel, o.outcome]), [['canonical', 'unusable_empty']],
+      "the canonical's empty answer is kept");
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'only the retry is called again');
+    assert.ok(isProse(mock.calls[2]!), 'and it is the plain-prose request');
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && s.content === 'prose memory'));
+    fx.manager.close();
+  });
+
+  it('a typed rejection of the retry is its outcome: the family exhausts and is never paid again', async () => {
+    const mock = scripted([THINKING as never, { throw: failure('context_length') }]);
+    const fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'no call after exhaustion');
+    fx.manager.close();
+  });
+});
+
+describe('the log bound never splits a surrogate pair at either cut', () => {
+  it('a pair straddling the head cut or the tail cut, at every nearby position', () => {
+    const n = 100_002;
+    const max = 2_000;
+    const marker = ` …[${n} of ${n} characters omitted]… `.length;
+    const budget = max - marker;
+    const tail = Math.floor(budget / 4);
+    const headEnd = budget - tail;
+    const tailStart = n - tail;
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const at of [-3, -2, -1, 0, 1].flatMap((d) => [headEnd + d, tailStart + d])) {
+      const input = `${'x'.repeat(at)}😀${'x'.repeat(n - 2 - at)}`;
+      const out = boundFailureLogText(input, max);
+      assert.ok(out.length <= max, `length at ${at}`);
+      assert.equal(lone.test(out), false, `no lone surrogate with the pair at ${at}`);
+      const omitted = Number(/…\[(\d+) of \d+ characters omitted\]…/.exec(out)![1]);
+      assert.equal(out.length - ` …[${omitted} of ${n} characters omitted]… `.length + omitted, n, `the omission count is exact at ${at}`);
+    }
   });
 });

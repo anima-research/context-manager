@@ -132,7 +132,7 @@ const COMPRESSION_FAILURE_LOG_MAX_CHARS = 2_000;
  * how many of how many characters were omitted, the whole within `max`.
  * Cuts move only toward omission, so no surrogate pair is split.
  */
-function boundFailureLogText(text: string, max = COMPRESSION_FAILURE_LOG_MAX_CHARS): string {
+export function boundFailureLogText(text: string, max = COMPRESSION_FAILURE_LOG_MAX_CHARS): string {
   if (text.length <= max) return text;
   const isLow = (index: number): boolean => {
     const code = text.charCodeAt(index);
@@ -582,14 +582,46 @@ interface CompressionFamilyProgress {
  * deadline is the caller's (agent-framework's provider admission).
  */
 interface CompressionLanePause {
-  until: number;
-  /** Consecutive paused failures; resets on any successful compression call. */
+  /** The lane's own backoff: 30 s doubling per failure, capped at 10 min. */
+  backoffUntil: number;
+  /**
+   * The provider's stated wait, when one was given: its instant, or Infinity
+   * when it cannot be held as one (an explicit hold until a restart, a change
+   * of membrane or model, or releaseCompressionPause). Null when none, or
+   * once released. Kept apart from the backoff so a release of the
+   * provider's wait leaves the lane's own pacing in place.
+   */
+  statedUntil: number | null;
+  /** Consecutive paused failures; resets on any provider answer. */
   failures: number;
   membrane: unknown;
+  /** The model of the call that failed (not the configured model at the time of the failure). */
   model: string | undefined;
-  /** Whether the provider's stated wait or the local backoff set `until`. */
-  source: 'retry-after' | 'backoff';
   reason: string;
+}
+
+/** The last instant a JavaScript Date can represent (ECMA-262 time value range). */
+const MAX_DATE_MS = 8.64e15;
+/** When the lane may call again: the later of its two constraints. */
+const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
+/** Which constraint binds: the provider's stated wait only when it outlasts the backoff. */
+const pauseSource = (pause: CompressionLanePause): 'retry-after' | 'backoff' =>
+  pause.statedUntil !== null && pause.statedUntil > pause.backoffUntil ? 'retry-after' : 'backoff';
+const pauseUntilText = (pause: CompressionLanePause): string => {
+  const until = pauseUntil(pause);
+  return Number.isFinite(until)
+    ? `until ${new Date(until).toISOString()}`
+    : 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
+};
+/**
+ * The model each failed compression call was dispatched with, keyed by its
+ * error: the pause describes the call that failed, even if the configured
+ * compression model changed while it was in flight.
+ */
+const dispatchedCompressionModel = new WeakMap<object, string>();
+function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
+  const model = (request.config as { model?: unknown } | undefined)?.model;
+  if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
 }
 
 interface CompressionRefusalNormalizedConfig {
@@ -1283,8 +1315,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get compressionFamilyProgressStateId(): string {
     return `${this.ns}/autobio:compression-family-progress`;
   }
-  /** Durable ladder progress per L1 request family (see CompressionFamilyProgress). */
-  private compressionFamilyProgress = new Map<string, CompressionFamilyProgress>();
   /** In-process pacing after a transient compression failure (see CompressionLanePause). */
   private compressionPause: CompressionLanePause | null = null;
 
@@ -1898,7 +1928,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.headWindowStartId = null;
     this._cachedHeadStartIndex = null;
     this.compressionRefusalQuarantine.clear();
-    this.compressionFamilyProgress.clear();
     this.pins = [];
     this.pinIdCounter = 0;
     this.resolutions.clear();
@@ -2114,7 +2143,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecords = [];
       this.chunkIdCounter = 0;
       this.compressionRefusalQuarantine.clear();
-      this.compressionFamilyProgress.clear();
       return;
     }
 
@@ -2223,7 +2251,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
-    this.compressionFamilyProgress = this.readCompressionFamilyProgress();
 
     const pinsState = this.store.getStateJson(this.pinsStateId);
     if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
@@ -3634,8 +3661,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * chunk records exactly as the quarantine sweep is (never blind).
    */
   private sweepPaidOffCompressionProgress(): void {
-    if (!this.store || this.compressionFamilyProgress.size === 0) return;
+    if (!this.store) return;
     try {
+      if (this.readCompressionFamilyProgress().size === 0) return;
       const records = this.store.getStateJson(this.chunksStateId);
       const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
       if (chunkRecords.length === 0) return;
@@ -3807,6 +3835,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Durable before the next rung's call: written and synced, so a crash
    * after it never re-pays a request whose answer it records. Only work on
    * the current branch writes; stale-branch work leaves nothing.
+   *
+   * The slot is shared by every strategy on this store and namespace (each
+   * reads it afresh; nothing is cached per instance), so each write is a
+   * read-merge-write of this family alone: other families are kept as the
+   * slot holds them, and answers another writer recorded for this family
+   * are kept beside this ladder's. The read and the write are synchronous,
+   * with no await between them.
    */
   private recordCompressionFamilyProgress(
     source: CompressionOperationBranch,
@@ -3816,32 +3851,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     serverErrorStreak: CompressionFamilyProgress['serverErrorStreak'],
   ): void {
     if (!this.store || !this.isCompressionBranchCurrent(source)) return;
-    this.compressionFamilyProgress.set(record.familyKey, {
+    const progress = this.readCompressionFamilyProgress();
+    const existing = progress.get(record.familyKey);
+    const answerKey = (outcome: CompressionRefusalOutcomeRecord): string => `${outcome.curveLabel}\u0000${outcome.requestHash}`;
+    const merged = new Map<string, CompressionRefusalOutcomeRecord>();
+    for (const outcome of existing?.outcomes ?? []) merged.set(answerKey(outcome), outcome);
+    for (const outcome of outcomes) if (!merged.has(answerKey(outcome))) merged.set(answerKey(outcome), { ...outcome });
+    const answered = new Set([...merged.values()].map((outcome) => outcome.requestHash));
+    // A streak counts consecutive server errors of one request: the higher
+    // count for the same request, and none once that request has answered.
+    let streak = serverErrorStreak ? { ...serverErrorStreak } : undefined;
+    const other = existing?.serverErrorStreak;
+    if (other && !answered.has(other.requestHash)) {
+      if (!streak) streak = { ...other };
+      else if (other.requestHash === streak.requestHash && other.count > streak.count) streak = { ...other };
+    }
+    if (streak && answered.has(streak.requestHash)) streak = undefined;
+    const tokens = canonicalProviderInputTokens ?? existing?.canonicalProviderInputTokens;
+    progress.set(record.familyKey, {
       familyKey: record.familyKey,
       chunkSourceHash: record.chunkSourceHash,
-      outcomes: outcomes.map((outcome) => ({ ...outcome })),
-      ...(canonicalProviderInputTokens !== undefined ? { canonicalProviderInputTokens } : {}),
-      ...(serverErrorStreak ? { serverErrorStreak: { ...serverErrorStreak } } : {}),
+      outcomes: [...merged.values()],
+      ...(tokens !== undefined ? { canonicalProviderInputTokens: tokens } : {}),
+      ...(streak ? { serverErrorStreak: streak } : {}),
       updated: Date.now(),
     });
-    this.writeCompressionFamilyProgress();
+    this.writeCompressionFamilyProgress(progress);
   }
 
-  private writeCompressionFamilyProgress(): void {
+  private writeCompressionFamilyProgress(progress: Map<string, CompressionFamilyProgress>): void {
     if (!this.store) return;
-    this.store.setStateJson(this.compressionFamilyProgressStateId, [...this.compressionFamilyProgress.values()]);
+    this.store.setStateJson(this.compressionFamilyProgressStateId, [...progress.values()]);
     this.store.sync();
   }
 
-  /** Drop progress at a meaningful boundary (mint, exhaustion, paid-off sweep). */
+  /**
+   * Drop progress at a meaningful boundary (mint, exhaustion, paid-off
+   * sweep): read afresh, remove only the matching families, keep every
+   * other writer's.
+   */
   private forgetCompressionFamilyProgress(matches: (entry: CompressionFamilyProgress) => boolean): void {
+    if (!this.store) return;
+    const progress = this.readCompressionFamilyProgress();
     let changed = false;
-    for (const [key, entry] of this.compressionFamilyProgress) {
+    for (const [key, entry] of progress) {
       if (!matches(entry)) continue;
-      this.compressionFamilyProgress.delete(key);
+      progress.delete(key);
       changed = true;
     }
-    if (changed) this.writeCompressionFamilyProgress();
+    if (changed) this.writeCompressionFamilyProgress(progress);
   }
 
   /**
@@ -3856,16 +3914,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionPause = null;
       return null;
     }
-    return Date.now() < pause.until ? pause : null;
+    return Date.now() < pauseUntil(pause) ? pause : null;
+  }
+
+  /**
+   * Release the provider's stated wait from the lane's pause: the caller's
+   * explicit word that the wait no longer holds (agent-framework calls this
+   * when an operator releases a provider wait; the release is recorded
+   * there). Only the provider-derived constraint goes: the lane's own
+   * backoff still paces it, and with it gone too the lane resumes at once.
+   * `model` limits the release to a pause on that model. True when a stated
+   * wait was released.
+   */
+  releaseCompressionPause(model?: string): boolean {
+    const pause = this.compressionPause;
+    if (!pause || pause.statedUntil === null) return false;
+    if (model !== undefined && pause.model !== model) return false;
+    pause.statedUntil = null;
+    if (Date.now() >= pause.backoffUntil) {
+      console.warn(`[autobiographical] compression resumed: the provider's stated wait was released`);
+      this.compressionPause = null;
+    } else {
+      console.warn(`[autobiographical] the provider's stated wait was released; compression stays paused by its backoff ${pauseUntilText(pause)}`);
+    }
+    return true;
   }
 
   /**
    * Pause compression calls after a failure that says nothing about the
-   * request: max(the provider's stated wait, the lane's own backoff of 30 s
-   * doubling to 10 min). A stated wait is never shortened; one that cannot be
-   * held as an instant (not finite) pauses the lane until a restart or a
-   * change of membrane or model. Discarded or stale-branch work installs
-   * nothing. One warning per pause, plus a structured log event.
+   * request, until both constraints have passed: the lane's own backoff (30 s
+   * doubling to 10 min) and the provider's stated wait, which is never
+   * shortened. A stated wait that cannot be held as an instant (not finite,
+   * or past the last instant a Date can hold) is an explicit hold until a
+   * restart, a change of membrane or model, or releaseCompressionPause. The
+   * pause belongs to the model the failed call was dispatched with.
+   * Discarded or stale-branch work installs nothing. One warning per pause,
+   * plus a structured log event.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -3875,9 +3959,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): void {
     if (!this.isCompressionBranchCurrent(source)) return;
     const now = Date.now();
+    const model = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined)
+      ?? this.config.compressionModel;
     const previous = this.compressionPause &&
       this.compressionPause.membrane === ctx.membrane &&
-      this.compressionPause.model === this.config.compressionModel
+      this.compressionPause.model === model
       ? this.compressionPause
       : null;
     const failures = (previous?.failures ?? 0) + 1;
@@ -3886,32 +3972,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS,
     );
     const stated = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
-    const statedMs = typeof stated === 'number' && !Number.isNaN(stated) && stated >= 0 ? stated : undefined;
-    const fromProvider = statedMs !== undefined && statedMs > backoff;
-    const until = fromProvider ? now + statedMs : now + backoff;
+    let statedUntil: number | null = null;
+    if (typeof stated === 'number' && !Number.isNaN(stated) && stated >= 0) {
+      const instant = now + stated;
+      statedUntil = Number.isFinite(instant) && instant <= MAX_DATE_MS ? instant : Number.POSITIVE_INFINITY;
+    }
+    // A stated wait still standing from an earlier failure on this model is
+    // not shortened by this one.
+    if (previous?.statedUntil != null && (statedUntil === null || previous.statedUntil > statedUntil)) {
+      statedUntil = previous.statedUntil;
+    }
     const reason = describeCompressionFailure(error);
-    this.compressionPause = {
-      until,
+    const pause: CompressionLanePause = {
+      backoffUntil: now + backoff,
+      statedUntil,
       failures,
       membrane: ctx.membrane,
-      model: this.config.compressionModel,
-      source: fromProvider ? 'retry-after' : 'backoff',
+      model,
       reason,
     };
-    const untilText = Number.isFinite(until)
-      ? `until ${new Date(until).toISOString()}`
-      : 'until a restart or a change of model (the provider stated an unbounded wait)';
+    this.compressionPause = pause;
+    const sourceLabel = pauseSource(pause);
     console.warn(
-      `[autobiographical] compression paused ${untilText} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
-        `(${fromProvider ? "the provider's stated wait" : 'backoff'}, failure ${failures}); no item consumed: ${reason}`,
+      `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
+        `(${sourceLabel === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${failures}, model ${model ?? 'unset'}); ` +
+        `no compression call and no further queue item until then: ${reason}`,
     );
+    const until = pauseUntil(pause);
     logCompressionCall({
       event: 'compression:lane-paused',
       operation: lane === 'l1' ? 'compress_l1' : 'merge',
       metadata: {
         until: Number.isFinite(until) ? new Date(until).toISOString() : null,
         failures,
-        source: fromProvider ? 'retry-after' : 'backoff',
+        source: sourceLabel,
+        model: model ?? null,
         error_type: compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error),
       },
     });
@@ -4768,10 +4863,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const parts: string[] = [];
       if (this.compressionQueue.length > 0) parts.push(`${this.compressionQueue.length} chunks`);
       if (needsMerge) parts.push(`${this.mergeQueue.length} merges`);
-      const pause = this.compressionPause && Date.now() < this.compressionPause.until ? this.compressionPause : null;
+      const pause = this.compressionPause && Date.now() < pauseUntil(this.compressionPause) ? this.compressionPause : null;
       const paused = pause
-        ? `; compression paused ${Number.isFinite(pause.until) ? `until ${new Date(pause.until).toISOString()}` : 'until a restart or a change of model'} ` +
-          `(${pause.source === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${pause.failures})`
+        ? `; compression paused ${pauseUntilText(pause)} ` +
+          `(${pauseSource(pause) === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${pause.failures})`
         : '';
       return {
         ready: false,
@@ -6616,6 +6711,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           );
           if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         } catch (error) {
+          noteDispatchedModel(error, attemptRequest);
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
           // Retry this attempt once with text-only recall pairs, loudly.
@@ -6632,10 +6728,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
-          response = await ctx.membrane!.complete(
-            acceptedRequest,
-            { formatter: this.nativeFormatter },
-          );
+          try {
+            response = await ctx.membrane!.complete(
+              acceptedRequest,
+              { formatter: this.nativeFormatter },
+            );
+          } catch (retryError) {
+            noteDispatchedModel(retryError, acceptedRequest);
+            throw retryError;
+          }
           if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
@@ -6682,7 +6783,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // a request in this family has given is kept, written before the next
       // rung's call, so a ladder interrupted by an outage resumes at the
       // interrupted rung without paying again for what it already knows.
-      const progress = this.compressionFamilyProgress.get(quarantineRecord.familyKey);
+      // Read afresh: another strategy on this store may have advanced it.
+      const progress = this.readCompressionFamilyProgress().get(quarantineRecord.familyKey);
       const knownOutcomes = new Map<string, CompressionRefusalOutcomeRecord>();
       for (const known of progress?.outcomes ?? []) {
         knownOutcomes.set(`${known.curveLabel}\u0000${known.requestHash}`, known);
@@ -7420,7 +7522,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // on the entry: Fable-5/Sonnet-5-class models require the encrypted
       // reasoning returned alongside generated text, and summaries are
       // replayed in the agent's own voice (see captureResponseContent).
-      let acceptedResponse = response as NormalizedResponse;
+      // `response` is absent only when the canonical's answer is known from
+      // progress: an end_turn whose text stripped to empty (recorded below
+      // before the plain-prose rung was interrupted). It has no text.
+      let acceptedResponse = response as NormalizedResponse | undefined;
       const extractSummaryText = (r: NormalizedResponse): string =>
         stripThinkingPreamble(
           r.content
@@ -7428,7 +7533,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             .map(b => b.text)
             .join('\n'),
         );
-      let summaryText = extractSummaryText(acceptedResponse);
+      let summaryText = acceptedResponse ? extractSummaryText(acceptedResponse) : '';
+      /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
+      let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
 
       // A generation whose whole text was a literal <thinking> wrapper strips
       // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
@@ -7442,28 +7549,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         successfulTrace?.curveLabel === 'source-only-tool-prose-hoist'
           ? successfulTrace
           : undefined;
+      const proseRequest = withPlainProseLine(request);
+      const proseRequestHash = sha256Json(proseRequest);
       if (!summaryText.trim() && !sourceOnlyFinalWon && !toolProseWonTrace) {
+        // The canonical answered, but with nothing usable: a deterministic
+        // answer like any other, kept so a resumed ladder never pays for it
+        // again. The plain-prose retry is then a rung of the same ladder: its
+        // known answer is reused, a rejection is its outcome, a transient
+        // failure interrupts here and a later tick resumes at it.
+        noteOutcome({ curveLabel: 'canonical', requestHash: canonicalRequestHash, outcome: 'unusable_empty', stopReason: 'end_turn' });
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
-        const proseResponse = await runAttempt(
-          withPlainProseLine(request),
+        const proseStep = await ladderStep('canonical-plain-prose', proseRequestHash, () => runAttempt(
+          proseRequest,
           'canonical-plain-prose',
           keptSummaries.map((summary) => summary.id),
           keptSummaries.map((summary) => summary.level),
           canonicalCoverageHash,
-        );
-        if (this.compressionResponseStopReason(proseResponse) === 'end_turn') {
-          const proseText = extractSummaryText(proseResponse as NormalizedResponse);
+        ));
+        if (proseStep.kind === 'answered') {
+          const proseStop = this.compressionResponseStopReason(proseStep.response);
+          const proseText = proseStop === 'end_turn' ? extractSummaryText(proseStep.response as NormalizedResponse) : '';
           if (proseText.trim()) {
-            acceptedResponse = proseResponse as NormalizedResponse;
+            acceptedResponse = proseStep.response as NormalizedResponse;
             summaryText = proseText;
             successfulTrace = attemptTraces[attemptTraces.length - 1];
+          } else {
+            proseOutcome = {
+              curveLabel: 'canonical-plain-prose',
+              requestHash: proseRequestHash,
+              outcome: proseStop === 'end_turn' ? 'unusable_empty' : proseStop === 'refusal' ? 'refusal' : 'incomplete',
+              ...(proseStop !== undefined ? { stopReason: proseStop } : {}),
+            };
+            noteOutcome(proseOutcome);
           }
+        } else {
+          proseOutcome = proseStep.outcome;
         }
       }
 
-      const responseContent = captureResponseContent(acceptedResponse.content);
+      const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -7492,7 +7618,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }]
             : [
                 { curveLabel: 'canonical', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
-                { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
+                proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
           if (this.isCompressionBranchCurrent(sourceBranch)) {
@@ -7542,7 +7668,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // so outputTokens — which includes thinking — is the right emission
         // cost with or without reasoning present.
         tokens:
-          acceptedResponse.usage?.outputTokens && acceptedResponse.usage.outputTokens > 0
+          acceptedResponse?.usage?.outputTokens && acceptedResponse.usage.outputTokens > 0
             ? acceptedResponse.usage.outputTokens
             : Math.ceil(summaryText.length / 3),
         sourceLevel: 0,
@@ -8442,6 +8568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
+        noteDispatchedModel(error, dispatchRequest);
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly.
         if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
@@ -8455,8 +8582,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           metadata: { error: String(error).slice(0, 300) },
         });
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
-        response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+        try {
+          response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+        } catch (retryError) {
+          noteDispatchedModel(retryError, acceptedRequest);
+          throw retryError;
+        }
       }
+      // Any answer from the provider ends the lane's pause and its backoff,
+      // whatever the disposition gate below makes of it (a refusal included).
+      if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
       // the request that authored it: sha256 of the accepted request's JSON,
@@ -8586,7 +8721,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!(error instanceof MergeDispositionRejection)) {
         console.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
-      logError = error instanceof Error ? error.message : String(error);
+      logError = boundFailureLogText(error instanceof Error ? error.message : String(error));
       throw error;
     } finally {
       logCompressionCall({
