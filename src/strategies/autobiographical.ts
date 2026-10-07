@@ -1335,6 +1335,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
   /** In-process pacing after a transient compression failure (see CompressionLanePause). */
   private compressionPause: CompressionLanePause | null = null;
+  /**
+   * Counts every wholesale re-decision of the compression queue (each
+   * rebuild, and each branch-mirror reset). An attempt that fails while the
+   * count is unchanged was not superseded, so its chunk goes back; one that
+   * changed meanwhile has a newer eligibility decision, which stands.
+   */
+  private compressionQueueGeneration = 0;
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -1931,6 +1938,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.chunks = [];
     this.pendingCompression = null;
     this.compressionQueue = [];
+    this.compressionQueueGeneration++;
     this._compressionCount = 0;
     this._drainProgress = 0;
     this._demandedL1Chunks.clear();
@@ -5093,6 +5101,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       if (queueIndex < 0) continue;
       const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
+      const queueGeneration = this.compressionQueueGeneration;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
 
@@ -5120,10 +5129,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A failure that says nothing about the request (transient, or a
         // deferral by the caller's provider admission) leaves this chunk's
         // work pending. Put it back at the head, so the lane finds it once the
-        // pause ends without waiting for a new message or a restart. It is
-        // judged afresh against the current branch's chunks, so a renumbered,
-        // withdrawn or meanwhile-compressed chunk is never resurrected.
-        if (this.isCompressionBranchCurrent(sourceBranch) && compressionFailureKind(error) === 'transient') {
+        // pause ends without waiting for a new message or a restart. Only if
+        // no newer queue decision superseded the attempt: a rebuild during the
+        // call has already re-decided this chunk's eligibility (it queues the
+        // chunk again if it is still eligible, and withdrawing it stands), and
+        // a chunk compressed meanwhile is never put back.
+        if (
+          this.isCompressionBranchCurrent(sourceBranch) &&
+          compressionFailureKind(error) === 'transient' &&
+          this.compressionQueueGeneration === queueGeneration
+        ) {
           this.requeuePendingChunk(key);
         }
         throw error;
@@ -11434,6 +11449,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected rebuildChunks(store: MessageStoreView): void {
     this.chunks = [];
     this.compressionQueue = [];
+    this.compressionQueueGeneration++;
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
     const byId = new Map<string, StoredMessage>();

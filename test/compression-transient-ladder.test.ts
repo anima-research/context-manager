@@ -715,6 +715,27 @@ describe('pending work stays discoverable after a transient failure or a deferra
     fx.manager.close();
   });
 
+  it('a chunk a newer queue decision withdrew while its call was in flight stays withdrawn (#48739)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('should not be called')]);
+    const fx = await queued(mock.membrane);
+    const tick = fx.strategy.tick(managerContext(fx.manager));
+    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    // While the call is in flight, a rebuild under a larger holdback withdraws
+    // every still-raw chunk from the queue (they still exist, uncompressed).
+    (fx.strategy as unknown as { config: { l1HoldbackChunks: number } }).config.l1HoldbackChunks = 100;
+    await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+    assert.deepEqual(fx.strategy.compressionQueueView(), [], 'the newer decision withdrew them');
+    release();
+    await assert.rejects(tick, /zz network failure/);
+    assert.deepEqual(fx.strategy.compressionQueueView(), [], 'the failed attempt does not resurrect withdrawn work');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'no second call to the withdrawn chunk');
+    fx.manager.close();
+  });
+
   it('a chunk compressed meanwhile (or gone) is not resurrected', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
