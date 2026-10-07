@@ -140,7 +140,9 @@ export interface FoldReceipt {
    * only `verbatim` makes it exactly what the resident was shown.
    */
   presentation: Presentation;
-  /** Estimates use the store's calibration at acceptance. */
+  /** The calibration the confirming compile captured: every estimated token
+   *  count in the receipt applies it, on both sides, to the layouts' base
+   *  estimates. (`usage` is the provider's report, not an estimate.) */
   estimate: { calibration: number };
 }
 

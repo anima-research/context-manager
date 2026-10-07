@@ -38,9 +38,11 @@
     record once; later ones read only the records added since.
   - Layout ranges carry exact membership, so a message missing from either
     view is never counted inside a range.
-  - Layout tokens are base estimates, taken before the store's calibration, so
-    identical content costs the same in every compile. A receipt counts each
-    summary once per side, in the first changed run that names it.
+  - Layouts persist base token estimates, taken before the store's
+    calibration, so identical content costs the same in every compile. A
+    receipt's estimated token counts apply the calibration its compile
+    captured to both sides, and count each summary once per side, in the
+    first changed run that names it.
   - `presentation` (`verbatim`, `altered` or `unknown`) records how the
     confirming round carried the compile, as its producer reported.
   - Usage is the confirming round's own, with unreported fields `unknown`.
