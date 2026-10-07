@@ -20,7 +20,10 @@ mutation remains outside the immutable trace contract.
 Regression coverage includes multi-level/weak-key identity, SameValueZero keys,
 iterator exceptions and nested iteration, an independent parent/action oracle
 across page growth, public detached calls, visitor exceptions/reentry and delayed
-exact metrics/layouts. Existing certificate and packed/object solver oracle tests
+exact metrics/layouts. The combined delayed-read fixture uses a matching cache
+receipt and the same action array at raw and summary levels. It checks distinct
+cache churn and nonempty raw/recall units, including recall deduplication beside
+a raw leaf, after input tokens and options change. Existing certificate and packed/object solver oracle tests
 also run against the combined implementation.
 
 The user selected both changes for the PR based on their specific reductions in

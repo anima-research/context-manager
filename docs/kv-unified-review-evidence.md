@@ -47,6 +47,31 @@ across arena page growth, detached public visitors, and delayed exact and lazy
 reads. These tests do not establish a general reentrancy contract for every
 shared-scratch evaluator operation.
 
+## PR143 review follow-up — 2026-10-07
+
+The context-node cap did not bound aggregate active-leaf sets or repeated long
+identifier serialization. Context compilation now checks separate linear
+membership and identifier-work budgets before constructing each key or child
+lists, including memo hits. Exceeding either declines conservatively to the
+existing solver. Two adversarial regressions observe key inputs on a 60-level
+chain with 20 leaves per pin level and a shorter chain with a repeated long ID;
+both reproduced budget overruns on the previous certificate code. The long-ID
+case also checks exact full-solver fallback, including candidates and bounds.
+
+The previous combined lazy-layout test had no matching cache receipt and
+compared empty unit lists. It now checks cache-relevant raw and summary actions
+sharing an ID array, distinct churn, raw units and one deduplicated recall beside
+a raw leaf after input changes. This strengthens coverage; the existing terminal
+evaluator passes without a runtime change.
+
+The final code was freshly built and typechecked under Node 22.22.3. Focused
+certificate/evaluation/changelog checks passed **48 tests, 0 failures**. The
+full offline suite passed **956 tests, 0 failures, cancellations or skips**;
+only the real Anthropic provider test was excluded. These are correctness and
+resource-guard checks, not new latency, allocation, RSS or GC measurements.
+The earlier timing cohorts below predate these storage guards and do not
+establish performance for this revision. No epsilon or summary-policy change.
+
 ## Earlier certificate-only timing
 
 These are the earlier A/B measurements reported in #131, before the two

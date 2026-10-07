@@ -4,6 +4,9 @@ import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { TerminalPolicyEvaluator } from '../../src/adaptive/kv-unified-terminal.js';
 import { PackedTraceArena } from '../../src/adaptive/kv-unified-packed-storage.js';
 import { ExactKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-policy.js';
+import { renderLayout } from '../../src/adaptive/render-offsets.js';
+import { SummaryTree } from '../../src/adaptive/summary-tree.js';
+import type { ExactPolicySolveOptions } from '../../src/adaptive/kv-unified-policy.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { MockChronicle } from './harness.js';
 
@@ -17,7 +20,7 @@ function fixture() {
     headChunkIds: new Set(), tailChunkIds: new Set() };
   const forest = new CanonicalSummaryForest(inputs);
   const options = { maxTokens: 1000 };
-  return { inputs, forest, options, evaluator: new TerminalPolicyEvaluator(inputs, forest, options) };
+  return { chronicle, inputs, forest, options, evaluator: new TerminalPolicyEvaluator(inputs, forest, options) };
 }
 
 // Invalid numeric levels below exercise cache-key identity only, not scoring.
@@ -128,13 +131,22 @@ test('shared visitors preserve exception identity, retry, reentry and ancestry d
 });
 
 test('combined shared traces and multi-level cache retain delayed exact metrics and lazy layouts', () => {
-  const { inputs, forest, options, evaluator } = fixture(), ids = ['a', 'b'];
+  const { chronicle, inputs } = fixture(), ids = ['a', 'b'];
+  chronicle.addChunk({ id: 'c', rawTokens: 60 });
+  const forest = new CanonicalSummaryForest(inputs);
+  const accepted = renderLayout(inputs, new SummaryTree(inputs), new Map(inputs.chunks.map(chunk => [chunk.id, 0])));
+  const options = { maxTokens: 1000, currentImmutablePrefixHash: 'accepted',
+    cache: { immutablePrefixHash: 'accepted', layout: accepted,
+      markers: [{ unitIndex: 1, offset: accepted.units[0].tokens }] } } satisfies ExactPolicySolveOptions;
+  const evaluator = new TerminalPolicyEvaluator(inputs, forest, options);
+  assert.equal(evaluator.cacheRelevant, true);
   const arena = new PackedTraceArena();
-  const rawTrace = arena.append(0, arena.action(ids, 0));
-  const summaryTrace = arena.append(0, arena.action(ids, 1));
+  const common = arena.append(0, arena.action(['c'], 0));
+  const rawTrace = arena.append(common, arena.action(ids, 0));
+  const summaryTrace = arena.append(common, arena.action(ids, 1));
   const oracle = new ExactKvUnifiedPolicySolver(inputs, forest);
   const expected = [0, 1].map(level => {
-    const frontier = new Map(ids.map(id => [id, level]));
+    const frontier = new Map([...ids.map(id => [id, level] as [string, number]), ['c', 0] as [string, number]]);
     const candidate = { frontier, renderedTokens: forest.tokensForFrontier(frontier) };
     const result = oracle.scoreCandidates([candidate], options,
       { statesVisited: 0, candidatesGenerated: 1, maxCandidatesAtState: 1, terminalCandidates: 1 });
@@ -144,7 +156,10 @@ test('combined shared traces and multi-level cache retain delayed exact metrics 
   });
   const lazy = [rawTrace, summaryTrace].map((id, index) =>
     evaluator.estimate(arena.evaluationReference(id), expected[index].renderedTokens));
-  evaluator.candidate(arena.evaluationReference(rawTrace), expected[0].renderedTokens);
+  for (const [index, estimate] of lazy.entries()) assert.equal(estimate.cacheChurn, expected[index].cacheChurn,
+    'compiled emissions for the shared action array must respect its level');
+  assert.notEqual(expected[0].cacheChurn, expected[1].cacheChurn);
+  const metricsOnly = evaluator.candidate(arena.evaluationReference(rawTrace), expected[0].renderedTokens);
   options.maxTokens = 1;
   for (const chunk of inputs.chunks) chunk.rawTokens *= 3;
   inputs.headTokens = 100;
@@ -152,7 +167,12 @@ test('combined shared traces and multi-level cache retain delayed exact metrics 
     const actual = estimate.exact(), reference = expected[index];
     assert.deepEqual(actual.frontier, reference.frontier);
     assert.deepEqual(actual.layout, reference.layout);
+    assert.ok(actual.layout.units.some(unit => unit.kind === 'raw'));
+    if (index === 1) assert.equal(actual.layout.units.filter(unit => unit.kind === 'recall').length, 1,
+      'both summarized leaves deduplicate to one recall beside the raw leaf');
     for (const key of ['renderedTokens', 'fidelityLoss', 'continuityLoss', 'cacheChurn', 'budgetPenalty'] as const)
       assert.equal(actual[key], reference[key]);
   }
+  assert.deepEqual(metricsOnly.frontier, expected[0].frontier);
+  assert.deepEqual(metricsOnly.layout, expected[0].layout);
 });
