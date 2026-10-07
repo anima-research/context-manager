@@ -26,6 +26,15 @@ export interface MessageStoreView {
   /** Closed-loop estimator calibration (optional — MessageStore provides it). */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
+  /**
+   * Whether a message is under a compression hold (ContextManager
+   * holdCompression / addMessage `holdCompression`). Compressing strategies
+   * must not fold a held message, anything after it, or the tool_use it
+   * answers. Absent on views not built by a ContextManager ⇒ nothing held.
+   */
+  isCompressionHeld?(id: MessageId): boolean;
+  /** Fast path: whether any hold exists (lets strategies skip scanning). */
+  hasCompressionHolds?(): boolean;
 }
 
 /**
@@ -142,6 +151,12 @@ export interface ContextStrategy {
    * Called after a message is added to the store.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
+
+  /**
+   * Called when ContextManager.releaseCompression actually released a hold.
+   * Compressing strategies should re-queue work the hold deferred.
+   */
+  onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
    * Check if strategy is ready to compile.

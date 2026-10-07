@@ -165,6 +165,8 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
       ),
     );
     assert.ok(preserved, 'the genuine tool result must be relocated, not replaced by a stub');
+    assert.deepStrictEqual(entries.at(-1)?.content, [text('[tool result moved during context repair]')],
+      'the emptied source entry must describe relocation, not claim that a call was omitted');
   });
 
   it('handles consecutive tool_use entries (double budget cut)', () => {

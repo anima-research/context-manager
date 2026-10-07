@@ -59,9 +59,9 @@ export interface ContextEntryInternal {
  * Token budget for context compilation.
  */
 export interface TokenBudget {
-  /** Maximum tokens for the context window */
+  /** Total token window, including reserveForResponse. Strategies target maxTokens - reserveForResponse input tokens. */
   maxTokens: number;
-  /** Reserve this many tokens for model response */
+  /** Response tokens withheld from maxTokens before fitting the input context. */
   reserveForResponse: number;
 }
 

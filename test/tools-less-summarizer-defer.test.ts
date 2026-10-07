@@ -59,29 +59,38 @@ async function openChatty(model: string) {
 describe('tools-less summarizer deferral', () => {
   after(cleanup);
 
-  it('classifies Fable/Mythos-family ids (bare, dated, gateway-prefixed) and nothing else', () => {
-    for (const m of ['claude-fable-5-1', 'claude-fable-5', 'claude-fable-5-20260901', 'anthropic/claude-fable-5-1', 'claude-mythos-5']) {
+  it('classifies Fable/Mythos-family ids (bare, dated, gateway, Bedrock) and nothing else', () => {
+    for (const m of [
+      'claude-fable-5-1', 'claude-fable-5', 'claude-fable-5-20260901',
+      'anthropic/claude-fable-5-1', 'claude-mythos-5',
+      'anthropic.claude-fable-5-1-v1:0',
+      'us.anthropic.claude-fable-5-1-v1:0',
+      'bedrock:us.anthropic.claude-fable-5-1-v1:0',
+      'bedrock:claude-mythos-5', 'eu.anthropic.claude-mythos-5-v1:0',
+    ]) {
       assert.ok(isToolsLessRefusingSummarizer(m), m);
     }
-    for (const m of ['claude-opus-5', 'claude-opus-4-8', 'claude-sonnet-5', 'gpt-5.6-sol', 'test-compression-model', 'fable-5']) {
+    for (const m of ['claude-opus-5', 'claude-opus-4-8', 'claude-sonnet-5', 'gpt-5.6-sol', 'test-compression-model', 'fable-5', 'anthropic.fable-5', 'anthropic.claude-opus-5-v1:0', 'notclaude-fable-5', 'claude-fableish-5']) {
       assert.ok(!isToolsLessRefusingSummarizer(m), m);
     }
   });
 
-  it('Fable summarizer + pure-chat chunks: defers until tools are pushed, then mints WITH tools declared', async () => {
-    const { manager, calls } = await openChatty('claude-fable-5-1');
-    await drain(manager);
-    assert.strictEqual(calls.length, 0, 'no summarizer call may be issued before the host pushes tools');
-    manager.setToolDefinitions(TOOLS);
-    // Deferred chunks are not a queued work item; they are re-examined on the
-    // next ingestion/activation (exactly what a resident's first turn does).
-    await drain(manager);
-    manager.addMessage('user', [t('one more line after the host pushed tools')]);
-    await drain(manager);
-    assert.ok(calls.length > 0, 'compression resumes once tools are pushed and the next message lands');
-    assert.ok(calls.every((c) => Array.isArray(c.tools) && (c.tools as unknown[]).length === TOOLS.length), 'every summarizer request declares the live tools');
-    await manager.close();
-  });
+  for (const model of ['claude-fable-5-1', 'us.anthropic.claude-fable-5-1-v1:0', 'bedrock:eu.anthropic.claude-mythos-5-v1:0']) {
+    it(`${model} + pure-chat chunks: defers until tools are pushed, then mints WITH tools declared`, async () => {
+      const { manager, calls } = await openChatty(model);
+      await drain(manager);
+      assert.strictEqual(calls.length, 0, 'no summarizer call may be issued before the host pushes tools');
+      manager.setToolDefinitions(TOOLS);
+      // Deferred chunks are not a queued work item; they are re-examined on the
+      // next ingestion/activation (exactly what a resident's first turn does).
+      await drain(manager);
+      manager.addMessage('user', [t('one more line after the host pushed tools')]);
+      await drain(manager);
+      assert.ok(calls.length > 0, 'compression resumes once tools are pushed and the next message lands');
+      assert.ok(calls.every((c) => Array.isArray(c.tools) && (c.tools as unknown[]).length === TOOLS.length), 'every summarizer request declares the live tools');
+      await manager.close();
+    });
+  }
 
   it('non-Fable summarizer + pure-chat chunks: still mints tools-less (baseline behaviour preserved)', async () => {
     const { manager, calls } = await openChatty('test-compression-model');

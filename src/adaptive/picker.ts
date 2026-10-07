@@ -28,13 +28,28 @@ import type {
 import type { SummaryEntry } from '../types/strategy.js';
 import { getSummaryParentId } from '../types/strategy.js';
 
-/** Diagnostic snapshot of the picker's final state when it refused. */
+/** Diagnostic snapshot of the selection or emission stage that refused. */
 export interface OverBudgetDiagnostics {
   headTokens: number;
   tailTokens: number;
   middleTokens: number;
+  /** Count for the refusing stage, in middleCountUnit; the legacy field name is retained for compatibility. */
   middleChunkCount: number;
+  /** Adaptive counts one picker chunk per source message/shard; hierarchical counts selection items or raw messages, not emitted wire messages. */
+  middleCountUnit?: 'picker-chunks' | 'selection-items' | 'raw-messages';
+  /** Level interpreted by deepestLevelKind. */
   deepestLevel: number;
+  /** Entire adaptive plan's maximum, the hierarchical representation attempted, or no plan computed yet (numeric zero is then only a legacy sentinel). Absent retains generic wording. */
+  deepestLevelKind?: 'planned' | 'attempted' | 'unplanned';
+  /** Deepest level in the loaded summary inventory, before pin/lock/geometry eligibility checks; 0 if empty. */
+  deepestAvailableLevel?: number;
+  /** Distinct loaded summaries per level, including merged children. */
+  summaryCountsByLevel?: Record<number, number>;
+  /** Configured total window, including the response reserve. */
+  configuredBudget?: number;
+  reserveForResponse?: number;
+  /** Configured window minus the response reserve, before over-budget grace. */
+  inputBudget?: number;
 }
 
 /**
@@ -69,11 +84,37 @@ export class OverBudgetError extends Error {
      *  masquerade as picker exhaustion (it cost a debugging session once). */
     stage?: string;
   }) {
+    const countLabels = {
+      'picker-chunks': 'middle picker chunks',
+      'selection-items': 'selected middle representations',
+      'raw-messages': 'middle raw messages',
+    };
+    const countLabel = opts.diagnostics.middleCountUnit && countLabels[opts.diagnostics.middleCountUnit];
+    const middleCount = countLabel
+      ? `, ${countLabel}=${opts.diagnostics.middleChunkCount}`
+      : ` across ${opts.diagnostics.middleChunkCount} chunks`;
+    const depthLabel = opts.diagnostics.deepestLevelKind === 'planned'
+      ? 'deepest planned level'
+      : opts.diagnostics.deepestLevelKind === 'attempted'
+        ? 'attempted representation level'
+        : 'deepest fold level';
+    const depth = opts.diagnostics.deepestLevelKind === 'unplanned'
+      ? 'fold plan=not computed'
+      : `${depthLabel}=L${opts.diagnostics.deepestLevel}`;
     super(
       `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
-        ` middle=${opts.diagnostics.middleTokens} across ${opts.diagnostics.middleChunkCount} chunks,` +
-        ` deepest fold level=L${opts.diagnostics.deepestLevel})`
+        ` middle=${opts.diagnostics.middleTokens}${middleCount}, ${depth}` +
+        (opts.diagnostics.deepestAvailableLevel === undefined ? '' :
+          `, deepest available level=L${opts.diagnostics.deepestAvailableLevel}`) +
+        (opts.diagnostics.summaryCountsByLevel === undefined ? '' :
+          `, summary inventory: ${Object.entries(opts.diagnostics.summaryCountsByLevel)
+            .sort(([a], [b]) => Number(a) - Number(b))
+            .map(([level, count]) => `L${level}=${count}`).join(' ') || 'empty'}`) +
+        (opts.diagnostics.configuredBudget === undefined ? '' : `, configured=${opts.diagnostics.configuredBudget}`) +
+        (opts.diagnostics.reserveForResponse === undefined ? '' : `, response reserve=${opts.diagnostics.reserveForResponse}`) +
+        (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
+        ')'
     );
     // Writable per Error convention so instanceof-by-name works across
     // iframe / vm boundaries; the field stays writable on the prototype.
