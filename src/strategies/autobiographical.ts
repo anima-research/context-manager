@@ -585,11 +585,15 @@ interface CompressionLanePause {
   /** The lane's own backoff: 30 s doubling per failure, capped at 10 min. */
   backoffUntil: number;
   /**
-   * The provider's stated wait, when one was given: its instant, or Infinity
-   * when it cannot be held as one (an explicit hold until a restart, a change
-   * of membrane or model, or releaseCompressionPause). Null when none, or
-   * once released. Kept apart from the backoff so a release of the
-   * provider's wait leaves the lane's own pacing in place.
+   * The external constraint, kept apart from the backoff so a release of it
+   * leaves the lane's own pacing in place. Null when none, or once released.
+   * - A provider's stated wait after a real failed call: its instant, or
+   *   Infinity when it cannot be held as one (an explicit hold until a
+   *   restart, a change of membrane or model, or releaseCompressionPause).
+   * - A no-call deferral by the caller's provider admission: when to ask the
+   *   admission again, its deadline or COMPRESSION_ADMISSION_RECHECK_MS,
+   *   whichever is sooner. Always finite: a cached admission answer, not a
+   *   provider deadline.
    */
   statedUntil: number | null;
   /**
@@ -615,14 +619,12 @@ const pauseSource = (pause: CompressionLanePause): 'retry-after' | 'backoff' =>
   pause.statedUntil !== null && pause.statedUntil > pause.backoffUntil ? 'retry-after' : 'backoff';
 const pauseSourceText = (pause: CompressionLanePause): string =>
   pauseSource(pause) === 'retry-after'
-    ? (pause.statedBy === 'admission' ? "the caller's provider admission" : "the provider's stated wait")
+    ? (pause.statedBy === 'admission' ? "then the caller's provider admission is asked again" : "the provider's stated wait")
     : 'backoff';
 const pauseUntilText = (pause: CompressionLanePause): string => {
   const until = pauseUntil(pause);
   if (Number.isFinite(until)) return `until ${new Date(until).toISOString()}`;
-  return pause.statedBy === 'admission'
-    ? "until the caller's provider admission releases it (it gave no deadline), a restart, or a change of model"
-    : 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
+  return 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
 };
 /**
  * The model each failed compression call was dispatched with, keyed by its
@@ -1251,6 +1253,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   static readonly COMPRESSION_PAUSE_BASE_MS = 30_000;
   /** Cap on the lane's own backoff. A provider's stated wait is never capped. */
   static readonly COMPRESSION_PAUSE_MAX_BACKOFF_MS = 10 * 60_000;
+  /** How long a no-call deferral by the caller's provider admission is
+   *  cached before the lane asks the admission again. Asking makes no
+   *  provider call (the admission refuses again while its wait binds), so
+   *  this bounds a cache, not a provider deadline. */
+  static readonly COMPRESSION_ADMISSION_RECHECK_MS = 30_000;
 
   /** Distinct quarantined request shapes tolerated per chunk before the
    *  quarantine goes sticky by chunk hash. Shape changes legitimately
@@ -3957,15 +3964,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const pause = this.compressionPause;
     if (!pause || pause.statedUntil === null) return false;
     if (model !== undefined && pause.model !== model) return false;
+    const released = pause.statedBy === 'admission' ? "the caller's cached admission deferral" : "the provider's stated wait";
     pause.statedUntil = null;
     pause.statedBy = null;
     // A release is the caller's word on the wait, not an answer from the
     // provider: the failure count stays, so a failure after it keeps doubling
     // the backoff from the genuine count (only an answer resets it).
     if (Date.now() >= pause.backoffUntil) {
-      console.warn(`[autobiographical] compression resumed: the provider's stated wait was released (failure count ${pause.failures} kept)`);
+      console.warn(`[autobiographical] compression resumed: ${released} was released (failure count ${pause.failures} kept)`);
     } else {
-      console.warn(`[autobiographical] the provider's stated wait was released; compression stays paused by its backoff ${pauseUntilText(pause)}`);
+      console.warn(`[autobiographical] ${released} was released; compression stays paused by its backoff ${pauseUntilText(pause)}`);
     }
     return true;
   }
@@ -4009,29 +4017,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // The caller's provider admission deferred this call (agent-framework's
     // refusal of a held model: `providerAdmission: 'deferred'`). No call was
-    // made, so nothing failed here: keep the external wait as the stated
-    // constraint (one without a deadline holds until it is released), and
-    // leave the failure count and the lane's own backoff as they were.
+    // made, so nothing failed here: the failure count and the lane's own
+    // backoff stay as they were. The admission stays the authority. Its
+    // answer is cached until the deadline it gave or for at most
+    // COMPRESSION_ADMISSION_RECHECK_MS, whichever is sooner, and the lane
+    // then asks again. Asking is not a provider call (the admission refuses
+    // again while its wait binds), so a condition that clears with no release
+    // reaching this instance (a recovered journal, a release made elsewhere)
+    // is observed. A genuine backoff can still postpone the next check, and a
+    // wait a provider stated after a real call is never shortened by it.
     if ((error as { providerAdmission?: unknown } | null)?.providerAdmission === 'deferred') {
-      const held = statedUntil ?? Number.POSITIVE_INFINITY;
+      const recheckAt = Math.min(
+        statedUntil ?? Number.POSITIVE_INFINITY,
+        now + AutobiographicalStrategy.COMPRESSION_ADMISSION_RECHECK_MS,
+      );
       const pause: CompressionLanePause = previous
         ? { ...previous }
         : { backoffUntil: 0, statedUntil: null, statedBy: null, failures: 0, membrane: ctx.membrane, model, reason: '' };
-      if (pause.statedUntil === null || held > pause.statedUntil) {
-        pause.statedUntil = held;
+      if (!(pause.statedBy === 'provider' && pause.statedUntil !== null && pause.statedUntil > recheckAt)) {
+        pause.statedUntil = recheckAt;
         pause.statedBy = 'admission';
       }
       pause.reason = describeCompressionFailure(error);
       this.compressionPause = pause;
+      const deadline = statedUntil === null
+        ? 'it gave no deadline'
+        : Number.isFinite(statedUntil)
+          ? `its deadline is ${new Date(statedUntil).toISOString()}`
+          : 'its deadline cannot be held as an instant';
       console.warn(
-        `[autobiographical] compression held ${pauseUntilText(pause)} by the caller's provider admission ` +
-          `(no call was made; model ${model ?? 'unset'}, failure count ${pause.failures}): ${pause.reason}`,
+        `[autobiographical] compression held by the caller's provider admission (no call was made; ${deadline}); ` +
+          `next check ${pauseUntilText(pause)} (model ${model ?? 'unset'}, failure count ${pause.failures}): ${pause.reason}`,
       );
-      const heldUntil = pauseUntil(pause);
+      const nextCheck = pauseUntil(pause);
       logCompressionCall({
         event: 'compression:lane-held-by-admission',
         operation: lane === 'l1' ? 'compress_l1' : 'merge',
-        metadata: { until: Number.isFinite(heldUntil) ? new Date(heldUntil).toISOString() : null, failures: pause.failures, model: model ?? null },
+        metadata: {
+          next_check: Number.isFinite(nextCheck) ? new Date(nextCheck).toISOString() : null,
+          admission_deadline: statedUntil === null ? null : Number.isFinite(statedUntil) ? new Date(statedUntil).toISOString() : 'unrepresentable',
+          failures: pause.failures,
+          model: model ?? null,
+        },
       });
       return;
     }

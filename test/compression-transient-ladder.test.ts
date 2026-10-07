@@ -55,7 +55,7 @@ function scripted(steps: Step[]) {
   };
 }
 
-interface RawPause { backoffUntil: number; statedUntil: number | null; failures: number; model: string | undefined; reason: string }
+interface RawPause { backoffUntil: number; statedUntil: number | null; statedBy: 'provider' | 'admission' | null; failures: number; model: string | undefined; reason: string }
 
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void { this.pushSummary(entry); }
@@ -86,6 +86,14 @@ class ProbeStrategy extends AutobiographicalStrategy {
     if (!pause) return;
     pause.backoffUntil = 0;
     if (pause.statedUntil !== null && Number.isFinite(pause.statedUntil)) pause.statedUntil = 0;
+  }
+  /** Note a transient failure as the lane does (white-box: a concurrent operation's error). */
+  notePause(error: unknown, ctx: StrategyContext): void {
+    const self = this as unknown as {
+      captureCompressionBranch(): unknown;
+      pauseCompressionLane(source: unknown, ctx: StrategyContext, error: unknown, lane: 'l1' | 'merge'): void;
+    };
+    self.pauseCompressionLane(self.captureCompressionBranch(), ctx, error, 'l1');
   }
   /** Set the pause's constraints relative to now (white-box clock for the release seam). */
   shiftPause(backoffFromNow: number, statedFromNow: number | null): void {
@@ -624,15 +632,16 @@ describe("a caller's admission deferral is an external wait, not a failed call (
   const requeue = (fx: Awaited<ReturnType<typeof queued>>) =>
     fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
 
-  it('on a fresh lane: the wait is kept, no failure is counted, no backoff is invented; a release resumes at once', async () => {
+  it('on a fresh lane: no failure is counted, no backoff is invented, the admission is asked again within 30 s; a release resumes at once', async () => {
     const mock = scripted([{ throw: deferred(120_000) }, OK('after the release')]);
     const fx = await queued(mock.membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
     const pause = fx.strategy.pause()!;
     assert.equal(pause.failures, 0, 'nothing failed here');
     assert.ok(pause.backoffUntil <= Date.now(), 'no local backoff');
-    assert.ok(pause.statedUntil! > Date.now() + 119_000, "the caller's wait is kept");
-    assert.match(fx.strategy.checkReadiness().description ?? '', /the caller's provider admission, failure 0/);
+    assert.ok(pause.statedUntil! <= Date.now() + 30_000 && pause.statedUntil! > Date.now() + 29_000,
+      'the cached answer lasts 30 s, not the admission\'s 120 s deadline');
+    assert.match(fx.strategy.checkReadiness().description ?? '', /then the caller's provider admission is asked again, failure 0/);
     assert.equal(progressSlot(fx.manager).length, 1);
     assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; serverErrorStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
 
@@ -667,20 +676,52 @@ describe("a caller's admission deferral is an external wait, not a failed call (
     fx.manager.close();
   });
 
-  it('a deferral with no deadline holds until it is released', async () => {
-    const mock = scripted([{ throw: deferred() }, OK('x')]);
+  it('a deferral with no deadline is rechecked, not cached: refusals count nothing, and recovery runs the pending chunk with no release (#49105)', async () => {
+    // An unreadable wait journal: the admission defers with no deadline, and
+    // keeps deferring after the first recheck. Then the journal reads again
+    // and reveals a later real wait (10 min), then that wait passes.
+    const mock = scripted([{ throw: deferred() }, { throw: deferred() }, { throw: deferred(600_000) }, OK('recovered memory')]);
     const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
-    assert.equal(fx.strategy.pause()!.statedUntil, Number.POSITIVE_INFINITY);
-    assert.match(fx.strategy.checkReadiness().description ?? '', /until the caller's provider admission releases it/);
+    const ctx = managerContext(fx.manager);
+    await assert.rejects(fx.strategy.tick(ctx), /no call was made/);
+    let pause = fx.strategy.pause()!;
+    assert.ok(Number.isFinite(pause.statedUntil!) && pause.statedUntil! <= Date.now() + 30_000, 'a recheck time, not an indefinite hold');
+    assert.equal(pause.statedBy, 'admission');
+    await fx.strategy.tick(ctx);
+    assert.equal(mock.calls.length, 1, 'no check before the recheck time');
+
+    for (const step of [2, 3]) {
+      fx.strategy.expirePause(); // 30 s pass
+      await assert.rejects(fx.strategy.tick(ctx), /no call was made/);
+      assert.equal(mock.calls.length, step, 'each recheck asks the admission once');
+      pause = fx.strategy.pause()!;
+      assert.equal(pause.failures, 0, 'a refusal is not a failure');
+      assert.ok(pause.backoffUntil <= Date.now(), 'and adds no backoff');
+      assert.ok(pause.statedUntil! <= Date.now() + 30_000, 'still at most 30 s, even against a 10 min deadline');
+    }
+    assert.match(fx.strategy.checkReadiness().description ?? '', /then the caller's provider admission is asked again, failure 0/);
+
+    // The admission clears: the already-pending chunk runs on the next check,
+    // with no release, new message, rebuild or restart.
     fx.strategy.expirePause();
-    await requeue(fx);
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(mock.calls.length, 1, 'time passing does not end it');
-    assert.equal(fx.strategy.releaseCompressionPause(), true);
-    await requeue(fx);
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(mock.calls.length, 2);
+    await fx.strategy.tick(ctx);
+    assert.equal(mock.calls.length, 4);
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && s.content === 'recovered memory'));
+    fx.manager.close();
+  });
+
+  it("a deferral never shortens a wait the provider stated after a real call", async () => {
+    const mock = scripted([{ throw: failure('rate_limit', { retryAfterMs: 600_000 }) }]);
+    const fx = await queued(mock.membrane);
+    const ctx = managerContext(fx.manager);
+    await assert.rejects(fx.strategy.tick(ctx), /zz rate_limit failure/);
+    const before = fx.strategy.pause()!;
+    assert.equal(before.statedBy, 'provider');
+    // A deferral arriving from a concurrent operation while that wait stands.
+    fx.strategy.notePause(deferred(), ctx);
+    const after = fx.strategy.pause()!;
+    assert.equal(after.statedBy, 'provider');
+    assert.equal(after.statedUntil, before.statedUntil, 'the 10 min provider wait stands');
     fx.manager.close();
   });
 });
