@@ -81,6 +81,18 @@ consistent allocation or GC cost. Three solver repeats and individual compile
 observations do not establish general latency or production behavior.
 The private snapshot, store data and raw machine logs are not published here.
 
+### Separate myserv package-02 result
+
+A later certificate-only package-02 run used the same pinned input/configuration
+and Bun 1.4.2, with matching runtime, dependency and harness identities and
+semantic-output parity. Each build had one warmup and three measured solver
+samples. Median bare solver entry was **1.548 s baseline / 0.601 s candidate**.
+Warm compile was **4.212 s / 3.619 s**, one observation per build. Cold compile
+was **4.628 s / 6.547 s**, also one observation per build; cold improvement is
+not established. This later bundle includes the certificate ownership-depth
+guard and predates the internal cache/visitor changes. It is a separate cohort
+from the Mac/Haswell table and does not measure the final combined PR.
+
 ## Why include the internal evaluation changes
 
 The first-level action cache avoids a nested Map lookup/allocation for ordinary
@@ -96,7 +108,9 @@ allocation, peak-RSS or GC gain for either change or their combination.
 ## Further investigations and next steps
 
 Through EXP-51, a count-only buffered-key reduction failed a cache-marker
-counterexample; the full proposed buffered key remains unproved. Immutable
+counterexample in general compiled emit/flush state. Reachability at the same
+pruning point was not established. The full CM131 buffered-key proposal remains
+unproved rather than disproved. Immutable
 forest cost views preserved tested results but did not establish acceleration.
 Cover-metric reuse had mixed timing and was parked. Further action/range and
 child-order caches, outer action handles, and clone/concat changes were rejected
