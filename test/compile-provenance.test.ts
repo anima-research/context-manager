@@ -102,3 +102,34 @@ describe('attributeEntries', () => {
     ]);
   });
 });
+
+describe('rawSources', () => {
+  it('resolves a body compiled from an auxiliary slot, which getMessage cannot see', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    const path = './test-raw-sources-aux';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      const side = await ContextManager.open({
+        store: main.getStore(),
+        namespace: 'subconscious/reader',
+        isolate: true,
+        strategy: new PassthroughStrategy(),
+        auxiliaryMessageViews: [{}],
+      });
+      const auxId = main.addMessage('alice', [text('from the main slot')], { inboundSource: { kind: 'channel' } } as never);
+      const result = await side.compile();
+      const raw = result.provenance!.messages.find((m) => m.kind === 'raw' && m.bodies[0]!.messageId === auxId);
+      assert.ok(raw, 'the reader compiled the auxiliary body raw');
+      assert.equal(side.getMessage(auxId), null, 'getMessage cannot resolve it');
+      const resolved = result.rawSources!.get(auxId);
+      assert.ok(resolved, 'rawSources does');
+      assert.deepEqual((resolved!.metadata as { inboundSource?: unknown }).inboundSource, { kind: 'channel' });
+      side.close();
+      main.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
