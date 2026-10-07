@@ -198,6 +198,39 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * Declares that select() reports its rendered layout completely, and which
+   * forms history can take under this strategy. Reporting completely means:
+   * every message it renders raw is a `copy` entry naming its source ids, and
+   * every entry that represents history through summaries names them in
+   * `ContextEntry.summaries`; a message of the view represented by neither
+   * is reported as omitted. A strategy that does not declare this gets no
+   * rendered layout, so no fold receipts are written for it.
+   */
+  readonly renderedForms?: ReadonlyArray<'raw' | 'summary' | 'omitted'>;
+
+  /**
+   * For layout reporting: which messages each named summary covers, at what
+   * level, and by what method it was written ('unknown' when the strategy
+   * does not record authorship). Required when select() names summaries.
+   */
+  describeRenderedSummaries?(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo>;
+
+  /**
+   * Why the last select() changed what it renders, when the strategy knows
+   * (for example 'budget-fit' or 'window'). Reading clears it.
+   */
+  takeSelectionCause?(): string | undefined;
+}
+
+/** What a rendered summary covers, for layout reporting. */
+export interface RenderedSummaryInfo {
+  level: number;
+  /** The stored message ids the summary covers. */
+  leaves: readonly MessageId[];
+  /** 'authored' | 'summarizer' | 'harness' | 'unknown'. */
+  method: string;
 }
 
 /**

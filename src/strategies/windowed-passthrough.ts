@@ -114,6 +114,8 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
+  /** Renders the window raw; history before the anchor is not rendered. */
+  readonly renderedForms = ['raw', 'omitted'] as const;
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
@@ -128,6 +130,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
   private prevCacheKeys: string[] | null = null;
+  /** Set when a committed select moved the anchor (see takeSelectionCause). */
+  private pendingCause: string | undefined;
 
   constructor(options: WindowedPassthroughOptions = {}) {
     const fraction = options.reAnchorFraction ?? 0.5;
@@ -297,6 +301,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         if (newAnchor !== this.anchor) {
           this.anchor = newAnchor;
           this.persistAnchor();
+          this.pendingCause = 'window';
         }
       }
     }
@@ -336,6 +341,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.applyImageStripping(entries, messages, store);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
+  }
+
+  /** 'window' when the last committed select moved the window's start. */
+  takeSelectionCause(): string | undefined {
+    const cause = this.pendingCause;
+    this.pendingCause = undefined;
+    return cause;
   }
 
   // --------------------------------------------------------------------------

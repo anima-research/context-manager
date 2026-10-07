@@ -68,6 +68,12 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  RenderedLayout,
+  LayoutUnit,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -93,7 +99,30 @@ export type {
   AddMessageOptions,
   CompressionHoldOptions,
   CompressionHoldInfo,
+  RenderedSummaryInfo,
 } from './types/index.js';
+
+// Accepted rounds and fold receipts
+export {
+  FOLD_QUERY_DEFAULT_LIMIT,
+  FOLD_QUERY_MAX_LIMIT,
+  FOLD_RECEIPT_RECORD,
+  ACCEPTED_LAYOUT_RECORD,
+  STORE_IDENTITY_RECORD,
+  storeIdentity,
+} from './fold-journal.js';
+export type {
+  FoldReceipt,
+  FoldReceiptSource,
+  FoldChange,
+  FoldForm,
+  FoldLayoutRun,
+  FoldSpanBound,
+  FoldQuery,
+  FoldQueryResult,
+  RoundUsage,
+  ReceiptSource,
+} from './fold-journal.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,

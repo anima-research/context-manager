@@ -40,6 +40,15 @@ export interface ContextEntry {
   /** Internal cache-layout identity when this entry ends one atomic rendered
    * unit. Used to reconcile message markers with accepted solver receipts. */
   cacheLayoutKey?: string;
+  /**
+   * The summaries this entry renders, for a `derived` entry that stands for
+   * folded history (both halves of a recall pair carry it; a combined recall
+   * answer names every summary it concatenates). Strategies that report
+   * their rendered layout (`ContextStrategy.reportsRenderedLayout`) must set
+   * it on every entry that represents history through a summary: the
+   * compile's layout derives each message's rendered form from it.
+   */
+  summaries?: Array<{ id: string; level: number; partial?: true }>;
 }
 
 /**
@@ -124,7 +133,103 @@ export interface CompileResult {
    * Separated because the system prompt is outside context-manager's scope.
    */
   systemInjections: ContentBlock[];
+
+  /**
+   * What each compiled message is a copy of, and the rendered layout this
+   * compile produced. Always set by `ContextManager.compile`; optional in the
+   * type so callers that build a CompileResult by hand (test doubles) still
+   * typecheck. Hand the whole object back to `ContextManager.acceptRound`
+   * once a provider round that carried these messages has succeeded.
+   */
+  provenance?: CompileProvenance;
 }
+
+/** A branch as a compile or receipt saw it: native id, name, creation time. */
+export interface BranchRef {
+  id: string;
+  name: string;
+  /** Chronicle's creation timestamp; with `id`, the branch's identity. */
+  created: number;
+}
+
+/**
+ * A stored body a compiled message carries as a raw copy. For a body stored
+ * as shards (bodyGroupId), `messageId` is the first shard's id — the id
+ * `addMessage` returned — and the body is described as a whole.
+ */
+export interface RawBodySource {
+  messageId: MessageId;
+  sequence: number;
+  /**
+   * True only when the whole stored body is in this request unaltered:
+   * every shard present, nothing truncated, no image stripped, no block
+   * removed by a structural repair.
+   */
+  complete: boolean;
+  /** Why the copy is not complete (absent when complete). */
+  missing?: Array<'shards' | 'content'>;
+}
+
+/** What one compiled message stands for. */
+export type CompiledMessageSources =
+  | { kind: 'raw'; bodies: RawBodySource[] }
+  | { kind: 'summary'; summaries: Array<{ id: string; level: number; partial?: true }> }
+  | { kind: 'injection'; namespace: string }
+  | { kind: 'other' };
+
+/**
+ * One compile's provenance: the per-message sources (parallel to
+ * `CompileResult.messages`) and the rendered layout. Immutable once
+ * returned — callers carry it with the request it describes.
+ */
+export interface CompileProvenance {
+  /** Unique per compile. */
+  compileId: string;
+  /** The context manager's namespace (its agent's state scope). */
+  namespace: string;
+  /** The branch this compile read. Acceptance binds to it. */
+  branch: BranchRef;
+  /** Parallel to `CompileResult.messages`. */
+  messages: CompiledMessageSources[];
+  /**
+   * The rendered layout, or null when the strategy does not report one
+   * (see `ContextStrategy.renderedForms`). Opaque to callers.
+   */
+  layout: RenderedLayout | null;
+  /** The active strategy's name. */
+  strategy: string;
+}
+
+/**
+ * A rendered layout: the forms every message of the strategy's view took in
+ * one compile, as ordered units. Raw messages are individual units; summary
+ * and omitted spans are ranges. Token estimates are base estimates (before
+ * the store's calibration multiplier), so they compare across compiles.
+ */
+export interface RenderedLayout {
+  v: 1;
+  units: LayoutUnit[];
+  /** Base-estimate tokens of everything this compile rendered. */
+  totalTokens: number;
+  /** The store calibration multiplier when the compile ran. */
+  calibration: number;
+  /** Why the strategy says this compile's layout changed, when it knows. */
+  cause?: string;
+}
+
+/** One unit of a rendered layout. Field names are short: layouts persist. */
+export type LayoutUnit =
+  /** A message rendered raw. `p` is set when the copy was partial. */
+  | { k: 'r'; s: number; id: string; t: number; p?: 1 }
+  /**
+   * Messages `a`..`b` of the view rendered through these summaries, each as
+   * `[id, level, method, partial]` (partial 1 when the summary's text was
+   * cut), sorted by id. `t` is the summaries' rendered tokens, attributed to
+   * the first unit each summary appears in.
+   */
+  | { k: 's'; a: number; ai: string; b: number; bi: string; sm: Array<[string, number, string, 0 | 1]>; t: number }
+  /** Messages `a`..`b` of the view not rendered at all. */
+  | { k: 'o'; a: number; ai: string; b: number; bi: string };
 
 /**
  * Branch information.

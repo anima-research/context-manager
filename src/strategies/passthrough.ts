@@ -16,6 +16,8 @@ import type {
  */
 export class PassthroughStrategy implements ContextStrategy {
   readonly name = 'passthrough';
+  /** Renders history raw; when it cannot all fit, the oldest is not rendered. */
+  readonly renderedForms = ['raw', 'omitted'] as const;
 
   checkReadiness(): ReadinessState {
     return { ready: true };
