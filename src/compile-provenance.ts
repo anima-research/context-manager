@@ -29,7 +29,7 @@ import type {
 interface BodyState {
   /** First shard (or the message itself). */
   head: StoredMessage;
-  /** Every member of the body in the view, in shard order. */
+  /** Every stored member of the body, in shard order. */
   members: StoredMessage[];
   /** Member ids present raw in this compile. */
   present: Set<MessageId>;
@@ -55,13 +55,15 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
 }
 
 /**
- * Attribute every entry of one compile. `view` is the strategy's view as
- * the compile saw it (ordered by sequence).
+ * Attribute every entry of one compile. `stored` is every message the
+ * compile read, before any view filter (ordered by sequence): a body is
+ * judged as stored, so a shard the filter hid from the strategy still
+ * belongs to its body, whose head is shard 0 whether or not it was visible.
  */
-export function attributeEntries(entries: readonly ContextEntry[], view: readonly StoredMessage[]): EntryProvenance {
+export function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]): EntryProvenance {
   const byId = new Map<MessageId, StoredMessage>();
   const groups = new Map<string, StoredMessage[]>();
-  for (const msg of view) {
+  for (const msg of stored) {
     byId.set(msg.id, msg);
     if (msg.bodyGroupId) {
       const list = groups.get(msg.bodyGroupId);
@@ -112,9 +114,9 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
   // declared its size must hold exactly that many shards, indices 0..n-1: an
   // interrupted write leaves immutable members that are not the whole body.
   // A group without a declaration (written before it was recorded) can only
-  // be judged by the members it has: complete then means every member in
-  // this view was carried, not that the group was written whole.
-  const stored = (state: BodyState): boolean => {
+  // be judged by the members stored for it: complete then means every one of
+  // them was carried, not that the group was written whole.
+  const wholeGroup = (state: BodyState): boolean => {
     const declared = state.head.shardCount;
     if (declared === undefined) return true;
     const indices = new Set(state.members.map((m) => m.shardIndex));
@@ -122,7 +124,7 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
       && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
   };
   const allShards = (state: BodyState): boolean =>
-    stored(state) && state.members.every((m) => state.present.has(m.id));
+    wholeGroup(state) && state.members.every((m) => state.present.has(m.id));
   const complete = (state: BodyState): boolean => state.contentOk && allShards(state);
   const rawComplete = new Map<MessageId, boolean>();
   for (const state of bodies.values()) {
@@ -166,8 +168,8 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
  * `estimateBase` returns a base (calibration-free) token estimate for some
  * rendered content. Raw message tokens are their entry's estimate, split
  * evenly across the messages a composite entry carries; a summary's tokens
- * are the estimates of the entries that render it, attributed once, to the
- * first unit it appears in.
+ * are the estimates of the entries that render it, named in every unit the
+ * summary renders (comparisons count each summary once per side).
  */
 export function buildRenderedLayout(opts: {
   view: readonly StoredMessage[];
@@ -215,7 +217,6 @@ export function buildRenderedLayout(opts: {
   }
 
   const units: LayoutUnit[] = [];
-  const attributed = new Set<string>();
   for (const msg of opts.view) {
     if (rawTokens.has(msg.id)) {
       const unit: LayoutUnit = { k: 'r', s: msg.sequence, id: msg.id, t: Math.round(rawTokens.get(msg.id)!) };
@@ -231,19 +232,14 @@ export function buildRenderedLayout(opts: {
         extend(last, msg);
         continue;
       }
-      let tokens = 0;
-      const sm: Array<[string, number, string, 0 | 1]> = [];
+      const sm: Array<[string, number, string, 0 | 1, number]> = [];
       for (const id of ids) {
         const info = opts.summaryInfo.get(id)!;
-        sm.push([id, info.level, info.method, partialSummaries.has(id) ? 1 : 0]);
-        if (!attributed.has(id)) {
-          attributed.add(id);
-          tokens += summaryTokens.get(id) ?? 0;
-        }
+        sm.push([id, info.level, info.method, partialSummaries.has(id) ? 1 : 0, Math.round(summaryTokens.get(id) ?? 0)]);
       }
       units.push({
         k: 's', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id,
-        m: [[msg.sequence, msg.id, msg.sequence, msg.id]], sm, t: Math.round(tokens),
+        m: [[msg.sequence, msg.id, msg.sequence, msg.id]], sm,
       });
       continue;
     }
@@ -283,11 +279,12 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean {
 
 /**
  * The stored messages behind every raw body the sources name, from the
- * compile's own view: each body's head and every shard of a sharded body.
+ * messages the compile read (the same `stored` list attribution judged
+ * bodies by): each body's head and every shard of a sharded body.
  */
 export function rawSourcesOf(
   sources: readonly CompiledMessageSources[],
-  view: readonly StoredMessage[],
+  stored: readonly StoredMessage[],
 ): ReadonlyMap<MessageId, StoredMessage> {
   const heads = new Set<MessageId>();
   for (const source of sources) {
@@ -296,14 +293,14 @@ export function rawSourcesOf(
   const out = new Map<MessageId, StoredMessage>();
   if (heads.size === 0) return out;
   const groups = new Set<string>();
-  for (const msg of view) {
+  for (const msg of stored) {
     if (heads.has(msg.id)) {
       out.set(msg.id, msg);
       if (msg.bodyGroupId) groups.add(msg.bodyGroupId);
     }
   }
   if (groups.size > 0) {
-    for (const msg of view) {
+    for (const msg of stored) {
       if (msg.bodyGroupId && groups.has(msg.bodyGroupId)) out.set(msg.id, msg);
     }
   }
@@ -311,21 +308,23 @@ export function rawSourcesOf(
 }
 
 /**
- * A composite entry (the strategy concatenated several shards' text into one
- * message) carries its members unaltered only when every member is text and
- * the composite carries their concatenation, in shard order, intact.
+ * A composite entry (the strategy merged several shards into one message)
+ * carries its members unaltered only when it carries their text,
+ * concatenated in shard order, intact, and every non-text block of theirs,
+ * unaltered and in their order, among its own non-text blocks. A composite
+ * gathers the text into one block, so where a non-text block sits relative
+ * to the text is not compared.
  */
 function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boolean {
-  const text = content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
   const ordered = [...members].sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));
-  let joined = '';
-  for (const msg of ordered) {
-    for (const block of msg.content) {
-      if (block.type !== 'text') return false;
-      joined += block.text;
-    }
-  }
-  return text.includes(joined);
+  const storedBlocks = ordered.flatMap((msg) => msg.content);
+  const textOf = (blocks: readonly ContentBlock[]): string =>
+    blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+  if (!textOf(content).includes(textOf(storedBlocks))) return false;
+  return coversStoredContent(
+    content.filter((b) => b.type !== 'text'),
+    storedBlocks.filter((b) => b.type !== 'text'),
+  );
 }
 
 /**

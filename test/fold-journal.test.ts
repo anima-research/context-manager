@@ -25,6 +25,7 @@ import type {
   TokenBudget,
   CompileProvenance,
   FoldReceipt,
+  LayoutUnit,
 } from '../src/index.js';
 
 const STORE = './test-fold-journal';
@@ -39,6 +40,9 @@ class ScriptedStrategy implements ContextStrategy {
   plan = new Map<string, Form>();
   /** Message ids whose raw copy is truncated in the render. */
   truncate = new Set<string>();
+  /** Message ids rendered raw although their plan names a summary that
+   *  still covers them (a pin keeps a covered message raw). */
+  pinned = new Set<string>();
   cause: string | undefined;
 
   checkReadiness(): ReadinessState {
@@ -49,7 +53,7 @@ class ScriptedStrategy implements ContextStrategy {
     const entries: ContextEntry[] = [];
     const emitted = new Set<string>();
     for (const msg of store.getAll()) {
-      const form = this.plan.get(msg.id) ?? 'raw';
+      const form = this.pinned.has(msg.id) ? 'raw' : this.plan.get(msg.id) ?? 'raw';
       if (form === 'omit') continue;
       if (form === 'raw') {
         const content: ContentBlock[] = this.truncate.has(msg.id)
@@ -463,6 +467,103 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it('compares with the branch\'s newest record, whichever manager on the store wrote it', async () => {
+    const { cm: a } = await open();
+    const ids = add(a, 4);
+    const narrowing = new ScriptedStrategy();
+    const b = await ContextManager.open({ store: a.getStore(), strategy: narrowing, namespace: 'agents/tester' });
+    assert.equal((await acceptCompile(a))?.kind, 'baseline');
+    narrowing.plan.set(ids[0]!, 'omit');
+    narrowing.plan.set(ids[1]!, 'omit');
+    const narrowed = await acceptCompile(b);
+    assert.deepEqual(narrowed?.changes?.map((c) => [c.before.form, c.after.form, c.messages]), [['raw', 'omitted', 2]]);
+    const widened = await acceptCompile(a);
+    assert.deepEqual(widened?.changes?.map((c) => [c.before.form, c.after.form, c.messages]), [['omitted', 'raw', 2]], "A compares with B's layout, not its own last one");
+    const again = await acceptCompile(b);
+    assert.deepEqual(again?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']], "and B with A's");
+    assert.equal(a.listFoldReceipts({ limit: 100 }).receipts.length, 4);
+    b.close();
+    a.close();
+  });
+
+  it('accepts a compile once: retries after a reopen write nothing, whether its acceptance changed the layout or not', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    const first = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(cm.acceptRound({ provenance: first })?.kind, 'baseline');
+    const unchanged = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(cm.acceptRound({ provenance: unchanged }), null, 'an identical layout makes no receipt');
+    strategy.plan.set(ids[0]!, 'omit');
+    const folded = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(cm.acceptRound({ provenance: folded })?.changes?.length, 1);
+    cm.close();
+
+    ({ cm, strategy } = await open());
+    assert.equal(cm.acceptRound({ provenance: first }), null, 'an older compile that wrote a receipt');
+    assert.equal(cm.acceptRound({ provenance: unchanged }), null, 'an older compile whose layout was unchanged');
+    assert.equal(cm.acceptRound({ provenance: folded }), null, 'the newest');
+    assert.deepEqual(cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind), ['change', 'baseline'], 'no false unfold');
+    strategy.plan.set(ids[0]!, 'omit');
+    assert.equal(await acceptCompile(cm), null, "the branch's last accepted layout is still the folded one");
+    cm.close();
+  });
+
+  it('finds a retried compile whose layout names no record id: none at all, or ids that are not record numbers', async () => {
+    const { cm } = await open();
+    const store = cm.getStore();
+    const branch = cm.currentBranchRef();
+    const records = () => store.getRecordIdsByType('context-manager/accepted-layout').length;
+    const handMade = (compileId: string, units: LayoutUnit[]): CompileProvenance => ({
+      compileId, namespace: 'agents/tester', branch, messages: [], strategy: 'hand', layout: { v: 1, units, totalTokens: 0, calibration: 1 },
+    });
+    const empty = handMade('empty', []);
+    const named = handMade('named', [{ k: 'r', s: 1, id: 'not-a-record-number', t: 3 }]);
+    const journal = new FoldJournal(store, 'agents/tester');
+    assert.equal(journal.accept(empty, Date.now(), undefined)?.kind, 'baseline');
+    assert.equal(journal.accept(named, Date.now(), undefined), null, 'an arrival');
+    assert.equal(records(), 2);
+    const fresh = new FoldJournal(store, 'agents/tester');
+    assert.equal(fresh.accept(empty, Date.now(), undefined), null);
+    assert.equal(fresh.accept(named, Date.now(), undefined), null);
+    assert.equal(records(), 2, 'both retries found their acceptance and wrote nothing');
+    cm.close();
+  });
+
+  it('counts each first confirmation in acceptance order, including compiles made before an earlier one was accepted', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    await acceptCompile(cm);
+    strategy.plan.set(ids[0]!, 'omit');
+    const narrow = (await cm.compile(BUDGET)).provenance!;
+    strategy.plan.delete(ids[0]!);
+    const wide = (await cm.compile(BUDGET)).provenance!;
+    assert.deepEqual(cm.acceptRound({ provenance: narrow })?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']]);
+    assert.deepEqual(cm.acceptRound({ provenance: wide })?.changes?.map((c) => [c.before.form, c.after.form]), [['omitted', 'raw']]);
+    cm.close();
+  });
+
+  it('charges a summary to the first changed run that names it, even when an unchanged unit already renders it', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 5);
+    // One summary covers all five; every message after the first is pinned raw.
+    for (const id of ids) strategy.plan.set(id, { summary: 'S', level: 1 });
+    for (const id of ids.slice(1)) strategy.pinned.add(id);
+    const baseline = await acceptCompile(cm);
+    assert.deepEqual(baseline?.layout?.map((r) => r.form.form), ['summary', 'raw']);
+    const summaryTokens = baseline!.layout![0]!.estimatedTokens;
+    assert.ok(summaryTokens > 0);
+
+    // Unpin the third and the fifth: two changed runs, separated by a raw
+    // message, both rendered through the summary the first unit renders.
+    strategy.pinned.delete(ids[2]!);
+    strategy.pinned.delete(ids[4]!);
+    const r = await acceptCompile(cm);
+    assert.deepEqual(r?.changes?.map((c) => [c.first.messageId, c.before.form, c.after.form]), [[ids[2], 'raw', 'summary'], [ids[4], 'raw', 'summary']]);
+    assert.deepEqual(r?.changes?.map((c) => c.estimatedTokensAfter), [summaryTokens, 0], 'the summary counts once, in the first changed run');
+    assert.ok(r!.changes!.every((c) => c.estimatedTokensBefore > 0));
+    cm.close();
+  });
+
   it('never puts receipt text into the compiled context', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 3);
@@ -496,6 +597,25 @@ describe('compile provenance', () => {
     assert.deepEqual(raw[1]!.bodies[0]!.missing, ['content']);
     assert.equal(p.namespace, 'agents/tester');
     assert.equal(p.branch.name, cm.currentBranch().name);
+    cm.close();
+  });
+
+  it('estimates layout tokens before calibration, so identical content costs the same at any calibration', async () => {
+    const { cm } = await open();
+    // Five blocks of two base tokens each: a calibrated estimate rounds each
+    // block on its own (two becomes one at 0.7, two at 0.8).
+    cm.addMessage('user', ['abcde', 'fghij', 'klmno', 'pqrst', 'uvwxy'].map((t): ContentBlock => ({ type: 'text', text: t })));
+    const store = (cm as unknown as { messageStore: { setTokenCalibration(f: number): void } }).messageStore;
+    const costs: Array<[number, number]> = [];
+    for (const factor of [0.7, 0.8, 1]) {
+      store.setTokenCalibration(factor);
+      const layout = (await cm.compile(BUDGET)).provenance!.layout!;
+      assert.equal(layout.calibration, factor);
+      const unit = layout.units[0]!;
+      assert.ok(unit.k === 'r');
+      costs.push([unit.t, layout.totalTokens]);
+    }
+    assert.deepEqual(costs, [[10, 10], [10, 10], [10, 10]]);
     cm.close();
   });
 });

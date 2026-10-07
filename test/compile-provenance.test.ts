@@ -6,7 +6,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { attributeEntries, coversStoredContent } from '../src/compile-provenance.js';
+import { attributeEntries, coversStoredContent, rawSourcesOf } from '../src/compile-provenance.js';
 import type { ContextEntry, StoredMessage } from '../src/index.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -14,6 +14,10 @@ const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 
 
 function msg(id: string, sequence: number, content: ContentBlock[], extra: Partial<StoredMessage> = {}): StoredMessage {
   return { id, sequence, participant: 'user', content, timestamp: new Date(0), ...extra } as StoredMessage;
+}
+
+function textOf(m: StoredMessage): string {
+  return m.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
 }
 
 function copy(m: StoredMessage, content: ContentBlock[] = m.content): ContextEntry {
@@ -102,6 +106,54 @@ describe('attributeEntries', () => {
     const legacy = msg('l0', 3, [text('old')], { bodyGroupId: 'g3', shardIndex: 0 });
     const legacyOnly = attributeEntries([copy(legacy)], [legacy]);
     assert.ok(legacyOnly.sources[0]!.kind === 'raw' && legacyOnly.sources[0]!.bodies[0]!.complete);
+  });
+
+  it('a composite carrying its members\' media unaltered is complete; a dropped or different image, or cut text, is not', async () => {
+    const { AutobiographicalStrategy } = await import('../src/index.js');
+    class Merger extends AutobiographicalStrategy {
+      merge(entries: ContextEntry[], messages: StoredMessage[]): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, {} as never, messages);
+      }
+    }
+    // As autobiographical's ingress chunker shards a body with an image: the
+    // text across the shards, the image on shard 0 after its text.
+    const g = { bodyGroupId: 'gm', shardCount: 2 };
+    const s0 = msg('m0', 1, [text('part one '), image('AAAA')], { ...g, shardIndex: 0 });
+    const s1 = msg('m1', 2, [text('part two')], { ...g, shardIndex: 1 });
+    const stored = [s0, s1];
+    // The strategy's own composite: media first, then the text joined.
+    const [merged] = new Merger({}).merge([copy(s0), copy(s1)], stored);
+    assert.deepEqual(merged!.content, [image('AAAA'), text('part one part two')]);
+    const bodyOf = (entry: ContextEntry) => {
+      const source = attributeEntries([entry], stored).sources[0]!;
+      assert.ok(source.kind === 'raw');
+      return source.bodies[0]!;
+    };
+    assert.deepEqual(bodyOf(merged!), { messageId: 'm0', sequence: 1, complete: true });
+    const variant = (content: ContentBlock[]): ContextEntry => ({ ...merged!, content });
+    assert.deepEqual(bodyOf(variant([text('part one part two')])).missing, ['content'], 'the image was dropped');
+    assert.deepEqual(bodyOf(variant([image('AAAB'), text('part one part two')])).missing, ['content'], 'a different image');
+    assert.deepEqual(bodyOf(variant([image('AAAA'), text('part one part')])).missing, ['content'], 'cut text');
+    assert.deepEqual(bodyOf(variant([text('[header] '), image('AAAA'), text('part one part two')])), { messageId: 'm0', sequence: 1, complete: true }, 'additions are allowed');
+  });
+
+  it('judges a body as stored, so a member the view filter hid is missing and the head keeps its id', () => {
+    // A view filter hid shard 0 from the strategy, which carried shard 1.
+    // Attribution reads the stored group: the head is still shard 0.
+    const declared = { bodyGroupId: 'gf', shardCount: 2 };
+    const h0 = msg('f0', 1, [text('[header]')], { ...declared, shardIndex: 0 });
+    const h1 = msg('f1', 2, [text('body')], { ...declared, shardIndex: 1 });
+    const result = attributeEntries([copy(h1)], [h0, h1]);
+    assert.deepEqual(result.sources[0], { kind: 'raw', bodies: [{ messageId: 'f0', sequence: 1, complete: false, missing: ['shards'] }] });
+    assert.equal(result.rawComplete.get('f1'), false);
+    assert.deepEqual([...rawSourcesOf(result.sources, [h0, h1]).keys()], ['f0', 'f1']);
+
+    // A group written before sizes were declared: complete means every
+    // stored member was carried, and a hidden one was not.
+    const l0 = msg('l0', 3, [text('old ')], { bodyGroupId: 'gl', shardIndex: 0 });
+    const l1 = msg('l1', 4, [text('body')], { bodyGroupId: 'gl', shardIndex: 1 });
+    const legacy = attributeEntries([copy(l1)], [l0, l1]);
+    assert.deepEqual(legacy.sources[0], { kind: 'raw', bodies: [{ messageId: 'l0', sequence: 3, complete: false, missing: ['shards'] }] });
   });
 
   it('reports a truncated or image-stripped copy as missing content', () => {
@@ -214,6 +266,63 @@ describe('sharded writes declare their group size', () => {
       assert.deepEqual(rawAgain.bodies[0]!.missing, ['shards']);
       reopened.close();
     });
+  });
+
+  it('a view filter that hides shard 0 leaves the body its identity, all its shards in rawSources, and no whole-delivery claim', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Halves extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        if (content.length < 2) return null;
+        return { bodyGroupId: 'hidden-head', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+      }
+    }
+    const path = './test-shard-filtered-head';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({
+        path,
+        strategy: new Halves(),
+        viewFilter: (m) => !(m.bodyGroupId && m.shardIndex === 0),
+      });
+      const id = cm.addMessage('alice', [text('[header]'), text('the body')]);
+      const [head, tail] = cm.getAllMessages();
+      assert.equal(head!.id, id);
+      const result = await cm.compile();
+      const raw = result.provenance!.messages.filter((m) => m.kind === 'raw');
+      assert.deepEqual(raw, [{ kind: 'raw', bodies: [{ messageId: id, sequence: head!.sequence, complete: false, missing: ['shards'] }] }]);
+      assert.deepEqual([...result.rawSources!.keys()].sort(), [head!.id, tail!.id].sort(), 'the head and every shard, hidden or not');
+      // The layout is the strategy's view: only the visible shard, as partial.
+      assert.deepEqual(result.provenance!.layout!.units.map((u) => u.k === 'r' && [u.id, u.p]), [[tail!.id, 1]]);
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('writes shards in index order, so addMessage returns shard 0\'s id whatever order the decision lists them in', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Reversed extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'reversed', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })).reverse() };
+      }
+    }
+    const path = './test-shard-order';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Reversed() });
+      const id = cm.addMessage('alice', [text('first '), text('second')]);
+      const shards = cm.getAllMessages();
+      assert.deepEqual(shards.map((m) => [m.shardIndex, textOf(m)]), [[0, 'first '], [1, 'second']]);
+      assert.equal(id, shards[0]!.id);
+      const result = await cm.compile();
+      const raw = result.provenance!.messages.find((m) => m.kind === 'raw');
+      assert.ok(raw && raw.kind === 'raw' && raw.bodies[0]!.messageId === id && raw.bodies[0]!.complete);
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
   });
 
   it('refuses a chunking decision whose indices are not 0..n-1, before writing anything', async () => {

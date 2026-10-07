@@ -44,7 +44,7 @@ export interface ContextEntry {
    * The summaries this entry renders, for a `derived` entry that stands for
    * folded history (both halves of a recall pair carry it; a combined recall
    * answer names every summary it concatenates). Strategies that report
-   * their rendered layout (`ContextStrategy.reportsRenderedLayout`) must set
+   * their rendered layout (`ContextStrategy.renderedForms`) must set
    * it on every entry that represents history through a summary: the
    * compile's layout derives each message's rendered form from it.
    */
@@ -145,12 +145,13 @@ export interface CompileResult {
 
   /**
    * The stored messages behind every raw body in `provenance`, as this
-   * compile's view held them: each body's head and, for a sharded body,
-   * every shard. The view may merge auxiliary stores (another namespace's
-   * slot), whose messages `getMessage` cannot resolve, so callers that need a
-   * body's metadata or content read it here. The map is bound to this compile:
-   * a later edit doesn't show through it. It's transient and isn't part of
-   * the persisted provenance.
+   * compile read them: each body's head and, for a sharded body, every
+   * shard, including any the view filter hid from the strategy. The view may
+   * merge auxiliary stores (another namespace's slot), whose messages
+   * `getMessage` cannot resolve, so callers that need a body's metadata or
+   * content read it here. The map is bound to this compile: a later edit
+   * doesn't show through it. It's transient and isn't part of the persisted
+   * provenance.
    */
   rawSources?: ReadonlyMap<MessageId, StoredMessage>;
 }
@@ -166,7 +167,8 @@ export interface BranchRef {
 /**
  * A stored body a compiled message carries as a raw copy. For a body stored
  * as shards (bodyGroupId), `messageId` is the first shard's id — the id
- * `addMessage` returned — and the body is described as a whole.
+ * `addMessage` returned — and the body is described as a whole, as stored:
+ * a shard the view filter hid from the strategy still belongs to it.
  */
 export interface RawBodySource {
   messageId: MessageId;
@@ -174,15 +176,15 @@ export interface RawBodySource {
   /**
    * True only when the whole stored body is in this request unaltered:
    * every shard present, nothing truncated, no image stripped, no block
-   * removed by a structural repair. A group that declared its size
-   * (StoredMessage.shardCount) must also hold all of its declared shards,
-   * so one an interrupted write left short is missing `shards`.
+   * removed by a structural repair. A shard the view filter hid is not
+   * present. A group that declared its size (StoredMessage.shardCount) must
+   * also hold all of its declared shards, so one an interrupted write left
+   * short is missing `shards`.
    *
    * For a group without a declaration (written before sizes were recorded),
-   * `complete` is weaker and relative to this view: every member the view
-   * holds was carried unaltered. It does not show that the group was ever
-   * written whole; an interrupted write can leave such a group short with
-   * nothing to tell it apart.
+   * `complete` is weaker: every member stored for it was carried unaltered.
+   * It does not show that the group was ever written whole; an interrupted
+   * write can leave such a group short with nothing to tell it apart.
    */
   complete: boolean;
   /** Why the copy is not complete (absent when complete). */
@@ -242,12 +244,13 @@ export type LayoutUnit =
   | { k: 'r'; s: number; id: string; t: number; p?: 1 }
   /**
    * A run of view messages rendered through these summaries, each as
-   * `[id, level, method, partial]` (partial 1 when the summary's text was
-   * cut), sorted by id. `t` is the summaries' rendered tokens, attributed to
-   * the first unit each summary appears in. `a`/`b` are the first and last
-   * member; `m` is the exact membership (see MemberRun).
+   * `[id, level, method, partial, tokens]` (partial 1 when the summary's
+   * text was cut; tokens: the summary's rendered tokens in this compile),
+   * sorted by id. A summary that renders several units names its tokens in
+   * each; comparisons count it once per side. `a`/`b` are the first and
+   * last member; `m` is the exact membership (see MemberRun).
    */
-  | { k: 's'; a: number; ai: string; b: number; bi: string; m: MemberRun[]; sm: Array<[string, number, string, 0 | 1]>; t: number }
+  | { k: 's'; a: number; ai: string; b: number; bi: string; m: MemberRun[]; sm: Array<[string, number, string, 0 | 1, number]> }
   /** A run of view messages not rendered at all; `m` is its exact membership. */
   | { k: 'o'; a: number; ai: string; b: number; bi: string; m: MemberRun[] };
 

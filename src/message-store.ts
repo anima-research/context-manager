@@ -836,6 +836,21 @@ export class MessageStore {
   }
 
   /**
+   * Base token estimate of some content: the sum of each block's raw
+   * estimate, before the calibration multiplier and its per-block rounding
+   * (which `estimateTokens` applies, so dividing its result by the
+   * calibration does not recover this). Identical content estimates the same
+   * at any calibration.
+   */
+  estimateBaseTokens(content: readonly ContentBlock[]): number {
+    let tokens = 0;
+    for (const block of content) {
+      tokens += this.estimateBlockTokensRaw(block);
+    }
+    return tokens;
+  }
+
+  /**
    * Closed-loop calibration multiplier applied to every estimate (default 1).
    * Owned by the strategy: it compares real `usage` totals against the
    * compile-time estimate and feeds the EMA back here, so the store's

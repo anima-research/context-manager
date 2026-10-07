@@ -21,15 +21,21 @@
  *
  * - `context-manager/store-identity`: minted once per store; names the
  *   store in every receipt.
- * - `context-manager/accepted-layout`: one per accepted compile that changed
- *   anything, holding the branch's new last accepted layout (a snapshot, or
- *   a delta on the previous record) AND the fold receipt that acceptance
- *   produced, if any. One record is one commit: a receipt can never exist
- *   without the layout it was compared into, or the reverse, so a crash or
- *   a failed append between the two cannot duplicate or lose a receipt. A
- *   retry after an uncertain write rereads the records and finds the
- *   compile already accepted if its record landed. Diffs read only these
- *   persisted units, never the live message view.
+ * - `context-manager/accepted-layout`: one per accepted compile, holding the
+ *   branch's new last accepted layout (a snapshot, or a delta on the
+ *   previous record; an unchanged layout is an empty delta) AND the fold
+ *   receipt that acceptance produced, if any. One record is one commit: a
+ *   receipt can never exist without the layout it was compared into, or the
+ *   reverse, so a crash or a failed append between the two cannot duplicate
+ *   or lose a receipt. Diffs read only these persisted units, never the live
+ *   message view.
+ *
+ * The records are the journal's only truth; what a journal keeps in memory
+ * is a cache it checks against them. Every acceptance compares with the
+ * branch's newest record in the store, whichever journal on the store wrote
+ * it. A compile is accepted once: a retry finds the record its first
+ * acceptance wrote, whether that acceptance reported success, reported
+ * failure after landing, ran in another journal, or ran before a reopen.
  *
  * Records that name messages or summaries assert state committed in branch
  * slots, which Chronicle buffers until sync, so every write syncs first.
@@ -176,7 +182,6 @@ interface AcceptedLayoutRecord {
 
 interface LatestLayout {
   recordId: string;
-  compileId: string;
   /** The receipt this record embedded, if any (its id is the record id). */
   receipt?: FoldReceipt;
   units: LayoutUnit[];
@@ -226,8 +231,9 @@ function readRecord<T>(store: JsStore, id: string): T | null {
 
 export class FoldJournal {
   private source: ReceiptSource = {};
-  private readonly latest = new Map<string, LatestLayout | null>();
-  private readonly acceptedCompiles = new Set<string>();
+  /** Each branch's last accepted layout as this journal last read or wrote
+   *  it; checked against the store before every use. */
+  private readonly latest = new Map<string, LatestLayout>();
   private readonly listeners = new Set<(receipt: FoldReceipt) => void>();
   /** Receipt ids this journal has announced to its listeners. */
   private readonly notified = new Set<string>();
@@ -265,19 +271,16 @@ export class FoldJournal {
   ): FoldReceipt | null {
     const layout = provenance.layout;
     if (!layout || provenance.namespace !== this.namespace) return null;
-    if (this.acceptedCompiles.has(provenance.compileId)) return null;
+    const ids = this.store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
     const key = branchKey(provenance.branch);
-    const prev = this.loadLatest(key);
+    const prev = this.loadLatest(key, ids);
     // The branch's latest committed record may hold a receipt this journal
     // never announced: its write reported failure after landing, in this
     // stream or the turn before, or another journal wrote it. Announce it now,
     // whatever this compile turns out to be, so listeners (a projection)
     // converge on the canonical record.
     if (prev?.receipt) this.announce(prev.receipt);
-    if (prev && prev.compileId === provenance.compileId) {
-      this.acceptedCompiles.add(provenance.compileId);
-      return null;
-    }
+    if (this.alreadyAccepted(provenance, layout, ids)) return null;
 
     let draft: Omit<FoldReceipt, 'id'> | null = null;
     if (!prev) {
@@ -287,9 +290,30 @@ export class FoldJournal {
       if (changes.length > 0) draft = this.changeReceipt(provenance, layout, prev, changes, acceptedAt, usage, presentation);
     }
     const receipt = this.commit(provenance, layout, prev, draft);
-    this.acceptedCompiles.add(provenance.compileId);
     if (receipt) this.announce(receipt);
     return receipt;
+  }
+
+  /**
+   * Whether a record of this namespace already accepted this compile. Every
+   * message a layout names was stored before its compile ran, and Chronicle
+   * gives every record a larger id than all before it, so the compile's own
+   * acceptance can only be newer than the newest message its layout names:
+   * the search reads only those records (all of them for a layout that
+   * names none). Chronicle reissues ids only after truncating a torn tail on
+   * open; a compile from before that crash can name lost messages whose ids
+   * now belong to newer records, so after such a recovery the search reads
+   * every record.
+   */
+  private alreadyAccepted(provenance: CompileProvenance, layout: RenderedLayout, ids: readonly string[]): boolean {
+    const floor = this.store.recovery() ? -1 : newestNamed(layout.units);
+    for (let i = ids.length - 1; i >= 0; i--) {
+      const id = Number(ids[i]);
+      if (Number.isSafeInteger(id) && id <= floor) break;
+      const record = readRecord<AcceptedLayoutRecord>(this.store, ids[i]!);
+      if (record && record.v === 1 && record.ns === this.namespace && record.compileId === provenance.compileId) return true;
+    }
+    return false;
   }
 
   /** Tell listeners about a receipt, once per receipt per journal. */
@@ -447,10 +471,12 @@ export class FoldJournal {
    * Commit one acceptance: the branch's new last accepted layout together
    * with its receipt (if any), as ONE record. Returns the receipt.
    *
-   * An identical layout with no receipt writes nothing. A failed append may
-   * or may not have landed, so the branch's cached latest layout is dropped:
-   * the next acceptance rereads the records, and finds this compile already
-   * accepted if its record did land, instead of writing a second receipt.
+   * Every acceptance writes its record, an unchanged layout included (an
+   * empty delta), so a retry of any accepted compile finds it. A failed
+   * append may or may not have landed, so the branch's cached latest layout
+   * is dropped: the next acceptance rereads the records, and finds this
+   * compile already accepted if its record did land, instead of writing a
+   * second receipt.
    */
   private commit(
     provenance: CompileProvenance,
@@ -466,20 +492,10 @@ export class FoldJournal {
       compileId: provenance.compileId,
       totalTokens: layout.totalTokens,
     };
-    let record: AcceptedLayoutRecord;
     const delta = prev && prev.chain < SNAPSHOT_EVERY ? layoutDelta(prev.units, layout.units) : null;
-    if (prev && delta) {
-      const identical = delta.drop === 0 && delta.ins.length === 0 && delta.app.length === 0 && prev.totalTokens === layout.totalTokens;
-      if (identical && !draft) {
-        // Nothing new to remember. This compile produced no receipt of its own.
-        const { receipt: _previousReceipt, ...unchanged } = prev;
-        this.latest.set(key, { ...unchanged, compileId: provenance.compileId });
-        return null;
-      }
-      record = { ...base, kind: 'delta', prev: prev.recordId, ...delta, chain: prev.chain + 1 };
-    } else {
-      record = { ...base, kind: 'snapshot', units: layout.units, chain: 0 };
-    }
+    const record: AcceptedLayoutRecord = prev && delta
+      ? { ...base, kind: 'delta', prev: prev.recordId, ...delta, chain: prev.chain + 1 }
+      : { ...base, kind: 'snapshot', units: layout.units, chain: 0 };
     if (draft) record.receipt = draft;
 
     let written: { id: string };
@@ -495,7 +511,6 @@ export class FoldJournal {
     const receipt = draft ? ({ ...draft, id: written.id } as FoldReceipt) : undefined;
     this.latest.set(key, {
       recordId: written.id,
-      compileId: provenance.compileId,
       ...(receipt ? { receipt } : {}),
       units: layout.units,
       totalTokens: layout.totalTokens,
@@ -506,19 +521,25 @@ export class FoldJournal {
     return receipt;
   }
 
-  /** The last accepted layout of a branch: memory, else the newest record. */
-  private loadLatest(key: string): LatestLayout | null {
-    if (this.latest.has(key)) return this.latest.get(key) ?? null;
-    const ids = this.store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
+  /**
+   * The last accepted layout of a branch: the newest record of this
+   * namespace and branch in the store, whichever journal on the store wrote
+   * it. `ids` are the store's accepted-layout record ids, oldest first. The
+   * cached layout stands when no record of the branch is newer than it, so
+   * only the records appended since it are read.
+   */
+  private loadLatest(key: string, ids: readonly string[]): LatestLayout | null {
+    const cached = this.latest.get(key);
     for (let i = ids.length - 1; i >= 0; i--) {
-      const record = readRecord<AcceptedLayoutRecord>(this.store, ids[i]!);
+      const id = ids[i]!;
+      if (cached && id === cached.recordId) return cached;
+      const record = readRecord<AcceptedLayoutRecord>(this.store, id);
       if (!record || record.v !== 1 || record.ns !== this.namespace || branchKey(record.branch) !== key) continue;
-      const units = this.reconstruct(ids[i]!, record);
+      const units = this.reconstruct(id, record);
       if (!units) break;
       const latest: LatestLayout = {
-        recordId: ids[i]!,
-        compileId: record.compileId,
-        ...(record.receipt ? { receipt: { ...record.receipt, id: ids[i]! } as FoldReceipt } : {}),
+        recordId: id,
+        ...(record.receipt ? { receipt: { ...record.receipt, id } as FoldReceipt } : {}),
         units,
         totalTokens: record.totalTokens,
         chain: record.chain,
@@ -526,7 +547,7 @@ export class FoldJournal {
       this.latest.set(key, latest);
       return latest;
     }
-    this.latest.set(key, null);
+    this.latest.delete(key);
     return null;
   }
 
@@ -642,12 +663,13 @@ function segmentsOf(units: readonly LayoutUnit[]): Segment[] {
  * never counts, even when it lies between a range's endpoints. Each
  * intersection whose forms differ is a change, and adjacent changes with the
  * same before/after forms merge into one run. Boundaries, ids and message
- * counts are exact; tokens count each unit once per side.
+ * counts are exact; tokens count each raw message once, and each summary
+ * once per side, in the first changed run that names it.
  */
 export function diffLayouts(before: readonly LayoutUnit[], after: readonly LayoutUnit[], calibration: number): FoldChange[] {
   const changes: FoldChange[] = [];
-  const countedBefore = new Set<number>();
-  const countedAfter = new Set<number>();
+  const countedBefore = new Set<string>();
+  const countedAfter = new Set<string>();
   let open: (FoldChange & { key: string }) | null = null;
   const flush = () => {
     if (!open) return;
@@ -677,8 +699,8 @@ export function diffLayouts(before: readonly LayoutUnit[], after: readonly Layou
     if (keyBefore === keyAfter) {
       flush();
     } else {
-      const tokensBefore = unitTokens(u, a.unit, countedBefore);
-      const tokensAfter = unitTokens(v, b.unit, countedAfter);
+      const tokensBefore = unitTokens(u, countedBefore);
+      const tokensAfter = unitTokens(v, countedAfter);
       const key = `${keyBefore}>${keyAfter}`;
       const count = hi - lo + 1;
       if (open && open.key === key) {
@@ -713,17 +735,30 @@ export function diffLayouts(before: readonly LayoutUnit[], after: readonly Layou
   return changes;
 }
 
-function unitTokens(u: LayoutUnit, index: number, counted: Set<number>): number {
+/**
+ * A unit's rendered tokens on one side of a comparison: a raw message's own
+ * (a raw unit is one message, met once per side), and each summary's the
+ * first time that side meets it. `counted` holds the summaries met so far.
+ */
+function unitTokens(u: LayoutUnit, counted: Set<string>): number {
   if (u.k === 'r') return u.t;
   if (u.k === 'o') return 0;
-  if (counted.has(index)) return 0;
-  counted.add(index);
-  return u.t;
+  let tokens = 0;
+  for (const [id, , , , t] of u.sm) {
+    if (counted.has(id)) continue;
+    counted.add(id);
+    tokens += t;
+  }
+  return tokens;
 }
 
-/** A baseline's layout as runs: consecutive raw units grouped. */
+/**
+ * A baseline's layout as runs: consecutive raw units grouped. Each summary's
+ * tokens count once, in the first run that names it.
+ */
 export function layoutRuns(units: readonly LayoutUnit[], calibration: number): FoldLayoutRun[] {
   const runs: FoldLayoutRun[] = [];
+  const counted = new Set<string>();
   for (const u of units) {
     const last = runs[runs.length - 1];
     if (u.k === 'r' && last && last.form.form === 'raw' && Boolean(last.form.partial) === Boolean(u.p)) {
@@ -737,11 +772,35 @@ export function layoutRuns(units: readonly LayoutUnit[], calibration: number): F
       last: { sequence: endOf(u), messageId: endIdOf(u) },
       messages: memberCount(u),
       form: formOf(u),
-      estimatedTokens: u.k === 'o' ? 0 : u.t,
+      estimatedTokens: unitTokens(u, counted),
     });
   }
   for (const run of runs) run.estimatedTokens = calibrated(run.estimatedTokens, calibration);
   return runs;
+}
+
+/**
+ * The newest record id a layout names (-1 when it names none): its raw
+ * messages and the first and last member of each range's runs. Every one of
+ * them was stored before the layout's compile ran.
+ */
+function newestNamed(units: readonly LayoutUnit[]): number {
+  let newest = -1;
+  const see = (id: string): void => {
+    const n = Number(id);
+    if (Number.isSafeInteger(n) && n > newest) newest = n;
+  };
+  for (const u of units) {
+    if (u.k === 'r') {
+      see(u.id);
+      continue;
+    }
+    for (const [, firstId, , lastId] of u.m) {
+      see(firstId);
+      see(lastId);
+    }
+  }
+  return newest;
 }
 
 // ============================================================================

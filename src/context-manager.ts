@@ -243,10 +243,7 @@ export class ContextManager {
    * filter sees (and can exclude from) the merged world.
    */
   private strategyMessageView() {
-    let view = mergeMessageStoreViews(
-      this.messageStore.createView(),
-      this.auxiliaryStores.map((s) => s.createView()),
-    );
+    let view = this.mergedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
@@ -256,6 +253,14 @@ export class ContextManager {
     view.isCompressionHeld = (id: MessageId) => holds.has(id);
     view.hasCompressionHolds = () => holds.size > 0;
     return view;
+  }
+
+  /** This manager's messages merged with its auxiliary slots, before the view filter. */
+  private mergedMessageView(): MessageStoreView {
+    return mergeMessageStoreViews(
+      this.messageStore.createView(),
+      this.auxiliaryStores.map((s) => s.createView()),
+    );
   }
 
   /**
@@ -480,8 +485,11 @@ export class ContextManager {
               `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
           );
         }
+        // Shards are written in index order, so the id returned (the first
+        // written) is shard 0's: the body's identity in compile provenance.
+        const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         let firstId: MessageId | null = null;
-        for (const shard of decision.shards) {
+        for (const shard of ordered) {
           const message = this.messageStore.append(
             participant,
             shard.content,
@@ -993,7 +1001,12 @@ export class ContextManager {
     if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
-    const attribution = attributeEntries(entries, viewMessages);
+    // Raw bodies are judged as stored: the view filter can hide a shard of a
+    // body from the strategy, but the body's identity (shard 0, the id
+    // addMessage returned) and its membership are the stored group's. The
+    // layout stays on the filtered view the strategy rendered.
+    const storedMessages = this.viewFilter ? this.mergedMessageView().getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -1025,13 +1038,13 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
-      result.rawSources = rawSourcesOf(attribution.sources, viewMessages);
+      result.rawSources = rawSourcesOf(attribution.sources, storedMessages);
       result.provenance = {
         compileId: randomUUID(),
         namespace: this.strategyNamespace,
         branch,
         messages: messageSources,
-        layout: this.renderedLayoutFor(view, viewMessages, entries, attribution.rawComplete, injected, selectionCause),
+        layout: this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause),
         strategy: this.strategy.name,
       };
       if (this.debugLogContext) this.logCompiledContext(result);
@@ -1109,7 +1122,6 @@ export class ContextManager {
    * would read covered history as omitted is worse than none).
    */
   private renderedLayoutFor(
-    view: MessageStoreView,
     viewMessages: StoredMessage[],
     entries: ContextEntry[],
     rawComplete: ReadonlyMap<MessageId, boolean>,
@@ -1131,10 +1143,14 @@ export class ContextManager {
       );
       return null;
     }
-    const calibration = view.getTokenCalibration?.() ?? 1;
+    // Estimators are store-level: the strategy view's estimates and its
+    // calibration are this store's (auxiliary slots delegate to it). Layouts
+    // keep base estimates, taken before the calibration multiplier and its
+    // per-block rounding, so identical content costs the same in every
+    // compile whatever the calibration was.
+    const calibration = this.messageStore.getTokenCalibration();
     const factor = Number.isFinite(calibration) && calibration > 0 ? calibration : 1;
-    const estimateBase = (content: ContentBlock[]): number =>
-      view.estimateTokens({ content } as StoredMessage) / factor;
+    const estimateBase = (content: ContentBlock[]): number => this.messageStore.estimateBaseTokens(content);
     let extraTokens = 0;
     for (const content of injected) extraTokens += estimateBase(content);
     return buildRenderedLayout({
@@ -1155,11 +1171,14 @@ export class ContextManager {
 
   /**
    * Accept a compile whose provider round succeeded. Call once a round that
-   * carried `provenance`'s messages has stood (repeat calls for later rounds
-   * of the same compile are no-ops). Compares the compile's rendered layout
-   * with the last layout accepted on the compile's own branch — even when
-   * another branch is selected by now — and appends a fold receipt when any
-   * message changed form, or a baseline when that branch has no record.
+   * carried `provenance`'s messages has stood. A compile is accepted once:
+   * repeat calls (later rounds of the same compile, or a retry after an
+   * uncertain failure, from this manager or another on the store, before or
+   * after a reopen) are no-ops. Compares the compile's rendered layout with
+   * the last layout accepted on the compile's own branch, by any manager on
+   * the store — even when another branch is selected by now — and appends a
+   * fold receipt when any message changed form, or a baseline when that
+   * branch has no record.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
