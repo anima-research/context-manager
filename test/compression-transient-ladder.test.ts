@@ -5,6 +5,7 @@ import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import { boundFailureLogText } from '../src/strategies/autobiographical.js';
+import { createHash } from 'node:crypto';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
@@ -96,6 +97,8 @@ class ProbeStrategy extends AutobiographicalStrategy {
 function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
+/** The strategy's request identity (sha256 of the request's JSON). */
+const sha256 = (request: NormalizedRequest): string => createHash('sha256').update(JSON.stringify(request)).digest('hex');
 const tool = (name: string): ToolDefinition => ({ name, description: 'd', inputSchema: { type: 'object', properties: {} } } as never);
 const progressSlot = (manager: ContextManager): unknown[] => {
   const value = manager.getStore().getStateJson('default/autobio:compression-family-progress');
@@ -566,6 +569,40 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
+  it("the stripped request's server errors are its own: eleven, a restart, then the twelfth ends it, the carrier request paid once (#48315)", async () => {
+    const path = freshPath();
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
+    const a = await build(first.membrane, { path });
+    const internals = a.strategy as unknown as { summaries: SummaryEntry[] };
+    internals.summaries.find((s) => s.id === 'L1-100')!.responseContent = [
+      { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
+      text('authored L1-100'),
+    ];
+    for (let i = 0; i < 11; i++) {
+      await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
+    }
+    assert.equal(first.calls.filter(carriesThinking).length, 1, 'the carrier request was sent once');
+    assert.equal(first.calls.length, 12);
+    const stripped = sha256(first.calls[1]!);
+    const progress = progressSlot(a.manager) as Array<{ serverErrorStreak?: { requestHash: string; count: number } }>;
+    assert.deepEqual(progress[0]!.serverErrorStreak, { requestHash: stripped, count: 11 }, 'counted against the stripped request');
+    a.manager.close();
+
+    const second = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const b = await build(second.membrane, { path });
+    (b.strategy as unknown as { summaries: SummaryEntry[] }).summaries.find((s) => s.id === 'L1-100')!.responseContent = [
+      { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
+      text('authored L1-100'),
+    ];
+    await b.strategy.run(b.target(), managerContext(b.manager));
+    assert.equal(second.calls.length, 1, 'only the stripped request after the restart');
+    assert.ok(!carriesThinking(second.calls[0]!));
+    assert.equal(sha256(second.calls[0]!), stripped, 'the same stripped request');
+    assert.equal(b.strategy.getCompressionQuarantineStatus().count, 1, 'the twelfth ends the family');
+    b.manager.close();
+  });
+
   it('a transient failure that merely mentions thinking interrupts the ladder; no degraded retry', async () => {
     const network = Object.assign(new Error('zz upstream: invalid_request while reading thinking blocks'), { type: 'network', retryable: true });
     const mock = scripted([{ throw: network }]);
@@ -644,6 +681,53 @@ describe("a caller's admission deferral is an external wait, not a failed call (
     await requeue(fx);
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(mock.calls.length, 2);
+    fx.manager.close();
+  });
+});
+
+describe('pending work stays discoverable after a transient failure or a deferral (#48424, #48444)', () => {
+  const deferred = (retryAfterMs?: number) => Object.assign(
+    new Error('Provider wait: same-model is held for resident; no call was made'),
+    { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+  );
+
+  it('with no new message, no restart and no manual rebuild, maintenance finds the chunk again once the wait ends', async () => {
+    const mock = scripted([{ throw: failure('network') }, { throw: deferred(120_000) }, OK('resumed memory')]);
+    const fx = await queued(mock.membrane);
+    const queuedAtStart = fx.strategy.compressionQueueView();
+    assert.ok(queuedAtStart.length >= 1);
+
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    assert.deepEqual(fx.strategy.compressionQueueView(), queuedAtStart, 'the failed chunk is back at the head');
+    assert.equal(fx.strategy.checkReadiness().ready, false, 'pending work is visible to maintenance');
+
+    fx.strategy.expirePause();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
+    assert.deepEqual(fx.strategy.compressionQueueView(), queuedAtStart, 'and again after the deferral');
+
+    // The operator releases the wait; the backoff has passed. The next
+    // maintenance tick, with nothing else happening, compresses the chunk.
+    assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'retried without any rebuild');
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && s.content === 'resumed memory'));
+    fx.manager.close();
+  });
+
+  it('a chunk compressed meanwhile (or gone) is not resurrected', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([{ gate, then: { throw: failure('network') } }]);
+    const fx = await queued(mock.membrane);
+    const head = fx.strategy.compressionQueueView()[0]!;
+    const tick = fx.strategy.tick(managerContext(fx.manager));
+    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    // While the call is in flight, the chunk becomes compressed (another producer).
+    (fx.strategy as unknown as { chunks: Array<{ compressed: boolean }> }).chunks[head]!.compressed = true;
+    release();
+    await assert.rejects(tick, /zz network failure/);
+    assert.equal(fx.strategy.compressionQueueView().includes(head), false);
     fx.manager.close();
   });
 });

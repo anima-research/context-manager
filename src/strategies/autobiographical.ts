@@ -630,6 +630,13 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
  * compression model changed while it was in flight.
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
+/**
+ * The hash of the request each failed L1 call actually dispatched, keyed by
+ * its error. A rung's outcome keeps the rung's identity, but a server-error
+ * streak counts failures of one request: after a carrier rejection the rung
+ * dispatches its stripped request, whose failures are its own.
+ */
+const dispatchedRequestHash = new WeakMap<object, string>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
@@ -4059,6 +4066,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  /**
+   * Put a chunk whose attempt failed transiently back at the head of the
+   * queue, found by its source identity among the current chunks: only if
+   * it still exists uncompressed and is not already queued.
+   */
+  private requeuePendingChunk(key: string): void {
+    const index = this.chunks.findIndex((chunk) => !chunk.compressed && this.chunkKey(chunk) === key);
+    if (index < 0 || this.compressionQueue.includes(index)) return;
+    this.compressionQueue.unshift(index);
+  }
+
   /** Any answer from the provider ends the lane's pause and its backoff. */
   private resumeCompressionLane(): void {
     if (!this.compressionPause) return;
@@ -5098,6 +5116,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       try {
         await compression;
+      } catch (error) {
+        // A failure that says nothing about the request (transient, or a
+        // deferral by the caller's provider admission) leaves this chunk's
+        // work pending. Put it back at the head, so the lane finds it once the
+        // pause ends without waiting for a new message or a restart. It is
+        // judged afresh against the current branch's chunks, so a renumbered,
+        // withdrawn or meanwhile-compressed chunk is never resurrected.
+        if (this.isCompressionBranchCurrent(sourceBranch) && compressionFailureKind(error) === 'transient') {
+          this.requeuePendingChunk(key);
+        }
+        throw error;
       } finally {
         // A branch switch may have installed different pending work.
         if (this.pendingCompression === compression) this.pendingCompression = null;
@@ -6769,7 +6798,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
-          if (!known) noteDispatchedModel(error, attemptRequest);
+          if (!known) {
+            noteDispatchedModel(error, attemptRequest);
+            if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
+          }
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
           // Retry this attempt once with text-only recall pairs, loudly. Only a
@@ -6807,10 +6839,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
+            if (retryError !== null && typeof retryError === 'object') {
+              dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
+            }
             throw retryError;
           }
           if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         }
+        // An answer ends the server-error streak of the request that gave it
+        // (persisted with the next progress write).
+        if (serverErrorStreak?.requestHash === sha256Json(acceptedRequest)) serverErrorStreak = undefined;
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
@@ -6886,14 +6924,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * that keeps failing with server errors: at the merge lane's bound its
        * streak becomes this rung's deterministic outcome.
        */
-      const interrupt = (error: unknown, curveLabel: string, requestHash: string): CompressionRefusalOutcomeRecord => {
+      const interrupt = (
+        error: unknown,
+        curveLabel: string,
+        requestHash: string,
+        streakHash: string = requestHash,
+      ): CompressionRefusalOutcomeRecord => {
         if (compressionErrorType(error) === 'server') {
-          const count = serverErrorStreak?.requestHash === requestHash ? serverErrorStreak.count + 1 : 1;
+          // Counted against the request actually dispatched (the stripped one
+          // after a carrier rejection); the outcome at the bound is the rung's.
+          const count = serverErrorStreak?.requestHash === streakHash ? serverErrorStreak.count + 1 : 1;
           if (count >= AutobiographicalStrategy.COMPRESSION_SERVER_ERROR_STREAK_LIMIT) {
             serverErrorStreak = undefined;
             return { curveLabel, requestHash, outcome: 'provider_error', errorType: 'server-persistent' };
           }
-          serverErrorStreak = { requestHash, count };
+          serverErrorStreak = { requestHash: streakHash, count };
         }
         persistProgress();
         throw error;
@@ -6939,7 +6984,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 outcome: 'provider_error',
                 errorType: compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error),
               }
-            : interrupt(error, curveLabel, requestHash);
+            : interrupt(
+                error,
+                curveLabel,
+                requestHash,
+                (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
+              );
           noteOutcome(outcome);
           return { kind: 'decided', outcome, reused: false };
         }
