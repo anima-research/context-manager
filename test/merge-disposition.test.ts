@@ -444,12 +444,35 @@ describe('Merge terminal-disposition gate', () => {
 
     const LIMIT = (AutobiographicalStrategy as unknown as { MERGE_SERVER_ERROR_STREAK_LIMIT: number })
       .MERGE_SERVER_ERROR_STREAK_LIMIT;
+    // Each failure also pauses the compression lane (room-225 L3): a tick
+    // during the pause makes no call. Expire it between ticks to stand for
+    // the time passing, so this test still sees one call per tick.
+    const lane = fx.strategy as unknown as { compressionPause: { until: number } | null };
     for (let i = 1; i < LIMIT; i++) {
       await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows (transient tier)`);
       assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burn below the bound');
+      const calls = mock.calls.length;
+      await fx.strategy.tick(ctx(fx.manager));
+      assert.equal(mock.calls.length, calls, 'no call while the lane is paused');
+      lane.compressionPause!.until = 0;
     }
     await fx.strategy.tick(ctx(fx.manager)); // streak hits the bound: recorded, not thrown
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the streak limit');
+    await fx.manager.close();
+  });
+
+  it('a non-retryable failure that says nothing about the request (credentials) pauses the lane, spending no merge attempt', async () => {
+    // Only a request-attributable rejection is evidence about the merge
+    // request (room-225 L3). An expired key fails every request identically
+    // until fixed: it pauses the lane instead of walking the bounded policy
+    // toward quarantine.
+    const authErr = Object.assign(new Error('401 invalid x-api-key'), { type: 'auth', retryable: false });
+    const mock = scripted([{ error: authErr }]);
+    const fx = await fixture(mock.membrane);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /401/);
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no merge attempt spent');
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 1, 'paused: no second call');
     await fx.manager.close();
   });
 

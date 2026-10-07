@@ -121,8 +121,16 @@ fallback limit of provider attempts. An over-budget variant is recorded and
 skipped without preventing a later eligible variant.
 
 Stop at the first non-refusal response containing persistable nonempty memory
-text. A refused, empty, or provider-error variant is recorded and the bounded
-curve continues. Canonical non-refusal behavior remains unchanged.
+text. A refused, empty, or deterministically rejected variant (a provider error
+attributable to the request: `context_length`, `invalid_request`, `safety`,
+`unsupported`) is recorded and the bounded curve continues. A transient provider
+failure (capacity, transport, credentials, or anything unclassified) is not
+evidence about the variant: the curve stops there, keeps the family's durable
+progress, pauses the compression lane, and a later tick resumes at that variant
+without repeating requests whose outcomes are recorded. A canonical rejection
+attributable to the request skips the variants and the canonical hoist: it goes
+to source-only-final once when that rung is configured, and otherwise exhausts
+the family. Canonical non-refusal behavior is otherwise unchanged.
 
 ### Optional later variants
 

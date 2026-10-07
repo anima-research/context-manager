@@ -94,6 +94,87 @@ function logCompressionCall(entry: Record<string, unknown>): void {
 }
 
 /**
+ * How a thrown compression failure bears on the request that failed.
+ *
+ * - `rejection`: the provider deterministically rejected THIS request (too
+ *   long, malformed, refused by policy, or asking for something the model does
+ *   not support). Repeating it changes nothing; a ladder may try a different
+ *   request, and a completed ladder of such outcomes exhausts the family.
+ * - `transient`: capacity, transport, credentials, or anything unclassified.
+ *   It says nothing about the request, so it never spends a ladder rung or
+ *   exhausts a family: the compression lane pauses and the same request is
+ *   tried again later.
+ * - `abort`: a cancellation. Neither evidence nor a reason to pause.
+ */
+type CompressionFailureKind = 'rejection' | 'transient' | 'abort';
+
+function compressionErrorType(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('type' in error)) return undefined;
+  const type = (error as { type: unknown }).type;
+  return typeof type === 'string' ? type : undefined;
+}
+
+function compressionFailureKind(error: unknown): CompressionFailureKind {
+  if (error instanceof Error && error.name === 'AbortError') return 'abort';
+  const type = compressionErrorType(error);
+  if (type === 'abort') return 'abort';
+  if (type === 'context_length' || type === 'invalid_request' || type === 'safety' || type === 'unsupported') {
+    return 'rejection';
+  }
+  return 'transient';
+}
+
+/** Longest failure text a compression log line carries. */
+const COMPRESSION_FAILURE_LOG_MAX_CHARS = 2_000;
+
+/**
+ * `text` when it fits; otherwise its head and tail around a marker stating
+ * how many of how many characters were omitted, the whole within `max`.
+ * Cuts move only toward omission, so no surrogate pair is split.
+ */
+function boundFailureLogText(text: string, max = COMPRESSION_FAILURE_LOG_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const isLow = (index: number): boolean => {
+    const code = text.charCodeAt(index);
+    return code >= 0xdc00 && code <= 0xdfff;
+  };
+  const marker = ` …[${text.length} of ${text.length} characters omitted]… `.length;
+  const budget = Math.max(0, max - marker);
+  const tail = Math.floor(budget / 4);
+  let headEnd = budget - tail;
+  if (headEnd > 0 && isLow(headEnd)) headEnd--;
+  let tailStart = text.length - tail;
+  if (tailStart < text.length && isLow(tailStart)) tailStart++;
+  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/**
+ * A bounded string describing a compression failure (one line unless the
+ * message itself has newlines), for logs that would otherwise print the
+ * error object. A provider error carries the whole
+ * request that failed (`rawRequest`); printing the object prints it, and a
+ * provider can echo the request in the message too. Every part is bounded.
+ */
+function describeCompressionFailure(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) return boundFailureLogText(String(error));
+    const fields = error as Error & { httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown };
+    const type = compressionErrorType(error);
+    const classification = [
+      type !== undefined ? boundFailureLogText(type, 128) : undefined,
+      typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
+      typeof fields.providerErrorCode === 'string' ? boundFailureLogText(fields.providerErrorCode, 128) : undefined,
+      typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    const name = boundFailureLogText(String(error.name), 128);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return boundFailureLogText(`${head}: ${boundFailureLogText(String(error.message))}`);
+  } catch {
+    return '[failure could not be described]';
+  }
+}
+
+/**
  * In-band marker shown to the summarizer just before the chunk it's
  * about to memorize. Primes attention without disrupting KV state —
  * the agent has seen this exact wording before every prior compression
@@ -467,6 +548,48 @@ interface CompressionRefusalQuarantineRecord {
   contextBudgetTokens: number;
   plan: CompressionRefusalPlanRecord[];
   created: number;
+}
+
+/**
+ * Durable progress through one L1 request family's ladder: what each request
+ * already tried has deterministically answered, so a ladder interrupted by a
+ * transient failure resumes at the interrupted rung instead of paying again
+ * for requests whose outcome is known, or exhausting a viable family.
+ *
+ * Kept separate from the quarantine ledger, whose projection IS the
+ * quarantined set (status and the klaxon count it). Branch-scoped like the
+ * rest of the strategy's state. Deleted at meaningful boundaries only: the
+ * chunk mints (or its debt is paid), or the family exhausts into quarantine.
+ */
+interface CompressionFamilyProgress {
+  familyKey: string;
+  chunkSourceHash: string;
+  /** Deterministic outcomes observed so far, by curveLabel and requestHash. */
+  outcomes: CompressionRefusalOutcomeRecord[];
+  /** The canonical's input tokens as the provider counted them, when it answered:
+   *  the fallback plan is recomputed from them. */
+  canonicalProviderInputTokens?: number;
+  /** Consecutive server failures of the request next in line. */
+  serverErrorStreak?: { requestHash: string; count: number };
+  updated: number;
+}
+
+/**
+ * In-process pacing of the compression lane after a failure that says
+ * nothing about the request (see compressionFailureKind). Scoped to the
+ * membrane instance and compression model it was observed on: a different
+ * provider or model ignores and clears it. A durable, restart-stable provider
+ * deadline is the caller's (agent-framework's provider admission).
+ */
+interface CompressionLanePause {
+  until: number;
+  /** Consecutive paused failures; resets on any successful compression call. */
+  failures: number;
+  membrane: unknown;
+  model: string | undefined;
+  /** Whether the provider's stated wait or the local backoff set `until`. */
+  source: 'retry-after' | 'backoff';
+  reason: string;
 }
 
 interface CompressionRefusalNormalizedConfig {
@@ -1071,6 +1194,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  fault (rhys 2026-08-06: 514 identical 500s) converges in ~an hour of
    *  ticks instead of never. */
   static readonly MERGE_SERVER_ERROR_STREAK_LIMIT = 12;
+  /** Consecutive server failures of one L1 request before its family exhausts,
+   *  the same bound the merge lane uses. Persisted, so a restart does not reset it. */
+  static readonly COMPRESSION_SERVER_ERROR_STREAK_LIMIT = 12;
+  /** First compression-lane pause after a transient failure; doubles per failure. */
+  static readonly COMPRESSION_PAUSE_BASE_MS = 30_000;
+  /** Cap on the lane's own backoff. A provider's stated wait is never capped. */
+  static readonly COMPRESSION_PAUSE_MAX_BACKOFF_MS = 10 * 60_000;
 
   /** Distinct quarantined request shapes tolerated per chunk before the
    *  quarantine goes sticky by chunk hash. Shape changes legitimately
@@ -1150,6 +1280,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get compressionRefusalQuarantineLedgerStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine-events`;
   }
+  protected get compressionFamilyProgressStateId(): string {
+    return `${this.ns}/autobio:compression-family-progress`;
+  }
+  /** Durable ladder progress per L1 request family (see CompressionFamilyProgress). */
+  private compressionFamilyProgress = new Map<string, CompressionFamilyProgress>();
+  /** In-process pacing after a transient compression failure (see CompressionLanePause). */
+  private compressionPause: CompressionLanePause | null = null;
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -1761,6 +1898,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.headWindowStartId = null;
     this._cachedHeadStartIndex = null;
     this.compressionRefusalQuarantine.clear();
+    this.compressionFamilyProgress.clear();
     this.pins = [];
     this.pinIdCounter = 0;
     this.resolutions.clear();
@@ -1936,6 +2074,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         fullSnapshotEvery: 10,
       });
     } catch { /* already registered */ }
+    try {
+      this.store.registerState({
+        id: this.compressionFamilyProgressStateId,
+        strategy: 'snapshot',
+      });
+    } catch { /* already registered */ }
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
@@ -1970,6 +2114,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecords = [];
       this.chunkIdCounter = 0;
       this.compressionRefusalQuarantine.clear();
+      this.compressionFamilyProgress.clear();
       return;
     }
 
@@ -2078,6 +2223,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
+    this.compressionFamilyProgress = this.readCompressionFamilyProgress();
 
     const pinsState = this.store.getStateJson(this.pinsStateId);
     if (pinsState && typeof pinsState === 'object' && Array.isArray((pinsState as { pins?: unknown }).pins)) {
@@ -3405,6 +3551,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
     await this.sweepPaidOffQuarantineRecords();
+    this.sweepPaidOffCompressionProgress();
     const status = this.getCompressionQuarantineStatus();
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
@@ -3482,6 +3629,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Ladder progress whose span is already covered, or whose chunk no longer
+   * exists, can never be resumed: drop it, judged against the persisted
+   * chunk records exactly as the quarantine sweep is (never blind).
+   */
+  private sweepPaidOffCompressionProgress(): void {
+    if (!this.store || this.compressionFamilyProgress.size === 0) return;
+    try {
+      const records = this.store.getStateJson(this.chunksStateId);
+      const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
+      if (chunkRecords.length === 0) return;
+      const byHash = new Map<string, ChunkRecord>();
+      for (const r of chunkRecords) {
+        if (r && Array.isArray(r.sourceIds)) byHash.set(sha256Json(r.sourceIds), r);
+      }
+      this.forgetCompressionFamilyProgress((entry) => {
+        const match = byHash.get(entry.chunkSourceHash);
+        return !match || match.compressed === true;
+      });
+    } catch (error) {
+      console.warn(`[autobiographical] compression progress sweep failed (progress remains): ${describeCompressionFailure(error)}`);
+    }
+  }
+
+  /**
    * A successful compression (or adoption of an existing exact L1) pays off
    * any quarantine debt recorded against the same chunk under earlier
    * request shapes — e.g. a chunk quarantined on text-only requests that
@@ -3492,8 +3663,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
     if (!this.store) return;
+    // The span is covered: no family of it needs ladder progress any more.
+    const chunkHash = sha256Json(chunk.messages.map((message) => message.id));
     try {
-      const hash = sha256Json(chunk.messages.map((message) => message.id));
+      this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash);
+    } catch (error) {
+      console.warn(`[autobiographical] could not drop compression progress for a compressed chunk: ${describeCompressionFailure(error)}`);
+    }
+    try {
+      const hash = chunkHash;
       const projection = this.readCompressionQuarantineProjection();
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
@@ -3605,6 +3783,145 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.isCompressionBranchCurrent(source)) {
       await this.deliverPendingCompressionQuarantineAlerts(source);
     }
+  }
+
+  private readCompressionFamilyProgress(): Map<string, CompressionFamilyProgress> {
+    const progress = new Map<string, CompressionFamilyProgress>();
+    if (!this.store) return progress;
+    const stored = this.store.getStateJson(this.compressionFamilyProgressStateId);
+    for (const entry of Array.isArray(stored) ? stored : []) {
+      const candidate = entry as Partial<CompressionFamilyProgress> | null;
+      if (
+        candidate &&
+        typeof candidate.familyKey === 'string' &&
+        typeof candidate.chunkSourceHash === 'string' &&
+        Array.isArray(candidate.outcomes)
+      ) {
+        progress.set(candidate.familyKey, candidate as CompressionFamilyProgress);
+      }
+    }
+    return progress;
+  }
+
+  /**
+   * Durable before the next rung's call: written and synced, so a crash
+   * after it never re-pays a request whose answer it records. Only work on
+   * the current branch writes; stale-branch work leaves nothing.
+   */
+  private recordCompressionFamilyProgress(
+    source: CompressionOperationBranch,
+    record: CompressionRefusalQuarantineRecord,
+    outcomes: CompressionRefusalOutcomeRecord[],
+    canonicalProviderInputTokens: number | undefined,
+    serverErrorStreak: CompressionFamilyProgress['serverErrorStreak'],
+  ): void {
+    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
+    this.compressionFamilyProgress.set(record.familyKey, {
+      familyKey: record.familyKey,
+      chunkSourceHash: record.chunkSourceHash,
+      outcomes: outcomes.map((outcome) => ({ ...outcome })),
+      ...(canonicalProviderInputTokens !== undefined ? { canonicalProviderInputTokens } : {}),
+      ...(serverErrorStreak ? { serverErrorStreak: { ...serverErrorStreak } } : {}),
+      updated: Date.now(),
+    });
+    this.writeCompressionFamilyProgress();
+  }
+
+  private writeCompressionFamilyProgress(): void {
+    if (!this.store) return;
+    this.store.setStateJson(this.compressionFamilyProgressStateId, [...this.compressionFamilyProgress.values()]);
+    this.store.sync();
+  }
+
+  /** Drop progress at a meaningful boundary (mint, exhaustion, paid-off sweep). */
+  private forgetCompressionFamilyProgress(matches: (entry: CompressionFamilyProgress) => boolean): void {
+    let changed = false;
+    for (const [key, entry] of this.compressionFamilyProgress) {
+      if (!matches(entry)) continue;
+      this.compressionFamilyProgress.delete(key);
+      changed = true;
+    }
+    if (changed) this.writeCompressionFamilyProgress();
+  }
+
+  /**
+   * The compression lane's pause, if one binds this membrane and compression
+   * model now. A pause observed on another membrane instance or model says
+   * nothing about this one, so it is ignored and cleared.
+   */
+  private activeCompressionPause(ctx: StrategyContext): CompressionLanePause | null {
+    const pause = this.compressionPause;
+    if (!pause) return null;
+    if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
+      this.compressionPause = null;
+      return null;
+    }
+    return Date.now() < pause.until ? pause : null;
+  }
+
+  /**
+   * Pause compression calls after a failure that says nothing about the
+   * request: max(the provider's stated wait, the lane's own backoff of 30 s
+   * doubling to 10 min). A stated wait is never shortened; one that cannot be
+   * held as an instant (not finite) pauses the lane until a restart or a
+   * change of membrane or model. Discarded or stale-branch work installs
+   * nothing. One warning per pause, plus a structured log event.
+   */
+  private pauseCompressionLane(
+    source: CompressionOperationBranch,
+    ctx: StrategyContext,
+    error: unknown,
+    lane: 'l1' | 'merge',
+  ): void {
+    if (!this.isCompressionBranchCurrent(source)) return;
+    const now = Date.now();
+    const previous = this.compressionPause &&
+      this.compressionPause.membrane === ctx.membrane &&
+      this.compressionPause.model === this.config.compressionModel
+      ? this.compressionPause
+      : null;
+    const failures = (previous?.failures ?? 0) + 1;
+    const backoff = Math.min(
+      AutobiographicalStrategy.COMPRESSION_PAUSE_BASE_MS * 2 ** (failures - 1),
+      AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS,
+    );
+    const stated = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+    const statedMs = typeof stated === 'number' && !Number.isNaN(stated) && stated >= 0 ? stated : undefined;
+    const fromProvider = statedMs !== undefined && statedMs > backoff;
+    const until = fromProvider ? now + statedMs : now + backoff;
+    const reason = describeCompressionFailure(error);
+    this.compressionPause = {
+      until,
+      failures,
+      membrane: ctx.membrane,
+      model: this.config.compressionModel,
+      source: fromProvider ? 'retry-after' : 'backoff',
+      reason,
+    };
+    const untilText = Number.isFinite(until)
+      ? `until ${new Date(until).toISOString()}`
+      : 'until a restart or a change of model (the provider stated an unbounded wait)';
+    console.warn(
+      `[autobiographical] compression paused ${untilText} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
+        `(${fromProvider ? "the provider's stated wait" : 'backoff'}, failure ${failures}); no item consumed: ${reason}`,
+    );
+    logCompressionCall({
+      event: 'compression:lane-paused',
+      operation: lane === 'l1' ? 'compress_l1' : 'merge',
+      metadata: {
+        until: Number.isFinite(until) ? new Date(until).toISOString() : null,
+        failures,
+        source: fromProvider ? 'retry-after' : 'backoff',
+        error_type: compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error),
+      },
+    });
+  }
+
+  /** Any answer from the provider ends the lane's pause and its backoff. */
+  private resumeCompressionLane(): void {
+    if (!this.compressionPause) return;
+    console.warn(`[autobiographical] compression resumed after ${this.compressionPause.failures} paused failure(s)`);
+    this.compressionPause = null;
   }
 
   /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
@@ -4451,9 +4768,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const parts: string[] = [];
       if (this.compressionQueue.length > 0) parts.push(`${this.compressionQueue.length} chunks`);
       if (needsMerge) parts.push(`${this.mergeQueue.length} merges`);
+      const pause = this.compressionPause && Date.now() < this.compressionPause.until ? this.compressionPause : null;
+      const paused = pause
+        ? `; compression paused ${Number.isFinite(pause.until) ? `until ${new Date(pause.until).toISOString()}` : 'until a restart or a change of model'} ` +
+          `(${pause.source === 'retry-after' ? "the provider's stated wait" : 'backoff'}, failure ${pause.failures})`
+        : '';
       return {
         ready: false,
-        description: `${parts.join(' + ')} pending`,
+        description: `${parts.join(' + ')} pending${paused}`,
       };
     }
 
@@ -4526,7 +4848,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
       })
       .catch((err) => {
-        console.error('AutobiographicalStrategy: speculative-drain error:', err);
+        console.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
       });
   }
 
@@ -4577,6 +4899,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn('AutobiographicalStrategy: No membrane instance for compression');
       return;
     }
+
+    // A transient provider failure paused the lane: no compression call and
+    // no queue item consumed until the pause ends (see pauseCompressionLane).
+    if (this.activeCompressionPause(ctx)) return;
 
     // Priority 1: Compress raw chunks → L1. Skipped while at the speculative
     // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
@@ -4669,6 +4995,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
+        this.resumeCompressionLane();
       } catch (error) {
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
@@ -4691,9 +5018,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // so each retry is a genuinely smaller request. Retryable errors
         // (429, network, timeout) keep the pre-existing rethrow semantics.
         const membraneType = (error as { type?: unknown; retryable?: unknown }) ?? {};
+        const failureKind = compressionFailureKind(error);
+        // Only a request-attributable rejection is evidence about this merge
+        // request. A non-retryable failure that is not (spent quota,
+        // credentials) pauses the lane like any transient one below.
         if (
           error instanceof Error &&
-          membraneType.retryable === false &&
+          failureKind === 'rejection' &&
           typeof membraneType.type === 'string'
         ) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
@@ -4718,6 +5049,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // budget, giving the provider a genuinely different request).
         // Below the bound the rethrow keeps transient semantics: no
         // attempt burn for a blip.
+        if (failureKind === 'transient') this.pauseCompressionLane(sourceBranch, ctx, error, 'merge');
         if (
           error instanceof Error &&
           membraneType.retryable === true &&
@@ -6282,6 +6614,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             attemptRequest,
             { formatter: this.nativeFormatter },
           );
+          if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         } catch (error) {
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
@@ -6303,6 +6636,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             acceptedRequest,
             { formatter: this.nativeFormatter },
           );
+          if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
         }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
@@ -6340,14 +6674,138 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (summary) => this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [],
       ).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
       const canonicalCoverageHash = sha256Json(canonicalLeafIds);
-      let response = await runAttempt(
+      const canonicalRecallIds = keptSummaries.map((summary) => summary.id);
+      const canonicalRecallLevels = keptSummaries.map((summary) => summary.level);
+
+      // ---- Durable ladder progress (CompressionFamilyProgress) ----
+      // Transient failures never spend the ladder. Every deterministic answer
+      // a request in this family has given is kept, written before the next
+      // rung's call, so a ladder interrupted by an outage resumes at the
+      // interrupted rung without paying again for what it already knows.
+      const progress = this.compressionFamilyProgress.get(quarantineRecord.familyKey);
+      const knownOutcomes = new Map<string, CompressionRefusalOutcomeRecord>();
+      for (const known of progress?.outcomes ?? []) {
+        knownOutcomes.set(`${known.curveLabel}\u0000${known.requestHash}`, known);
+      }
+      const progressOutcomes: CompressionRefusalOutcomeRecord[] = [...(progress?.outcomes ?? [])];
+      let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
+      let serverErrorStreak = progress?.serverErrorStreak;
+      const persistProgress = (): void => {
+        this.recordCompressionFamilyProgress(
+          sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, serverErrorStreak,
+        );
+      };
+      /** Keep one deterministic answer; durable before the next rung's call. */
+      const noteOutcome = (outcome: CompressionRefusalOutcomeRecord): void => {
+        const key = `${outcome.curveLabel}\u0000${outcome.requestHash}`;
+        if (knownOutcomes.has(key)) return;
+        knownOutcomes.set(key, outcome);
+        progressOutcomes.push(outcome);
+        // An answer ends that request's server-error streak.
+        if (serverErrorStreak?.requestHash === outcome.requestHash) serverErrorStreak = undefined;
+        persistProgress();
+      };
+      /**
+       * A transient failure says nothing about the request: keep what the
+       * ladder has learned and rethrow (the outer catch pauses the lane). The
+       * next eligible tick resumes at this rung. The one exception is a request
+       * that keeps failing with server errors: at the merge lane's bound its
+       * streak becomes this rung's deterministic outcome.
+       */
+      const interrupt = (error: unknown, curveLabel: string, requestHash: string): CompressionRefusalOutcomeRecord => {
+        if (compressionErrorType(error) === 'server') {
+          const count = serverErrorStreak?.requestHash === requestHash ? serverErrorStreak.count + 1 : 1;
+          if (count >= AutobiographicalStrategy.COMPRESSION_SERVER_ERROR_STREAK_LIMIT) {
+            serverErrorStreak = undefined;
+            return { curveLabel, requestHash, outcome: 'provider_error', errorType: 'server-persistent' };
+          }
+          serverErrorStreak = { requestHash, count };
+        }
+        persistProgress();
+        throw error;
+      };
+      type LadderStep =
+        | { kind: 'answered'; response: unknown }
+        | { kind: 'decided'; outcome: CompressionRefusalOutcomeRecord; reused: boolean };
+      /**
+       * One rung's request: reuse its known answer, or call it. A thrown
+       * request-attributable rejection becomes the rung's outcome; a transient
+       * failure interrupts the ladder; an abort or branch discard propagates.
+       */
+      const ladderStep = async (
+        curveLabel: string,
+        requestHash: string,
+        call: () => Promise<unknown>,
+      ): Promise<LadderStep> => {
+        const known = knownOutcomes.get(`${curveLabel}\u0000${requestHash}`);
+        if (known) {
+          logCompressionCall({
+            event: 'compression:curve-attempt-reused',
+            operation: 'compress_l1',
+            metadata: { quarantine_key: quarantineRecord.key, curveLabel, requestHash, outcome: known.outcome },
+          });
+          return { kind: 'decided', outcome: known, reused: true };
+        }
+        try {
+          return { kind: 'answered', response: await call() };
+        } catch (error) {
+          if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+          if (!this.isCompressionBranchCurrent(sourceBranch)) {
+            this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
+            throw Object.assign(new Error('Compression error crossed a branch boundary'), {
+              name: 'CompressionBranchDiscard',
+            });
+          }
+          const kind = compressionFailureKind(error);
+          if (kind === 'abort') throw error;
+          const outcome: CompressionRefusalOutcomeRecord = kind === 'rejection'
+            ? {
+                curveLabel,
+                requestHash,
+                outcome: 'provider_error',
+                errorType: compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error),
+              }
+            : interrupt(error, curveLabel, requestHash);
+          noteOutcome(outcome);
+          return { kind: 'decided', outcome, reused: false };
+        }
+      };
+
+      // ---- Canonical stage: the canonical request, then its tool_use retries ----
+      let response: unknown;
+      let canonicalStopReason: string | undefined;
+      /**
+       * The canonical stage ended in a deterministic rejection (thrown and
+       * request-attributable, or a request at the server-error bound): the
+       * same request cannot succeed, so the ladder skips to the one permitted
+       * different request, source-only-final, and exhausts if that fails.
+       */
+      let canonicalRejection: CompressionRefusalOutcomeRecord | undefined;
+      const canonicalStep = await ladderStep('canonical', canonicalRequestHash, () => runAttempt(
         request,
         'canonical',
-        keptSummaries.map((summary) => summary.id),
-        keptSummaries.map((summary) => summary.level),
+        canonicalRecallIds,
+        canonicalRecallLevels,
         canonicalCoverageHash,
-      );
-      successfulTrace = attemptTraces[attemptTraces.length - 1];
+      ));
+      if (canonicalStep.kind === 'answered') {
+        response = canonicalStep.response;
+        successfulTrace = attemptTraces[attemptTraces.length - 1];
+        canonicalStopReason = this.compressionResponseStopReason(response);
+        if (canonicalStopReason !== 'end_turn') {
+          progressCanonicalInputTokens = this.compressionResponseInputTokens(response);
+          noteOutcome({
+            curveLabel: 'canonical',
+            requestHash: canonicalRequestHash,
+            outcome: canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete',
+            ...(canonicalStopReason !== undefined ? { stopReason: canonicalStopReason } : {}),
+          });
+        }
+      } else if (canonicalStep.outcome.outcome === 'provider_error') {
+        canonicalRejection = canonicalStep.outcome;
+      } else {
+        canonicalStopReason = canonicalStep.outcome.stopReason;
+      }
 
       // Terminal-disposition gate (2026-08-01): only a complete `end_turn`
       // may proceed toward persistence. A refusal takes the curve-fallback
@@ -6357,7 +6815,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // truncation the way they dodge a classifier, but the path gives us
       // bounded attempts, durable receipts, and quarantine instead of
       // either canonizing an incomplete memory or retrying forever.
-      let canonicalStopReason = this.compressionResponseStopReason(response);
 
       // tool_use is the one non-end_turn disposition the curve variants
       // CANNOT dodge: they vary the recall frontier, not the response mode,
@@ -6365,46 +6822,78 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // quarantines (lena 2026-08-06, L1 site — the merge site had already
       // grown this retry). One immediate canonical retry with the no-tools
       // line, before the curve plan burns its bounded attempts.
-      if (canonicalStopReason === 'tool_use') {
+      if (canonicalStopReason === 'tool_use' && !canonicalRejection) {
         console.warn(
           `[autobiographical] canonical L1 mint rejected on tool_use — retrying once with no-tools instruction`,
         );
-        const retryResponse = await runAttempt(
-          withNoToolsLine(request),
+        const noToolsRequest = withNoToolsLine(request);
+        const noToolsHash = sha256Json(noToolsRequest);
+        const retryStep = await ladderStep('canonical-no-tools', noToolsHash, () => runAttempt(
+          noToolsRequest,
           'canonical-no-tools',
-          keptSummaries.map((summary) => summary.id),
-          keptSummaries.map((summary) => summary.level),
+          canonicalRecallIds,
+          canonicalRecallLevels,
           canonicalCoverageHash,
-        );
-        let retryStopReason = this.compressionResponseStopReason(retryResponse);
-        if (retryStopReason === 'end_turn') {
-          response = retryResponse;
-          canonicalStopReason = retryStopReason;
-          successfulTrace = attemptTraces[attemptTraces.length - 1];
-        } else if (retryStopReason === 'tool_use') {
+        ));
+        let retryStopReason: string | undefined;
+        if (retryStep.kind === 'answered') {
+          retryStopReason = this.compressionResponseStopReason(retryStep.response);
+          if (retryStopReason === 'end_turn') {
+            response = retryStep.response;
+            canonicalStopReason = retryStopReason;
+            successfulTrace = attemptTraces[attemptTraces.length - 1];
+          } else {
+            noteOutcome({
+              curveLabel: 'canonical-no-tools',
+              requestHash: noToolsHash,
+              outcome: retryStopReason === 'refusal' ? 'refusal' : 'incomplete',
+              ...(retryStopReason !== undefined ? { stopReason: retryStopReason } : {}),
+            });
+          }
+        } else if (retryStep.outcome.outcome === 'provider_error') {
+          canonicalRejection = retryStep.outcome;
+        } else {
+          retryStopReason = retryStep.outcome.stopReason;
+        }
+        if (retryStopReason === 'tool_use' && !canonicalRejection) {
           // The span out-pulls the sentence — remove the tools param so a
           // tool call is structurally impossible (see withoutToolsParam).
           console.warn(
             `[autobiographical] no-tools retry also rejected on tool_use — escalating to tools-less request`,
           );
-          const toolslessResponse = await runAttempt(
-            withoutToolsParam(withNoToolsLine(request)),
+          const toolslessRequest = withoutToolsParam(withNoToolsLine(request));
+          const toolslessHash = sha256Json(toolslessRequest);
+          const toolslessStep = await ladderStep('canonical-toolless', toolslessHash, () => runAttempt(
+            toolslessRequest,
             'canonical-toolless',
-            keptSummaries.map((summary) => summary.id),
-            keptSummaries.map((summary) => summary.level),
+            canonicalRecallIds,
+            canonicalRecallLevels,
             canonicalCoverageHash,
-          );
-          if (this.compressionResponseStopReason(toolslessResponse) === 'end_turn') {
-            response = toolslessResponse;
-            canonicalStopReason = 'end_turn';
-            successfulTrace = attemptTraces[attemptTraces.length - 1];
+          ));
+          if (toolslessStep.kind === 'answered') {
+            const toolslessStop = this.compressionResponseStopReason(toolslessStep.response);
+            if (toolslessStop === 'end_turn') {
+              response = toolslessStep.response;
+              canonicalStopReason = 'end_turn';
+              successfulTrace = attemptTraces[attemptTraces.length - 1];
+            } else {
+              noteOutcome({
+                curveLabel: 'canonical-toolless',
+                requestHash: toolslessHash,
+                outcome: toolslessStop === 'refusal' ? 'refusal' : 'incomplete',
+                ...(toolslessStop !== undefined ? { stopReason: toolslessStop } : {}),
+              });
+            }
+          } else if (toolslessStep.outcome.outcome === 'provider_error') {
+            canonicalRejection = toolslessStep.outcome;
           }
         }
       }
       if (canonicalStopReason !== 'end_turn') {
-        const canonicalOutcome: CompressionAttemptOutcome =
-          canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete';
-        const canonicalProviderInputTokens = this.compressionResponseInputTokens(response);
+        const canonicalOutcome: CompressionAttemptOutcome = canonicalRejection
+          ? 'provider_error'
+          : canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete';
+        const canonicalProviderInputTokens = progressCanonicalInputTokens;
         fallbackPlan = this.compressionRefusalPlan(
           request,
           variants,
@@ -6421,20 +6910,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           canonicalProviderInputTokens,
           sourceOnlyFallbackRequestHash,
         );
-        const outcomes: CompressionRefusalOutcomeRecord[] = [{
+        const outcomes: CompressionRefusalOutcomeRecord[] = [canonicalRejection ?? {
           curveLabel: 'canonical',
           requestHash: canonicalRequestHash,
           outcome: canonicalOutcome,
           ...(canonicalStopReason !== undefined ? { stopReason: canonicalStopReason } : {}),
         }];
-        attemptTraces[0]!.outcome = canonicalOutcome;
+        const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
+        if (canonicalTrace) canonicalTrace.outcome = canonicalOutcome;
         successfulTrace = undefined;
         logCompressionCall({
-          event: canonicalOutcome === 'refusal'
-            ? 'compression:canonical-refused'
-            : 'compression:canonical-incomplete',
+          event: canonicalRejection
+            ? 'compression:canonical-rejected'
+            : canonicalOutcome === 'refusal'
+              ? 'compression:canonical-refused'
+              : 'compression:canonical-incomplete',
           operation: 'compress_l1',
-          metadata: attemptTraces[0],
+          metadata: canonicalTrace ?? outcomes[0],
         });
         let fallbackResponse: NormalizedResponse | undefined;
 
@@ -6448,33 +6940,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           coverageHash: string,
         ): Promise<void> => {
           const requestHash = sha256Json(hoistedRequest);
-          try {
-            const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
-            const trace = attemptTraces[attemptTraces.length - 1]!;
-            const assessment = this.assessFallbackCompressionResponse(rungResponse);
-            if (assessment.outcome === 'valid') {
-              trace.outcome = 'success';
-              fallbackResponse = assessment.response;
-              response = assessment.response;
-              successfulTrace = trace;
-            } else {
-              trace.outcome = assessment.outcome;
-              outcomes.push({
-                curveLabel, requestHash, outcome: assessment.outcome,
-                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
-                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
-              });
-            }
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
-          } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
-            const errorType = error && typeof error === 'object' && 'type' in error
-              ? String((error as { type: unknown }).type)
-              : error instanceof Error ? error.name : typeof error;
-            const trace = attemptTraces[attemptTraces.length - 1];
-            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
-            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
+          const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
+            hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
+          ));
+          if (result.kind === 'decided') {
+            outcomes.push(result.outcome);
+            return;
           }
+          const trace = attemptTraces[attemptTraces.length - 1]!;
+          const assessment = this.assessFallbackCompressionResponse(result.response);
+          if (assessment.outcome === 'valid') {
+            trace.outcome = 'success';
+            fallbackResponse = assessment.response;
+            response = assessment.response;
+            successfulTrace = trace;
+          } else {
+            trace.outcome = assessment.outcome;
+            const outcome: CompressionRefusalOutcomeRecord = {
+              curveLabel, requestHash, outcome: assessment.outcome,
+              ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+              ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+            };
+            outcomes.push(outcome);
+            noteOutcome(outcome);
+          }
+          logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
         };
 
         // ---- tool-prose hoist rung (compressionToolProseFallback) ----
@@ -6491,14 +6981,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             await runToolProseRung(
               hoistedCanonical,
               'tool-prose-hoist',
-              keptSummaries.map((summary) => summary.id),
-              keptSummaries.map((summary) => summary.level),
+              canonicalRecallIds,
+              canonicalRecallLevels,
               canonicalCoverageHash,
             );
           }
         }
 
-        for (const planned of fallbackPlan) {
+        // A canonical rejection skips the recall variants: each reuses the
+        // canonical's head, middle, chunk, tools, system and config and only
+        // expands recall, so it is the same rejected request made larger.
+        for (const planned of canonicalRejection ? [] : fallbackPlan) {
           if (fallbackResponse) break;
           const variant = variants.find((candidate) =>
             candidate.parent.id === planned.parentId && candidate.requestHash === planned.requestHash,
@@ -6545,59 +7038,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             });
             continue;
           }
-          let variantResponse: unknown;
-          try {
-            variantResponse = await runAttempt(
-              variant.request,
-              curveLabel,
-              variantFrontier.map((summary) => summary.id),
-              variantFrontier.map((summary) => summary.level),
-              variant.leafCoverageHash,
-              variant.parent.id,
-              variant.children.map((child) => child.id),
-            );
-          } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
-            if (!this.isCompressionBranchCurrent(sourceBranch)) {
-              this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
-              throw Object.assign(new Error('Compression error crossed a branch boundary'), {
-                name: 'CompressionBranchDiscard',
+          const result = await ladderStep(curveLabel, variant.requestHash, () => runAttempt(
+            variant.request,
+            curveLabel,
+            variantFrontier.map((summary) => summary.id),
+            variantFrontier.map((summary) => summary.level),
+            variant.leafCoverageHash,
+            variant.parent.id,
+            variant.children.map((child) => child.id),
+          ));
+          if (result.kind === 'decided') {
+            outcomes.push({ ...result.outcome, admittedTokens, budgetTokens: contextBudget });
+            if (!result.reused) {
+              const trace: CompressionAttemptTrace = {
+                curveLabel,
+                recallIds: variantFrontier.map((summary) => summary.id),
+                recallLevels: variantFrontier.map((summary) => summary.level),
+                expandedParentId: variant.parent.id,
+                expandedChildIds: variant.children.map((child) => child.id),
+                leafCoverageHash: variant.leafCoverageHash,
+                requestHash: variant.requestHash,
+                messageCount: variant.request.messages.length,
+                estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
+                latencyMs: 0,
+                persisted: false,
+                outcome: 'provider_error',
+                ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
+                admittedTokens,
+                budgetTokens: contextBudget,
+              };
+              attemptTraces.push(trace);
+              logCompressionCall({
+                event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
               });
             }
-            const errorType = error && typeof error === 'object' && 'type' in error
-              ? String((error as { type: unknown }).type)
-              : error instanceof Error ? error.name : typeof error;
-            const trace: CompressionAttemptTrace = {
-              curveLabel,
-              recallIds: variantFrontier.map((summary) => summary.id),
-              recallLevels: variantFrontier.map((summary) => summary.level),
-              expandedParentId: variant.parent.id,
-              expandedChildIds: variant.children.map((child) => child.id),
-              leafCoverageHash: variant.leafCoverageHash,
-              requestHash: variant.requestHash,
-              messageCount: variant.request.messages.length,
-              estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
-              latencyMs: 0,
-              persisted: false,
-              outcome: 'provider_error',
-              errorType,
-              admittedTokens,
-              budgetTokens: contextBudget,
-            };
-            attemptTraces.push(trace);
-            outcomes.push({
-              curveLabel,
-              requestHash: variant.requestHash,
-              outcome: 'provider_error',
-              errorType,
-              admittedTokens,
-              budgetTokens: contextBudget,
-            });
-            logCompressionCall({
-              event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-            });
             continue;
           }
+          const variantResponse = result.response;
           const trace = attemptTraces[attemptTraces.length - 1]!;
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
@@ -6609,20 +7086,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const assessment = this.assessFallbackCompressionResponse(variantResponse);
           if (assessment.outcome === 'refusal') {
             trace.outcome = 'refusal';
-            outcomes.push({
+            const outcome: CompressionRefusalOutcomeRecord = {
               curveLabel,
               requestHash: variant.requestHash,
               outcome: 'refusal',
               stopReason: assessment.stopReason,
               admittedTokens,
               budgetTokens: contextBudget,
-            });
+            };
+            outcomes.push(outcome);
+            noteOutcome(outcome);
             continue;
           }
           if (assessment.outcome !== 'valid') {
             trace.outcome = assessment.outcome;
             if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
-            outcomes.push({
+            const outcome: CompressionRefusalOutcomeRecord = {
               curveLabel,
               requestHash: variant.requestHash,
               outcome: assessment.outcome,
@@ -6632,7 +7111,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 : {}),
               admittedTokens,
               budgetTokens: contextBudget,
-            });
+            };
+            outcomes.push(outcome);
+            noteOutcome(outcome);
             continue;
           }
           trace.outcome = 'success';
@@ -6652,13 +7133,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
-          try {
-            const sourceOnlyResponse = await runAttempt(
-              sourceOnlyFallbackRequest, curveLabel, [], [],
-              sha256Json(chunk.messages.map((message) => message.id)),
-            );
+          const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
+            sourceOnlyFallbackRequest!, curveLabel, [], [],
+            sha256Json(chunk.messages.map((message) => message.id)),
+          ));
+          if (result.kind === 'decided') {
+            outcomes.push(result.outcome);
+            sourceOnlyOutcome = result.outcome.outcome;
+          } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
-            const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
+            const assessment = this.assessFallbackCompressionResponse(result.response);
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
               fallbackResponse = assessment.response;
@@ -6667,30 +7151,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } else {
               sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
-              outcomes.push({
+              const outcome: CompressionRefusalOutcomeRecord = {
                 curveLabel, requestHash, outcome: assessment.outcome,
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
-              });
+              };
+              outcomes.push(outcome);
+              noteOutcome(outcome);
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
-          } catch (error) {
-            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
-            const errorType = error && typeof error === 'object' && 'type' in error
-              ? String((error as { type: unknown }).type)
-              : error instanceof Error ? error.name : typeof error;
-            const trace = attemptTraces[attemptTraces.length - 1];
-            if (trace?.curveLabel === curveLabel) { trace.outcome = 'provider_error'; trace.errorType = errorType; }
-            outcomes.push({ curveLabel, requestHash, outcome: 'provider_error', errorType });
-            sourceOnlyOutcome = 'provider_error';
           }
         }
 
         // Source-only final REFUSED too: the same carrier sits in the target
         // chunk itself, so give the source-only shape the same rewrite once.
         // Refusal-gated like the canonical hoist: any other way that attempt
-        // ended is not this rung's problem.
-        if (!fallbackResponse && sourceOnlyFallbackRequest && sourceOnlyOutcome === 'refusal') {
+        // ended is not this rung's problem. A canonical rejection allows only
+        // source-only-final itself (one extra call at most).
+        if (!fallbackResponse && !canonicalRejection && sourceOnlyFallbackRequest && sourceOnlyOutcome === 'refusal') {
           const hoistedSourceOnly = this.toolProseHoistedRequest(sourceOnlyFallbackRequest);
           if (hoistedSourceOnly) {
             await runToolProseRung(
@@ -6701,7 +7179,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
           }
         }
-
         // ---- split-stitch rung (compressionSplitFallback) ----
         // Last rung before quarantine. Observed 2026-09-05 (princess, Bedrock/Sonnet-4.5):
         // chunks refused whole in every presentation while sub-ranges folded cleanly; the
@@ -6712,8 +7189,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // error aborts the rung (errors never recurse into smaller calls). Bounded by a
         // per-chunk call cap and a sliding-window cap scoped to this strategy instance
         // (it resets when the process restarts; it is not a durable quota).
-        if (!fallbackResponse && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
-          const leafHash = sha256Json(chunk.messages.map((message) => message.id));
+        const splitLeafHash = sha256Json(chunk.messages.map((message) => message.id));
+        const knownSplit = knownOutcomes.get(`split-stitch\u0000${splitLeafHash}`);
+        if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest && knownSplit) {
+          // The rung already ended deterministically for this family.
+          outcomes.push(knownSplit);
+        } else if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
+          const leafHash = splitLeafHash;
           const textOf = (m: { content: ContentBlock[] }): string =>
             m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
           const hasType = (m: { content: ContentBlock[] }, t: string): boolean => m.content.some((blk) => blk.type === t);
@@ -6778,6 +7260,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } catch (error) {
               attempted.errors++;
               if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+              // The rung is one atomic retry unit: a transient failure (or an
+              // abort) ends this attempt of it and propagates; only a
+              // deterministic rejection of a piece abandons the rung.
+              if (compressionFailureKind(error) !== 'rejection') throw error;
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
               return false;
             }
@@ -6830,7 +7316,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
             return true;
           };
-          const complete = await fold(0, chunk.messages.length - 1, false);
+          let complete = false;
+          try {
+            complete = await fold(0, chunk.messages.length - 1, false);
+          } catch (error) {
+            if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            // The attempt's receipt stands either way.
+            this.lastSplitAttempted = { ...attempted, complete: false };
+            if (compressionFailureKind(error) === 'abort') throw error;
+            // Interrupted: progress is kept and the whole rung runs again on the
+            // next eligible tick (its existing per-attempt caps still apply). At
+            // the server-error bound it ends here as a provider error instead.
+            const persistent = interrupt(error, 'split-stitch', leafHash);
+            abortReason = `provider-error:${persistent.errorType ?? 'server-persistent'}`;
+          }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
             const stitchedText = parts.map((p) => p.text).join('\n\n');
@@ -6883,7 +7382,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
           } else {
             const reason = abortReason ?? 'refused';
-            outcomes.push({ curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) });
+            const splitOutcome: CompressionRefusalOutcomeRecord = { curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) };
+            outcomes.push(splitOutcome);
+            noteOutcome(splitOutcome);
             console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
             logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } });
           }
@@ -6895,6 +7396,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, outcomes);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          // The quarantine ledger now holds this family's outcome.
+          this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
           logCompressionCall({
             event: 'compression:curve-exhausted',
             operation: 'compress_l1',
@@ -6992,6 +7495,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: canonicalRequestHash },
               ];
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
+          if (this.isCompressionBranchCurrent(sourceBranch)) {
+            this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
+          }
         }
         return;
       }
@@ -7107,8 +7613,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.logCompressionBranchDiscard(sourceBranch, 'canonical_error', quarantineRecord);
         return;
       }
-      console.error('Failed to compress chunk (hierarchical):', error);
-      logError = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to compress chunk (hierarchical): ${describeCompressionFailure(error)}`);
+      // A failure that says nothing about the request pauses the lane; the
+      // chunk keeps its place and its family keeps its progress.
+      if (compressionFailureKind(error) === 'transient') this.pauseCompressionLane(sourceBranch, ctx, error, 'l1');
+      logError = boundFailureLogText(error instanceof Error ? error.message : String(error));
       inFlightError = error;
       throw error;
     } finally {
@@ -8075,7 +8584,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
       if (!(error instanceof MergeDispositionRejection)) {
-        console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+        console.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
       logError = error instanceof Error ? error.message : String(error);
       throw error;
