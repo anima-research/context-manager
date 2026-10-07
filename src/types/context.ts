@@ -174,7 +174,15 @@ export interface RawBodySource {
   /**
    * True only when the whole stored body is in this request unaltered:
    * every shard present, nothing truncated, no image stripped, no block
-   * removed by a structural repair.
+   * removed by a structural repair. A group that declared its size
+   * (StoredMessage.shardCount) must also hold all of its declared shards,
+   * so one an interrupted write left short is missing `shards`.
+   *
+   * For a group without a declaration (written before sizes were recorded),
+   * `complete` is weaker and relative to this view: every member the view
+   * holds was carried unaltered. It does not show that the group was ever
+   * written whole; an interrupted write can leave such a group short with
+   * nothing to tell it apart.
    */
   complete: boolean;
   /** Why the copy is not complete (absent when complete). */

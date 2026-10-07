@@ -108,9 +108,22 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
     entryBodies.push(states);
   }
 
-  // Pass 2: per-entry sources with request-level completeness.
-  const complete = (state: BodyState): boolean =>
-    state.contentOk && state.members.every((m) => state.present.has(m.id));
+  // Pass 2: per-entry sources with request-level completeness. A group that
+  // declared its size must hold exactly that many shards, indices 0..n-1: an
+  // interrupted write leaves immutable members that are not the whole body.
+  // A group without a declaration (written before it was recorded) can only
+  // be judged by the members it has: complete then means every member in
+  // this view was carried, not that the group was written whole.
+  const stored = (state: BodyState): boolean => {
+    const declared = state.head.shardCount;
+    if (declared === undefined) return true;
+    const indices = new Set(state.members.map((m) => m.shardIndex));
+    return state.members.length === declared && indices.size === declared
+      && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
+  };
+  const allShards = (state: BodyState): boolean =>
+    stored(state) && state.members.every((m) => state.present.has(m.id));
+  const complete = (state: BodyState): boolean => state.contentOk && allShards(state);
   const rawComplete = new Map<MessageId, boolean>();
   for (const state of bodies.values()) {
     const ok = complete(state);
@@ -123,7 +136,7 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
       const out: RawBodySource[] = states.map((state) => {
         const ok = complete(state);
         const missing: Array<'shards' | 'content'> = [];
-        if (!state.members.every((m) => state.present.has(m.id))) missing.push('shards');
+        if (!allShards(state)) missing.push('shards');
         if (!state.contentOk) missing.push('content');
         return {
           messageId: state.head.id,

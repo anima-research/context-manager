@@ -468,6 +468,18 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
+        // Every shard declares its group's size, so a group an interrupted
+        // write left short reads as partial, not whole (compile provenance).
+        // That needs indices exactly 0..n-1: refuse anything else before
+        // writing a shard.
+        const shardCount = decision.shards.length;
+        const indices = new Set(decision.shards.map((s) => s.shardIndex));
+        if (indices.size !== shardCount || ![...indices].every((i) => Number.isInteger(i) && i >= 0 && i < shardCount)) {
+          throw new Error(
+            `chunkIngressMessage returned shard indices ${JSON.stringify(decision.shards.map((s) => s.shardIndex))}; ` +
+              `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
+          );
+        }
         let firstId: MessageId | null = null;
         for (const shard of decision.shards) {
           const message = this.messageStore.append(
@@ -478,6 +490,7 @@ export class ContextManager {
             {
               bodyGroupId: decision.bodyGroupId,
               shardIndex: shard.shardIndex,
+              shardCount,
             }
           );
           if (firstId === null) firstId = message.id;
