@@ -135,7 +135,10 @@ export function attributeEntries(entries: readonly ContextEntry[], view: readonl
       return { kind: 'raw', bodies: out };
     }
     if (entry.summaries && entry.summaries.length > 0) {
-      return { kind: 'summary', summaries: entry.summaries.map((s) => ({ id: s.id, level: s.level })) };
+      return {
+        kind: 'summary',
+        summaries: entry.summaries.map((s) => (s.partial ? { id: s.id, level: s.level, partial: true as const } : { id: s.id, level: s.level })),
+      };
     }
     return { kind: 'other' };
   });

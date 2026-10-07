@@ -1,7 +1,7 @@
 - `compile()` returns `provenance` beside the messages. It holds a `compileId`, the
   namespace and branch the compile read (`{id, name, created}`), and one entry per
   compiled message naming what it carries: raw stored bodies (each marked
-  `complete`, or listing what is `missing`: content, shards or tool pairing), the
+  `complete`, or listing what is `missing`: content or shards), the
   summaries it renders, a context injection, or other derived content. It also
   holds an immutable rendered layout for strategies that report one. The sources
   of a split message repeat on every part.
