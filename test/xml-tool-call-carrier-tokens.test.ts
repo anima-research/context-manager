@@ -57,11 +57,43 @@ describe('XML-history carrier token estimates (membrane#101)', () => {
     assert.ok(tokens > 100);
   });
 
+  // NOTICE as membrane's formatToolCallNotice replays it: the closing tag it
+  // quotes is escaped.
+  const NOTICE_ELEMENT =
+    '<tool_call_notice invoke="0" tool="board_update" kind="refused">' +
+    `the value of item contains the closing tag \`&lt;/antra:parameter&gt;\`; nothing was sent. ${'y'.repeat(300)}` +
+    '</tool_call_notice>';
+
   it('prices a tool_notice as the notice elements it replays', () => {
     const messages = openMessages();
-    const rendered =
-      `<tool_call_notice invoke="0" tool="board_update" kind="refused">${NOTICE.message}</tool_call_notice>`;
-    assert.strictEqual(messages.estimateTokens({ content: [notice] } as never), jsonTokenEstimator(rendered));
+    assert.strictEqual(messages.estimateTokens({ content: [notice] } as never), jsonTokenEstimator(NOTICE_ELEMENT));
+  });
+
+  it('prices a tool_notice as membrane escapes it: entities in the message and tool name, and quotes in the attribute', () => {
+    const messages = openMessages();
+    const escapes = {
+      invoke: 2,
+      toolName: 'a&b"',
+      kind: 'warning',
+      message: '&<>'.repeat(300),
+    };
+    // membrane's formatToolCallNotice (membrane#101): `&`, `<`, `>` escaped in
+    // the message and the tool name, and `"` too in the tool attribute.
+    const replayed =
+      `<tool_call_notice invoke="2" tool="a&amp;b&quot;" kind="warning">${'&amp;&lt;&gt;'.repeat(300)}</tool_call_notice>`;
+    const block = { type: 'tool_notice', notices: [escapes] } as unknown as ContentBlock;
+    assert.strictEqual(messages.estimateTokens({ content: [block] } as never), jsonTokenEstimator(replayed));
+  });
+
+  it('prices several notices as their elements joined by newlines', () => {
+    const messages = openMessages();
+    const second = { invoke: 1, toolName: 'board_update', kind: 'warning', message: 'odd <markup>' };
+    const replayed = [
+      NOTICE_ELEMENT,
+      '<tool_call_notice invoke="1" tool="board_update" kind="warning">odd &lt;markup&gt;</tool_call_notice>',
+    ].join('\n');
+    const block = { type: 'tool_notice', notices: [NOTICE, second] } as unknown as ContentBlock;
+    assert.strictEqual(messages.estimateTokens({ content: [block] } as never), jsonTokenEstimator(replayed));
   });
 
   it('still prices an unrecognized block at 0', () => {
