@@ -44,7 +44,11 @@ export class TerminalPolicyEvaluator {
   private readonly ids: readonly string[];
   private readonly index: Map<string, number>;
   private readonly ranges = new WeakMap<readonly string[], Uint32Array>();
-  private readonly actions = new WeakMap<readonly string[], Map<number, CompiledAction>>();
+  private readonly actions = new WeakMap<readonly string[], {
+    readonly level: number;
+    readonly action: CompiledAction;
+    otherLevels?: Map<number, CompiledAction>;
+  }>();
   private readonly stride: number;
   private readonly fidelity: Float64Array;
   private readonly continuity: Float64Array;
@@ -149,8 +153,11 @@ export class TerminalPolicyEvaluator {
   get exactEvaluations(): number { return this.evaluations; }
 
   private compileAction(ids: readonly string[], level: number): CompiledAction {
-    let levels = this.actions.get(ids);
-    const cached = levels?.get(level);
+    const entry = this.actions.get(ids);
+    // Packed action arrays normally have one level. Keep that result directly;
+    // diagnostic traces that reuse an array at other levels retain exact keys.
+    const cached = entry && (entry.level === level || Object.is(entry.level, level))
+      ? entry.action : entry?.otherLevels?.get(level);
     if (cached) return cached;
     let fidelity = 0, continuity = 0, matches = true;
     const units = new Map<number, number>();
@@ -166,8 +173,8 @@ export class TerminalPolicyEvaluator {
     let cursor = 0;
     for (const [code, index] of units) { emissions[cursor++] = code; emissions[cursor++] = index; }
     const result = { fidelity, continuity, matches, leaves: ids.length, emissions };
-    if (!levels) { levels = new Map(); this.actions.set(ids, levels); }
-    levels.set(level, result);
+    if (!entry) this.actions.set(ids, { level, action: result });
+    else (entry.otherLevels ??= new Map()).set(level, result);
     return result;
   }
 

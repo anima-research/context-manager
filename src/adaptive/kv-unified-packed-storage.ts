@@ -47,6 +47,22 @@ export class PackedTraceArena {
     return id;
   }
 
+  /** Internal solver references keep a shared visitor; public reference stays detached-callable. */
+  evaluationReference(id: number): FrontierTraceSource {
+    return new PackedTraceReference(this, id);
+  }
+
+  /** Internal traversal shared by references; preserves newest-to-oldest order. */
+  visitTrace(id: number, visit: (ids: readonly string[], level: number) => void): void {
+    for (let cursor = id; cursor !== 0;) {
+      const page = cursor >>> TRACE_SHIFT;
+      const offset = cursor & TRACE_MASK;
+      const action = this.definitions[this.actions[page][offset]];
+      visit(action.ids, action.level);
+      cursor = this.parents[page][offset];
+    }
+  }
+
   reference(id: number): FrontierTraceSource {
     const arena = this;
     return {
@@ -63,6 +79,21 @@ export class PackedTraceArena {
   }
 
   get nodes(): number { return this.length; }
+}
+
+/** Keep reference state private; one prototype visitor replaces a closure per reference. */
+class PackedTraceReference implements FrontierTraceSource {
+  readonly #arena: PackedTraceArena;
+  readonly #id: number;
+
+  constructor(arena: PackedTraceArena, id: number) {
+    this.#arena = arena;
+    this.#id = id;
+  }
+
+  forEachAssignment(visit: (ids: readonly string[], level: number) => void): void {
+    this.#arena.visitTrace(this.#id, visit);
+  }
 }
 
 /** Owned labels are integer handles into reusable packed numeric records. A batch

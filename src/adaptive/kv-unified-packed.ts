@@ -125,7 +125,7 @@ export class PackedDagSolver {
     let value = this.signatures.get(id);
     if (value !== undefined) return value;
     const frontier = new Map<string, number>();
-    this.s.traces.reference(this.s.finishTrace(id)).forEachAssignment((ids, level) => {
+    this.s.traces.evaluationReference(this.s.finishTrace(id)).forEachAssignment((ids, level) => {
       for (const leafId of ids) frontier.set(leafId, level);
     });
     value = frontierSignature(frontier, this.leafIds);
@@ -375,7 +375,7 @@ export class PackedDagSolver {
       }
       this.flush(id, Infinity);
       if (s.data[(id) * LABEL_STRIDE + LabelField.Tokens] <= this.options.maxTokens) terminal.push({
-        trace: s.traces.reference(s.finishTrace(id)), tokens: s.data[(id) * LABEL_STRIDE + LabelField.Tokens],
+        trace: s.traces.evaluationReference(s.finishTrace(id)), tokens: s.data[(id) * LABEL_STRIDE + LabelField.Tokens],
       });
       s.release(id);
     }
@@ -389,7 +389,7 @@ export class PackedDagSolver {
       for (const [id, level] of feasibility.frontier) { const ids = byLevel.get(level); if (ids) ids.push(id); else byLevel.set(level, [id]); }
       let trace = 0;
       for (const [level, ids] of byLevel) trace = s.traces.append(trace, s.traces.action(ids, level));
-      terminal.push({ trace: s.traces.reference(trace), tokens: feasibility.floorTokens });
+      terminal.push({ trace: s.traces.evaluationReference(trace), tokens: feasibility.floorTokens });
     }
     const stats = {
       statesVisited: this.states, candidatesGenerated: this.created, maxCandidatesAtState: this.maximum, terminalCandidates: terminal.length,
