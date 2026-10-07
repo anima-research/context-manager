@@ -60,6 +60,13 @@ A conservative floating-point allowance is subtracted from each bound.
   gap-bearing ownership are supported, including nested holes. Contexts are
   rebuilt from today's inputs. More than `4 * (leaves + summaries) + 256`
   context nodes declines the certificate and uses the existing solver.
+- Context construction also limits aggregate active-leaf memberships to
+  `32 * (leaves + summaries) + 1024`, including repeated memo lookups. Before
+  building each JSON key or child lists, it charges identifier lengths plus
+  one unit per identifier against `32 * (leaves + summaries + input identifier
+  lengths) + 1024`. This bounds repeated leaf sets and long serialized IDs;
+  JSON escaping adds at most a constant factor. Exceeding either storage-work
+  limit declines the certificate and retains the full solver's behavior.
 - Ownership chains deeper than 256 summaries decline before recursive context
   construction, independently of the context-node and extension caps.
 - Initial/blank-slate solves, forced budget transitions, and unsuccessful
@@ -95,7 +102,9 @@ the canonical select/expand recurrence. Its legal cuts and independently counted
 tokens agree with the forest oracle; certified lower bounds are checked against
 every feasible cut. Eight evolving turns exercise acceptance, changed pins and
 locks, fresh L1, refolding, cache receipts, a tighter wall and a changed prefix.
-Explicit regressions cover context/extension/depth caps and numeric boundaries.
+Explicit regressions cover context/extension/depth caps, aggregate storage
+before key serialization (wide pin chains and repeated long identifiers),
+full-solver fallback and numeric boundaries.
 
 The certificate proves the exact hysteresis policy. Universal identity with a
 bucketed approximate optimizer is not its contract. The existing six-leaf hole

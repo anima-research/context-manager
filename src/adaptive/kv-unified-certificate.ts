@@ -99,6 +99,15 @@ export function certifyCarriedLayout(
   const summaryNodes = new Map<string, number>();
   const contextLimit = 4 * (leaves.length + inputs.summaries.size) + 256;
   const contextLimitReached = new Error('certificate context limit');
+  // Node count alone does not bound large active sets or repeated long IDs.
+  // Charge every attempted context, including memo hits, before allocating
+  // its JSON key, sets or child lists. Partition storage is linear in these
+  // memberships; JSON escaping uses at most six units per identifier unit.
+  const membershipLimit = 32 * (leaves.length + inputs.summaries.size) + 1024;
+  const identifierLimit = 32 * (leaves.length + inputs.summaries.size +
+    leaves.reduce((sum, leaf) => sum + leaf.id.length, 0) +
+    [...inputs.summaries.keys()].reduce((sum, id) => sum + id.length, 0)) + 1024;
+  let memberships = 0, identifierUnits = 0;
   const addNode = (node: LinearNode): number => {
     if (nodes.length >= contextLimit) throw contextLimitReached;
     nodes.push(node);
@@ -128,6 +137,14 @@ export function certifyCarriedLayout(
     return children;
   };
   const addSummary = (id: string, activeIds: readonly string[]): number => {
+    memberships += activeIds.length;
+    if (memberships > membershipLimit) throw contextLimitReached;
+    identifierUnits += id.length + 1;
+    if (identifierUnits > identifierLimit) throw contextLimitReached;
+    for (const leafId of activeIds) {
+      identifierUnits += leafId.length + 1;
+      if (identifierUnits > identifierLimit) throw contextLimitReached;
+    }
     const key = JSON.stringify([id, activeIds]);
     const known = summaryNodes.get(key);
     if (known !== undefined) return known;

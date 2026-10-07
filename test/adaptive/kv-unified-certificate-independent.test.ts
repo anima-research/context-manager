@@ -121,6 +121,55 @@ test('certificate context, extension and ownership-depth caps decline conservati
   assert.equal(certifyCarriedLayout(inputs, forest, { maxTokens: 10000, adoptEpsilon: 1e6, presentation: presentation(inputs, new Map()) }), null);
 });
 
+for (const [name, depth, width, longId] of [
+  ['wide pin chain', 60, 20, false], ['repeated long identifiers', 10, 1, true],
+] as const) test(`aggregate context storage bounds ${name} before serializing keys`, () => {
+  const chain = (depth: number, width: number, longId = false) => {
+    const c = new MockChronicle({ recallPairTokens: 10 });
+    for (let level = 1; level <= depth; level++) for (let i = 0; i < width; i++) {
+      const id = longId && level === depth ? 'long-'.repeat(2048) : `c${level}-${i}`;
+      c.addChunk({ id, rawTokens: 30 }); c.chunks.at(-1)!.pinLevel = level;
+    }
+    let upper = c.produceL1(c.chunks.map(chunk => chunk.id));
+    for (let level = 2; level <= depth; level++) upper = c.produceUpper(level, [upper.id]);
+    const inputs = inputsFor(c), forest = new CanonicalSummaryForest(inputs);
+    const frontier = new Map(c.chunks.map(chunk => [chunk.id, chunk.pinLevel!]));
+    const options = { maxTokens: 10000, adoptEpsilon: 1e12, presentation: presentation(inputs, frontier) };
+    assert.equal(forest.constraintConflicts.length, 0);
+    assert.equal(forest.tokensForFrontier(frontier), depth * 10);
+    return { inputs, forest, options };
+  };
+  const small = chain(3, 1);
+  assert.ok(certifyCarriedLayout(small.inputs, small.forest, small.options), 'ordinary bounded contexts still certify');
+  const fixture = chain(depth, width, longId), count = fixture.inputs.chunks.length + fixture.inputs.summaries.size;
+  const membershipsLimit = 32 * count + 1024;
+  const identifierLimit = 32 * (count + fixture.inputs.chunks.reduce((n, c) => n + c.id.length, 0) +
+    [...fixture.inputs.summaries.keys()].reduce((n, id) => n + id.length, 0)) + 1024;
+  const stringify = JSON.stringify; let memberships = 0, identifiers = 0;
+  // Observe actual context-key inputs and stop the unfixed implementation
+  // before it allocates excessive strings. The guard must decline first.
+  JSON.stringify = ((value: unknown, ...rest: unknown[]) => {
+    if (Array.isArray(value) && value.length === 2 && typeof value[0] === 'string' && Array.isArray(value[1])) {
+      memberships += value[1].length;
+      identifiers += value[0].length + 1 + value[1].reduce((n: number, id: string) => n + id.length + 1, 0);
+      assert.ok(memberships <= membershipsLimit && identifiers <= identifierLimit,
+        'context serialization exceeded the aggregate storage budget');
+    }
+    return Reflect.apply(stringify, JSON, [value, ...rest]);
+  }) as typeof JSON.stringify;
+  try {
+    assert.equal(certifyCarriedLayout(fixture.inputs, fixture.forest, fixture.options), null);
+  } finally { JSON.stringify = stringify; }
+  assert.ok(memberships > 0, 'exercise context construction rather than an earlier precondition decline');
+  if (longId) {
+    const solver = new ParetoKvUnifiedPolicySolver(fixture.inputs, fixture.forest);
+    const ordinary = solver.solve(fixture.options);
+    assert.ok(ordinary.feasible);
+    assert.deepEqual(solver.solve({ ...fixture.options, hysteresisCertificate: true }), ordinary,
+      'storage decline preserves the full solver, candidates, floors and error bounds');
+  }
+});
+
 test('numeric walls, epsilon, zero costs and invalid policy retain their contracts', () => {
   const c = new MockChronicle({ recallPairTokens: 0 }); c.addChunk({ id: 'a', rawTokens: 0 }); c.addChunk({ id: 'b', rawTokens: 0 }); c.produceL1(['a', 'b']);
   const inputs = inputsFor(c), forest = new CanonicalSummaryForest(inputs);
