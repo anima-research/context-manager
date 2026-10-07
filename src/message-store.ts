@@ -423,7 +423,23 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    // Whether this instance's id index and materialized cache reflected
+    // every write to the slot BEFORE this append — including writes made
+    // through a sibling MessageStore on the same store. A local write may
+    // re-certify only state that was current going in; a stale index or
+    // cache stays stale and is rebuilt on the next lookup. Previously the
+    // append stamped both as current regardless: after a sibling removed
+    // an earlier message, a lookup by id here returned the wrong message
+    // under the right id (Astra's reproducer, 2026-10-07).
+    const branchId = this.store.currentBranch().id;
+    const indexWasCurrent =
+      this.indexBranchId === branchId &&
+      this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent =
+      this.allCache !== null &&
+      this.allCache.branchId === branchId &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId);
+    const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -462,6 +478,7 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
       this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
@@ -476,13 +493,18 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
+    if (indexWasCurrent) {
+      // This instance made the write and its index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = version;
+    }
+    // Else: left stale on purpose; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
