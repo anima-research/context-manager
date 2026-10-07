@@ -921,6 +921,32 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0.
+   */
+  private static carrierTokensRaw(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${String(toolName)}" kind="${String(kind)}">${String(message)}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -972,7 +998,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.carrierTokensRaw(block);
     }
   }
 
