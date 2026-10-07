@@ -33,6 +33,9 @@
     accepted once: a retry writes nothing, whether its first acceptance
     reported success or an uncertain failure, ran in another manager on the
     store, or ran before a reopen.
+  - Every manager on one store object shares an index of these records. The
+    first acceptance or receipt query after the store opens reads every
+    record once; later ones read only the records added since.
   - Layout ranges carry exact membership, so a message missing from either
     view is never counted inside a range.
   - Layout tokens are base estimates, taken before the store's calibration, so
