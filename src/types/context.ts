@@ -1,5 +1,5 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import type { MessageId, StoredContentBlock } from './message.js';
+import type { MessageId, StoredContentBlock, StoredMessage } from './message.js';
 
 /**
  * Describes how a context entry relates to its source message.
@@ -142,6 +142,17 @@ export interface CompileResult {
    * once a provider round that carried these messages has succeeded.
    */
   provenance?: CompileProvenance;
+
+  /**
+   * The stored messages behind every raw body in `provenance`, as this
+   * compile's view held them: each body's head and, for a sharded body,
+   * every shard. The view may merge auxiliary stores (another namespace's
+   * slot), whose messages `getMessage` cannot resolve, so callers that need a
+   * body's metadata or content read it here. The map is bound to this compile:
+   * a later edit doesn't show through it. It's transient and isn't part of
+   * the persisted provenance.
+   */
+  rawSources?: ReadonlyMap<MessageId, StoredMessage>;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */
@@ -222,14 +233,24 @@ export type LayoutUnit =
   /** A message rendered raw. `p` is set when the copy was partial. */
   | { k: 'r'; s: number; id: string; t: number; p?: 1 }
   /**
-   * Messages `a`..`b` of the view rendered through these summaries, each as
+   * A run of view messages rendered through these summaries, each as
    * `[id, level, method, partial]` (partial 1 when the summary's text was
    * cut), sorted by id. `t` is the summaries' rendered tokens, attributed to
-   * the first unit each summary appears in.
+   * the first unit each summary appears in. `a`/`b` are the first and last
+   * member; `m` is the exact membership (see MemberRun).
    */
-  | { k: 's'; a: number; ai: string; b: number; bi: string; sm: Array<[string, number, string, 0 | 1]>; t: number }
-  /** Messages `a`..`b` of the view not rendered at all. */
-  | { k: 'o'; a: number; ai: string; b: number; bi: string };
+  | { k: 's'; a: number; ai: string; b: number; bi: string; m: MemberRun[]; sm: Array<[string, number, string, 0 | 1]>; t: number }
+  /** A run of view messages not rendered at all; `m` is its exact membership. */
+  | { k: 'o'; a: number; ai: string; b: number; bi: string; m: MemberRun[] };
+
+/**
+ * `[firstSequence, firstId, lastSequence, lastId]`: every integer sequence
+ * from first to last is a member. A range unit's members are exactly the
+ * union of its runs, so a message the view lacked (removed, filtered out)
+ * is never counted as part of a range just because it lies between the
+ * range's endpoints.
+ */
+export type MemberRun = [number, string, number, string];
 
 /**
  * Branch information.

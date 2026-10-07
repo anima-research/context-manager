@@ -11915,32 +11915,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (out === content) {
         return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
       }
-      // truncateContent keeps text blocks in order until the budget runs out,
-      // cuts the one that straddles it, drops later text, and keeps every
-      // non-text block. Compare text blocks positionally.
-      const fullTexts = content
-        .map((b, i) => ({ b, owner: owners[i]! }))
-        .filter((x) => x.b.type === 'text');
-      const outTexts = out.filter((b) => b.type === 'text') as Array<{ type: 'text'; text: string }>;
-      const state = new Map<number, 'full' | 'partial'>();
-      fullTexts.forEach((x, k) => {
-        if (x.owner < 0) return;
-        const kept = outTexts[k];
-        const fullText = (x.b as { text: string }).text;
-        const prior = state.get(x.owner);
-        if (kept && kept.text === fullText) {
-          if (prior === undefined) state.set(x.owner, 'full');
-        } else if (kept && fullText.length > 0) {
-          state.set(x.owner, 'partial');
-        } else if (prior !== undefined) {
-          state.set(x.owner, 'partial');
+      // truncateContent keeps blocks in order: text until the budget runs
+      // out (the straddling block cut, later text dropped), and every
+      // non-text block (a tool_result possibly shortened). Align the two
+      // arrays: an unchanged block is the same object, a cut or shortened one
+      // is a new block of the same type in the same position, and a dropped
+      // one has no counterpart. A summary is whole when all its blocks
+      // survived unchanged, partial when any of them survived at all —
+      // including a retained thinking block whose text was dropped — and
+      // absent otherwise.
+      const kept = new Map<number, { whole: number; touched: number; total: number }>();
+      let j = 0;
+      content.forEach((block, i) => {
+        const owner = owners[i]!;
+        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, touched: 0, total: 0 }) : null;
+        if (tally) tally.total++;
+        const counterpart = out[j];
+        if (counterpart === block) {
+          j++;
+          if (tally) { tally.whole++; tally.touched++; }
+        } else if (counterpart && counterpart.type === block.type) {
+          j++;
+          if (tally) tally.touched++;
         }
+        if (tally) kept.set(owner, tally);
       });
       const refs: Array<{ id: string; level: number; partial?: true }> = [];
       summaries.forEach((s, idx) => {
-        const st = state.get(idx);
-        if (st === 'full') refs.push({ id: s.id, level: s.level });
-        else if (st === 'partial') refs.push({ id: s.id, level: s.level, partial: true });
+        const tally = kept.get(idx);
+        if (!tally || tally.touched === 0) return;
+        refs.push(tally.whole === tally.total ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       });
       return { content: out, refs };
     }

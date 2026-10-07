@@ -215,8 +215,7 @@ export function buildRenderedLayout(opts: {
       const ids = [...covering].sort();
       const last = units[units.length - 1];
       if (last && last.k === 's' && sameIds(last.sm.map((s) => s[0]), ids)) {
-        last.b = msg.sequence;
-        last.bi = msg.id;
+        extend(last, msg);
         continue;
       }
       let tokens = 0;
@@ -229,16 +228,18 @@ export function buildRenderedLayout(opts: {
           tokens += summaryTokens.get(id) ?? 0;
         }
       }
-      units.push({ k: 's', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id, sm, t: Math.round(tokens) });
+      units.push({
+        k: 's', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id,
+        m: [[msg.sequence, msg.id, msg.sequence, msg.id]], sm, t: Math.round(tokens),
+      });
       continue;
     }
     const last = units[units.length - 1];
     if (last && last.k === 'o') {
-      last.b = msg.sequence;
-      last.bi = msg.id;
+      extend(last, msg);
       continue;
     }
-    units.push({ k: 'o', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id });
+    units.push({ k: 'o', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id, m: [[msg.sequence, msg.id, msg.sequence, msg.id]] });
   }
 
   return {
@@ -250,8 +251,50 @@ export function buildRenderedLayout(opts: {
   };
 }
 
+/** Add the next view message to a range unit, keeping its exact membership. */
+function extend(unit: Extract<LayoutUnit, { k: 's' | 'o' }>, msg: StoredMessage): void {
+  unit.b = msg.sequence;
+  unit.bi = msg.id;
+  const run = unit.m[unit.m.length - 1]!;
+  if (run[2] + 1 === msg.sequence) {
+    run[2] = msg.sequence;
+    run[3] = msg.id;
+  } else {
+    unit.m.push([msg.sequence, msg.id, msg.sequence, msg.id]);
+  }
+}
+
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/**
+ * The stored messages behind every raw body the sources name, from the
+ * compile's own view: each body's head and every shard of a sharded body.
+ */
+export function rawSourcesOf(
+  sources: readonly CompiledMessageSources[],
+  view: readonly StoredMessage[],
+): ReadonlyMap<MessageId, StoredMessage> {
+  const heads = new Set<MessageId>();
+  for (const source of sources) {
+    if (source.kind === 'raw') for (const body of source.bodies) heads.add(body.messageId);
+  }
+  const out = new Map<MessageId, StoredMessage>();
+  if (heads.size === 0) return out;
+  const groups = new Set<string>();
+  for (const msg of view) {
+    if (heads.has(msg.id)) {
+      out.set(msg.id, msg);
+      if (msg.bodyGroupId) groups.add(msg.bodyGroupId);
+    }
+  }
+  if (groups.size > 0) {
+    for (const msg of view) {
+      if (msg.bodyGroupId && groups.has(msg.bodyGroupId)) out.set(msg.id, msg);
+    }
+  }
+  return out;
 }
 
 /**
@@ -345,10 +388,10 @@ function sameNested(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Media payloads can be megabytes of base64 and are re-materialized from the
- * blob store between reads, so they are compared by kind, media type, length
- * and sampled ends. The only alteration a compile makes to media is removing
- * it (an image stripped to a text placeholder changes the block's type).
+ * Media sources are equal only when every field that carries the payload is
+ * exactly equal: the kind, the media type, and the URL or the whole data.
+ * A sampled comparison could call different bytes the same, and the
+ * complete-body claim rests on this.
  */
 function sameMediaSource(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -356,14 +399,7 @@ function sameMediaSource(a: unknown, b: unknown): boolean {
   const sa = a as Record<string, unknown>;
   const sb = b as Record<string, unknown>;
   if (sa.type !== sb.type) return false;
-  const mediaA = sa.media_type ?? sa.mediaType;
-  const mediaB = sb.media_type ?? sb.mediaType;
-  if (mediaA !== mediaB) return false;
+  if ((sa.media_type ?? sa.mediaType) !== (sb.media_type ?? sb.mediaType)) return false;
   if (typeof sa.url === 'string' || typeof sb.url === 'string') return sa.url === sb.url;
-  const da = sa.data;
-  const db = sb.data;
-  if (typeof da !== 'string' || typeof db !== 'string') return JSON.stringify(sa) === JSON.stringify(sb);
-  if (da.length !== db.length) return false;
-  const n = 64;
-  return da.slice(0, n) === db.slice(0, n) && da.slice(-n) === db.slice(-n);
+  return sa.data === sb.data;
 }

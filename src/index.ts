@@ -106,7 +106,6 @@ export type {
 export {
   FOLD_QUERY_DEFAULT_LIMIT,
   FOLD_QUERY_MAX_LIMIT,
-  FOLD_RECEIPT_RECORD,
   ACCEPTED_LAYOUT_RECORD,
   STORE_IDENTITY_RECORD,
   storeIdentity,
@@ -122,6 +121,7 @@ export type {
   FoldQueryResult,
   RoundUsage,
   ReceiptSource,
+  Presentation,
 } from './fold-journal.js';
 
 export {

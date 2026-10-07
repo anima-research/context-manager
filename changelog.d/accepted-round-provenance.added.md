@@ -4,7 +4,9 @@
   `complete`, or listing what is `missing`: content or shards), the
   summaries it renders, a context injection, or other derived content. It also
   holds an immutable rendered layout for strategies that report one. The sources
-  of a split message repeat on every part.
+  of a split message repeat on every part. `rawSources` maps every raw body
+  named there to the stored message the compile's view held, auxiliary-store
+  messages included.
 - Strategies can report their rendered layout. A strategy declares `renderedForms`
   and names the summaries behind derived entries in `ContextEntry.summaries`, with
   `describeRenderedSummaries(ids)` giving each summary's level, covered messages and
@@ -19,9 +21,14 @@
   a different summary, omitted), it appends a receipt naming each changed run's
   boundaries, forms, summaries and estimated tokens. It writes a baseline when the
   branch has no record. Arrivals are not folds.
-  - Receipts, the per-branch accepted layouts, and a once-minted store id are
-    Chronicle typed records, so they are unbranched, survive branch deletion, and
-    are written only after the store syncs.
+  - Each acceptance commits the branch's new layout and its receipt as one
+    Chronicle typed record, alongside a once-minted store-id record. These are
+    unbranched, survive branch deletion, are written only after the store
+    syncs, and a retry after an uncertain write can't duplicate a receipt.
+  - Layout ranges carry exact membership, so a message missing from either
+    view is never counted inside a range.
+  - `presentation` (`verbatim`, `altered` or `unknown`) records how the
+    confirming round carried the compile, as its producer reported.
   - Usage is the confirming round's own, with unreported fields `unknown`.
   - Query with `listFoldReceipts({ since, limit, branch })`, read a branch's whole
     record with `foldReceiptsFor(branch)`, subscribe with `onFoldReceipt`, and

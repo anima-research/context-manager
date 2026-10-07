@@ -53,9 +53,9 @@ import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
-import { attributeEntries, buildRenderedLayout } from './compile-provenance.js';
+import { attributeEntries, buildRenderedLayout, rawSourcesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf } from './fold-journal.js';
-import type { FoldQuery, FoldQueryResult, FoldReceipt, ReceiptSource, RoundUsage } from './fold-journal.js';
+import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
   BranchRef,
   CompiledMessageSources,
@@ -1012,6 +1012,7 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
+      result.rawSources = rawSourcesOf(attribution.sources, viewMessages);
       result.provenance = {
         compileId: randomUUID(),
         namespace: this.strategyNamespace,
@@ -1147,13 +1148,21 @@ export class ContextManager {
    * another branch is selected by now — and appends a fold receipt when any
    * message changed form, or a baseline when that branch has no record.
    * `usage` is the confirming round's own usage as the provider reported it;
-   * leave a field undefined when it was not reported.
+   * leave a field undefined when it was not reported. `presentation` is how
+   * that round carried the compile, as its producer reported (`verbatim`,
+   * `altered`, or `unknown`, the default); receipts record it beside the
+   * layout, which is the compile's.
    *
    * Returns the receipt written, or null (no change, already accepted, or a
    * strategy that does not report its layout).
    */
-  acceptRound(args: { provenance: CompileProvenance; acceptedAt?: number; usage?: RoundUsage }): FoldReceipt | null {
-    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage);
+  acceptRound(args: {
+    provenance: CompileProvenance;
+    acceptedAt?: number;
+    usage?: RoundUsage;
+    presentation?: Presentation;
+  }): FoldReceipt | null {
+    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
   }
 
   /** Fold receipts of one branch (default: the selected one), newest first. */

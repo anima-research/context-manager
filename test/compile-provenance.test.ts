@@ -35,6 +35,14 @@ describe('coversStoredContent', () => {
     assert.equal(coversStoredContent([text('hello world'), image('AAAA')], stored), false);
   });
 
+  it('compares media exactly: same length and same ends are not the same bytes', () => {
+    const head = 'A'.repeat(64);
+    const stored = [image(`${head}${'B'.repeat(100)}${head}`)];
+    const altered = [image(`${head}${'C'.repeat(100)}${head}`)];
+    assert.equal(coversStoredContent(altered, stored), false);
+    assert.ok(coversStoredContent([image(`${head}${'B'.repeat(100)}${head}`)], stored));
+  });
+
   it('ignores empty stored text, which carries nothing', () => {
     assert.ok(coversStoredContent([text('a')], [text(''), text('a')]));
   });

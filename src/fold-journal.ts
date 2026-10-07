@@ -17,14 +17,19 @@
  * Storage is Chronicle typed records, not branch state: typed records are
  * enumerable from any branch and survive branch deletion, so every branch's
  * receipts stay queryable and a round can be accepted onto the branch it was
- * compiled on even after another branch was selected. Three record types:
+ * compiled on even after another branch was selected. Two record types:
  *
  * - `context-manager/store-identity`: minted once per store; names the
  *   store in every receipt.
- * - `context-manager/accepted-layout`: the last accepted layout per
- *   (namespace, branch), as a snapshot or a delta on the previous record.
- *   Diffs read only these persisted units, never the live message view.
- * - `context-manager/fold-receipt`: the receipts themselves.
+ * - `context-manager/accepted-layout`: one per accepted compile that changed
+ *   anything, holding the branch's new last accepted layout (a snapshot, or
+ *   a delta on the previous record) AND the fold receipt that acceptance
+ *   produced, if any. One record is one commit: a receipt can never exist
+ *   without the layout it was compared into, or the reverse, so a crash or
+ *   a failed append between the two cannot duplicate or lose a receipt. A
+ *   retry after an uncertain write rereads the records and finds the
+ *   compile already accepted if its record landed. Diffs read only these
+ *   persisted units, never the live message view.
  *
  * Records that name messages or summaries assert state committed in branch
  * slots, which Chronicle buffers until sync, so every write syncs first.
@@ -36,7 +41,6 @@ import type { BranchRef, CompileProvenance, LayoutUnit, RenderedLayout } from '.
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
-export const FOLD_RECEIPT_RECORD = 'context-manager/fold-receipt';
 
 /** A delta chain longer than this is replaced by a fresh snapshot. */
 const SNAPSHOT_EVERY = 64;
@@ -72,7 +76,7 @@ export interface FoldSpanBound {
 export interface FoldChange {
   first: FoldSpanBound;
   last: FoldSpanBound;
-  /** Message count, when the persisted layouts make it exact. */
+  /** How many messages the run holds (exact: present in both layouts). */
   messages?: number;
   before: FoldForm;
   after: FoldForm;
@@ -121,9 +125,19 @@ export interface FoldReceipt {
   /** The confirming round's usage. It belongs to the whole round: no part of
    *  it is the cost of the fold. */
   usage: { input: number | 'unknown'; cacheRead: number | 'unknown'; cacheWrite: number | 'unknown'; scope: 'round' };
+  /**
+   * How the confirming round carried this compile, as its producer reported:
+   * `verbatim` (every consumer message carried as compiled), `altered` (some
+   * consumer content was not carried verbatim), or `unknown` (the producer
+   * could not establish it, or did not report). The layout is the compile's;
+   * only `verbatim` makes it exactly what the resident was shown.
+   */
+  presentation: Presentation;
   /** Estimates use the store's calibration at acceptance. */
   estimate: { calibration: number };
 }
+
+export type Presentation = 'verbatim' | 'altered' | 'unknown';
 
 export interface FoldQuery {
   /** A receipt id (receipts after it) or an ISO time (accepted at or after). */
@@ -156,6 +170,8 @@ interface AcceptedLayoutRecord {
   app?: LayoutUnit[];
   totalTokens: number;
   chain: number;
+  /** The receipt this acceptance produced; its id is the record's id. */
+  receipt?: Omit<FoldReceipt, 'id'>;
 }
 
 interface LatestLayout {
@@ -165,8 +181,6 @@ interface LatestLayout {
   totalTokens: number;
   chain: number;
 }
-
-type StoredReceipt = Omit<FoldReceipt, 'id'> & { ns: string };
 
 const storeIdentityCache = new WeakMap<JsStore, string>();
 
@@ -239,7 +253,12 @@ export class FoldJournal {
    * records the layout as the branch's last accepted one. Idempotent per
    * compile. Returns the receipt written, if any.
    */
-  accept(provenance: CompileProvenance, acceptedAt: number, usage: RoundUsage | undefined): FoldReceipt | null {
+  accept(
+    provenance: CompileProvenance,
+    acceptedAt: number,
+    usage: RoundUsage | undefined,
+    presentation: Presentation = 'unknown',
+  ): FoldReceipt | null {
     const layout = provenance.layout;
     if (!layout || provenance.namespace !== this.namespace) return null;
     if (this.acceptedCompiles.has(provenance.compileId)) return null;
@@ -250,20 +269,14 @@ export class FoldJournal {
       return null;
     }
 
-    // Records below name state committed in branch slots (messages,
-    // summaries): make that state durable before asserting it.
-    this.store.sync();
-
-    let receipt: FoldReceipt | null = null;
+    let draft: Omit<FoldReceipt, 'id'> | null = null;
     if (!prev) {
-      receipt = this.appendReceipt(this.baselineReceipt(provenance, layout, acceptedAt, usage));
+      draft = this.baselineReceipt(provenance, layout, acceptedAt, usage, presentation);
     } else {
       const changes = diffLayouts(prev.units, layout.units, layout.calibration);
-      if (changes.length > 0) {
-        receipt = this.appendReceipt(this.changeReceipt(provenance, layout, prev, changes, acceptedAt, usage));
-      }
+      if (changes.length > 0) draft = this.changeReceipt(provenance, layout, prev, changes, acceptedAt, usage, presentation);
     }
-    this.appendLayout(provenance, layout, prev);
+    const receipt = this.commit(provenance, layout, prev, draft);
     this.acceptedCompiles.add(provenance.compileId);
     if (receipt) {
       for (const listener of this.listeners) {
@@ -332,22 +345,14 @@ export class FoldJournal {
   }
 
   private refreshReceipts(): void {
-    const ids = this.store.getRecordIdsByType(FOLD_RECEIPT_RECORD);
+    const ids = this.store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
     for (let i = this.receiptIdsSeen; i < ids.length; i++) {
       const id = ids[i]!;
-      const stored = readRecord<StoredReceipt>(this.store, id);
-      if (!stored || stored.ns !== this.namespace || stored.v !== 1) continue;
-      const { ns: _ns, ...rest } = stored;
-      this.receipts.set(id, { ...rest, id } as FoldReceipt);
+      const record = readRecord<AcceptedLayoutRecord>(this.store, id);
+      if (!record || record.v !== 1 || record.ns !== this.namespace || !record.receipt) continue;
+      this.receipts.set(id, { ...record.receipt, id } as FoldReceipt);
     }
     this.receiptIdsSeen = ids.length;
-  }
-
-  private appendReceipt(receipt: Omit<FoldReceipt, 'id'>): FoldReceipt {
-    const record = this.store.appendJson(FOLD_RECEIPT_RECORD, { ...receipt, ns: this.namespace });
-    const full = { ...receipt, id: record.id } as FoldReceipt;
-    this.receipts.set(record.id, full);
-    return full;
   }
 
   private sourceFor(provenance: CompileProvenance): FoldReceiptSource {
@@ -361,7 +366,13 @@ export class FoldJournal {
     };
   }
 
-  private common(provenance: CompileProvenance, layout: RenderedLayout, acceptedAt: number, usage: RoundUsage | undefined) {
+  private common(
+    provenance: CompileProvenance,
+    layout: RenderedLayout,
+    acceptedAt: number,
+    usage: RoundUsage | undefined,
+    presentation: Presentation,
+  ) {
     return {
       v: 1 as const,
       acceptedAt: new Date(acceptedAt).toISOString(),
@@ -376,6 +387,7 @@ export class FoldJournal {
         scope: 'round' as const,
       },
       estimate: { calibration: layout.calibration },
+      presentation,
     };
   }
 
@@ -384,9 +396,10 @@ export class FoldJournal {
     layout: RenderedLayout,
     acceptedAt: number,
     usage: RoundUsage | undefined,
+    presentation: Presentation,
   ): Omit<FoldReceipt, 'id'> {
     return {
-      ...this.common(provenance, layout, acceptedAt, usage),
+      ...this.common(provenance, layout, acceptedAt, usage, presentation),
       kind: 'baseline',
       historyBefore: 'unknown',
       layout: layoutRuns(layout.units, layout.calibration),
@@ -401,9 +414,10 @@ export class FoldJournal {
     changes: FoldChange[],
     acceptedAt: number,
     usage: RoundUsage | undefined,
+    presentation: Presentation,
   ): Omit<FoldReceipt, 'id'> {
     return {
-      ...this.common(provenance, layout, acceptedAt, usage),
+      ...this.common(provenance, layout, acceptedAt, usage, presentation),
       kind: 'change',
       changes,
       renderedTokens: {
@@ -413,8 +427,21 @@ export class FoldJournal {
     };
   }
 
-  /** Persist `layout` as the branch's last accepted layout. */
-  private appendLayout(provenance: CompileProvenance, layout: RenderedLayout, prev: LatestLayout | null): void {
+  /**
+   * Commit one acceptance: the branch's new last accepted layout together
+   * with its receipt (if any), as ONE record. Returns the receipt.
+   *
+   * An identical layout with no receipt writes nothing. A failed append may
+   * or may not have landed, so the branch's cached latest layout is dropped:
+   * the next acceptance rereads the records, and finds this compile already
+   * accepted if its record did land, instead of writing a second receipt.
+   */
+  private commit(
+    provenance: CompileProvenance,
+    layout: RenderedLayout,
+    prev: LatestLayout | null,
+    draft: Omit<FoldReceipt, 'id'> | null,
+  ): FoldReceipt | null {
     const key = branchKey(provenance.branch);
     const base = {
       v: 1 as const,
@@ -426,16 +453,27 @@ export class FoldJournal {
     let record: AcceptedLayoutRecord;
     const delta = prev && prev.chain < SNAPSHOT_EVERY ? layoutDelta(prev.units, layout.units) : null;
     if (prev && delta) {
-      if (delta.drop === 0 && delta.ins.length === 0 && delta.app.length === 0 && prev.totalTokens === layout.totalTokens) {
-        // Identical layout: nothing new to remember.
+      const identical = delta.drop === 0 && delta.ins.length === 0 && delta.app.length === 0 && prev.totalTokens === layout.totalTokens;
+      if (identical && !draft) {
         this.latest.set(key, { ...prev, compileId: provenance.compileId });
-        return;
+        return null;
       }
       record = { ...base, kind: 'delta', prev: prev.recordId, ...delta, chain: prev.chain + 1 };
     } else {
       record = { ...base, kind: 'snapshot', units: layout.units, chain: 0 };
     }
-    const written = this.store.appendJson(ACCEPTED_LAYOUT_RECORD, record);
+    if (draft) record.receipt = draft;
+
+    let written: { id: string };
+    try {
+      // The record names state committed in branch slots (messages,
+      // summaries): make that state durable before asserting it.
+      this.store.sync();
+      written = this.store.appendJson(ACCEPTED_LAYOUT_RECORD, record);
+    } catch (err) {
+      this.latest.delete(key);
+      throw err;
+    }
     this.latest.set(key, {
       recordId: written.id,
       compileId: provenance.compileId,
@@ -443,6 +481,10 @@ export class FoldJournal {
       totalTokens: layout.totalTokens,
       chain: record.chain,
     });
+    if (!draft) return null;
+    const receipt = { ...draft, id: written.id } as FoldReceipt;
+    this.receipts.set(written.id, receipt);
+    return receipt;
   }
 
   /** The last accepted layout of a branch: memory, else the newest record. */
@@ -525,6 +567,14 @@ function endOf(u: LayoutUnit): number { return u.k === 'r' ? u.s : u.b; }
 function startIdOf(u: LayoutUnit): string { return u.k === 'r' ? u.id : u.ai; }
 function endIdOf(u: LayoutUnit): string { return u.k === 'r' ? u.id : u.bi; }
 
+/** How many messages a unit holds: exact, from its membership runs. */
+function memberCount(u: LayoutUnit): number {
+  if (u.k === 'r') return 1;
+  let n = 0;
+  for (const [first, , last] of u.m) n += last - first + 1;
+  return n;
+}
+
 function formKey(u: LayoutUnit): string {
   if (u.k === 'r') return u.p ? 'r:p' : 'r';
   if (u.k === 's') return `s:${u.sm.map((s) => `${s[0]}${s[3] ? '~' : ''}`).join(',')}`;
@@ -543,60 +593,86 @@ function formOf(u: LayoutUnit): FoldForm {
   return { form: 'omitted' };
 }
 
+/** A contiguous run of member sequences of one unit. */
+interface Segment {
+  start: number;
+  startId: string;
+  end: number;
+  endId: string;
+  unit: number;
+}
+
+/** Every unit's exact membership, as runs in sequence order. */
+function segmentsOf(units: readonly LayoutUnit[]): Segment[] {
+  const out: Segment[] = [];
+  units.forEach((u, unit) => {
+    if (u.k === 'r') {
+      out.push({ start: u.s, startId: u.id, end: u.s, endId: u.id, unit });
+    } else {
+      for (const [start, startId, end, endId] of u.m) out.push({ start, startId, end, endId, unit });
+    }
+  });
+  return out;
+}
+
 /**
- * Compare two layouts over the messages present in both. Units are walked in
- * sequence order; each overlap between an old and a new unit whose forms
- * differ is a change, and adjacent changes with the same before/after forms
- * merge into one run. Boundaries and ids come from the persisted units.
+ * Compare two layouts over exactly the messages present in both. Each
+ * layout's membership is a list of runs of consecutive sequences; the walk
+ * intersects runs, so a message one view lacked (removed, filtered out)
+ * never counts, even when it lies between a range's endpoints. Each
+ * intersection whose forms differ is a change, and adjacent changes with the
+ * same before/after forms merge into one run. Boundaries, ids and message
+ * counts are exact; tokens count each unit once per side.
  */
 export function diffLayouts(before: readonly LayoutUnit[], after: readonly LayoutUnit[], calibration: number): FoldChange[] {
   const changes: FoldChange[] = [];
   const countedBefore = new Set<number>();
   const countedAfter = new Set<number>();
-  let open: (FoldChange & { key: string; exact: boolean }) | null = null;
+  let open: (FoldChange & { key: string }) | null = null;
   const flush = () => {
     if (!open) return;
-    const { key: _key, exact, ...change } = open;
-    if (!exact) delete change.messages;
+    const { key: _key, ...change } = open;
     changes.push(change);
     open = null;
   };
 
+  const A = segmentsOf(before);
+  const B = segmentsOf(after);
   let i = 0;
   let j = 0;
-  while (i < before.length && j < after.length) {
-    const u = before[i]!;
-    const v = after[j]!;
-    if (endOf(u) < startOf(v)) { i++; continue; }
-    if (endOf(v) < startOf(u)) { j++; continue; }
-    const lo = Math.max(startOf(u), startOf(v));
-    const hi = Math.min(endOf(u), endOf(v));
-    const loId = startOf(u) >= startOf(v) ? startIdOf(u) : startIdOf(v);
-    const hiId = endOf(u) <= endOf(v) ? endIdOf(u) : endIdOf(v);
+  while (i < A.length && j < B.length) {
+    const a = A[i]!;
+    const b = B[j]!;
+    if (a.end < b.start) { i++; continue; }
+    if (b.end < a.start) { j++; continue; }
+    const lo = Math.max(a.start, b.start);
+    const hi = Math.min(a.end, b.end);
+    const loId = a.start >= b.start ? a.startId : b.startId;
+    const hiId = a.end <= b.end ? a.endId : b.endId;
+    const u = before[a.unit]!;
+    const v = after[b.unit]!;
     const keyBefore = formKey(u);
     const keyAfter = formKey(v);
 
     if (keyBefore === keyAfter) {
       flush();
     } else {
-      const tokensBefore = unitTokens(u, i, countedBefore);
-      const tokensAfter = unitTokens(v, j, countedAfter);
-      const exact = u.k === 'r' || v.k === 'r';
+      const tokensBefore = unitTokens(u, a.unit, countedBefore);
+      const tokensAfter = unitTokens(v, b.unit, countedAfter);
       const key = `${keyBefore}>${keyAfter}`;
+      const count = hi - lo + 1;
       if (open && open.key === key) {
         open.last = { sequence: hi, messageId: hiId };
         open.estimatedTokensBefore += tokensBefore;
         open.estimatedTokensAfter += tokensAfter;
-        open.messages = (open.messages ?? 0) + (exact ? 1 : 0);
-        open.exact = open.exact && exact;
+        open.messages = (open.messages ?? 0) + count;
       } else {
         flush();
         open = {
           key,
-          exact,
           first: { sequence: lo, messageId: loId },
           last: { sequence: hi, messageId: hiId },
-          messages: exact ? 1 : 0,
+          messages: count,
           before: formOf(u),
           after: formOf(v),
           estimatedTokensBefore: tokensBefore,
@@ -605,8 +681,8 @@ export function diffLayouts(before: readonly LayoutUnit[], after: readonly Layou
       }
     }
 
-    if (endOf(u) < endOf(v)) i++;
-    else if (endOf(v) < endOf(u)) j++;
+    if (a.end < b.end) i++;
+    else if (b.end < a.end) j++;
     else { i++; j++; }
   }
   flush();
@@ -639,7 +715,7 @@ export function layoutRuns(units: readonly LayoutUnit[], calibration: number): F
     runs.push({
       first: { sequence: startOf(u), messageId: startIdOf(u) },
       last: { sequence: endOf(u), messageId: endIdOf(u) },
-      ...(u.k === 'r' ? { messages: 1 } : {}),
+      messages: memberCount(u),
       form: formOf(u),
       estimatedTokens: u.k === 'o' ? 0 : u.t,
     });

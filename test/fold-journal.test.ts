@@ -11,7 +11,9 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
-import { ContextManager, FOLD_RECEIPT_RECORD } from '../src/index.js';
+import type { JsStore } from '@animalabs/chronicle';
+import { ContextManager } from '../src/index.js';
+import { FoldJournal } from '../src/fold-journal.js';
 import type {
   ContextEntry,
   ContextLogView,
@@ -192,7 +194,7 @@ describe('fold journal', () => {
     assert.equal(r?.changes?.length, 1);
     assert.equal((r?.changes?.[0]?.before as { summaries: Array<{ id: string }> }).summaries[0]!.id, 'L1-1');
     assert.equal((r?.changes?.[0]?.after as { summaries: Array<{ id: string }> }).summaries[0]!.id, 'L2-1');
-    assert.equal(r?.changes?.[0]?.messages, undefined, 'summary-to-summary runs carry no exact count');
+    assert.equal(r?.changes?.[0]?.messages, 2, 'counts are exact from membership');
 
     // Unfold after a budget increase: summary back to raw.
     strategy.plan.delete(ids[0]!);
@@ -208,6 +210,29 @@ describe('fold journal', () => {
     assert.equal(r?.changes?.[0]?.first.messageId, ids[4]);
     assert.equal(r?.changes?.[0]?.last.messageId, ids[5]);
     assert.equal(r?.changes?.[0]?.estimatedTokensAfter, 0);
+    cm.close();
+  });
+
+  it('compares only messages present in both layouts, even inside a range', async () => {
+    const { cm, strategy } = await open();
+    const [m1, m2, m3] = add(cm, 3);
+    const baseline = await acceptCompile(cm);
+    const threeRaw = baseline!.layout![0]!.estimatedTokens;
+    // m2 leaves the view; a summary covers the remaining two.
+    cm.removeMessage(m2!);
+    strategy.plan.set(m1!, { summary: 's13', level: 1 });
+    strategy.plan.set(m3!, { summary: 's13', level: 1 });
+    const r = await acceptCompile(cm);
+    assert.equal(r?.changes?.length, 1);
+    const change = r!.changes![0]!;
+    assert.equal(change.messages, 2, 'm2 was in neither the summary nor the new view');
+    assert.equal(change.first.messageId, m1);
+    assert.equal(change.last.messageId, m3);
+    // m2's raw tokens are not charged: the three bodies are the same size, so
+    // the run's "before" is two thirds of the baseline's three raw messages.
+    assert.ok(Math.abs(change.estimatedTokensBefore * 3 - threeRaw * 2) <= 3, `${change.estimatedTokensBefore} vs ${threeRaw}`);
+    const units = (await cm.compile(BUDGET)).provenance!.layout!.units;
+    assert.ok(units.some((u) => u.k === 's' && u.m.length === 2), 'the summary unit records its two runs');
     cm.close();
   });
 
@@ -371,6 +396,47 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it('commits receipt and layout together: a failed or uncertain append never duplicates a receipt', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    // 'fail': the append throws before writing. 'landed': it writes, then throws.
+    let mode: 'ok' | 'fail' | 'landed' = 'fail';
+    const flaky = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            if (mode === 'fail') throw new Error('disk full');
+            const written = target.appendJson(type, payload);
+            if (mode === 'landed') throw new Error('write reported failure after landing');
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const journal = new FoldJournal(flaky, 'agents/tester');
+
+    const first = (await cm.compile(BUDGET)).provenance!;
+    assert.throws(() => journal.accept(first, Date.now(), undefined), /disk full/);
+    mode = 'ok';
+    assert.equal(journal.accept(first, Date.now(), undefined)?.kind, 'baseline', 'the retry writes the baseline once');
+    assert.equal(journal.accept(first, Date.now(), undefined), null);
+
+    strategy.plan.set(ids[0]!, 'omit');
+    const second = (await cm.compile(BUDGET)).provenance!;
+    mode = 'landed';
+    assert.throws(() => journal.accept(second, Date.now(), undefined), /after landing/);
+    mode = 'ok';
+    const retry = new FoldJournal(flaky, 'agents/tester');
+    assert.equal(journal.accept(second, Date.now(), undefined), null, 'the landed record is found on reread');
+    assert.equal(retry.accept(second, Date.now(), undefined), null, 'and by a fresh journal');
+    const kinds = cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind);
+    assert.deepEqual(kinds, ['change', 'baseline']);
+    cm.close();
+  });
+
   it('never puts receipt text into the compiled context', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 3);
@@ -380,7 +446,7 @@ describe('fold journal', () => {
     const { messages } = await cm.compile(BUDGET);
     const text = JSON.stringify(messages);
     assert.doesNotMatch(text, /"kind":"(baseline|change)"|historyBefore|renderedTokens/);
-    assert.equal(cm.getStore().getRecordIdsByType(FOLD_RECEIPT_RECORD).length, 2);
+    assert.equal(cm.listFoldReceipts().receipts.length, 2);
     cm.close();
   });
 });
