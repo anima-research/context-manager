@@ -929,9 +929,11 @@ export class MessageStore {
    * formatToolCallNotice escapes it. Both reach the provider
    * as text, so both are priced as the markup they replay as — never 0. Read
    * structurally, so this holds whatever membrane version typed the block.
-   * Any other unknown block stays at 0.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
    */
-  private static carrierTokensRaw(block: unknown): number {
+  static xmlHistoryCarrierTokens(block: unknown): number {
     const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
     if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
       return jsonTokenEstimator(carrier.rawXml);
@@ -1004,7 +1006,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return MessageStore.carrierTokensRaw(block);
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
