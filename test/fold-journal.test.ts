@@ -438,8 +438,28 @@ describe('fold journal', () => {
     assert.equal(journal.accept(second, Date.now(), undefined), null);
     assert.equal(announced.length, 1, 'never twice');
     assert.equal(retry.accept(second, Date.now(), undefined), null, 'a fresh journal finds it too');
+
+    // The ordinary next-activation path: the uncertain write was on the
+    // stream's last round, and the next accepted compile is a new compile
+    // with an identical layout.
+    const third = (await cm.compile(BUDGET)).provenance!;
+    strategy.plan.set(ids[1]!, 'omit');
+    const fourth = (await cm.compile(BUDGET)).provenance!;
+    const nextActivation = new FoldJournal(flaky, 'agents/tester');
+    const heard: string[] = [];
+    nextActivation.onReceipt((r) => heard.push(r.id));
+    mode = 'landed';
+    assert.throws(() => nextActivation.accept(fourth, Date.now(), undefined), /after landing/);
+    mode = 'ok';
+    const landed = cm.listFoldReceipts({ limit: 1 }).receipts[0]!;
+    assert.ok(!heard.includes(landed.id), 'the uncertain receipt is not announced yet');
+    const sameLayout = (await cm.compile(BUDGET)).provenance!;
+    assert.notEqual(sameLayout.compileId, fourth.compileId);
+    assert.equal(nextActivation.accept(sameLayout, Date.now(), undefined), null, 'identical layout: no new receipt');
+    assert.equal(heard.filter((id) => id === landed.id).length, 1, 'the recovered receipt is announced, once');
+    void third;
     const kinds = cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind);
-    assert.deepEqual(kinds, ['change', 'baseline']);
+    assert.deepEqual(kinds, ['change', 'change', 'baseline'], 'one receipt per committed change, none duplicated');
     cm.close();
   });
 

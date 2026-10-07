@@ -268,13 +268,14 @@ export class FoldJournal {
     if (this.acceptedCompiles.has(provenance.compileId)) return null;
     const key = branchKey(provenance.branch);
     const prev = this.loadLatest(key);
+    // The branch's latest committed record may hold a receipt this journal
+    // never announced: its write reported failure after landing, in this
+    // stream or the turn before, or another journal wrote it. Announce it now,
+    // whatever this compile turns out to be, so listeners (a projection)
+    // converge on the canonical record.
+    if (prev?.receipt) this.announce(prev.receipt);
     if (prev && prev.compileId === provenance.compileId) {
-      // Already committed: by an earlier call whose write reported failure
-      // after landing, or by another journal on this store. Announce its
-      // receipt if this journal never did, so listeners (a projection)
-      // converge on the canonical record.
       this.acceptedCompiles.add(provenance.compileId);
-      if (prev.receipt) this.announce(prev.receipt);
       return null;
     }
 
