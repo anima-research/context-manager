@@ -1776,6 +1776,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = 1;
     this._calibrationLoaded = false;
     this._lastKvStable = null;
+    this._storeOrder = new Map();
+    this._storeOrderSource = [];
+    this._chunkByPosition = null;
+    this._l1ByMessage = null;
   }
 
   /**

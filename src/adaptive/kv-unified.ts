@@ -263,11 +263,14 @@ export class CanonicalSummaryForest {
   // from it instead of rebuilding ownership over every leaf.
   private readonly sourceChunks: readonly PickerChunk[];
   private readonly sourceInputs: PickerInputs;
+  /** `inputs.chunks` as given, element by element, for `builtFrom`. */
+  private readonly sourceChunkList: readonly PickerChunk[];
   private readonly sourceOptions: CanonicalForestOptions;
 
   constructor(inputs: PickerInputs, options: CanonicalForestOptions = {}, prebuilt?: PrebuiltForestParts) {
     this.fixedTokens = inputs.headTokens + inputs.tailTokens;
     this.sourceInputs = inputs;
+    this.sourceChunkList = [...inputs.chunks];
     this.sourceOptions = options;
     this.derived = prebuilt !== undefined;
     this.ownership = prebuilt?.ownership ?? {};
@@ -710,9 +713,15 @@ export class CanonicalSummaryForest {
     return this.orderedLeafList;
   }
 
-  /** Whether `orderedChunks()` is the sorted form of exactly these inputs' chunks. */
+  /** Whether `orderedChunks()` is the sorted form of exactly these inputs'
+   * chunks: the same inputs object, still holding the same chunk objects
+   * (a chunk replaced inside the array after the build is detected). */
   builtFrom(inputs: PickerInputs): boolean {
-    return this.sourceInputs === inputs;
+    if (inputs !== this.sourceInputs) return false;
+    const given = inputs.chunks, snapshot = this.sourceChunkList;
+    if (given.length !== snapshot.length) return false;
+    for (let i = 0; i < given.length; i++) if (given[i] !== snapshot[i]) return false;
+    return true;
   }
 
   /** The picker chunks in leaf order (parallel to `orderedLeaves()`). */

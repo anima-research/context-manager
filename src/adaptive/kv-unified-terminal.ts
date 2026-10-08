@@ -272,6 +272,9 @@ export class TerminalPolicyEvaluator {
 
   private fill(trace: FrontierTraceReference | FrontierLevels): void {
     if (trace && 'levels' in trace) {
+      if (trace.levels.length !== this.levels.length) {
+        throw new Error(`kv-unified levels vector has ${trace.levels.length} entries for ${this.levels.length} leaves`);
+      }
       this.levels.set(trace.levels);
       return;
     }
