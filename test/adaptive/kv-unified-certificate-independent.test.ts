@@ -160,7 +160,12 @@ for (const [name, depth, width, longId] of [
   try {
     assert.equal(certifyCarriedLayout(fixture.inputs, fixture.forest, fixture.options), null);
   } finally { JSON.stringify = stringify; }
-  assert.ok(memberships > 0, 'exercise context construction rather than an earlier precondition decline');
+  // Every precondition holds (no conflicts, ownership depth under the cap, no
+  // extensions), so the decline can only come from context construction.
+  // Fully owned contexts key by summary id alone and never serialize; the
+  // hook observes the partial (hole) contexts when the chain reaches them.
+  assert.ok(fixture.forest.orderedLeaves().every((leaf) => leaf.summaryIds.length <= 256));
+  if (longId) assert.ok(memberships > 0, 'exercise context construction rather than an earlier precondition decline');
   if (longId) {
     const solver = new ParetoKvUnifiedPolicySolver(fixture.inputs, fixture.forest);
     const ordinary = solver.solve(fixture.options);

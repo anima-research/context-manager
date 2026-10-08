@@ -47,6 +47,33 @@ interface EvaluatorStructure {
 
 const structures = new WeakMap<object, EvaluatorStructure>();
 
+const presentedByLeaves = new WeakMap<ReadonlyMap<string, PresentedLeaf>, {
+  ownership: object; leaves: readonly CanonicalLeaf[]; previous: (PresentedLeaf | undefined)[];
+}>();
+
+/** The accepted presentation's entry per leaf position of `forest`, looked
+ * up once per (presentation map, forest) and shared by the certificate and
+ * the evaluators of the same compile. The array is not to be mutated. */
+export function presentedLeavesByIndex(
+  presentation: ReadonlyMap<string, PresentedLeaf>,
+  forest: CanonicalSummaryForest,
+): readonly (PresentedLeaf | undefined)[] {
+  const leaves = forest.orderedLeaves();
+  const known = presentedByLeaves.get(presentation);
+  if (known && known.ownership === forest.ownership && known.leaves.length === leaves.length) {
+    let same = true;
+    for (let i = 0; same && i < leaves.length; i++) {
+      const a = known.leaves[i], b = leaves[i];
+      same = a === b || a.id === b.id;
+    }
+    if (same) return known.previous;
+  }
+  const previous: (PresentedLeaf | undefined)[] = new Array(leaves.length);
+  for (let i = 0; i < leaves.length; i++) previous[i] = presentation.get(leaves[i].id);
+  presentedByLeaves.set(presentation, { ownership: forest.ownership, leaves, previous });
+  return previous;
+}
+
 interface CompiledAction {
   readonly fidelity: number;
   readonly continuity: number;
@@ -202,13 +229,14 @@ export class TerminalPolicyEvaluator {
     const currentSeq = presentation?.currentSeq ?? 0;
     const nextLeaves: (CanonicalLeaf | undefined)[] = new Array(n);
     const nextPrevious: (PresentedLeaf | undefined)[] = new Array(n);
+    const previousAt = presentation && fromForest ? presentedLeavesByIndex(presentation.leaves, forest) : null;
     let age = 0;
     for (let i = n - 1; i >= 0; i--) {
       const chunk = this.chunks[i];
       const midpoint = age + chunk.rawTokens / 2;
       age += chunk.rawTokens;
       const leaf = fromForest ? leaves[i] : forest.leaf(chunk.id)!;
-      const previous = presentation?.leaves.get(chunk.id);
+      const previous = previousAt ? previousAt[i] : presentation?.leaves.get(chunk.id);
       this.unitTokens[i + 1] = chunk.rawTokens;
       this.unitKeys[i + 1] = chunk.id;
       this.unitKinds[i + 1] = 'raw';

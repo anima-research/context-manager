@@ -2,7 +2,7 @@ import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import type { PresentedLeaf } from './kv-unified-policy.js';
 import { CanonicalSummaryForest, type CanonicalLeaf } from './kv-unified.js';
-import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
+import { TerminalPolicyEvaluator, presentedLeavesByIndex } from './kv-unified-terminal.js';
 import {
   ExactKvUnifiedPolicySolver,
   budgetPenalty,
@@ -252,6 +252,7 @@ function buildDag(
     }
     return children;
   };
+  const allowed = forest.allowedLevelMasks();
   const addSummary = (id: string, activeIds: readonly string[]): number => {
     memberships += activeIds.length;
     if (memberships > membershipLimit) throw contextLimitReached;
@@ -261,14 +262,29 @@ function buildDag(
       identifierUnits += leafId.length + 1;
       if (identifierUnits > identifierLimit) throw contextLimitReached;
     }
-    const key = JSON.stringify([id, activeIds]);
+    const summary = forest.summary(id)!;
+    // The active set is a subset of the summary's leaves; the full set (no
+    // hole above it) keys by the id alone and tests participants by bit.
+    const full = activeIds.length === summary.leafIds.length;
+    const key = full ? id : JSON.stringify([id, activeIds]);
     const known = summaryNodes.get(key);
     if (known !== undefined) return known;
-    const summary = forest.summary(id)!;
     const children = addChildren(id, activeIds);
-    const participants = activeIds.filter((id) => forest.leaf(id)!.allowedLevels.includes(summary.level));
-    const participantSet = new Set(participants);
-    const holes = activeIds.filter((id) => !participantSet.has(id));
+    let participants: readonly string[];
+    let holes: readonly string[];
+    if (full && summary.level < 31) {
+      const indices = forest.leafIndicesOf(summary);
+      const bit = 1 << summary.level;
+      let count = 0;
+      for (let k = 0; k < indices.length; k++) if (allowed[indices[k]] & bit) count++;
+      participants = count === indices.length ? summary.leafIds
+        : summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) !== 0);
+      holes = count === indices.length ? [] : summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) === 0);
+    } else {
+      participants = activeIds.filter((id) => forest.leaf(id)!.allowedLevels.includes(summary.level));
+      const participantSet = new Set(participants);
+      holes = activeIds.filter((id) => !participantSet.has(id));
+    }
     const canSelect = participants.length > 0;
     const selectedChildren = canSelect && holes.length > 0 ? addChildren(id, holes) : [];
     const index = addNode({
@@ -332,12 +348,13 @@ export function certifyCarriedLayout(
   const cached = options.reuse?.certificate;
   const known = cached && cached.ownership === forest.ownership ? cached.fixed : undefined;
   const checkedLeaves: CanonicalLeaf[] = new Array(n);
-  const checkedPrevious: (PresentedLeaf | undefined)[] = new Array(n);
+  // One receipt lookup per leaf position, shared with this compile's
+  // evaluator.
+  const checkedPrevious = presentedLeavesByIndex(presentation.leaves, forest) as (PresentedLeaf | undefined)[];
   for (let i = 0; i < n; i++) {
     const leaf = leaves[i];
-    const previous = presentation.leaves.get(leaf.id);
+    const previous = checkedPrevious[i];
     checkedLeaves[i] = leaf;
-    checkedPrevious[i] = previous;
     if (known && i < known.leaves.length && known.leaves[i] === leaf && known.previous[i] === previous) {
       // Same leaf object against the same receipt entry: the checks below
       // gave this level last compile and depend on nothing else.

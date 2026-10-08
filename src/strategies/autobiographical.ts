@@ -8349,7 +8349,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const tokens = msgCap > 0
         ? Math.min(pse[i], msgCap + 50)
         : pse[i];
-      const bound = pinBounds.get(i);
+      const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -8358,7 +8358,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         lockedByAgent: this.locked.has(msg.id),
         // A classic pin (in pinnedSet with no level bound) stays force-raw. A
         // leveled pin is not force-raw; it carries its bound instead.
-        pinned: pinnedSet.has(i) && bound === undefined,
+        pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),

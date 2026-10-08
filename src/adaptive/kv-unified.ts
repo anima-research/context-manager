@@ -794,8 +794,9 @@ export class CanonicalSummaryForest {
     return this.leafMap.get(id) ?? null;
   }
 
-  /** Allowed levels per leaf position as bits (levels below 31). */
-  private allowedLevelMasks(): Uint32Array {
+  /** Allowed levels per leaf position (`orderedLeaves()` order) as bits,
+   *  levels below 31; built once per forest. */
+  allowedLevelMasks(): Uint32Array {
     if (this.allowedMasksMemo) return this.allowedMasksMemo;
     const leaves = this.orderedLeafList;
     const masks = new Uint32Array(leaves.length);
@@ -808,7 +809,9 @@ export class CanonicalSummaryForest {
   }
   private allowedMasksMemo: Uint32Array | undefined;
 
-  private summaryLeafIndices(summary: CanonicalSummary): Int32Array {
+  /** Positions in `orderedLeaves()` of a summary's leaves, parallel to its
+   *  `leafIds`; cached per summary object and stable across derived forests. */
+  leafIndicesOf(summary: CanonicalSummary): Int32Array {
     let indices = summaryLeafIndexCache.get(summary);
     if (!indices) {
       indices = Int32Array.from(summary.leafIds, (id) => this.leafMap.get(id)!.index);
@@ -1279,7 +1282,7 @@ export class CanonicalSummaryForest {
     const participantsOf = (summary: CanonicalSummary, activeIds: readonly ChunkId[]):
       { count: number; ids: () => ChunkId[] } => {
       if (activeIds.length === summary.leafIds.length && summary.level < 31) {
-        const indices = this.summaryLeafIndices(summary);
+        const indices = this.leafIndicesOf(summary);
         const bit = 1 << summary.level;
         let count = 0;
         for (let k = 0; k < indices.length; k++) if (allowed[indices[k]] & bit) count++;
