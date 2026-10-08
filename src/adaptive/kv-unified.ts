@@ -283,6 +283,20 @@ export interface PrebuiltForestParts {
   readonly treeifiedSummaryIds: readonly SummaryId[];
   readonly gapBearingSummaryIds: readonly SummaryId[];
   readonly leafZone: Uint8Array;
+  readonly lineage?: ForestLineage;
+}
+
+/** How a forest's ownership relates to the forest it was extended from
+ *  (see `derive`): consumers keyed by `ownership` may patch their state for
+ *  the changed leaves and summaries instead of rebuilding it. */
+export interface ForestLineage {
+  /** The previous forest's `ownership`. */
+  readonly parent: object;
+  /** Positions whose leaf object is new (rebuilt or appended), ascending. */
+  readonly changedLeaves: Int32Array;
+  /** Summaries whose object is new (added, re-parented, or with changed
+   *  leaves or children); every other summary object is shared. */
+  readonly changedSummaryIds: ReadonlySet<SummaryId>;
 }
 
 /** Head/tail membership per ordered chunk: bit 0 head, bit 1 tail. */
@@ -307,8 +321,11 @@ export class CanonicalSummaryForest {
    *  derive compares zones without four set lookups per chunk. */
   private readonly leafZone: Uint8Array;
   /** Identity of the ownership structure: shared by every forest derived
-   * from the same full build, new on each full build. */
+   * from the same full build, new on each full build and on each extension
+   * (see `lineage`). */
   readonly ownership: object;
+  /** Set when this forest's ownership was extended from a previous one. */
+  readonly lineage: ForestLineage | undefined;
   private internalHolesMemo: boolean | undefined;
 
   /** Leaf positions in `orderedLeafList`: ids present at the full build in
@@ -334,6 +351,7 @@ export class CanonicalSummaryForest {
     this.sourceOptions = options;
     this.derived = prebuilt !== undefined;
     this.ownership = prebuilt?.ownership ?? {};
+    this.lineage = prebuilt?.lineage;
     if (prebuilt) {
       this.sourceChunks = prebuilt.chunks;
       this.leafZone = prebuilt.leafZone;
@@ -632,6 +650,219 @@ export class CanonicalSummaryForest {
     this.gapBearingSummaryIds = [...gapBearing].sort();
   }
 
+  /**
+   * Derive when ownership changed by additions: new summaries, children
+   * re-parented under them, ownerless leaves now owned, owned leaves
+   * appended. Only the leaves whose chain changed and the summaries on an
+   * old or new chain of such a leaf are rebuilt; every other leaf and summary
+   * object is shared with `previous`, and `lineage` names what changed. The
+   * result equals a full build of `inputs`; any input the full build would
+   * reject, or treeified or gap-bearing ownership, returns null so the
+   * constructor runs with its own diagnostics. Called by `derive` after its
+   * checks on options, summaries' levels and costs, and chunk positions.
+   */
+  private static extend(
+    previous: CanonicalSummaryForest,
+    inputs: PickerInputs,
+    options: CanonicalForestOptions,
+    chunks: readonly PickerChunk[],
+  ): CanonicalSummaryForest | null {
+    if (previous.treeifiedSummaryIds.length > 0 || previous.gapBearingSummaryIds.length > 0) return null;
+    const old = previous.sourceChunks;
+    const oldLeaves = previous.orderedLeafList;
+    const oldMap = previous.summaryMap;
+    // One chain walk per L1, validated as the full build validates it; the
+    // previous chain array is kept when the ids did not change.
+    const chainByL1 = new Map<SummaryId, SummaryId[]>();
+    const walk = (l1Id: SummaryId): SummaryId[] | null => {
+      const known = chainByL1.get(l1Id);
+      if (known) return known;
+      const chain: SummaryId[] = [];
+      const seen = new Set<SummaryId>();
+      let currentId: SummaryId | undefined = l1Id;
+      let previousLevel = 0;
+      while (currentId !== undefined) {
+        if (seen.has(currentId)) return null;
+        seen.add(currentId);
+        const entry = inputs.summaries.get(currentId);
+        if (!entry) return null;
+        if (chain.length === 0 && entry.level !== 1) return null;
+        if (entry.level <= previousLevel) return null;
+        const recallTokens = inputs.recallPairTokens?.get(entry.id) ?? entry.tokens;
+        if (!Number.isFinite(recallTokens) || recallTokens < 0) return null;
+        chain.push(entry.id);
+        previousLevel = entry.level;
+        currentId = getSummaryParentId(entry);
+      }
+      const placed = oldMap.get(l1Id);
+      let result = chain;
+      if (placed) {
+        const first = previous.leafIndicesOf(placed)[0];
+        const before = oldLeaves[first].summaryIds;
+        let same = before.length === chain.length;
+        for (let k = 0; same && k < chain.length; k++) same = before[k] === chain[k];
+        if (same) result = before as SummaryId[];
+      }
+      chainByL1.set(l1Id, result);
+      return result;
+    };
+    const zone = leafZones(chunks, inputs);
+    const oldZone = previous.leafZone;
+    const sameLeaf = (a: PickerChunk, b: PickerChunk, i: number): boolean =>
+      a.rawTokens === b.rawTokens && a.currentResolution === b.currentResolution &&
+      a.lockedByAgent === b.lockedByAgent && a.pinned === b.pinned &&
+      a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
+      oldZone[i] === zone[i];
+    const n = chunks.length;
+    const chainOf: (readonly SummaryId[])[] = new Array(n);
+    const rebuilt = new Uint8Array(n);
+    const changedSummaryIds = new Set<SummaryId>();
+    /** L1s whose owned positions differ from the previous forest, with those positions. */
+    const positionsOfL1 = new Map<SummaryId, number[]>();
+    const noChain: readonly SummaryId[] = [];
+    for (let i = 0; i < n; i++) {
+      const chunk = chunks[i];
+      const chain = chunk.l1Id === undefined ? noChain : walk(chunk.l1Id);
+      if (chain === null) return null;
+      chainOf[i] = chain;
+      const before = i < old.length ? oldLeaves[i].summaryIds : null;
+      // `walk` returns the previous chain array when the ids match, so a
+      // different non-empty array is a different chain; empty chains are
+      // one per leaf in a full build and compare by length.
+      const ownedChanged = before === null ? chain.length > 0
+        : before !== chain && (before.length > 0 || chain.length > 0);
+      if (ownedChanged) {
+        if (before) for (const id of before) changedSummaryIds.add(id);
+        for (const id of chain) changedSummaryIds.add(id);
+        // A leaf newly owned by this L1 (it was ownerless or appended); a
+        // re-parented L1 keeps its previous leaves, added below.
+        if (chunk.l1Id !== undefined && (before === null || before.length === 0)) {
+          let positions = positionsOfL1.get(chunk.l1Id);
+          if (!positions) positionsOfL1.set(chunk.l1Id, positions = []);
+          positions.push(i);
+        }
+      }
+      if (ownedChanged || before === null || !sameLeaf(old[i], chunk, i)) rebuilt[i] = 1;
+    }
+    if (changedSummaryIds.size === 0) return null;
+    // An L1 that gained leaves keeps its previous ones too (disjoint sets).
+    for (const [l1Id, positions] of positionsOfL1) {
+      const placed = oldMap.get(l1Id);
+      if (placed) positions.push(...previous.leafIndicesOf(placed));
+    }
+    // Leaves and children of every changed summary, from the L1 blocks under it.
+    const leavesOf = new Map<SummaryId, number[]>();
+    const childrenOf = new Map<SummaryId, Set<SummaryId>>();
+    for (const [l1Id, chain] of chainByL1) {
+      let touches = false;
+      for (const id of chain) if (changedSummaryIds.has(id)) { touches = true; break; }
+      if (!touches) continue;
+      let block = positionsOfL1.get(l1Id);
+      if (!block) {
+        const placed = oldMap.get(l1Id);
+        if (!placed) return null;
+        block = Array.from(previous.leafIndicesOf(placed));
+      }
+      for (let k = 0; k < chain.length; k++) {
+        const id = chain[k];
+        if (!changedSummaryIds.has(id)) continue;
+        let positions = leavesOf.get(id);
+        if (!positions) leavesOf.set(id, positions = []);
+        for (const at of block) positions.push(at);
+        if (k > 0) {
+          let children = childrenOf.get(id);
+          if (!children) childrenOf.set(id, children = new Set());
+          children.add(chain[k - 1]);
+        }
+      }
+    }
+    for (const id of changedSummaryIds) {
+      // A summary on an old chain only (its leaves moved away) would need a
+      // removal; the full build decides.
+      if (!leavesOf.has(id)) return null;
+    }
+    const summaryMap = new Map(oldMap);
+    const firstPositionOf = (id: SummaryId): number => {
+      const positions = leavesOf.get(id);
+      if (positions) return positions[0];
+      return previous.leafIndicesOf(oldMap.get(id)!)[0];
+    };
+    for (const positions of leavesOf.values()) {
+      positions.sort((a, b) => a - b);
+      if (positions[positions.length - 1] - positions[0] + 1 !== positions.length) return null;
+    }
+    for (const [id, positions] of leavesOf) {
+      const entry = inputs.summaries.get(id)!;
+      const leafIds = positions.map((at) => chunks[at].id);
+      const children = childrenOf.get(id);
+      const summary: CanonicalSummary = {
+        kind: 'summary',
+        id,
+        level: entry.level,
+        recallTokens: inputs.recallPairTokens?.get(id) ?? entry.tokens,
+        parentId: getSummaryParentId(entry),
+        childSummaryIds: children
+          ? [...children].sort((a, b) => firstPositionOf(a) - firstPositionOf(b) || a.localeCompare(b))
+          : [],
+        // Chains start at the L1, so only an L1 has direct leaves, and they
+        // are all of its leaves.
+        directLeafIds: entry.level === 1 ? leafIds : [],
+        leafIds,
+        firstSequence: chunks[positions[0]].sequence,
+        lastSequence: chunks[positions[positions.length - 1]].sequence,
+      };
+      summaryMap.set(id, summary);
+      summaryLeafIndexCache.set(summary, Int32Array.from(positions));
+    }
+    const appendedIndex = new Map(previous.appendedIndex);
+    const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
+    const conflicts: ConstraintConflict[] = [];
+    const orderedLeaves: CanonicalLeaf[] = new Array(n);
+    const chainLevels = new Map<readonly SummaryId[], ChainLevels>();
+    const changedLeaves: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const chunk = chunks[i];
+      if (i >= old.length) appendedIndex.set(chunk.id, i);
+      if (rebuilt[i] === 0) {
+        orderedLeaves[i] = oldLeaves[i];
+        if (previousConflicts.size > 0) {
+          const conflict = previousConflicts.get(chunk.id);
+          if (conflict) conflicts.push(conflict);
+        }
+        continue;
+      }
+      if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
+      const result = CanonicalSummaryForest.buildLeaf(chunk, chainOf[i], inputs, options, summaryMap, i, chainLevels);
+      orderedLeaves[i] = result.leaf;
+      if (result.conflict) conflicts.push(result.conflict);
+      changedLeaves.push(i);
+    }
+    const roots: CanonicalRoot[] = [];
+    const seenSummaryRoots = new Set<SummaryId>();
+    for (let i = 0; i < n; i++) {
+      const chain = chainOf[i];
+      if (chain.length === 0) {
+        roots.push({ kind: 'leaf', id: chunks[i].id, firstSequence: chunks[i].sequence });
+      } else {
+        const id = chain[chain.length - 1];
+        if (!seenSummaryRoots.has(id)) {
+          roots.push({ kind: 'summary', id, firstSequence: summaryMap.get(id)!.firstSequence });
+          seenSummaryRoots.add(id);
+        }
+      }
+    }
+    roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
+    return new CanonicalSummaryForest(inputs, options, {
+      ownership: {},
+      chunks, baseIndex: previous.baseIndex, appendedIndex, summaryMap, orderedLeafList: orderedLeaves, roots,
+      constraintConflicts: conflicts,
+      treeifiedSummaryIds: [],
+      gapBearingSummaryIds: [],
+      leafZone: zone,
+      lineage: { parent: previous.ownership, changedLeaves: Int32Array.from(changedLeaves), changedSummaryIds },
+    });
+  }
+
   /** The per-leaf layer: available levels from the ownership chain, then the
    * leaf's constraints narrow them. Independent of every other leaf. */
   private static buildLeaf(
@@ -735,26 +966,57 @@ export class CanonicalSummaryForest {
       !Number.isFinite(inputs.tailTokens) || inputs.tailTokens < 0
     ) return null;
     const pi = previous.sourceInputs;
-    if (inputs.summaries.size !== pi.summaries.size) return null;
+    // Summaries are compared with the previous forest's own record of them:
+    // the strategy updates a child's parent link on the entry object itself
+    // when an upper summary arrives, so the old input map may already show
+    // the new link. A summary the previous forest did not place (no chain
+    // reached it) is compared with the old entry as before.
+    let ownershipChanged = false;
     for (const [id, entry] of inputs.summaries) {
+      const placed = previous.summaryMap.get(id);
+      const recall = inputs.recallPairTokens?.get(id) ?? entry.tokens;
+      if (placed) {
+        if (placed.level !== entry.level || placed.recallTokens !== recall) return null;
+        if (getSummaryParentId(entry) !== placed.parentId) ownershipChanged = true;
+        continue;
+      }
       const old = pi.summaries.get(id);
-      if (!old || old.level !== entry.level || getSummaryParentId(old) !== getSummaryParentId(entry)) return null;
-      if ((inputs.recallPairTokens?.get(id) ?? entry.tokens) !== (pi.recallPairTokens?.get(id) ?? old.tokens)) return null;
+      if (!old) { ownershipChanged = true; continue; }
+      if (old.level !== entry.level || getSummaryParentId(old) !== getSummaryParentId(entry)) return null;
+      if (recall !== (pi.recallPairTokens?.get(id) ?? old.tokens)) return null;
+    }
+    if (inputs.summaries.size < pi.summaries.size) {
+      for (const id of pi.summaries.keys()) if (!inputs.summaries.has(id)) return null;
     }
     const chunks = orderedChunks(inputs.chunks);
     const old = previous.sourceChunks;
     if (chunks.length < old.length) return null;
+    const oldLeaves = previous.orderedLeafList;
     for (let i = 0; i < old.length; i++) {
-      const a = old[i], b = chunks[i];
-      if (a.id !== b.id || a.sequence !== b.sequence || a.l1Id !== b.l1Id) return null;
+      // Position, id and ownership are read from the leaf the previous forest
+      // built, not from the old chunk object, which a caller may have updated
+      // in place since.
+      const leaf = oldLeaves[i], b = chunks[i];
+      if (leaf.id !== b.id || leaf.sequence !== b.sequence) return null;
+      const l1Id = leaf.summaryIds.length > 0 ? leaf.summaryIds[0] : undefined;
+      if (l1Id !== b.l1Id) {
+        // A leaf may become owned; any other change of ownership is a full build.
+        if (l1Id !== undefined) return null;
+        ownershipChanged = true;
+      }
     }
     let lastSequence = old.length > 0 ? old[old.length - 1].sequence : -Infinity;
+    const appendedIds = chunks.length > old.length ? new Set<ChunkId>() : null;
     for (let i = old.length; i < chunks.length; i++) {
       const chunk = chunks[i];
-      if (chunk.l1Id !== undefined || chunk.sequence <= lastSequence || previous.leaf(chunk.id) !== null) return null;
+      if (chunk.sequence <= lastSequence || previous.leaf(chunk.id) !== null) return null;
       if (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0) return null;
+      if (appendedIds!.has(chunk.id)) return null;
+      appendedIds!.add(chunk.id);
+      if (chunk.l1Id !== undefined) ownershipChanged = true;
       lastSequence = chunk.sequence;
     }
+    if (ownershipChanged) return CanonicalSummaryForest.extend(previous, inputs, options, chunks);
 
     const zone = leafZones(chunks, inputs);
     const oldZone = previous.leafZone;
@@ -771,7 +1033,6 @@ export class CanonicalSummaryForest {
     const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
     const conflicts: ConstraintConflict[] = [];
     const orderedLeaves: CanonicalLeaf[] = new Array(chunks.length);
-    const oldLeaves = previous.orderedLeafList;
     const roots = [...previous.roots];
     let ownedLeafChanged = false;
     for (let i = 0; i < chunks.length; i++) {
