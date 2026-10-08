@@ -98,8 +98,9 @@ export class SummaryTree {
         l1Id: c.l1Id,
       });
     }
+    const collected = new Map<SummaryId, LeafCollection>();
     for (const [, s] of this.summaries) {
-      this.nodes.set(s.id, this.buildNode(s));
+      this.nodes.set(s.id, this.buildNode(s, collected));
     }
   }
 
@@ -237,16 +238,8 @@ export class SummaryTree {
 
   // ---- internals ----
 
-  private buildNode(s: SummaryEntry): SummaryNode {
-    const leafChunkIds = this.collectLeafIds(s);
-    let firstSequence = Infinity;
-    let lastSequence = -Infinity;
-    for (const id of leafChunkIds) {
-      const seq = this.leaves.get(id)?.sequence;
-      if (seq === undefined) continue;
-      if (seq < firstSequence) firstSequence = seq;
-      if (seq > lastSequence) lastSequence = seq;
-    }
+  private buildNode(s: SummaryEntry, collected?: Map<SummaryId, LeafCollection>): SummaryNode {
+    const leaves = this.collectLeaves(s, collected);
     return {
       kind: 'summary',
       id: s.id,
@@ -254,9 +247,9 @@ export class SummaryTree {
       recallTokens: this.recallPairTokens.get(s.id) ?? s.tokens,
       childIds: [...s.sourceIds],
       childrenAreLeaves: s.sourceLevel === 0,
-      leafChunkIds,
-      firstSequence: firstSequence === Infinity ? -1 : firstSequence,
-      lastSequence: lastSequence === -Infinity ? -1 : lastSequence,
+      leafChunkIds: leaves.sorted,
+      firstSequence: leaves.first === Infinity ? -1 : leaves.first,
+      lastSequence: leaves.last === -Infinity ? -1 : leaves.last,
       sourceRange: s.sourceRange,
       parentId: getSummaryParentId(s),
     };
@@ -276,7 +269,21 @@ export class SummaryTree {
    *  coverage is its LIVE sources — `children()` already applies the same
    *  filter. */
   private collectLeafIds(summary: SummaryEntry): ChunkId[] {
-    const out: ChunkId[] = [];
+    return this.collectLeaves(summary).sorted;
+  }
+
+  /** The walk above, with a per-build memo (`collected`): a child summary
+   *  walked earlier is replayed from its record (its live leaves in first-
+   *  visit order, minus those already seen; its first/last sequence) when
+   *  none of the summaries under it has been visited by this walk, which is
+   *  exactly when the walk would have produced the same visit. Otherwise the
+   *  child is walked as before. */
+  private collectLeaves(summary: SummaryEntry, collected?: Map<SummaryId, LeafCollection>): LeafCollection {
+    const kept = collected?.get(summary.id);
+    if (kept) return kept;
+    const visited: ChunkId[] = [];
+    let first = Infinity;
+    let last = -Infinity;
     const seenLeaves = new Set<ChunkId>();
     const seenSummaries = new Set<SummaryId>();
     const visit = (s: SummaryEntry): void => {
@@ -284,23 +291,62 @@ export class SummaryTree {
       seenSummaries.add(s.id);
       if (s.sourceLevel === 0) {
         for (const mid of s.sourceIds) {
-          if (!this.leaves.has(mid)) continue; // ghost of a surgically removed chunk
+          const leaf = this.leaves.get(mid);
+          if (!leaf) continue; // ghost of a surgically removed chunk
           if (!seenLeaves.has(mid)) {
             seenLeaves.add(mid);
-            out.push(mid);
+            visited.push(mid);
+            if (leaf.sequence < first) first = leaf.sequence;
+            if (leaf.sequence > last) last = leaf.sequence;
           }
         }
       } else {
         for (const sid of s.sourceIds) {
           const child = this.summaries.get(sid);
-          if (child) visit(child);
+          if (!child) continue;
+          const known = collected?.get(child.id);
+          if (known && known.summaries.every((id) => !seenSummaries.has(id))) {
+            for (const id of known.summaries) seenSummaries.add(id);
+            for (const mid of known.visited) {
+              if (seenLeaves.has(mid)) continue;
+              seenLeaves.add(mid);
+              visited.push(mid);
+            }
+            // A leaf skipped here was counted when it was first seen.
+            if (known.first < first) first = known.first;
+            if (known.last > last) last = known.last;
+            continue;
+          }
+          visit(child);
         }
       }
     };
     visit(summary);
-    out.sort((a, b) => (this.leaves.get(a)?.sequence ?? 0) - (this.leaves.get(b)?.sequence ?? 0));
-    return out;
+    // Sources usually arrive in sequence order already; a stable sort of an
+    // ordered list returns it unchanged, so it is only run when needed.
+    let ordered = true;
+    for (let i = 1, previous = this.leaves.get(visited[0])?.sequence ?? 0; ordered && i < visited.length; i++) {
+      const sequence = this.leaves.get(visited[i])?.sequence ?? 0;
+      ordered = previous <= sequence;
+      previous = sequence;
+    }
+    const sorted = ordered ? visited : visited.slice().sort(
+      (a, b) => (this.leaves.get(a)?.sequence ?? 0) - (this.leaves.get(b)?.sequence ?? 0),
+    );
+    const result: LeafCollection = { visited, sorted, first, last, summaries: [...seenSummaries] };
+    collected?.set(summary.id, result);
+    return result;
   }
+}
+
+/** One summary's leaf walk: live leaves in first-visit order and sorted by
+ *  sequence, the sequence span, and the summaries the walk visited. */
+interface LeafCollection {
+  visited: ChunkId[];
+  sorted: ChunkId[];
+  first: number;
+  last: number;
+  summaries: SummaryId[];
 }
 
 function sequenceOf(n: TreeNode): number {
