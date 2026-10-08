@@ -70,7 +70,21 @@ full offline suite passed **956 tests, 0 failures, cancellations or skips**;
 only the real Anthropic provider test was excluded. These are correctness and
 resource-guard checks, not new latency, allocation, RSS or GC measurements.
 The earlier timing cohorts below predate these storage guards and do not
-establish performance for this revision. No epsilon or summary-policy change.
+establish performance for this revision.
+
+**One policy change, always on.** Latent demand scores every what-if solve in
+one shared floor frame (fixing the sign error of the per-solve frames) and
+emits a merge only when the best-vs-best improvement exceeds `adoptEpsilon`;
+`main` emits any merge with improvement above 0. The emitted context is
+unchanged, but the set of requested merges is not: a request that `main`
+scored negative and this head scores positive is new, and one with an
+improvement in `(0, adoptEpsilon]` is dropped. With `speculativeProduction:
+false` the difference reaches the store (different summaries and ids). A
+differential harness run by a reviewer (about 2,500 compiles, histories of
+50 to 5,021 messages, certificate on and off, epsilon 0 and 50) found no
+divergence in emitted messages, layouts, receipts, state or selection under
+the default configuration, and divergences in produced requests only. The
+maintainer decides whether this lands as is or behind a flag.
 
 ## Earlier certificate-only timing
 
@@ -148,6 +162,7 @@ to establish sufficient state for more complex exact pruning and test it
 against cache-prefix/emission counterexamples. Then implement one isolated
 change, verify survivors, traces, ties and error envelopes against an
 independent oracle and current solver, and run bounded performance tests.
-This is a plan, not work already completed. Epsilon, summary policy and demand
-scenario selection are unchanged; joint demand, skipping scenarios and
-emergency fallback require separate behavioral evaluation.
+This is a plan, not work already completed. Demand scenario selection is
+unchanged apart from the shared frame and the epsilon gate above; joint
+demand, skipping scenarios and emergency fallback require separate behavioral
+evaluation.
