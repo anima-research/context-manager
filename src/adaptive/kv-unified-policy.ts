@@ -119,6 +119,10 @@ export type ExactPolicySolveResult =
       readonly continuityFloor: number;
       readonly cacheRelevant: boolean;
       readonly enumeration: ExactCutEnumerationStats;
+      /** Best score this pool reaches when both penalties are measured from
+       * the given floors instead of the pool's own. Scores from different
+       * solves are comparable only through a shared frame like this. */
+      readonly bestScoreUnder?: (cacheFloor: number, continuityFloor: number) => number;
     };
 
 export interface UnscoredCandidate {
@@ -257,7 +261,7 @@ export class ExactKvUnifiedPolicySolver {
       );
       if (carried && carried.score <= selected.score + epsilon) selected = carried;
     }
-    return {
+    return withBestScoreUnder({
       feasible: true,
       selected,
       candidates,
@@ -265,7 +269,13 @@ export class ExactKvUnifiedPolicySolver {
       continuityFloor,
       cacheRelevant,
       enumeration: stats,
-    };
+    }, (kf, cf) => {
+      let best = Infinity;
+      for (const c of unscored) {
+        best = Math.min(best, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, continuityMultiplier));
+      }
+      return best;
+    });
   }
 
   private fidelityLoss(
@@ -490,6 +500,18 @@ export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyC
   leafIds: readonly ChunkId[]): number {
   return a.score - b.score || a.renderedTokens - b.renderedTokens ||
     frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds));
+}
+
+/** Attach the shared-frame scorer as a non-enumerable property: results are
+ * compared structurally in tests and serialized by diagnostics, and a
+ * per-result closure must not take part in either. Object spread drops it;
+ * callers fall back to scoring the public candidate list. */
+export function withBestScoreUnder<T extends object>(
+  result: T,
+  bestScoreUnder: (cacheFloor: number, continuityFloor: number) => number,
+): T & { readonly bestScoreUnder: typeof bestScoreUnder } {
+  Object.defineProperty(result, 'bestScoreUnder', { value: bestScoreUnder, enumerable: false, writable: false, configurable: true });
+  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder };
 }
 
 export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,

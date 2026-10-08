@@ -127,6 +127,8 @@ export class ParetoKvUnifiedPolicySolver {
   private summaryMetricCache = new WeakMap<readonly ChunkId[], { continuity: number; fidelity: number }>();
   private readonly newestSequence: number;
   private bufferGapEmissions = false;
+  /** Wall time of the last certificate attempt, succeeded or not. */
+  lastCertificateMs = 0;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
@@ -147,7 +149,9 @@ export class ParetoKvUnifiedPolicySolver {
     const internalHoles = this.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
+      const started = performance.now();
       const certified = certifyCarriedLayout(this.inputs, this.forest, options);
+      this.lastCertificateMs = performance.now() - started;
       if (certified) return certified;
     }
     if (options.engine !== 'leaf') {

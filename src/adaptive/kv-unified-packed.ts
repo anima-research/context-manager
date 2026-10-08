@@ -2,8 +2,7 @@ import type { PickerInputs } from './picker.js';
 import { CanonicalSummaryForest, SparseLabelCeilingError, type MinimumTokenResult } from './kv-unified.js';
 import { tailUnits } from './render-offsets.js';
 import {
-  ExactKvUnifiedPolicySolver, continuityLeafLoss, fidelityLeafLoss, frontierSignature, normalizePolicy,
-} from './kv-unified-policy.js';
+  ExactKvUnifiedPolicySolver, continuityLeafLoss, fidelityLeafLoss, frontierSignature, normalizePolicy, withBestScoreUnder } from './kv-unified-policy.js';
 import { TerminalPolicyEvaluator, type FrontierTraceReference } from './kv-unified-terminal.js';
 import { scoreBoundedCandidates } from './kv-unified-selective.js';
 import { PackedBuckets, PackedLabels, LABEL_STRIDE, LabelField } from './kv-unified-packed-storage.js';
@@ -415,11 +414,12 @@ export class PackedDagSolver {
     };
     // Do not spread result: its candidate-list getter deliberately performs
     // the remaining exact work only when an observer requests that list.
-    return {
+    const out: Extract<ParetoPolicySolveResult, { feasible: true }> = {
       feasible: true, selected: result.selected, cacheFloor: result.cacheFloor,
       continuityFloor: result.continuityFloor, cacheRelevant: result.cacheRelevant,
       enumeration: result.enumeration, propagation,
       get candidates() { return result.candidates; },
     };
+    return result.bestScoreUnder ? withBestScoreUnder(out, result.bestScoreUnder) : out;
   }
 }
