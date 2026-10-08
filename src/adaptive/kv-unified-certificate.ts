@@ -421,7 +421,11 @@ export function certifyCarriedLayout(
   const fixedLevel = new Int32Array(n);
   let fixedCount = 0;
   const cached = options.reuse?.certificate;
-  const known = cached && cached.ownership === forest.ownership ? cached.fixed : undefined;
+  // The per-position check below is by leaf and receipt object identity, so
+  // a graph built for this ownership or for the lineage parent (positions
+  // stable, rebuilt leaves are new objects) answers for unchanged leaves.
+  const known = cached && (cached.ownership === forest.ownership || cached.ownership === forest.lineage?.parent)
+    ? cached.fixed : undefined;
   const checkedLeaves: CanonicalLeaf[] = new Array(n);
   // One receipt lookup per leaf position, shared with this compile's
   // evaluator.
