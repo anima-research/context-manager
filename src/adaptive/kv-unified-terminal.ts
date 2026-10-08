@@ -35,6 +35,9 @@ export interface FrontierLevels {
 interface EvaluatorStructure {
   readonly stride: number;
   readonly summaryCount: number;
+  /** Summary ids in code order (`allSummaries()` at build), so a structure
+   *  taken from a lineage parent can translate its summary codes. */
+  readonly summaryIds: readonly string[];
   chunkCount: number;
   leaves: (CanonicalLeaf | undefined)[];
   previous: (PresentedLeaf | undefined)[];
@@ -191,21 +194,48 @@ export class TerminalPolicyEvaluator {
     // own copy, so an older evaluator's layout stays readable.
     const n = this.chunks.length;
     let structure = fromForest ? structures.get(forest.ownership) : undefined;
-    if (structure && (structure.stride !== this.stride || structure.summaryCount !== summaries.length)) structure = undefined;
+    // A forest extended from a previous ownership (summaries added or
+    // re-parented) reads the parent's structure: leaf slots are by position,
+    // and the leaves the extension rebuilt are new objects that the loop
+    // below recomputes. Summary codes follow the sorted summary list, which
+    // the extension may have grown or reordered, so every code is translated
+    // once through a table keyed by the parent's code order.
+    let remap: Uint32Array | null = null;
+    if (!structure && fromForest && forest.lineage) {
+      const parent = structures.get(forest.lineage.parent);
+      if (parent && parent.stride === this.stride) {
+        const table = new Uint32Array(parent.chunkCount + parent.summaryCount + 3);
+        let complete = true;
+        for (let code = 1; code <= parent.chunkCount; code++) table[code] = code;
+        for (let k = 0; complete && k < parent.summaryCount; k++) {
+          const code = summaryCode.get(parent.summaryIds[k]);
+          if (code === undefined) complete = false;
+          else table[parent.chunkCount + k + 1] = code;
+        }
+        table[parent.chunkCount + parent.summaryCount + 1] = this.headCode;
+        table[parent.chunkCount + parent.summaryCount + 2] = this.tailCode;
+        if (complete) { structure = parent; remap = table; }
+      }
+    }
+    if (structure && remap === null && (structure.stride !== this.stride || structure.summaryCount !== summaries.length)) structure = undefined;
     const leafCount = structure?.leaves.length ?? 0;
     const shift = structure ? n - structure.chunkCount : 0;
     if (structure && leafCount >= n) {
       this.matches = structure.matches.slice(0, n * this.stride);
       this.representations = structure.representations.slice(0, n * this.stride);
-      if (shift !== 0) {
-        const codes = this.representations;
+      const codes = this.representations;
+      if (remap) {
+        for (let at = 0; at < codes.length; at++) codes[at] = remap[codes[at]];
+      } else if (shift !== 0) {
         for (let at = 0; at < codes.length; at++) if (codes[at] > leafCount) codes[at] += shift;
       }
     } else if (structure) {
       this.matches.set(structure.matches);
       this.representations.set(structure.representations);
-      if (shift !== 0) {
-        const codes = this.representations;
+      const codes = this.representations;
+      if (remap) {
+        for (let at = 0, end = leafCount * this.stride; at < end; at++) codes[at] = remap[codes[at]];
+      } else if (shift !== 0) {
         for (let at = 0, end = leafCount * this.stride; at < end; at++) if (codes[at] > leafCount) codes[at] += shift;
       }
     }
@@ -216,7 +246,9 @@ export class TerminalPolicyEvaluator {
     const layout = options.cache?.layout;
     const keptUnits = structure?.previousUnits;
     if (layout && keptUnits && keptUnits.layout === layout) {
-      this.previousUnits = shift === 0 ? keptUnits.units : keptUnits.units.map((code) => code > leafCount ? code + shift : code);
+      const table = remap;
+      this.previousUnits = table ? keptUnits.units.map((code) => table[code])
+        : shift === 0 ? keptUnits.units : keptUnits.units.map((code) => code > leafCount ? code + shift : code);
     } else {
       this.previousUnits = Uint32Array.from(layout?.units ?? [], (unit) => {
         if (unit.kind === 'head') return this.headCode;
@@ -277,7 +309,7 @@ export class TerminalPolicyEvaluator {
     }
     if (fromForest) {
       structures.set(forest.ownership, {
-        stride: this.stride, summaryCount: summaries.length, chunkCount: n,
+        stride: this.stride, summaryCount: summaries.length, summaryIds: summaries.map((summary) => summary.id), chunkCount: n,
         leaves: nextLeaves, previous: nextPrevious,
         matches: this.matches, representations: this.representations, distance,
         previousUnits: layout ? { layout, units: this.previousUnits } : undefined,
