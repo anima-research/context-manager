@@ -2,7 +2,7 @@ import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import { CanonicalSummaryForest } from './kv-unified.js';
 import {
-  budgetPenalty, continuityLeafLoss, fidelityLeafLoss, normalizePolicy,
+  budgetPenalty, continuityLeafBase, fidelityLeafBase, normalizePolicy,
   type ExactPolicySolveOptions, type UnscoredCandidate,
 } from './kv-unified-policy.js';
 import { tailUnits, type RenderLayout, type RenderedUnit } from './render-offsets.js';
@@ -19,6 +19,11 @@ export interface FrontierTraceSource {
 }
 
 export type FrontierTraceReference = FrontierTrace | FrontierTraceSource | null;
+
+/** A complete cut given as the level per leaf in `orderedLeafIds` order. */
+export interface FrontierLevels {
+  readonly levels: ArrayLike<number>;
+}
 
 interface CompiledAction {
   readonly fidelity: number;
@@ -40,9 +45,10 @@ export function visitFrontierTrace(trace: FrontierTraceReference,
  * This removes billions of repeated powers/hash lookups and keeps only one
  * compact scratch vector instead of thousands of 70k-entry Maps. */
 export class TerminalPolicyEvaluator {
-  private readonly chunks: PickerInputs['chunks'];
+  private readonly chunks: readonly PickerInputs['chunks'][number][];
   private readonly ids: readonly string[];
-  private readonly index: Map<string, number>;
+  /** Position of a leaf id in `chunks`, undefined for an unknown id. */
+  private readonly leafIndex: (id: string) => number | undefined;
   private readonly ranges = new WeakMap<readonly string[], Uint32Array>();
   private readonly actions = new WeakMap<readonly string[], {
     readonly level: number;
@@ -78,16 +84,26 @@ export class TerminalPolicyEvaluator {
     private readonly options: ExactPolicySolveOptions) {
     this.policy = normalizePolicy(options.policy);
     this.maxTokens = options.maxTokens;
-    this.chunks = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
+    // A forest built from these inputs holds their chunks in this same order
+    // (sequence, then id), parallel to its leaves and their `index`.
+    const fromForest = forest.builtFrom(inputs);
+    const leaves = forest.orderedLeaves();
+    this.chunks = fromForest ? forest.orderedChunks()
+      : [...inputs.chunks].sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
     this.ids = this.chunks.map((chunk) => chunk.id);
-    this.index = new Map(this.chunks.map((chunk, index) => [chunk.id, index]));
-    this.stride = 1 + forest.allSummaries().reduce((max, summary) => Math.max(max, summary.level), 0);
+    if (fromForest) {
+      this.leafIndex = (id) => forest.leaf(id)?.index;
+    } else {
+      const index = new Map(this.chunks.map((chunk, i) => [chunk.id, i]));
+      this.leafIndex = (id) => index.get(id);
+    }
+    const summaries = forest.allSummaries();
+    this.stride = 1 + summaries.reduce((max, summary) => Math.max(max, summary.level), 0);
     this.levels = this.stride <= 256 ? new Uint8Array(this.chunks.length) : new Uint32Array(this.chunks.length);
     this.fidelity = new Float64Array(this.chunks.length * this.stride);
     this.continuity = new Float64Array(this.fidelity.length);
     this.matches = new Uint8Array(this.fidelity.length);
     this.representations = new Uint32Array(this.fidelity.length);
-    const summaries = forest.allSummaries();
     const summaryCode = new Map(summaries.map((summary, i) => [summary.id, this.chunks.length + i + 1]));
     this.headCode = this.chunks.length + summaries.length + 1;
     this.tailCode = this.headCode + 1;
@@ -112,37 +128,46 @@ export class TerminalPolicyEvaluator {
     // Per-message tail (see render-offsets `tailUnits`): tail chunks emit as
     // their own raw codes, in wire order, after the middle; only unattributed
     // tail tokens remain on the opaque tail code.
-    this.tailCodes = tailUnits(inputs).flatMap((unit) => unit.chunkId ? [this.index.get(unit.chunkId)! + 1] : []);
-    this.unitTokens[this.tailCode] = tailUnits(inputs).find((unit) => unit.kind === 'tail')?.tokens ?? 0;
+    const tail = tailUnits(inputs);
+    this.tailCodes = tail.flatMap((unit) => unit.chunkId ? [this.leafIndex(unit.chunkId)! + 1] : []);
+    this.unitTokens[this.tailCode] = tail.find((unit) => unit.kind === 'tail')?.tokens ?? 0;
     this.unitKeys[this.headCode] = this.unitKinds[this.headCode] = 'head';
     this.unitKeys[this.tailCode] = this.unitKinds[this.tailCode] = 'tail';
-    this.previousUnits = Uint32Array.from(options.cache?.layout.units ?? [], (unit) =>
-      unit.kind === 'head' ? this.headCode : unit.kind === 'tail' ? this.tailCode :
-        unit.kind === 'raw' ? (this.index.has(unit.key) ? this.index.get(unit.key)! + 1 : 0) :
-          summaryCode.get(unit.key) ?? 0);
+    this.previousUnits = Uint32Array.from(options.cache?.layout.units ?? [], (unit) => {
+      if (unit.kind === 'head') return this.headCode;
+      if (unit.kind === 'tail') return this.tailCode;
+      if (unit.kind !== 'raw') return summaryCode.get(unit.key) ?? 0;
+      const at = this.leafIndex(unit.key);
+      return at === undefined ? 0 : at + 1;
+    });
     this.markerUnits = new Set(options.cache?.markers.map((marker) => marker.unitIndex));
     this.cacheRelevant = options.cache !== undefined && options.currentImmutablePrefixHash !== undefined &&
       options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
     const newest = this.chunks.at(-1)?.sequence ?? 0;
+    const currentSeq = presentation?.currentSeq ?? 0;
     let age = 0;
     for (let i = this.chunks.length - 1; i >= 0; i--) {
       const chunk = this.chunks[i];
       const midpoint = age + chunk.rawTokens / 2;
       age += chunk.rawTokens;
-      const leaf = forest.leaf(chunk.id)!;
-      const previous = options.presentation?.leaves.get(chunk.id);
+      const leaf = fromForest ? leaves[i] : forest.leaf(chunk.id)!;
+      const previous = presentation?.leaves.get(chunk.id);
       this.unitTokens[i + 1] = chunk.rawTokens;
       this.unitKeys[i + 1] = chunk.id;
       this.unitKinds[i + 1] = 'raw';
       this.unitExtension[i + 1] = presentation && !previous ? 1 : 0;
+      // The level-independent factors once per leaf; the per-level loss is
+      // the same product as the policy functions, in the same order.
+      const fidelityBase = leaf.externallyAccounted ? 0 : fidelityLeafBase(chunk, newest, this.policy);
+      const continuityBase = previous ? continuityLeafBase(chunk, previous, currentSeq, midpoint, this.policy) : 0;
       for (const level of leaf.allowedLevels) {
         const at = i * this.stride + level;
         const slot = leaf.availableLevels.indexOf(level);
         const summary = slot > 0 ? leaf.summaryIds[slot - 1] : undefined;
         const hash = leaf.repHashes[slot];
-        this.fidelity[at] = leaf.externallyAccounted ? 0 : fidelityLeafLoss(chunk, level, newest, this.policy);
-        this.continuity[at] = continuityLeafLoss(chunk, level, hash, previous,
-          options.presentation?.currentSeq ?? 0, midpoint, this.policy);
+        this.fidelity[at] = leaf.externallyAccounted ? 0 : fidelityBase * level;
+        this.continuity[at] = !previous || (hash === previous.repHash && level === previous.level) ? 0
+          : continuityBase * Math.max(1, Math.abs(level - previous.level));
         this.matches[at] = !previous || (previous.level === level && previous.repHash === hash) ? 1 : 0;
         this.representations[at] = leaf.externallyAccounted ? 0 :
           (chunk.pinned || level === 0 ? i + 1 : summaryCode.get(summary!)!);
@@ -163,7 +188,7 @@ export class TerminalPolicyEvaluator {
     let fidelity = 0, continuity = 0, matches = true;
     const units = new Map<number, number>();
     for (const id of ids) {
-      const index = this.index.get(id)!;
+      const index = this.leafIndex(id)!;
       const at = index * this.stride + level;
       fidelity += this.fidelity[at]; continuity += this.continuity[at];
       matches &&= this.matches[at] === 1;
@@ -245,14 +270,18 @@ export class TerminalPolicyEvaluator {
     };
   }
 
-  private fill(trace: FrontierTraceReference): void {
+  private fill(trace: FrontierTraceReference | FrontierLevels): void {
+    if (trace && 'levels' in trace) {
+      this.levels.set(trace.levels);
+      return;
+    }
     this.levels.fill(0);
     // Valid cut traces assign each leaf exactly once, so traversal direction
     // is immaterial. Reuse numeric indices for shared summary/raw-run actions.
     visitFrontierTrace(trace, (ids, level) => {
       let ranges = this.ranges.get(ids);
       if (!ranges) {
-        const indices = ids.map((id) => this.index.get(id)!).sort((a, b) => a - b);
+        const indices = ids.map((id) => this.leafIndex(id)!).sort((a, b) => a - b);
         const spans: number[] = [];
         for (const index of indices) {
           if (spans.length > 0 && spans[spans.length - 1] === index) spans[spans.length - 1]++;
@@ -265,7 +294,7 @@ export class TerminalPolicyEvaluator {
     });
   }
 
-  candidate(trace: FrontierTraceReference, renderedTokens: number): UnscoredCandidate {
+  candidate(trace: FrontierTraceReference | FrontierLevels, renderedTokens: number): UnscoredCandidate {
     this.evaluations++;
     this.fill(trace);
     let fidelityLoss = 0;

@@ -711,6 +711,11 @@ export class CanonicalSummaryForest {
     return this.orderedLeafList;
   }
 
+  /** Whether `orderedChunks()` is the sorted form of exactly these inputs' chunks. */
+  builtFrom(inputs: PickerInputs): boolean {
+    return this.sourceInputs === inputs;
+  }
+
   /** The picker chunks in leaf order (parallel to `orderedLeaves()`). */
   orderedChunks(): readonly PickerChunk[] {
     return this.sourceChunks;
@@ -745,10 +750,11 @@ export class CanonicalSummaryForest {
   }
 
   allSummaries(): readonly CanonicalSummary[] {
-    return [...this.summaryMap.values()].sort(
+    return this.allSummariesMemo ??= [...this.summaryMap.values()].sort(
       (a, b) => a.firstSequence - b.firstSequence || a.level - b.level || a.id.localeCompare(b.id),
     );
   }
+  private allSummariesMemo: readonly CanonicalSummary[] | undefined;
 
   /**
    * Linear structural decision graph. A summary has a select action and
@@ -967,6 +973,31 @@ export class CanonicalSummaryForest {
         terminalCandidates: candidates.length,
       },
     };
+  }
+
+  /** `tokensForFrontier` for a frontier given as the level per leaf in
+   * `orderedLeaves()` order (missing entries are raw). Same sums, same order. */
+  tokensForLevels(levels: ArrayLike<number>): number {
+    let tokens = this.fixedTokens;
+    const summaries = new Set<SummaryId>();
+    const leaves = this.orderedLeafList;
+    for (let i = 0; i < leaves.length; i++) {
+      const leaf = leaves[i];
+      const level = levels[i] ?? 0;
+      if (!leaf.allowedLevels.includes(level)) {
+        throw new Error(`frontier selects disallowed L${level} for ${leaf.id}`);
+      }
+      if (level === 0) {
+        if (!leaf.externallyAccounted) tokens += leaf.rawTokens;
+        continue;
+      }
+      const slot = leaf.availableLevels.indexOf(level);
+      const summaryId = slot > 0 ? leaf.summaryIds[slot - 1] : undefined;
+      if (!summaryId) throw new Error(`frontier selects unavailable L${level} for ${leaf.id}`);
+      summaries.add(summaryId);
+    }
+    for (const summaryId of summaries) tokens += this.summaryMap.get(summaryId)!.recallTokens;
+    return tokens;
   }
 
   tokensForFrontier(frontier: ReadonlyMap<ChunkId, number>): number {

@@ -144,12 +144,13 @@ export class ExactKvUnifiedPolicySolver {
   readonly forest: CanonicalSummaryForest;
 
   private tree: SummaryTree | null = null;
-  private readonly orderedChunks: PickerInputs['chunks'];
+  private readonly orderedChunks: readonly PickerInputs['chunks'][number][];
   private readonly summaryLeaves = new Map<SummaryId, readonly ChunkId[]>();
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
-    this.orderedChunks = [...inputs.chunks].sort(
+    // A forest built from these inputs already holds this sort of them.
+    this.orderedChunks = this.forest.builtFrom(inputs) ? this.forest.orderedChunks() : [...inputs.chunks].sort(
       (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
     );
     for (const summary of this.forest.allSummaries()) {
@@ -251,8 +252,10 @@ export class ExactKvUnifiedPolicySolver {
       matching.set(result, candidate.matchesPresentation);
       return result;
     });
-    const leafIds = this.orderedChunks.map((chunk) => chunk.id);
-    candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
+    if (candidates.length > 1) {
+      const leafIds = this.orderedChunks.map((chunk) => chunk.id);
+      candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
+    }
     let selected = candidates[0];
     const epsilon =
       Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
@@ -429,15 +432,48 @@ export function normalizePolicy(
   return policy;
 }
 
+/** The level-independent factor of `fidelityLeafLoss`: the loss at level L is
+ * exactly `fidelityLeafBase(...) * L` (same operations, same order). */
+export function fidelityLeafBase(
+  chunk: PickerInputs['chunks'][number],
+  newestSequence: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
+  return salience * age ** (-policy.alpha) * chunk.rawTokens;
+}
+
 export function fidelityLeafLoss(
   chunk: PickerInputs['chunks'][number],
   level: number,
   newestSequence: number,
   policy: KvUnifiedWelfarePolicy,
 ): number {
-  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  return fidelityLeafBase(chunk, newestSequence, policy) * level;
+}
+
+/** The level-independent factor of `continuityLeafLoss` for a leaf with an
+ * accepted presentation: the loss at a level that moves the leaf is exactly
+ * `continuityLeafBase(...) * max(1, |level - previous.level|)`. */
+export function continuityLeafBase(
+  chunk: PickerInputs['chunks'][number],
+  previous: PresentedLeaf,
+  currentSeq: number,
+  midpointAgeTokens: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  const recency =
+    policy.continuityRecencyFloor +
+    (1 - policy.continuityRecencyFloor) *
+      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
+  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
+  const stability =
+    policy.continuityStableFloor +
+    (1 - policy.continuityStableFloor) *
+      2 ** (-tau / positive(policy.continuityStableHalfLife));
   const salience = clamp(chunk.salience ?? 1, 0.2, 1);
-  return salience * age ** (-policy.alpha) * chunk.rawTokens * level;
+  return salience * chunk.rawTokens * recency * stability;
 }
 
 export function continuityLeafLoss(
@@ -450,18 +486,8 @@ export function continuityLeafLoss(
   policy: KvUnifiedWelfarePolicy,
 ): number {
   if (!previous || (repHash === previous.repHash && level === previous.level)) return 0;
-  const recency =
-    policy.continuityRecencyFloor +
-    (1 - policy.continuityRecencyFloor) *
-      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
-  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
-  const stability =
-    policy.continuityStableFloor +
-    (1 - policy.continuityStableFloor) *
-      2 ** (-tau / positive(policy.continuityStableHalfLife));
-  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
   const representationDistance = Math.max(1, Math.abs(level - previous.level));
-  return salience * chunk.rawTokens * recency * stability * representationDistance;
+  return continuityLeafBase(chunk, previous, currentSeq, midpointAgeTokens, policy) * representationDistance;
 }
 
 export function budgetPenalty(

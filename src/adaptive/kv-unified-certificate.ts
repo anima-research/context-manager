@@ -297,16 +297,19 @@ export function certifyCarriedLayout(
   }
   const rootsMatch = roots.every((root) => matches[root] === 1);
 
+  // A cut as the level per leaf, in `leaves` order (`CanonicalLeaf.index`).
   type Assignment = Array<[ChunkId, number]>;
-  let extensions: Assignment[];
+  let extensions: Uint32Array[];
   if (fixedCount === n) {
     // Exactly one matching frontier, or none.
     if (!rootsMatch) return null;
-    extensions = [leaves.map((leaf, i) => [leaf.id, fixedLevel[i]] as [ChunkId, number])];
+    extensions = [Uint32Array.from(fixedLevel)];
   } else if (freeAreRootLeaves && rootsMatch) {
     // Every free leaf is an ownerless root that allows raw: each has exactly
     // one cut, so the accepted layout has exactly one extension.
-    extensions = [leaves.map((leaf, i) => [leaf.id, Math.max(0, fixedLevel[i])] as [ChunkId, number])];
+    const levels = new Uint32Array(n);
+    for (let i = 0; i < n; i++) levels[i] = fixedLevel[i] > 0 ? fixedLevel[i] : 0;
+    extensions = [levels];
   } else {
     // Enumerate every cut that keeps each old leaf at its accepted level. A
     // node may be selected only when all of its old leaves are accepted at
@@ -370,13 +373,15 @@ export function certifyCarriedLayout(
     };
     const combined = combineChildren(roots);
     if (combined === null) return null;
-    extensions = combined;
+    extensions = combined.map((assignment) => {
+      const levels = new Uint32Array(n);
+      for (const [id, level] of assignment) levels[forest.leaf(id)!.index] = level;
+      return levels;
+    });
   }
-  const candidates = extensions.map((assignment) => {
-    const frontier = new Map<ChunkId, number>(assignment);
-    for (const leaf of leaves) if (!frontier.has(leaf.id)) frontier.set(leaf.id, 0);
-    return { frontier, renderedTokens: forest.tokensForFrontier(frontier) };
-  }).filter((candidate) => candidate.renderedTokens <= options.maxTokens);
+  const candidates = extensions
+    .map((levels) => ({ levels, renderedTokens: forest.tokensForLevels(levels) }))
+    .filter((candidate) => candidate.renderedTokens <= options.maxTokens);
   if (candidates.length === 0) return null;
   const witness = candidates.reduce((best, candidate) => candidate.renderedTokens < best.renderedTokens ? candidate : best);
 
@@ -387,17 +392,8 @@ export function certifyCarriedLayout(
   // ${witness.renderedTokens} tokens), so no minimum-token floor is needed.
   void witness;
   const evaluator = new TerminalPolicyEvaluator(inputs, forest, options);
-  const unscored = candidates.map((candidate) => {
-    const byLevel = new Map<number, ChunkId[]>();
-    for (const [id, level] of candidate.frontier) {
-      let ids = byLevel.get(level);
-      if (!ids) byLevel.set(level, ids = []);
-      ids.push(id);
-    }
-    return evaluator.candidate({
-      forEachAssignment(visit) { for (const [level, ids] of byLevel) visit(ids, level); },
-    }, candidate.renderedTokens);
-  });
+  const unscored = candidates.map((candidate) =>
+    evaluator.candidate({ levels: candidate.levels }, candidate.renderedTokens));
   const scored = new ExactKvUnifiedPolicySolver(inputs, forest).scorePreparedCandidates(
     unscored, options,
     { statesVisited: 0, candidatesGenerated: candidates.length, maxCandidatesAtState: candidates.length, terminalCandidates: candidates.length },
