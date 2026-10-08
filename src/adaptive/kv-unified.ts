@@ -226,6 +226,7 @@ const IMPOSSIBLE = Number.POSITIVE_INFINITY;
 
 /** Parts of a forest derived from a previous one (see `derive`). */
 export interface PrebuiltForestParts {
+  readonly ownership: object;
   readonly chunks: readonly PickerChunk[];
   readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
   readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
@@ -244,6 +245,9 @@ export class CanonicalSummaryForest {
   readonly gapBearingSummaryIds: readonly SummaryId[];
   /** True when this forest was derived from a previous compile's forest. */
   readonly derived: boolean;
+  /** Identity of the ownership structure: shared by every forest derived
+   * from the same full build, new on each full build. */
+  readonly ownership: object;
   private internalHolesMemo: boolean | undefined;
 
   private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
@@ -260,6 +264,7 @@ export class CanonicalSummaryForest {
     this.sourceInputs = inputs;
     this.sourceOptions = options;
     this.derived = prebuilt !== undefined;
+    this.ownership = prebuilt?.ownership ?? {};
     if (prebuilt) {
       this.sourceChunks = prebuilt.chunks;
       this.leafMap = prebuilt.leafMap;
@@ -681,6 +686,7 @@ export class CanonicalSummaryForest {
     }
     if (appended) roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
     const derived = new CanonicalSummaryForest(inputs, options, {
+      ownership: previous.ownership,
       chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: ordered, roots,
       constraintConflicts: conflicts,
       treeifiedSummaryIds: previous.treeifiedSummaryIds,
@@ -692,6 +698,11 @@ export class CanonicalSummaryForest {
 
   orderedLeaves(): readonly CanonicalLeaf[] {
     return this.orderedLeafList;
+  }
+
+  /** The picker chunks in leaf order (parallel to `orderedLeaves()`). */
+  orderedChunks(): readonly PickerChunk[] {
+    return this.sourceChunks;
   }
 
   /** Some summary has a live participant and a live non-participant leaf: a

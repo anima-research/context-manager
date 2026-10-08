@@ -14,20 +14,12 @@ import {
   type ParetoSolveOptions,
 } from '../kv-unified-pareto.js';
 import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
-import type { SummaryTree } from '../summary-tree.js';
 
-/** Mutable holder a host keeps across compiles so unchanged structures can
- * be derived instead of rebuilt. Everything in it is validated against the
- * new inputs before reuse; a stale holder only costs a miss. */
-export interface KvUnifiedReuse {
-  forest?: CanonicalSummaryForest;
-  tree?: SummaryTree;
-}
+export type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
   /** Live adapter refuses missing policy/grid fields when true. */
   requireExplicitPolicy?: boolean;
-  reuse?: KvUnifiedReuse;
   treeifyNonContiguousSummaries?: boolean;
   preserveGapBearingSummaries?: boolean;
   latentDemand?: {
@@ -354,6 +346,7 @@ function solveWithLatentCandidate(
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,
+    reuse: undefined,
   });
 }
 

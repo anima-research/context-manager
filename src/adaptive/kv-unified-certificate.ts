@@ -1,6 +1,6 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
-import { CanonicalSummaryForest } from './kv-unified.js';
+import { CanonicalSummaryForest, type CanonicalLeaf } from './kv-unified.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -26,9 +26,9 @@ export type CertifiedPolicyResult = Extract<ExactPolicySolveResult, { feasible: 
   readonly certificate: HysteresisCertificate;
 };
 
-interface LinearNode {
-  readonly tokens: number;
-  readonly fidelity: number;
+export interface DagNode {
+  tokens: number;
+  fidelity: number;
   readonly children: readonly number[];
   /** Independent, constraint-forced holes emitted beside a selected summary. */
   readonly selectedChildren: readonly number[];
@@ -36,67 +36,80 @@ interface LinearNode {
   readonly id: string;
   readonly level: number;
   readonly leafIds: readonly string[];
-  readonly canSelect: boolean;
+  canSelect: boolean;
+  /** Leaf positions of a summary node's participants, null for a leaf node. */
+  readonly participants: Int32Array | null;
+  /** Leaf position of a leaf node, -1 for a summary node. */
+  readonly leafIndex: number;
 }
 
-/** Try to prove that the existing hysteresis rule selects the carried cut.
- *
- * Convexity gives B(T) >= B(t) + B'(t)(T-t). A linear forest solve then gives
- * L(t) = min_cuts(F + B'(t) T) + B(t) - B'(t)t <= min_feasible(F+B).
- * The linear solve may include over-budget cuts: relaxing the hard wall only
- * lowers L. Cache/continuity penalties remain present and nonnegative.
- *
- * This is a sufficient certificate, not an approximate optimizer. No bucket
- * errors or policy deadlines enter the proof. Failed certificates fall back
- * to the existing solver. Internal holes use the canonical select-participants
- * plus expand-holes recurrence. Excessive context/extension graphs and nonzero
- * carried cache churn decline; no eligibility or adoption rule is relaxed.
- */
-export function certifyCarriedLayout(
-  inputs: PickerInputs,
-  forest: CanonicalSummaryForest,
-  options: ExactPolicySolveOptions,
-): CertifiedPolicyResult | null {
-  const epsilon = options.adoptEpsilon ?? 0;
-  if (!options.presentation || !Number.isFinite(epsilon) || epsilon <= 0 ||
-      !Number.isFinite(options.maxTokens) || options.maxTokens < 0 ||
-      forest.constraintConflicts.length > 0) return null;
-  const policy = normalizePolicy(options.policy);
-  const leaves = forest.orderedLeaves();
-  // Bound recursive context construction independently of the node-count cap.
-  // Decline deep ownership chains before entering the recursive compiler.
-  if (leaves.some((leaf) => leaf.summaryIds.length > 256)) return null;
-  const chunks = new Map(inputs.chunks.map((chunk) => [chunk.id, chunk]));
-  const newest = inputs.chunks.reduce((latest, chunk) => Math.max(latest, chunk.sequence), 0);
-  // Old leaves are fixed at their accepted level. New leaves (no accepted
-  // representation — appended since the presentation) are free: hysteresis
-  // keeps the accepted layout under the BEST extension over them, so every
-  // valid extension is enumerated below and scored exactly. A fresh L1 over
-  // appended messages is the common case (one solve per mint otherwise).
-  const fixed = new Map<ChunkId, number>();
-  const leafFidelity = new Map<ChunkId, number>();
-  for (const leaf of leaves) {
-    const previous = options.presentation.leaves.get(leaf.id);
-    if (previous) {
-      if (!leaf.allowedLevels.includes(previous.level)) return null;
-      const summaryId = previous.level === 0 ? undefined : leaf.summaryIds.find(
-        (id) => forest.summary(id)!.level === previous.level,
-      );
-      const hash = previous.level === 0 ? `raw:${leaf.id}` : `summary:${summaryId}`;
-      if (hash !== previous.repHash) return null;
-      fixed.set(leaf.id, previous.level);
-    } else if (!leaf.allowedLevels.includes(0) && leaf.allowedLevels.length === 0) return null;
-    leafFidelity.set(leaf.id, leaf.externallyAccounted ? 0 :
-      fidelityLeafLoss(chunks.get(leaf.id)!, 1, newest, policy));
-  }
+/** The certificate's context DAG for one ownership structure. Kept in the
+ * reuse holder across compiles; `fidelity` is refreshed on every use. */
+export interface CertificateDag {
+  readonly ownership: object;
+  leafObjects: readonly CanonicalLeaf[];
+  readonly nodes: DagNode[];
+  readonly roots: number[];
+  readonly leafNode: Map<ChunkId, number>;
+}
 
-  // Compile the canonical cut recurrence into an active-leaf context DAG.
-  // Selecting a summary covers exactly its eligible participants and expands
-  // its forced holes. Expanding covers all active children. These disjoint
-  // branches are the same as enumerateExactCuts/minimumTokens, so a linear
-  // minimum is valid even with nested holes or chronological ownership gaps.
-  const nodes: LinearNode[] = [];
-  const leafNodes = new Map<string, number>();
+function leafNodeFields(leaf: CanonicalLeaf): { tokens: number; canSelect: boolean } {
+  const canSelect = leaf.allowedLevels.includes(0);
+  return { tokens: canSelect ? (leaf.externallyAccounted ? 0 : leaf.rawTokens) : Infinity, canSelect };
+}
+
+/** Reuse a cached graph when the forest shares its ownership build and no
+ * owned leaf object changed. Ownerless leaves that changed are patched in
+ * place; appended ownerless leaves become new roots. */
+function reuseDag(
+  cache: CertificateDag | undefined,
+  forest: CanonicalSummaryForest,
+  leaves: readonly CanonicalLeaf[],
+): CertificateDag | null {
+  if (!cache || cache.ownership !== forest.ownership) return null;
+  const previous = cache.leafObjects;
+  if (leaves.length < previous.length) return null;
+  for (let i = 0; i < previous.length; i++) {
+    const leaf = leaves[i];
+    if (leaf === previous[i]) continue;
+    if (leaf.id !== previous[i].id || leaf.summaryIds.length > 0) return null;
+    const index = cache.leafNode.get(leaf.id);
+    if (index === undefined) return null;
+    const node = cache.nodes[index];
+    const fields = leafNodeFields(leaf);
+    node.tokens = fields.tokens;
+    node.canSelect = fields.canSelect;
+  }
+  for (let i = previous.length; i < leaves.length; i++) {
+    const leaf = leaves[i];
+    if (leaf.summaryIds.length > 0 || cache.leafNode.has(leaf.id)) return null;
+    const fields = leafNodeFields(leaf);
+    cache.nodes.push({
+      tokens: fields.tokens, fidelity: 0, children: [], selectedChildren: [], canExpand: false,
+      id: leaf.id, level: 0, leafIds: [leaf.id], canSelect: fields.canSelect, participants: null, leafIndex: i,
+    });
+    cache.leafNode.set(leaf.id, cache.nodes.length - 1);
+    cache.roots.push(cache.nodes.length - 1);
+  }
+  cache.leafObjects = leaves;
+  return cache;
+}
+
+/** Compile the canonical cut recurrence into an active-leaf context DAG.
+ * Selecting a summary covers exactly its eligible participants and expands
+ * its forced holes. Expanding covers all active children. These disjoint
+ * branches are the same as enumerateExactCuts/minimumTokens, so a linear
+ * minimum is valid even with nested holes or chronological ownership gaps.
+ * Returns null when the context limits are exceeded. */
+function buildDag(
+  forest: CanonicalSummaryForest,
+  leaves: readonly CanonicalLeaf[],
+  inputs: PickerInputs,
+): CertificateDag | null {
+  const leafIndex = new Map<ChunkId, number>();
+  for (let i = 0; i < leaves.length; i++) leafIndex.set(leaves[i].id, i);
+  const nodes: DagNode[] = [];
+  const leafNode = new Map<ChunkId, number>();
   const summaryNodes = new Map<string, number>();
   const contextLimit = 4 * (leaves.length + inputs.summaries.size) + 256;
   const contextLimitReached = new Error('certificate context limit');
@@ -109,22 +122,21 @@ export function certifyCarriedLayout(
     leaves.reduce((sum, leaf) => sum + leaf.id.length, 0) +
     [...inputs.summaries.keys()].reduce((sum, id) => sum + id.length, 0)) + 1024;
   let memberships = 0, identifierUnits = 0;
-  const addNode = (node: LinearNode): number => {
+  const addNode = (node: DagNode): number => {
     if (nodes.length >= contextLimit) throw contextLimitReached;
     nodes.push(node);
     return nodes.length - 1;
   };
   const addLeaf = (id: string): number => {
-    const known = leafNodes.get(id);
+    const known = leafNode.get(id);
     if (known !== undefined) return known;
     const leaf = forest.leaf(id)!;
+    const fields = leafNodeFields(leaf);
     const index = addNode({
-      tokens: leaf.allowedLevels.includes(0)
-        ? (leaf.externallyAccounted ? 0 : leaf.rawTokens) : Infinity,
-      fidelity: 0, children: [], selectedChildren: [], canExpand: false,
-      id, level: 0, leafIds: [id], canSelect: leaf.allowedLevels.includes(0),
+      tokens: fields.tokens, fidelity: 0, children: [], selectedChildren: [], canExpand: false,
+      id, level: 0, leafIds: [id], canSelect: fields.canSelect, participants: null, leafIndex: leafIndex.get(id)!,
     });
-    leafNodes.set(id, index);
+    leafNode.set(id, index);
     return index;
   };
   const addChildren = (id: string, activeIds: readonly string[]): number[] => {
@@ -167,11 +179,11 @@ export function certifyCarriedLayout(
     const holes = activeIds.filter((id) => !participantSet.has(id));
     const canSelect = participants.length > 0;
     const selectedChildren = canSelect && holes.length > 0 ? addChildren(id, holes) : [];
-    const fidelity = participants.reduce((sum, id) => sum + leafFidelity.get(id)! * summary.level, 0);
     const index = addNode({
       tokens: canSelect ? summary.recallTokens : Infinity,
-      fidelity, children, selectedChildren, canExpand: true,
+      fidelity: 0, children, selectedChildren, canExpand: true,
       id: summary.id, level: summary.level, leafIds: participants, canSelect,
+      participants: Int32Array.from(participants, (leafId) => leafIndex.get(leafId)!), leafIndex: -1,
     });
     summaryNodes.set(key, index);
     return index;
@@ -184,81 +196,182 @@ export function certifyCarriedLayout(
     if (error === contextLimitReached) return null;
     throw error;
   }
+  return { ownership: forest.ownership, leafObjects: leaves, nodes, roots, leafNode };
+}
 
-  // Enumerate every cut that keeps each old leaf at its accepted level. A node
-  // may be selected only when all of its old leaves are accepted at exactly
-  // its level (and every new leaf allows it); otherwise it must expand.
-  const EXTENSION_CAP = 256;
+/** Try to prove that the existing hysteresis rule selects the carried cut.
+ *
+ * Convexity gives B(T) >= B(t) + B'(t)(T-t). A linear forest solve then gives
+ * L(t) = min_cuts(F + B'(t) T) + B(t) - B'(t)t <= min_feasible(F+B).
+ * The linear solve may include over-budget cuts: relaxing the hard wall only
+ * lowers L. Cache/continuity penalties remain present and nonnegative.
+ *
+ * This is a sufficient certificate, not an approximate optimizer. No bucket
+ * errors or policy deadlines enter the proof. Failed certificates fall back
+ * to the existing solver. Internal holes use the canonical select-participants
+ * plus expand-holes recurrence. Excessive context/extension graphs and nonzero
+ * carried cache churn decline; no eligibility or adoption rule is relaxed.
+ */
+export function certifyCarriedLayout(
+  inputs: PickerInputs,
+  forest: CanonicalSummaryForest,
+  options: ExactPolicySolveOptions,
+): CertifiedPolicyResult | null {
+  const epsilon = options.adoptEpsilon ?? 0;
+  if (!options.presentation || !Number.isFinite(epsilon) || epsilon <= 0 ||
+      !Number.isFinite(options.maxTokens) || options.maxTokens < 0 ||
+      forest.constraintConflicts.length > 0) return null;
+  const policy = normalizePolicy(options.policy);
+  const leaves = forest.orderedLeaves();
+  // Bound recursive context construction independently of the node-count cap.
+  // Decline deep ownership chains before entering the recursive compiler.
+  if (leaves.some((leaf) => leaf.summaryIds.length > 256)) return null;
+  const chunks = forest.orderedChunks();
+  const n = leaves.length;
+  const newest = n > 0 ? chunks[n - 1].sequence : 0;
+  const presentation = options.presentation;
+
+  // Accepted level per leaf, or -1 for a leaf appended since the presentation.
+  // Old leaves are fixed at their accepted level. New leaves are free:
+  // hysteresis keeps the accepted layout under the BEST extension over them,
+  // so every valid extension is enumerated below and scored exactly.
+  const fixedLevel = new Int32Array(n);
+  let fixedCount = 0;
+  for (let i = 0; i < n; i++) {
+    const leaf = leaves[i];
+    const previous = presentation.leaves.get(leaf.id);
+    if (previous) {
+      if (!leaf.allowedLevels.includes(previous.level)) return null;
+      const summaryId = previous.level === 0 ? undefined : leaf.summaryIds.find(
+        (id) => forest.summary(id)!.level === previous.level,
+      );
+      const hash = previous.level === 0 ? `raw:${leaf.id}` : `summary:${summaryId}`;
+      if (hash !== previous.repHash) return null;
+      fixedLevel[i] = previous.level;
+      fixedCount++;
+    } else {
+      if (!leaf.allowedLevels.includes(0) && leaf.allowedLevels.length === 0) return null;
+      fixedLevel[i] = -1;
+    }
+  }
+
+  // The context DAG depends only on the forest's ownership and leaf
+  // constraints, so a previous compile's graph is reused when the forest was
+  // derived from the same build and no owned leaf changed. Fidelity is
+  // relative to the newest leaf and is refreshed below every compile.
+  const dag = reuseDag(options.reuse?.certificate, forest, leaves) ?? buildDag(forest, leaves, inputs);
+  if (dag === null) return null;
+  if (options.reuse) options.reuse.certificate = dag;
+  const { nodes, roots } = dag;
+  const leafFidelity = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    leafFidelity[i] = leaves[i].externallyAccounted ? 0 : fidelityLeafLoss(chunks[i], 1, newest, policy);
+  }
+  for (const node of nodes) {
+    if (node.participants === null) { node.fidelity = 0; continue; }
+    let fidelity = 0;
+    for (let k = 0; k < node.participants.length; k++) {
+      fidelity += leafFidelity[node.participants[k]] * node.level;
+    }
+    node.fidelity = fidelity;
+  }
+
+  // Does the accepted layout, with every free leaf raw, match the graph? A
+  // leaf node matches when raw is allowed and it is free or accepted raw; a
+  // summary node matches when selected (every participant accepted at its
+  // level, forced holes matching) or expanded (every child matching). Token
+  // accounting alone would wrongly admit mixed cuts through unconstrained
+  // siblings, so this validates coverage before anything is materialized.
+  const matches = new Uint8Array(nodes.length);
+  let freeAreRootLeaves = true;
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (node.participants === null) {
+      const level = fixedLevel[node.leafIndex];
+      matches[i] = node.canSelect && (level === 0 || level === -1) ? 1 : 0;
+      if (level === -1 && (!node.canSelect || leaves[node.leafIndex].summaryIds.length > 0)) freeAreRootLeaves = false;
+      continue;
+    }
+    let selected = node.canSelect;
+    for (let k = 0; selected && k < node.participants.length; k++) selected = fixedLevel[node.participants[k]] === node.level;
+    for (let k = 0; selected && k < node.selectedChildren.length; k++) selected = matches[node.selectedChildren[k]] === 1;
+    let expanded = node.canExpand;
+    for (let k = 0; expanded && k < node.children.length; k++) expanded = matches[node.children[k]] === 1;
+    matches[i] = selected || expanded ? 1 : 0;
+  }
+  const rootsMatch = roots.every((root) => matches[root] === 1);
+
   type Assignment = Array<[ChunkId, number]>;
-  const cutMemo = new Map<number, Assignment[] | null>();
-  const combineChildren = (children: readonly number[], initial: Assignment = []): Assignment[] | null => {
-    let combinations = [initial];
-    for (const child of children) {
-      const childCuts = cuts(child);
-      if (childCuts === null) return null;
-      if (childCuts.length === 1) {
-        // One cut for this child: extend every combination in place. The
-        // arrays in `combinations` are private to this call (the caller's
-        // fresh initial, or copies made below), and memoized cuts are only
-        // ever read as suffixes, so nothing shared is mutated.
-        const suffix = childCuts[0];
-        for (const prefix of combinations) for (const entry of suffix) prefix.push(entry);
-        continue;
-      }
-      const next: Assignment[] = [];
-      for (const prefix of combinations) for (const suffix of childCuts) {
-        next.push([...prefix, ...suffix]);
-        if (next.length > EXTENSION_CAP) return null;
-      }
-      combinations = next;
-    }
-    return combinations;
-  };
-  const cuts = (index: number): Assignment[] | null => {
-    if (cutMemo.has(index)) return cutMemo.get(index)!;
-    const node = nodes[index];
-    if (!node.canExpand) {
-      const id = node.leafIds[0]!;
-      const level = fixed.get(id);
-      if (level !== undefined) return level === 0 ? [[[id, 0]]] : [];
-      return forest.leaf(id)!.allowedLevels.includes(0) ? [[[id, 0]]] : [];
-    }
-    const out: Assignment[] = [];
-    const selectable = node.canSelect && node.leafIds.every((id) => {
-      const leaf = forest.leaf(id)!;
-      if (leaf.externallyAccounted) return true;
-      const level = fixed.get(id);
-      return level === undefined ? leaf.allowedLevels.includes(node.level) : level === node.level;
-    });
-    if (selectable) {
-      const selected = combineChildren(node.selectedChildren,
-        node.leafIds.map((id) => [id, node.level] as [ChunkId, number]));
-      if (selected === null) return null;
-      out.push(...selected);
-    }
-    const expanded = combineChildren(node.children);
-    if (expanded === null) return null;
-    out.push(...expanded);
-    const result = out.length > EXTENSION_CAP ? null : out;
-    cutMemo.set(index, result);
-    return result;
-  };
   let extensions: Assignment[];
-  if (fixed.size === leaves.length) {
-    // There is exactly one matching frontier. Validate its complete coverage
-    // on today's graph before materializing it once; token accounting alone
-    // would wrongly admit arbitrary mixed cuts through unconstrained siblings.
-    const matches = new Uint8Array(nodes.length);
-    for (let i = 0; i < nodes.length; i++) {
-      const node = nodes[i];
-      const selected = node.canSelect && node.leafIds.every((id) => fixed.get(id) === node.level)
-        && node.selectedChildren.every((child) => matches[child]);
-      const expanded = node.canExpand && node.children.every((child) => matches[child]);
-      matches[i] = selected || expanded ? 1 : 0;
-    }
-    if (roots.some((root) => !matches[root])) return null;
-    extensions = [[...fixed]];
+  if (fixedCount === n) {
+    // Exactly one matching frontier, or none.
+    if (!rootsMatch) return null;
+    extensions = [leaves.map((leaf, i) => [leaf.id, fixedLevel[i]] as [ChunkId, number])];
+  } else if (freeAreRootLeaves && rootsMatch) {
+    // Every free leaf is an ownerless root that allows raw: each has exactly
+    // one cut, so the accepted layout has exactly one extension.
+    extensions = [leaves.map((leaf, i) => [leaf.id, Math.max(0, fixedLevel[i])] as [ChunkId, number])];
   } else {
+    // Enumerate every cut that keeps each old leaf at its accepted level. A
+    // node may be selected only when all of its old leaves are accepted at
+    // exactly its level (and every new leaf allows it); otherwise it must
+    // expand.
+    const fixed = new Map<ChunkId, number>();
+    for (let i = 0; i < n; i++) if (fixedLevel[i] >= 0) fixed.set(leaves[i].id, fixedLevel[i]);
+    const EXTENSION_CAP = 256;
+    const cutMemo = new Map<number, Assignment[] | null>();
+    const combineChildren = (children: readonly number[], initial: Assignment = []): Assignment[] | null => {
+      let combinations = [initial];
+      for (const child of children) {
+        const childCuts = cuts(child);
+        if (childCuts === null) return null;
+        if (childCuts.length === 1) {
+          // One cut for this child: extend every combination in place. The
+          // arrays in `combinations` are private to this call (the caller's
+          // fresh initial, or copies made below), and memoized cuts are only
+          // ever read as suffixes, so nothing shared is mutated.
+          const suffix = childCuts[0];
+          for (const prefix of combinations) for (const entry of suffix) prefix.push(entry);
+          continue;
+        }
+        const next: Assignment[] = [];
+        for (const prefix of combinations) for (const suffix of childCuts) {
+          next.push([...prefix, ...suffix]);
+          if (next.length > EXTENSION_CAP) return null;
+        }
+        combinations = next;
+      }
+      return combinations;
+    };
+    const cuts = (index: number): Assignment[] | null => {
+      if (cutMemo.has(index)) return cutMemo.get(index)!;
+      const node = nodes[index];
+      if (!node.canExpand) {
+        const id = node.leafIds[0]!;
+        const level = fixed.get(id);
+        if (level !== undefined) return level === 0 ? [[[id, 0]]] : [];
+        return forest.leaf(id)!.allowedLevels.includes(0) ? [[[id, 0]]] : [];
+      }
+      const out: Assignment[] = [];
+      const selectable = node.canSelect && node.leafIds.every((id) => {
+        const leaf = forest.leaf(id)!;
+        if (leaf.externallyAccounted) return true;
+        const level = fixed.get(id);
+        return level === undefined ? leaf.allowedLevels.includes(node.level) : level === node.level;
+      });
+      if (selectable) {
+        const selected = combineChildren(node.selectedChildren,
+          node.leafIds.map((id) => [id, node.level] as [ChunkId, number]));
+        if (selected === null) return null;
+        out.push(...selected);
+      }
+      const expanded = combineChildren(node.children);
+      if (expanded === null) return null;
+      out.push(...expanded);
+      const result = out.length > EXTENSION_CAP ? null : out;
+      cutMemo.set(index, result);
+      return result;
+    };
     const combined = combineChildren(roots);
     if (combined === null) return null;
     extensions = combined;

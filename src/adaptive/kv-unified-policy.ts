@@ -7,6 +7,7 @@
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import type { KvUnifiedReuse } from './kv-unified-reuse.js';
 import {
   CanonicalSummaryForest,
   type ExactCutCandidate,
@@ -78,6 +79,8 @@ export class KvUnifiedPolicyError extends Error {
 }
 
 export interface ExactPolicySolveOptions {
+  /** Cross-compile reuse holder (see kv-unified-reuse.ts). Never read by what-if solves. */
+  readonly reuse?: KvUnifiedReuse;
   readonly maxTokens: number;
   readonly policy?: Partial<KvUnifiedWelfarePolicy>;
   readonly presentation?: AcceptedPresentationReference;
