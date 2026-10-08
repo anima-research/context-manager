@@ -68,8 +68,10 @@ export function presentedLeavesByIndex(
   const leaves = forest.orderedLeaves();
   const known = presentedByScope.get(scope);
   if (known && known.presentation === presentation && known.ownership === forest.ownership && known.leaves.length === leaves.length) {
+    // Positions below the full build's count carry the same ids in every
+    // forest of this ownership; only appended ones are compared.
     let same = true;
-    for (let i = 0; same && i < leaves.length; i++) {
+    for (let i = forest.baseLeafCount; same && i < leaves.length; i++) {
       const a = known.leaves[i], b = leaves[i];
       same = a === b || a.id === b.id;
     }
@@ -222,10 +224,15 @@ export class TerminalPolicyEvaluator {
     const shift = structure ? n - structure.chunkCount : 0;
     // Raw codes are positions. The kept layout translation is reused only
     // when every position the structure knows still holds the same leaf id:
-    // a sibling forest of this ownership may have appended other leaves, and
-    // a structure longer than this forest names positions it does not have.
+    // a sibling forest of this ownership (or of the lineage parent's) may
+    // have appended other leaves, and a structure longer than this forest
+    // names positions it does not have. Positions below the full build's
+    // count are the same ids in every such forest, so only the appended
+    // ones are read (a read per leaf object is a cache miss per leaf).
     let aligned = structure !== undefined && leafCount <= n;
-    for (let i = 0; aligned && i < leafCount; i++) aligned = structure!.leaves[i]?.id === this.ids[i];
+    for (let i = Math.min(forest.baseLeafCount, leafCount); aligned && i < leafCount; i++) {
+      aligned = structure!.leaves[i]?.id === this.ids[i];
+    }
     if (structure && leafCount >= n) {
       this.matches = structure.matches.slice(0, n * this.stride);
       this.representations = structure.representations.slice(0, n * this.stride);

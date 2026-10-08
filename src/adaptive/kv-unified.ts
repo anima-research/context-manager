@@ -1086,6 +1086,14 @@ export class CanonicalSummaryForest {
     return this.orderedLeafList;
   }
 
+  /** Leaf count of the full build this forest descends from. A derive keeps
+   * every position below it under the same leaf id (ids are checked by
+   * position, and an extension runs after that check), so forests of one
+   * ownership, and extensions of them, can differ only from here on. */
+  get baseLeafCount(): number {
+    return this.baseIndex.size;
+  }
+
   /** Whether `orderedChunks()` is the sorted form of exactly these inputs'
    * chunks: the same inputs object, still holding the same chunk objects
    * (a chunk replaced inside the array after the build is detected). */
