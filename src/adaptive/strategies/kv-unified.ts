@@ -124,8 +124,21 @@ export class KvUnifiedStrategy implements FoldingSolver {
       : [];
     this.requests = produced;
     this.timings = { ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves };
+    // The selected cut as a level per leaf; the forest's leaf order is by
+    // sequence, so when the sequences are dense (0..n-1) the array is
+    // indexed by sequence. The frontier map is built only if someone reads it.
+    const selected = result.selected;
+    let levelsBySequence: ArrayLike<number> | undefined;
+    const levels = selected.levels;
+    if (levels) {
+      const chunks = forest.orderedChunks();
+      let dense = chunks.length === levels.length;
+      for (let k = 0; dense && k < chunks.length; k++) if (chunks[k].sequence !== k) dense = false;
+      if (dense) levelsBySequence = levels;
+    }
     return {
-      frontier: result.selected.frontier,
+      get frontier() { return selected.frontier; },
+      levelsBySequence,
       produced,
       exhausted: false,
     };

@@ -1,5 +1,6 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import type { PresentedLeaf } from './kv-unified-policy.js';
 import { CanonicalSummaryForest, type CanonicalLeaf } from './kv-unified.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import {
@@ -51,6 +52,10 @@ export interface CertificateDag {
   readonly nodes: DagNode[];
   readonly roots: number[];
   readonly leafNode: Map<ChunkId, number>;
+  /** Last compile's accepted-level check per leaf: the leaf object, the
+   *  receipt entry it was checked against, and the level it fixed. A leaf
+   *  seen again with the same objects passes with the same level. */
+  fixed?: { leaves: CanonicalLeaf[]; previous: (PresentedLeaf | undefined)[]; level: Int32Array };
 }
 
 function leafNodeFields(leaf: CanonicalLeaf): { tokens: number; canSelect: boolean } {
@@ -237,9 +242,23 @@ export function certifyCarriedLayout(
   // so every valid extension is enumerated below and scored exactly.
   const fixedLevel = new Int32Array(n);
   let fixedCount = 0;
+  const cached = options.reuse?.certificate;
+  const known = cached && cached.ownership === forest.ownership ? cached.fixed : undefined;
+  const checkedLeaves: CanonicalLeaf[] = new Array(n);
+  const checkedPrevious: (PresentedLeaf | undefined)[] = new Array(n);
   for (let i = 0; i < n; i++) {
     const leaf = leaves[i];
     const previous = presentation.leaves.get(leaf.id);
+    checkedLeaves[i] = leaf;
+    checkedPrevious[i] = previous;
+    if (known && i < known.leaves.length && known.leaves[i] === leaf && known.previous[i] === previous) {
+      // Same leaf object against the same receipt entry: the checks below
+      // gave this level last compile and depend on nothing else.
+      const level = known.level[i];
+      fixedLevel[i] = level;
+      if (level >= 0) fixedCount++;
+      continue;
+    }
     if (previous) {
       if (!leaf.allowedLevels.includes(previous.level)) return null;
       if (leaf.repHashes[leaf.availableLevels.indexOf(previous.level)] !== previous.repHash) return null;
@@ -257,6 +276,7 @@ export function certifyCarriedLayout(
   // relative to the newest leaf and is refreshed below every compile.
   const dag = reuseDag(options.reuse?.certificate, forest, leaves) ?? buildDag(forest, leaves, inputs);
   if (dag === null) return null;
+  dag.fixed = { leaves: checkedLeaves, previous: checkedPrevious, level: fixedLevel };
   if (options.reuse) options.reuse.certificate = dag;
   const { nodes, roots } = dag;
   const leafFidelity = new Float64Array(n);

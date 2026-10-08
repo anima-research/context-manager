@@ -239,8 +239,15 @@ export interface PickerInputs {
 }
 
 export interface PickerResult {
-  /** Applied resolution per live chunk (the solver's frontier, validated). */
-  finalResolutions: ReadonlyMap<ChunkId, number>;
+  /** Applied resolution per live chunk (the solver's frontier, validated).
+   *  Built on first read; `levelAt` answers without it. */
+  readonly finalResolutions: ReadonlyMap<ChunkId, number>;
+  /** Applied resolution of the chunk with this sequence and id: by position
+   *  when the solver supplied levels by sequence, else from its frontier. */
+  levelAt(sequence: number, id: ChunkId): number;
+  /** The solver's levels by sequence, when it supplied them (see
+   *  FoldingSolution.levelsBySequence). */
+  levelsBySequence?: ArrayLike<number>;
   /** Production requests the solver emitted (summaries that don't exist yet). */
   produced: ProduceRequest[];
   /** Rendered-token estimate of the applied frontier. */
@@ -274,8 +281,9 @@ export interface PickerResult {
  */
 export function accountFrontier(
   inputs: PickerInputs,
-  frontier: ReadonlyMap<ChunkId, number>,
+  frontier: ReadonlyMap<ChunkId, number> | ((chunk: PickerChunk) => number),
 ): { tokens: number; unrealizable: ChunkId[] } {
+  const levelOf = typeof frontier === 'function' ? frontier : (c: PickerChunk) => frontier.get(c.id) ?? 0;
   const summaries = inputs.summaries;
   const recallPairTokens = inputs.recallPairTokens ?? new Map<SummaryId, number>();
   const ancestorAt = (chunk: PickerChunk, level: number): SummaryEntry | null => {
@@ -294,7 +302,7 @@ export function accountFrontier(
   const unrealizable: ChunkId[] = [];
   for (const c of inputs.chunks) {
     if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id)) continue;
-    const effective = c.pinned ? 0 : frontier.get(c.id) ?? 0;
+    const effective = c.pinned ? 0 : levelOf(c);
     if (effective === 0) {
       total += c.rawTokens;
       continue;
@@ -325,28 +333,39 @@ export class Picker {
 
   run(inputs: PickerInputs, budget: FoldingBudget): PickerResult {
     const solution = this.solver.solve(inputs, budget);
-    const { frontier, produced } = solution;
+    const { produced } = solution;
+    const bySequence = solution.levelsBySequence;
 
     // Apply: the frontier is authoritative for live chunks. Entries for ids
     // with no live chunk (summaries whose sources were removed by surgery)
-    // are dropped and counted — never persisted.
-    const final = new Map<ChunkId, number>();
+    // are dropped and counted — never persisted. With levels by sequence
+    // the solver's leaves are exactly the live chunks, so nothing is dead
+    // and the frontier map is never materialized unless a caller reads it.
+    const clamp = (lvl: number): number => (!Number.isFinite(lvl) || lvl < 0 ? 0 : lvl);
+    const levelAt = (sequence: number, id: ChunkId): number =>
+      clamp(bySequence && sequence >= 0 && sequence < bySequence.length
+        ? bySequence[sequence]
+        : solution.frontier.get(id) ?? 0);
+    const levelOf = (c: PickerChunk): number => levelAt(c.sequence, c.id);
     let moves = 0;
-    for (const c of inputs.chunks) {
-      let lvl = frontier.get(c.id) ?? 0;
-      if (!Number.isFinite(lvl) || lvl < 0) lvl = 0;
-      final.set(c.id, lvl);
-      if (lvl !== c.currentResolution) moves++;
-    }
-    const deadFrontierIds = frontier.size > final.size
-      ? [...frontier.keys()].filter((id) => !final.has(id)).length
+    for (const c of inputs.chunks) if (levelOf(c) !== c.currentResolution) moves++;
+    let final: Map<ChunkId, number> | null = null;
+    const finalResolutions = (): Map<ChunkId, number> => {
+      if (!final) {
+        final = new Map();
+        for (const c of inputs.chunks) final.set(c.id, levelOf(c));
+      }
+      return final;
+    };
+    const deadFrontierIds = !bySequence && solution.frontier.size > inputs.chunks.length
+      ? [...solution.frontier.keys()].filter((id) => !finalResolutions().has(id)).length
       : 0;
 
     // Account + validate. An unrealizable target is a solver bug: it is
     // accounted as raw (the renderer makes the same call) and reported
     // LOUDLY — the walk's silent skip is exactly what hid the 2026-07
     // plan/render divergence.
-    const { tokens, unrealizable } = accountFrontier(inputs, final);
+    const { tokens, unrealizable } = accountFrontier(inputs, levelOf);
     if (unrealizable.length > 0) {
       console.error(
         `[picker-unrealizable] solver=${this.solver.name}: ${unrealizable.length} chunk(s) target ` +
@@ -362,7 +381,9 @@ export class Picker {
     }
 
     return {
-      finalResolutions: final,
+      get finalResolutions() { return finalResolutions(); },
+      levelAt,
+      levelsBySequence: bySequence,
       produced,
       finalTokens: tokens,
       budgetMet: tokens <= budget.targetBudget,

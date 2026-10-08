@@ -46,7 +46,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
@@ -8456,6 +8456,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
+    // A picker result answers by position; a stubbed result (tests, hosts
+    // that wrap the picker) may only carry the map.
+    const levelAt: PickerResult['levelAt'] = typeof result.levelAt === 'function'
+      ? result.levelAt
+      : (_sequence, id) => result.finalResolutions.get(id) ?? 0;
     if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
       const reuse = this.kvUnifiedReuse;
       // The tree is only needed for a leaf the forest cannot hash at its
@@ -8471,7 +8476,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // level; the tree is the fallback for leaves it does not know.
       const forest = reuse.forest;
       for (const chunk of pickerInputs.chunks) {
-        const level = result.finalResolutions.get(chunk.id) ?? 0;
+        const level = levelAt(chunk.sequence, chunk.id);
         const leaf = forest?.leaf(chunk.id);
         const slot = leaf ? leaf.availableLevels.indexOf(level) : -1;
         let repHash: string;
@@ -8496,8 +8501,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // produces; asserted equal in the terminal evaluator tests). The size
       // check ties it to this compile's applied frontier.
       const last = this._lastKvUnified?.lastResult;
-      const solvedLayout = last?.feasible && last.cacheRelevant &&
-        last.selected.frontier.size === result.finalResolutions.size ? last.selected.layout : null;
+      const solvedLayout = last?.feasible && last.cacheRelevant && result.levelsBySequence !== undefined &&
+        last.selected.levels === result.levelsBySequence ? last.selected.layout : null;
       this.kvUnifiedDraft = {
         leaves,
         layout: solvedLayout ?? renderLayout(pickerInputs, summaryTree(), result.finalResolutions),
@@ -8542,8 +8547,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a failed compile: they are recovery work, not presentation state.
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
-    for (const [id, level] of result.finalResolutions) {
+    for (const chunk of pickerChunks) {
+      const id = chunk.id;
       if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
+      const level = levelAt(chunk.sequence, id);
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
@@ -8655,6 +8662,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 5. Emit middle entries in source order -----
+    const positionOf = this.positionIndex(messages);
     // Walk middle messages. Handle two cases:
     //  - bodyGroupId set: collect all consecutive shards from the same group,
     //    emit ONE combined entry with concatenated content (raw shards + inline
@@ -8792,7 +8800,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
 
         for (const shard of sortedShards) {
-          const resolution = result.finalResolutions.get(shard.id) ?? 0;
+          const resolution = levelAt(positionOf.get(shard.id) ?? -1, shard.id);
           if (resolution === 0) {
             if (currentRun?.kind !== 'raw') {
               flushRun();
@@ -8832,7 +8840,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
 
       // Non-shard path: existing behavior.
-      const resolution = result.finalResolutions.get(msg.id) ?? 0;
+      const resolution = levelAt(i, msg.id);
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
         const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];

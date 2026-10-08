@@ -99,6 +99,10 @@ export interface ExactPolicySolveOptions {
 export interface ExactPolicyCandidate {
   readonly frontier: ReadonlyMap<ChunkId, number>;
   readonly layout: RenderLayout;
+  /** The cut as the level per leaf in `leafIds` order, when the candidate
+   *  came through the terminal evaluator (the same assignment as `frontier`). */
+  readonly levels?: ArrayLike<number>;
+  readonly leafIds?: readonly ChunkId[];
   readonly renderedTokens: number;
   readonly cacheChurn: number;
   readonly continuityLoss: number;
@@ -131,6 +135,8 @@ export type ExactPolicySolveResult =
 export interface UnscoredCandidate {
   frontier: ReadonlyMap<ChunkId, number>;
   layout: RenderLayout;
+  levels?: ArrayLike<number>;
+  leafIds?: readonly ChunkId[];
   renderedTokens: number;
   cacheChurn: number;
   continuityLoss: number;
@@ -249,8 +255,10 @@ export class ExactKvUnifiedPolicySolver {
         fidelityLoss: candidate.fidelityLoss, budgetPenalty: candidate.budgetPenalty,
         cacheExcess, continuityExcess, score,
       };
+      Object.defineProperty(result, 'levels', { get: () => candidate.levels, enumerable: false });
+      Object.defineProperty(result, 'leafIds', { get: () => candidate.leafIds, enumerable: false });
       matching.set(result, candidate.matchesPresentation);
-      return result;
+      return result as ExactPolicyCandidate;
     });
     if (candidates.length > 1) {
       const leafIds = this.orderedChunks.map((chunk) => chunk.id);

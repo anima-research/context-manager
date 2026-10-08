@@ -375,11 +375,24 @@ export class TerminalPolicyEvaluator {
       if (this.unitTokens[this.tailCode] > 0) append(this.tailCode);
       return layout = { units, totalTokens: offset };
     };
-    return {
+    let levels: Uint8Array | Uint32Array | undefined;
+    const getLevels = () => {
+      if (!levels) {
+        this.fill(trace);
+        levels = this.levels.slice();
+      }
+      return levels;
+    };
+    const candidate: UnscoredCandidate = {
       get frontier() { return getFrontier(); },
       get layout() { return getLayout(); },
       fidelityLoss, continuityLoss, renderedTokens, cacheChurn, matchesPresentation,
       budgetPenalty: budgetPenalty(renderedTokens, this.maxTokens, this.policy),
     };
+    // Non-enumerable, like the solver's bound hook: results are compared
+    // structurally in diagnostics and tests.
+    Object.defineProperty(candidate, 'levels', { get: getLevels, enumerable: false });
+    Object.defineProperty(candidate, 'leafIds', { value: this.ids, enumerable: false });
+    return candidate;
   }
 }
