@@ -230,7 +230,7 @@ interface PartialCut {
 
 const IMPOSSIBLE = Number.POSITIVE_INFINITY;
 
-type OrderedChild =
+export type OrderedChild =
   | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string; index: number }
   | { kind: 'summary'; id: SummaryId; firstSequence: number; key: string };
 const orderedChildrenCache = new WeakMap<CanonicalSummary, readonly OrderedChild[]>();
@@ -1446,7 +1446,9 @@ export class CanonicalSummaryForest {
     return constraints;
   }
 
-  private orderedChildren(summary: CanonicalSummary): readonly OrderedChild[] {
+  /** A summary's direct leaves and child summaries in (first sequence, id)
+   *  order; cached per summary object. */
+  orderedChildren(summary: CanonicalSummary): readonly OrderedChild[] {
     // Summary objects are shared by every forest derived from the same build
     // and leaf sequences are fixed per id, so the order is a property of
     // the summary object.
