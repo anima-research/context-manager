@@ -223,6 +223,8 @@ interface MutableSummary {
    *  order, so these lists hold distinct ids in increasing position. */
   directLeafIds: ChunkId[];
   leafIds: ChunkId[];
+  /** Positions of `leafIds`, parallel to it. */
+  leafPositions: number[];
 }
 
 /** Levels and representation hashes along one ownership chain, shared by
@@ -508,6 +510,7 @@ export class CanonicalSummaryForest {
                 childSummaryIds: new Set(),
                 directLeafIds: [],
                 leafIds: [],
+                leafPositions: [],
               };
               mutableSummaries.set(id, summary);
             }
@@ -518,7 +521,7 @@ export class CanonicalSummaryForest {
         }
         const chunkId = chunks[at].id;
         resolved[0].directLeafIds.push(chunkId);
-        for (const summary of resolved) summary.leafIds.push(chunkId);
+        for (const summary of resolved) { summary.leafIds.push(chunkId); summary.leafPositions.push(at); }
       }
     };
     while (true) {
@@ -528,8 +531,8 @@ export class CanonicalSummaryForest {
         // Leaf ids are listed in increasing position, so the owned leaves
         // are contiguous exactly when the list spans as many positions as it
         // has entries.
-        const ids = summary.leafIds;
-        if (ids.length > 0 && indexOfLeaf.get(ids[ids.length - 1])! - indexOfLeaf.get(ids[0])! + 1 !== ids.length) {
+        const positions = summary.leafPositions;
+        if (positions.length > 0 && positions[positions.length - 1] - positions[0] + 1 !== positions.length) {
           contiguityIssues.push({
             code: 'non-contiguous-ownership',
             message: `summary ${summary.id} owns non-contiguous live leaves`,
@@ -563,12 +566,11 @@ export class CanonicalSummaryForest {
     // is its first leaf's.
     const firstPosition = new Map<SummaryId, number>();
     for (const summary of mutableSummaries.values()) {
-      const ids = summary.leafIds;
-      firstPosition.set(summary.id, ids.length === 0 ? Infinity : indexOfLeaf.get(ids[0])!);
+      firstPosition.set(summary.id, summary.leafPositions.length === 0 ? Infinity : summary.leafPositions[0]);
     }
     for (const summary of mutableSummaries.values()) {
       const leafIds = summary.leafIds;
-      summaryMap.set(summary.id, {
+      const built: CanonicalSummary = {
         kind: 'summary',
         id: summary.id,
         level: summary.level,
@@ -580,7 +582,11 @@ export class CanonicalSummaryForest {
         leafIds,
         firstSequence: chunkById.get(leafIds[0])!.sequence,
         lastSequence: chunkById.get(leafIds[leafIds.length - 1])!.sequence,
-      });
+      };
+      summaryMap.set(summary.id, built);
+      // The positions are known here; `leafIndicesOf` would recompute them
+      // through the leaf index for every summary of every new forest.
+      summaryLeafIndexCache.set(built, Int32Array.from(summary.leafPositions));
     }
 
     const orderedLeafList: CanonicalLeaf[] = new Array(chunks.length);
@@ -832,13 +838,27 @@ export class CanonicalSummaryForest {
   hasInternalProtectedHoles(): boolean {
     if (this.internalHolesMemo !== undefined) return this.internalHolesMemo;
     let holes = false;
+    const masks = this.allowedLevelMasks();
+    const leaves = this.orderedLeafList;
     for (const summary of this.allSummaries()) {
       let live = 0, allowed = 0;
-      for (const id of summary.leafIds) {
-        const leaf = this.leafOf(id)!;
-        if (leaf.externallyAccounted) continue;
-        live++;
-        if (leaf.allowedLevels.includes(summary.level)) allowed++;
+      if (summary.level < 31) {
+        // The same test by position and allowed-level bit.
+        const indices = this.leafIndicesOf(summary);
+        const bit = 1 << summary.level;
+        for (let k = 0; k < indices.length; k++) {
+          const i = indices[k];
+          if (leaves[i].externallyAccounted) continue;
+          live++;
+          if (masks[i] & bit) allowed++;
+        }
+      } else {
+        for (const id of summary.leafIds) {
+          const leaf = this.leafOf(id)!;
+          if (leaf.externallyAccounted) continue;
+          live++;
+          if (leaf.allowedLevels.includes(summary.level)) allowed++;
+        }
       }
       if (allowed > 0 && allowed < live) { holes = true; break; }
     }
