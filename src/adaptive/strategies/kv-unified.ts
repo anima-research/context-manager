@@ -15,9 +15,17 @@ import {
 } from '../kv-unified-pareto.js';
 import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
 
+/** Mutable holder a host keeps across compiles so unchanged structures can
+ * be derived instead of rebuilt. Everything in it is validated against the
+ * new inputs before reuse; a stale holder only costs a miss. */
+export interface KvUnifiedReuse {
+  forest?: CanonicalSummaryForest;
+}
+
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
   /** Live adapter refuses missing policy/grid fields when true. */
   requireExplicitPolicy?: boolean;
+  reuse?: KvUnifiedReuse;
   treeifyNonContiguousSummaries?: boolean;
   preserveGapBearingSummaries?: boolean;
   latentDemand?: {
@@ -29,6 +37,7 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
 
 export interface KvUnifiedTimings {
   readonly forestMs: number;
+  readonly forestDerived: boolean;
   readonly certificateMs: number;
   readonly baseSolveMs: number;
   readonly demandMs: number;
@@ -77,10 +86,15 @@ export class KvUnifiedStrategy implements FoldingSolver {
   solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
     if (this.options.requireExplicitPolicy) validateExplicitOptions(this.options);
     const t0 = performance.now();
-    const forest = new CanonicalSummaryForest(inputs, {
+    const forestOptions = {
       treeifyNonContiguousSummaries: this.options.treeifyNonContiguousSummaries,
       preserveGapBearingSummaries: this.options.preserveGapBearingSummaries,
-    });
+    };
+    const reuse = this.options.reuse;
+    const forest =
+      (reuse?.forest ? CanonicalSummaryForest.derive(reuse.forest, inputs, forestOptions) : null) ??
+      new CanonicalSummaryForest(inputs, forestOptions);
+    if (reuse) reuse.forest = forest;
     const t1 = performance.now();
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
     const result = solver.solve({
@@ -92,7 +106,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     this.demandEvaluations = [];
     this.requests = [];
     this.demandSolves = 0;
-    this.timings = { forestMs: t1 - t0, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1, demandMs: 0, demandSolves: 0 };
+    this.timings = { forestMs: t1 - t0, forestDerived: forest.derived, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1, demandMs: 0, demandSolves: 0 };
     if (!result.feasible) {
       if (result.feasibility.frontier) {
         return {

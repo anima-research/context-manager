@@ -224,19 +224,52 @@ interface PartialCut {
 
 const IMPOSSIBLE = Number.POSITIVE_INFINITY;
 
+/** Parts of a forest derived from a previous one (see `derive`). */
+export interface PrebuiltForestParts {
+  readonly chunks: readonly PickerChunk[];
+  readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
+  readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
+  readonly orderedLeafList: readonly CanonicalLeaf[];
+  readonly roots: readonly CanonicalRoot[];
+  readonly constraintConflicts: readonly ConstraintConflict[];
+  readonly treeifiedSummaryIds: readonly SummaryId[];
+  readonly gapBearingSummaryIds: readonly SummaryId[];
+}
+
 export class CanonicalSummaryForest {
   readonly fixedTokens: number;
   readonly roots: readonly CanonicalRoot[];
   readonly constraintConflicts: readonly ConstraintConflict[];
   readonly treeifiedSummaryIds: readonly SummaryId[];
   readonly gapBearingSummaryIds: readonly SummaryId[];
+  /** True when this forest was derived from a previous compile's forest. */
+  readonly derived: boolean;
 
   private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
   private readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
   private readonly orderedLeafList: readonly CanonicalLeaf[];
+  // What this forest was built from, kept so the next compile can derive
+  // from it instead of rebuilding ownership over every leaf.
+  private readonly sourceChunks: readonly PickerChunk[];
+  private readonly sourceInputs: PickerInputs;
+  private readonly sourceOptions: CanonicalForestOptions;
 
-  constructor(inputs: PickerInputs, options: CanonicalForestOptions = {}) {
+  constructor(inputs: PickerInputs, options: CanonicalForestOptions = {}, prebuilt?: PrebuiltForestParts) {
     this.fixedTokens = inputs.headTokens + inputs.tailTokens;
+    this.sourceInputs = inputs;
+    this.sourceOptions = options;
+    this.derived = prebuilt !== undefined;
+    if (prebuilt) {
+      this.sourceChunks = prebuilt.chunks;
+      this.leafMap = prebuilt.leafMap;
+      this.summaryMap = prebuilt.summaryMap;
+      this.orderedLeafList = prebuilt.orderedLeafList;
+      this.roots = prebuilt.roots;
+      this.constraintConflicts = prebuilt.constraintConflicts;
+      this.treeifiedSummaryIds = prebuilt.treeifiedSummaryIds;
+      this.gapBearingSummaryIds = prebuilt.gapBearingSummaryIds;
+      return;
+    }
     const issues: CanonicalForestIssue[] = [];
     if (
       !Number.isFinite(inputs.headTokens) ||
@@ -464,52 +497,9 @@ export class CanonicalSummaryForest {
     const leafMap = new Map<ChunkId, CanonicalLeaf>();
     const conflicts: ConstraintConflict[] = [];
     for (const chunk of chunks) {
-      const chain = chains.get(chunk.id) ?? [];
-      const availableLevels = [0, ...chain.map((id) => summaryMap.get(id)!.level)];
-      const constraints = this.constraintsFor(chunk, inputs, options);
-      let allowedLevels = [...availableLevels];
-      const requestedMissingLevels = new Set<number>();
-      for (const constraint of constraints) {
-        const level = constraint.kind === 'raw' ? 0 : constraint.level;
-        if (level === undefined || !Number.isInteger(level) || level < 0) {
-          allowedLevels = [];
-          continue;
-        }
-        if (constraint.kind === 'raw' || constraint.kind === 'exact') {
-          if (!availableLevels.includes(level)) requestedMissingLevels.add(level);
-          allowedLevels = allowedLevels.filter((candidate) => candidate === level);
-        } else if (constraint.kind === 'max') {
-          allowedLevels = allowedLevels.filter((candidate) => candidate <= level);
-        } else {
-          if (!availableLevels.some((candidate) => candidate >= level)) {
-            requestedMissingLevels.add(level);
-          }
-          allowedLevels = allowedLevels.filter((candidate) => candidate >= level);
-        }
-      }
-      allowedLevels.sort((a, b) => a - b);
-      const leaf: CanonicalLeaf = {
-        kind: 'leaf',
-        id: chunk.id,
-        sequence: chunk.sequence,
-        rawTokens: chunk.rawTokens,
-        carriedLevel: chunk.currentResolution,
-        externallyAccounted:
-          inputs.headChunkIds.has(chunk.id) || inputs.tailChunkIds.has(chunk.id),
-        summaryIds: chain,
-        availableLevels,
-        allowedLevels,
-        constraints,
-      };
-      leafMap.set(chunk.id, leaf);
-      if (allowedLevels.length === 0) {
-        conflicts.push({
-          leafId: chunk.id,
-          availableLevels,
-          constraints,
-          requestedMissingLevels: [...requestedMissingLevels].sort((a, b) => a - b),
-        });
-      }
+      const built = CanonicalSummaryForest.buildLeaf(chunk, chains.get(chunk.id) ?? [], inputs, options, summaryMap);
+      leafMap.set(chunk.id, built.leaf);
+      if (built.conflict) conflicts.push(built.conflict);
     }
 
     const roots: CanonicalRoot[] = [];
@@ -537,6 +527,7 @@ export class CanonicalSummaryForest {
     }
     roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
 
+    this.sourceChunks = chunks;
     this.leafMap = leafMap;
     this.summaryMap = summaryMap;
     this.orderedLeafList = chunks.map((chunk) => leafMap.get(chunk.id)!);
@@ -544,6 +535,154 @@ export class CanonicalSummaryForest {
     this.constraintConflicts = conflicts;
     this.treeifiedSummaryIds = [...treeified].sort();
     this.gapBearingSummaryIds = [...gapBearing].sort();
+  }
+
+  /** The per-leaf layer: available levels from the ownership chain, then the
+   * leaf's constraints narrow them. Independent of every other leaf. */
+  private static buildLeaf(
+    chunk: PickerChunk,
+    chain: readonly SummaryId[],
+    inputs: PickerInputs,
+    options: CanonicalForestOptions,
+    summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>,
+  ): { leaf: CanonicalLeaf; conflict?: ConstraintConflict } {
+    const availableLevels = [0, ...chain.map((id) => summaryMap.get(id)!.level)];
+    const constraints = CanonicalSummaryForest.constraintsFor(chunk, inputs, options);
+    let allowedLevels = [...availableLevels];
+    const requestedMissingLevels = new Set<number>();
+    for (const constraint of constraints) {
+      const level = constraint.kind === 'raw' ? 0 : constraint.level;
+      if (level === undefined || !Number.isInteger(level) || level < 0) {
+        allowedLevels = [];
+        continue;
+      }
+      if (constraint.kind === 'raw' || constraint.kind === 'exact') {
+        if (!availableLevels.includes(level)) requestedMissingLevels.add(level);
+        allowedLevels = allowedLevels.filter((candidate) => candidate === level);
+      } else if (constraint.kind === 'max') {
+        allowedLevels = allowedLevels.filter((candidate) => candidate <= level);
+      } else {
+        if (!availableLevels.some((candidate) => candidate >= level)) {
+          requestedMissingLevels.add(level);
+        }
+        allowedLevels = allowedLevels.filter((candidate) => candidate >= level);
+      }
+    }
+    allowedLevels.sort((a, b) => a - b);
+    const leaf: CanonicalLeaf = {
+      kind: 'leaf',
+      id: chunk.id,
+      sequence: chunk.sequence,
+      rawTokens: chunk.rawTokens,
+      carriedLevel: chunk.currentResolution,
+      externallyAccounted:
+        inputs.headChunkIds.has(chunk.id) || inputs.tailChunkIds.has(chunk.id),
+      summaryIds: chain,
+      availableLevels,
+      allowedLevels,
+      constraints,
+    };
+    if (allowedLevels.length === 0) {
+      return {
+        leaf,
+        conflict: {
+          leafId: chunk.id,
+          availableLevels,
+          constraints,
+          requestedMissingLevels: [...requestedMissingLevels].sort((a, b) => a - b),
+        },
+      };
+    }
+    return { leaf };
+  }
+
+  /**
+   * Build the forest for `inputs` from `previous` when ownership did not
+   * change: every previous leaf is still there in the same order with the
+   * same L1 link, only ownerless leaves were appended, summaries and recall
+   * costs are identical, and the options match. Summary nodes, treeified and
+   * gap-bearing sets are shared. Leaves whose own fields or head/tail
+   * membership changed are rebuilt; the rest are shared. Returns null when a
+   * full build is needed, which the caller does with the constructor.
+   */
+  static derive(
+    previous: CanonicalSummaryForest,
+    inputs: PickerInputs,
+    options: CanonicalForestOptions = {},
+  ): CanonicalSummaryForest | null {
+    const po = previous.sourceOptions;
+    if (options.constraints || options.overlapExempt || po.constraints || po.overlapExempt) return null;
+    if (
+      Boolean(options.treeifyNonContiguousSummaries) !== Boolean(po.treeifyNonContiguousSummaries) ||
+      Boolean(options.preserveGapBearingSummaries) !== Boolean(po.preserveGapBearingSummaries)
+    ) return null;
+    if (
+      !Number.isFinite(inputs.headTokens) || inputs.headTokens < 0 ||
+      !Number.isFinite(inputs.tailTokens) || inputs.tailTokens < 0
+    ) return null;
+    const pi = previous.sourceInputs;
+    if (inputs.summaries.size !== pi.summaries.size) return null;
+    for (const [id, entry] of inputs.summaries) {
+      const old = pi.summaries.get(id);
+      if (!old || old.level !== entry.level || getSummaryParentId(old) !== getSummaryParentId(entry)) return null;
+      if ((inputs.recallPairTokens?.get(id) ?? entry.tokens) !== (pi.recallPairTokens?.get(id) ?? old.tokens)) return null;
+    }
+    const chunks = [...inputs.chunks].sort(
+      (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
+    );
+    const old = previous.sourceChunks;
+    if (chunks.length < old.length) return null;
+    for (let i = 0; i < old.length; i++) {
+      const a = old[i], b = chunks[i];
+      if (a.id !== b.id || a.sequence !== b.sequence || a.l1Id !== b.l1Id) return null;
+    }
+    let lastSequence = old.length > 0 ? old[old.length - 1].sequence : -Infinity;
+    for (let i = old.length; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      if (chunk.l1Id !== undefined || chunk.sequence <= lastSequence || previous.leafMap.has(chunk.id)) return null;
+      if (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0) return null;
+      lastSequence = chunk.sequence;
+    }
+
+    const sameLeaf = (a: PickerChunk, b: PickerChunk): boolean =>
+      a.rawTokens === b.rawTokens && a.currentResolution === b.currentResolution &&
+      a.lockedByAgent === b.lockedByAgent && a.pinned === b.pinned &&
+      a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
+      pi.headChunkIds.has(a.id) === inputs.headChunkIds.has(b.id) &&
+      pi.tailChunkIds.has(a.id) === inputs.tailChunkIds.has(b.id);
+    const leafMap = new Map(previous.leafMap);
+    const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
+    const conflicts: ConstraintConflict[] = [];
+    const ordered: CanonicalLeaf[] = new Array(chunks.length);
+    const roots = [...previous.roots];
+    let appended = false;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      if (i < old.length && sameLeaf(old[i], chunk)) {
+        const leaf = previous.leafMap.get(chunk.id)!;
+        ordered[i] = leaf;
+        const conflict = previousConflicts.get(chunk.id);
+        if (conflict) conflicts.push(conflict);
+        continue;
+      }
+      if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
+      const chain = i < old.length ? previous.leafMap.get(chunk.id)!.summaryIds : [];
+      const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap);
+      leafMap.set(chunk.id, built.leaf);
+      ordered[i] = built.leaf;
+      if (built.conflict) conflicts.push(built.conflict);
+      if (i >= old.length) {
+        roots.push({ kind: 'leaf', id: chunk.id, firstSequence: chunk.sequence });
+        appended = true;
+      }
+    }
+    if (appended) roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
+    return new CanonicalSummaryForest(inputs, options, {
+      chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: ordered, roots,
+      constraintConflicts: conflicts,
+      treeifiedSummaryIds: previous.treeifiedSummaryIds,
+      gapBearingSummaryIds: previous.gapBearingSummaryIds,
+    });
   }
 
   orderedLeaves(): readonly CanonicalLeaf[] {
@@ -1073,7 +1212,7 @@ export class CanonicalSummaryForest {
     return { feasible: true, floorTokens, frontier };
   }
 
-  private constraintsFor(
+  private static constraintsFor(
     chunk: PickerChunk,
     inputs: PickerInputs,
     options: CanonicalForestOptions,

@@ -49,7 +49,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
-import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import {
@@ -9435,6 +9435,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        reuse: this.kvUnifiedReuse,
         continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
         latentDemand: {
           mergeThreshold: this.config.mergeThreshold ?? 6,
@@ -9494,6 +9495,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
+  /** Structures kv-unified may derive from across compiles (validated on use). */
+  private readonly kvUnifiedReuse: KvUnifiedReuse = {};
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
