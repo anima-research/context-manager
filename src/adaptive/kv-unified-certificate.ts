@@ -129,6 +129,17 @@ export function certifyCarriedLayout(
   };
   const addChildren = (id: string, activeIds: readonly string[]): number[] => {
     const summary = forest.summary(id)!;
+    // activeIds is always a subset of this summary's leaves, so equal length
+    // means full ownership: every direct leaf and child summary is active and
+    // the per-summary membership set (O(leaves) at every level) is skipped.
+    if (activeIds.length === summary.leafIds.length) {
+      const children = summary.directLeafIds.map(addLeaf);
+      for (const childId of summary.childSummaryIds) {
+        const child = forest.summary(childId)!;
+        if (child.leafIds.length > 0) children.push(addSummary(childId, child.leafIds));
+      }
+      return children;
+    }
     const active = new Set(activeIds);
     const children = summary.directLeafIds.filter((id) => active.has(id)).map(addLeaf);
     for (const childId of summary.childSummaryIds) {
@@ -185,6 +196,15 @@ export function certifyCarriedLayout(
     for (const child of children) {
       const childCuts = cuts(child);
       if (childCuts === null) return null;
+      if (childCuts.length === 1) {
+        // One cut for this child: extend every combination in place. The
+        // arrays in `combinations` are private to this call (the caller's
+        // fresh initial, or copies made below), and memoized cuts are only
+        // ever read as suffixes, so nothing shared is mutated.
+        const suffix = childCuts[0];
+        for (const prefix of combinations) for (const entry of suffix) prefix.push(entry);
+        continue;
+      }
       const next: Assignment[] = [];
       for (const prefix of combinations) for (const suffix of childCuts) {
         next.push([...prefix, ...suffix]);
