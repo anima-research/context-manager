@@ -11,6 +11,8 @@ import type { ApproximationEnvelope, ParetoPolicySolveResult, ParetoSolveOptions
 interface Action {
   trace: number;
   ids: readonly string[];
+  /** Forest positions parallel to `ids`, when the caller had them. */
+  indices?: ArrayLike<number>;
   level: number;
   fidelity: number;
   continuity: number;
@@ -286,15 +288,17 @@ export class PackedDagSolver {
     s.pending[id] = ordered.slice(consumed);
   }
 
-  private action(ids: readonly string[], level: number, summaryId?: string): Action {
+  private action(ids: readonly string[], level: number, summaryId?: string, indices?: ArrayLike<number>): Action {
     let fidelity = 0, continuity = 0, tokens = 0, extension = 0, sequence = Infinity;
     const presentation = this.options.presentation;
     // Same terms as fidelityLeafLoss / continuityLeafLoss: base times level,
     // base times representation distance, in the same operation order.
     const summaryHash = level === 0 ? undefined : `summary:${summaryId}`;
-    for (const id of ids) {
-      const leaf = this.forest.leaf(id)!;
-      const i = leaf.index;
+    for (let k = 0; k < ids.length; k++) {
+      const id = ids[k];
+      // The forest's ordered leaves sit at their own index.
+      const i = indices ? indices[k] : this.forest.leaf(id)!.index;
+      const leaf = this.leaves[i];
       sequence = Math.min(sequence, leaf.sequence);
       if (level > 0) fidelity += this.fidelityBase[i] * level;
       const previousLevel = this.previousLevel[i];
@@ -314,7 +318,7 @@ export class PackedDagSolver {
       tokens = summary.recallTokens;
       if (presentation && summary.leafIds.length > 0 && summary.leafIds.every((id) => !presentation.leaves.has(id))) extension = tokens;
     }
-    return { trace: ids.length ? this.s.traces.action(ids, level) : 0, ids, level, fidelity, continuity, tokens, extension, key: summaryId, sequence };
+    return { trace: ids.length ? this.s.traces.action(ids, level) : 0, ids, indices, level, fidelity, continuity, tokens, extension, key: summaryId, sequence };
   }
 
   private apply(id: number, action: Action): void {
@@ -323,8 +327,9 @@ export class PackedDagSolver {
     s.assign(id, action.trace, action.fidelity, action.continuity);
     if (!s.data[(id) * LABEL_STRIDE + LabelField.Intact]) { s.data[(id) * LABEL_STRIDE + LabelField.Tokens] += action.tokens; s.data[(id) * LABEL_STRIDE + LabelField.Extension] += action.extension; return; }
     if (action.key) this.emit(id, 'recall', action.key, action.tokens, action.extension > 0, action.sequence);
-    else for (const leafId of action.ids) {
-      const leaf = this.forest.leaf(leafId)!;
+    else for (let k = 0; k < action.ids.length; k++) {
+      const leafId = action.ids[k];
+      const leaf = this.leaves[action.indices ? action.indices[k] : this.forest.leaf(leafId)!.index];
       this.emit(id, 'raw', leafId, leaf.rawTokens,
         this.options.presentation !== undefined && !this.options.presentation.leaves.has(leafId), leaf.sequence);
     }
@@ -345,18 +350,20 @@ export class PackedDagSolver {
         at++; continue;
       }
       const ids: string[] = [];
+      const indices: number[] = [];
       let unselectable = false;
       while (at < children.length && children[at].kind === 'leaf') {
         const child = children[at++] as Extract<OrderedChild, { kind: 'leaf' }>;
         if (this.external[child.index]) continue;
         ids.push(child.id);
+        indices.push(child.index);
         if ((this.allowed[child.index] & 1) === 0) unselectable = true;
       }
       if (unselectable) {
         for (const id of labels) this.s.release(id);
         labels = [];
       } else {
-        const action = this.action(ids, 0);
+        const action = this.action(ids, 0, undefined, indices);
         for (const id of labels) this.apply(id, action);
       }
       labels = this.prune(labels);
@@ -368,16 +375,17 @@ export class PackedDagSolver {
     this.expanded += incoming.length;
     const summary = this.forest.summary(summaryId)!;
     let participants: string[], holes: string[];
+    let participantIndices: number[] | undefined;
     if (!active && summary.level < 31) {
       // Full ownership: a bit test per leaf position, in leafIds order.
       const indices = this.forest.leafIndicesOf(summary);
       const bit = 1 << summary.level;
       const ids = summary.leafIds;
-      participants = []; holes = [];
+      participants = []; holes = []; participantIndices = [];
       for (let k = 0; k < indices.length; k++) {
         const i = indices[k];
         if (this.external[i]) continue;
-        if (this.allowed[i] & bit) participants.push(ids[k]); else holes.push(ids[k]);
+        if (this.allowed[i] & bit) { participants.push(ids[k]); participantIndices.push(i); } else holes.push(ids[k]);
       }
     } else {
       const live = summary.leafIds.filter((id) => (!active || active.has(id)) && !this.forest.leaf(id)!.externallyAccounted);
@@ -386,7 +394,7 @@ export class PackedDagSolver {
     }
     let selected: number[] = [];
     if (participants.length) {
-      const action = this.action(participants, summary.level, summaryId);
+      const action = this.action(participants, summary.level, summaryId, participantIndices);
       selected = incoming.map((id) => { const copy = this.s.clone(id); this.apply(copy, action); return copy; });
       if (holes.length) selected = this.children(summaryId, selected, new Set(holes), limit);
     }
@@ -407,7 +415,7 @@ export class PackedDagSolver {
       else {
         const leaf = this.forest.leaf(root.id)!;
         if (!leaf.externallyAccounted) {
-          const action = this.action([leaf.id], 0);
+          const action = this.action([leaf.id], 0, undefined, [leaf.index]);
           for (const id of labels) this.apply(id, action);
         }
         labels = this.prune(labels);
