@@ -32,9 +32,19 @@
  * a namespace without strategy state is reported and nothing else is done.
  * Messages are read through a MessageStore, whose construction re-registers
  * the message slot's history indexes, idempotently, as every open of the
- * store does. Chronicle has no read-only open: opening takes the store's lock
- * and may rewrite its state index, so run this on a stopped resident's store
- * or on a copy.
+ * store does, rebuilding any that are missing or stale.
+ *
+ * Inspection is mutation-free logically, not byte-for-byte. Chronicle has no
+ * read-only open: opening takes the store's lock, so run this on a stopped
+ * resident's store or on a copy. Every close rewrites state.bin,
+ * state-indexes.bin (where a rebuilt history index lands) and branches.bin,
+ * whose bytes can change even when what they hold doesn't. And when the
+ * store wasn't closed cleanly, opening may correct stale branch heads, which
+ * the close writes to branches.bin, and truncate a torn tail from
+ * records.log; a truncation is reported on stderr, even when the open then
+ * fails, since nothing records it afterwards. So to keep a store's files as
+ * they were, as forensics during an incident needs, copy the store before
+ * inspecting it.
  *
  * `--sample-compile <tokens>` additionally writes one compile at that
  * budget from a live, audit-only open of the same message slot, using this
@@ -50,7 +60,7 @@
  * invocation.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
 
@@ -144,7 +154,27 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  const store = JsStore.open({ path: storePath });
+  // Chronicle's open truncates a torn tail from records.log before the steps that can still make the open fail, and
+  // nothing records the truncation afterwards. Its recovery() report needs the opened store, which a failed open
+  // doesn't leave, so compare the log's size across the open instead, and report whether or not the open succeeds.
+  const log = `${storePath}/records.log`;
+  const logSize = () => (existsSync(log) ? statSync(log).size : 0);
+  const sizeBefore = logSize();
+  let store: JsStore;
+  try {
+    store = JsStore.open({ path: storePath });
+  } finally {
+    const size = logSize();
+    if (size < sizeBefore) {
+      const dropped = sizeBefore - size;
+      console.error(
+        `⚠️ Opening this store truncated a torn tail from records.log: it dropped ${dropped} byte${dropped === 1 ? '' : 's'}, ` +
+          `and the log now ends at byte ${size}. A torn tail is whatever follows the last record that reads whole: ` +
+          'usually an append that didn\'t complete, which a crash can leave, and so can copying a store while its ' +
+          'resident writes. Those bytes are gone from this store, and later opens won\'t report them.',
+      );
+    }
+  }
   try {
     const stateIds = new Set(store.listStates().map((state) => state.id));
     const summariesId = `${namespace}/autobio:summaries`;

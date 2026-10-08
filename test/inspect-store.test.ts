@@ -1,7 +1,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,14 +77,10 @@ function snapshot(path: string): string {
   } finally { store.close(); }
 }
 
+/** The script run as a process: its exit code, and both streams whatever the code. */
 function run(args: string[]): { code: number; stdout: string; stderr: string } {
-  try {
-    const stdout = execFileSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    return { code: 0, stdout, stderr: '' };
-  } catch (e) {
-    const err = e as { status?: number; stdout?: string; stderr?: string };
-    return { code: err.status ?? -1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
-  }
+  const result = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return { code: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
 describe('inspect-store', () => {
@@ -92,8 +88,9 @@ describe('inspect-store', () => {
     const path = await residentStore();
     const out = join(path, '..', 'out');
     const before = snapshot(path);
-    const { code, stdout } = run([path, '--namespace', 'agents/Ada', '--output', out]);
+    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out]);
     assert.equal(code, 0);
+    assert.doesNotMatch(stderr, /torn tail/, 'a cleanly closed store has no truncation to report');
     assert.match(stdout, /Summaries: 1 /);
     assert.match(stdout, /Messages: 6 \(the shared message slot messages\)/, 'the sole registered slot, named');
     assert.deepEqual(readdirSync(out).sort(), ['messages.md', 'summary-lineage.md', 'summary-tree.md'], 'the inspection files and no compile, unless asked');
@@ -233,6 +230,35 @@ describe('inspect-store', () => {
     assert.equal(absent.code, 1);
     assert.match(absent.stderr, /--ns needs a value/);
     assert.equal(existsSync(join(path, '..', 'absent')), false);
+  });
+
+  it('reports a torn tail that opening the store truncated from records.log, and changes no state', async () => {
+    const path = await residentStore();
+    const before = snapshot(path); // taken before the tail is added: the snapshot's own open would truncate it
+    const log = join(path, 'records.log');
+    const clean = readFileSync(log);
+    appendFileSync(log, Buffer.from([1, 2, 3, 4, 5, 6, 7])); // a partial frame, as an append that didn't complete leaves
+    const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-torn')]);
+    assert.equal(code, 0, stderr);
+    assert.match(stderr, new RegExp(`truncated a torn tail from records\\.log: it dropped 7 bytes, and the log now ends at byte ${clean.length}\\.`));
+    assert.deepEqual(readFileSync(log), clean, 'the open truncated the log back to its last valid record');
+    assert.equal(snapshot(path), before, 'every state and every strategy value is unchanged');
+  });
+
+  it('reports a torn tail that the open truncated even when the open then fails', async () => {
+    const path = await residentStore();
+    const log = join(path, 'records.log');
+    const clean = readFileSync(log);
+    appendFileSync(log, Buffer.from([1, 2, 3, 4, 5, 6, 7]));
+    // A state.bin that no longer reads (a crash during its rewrite can leave one). Chronicle loads it only after
+    // truncating the log's tail, so the open fails having already truncated.
+    const stateBin = join(path, 'state.bin');
+    writeFileSync(stateBin, readFileSync(stateBin).fill(0, 0, 4)); // its magic
+    const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-failed')]);
+    assert.equal(code, 1, stderr);
+    assert.match(stderr, new RegExp(`truncated a torn tail from records\\.log: it dropped 7 bytes, and the log now ends at byte ${clean.length}\\.`));
+    assert.ok(stderr.indexOf('torn tail') < stderr.indexOf('FATAL'), 'the report, then the failed open');
+    assert.deepEqual(readFileSync(log), clean, 'the failed open had truncated the log');
   });
 
   it('never creates a store that does not exist', () => {
