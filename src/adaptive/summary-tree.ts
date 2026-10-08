@@ -19,7 +19,7 @@
  */
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
-import type { PickerInputs } from './picker.js';
+import type { PickerChunk, PickerInputs } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
 import { getSummaryParentId } from '../types/strategy.js';
 
@@ -63,16 +63,33 @@ export function nodeTokens(node: TreeNode): number {
 }
 
 export class SummaryTree {
-  private readonly leaves = new Map<ChunkId, LeafNode>();
-  private readonly nodes = new Map<SummaryId, SummaryNode>();
+  private readonly leaves: Map<ChunkId, LeafNode> = new Map();
+  private readonly nodes: Map<SummaryId, SummaryNode> = new Map();
   private readonly summaries: ReadonlyMap<SummaryId, SummaryEntry>;
   private readonly recallPairTokens: ReadonlyMap<SummaryId, number>;
-  private readonly leafSeq = new Map<ChunkId, number>();
+  private readonly leafSeq: Map<ChunkId, number> = new Map();
   private rootCache: TreeNode[] | null = null;
+  /** The chunks this tree was built from, for `derive`. */
+  private readonly sourceChunks: readonly PickerChunk[];
 
-  constructor(inputs: PickerInputs) {
+  constructor(inputs: PickerInputs, previous?: SummaryTree) {
     this.summaries = inputs.summaries;
     this.recallPairTokens = inputs.recallPairTokens ?? new Map();
+    this.sourceChunks = inputs.chunks;
+    if (previous) {
+      // `derive` verified ownership did not change: share the summary nodes,
+      // copy the leaves and patch only what moved.
+      this.nodes = previous.nodes;
+      this.leaves = new Map(previous.leaves);
+      this.leafSeq = new Map(previous.leafSeq);
+      for (const c of inputs.chunks) {
+        const leaf = this.leaves.get(c.id);
+        if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence) continue;
+        this.leafSeq.set(c.id, c.sequence);
+        this.leaves.set(c.id, { kind: 'leaf', chunkId: c.id, sequence: c.sequence, rawTokens: c.rawTokens, l1Id: c.l1Id });
+      }
+      return;
+    }
 
     for (const c of inputs.chunks) {
       this.leafSeq.set(c.id, c.sequence);
@@ -87,6 +104,38 @@ export class SummaryTree {
     for (const [, s] of this.summaries) {
       this.nodes.set(s.id, this.buildNode(s));
     }
+  }
+
+  /**
+   * Build the tree for `inputs` from `previous` when no summary changed and
+   * every previous leaf is still present with the same sequence and L1 link;
+   * new leaves must be ownerless. Chunk order may differ. Returns null when a
+   * full build is needed.
+   */
+  static derive(previous: SummaryTree, inputs: PickerInputs): SummaryTree | null {
+    if (inputs.summaries.size !== previous.summaries.size) return null;
+    const recall = inputs.recallPairTokens ?? new Map<SummaryId, number>();
+    for (const [id, s] of inputs.summaries) {
+      const o = previous.summaries.get(id);
+      if (
+        !o || o.level !== s.level || o.sourceLevel !== s.sourceLevel ||
+        getSummaryParentId(o) !== getSummaryParentId(s) ||
+        (recall.get(id) ?? s.tokens) !== (previous.recallPairTokens.get(id) ?? o.tokens) ||
+        o.sourceRange.first !== s.sourceRange.first || o.sourceRange.last !== s.sourceRange.last ||
+        o.sourceIds.length !== s.sourceIds.length
+      ) return null;
+      for (let i = 0; i < s.sourceIds.length; i++) if (o.sourceIds[i] !== s.sourceIds[i]) return null;
+    }
+    let matched = 0;
+    for (const c of inputs.chunks) {
+      const leaf = previous.leaves.get(c.id);
+      if (leaf) {
+        if (leaf.sequence !== c.sequence || leaf.l1Id !== c.l1Id) return null;
+        matched++;
+      } else if (c.l1Id !== undefined) return null;
+    }
+    if (matched !== previous.leaves.size) return null;
+    return new SummaryTree(inputs, previous);
   }
 
   // ---- node access ----

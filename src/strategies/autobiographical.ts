@@ -8366,7 +8366,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
     if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
-      const tree = new SummaryTree(pickerInputs);
+      const reuse = this.kvUnifiedReuse;
+      const tree = (reuse.tree ? SummaryTree.derive(reuse.tree, pickerInputs) : null) ?? new SummaryTree(pickerInputs);
+      reuse.tree = tree;
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
       for (const chunk of pickerInputs.chunks) {
