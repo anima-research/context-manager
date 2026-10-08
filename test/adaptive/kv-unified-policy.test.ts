@@ -1387,6 +1387,16 @@ test('latent demand gates a certified base solve against the unrestricted best c
     for (const chunk of chronicle.chunks) chunk.salience = 0.2;
     chronicle.produceL1(['c0', 'c1']);
     chronicle.produceL1(['c2', 'c3']);
+    // Earlier L2 costs elsewhere in the history: the merge's expected (p50)
+    // recall cost then differs from its conservative (p80) one.
+    for (const [k, tokens] of [10, 20, 30, 40].entries()) {
+      const id = `L2-seen-${k}`;
+      chronicle.summaries.set(id, {
+        id, level: 2, content: 'seen', tokens, sourceLevel: 1, sourceIds: [],
+        sourceRange: { first: 'none', last: 'none' }, created: 0,
+      });
+      chronicle.recallPairTokens.set(id, tokens);
+    }
     const inputs: PickerInputs = {
       chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
       headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
@@ -1414,4 +1424,11 @@ test('latent demand gates a certified base solve against the unrestricted best c
     certified.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
     unrestricted.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
   );
+  const candidate = certified.strategy.lastDemandEvaluations[0]!;
+  assert.notEqual(candidate.expectedRecallTokens, candidate.conservativeRecallTokens);
+  // One conservative what-if each; the certified run adds the unrestricted
+  // base solve and nothing else: the expected-cost solve waits for the final
+  // gate, which neither run passes.
+  assert.equal(unrestricted.strategy.lastTimings?.demandSolves, 1);
+  assert.equal(certified.strategy.lastTimings?.demandSolves, 2);
 });

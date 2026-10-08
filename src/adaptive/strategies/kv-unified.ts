@@ -172,7 +172,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
       ? this.options.adoptEpsilon!
       : 0;
-    const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>): LatentDemandEvaluation[] => {
+    const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>, withExpected: boolean): LatentDemandEvaluation[] => {
       // One frame for the whole compile. Each solve measures its penalties
       // from its own pool's floors, so raw scores from two solves are not
       // comparable: a what-if whose forest reaches a lower continuity floor
@@ -200,8 +200,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
         const conservativeImprovement = baseBest - best(conservative);
         let expectedImprovement = conservativeImprovement;
         // Pass 2: the expected (p50) solve only orders emitted requests among
-        // themselves, so candidates the gate rejects never pay for it.
-        if (conservativeImprovement > epsilon &&
+        // themselves, so candidates the gate rejects never pay for it, and it
+        // runs once, against the base the gate is final on.
+        if (withExpected && conservativeImprovement > epsilon &&
             candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
           const expected = solveWithLatentCandidate(
             inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
@@ -236,18 +237,19 @@ export class KvUnifiedStrategy implements FoldingSolver {
       );
       return evaluations;
     };
-    let evaluations = rank(baseline);
+    let base = baseline;
     // A certified base solve exposes only the carried layout and its
     // extensions, which the certificate allows to score up to adoptEpsilon
     // above the best cut. A merge gated against that score could be worth
     // less than epsilon against the true best. Decide such a merge against
     // the unrestricted base solve; it runs only when a merge would otherwise
     // be requested, which is followed by a summarizer call anyway.
-    if (baseline.certificate && evaluations.some((evaluation) => evaluation.conservativeImprovement > epsilon)) {
+    if (baseline.certificate && rank(baseline, false).some((evaluation) => evaluation.conservativeImprovement > epsilon)) {
       const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
       this.demandSolves++;
-      if (unrestricted.feasible) evaluations = rank(unrestricted);
+      if (unrestricted.feasible) base = unrestricted;
     }
+    const evaluations = rank(base, true);
     this.demandEvaluations = evaluations;
     return evaluations
       .filter((evaluation) => evaluation.conservativeImprovement > epsilon)
