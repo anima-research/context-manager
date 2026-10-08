@@ -1051,6 +1051,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * updated by ID when its L1 lands.
    */
   protected chunkRecords: ChunkRecord[] = [];
+  /** The chunk owning each position of the listing the last rebuild saw. */
+  private _chunkByPosition: { listing: readonly StoredMessage[]; chunks: (Chunk | undefined)[] } | null = null;
   protected chunkIdCounter = 0;
   /**
    * Fail-closed latch: set when most persisted records resolve to zero live
@@ -2428,10 +2430,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected pinnedPositions(messages: StoredMessage[]): Set<number> {
     if (this.pins.length === 0) return new Set();
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
       const first = positionOf.get(pin.firstMessageId);
@@ -2455,8 +2454,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+    const positionOf = this.positionIndex(messages);
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
@@ -3803,6 +3801,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Merges refused by executeMerge because they would have minted a crossed node. */
   private topologyRefusals = 0;
 
+  /** id -> index for `messages`: the shared store order when this is the
+   *  listing it was refreshed from, else a map built for this call. */
+  protected positionIndex(messages: ReadonlyArray<{ id: MessageId }>): ReadonlyMap<MessageId, number> {
+    if (messages === this._storeOrderSource) return this._storeOrder;
+    const positionOf = new Map<MessageId, number>();
+    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+    return positionOf;
+  }
+
   protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
     if (messages.length === 0) return;
     const prev = this._storeOrderSource;
@@ -3852,6 +3859,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // hidden (viewFilter) or pruned: it occupies no position at all.
     for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
     return index;
+  }
+
+  /** First live L1 per message id (the fold-path fallback in selectAdaptive),
+   *  rebuilt only when the summary list's entries change. */
+  private _l1ByMessage: { entries: readonly SummaryEntry[]; map: Map<MessageId, SummaryId> } | null = null;
+  private l1ByMessageIndex(): Map<MessageId, SummaryId> {
+    const memo = this._l1ByMessage;
+    const current = this.summaries;
+    if (memo && memo.entries.length === current.length && memo.entries.every((s, i) => s === current[i])) return memo.map;
+    const map = new Map<MessageId, SummaryId>();
+    for (const s of current) {
+      if (s.level !== 1) continue;
+      for (const mid of s.sourceIds) {
+        if (!map.has(mid)) map.set(mid, s.id);
+      }
+    }
+    this._l1ByMessage = { entries: [...current], map };
+    return map;
   }
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
@@ -8208,11 +8233,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // For each compressible (non-head, non-tail) message we create one
     // PickerChunk. Its l1Id is determined by the existing chunks that
     // group messages into L1 summaries.
-    const chunksByMessageId = new Map<MessageId, Chunk>();
-    for (const ch of this.chunks) {
-      for (const m of ch.messages) {
-        chunksByMessageId.set(m.id, ch);
-      }
+    // rebuildChunks ran on this same listing just before (select), so its
+    // per-position owner table answers directly; any other listing gets a map.
+    const chunkAtPosition = this._chunkByPosition?.listing === messages ? this._chunkByPosition.chunks : null;
+    let chunksByMessageId: Pick<ReadonlyMap<MessageId, Chunk>, 'get'>;
+    if (chunkAtPosition) {
+      const order = this._storeOrder;
+      chunksByMessageId = { get: (id) => { const at = order.get(id); return at === undefined ? undefined : chunkAtPosition[at]; } };
+    } else {
+      const byId = new Map<MessageId, Chunk>();
+      for (const ch of this.chunks) for (const m of ch.messages) byId.set(m.id, ch);
+      chunksByMessageId = byId;
     }
 
     // Pinned-position set so the picker doesn't fold messages the user
@@ -8239,13 +8270,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // 233 raw messages pinned under re-merged L4s; the June c-279 chunk had
     // been in this deadlock silently). L1 `sourceIds` IS the coverage
     // authority — fall back to it when the ledger has no pointer.
-    const l1ByMessage = new Map<MessageId, SummaryId>();
-    for (const s of this.summaries) {
-      if (s.level !== 1) continue;
-      for (const mid of s.sourceIds) {
-        if (!l1ByMessage.has(mid)) l1ByMessage.set(mid, s.id);
-      }
-    }
+    const l1ByMessage = this.l1ByMessageIndex();
 
     // The foldable middle is everything outside the LIVE head window and the
     // reserved tail — INCLUDING [0, headStart) after a head-window reset.
@@ -8260,7 +8285,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const ch = chunksByMessageId.get(msg.id);
+      const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
       const tokens = msgCap > 0
         ? Math.min(pse[i], msgCap + 50)
         : pse[i];
@@ -9656,7 +9681,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected findAncestorAt(
     messageId: MessageId,
     level: number,
-    chunksByMessageId: ReadonlyMap<MessageId, Chunk>,
+    chunksByMessageId: Pick<ReadonlyMap<MessageId, Chunk>, 'get'>,
     summariesById?: ReadonlyMap<string, SummaryEntry>,
     /** Fold-path fallback (see selectAdaptive): message → covering L1 id
      *  from L1 sourceIds, for released/boundary-drifted chunk records.
@@ -9922,10 +9947,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Legacy (positionedRecallPairs=false): summaries concatenated into one
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     const pinnedPositionsSet = this.pinnedPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
@@ -10442,10 +10464,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     messages: StoredMessage[],
   ): SummaryEntry[] {
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     return [...summaries].sort((a, b) => {
       const posA = positionOf.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
       const posB = positionOf.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
@@ -10614,14 +10633,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const position = listing.length === 0 ? new Map<MessageId, number>() : this._storeOrder;
 
     const consumed = new Uint8Array(listing.length);
+    const byPosition: (Chunk | undefined)[] = new Array(listing.length);
+    this._chunkByPosition = { listing, chunks: byPosition };
     let orphaned = 0;
+    const positions: number[] = [];
     for (const rec of this.chunkRecords) {
       const msgs: StoredMessage[] = [];
+      positions.length = 0;
       for (const id of rec.sourceIds) {
         const at = position.get(id);
         if (at === undefined) continue;
         msgs.push(listing[at]);
         consumed[at] = 1;
+        positions.push(at);
       }
       if (msgs.length === 0) { orphaned++; continue; }
       const chunk: Chunk = {
@@ -10637,6 +10661,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         phaseType: rec.phaseType,
         recordId: rec.id,
       };
+      for (const at of positions) byPosition[at] = chunk;
       this.chunks.push(chunk);
     }
 
@@ -10709,6 +10734,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
         this.appendChunkRecord(record);
         chunk.recordId = record.id;
+      }
+      for (const m of chunk.messages) {
+        const at = position.get(m.id);
+        if (at !== undefined) byPosition[at] = chunk;
       }
       this.chunks.push(chunk);
       this.compressionQueue.push(chunk.index);

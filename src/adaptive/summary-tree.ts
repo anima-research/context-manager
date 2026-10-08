@@ -67,7 +67,6 @@ export class SummaryTree {
   private readonly nodes: Map<SummaryId, SummaryNode> = new Map();
   private readonly summaries: ReadonlyMap<SummaryId, SummaryEntry>;
   private readonly recallPairTokens: ReadonlyMap<SummaryId, number>;
-  private readonly leafSeq: Map<ChunkId, number> = new Map();
   private rootCache: TreeNode[] | null = null;
   /** The chunks this tree was built from, for `derive`. */
   private readonly sourceChunks: readonly PickerChunk[];
@@ -81,18 +80,15 @@ export class SummaryTree {
       // copy the leaves and patch only what moved.
       this.nodes = previous.nodes;
       this.leaves = new Map(previous.leaves);
-      this.leafSeq = new Map(previous.leafSeq);
       for (const c of inputs.chunks) {
         const leaf = this.leaves.get(c.id);
         if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence) continue;
-        this.leafSeq.set(c.id, c.sequence);
         this.leaves.set(c.id, { kind: 'leaf', chunkId: c.id, sequence: c.sequence, rawTokens: c.rawTokens, l1Id: c.l1Id });
       }
       return;
     }
 
     for (const c of inputs.chunks) {
-      this.leafSeq.set(c.id, c.sequence);
       this.leaves.set(c.id, {
         kind: 'leaf',
         chunkId: c.id,
@@ -245,7 +241,7 @@ export class SummaryTree {
     let firstSequence = Infinity;
     let lastSequence = -Infinity;
     for (const id of leafChunkIds) {
-      const seq = this.leafSeq.get(id);
+      const seq = this.leaves.get(id)?.sequence;
       if (seq === undefined) continue;
       if (seq < firstSequence) firstSequence = seq;
       if (seq > lastSequence) lastSequence = seq;
@@ -287,7 +283,7 @@ export class SummaryTree {
       seenSummaries.add(s.id);
       if (s.sourceLevel === 0) {
         for (const mid of s.sourceIds) {
-          if (!this.leafSeq.has(mid)) continue; // ghost of a surgically removed chunk
+          if (!this.leaves.has(mid)) continue; // ghost of a surgically removed chunk
           if (!seenLeaves.has(mid)) {
             seenLeaves.add(mid);
             out.push(mid);
@@ -301,7 +297,7 @@ export class SummaryTree {
       }
     };
     visit(summary);
-    out.sort((a, b) => (this.leafSeq.get(a) ?? 0) - (this.leafSeq.get(b) ?? 0));
+    out.sort((a, b) => (this.leaves.get(a)?.sequence ?? 0) - (this.leaves.get(b)?.sequence ?? 0));
     return out;
   }
 }

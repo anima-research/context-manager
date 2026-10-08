@@ -672,7 +672,6 @@ export class CanonicalSummaryForest {
     const conflicts: ConstraintConflict[] = [];
     const ordered: CanonicalLeaf[] = new Array(chunks.length);
     const roots = [...previous.roots];
-    let appended = false;
     let ownedLeafChanged = false;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
@@ -691,11 +690,11 @@ export class CanonicalSummaryForest {
       ordered[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
       if (i >= old.length) {
+        // Appended leaves carry sequences above every previous leaf (checked
+        // above), so pushing them in chunk order keeps the roots sorted.
         roots.push({ kind: 'leaf', id: chunk.id, firstSequence: chunk.sequence });
-        appended = true;
       }
     }
-    if (appended) roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
     const derived = new CanonicalSummaryForest(inputs, options, {
       ownership: previous.ownership,
       chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: ordered, roots,
