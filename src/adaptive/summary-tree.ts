@@ -76,10 +76,11 @@ export class SummaryTree {
     this.recallPairTokens = inputs.recallPairTokens ?? new Map();
     this.sourceChunks = inputs.chunks;
     if (previous) {
-      // `derive` verified ownership did not change: share the summary nodes,
-      // copy the leaves and patch only what moved.
+      // `derive` verified ownership did not change: share the summary nodes
+      // and take over the leaf map, patching only what moved (the previous
+      // tree is superseded by this one).
       this.nodes = previous.nodes;
-      this.leaves = new Map(previous.leaves);
+      this.leaves = previous.leaves;
       for (const c of inputs.chunks) {
         const leaf = this.leaves.get(c.id);
         if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence) continue;

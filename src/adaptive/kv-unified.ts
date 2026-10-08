@@ -670,7 +670,11 @@ export class CanonicalSummaryForest {
       a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
       pi.headChunkIds.has(a.id) === inputs.headChunkIds.has(b.id) &&
       pi.tailChunkIds.has(a.id) === inputs.tailChunkIds.has(b.id);
-    const leafMap = new Map(previous.leafMap);
+    // The derived forest takes over the previous forest's leaf map and
+    // extends it in place (appended leaves added, changed leaves replaced):
+    // the previous forest is superseded by this one, and nothing reads it
+    // for leaves it did not have. Its ordered leaf list stays its own.
+    const leafMap = previous.leafMap as Map<ChunkId, CanonicalLeaf>;
     const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
     const conflicts: ConstraintConflict[] = [];
     const ordered: CanonicalLeaf[] = new Array(chunks.length);

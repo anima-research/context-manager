@@ -70,13 +70,16 @@ test('derive handles appended ownerless leaves, a sliding tail, and per-leaf cha
   }));
   next.chunks.push(...appended);
   next.tailTokens = 123;
+  // The derived forest takes the previous leaf map over, so capture the
+  // objects to compare against before deriving.
+  const oldC0 = first.leaf('c0'), oldC8 = first.leaf('c8');
   const derived = CanonicalSummaryForest.derive(first, next, options);
   assert.ok(derived);
   const fresh = new CanonicalSummaryForest(next, options);
   assert.deepEqual(shape(derived), shape(fresh));
   // Unchanged leaves are shared, changed ones are new objects.
-  assert.equal(derived.leaf('c0'), first.leaf('c0'));
-  assert.notEqual(derived.leaf('c8'), first.leaf('c8'));
+  assert.equal(derived.leaf('c0'), oldC0);
+  assert.notEqual(derived.leaf('c8'), oldC8);
   assert.equal(derived.summary(first.roots.find((root) => root.kind === 'summary')!.id), first.summary(first.roots.find((root) => root.kind === 'summary')!.id));
   // Chained derivation keeps working.
   const third = nextCompile(next);

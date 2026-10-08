@@ -1053,6 +1053,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected chunkRecords: ChunkRecord[] = [];
   /** The chunk owning each position of the listing the last rebuild saw. */
   private _chunkByPosition: { listing: readonly StoredMessage[]; chunks: (Chunk | undefined)[] } | null = null;
+  /** Record-derived chunks of the last rebuild: reused while the listing only
+   *  grew, the record list only grew and the token calibration is unchanged. */
+  private _recordChunks: {
+    listing: readonly StoredMessage[];
+    records: ChunkRecord[];
+    calibration: number;
+    ignoreSize: boolean;
+    entries: Array<{ record: ChunkRecord; messages: StoredMessage[]; tokens: number; positions: number[] }>;
+  } | null = null;
+  /** Static salience per listing position (see selectAdaptive). */
+  private _salience: { listing: readonly StoredMessage[]; values: Float64Array } | null = null;
   protected chunkIdCounter = 0;
   /**
    * Fail-closed latch: set when most persisted records resolve to zero live
@@ -1780,6 +1791,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._storeOrderSource = [];
     this._chunkByPosition = null;
     this._l1ByMessage = null;
+    this._recordChunks = null;
+    this._salience = null;
+    this._exactL1 = null;
   }
 
   /**
@@ -2505,10 +2519,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Read the durable log as well as the local mirror for cross-instance L1 races. */
+  /** First live L1 per joined source-id key, rebuilt only when the summary
+   *  list's entries change (the scan joined every L1's ids on every call). */
+  private _exactL1: { entries: readonly SummaryEntry[]; byKey: Map<string, SummaryEntry> } | null = null;
   private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
-    const local = this.summaries.find(
-      (summary) => summary.level === 1 && summary.sourceIds.join(':') === chunkIdKey,
-    );
+    const memo = this._exactL1;
+    const current = this.summaries;
+    let byKey: Map<string, SummaryEntry>;
+    if (memo && memo.entries.length === current.length && memo.entries.every((s, i) => s === current[i])) {
+      byKey = memo.byKey;
+    } else {
+      byKey = new Map();
+      for (const summary of current) {
+        if (summary.level !== 1) continue;
+        const key = summary.sourceIds.join(':');
+        if (!byKey.has(key)) byKey.set(key, summary);
+      }
+      this._exactL1 = { entries: [...current], byKey };
+    }
+    const local = byKey.get(chunkIdKey);
     if (local) return local;
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
@@ -3804,6 +3833,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private topologyViolations: TopologyViolation[] = [];
   /** Merges refused by executeMerge because they would have minted a crossed node. */
   private topologyRefusals = 0;
+
+  /** `staticSalience` per position of `messages`, kept across appends (the
+   *  earlier positions hold the same message objects, so the same values). */
+  private salienceByPosition(messages: readonly StoredMessage[]): Float64Array {
+    const memo = this._salience;
+    if (memo && memo.listing === messages) return memo.values;
+    const values = new Float64Array(messages.length);
+    let from = 0;
+    if (memo && messages.length >= memo.listing.length) {
+      const prev = memo.listing;
+      let i = 0;
+      while (i < prev.length && messages[i] === prev[i]) i++;
+      if (i === prev.length) { values.set(memo.values); from = prev.length; }
+    }
+    for (let i = from; i < messages.length; i++) values[i] = AutobiographicalStrategy.staticSalience(messages[i]);
+    this._salience = { listing: messages, values };
+    return values;
+  }
 
   /** id -> index for `messages`: the shared store order when this is the
    *  listing it was refreshed from, else a map built for this call. */
@@ -8286,6 +8333,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : [[headEnd, effectiveRecentStart]];
 
     const pickerChunks: PickerChunk[] = [];
+    const salience = this.salienceByPosition(messages);
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
@@ -8306,7 +8354,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
-        salience: AutobiographicalStrategy.staticSalience(msg),
+        salience: salience[i],
       });
     }
 
@@ -10639,17 +10687,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const consumed = new Uint8Array(listing.length);
     const byPosition: (Chunk | undefined)[] = new Array(listing.length);
     this._chunkByPosition = { listing, chunks: byPosition };
+    // A record resolves to the same message objects at the same positions as
+    // last time when the listing only grew (the store keeps message objects
+    // until an edit, which replaces them all), so its messages and token sum
+    // carry over; only the record's own fields are re-read.
+    const calibration = store.getTokenCalibration?.() ?? 1;
+    const ignoreSize = !!this.config.attachmentsIgnoreSize;
+    const memo = this._recordChunks;
+    let reusable = memo !== null && memo.records === this.chunkRecords && memo.calibration === calibration &&
+      memo.ignoreSize === ignoreSize && listing.length >= memo.listing.length;
+    if (reusable) {
+      const prev = memo!.listing;
+      for (let i = 0; i < prev.length; i++) if (listing[i] !== prev[i]) { reusable = false; break; }
+    }
+    const entries: NonNullable<typeof memo>['entries'] = [];
     let orphaned = 0;
-    const positions: number[] = [];
-    for (const rec of this.chunkRecords) {
-      const msgs: StoredMessage[] = [];
-      positions.length = 0;
-      for (const id of rec.sourceIds) {
-        const at = position.get(id);
-        if (at === undefined) continue;
-        msgs.push(listing[at]);
-        consumed[at] = 1;
-        positions.push(at);
+    for (let r = 0; r < this.chunkRecords.length; r++) {
+      const rec = this.chunkRecords[r];
+      const kept = reusable && r < memo!.entries.length ? memo!.entries[r] : null;
+      let msgs: StoredMessage[], tokens: number, positions: number[];
+      if (kept && kept.record === rec && kept.messages.length === rec.sourceIds.length) {
+        ({ messages: msgs, tokens, positions } = kept);
+        for (const at of positions) consumed[at] = 1;
+        entries.push(kept);
+      } else {
+        msgs = []; positions = [];
+        for (const id of rec.sourceIds) {
+          const at = position.get(id);
+          if (at === undefined) continue;
+          msgs.push(listing[at]);
+          consumed[at] = 1;
+          positions.push(at);
+        }
+        tokens = msgs.reduce((sum, m) => sum + (ignoreSize
+          ? this.estimateTextOnlyTokens(m)
+          : store.estimateTokens(m)), 0);
+        entries.push({ record: rec, messages: msgs, tokens, positions });
       }
       if (msgs.length === 0) { orphaned++; continue; }
       const chunk: Chunk = {
@@ -10657,9 +10730,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         startIndex: -1, // record-derived; filtered-array indices are not meaningful
         endIndex: -1,
         messages: msgs,
-        tokens: msgs.reduce((sum, m) => sum + (this.config.attachmentsIgnoreSize
-          ? this.estimateTextOnlyTokens(m)
-          : store.estimateTokens(m)), 0),
+        tokens,
         compressed: rec.compressed,
         summaryId: rec.summaryId,
         phaseType: rec.phaseType,
@@ -10668,6 +10739,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const at of positions) byPosition[at] = chunk;
       this.chunks.push(chunk);
     }
+    this._recordChunks = { listing, records: this.chunkRecords, calibration, ignoreSize, entries };
 
     // ---- 2. Fail closed on the chain-break signature. ----
     // Most records resolving to zero live messages means message identity
