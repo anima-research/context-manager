@@ -861,27 +861,28 @@ export class MessageStore {
    * Estimate tokens for a message.
    */
   estimateTokens(message: StoredMessage): number {
+    const content = message.content;
     const hit = this._messageTokens.get(message);
-    if (
-      hit && hit.content === message.content && hit.length === message.content.length &&
-      hit.calibration === this.tokenCalibration
-    ) return hit.tokens;
+    if (hit && hit.calibration === this.tokenCalibration && hit.blocks.length === content.length) {
+      let same = true;
+      for (let i = 0; same && i < content.length; i++) same = hit.blocks[i] === content[i];
+      if (same) return hit.tokens;
+    }
     let tokens = 0;
-    for (const block of message.content) {
+    for (const block of content) {
       tokens += this.estimateBlockTokens(block);
     }
-    this._messageTokens.set(message, {
-      content: message.content, length: message.content.length, calibration: this.tokenCalibration, tokens,
-    });
+    this._messageTokens.set(message, { blocks: content.slice(), calibration: this.tokenCalibration, tokens });
     return tokens;
   }
 
   /** Whole-message estimate per mapped message object. Guarded by the
-   *  content array's identity and length and by the calibration factor, so a
-   *  message whose blocks were swapped or a recalibration never serves a stale
-   *  sum. Entries die with the message objects. */
+   *  identity of every block (a caller may replace one inside the same
+   *  content array) and by the calibration factor, so a changed block or a
+   *  recalibration never serves a stale sum. Entries die with the message
+   *  objects. */
   private _messageTokens = new WeakMap<StoredMessage, {
-    content: readonly ContentBlock[]; length: number; calibration: number; tokens: number;
+    blocks: readonly ContentBlock[]; calibration: number; tokens: number;
   }>();
 
   /**

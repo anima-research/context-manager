@@ -1,7 +1,7 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import type { PresentedLeaf } from './kv-unified-policy.js';
-import { CanonicalSummaryForest, type CanonicalLeaf, type CanonicalSummary } from './kv-unified.js';
+import { CanonicalSummaryForest, orderedChunks, type CanonicalLeaf, type CanonicalSummary } from './kv-unified.js';
 import { TerminalPolicyEvaluator, presentedLeavesByIndex } from './kv-unified-terminal.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -409,7 +409,7 @@ export function certifyCarriedLayout(
   // Bound recursive context construction independently of the node-count cap.
   // Decline deep ownership chains before entering the recursive compiler.
   if (leaves.some((leaf) => leaf.summaryIds.length > 256)) return null;
-  const chunks = forest.orderedChunks();
+  const chunks = forest.builtFrom(inputs) ? forest.orderedChunks() : orderedChunks(inputs.chunks);
   const n = leaves.length;
   const newest = n > 0 ? chunks[n - 1].sequence : 0;
   const presentation = options.presentation;

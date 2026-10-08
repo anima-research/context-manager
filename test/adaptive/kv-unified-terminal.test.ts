@@ -267,3 +267,68 @@ test('an evaluator reuses a kept layout translation only where the structure hol
     }
   }
 });
+
+test('a solve reusing one options object after the presentation map changed reads the new entry', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'x', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['x']);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const leaves = new Map([['x', { level: 0, repHash: 'raw:x', lastChangedSeq: 1 }]]);
+  const options = {
+    maxTokens: 10_000, adoptEpsilon: 1, hysteresisCertificate: true,
+    policy: { continuityLambda: 10_000, continuityScale: 1, budgetLowRatio: 0, budgetHighRatio: 1 },
+    presentation: { currentSeq: 5, leaves } as AcceptedPresentationReference,
+  };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, new CanonicalSummaryForest(inputs));
+  const first = solver.solve(options);
+  assert.ok(first.feasible);
+  assert.equal(first.selected.frontier.get('x'), 0);
+  // The accepted level moves to L1 inside the same map, and the same options
+  // object is solved again: it must read the map again, as a fresh one would.
+  leaves.set('x', { level: 1, repHash: `summary:${l1.id}`, lastChangedSeq: 1 });
+  const reused = solver.solve(options);
+  const fresh = new ParetoKvUnifiedPolicySolver(inputs, new CanonicalSummaryForest(inputs)).solve({ ...options });
+  assert.ok(reused.feasible && fresh.feasible);
+  assert.equal(reused.selected.frontier.get('x'), 1);
+  assert.deepEqual([...reused.selected.frontier], [...fresh.selected.frontier]);
+  assert.equal(reused.selected.score, fresh.selected.score);
+  assert.equal(reused.selected.continuityLoss, fresh.selected.continuityLoss);
+});
+
+test('a kept layout translation with an unknown unit is rebuilt once the forest holds that leaf', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.produceL1(['a']);
+  chronicle.produceL1(['b']);
+  const baseInputs = live(chronicle);
+  const base = new CanonicalSummaryForest(baseInputs);
+  chronicle.addChunk({ id: 'x', rawTokens: 100 });
+  const grownInputs = live(chronicle);
+  // The accepted layout names x; the shorter forest cannot code that unit.
+  const layout = renderLayout(grownInputs, new SummaryTree(grownInputs), new Map([['a', 1], ['b', 1], ['x', 0]]));
+  assert.equal(layout.units.length, 3);
+  const options = {
+    maxTokens: 150, policy: { cacheLambda: 10000, cacheScale: 100 },
+    cache: { immutablePrefixHash: 'same', layout,
+      markers: layout.units.map((_, i) => ({ unitIndex: i + 1, offset: layout.units[i + 1]?.offset ?? layout.totalTokens })) },
+    currentImmutablePrefixHash: 'same',
+  };
+  new TerminalPolicyEvaluator(baseInputs, base, options);
+  const grown = CanonicalSummaryForest.derive(base, grownInputs)!;
+  assert.ok(grown);
+  const reused = new TerminalPolicyEvaluator(grownInputs, grown, options);
+  const fresh = new TerminalPolicyEvaluator(grownInputs, new CanonicalSummaryForest(grownInputs), options);
+  for (const candidate of grown.enumerateExactCuts().candidates) {
+    const trace = traceFor(candidate.frontier);
+    const actual = reused.candidate(trace, candidate.renderedTokens);
+    const expected = fresh.candidate(trace, candidate.renderedTokens);
+    const at = [...candidate.frontier].join(' ');
+    assert.equal(actual.cacheChurn, expected.cacheChurn, `churn at ${at}`);
+    assert.equal(actual.fidelityLoss, expected.fidelityLoss, `F at ${at}`);
+    assert.equal(actual.continuityLoss, expected.continuityLoss, `K at ${at}`);
+  }
+});

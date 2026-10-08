@@ -366,3 +366,14 @@ test('derive reads leaf fields from its own leaves, not from chunk objects updat
   assert.equal(reused.exhausted, fresh.exhausted);
   assert.deepEqual(reused.frontier, fresh.frontier);
 });
+
+test('derive declines a placed summary deleted from the same input map', () => {
+  const inputs = fixture();
+  const forest = new CanonicalSummaryForest(inputs);
+  const l1 = [...inputs.summaries.values()].find((entry) => entry.level === 1)!;
+  // The caller edits the map the forest was built from, in place; the chunks
+  // still name the deleted L1.
+  (inputs.summaries as Map<string, unknown>).delete(l1.id);
+  assert.equal(CanonicalSummaryForest.derive(forest, inputs), null);
+  assert.throws(() => new CanonicalSummaryForest(inputs));
+});

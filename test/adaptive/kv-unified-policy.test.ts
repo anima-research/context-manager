@@ -1375,3 +1375,43 @@ test('latent demand is re-ranked on every solve: appended messages and policy ch
   assert.deepEqual(third.produced, fresh(appended, { budgetOverLambda: 0 }).produced);
   assert.equal(third.produced.length, 0);
 });
+
+test('latent demand gates a certified base solve against the unrestricted best cut', () => {
+  // Four raw leaves under two L1s. The accepted raw layout certifies under a
+  // wide adoptEpsilon, so the base solve exposes only that layout, scored up
+  // to epsilon above the best cut. A merge compared with that score alone
+  // would look worth more than epsilon; against the best cut it is not.
+  const build = (hysteresisCertificate: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 100 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+    for (const chunk of chronicle.chunks) chunk.salience = 0.2;
+    chronicle.produceL1(['c0', 'c1']);
+    chronicle.produceL1(['c2', 'c3']);
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map(chronicle.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }]));
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.125, budgetUnderLambda: 0, budgetOverLambda: 1600,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      adoptEpsilon: 1300, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4 },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 });
+    return { strategy, result };
+  };
+  const certified = build(true);
+  const unrestricted = build(false);
+  assert.ok(certified.strategy.lastResult?.certificate, 'the base solve certifies the accepted layout');
+  assert.equal(unrestricted.strategy.lastResult?.certificate, undefined);
+  assert.deepEqual(certified.result.produced, unrestricted.result.produced);
+  assert.deepEqual(
+    certified.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
+    unrestricted.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
+  );
+});

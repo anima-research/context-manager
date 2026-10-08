@@ -120,7 +120,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
       );
     }
     const produced = this.options.latentDemand
-      ? this.rankLatentDemand(inputs, forest, result, budget)
+      ? this.rankLatentDemand(inputs, forest, solver, result, budget)
       : [];
     this.requests = produced;
     this.timings = { ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves };
@@ -150,6 +150,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
   private rankLatentDemand(
     inputs: PickerInputs,
     forest: CanonicalSummaryForest,
+    solver: ParetoKvUnifiedPolicySolver,
     baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
     budget: FoldingBudget,
   ): ProduceRequest[] {
@@ -164,74 +165,89 @@ export class KvUnifiedStrategy implements FoldingSolver {
       this.demandSolves++;
       return conservative.feasible ? [{ candidate, conservative }] : [];
     });
-    // One frame for the whole compile. Each solve measures its penalties
-    // from its own pool's floors, so raw scores from two solves are not
-    // comparable: a what-if whose forest reaches a lower continuity floor
-    // looks worse, not better. Every what-if forest contains the base forest,
-    // so the lowest floors any pool reached are the frame for all of them,
-    // and both sides are rescored there before subtracting.
-    let cacheFloor = baseline.cacheFloor;
-    let continuityFloor = baseline.continuityFloor;
-    for (const { conservative } of solved) {
-      cacheFloor = Math.min(cacheFloor, conservative.cacheFloor);
-      continuityFloor = Math.min(continuityFloor, conservative.continuityFloor);
-    }
     const policy = normalizePolicy(this.options.policy);
     const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
-    const best = (result: Extract<ParetoPolicySolveResult, { feasible: true }>): number => {
-      if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
-      let score = Infinity;
-      for (const c of result.candidates) {
-        score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
-          cacheFloor, continuityFloor, policy, multiplier));
-      }
-      return score;
-    };
-    const baseBest = best(baseline);
     // Merges worth less than adoptEpsilon are not demanded; that is the
     // hysteresis policy's own tolerance, applied here to best-vs-best.
     const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
       ? this.options.adoptEpsilon!
       : 0;
-    const evaluations: LatentDemandEvaluation[] = [];
-    for (const { candidate, conservative } of solved) {
-      const conservativeImprovement = baseBest - best(conservative);
-      let expectedImprovement = conservativeImprovement;
-      // Pass 2: the expected (p50) solve only orders emitted requests among
-      // themselves, so candidates the gate rejects never pay for it.
-      if (conservativeImprovement > epsilon &&
-          candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
-        const expected = solveWithLatentCandidate(
-          inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
-        );
-        this.demandSolves++;
-        if (!expected.feasible) continue;
-        expectedImprovement = baseBest - best(expected);
+    const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>): LatentDemandEvaluation[] => {
+      // One frame for the whole compile. Each solve measures its penalties
+      // from its own pool's floors, so raw scores from two solves are not
+      // comparable: a what-if whose forest reaches a lower continuity floor
+      // looks worse, not better. Every what-if forest contains the base forest,
+      // so the lowest floors any pool reached are the frame for all of them,
+      // and both sides are rescored there before subtracting.
+      let cacheFloor = base.cacheFloor;
+      let continuityFloor = base.continuityFloor;
+      for (const { conservative } of solved) {
+        cacheFloor = Math.min(cacheFloor, conservative.cacheFloor);
+        continuityFloor = Math.min(continuityFloor, conservative.continuityFloor);
       }
-      evaluations.push({
-        request: candidate.request,
-        sourceIds: candidate.sourceIds,
-        expectedRecallTokens: candidate.expectedRecallTokens,
-        conservativeRecallTokens: candidate.conservativeRecallTokens,
-        expectedImprovement,
-        conservativeImprovement,
-        // Approximate only when pruning could have cost score: a bucket that
-        // merged nothing, or an exact engine, reports a zero bound.
-        approximate: Boolean(
-          conservative.propagation &&
-          (
-            !conservative.propagation.approximationBounded ||
-            conservative.propagation.approximationScoreErrorBound > 0
+      const best = (result: Extract<ParetoPolicySolveResult, { feasible: true }>): number => {
+        if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
+        let score = Infinity;
+        for (const c of result.candidates) {
+          score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
+            cacheFloor, continuityFloor, policy, multiplier));
+        }
+        return score;
+      };
+      const baseBest = best(base);
+      const evaluations: LatentDemandEvaluation[] = [];
+      for (const { candidate, conservative } of solved) {
+        const conservativeImprovement = baseBest - best(conservative);
+        let expectedImprovement = conservativeImprovement;
+        // Pass 2: the expected (p50) solve only orders emitted requests among
+        // themselves, so candidates the gate rejects never pay for it.
+        if (conservativeImprovement > epsilon &&
+            candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
+          const expected = solveWithLatentCandidate(
+            inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
+          );
+          this.demandSolves++;
+          if (!expected.feasible) continue;
+          expectedImprovement = baseBest - best(expected);
+        }
+        evaluations.push({
+          request: candidate.request,
+          sourceIds: candidate.sourceIds,
+          expectedRecallTokens: candidate.expectedRecallTokens,
+          conservativeRecallTokens: candidate.conservativeRecallTokens,
+          expectedImprovement,
+          conservativeImprovement,
+          // Approximate only when pruning could have cost score: a bucket that
+          // merged nothing, or an exact engine, reports a zero bound.
+          approximate: Boolean(
+            conservative.propagation &&
+            (
+              !conservative.propagation.approximationBounded ||
+              conservative.propagation.approximationScoreErrorBound > 0
+            ),
           ),
-        ),
-      });
+        });
+      }
+      evaluations.sort((a, b) =>
+        b.conservativeImprovement - a.conservativeImprovement ||
+        b.expectedImprovement - a.expectedImprovement ||
+        a.request.level - b.request.level ||
+        a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
+      );
+      return evaluations;
+    };
+    let evaluations = rank(baseline);
+    // A certified base solve exposes only the carried layout and its
+    // extensions, which the certificate allows to score up to adoptEpsilon
+    // above the best cut. A merge gated against that score could be worth
+    // less than epsilon against the true best. Decide such a merge against
+    // the unrestricted base solve; it runs only when a merge would otherwise
+    // be requested, which is followed by a summarizer call anyway.
+    if (baseline.certificate && evaluations.some((evaluation) => evaluation.conservativeImprovement > epsilon)) {
+      const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+      this.demandSolves++;
+      if (unrestricted.feasible) evaluations = rank(unrestricted);
     }
-    evaluations.sort((a, b) =>
-      b.conservativeImprovement - a.conservativeImprovement ||
-      b.expectedImprovement - a.expectedImprovement ||
-      a.request.level - b.request.level ||
-      a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
-    );
     this.demandEvaluations = evaluations;
     return evaluations
       .filter((evaluation) => evaluation.conservativeImprovement > epsilon)

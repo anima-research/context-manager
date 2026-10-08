@@ -45,7 +45,9 @@ interface EvaluatorStructure {
   representations: Uint32Array;
   /** 0 when the slot carries no continuity loss, else max(1, |level - previous.level|). */
   distance: Float64Array;
-  previousUnits?: { layout: RenderLayout; units: Uint32Array };
+  /** `unknown`: some unit of the layout had no code in the forest that saved
+   *  this; a forest that gained that leaf or summary must translate again. */
+  previousUnits?: { layout: RenderLayout; units: Uint32Array; unknown: boolean };
 }
 
 const structures = new WeakMap<object, EvaluatorStructure>();
@@ -258,7 +260,7 @@ export class TerminalPolicyEvaluator {
     const knownPrevious = structure?.previous ?? [];
     const layout = options.cache?.layout;
     const keptUnits = structure?.previousUnits;
-    if (layout && keptUnits && keptUnits.layout === layout && aligned) {
+    if (layout && keptUnits && keptUnits.layout === layout && aligned && !keptUnits.unknown) {
       const table = remap;
       this.previousUnits = table ? keptUnits.units.map((code) => table[code])
         : shift === 0 ? keptUnits.units : keptUnits.units.map((code) => code > leafCount ? code + shift : code);
@@ -325,7 +327,7 @@ export class TerminalPolicyEvaluator {
         stride: this.stride, summaryCount: summaries.length, summaryIds: summaries.map((summary) => summary.id), chunkCount: n,
         leaves: nextLeaves, previous: nextPrevious,
         matches: this.matches, representations: this.representations, distance,
-        previousUnits: layout ? { layout, units: this.previousUnits } : undefined,
+        previousUnits: layout ? { layout, units: this.previousUnits, unknown: this.previousUnits.includes(0) } : undefined,
       });
     }
   }

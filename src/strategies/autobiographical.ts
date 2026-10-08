@@ -1794,6 +1794,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._recordChunks = null;
     this._salience = null;
     this._exactL1 = null;
+    this._postStripMemo = null;
+    this._coverageMemo = null;
+    delete this.kvUnifiedReuse.forest;
+    delete this.kvUnifiedReuse.tree;
+    delete this.kvUnifiedReuse.certificate;
   }
 
   /**

@@ -236,7 +236,8 @@ interface ChainLevels {
 
 /** `chunks` in (sequence, id) order: a copy when already ordered (sorting a
  *  sorted list still pays a comparator call per element), else sorted. */
-function orderedChunks(chunks: readonly PickerChunk[]): PickerChunk[] {
+/** `chunks` by sequence then id; a copy, so the caller's array is untouched. */
+export function orderedChunks(chunks: readonly PickerChunk[]): PickerChunk[] {
   let ordered = true;
   for (let i = 1; ordered && i < chunks.length; i++) {
     const a = chunks[i - 1], b = chunks[i];
@@ -1001,9 +1002,10 @@ export class CanonicalSummaryForest {
       if (old.level !== entry.level || getSummaryParentId(old) !== getSummaryParentId(entry)) return null;
       if (recall !== (pi.recallPairTokens?.get(id) ?? old.tokens)) return null;
     }
-    if (inputs.summaries.size < pi.summaries.size) {
-      for (const id of pi.summaries.keys()) if (!inputs.summaries.has(id)) return null;
-    }
+    // A placed summary that is gone is a full build (which reports any chunk
+    // still pointing at it). Checked against the previous forest's own
+    // record, not the old input map: a caller may edit that map in place.
+    for (const id of previous.summaryMap.keys()) if (!inputs.summaries.has(id)) return null;
     const chunks = orderedChunks(inputs.chunks);
     const oldLeaves = previous.orderedLeafList;
     if (chunks.length < oldLeaves.length) return null;

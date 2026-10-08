@@ -8,6 +8,7 @@ import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
   type ExactCutCandidate,
+  orderedChunks,
 } from './kv-unified.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -132,7 +133,10 @@ export class ParetoKvUnifiedPolicySolver {
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
     this.leaves = this.forest.orderedLeaves();
-    this.chunks = this.forest.orderedChunks();
+    // A forest built from these inputs already holds this sort of them; any
+    // other forest prices with the caller's current chunks (same as the exact
+    // scorer and the terminal evaluator).
+    this.chunks = this.forest.builtFrom(inputs) ? this.forest.orderedChunks() : orderedChunks(inputs.chunks);
     this.midpointAge = new Float64Array(this.leaves.length);
     this.newestSequence = inputs.chunks.reduce((newest, chunk) => Math.max(newest, chunk.sequence), 0);
     let age = 0;
@@ -144,6 +148,11 @@ export class ParetoKvUnifiedPolicySolver {
   }
 
   solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
+    // The options object is the scope of the per-solve caches (the accepted
+    // presentation read per leaf position, shared by the certificate and the
+    // evaluators). A caller reusing one object across solves, with its
+    // presentation map edited in between, must not be served the old read.
+    options = { ...options };
     this.summaryMetricCache = new WeakMap();
     const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { ExactKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-policy.js';
 import { TerminalPolicyEvaluator, type FrontierTrace } from '../../src/adaptive/kv-unified-terminal.js';
+import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { MockChronicle } from './harness.js';
 
@@ -74,4 +75,22 @@ test('a levels vector prices like the frontier map and must cover every leaf', (
     assert.deepEqual(byLevels.frontier, byTrace.frontier);
   }
   assert.throws(() => evaluator.candidate({ levels: new Uint32Array(2) }, 0), /levels vector has 2 entries for 4 leaves/);
+});
+
+test('the propagation engines price chunks replaced after the build from the current inputs', () => {
+  const inputs = fixture();
+  const forest = new CanonicalSummaryForest(inputs);
+  for (const i of [2, 3]) inputs.chunks[i] = { ...inputs.chunks[i], salience: 0.2 };
+  assert.equal(forest.builtFrom(inputs), false);
+  const solve = { maxTokens: 235, policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 1 } };
+  for (const variant of [{ engine: 'leaf' as const }, { storage: 'objects' as const }, {}]) {
+    const stale = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...solve, ...variant });
+    const fresh = new ParetoKvUnifiedPolicySolver(inputs, new CanonicalSummaryForest(inputs)).solve({ ...solve, ...variant });
+    assert.ok(stale.feasible && fresh.feasible);
+    const at = JSON.stringify(variant);
+    // The pair that lost salience is the one to fold.
+    assert.deepEqual([...fresh.selected.frontier].sort(), [['c0', 0], ['c1', 0], ['c2', 1], ['c3', 1]], `fresh fold at ${at}`);
+    assert.deepEqual([...stale.selected.frontier].sort(), [...fresh.selected.frontier].sort(), `frontier at ${at}`);
+    assert.equal(stale.selected.score, fresh.selected.score, `score at ${at}`);
+  }
 });
