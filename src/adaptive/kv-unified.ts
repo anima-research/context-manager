@@ -237,6 +237,12 @@ const orderedChildrenCache = new WeakMap<CanonicalSummary, readonly OrderedChild
 /** Positions (in `orderedLeaves()`) of a summary's leaves, parallel to its
  *  `leafIds`; stable across derived forests. */
 const summaryLeafIndexCache = new WeakMap<CanonicalSummary, Int32Array>();
+const summaryHashes = new WeakMap<CanonicalSummary, string>();
+function summaryHashOf(summary: CanonicalSummary): string {
+  let hash = summaryHashes.get(summary);
+  if (hash === undefined) summaryHashes.set(summary, hash = `summary:${summary.id}`);
+  return hash;
+}
 
 /** Parts of a forest derived from a previous one (see `derive`). */
 export interface PrebuiltForestParts {
@@ -370,8 +376,17 @@ export class CanonicalSummaryForest {
     }
 
     const chains = new Map<ChunkId, SummaryId[]>();
+    // Every chunk under one L1 has the same chain: a walk that raised no
+    // issue is shared; a walk with issues is repeated per chunk so each
+    // issue names its chunk as before.
+    const cleanChainByL1 = new Map<SummaryId, SummaryId[]>();
     const mutableSummaries = new Map<SummaryId, MutableSummary>();
     for (const chunk of chunks) {
+      if (chunk.l1Id !== undefined) {
+        const known = cleanChainByL1.get(chunk.l1Id);
+        if (known) { chains.set(chunk.id, known); continue; }
+      }
+      const issuesBefore = issues.length;
       const chain: SummaryId[] = [];
       const seen = new Set<SummaryId>();
       let currentId = chunk.l1Id;
@@ -441,6 +456,7 @@ export class CanonicalSummaryForest {
         currentId = getSummaryParentId(entry);
       }
       chains.set(chunk.id, chain);
+      if (chunk.l1Id !== undefined && issues.length === issuesBefore) cleanChainByL1.set(chunk.l1Id, chain);
     }
 
     if (issues.length > 0) throw new CanonicalForestError(issues);
@@ -486,17 +502,22 @@ export class CanonicalSummaryForest {
       rebuildOwnership();
       const contiguityIssues: CanonicalForestIssue[] = [];
       for (const summary of mutableSummaries.values()) {
-        const indices = [...summary.leafIds].map((id) => indexOfLeaf.get(id)!).sort((a, b) => a - b);
-        for (let i = 1; i < indices.length; i++) {
-          if (indices[i] !== indices[i - 1] + 1) {
-            contiguityIssues.push({
-              code: 'non-contiguous-ownership',
-              message: `summary ${summary.id} owns non-contiguous live leaves`,
-              leafIds: [...summary.leafIds],
-              summaryIds: [summary.id],
-            });
-            break;
-          }
+        // Leaf positions are distinct, so the set is contiguous exactly when
+        // it spans count positions from its lowest to its highest.
+        let lowest = Infinity, highest = -Infinity, count = 0;
+        for (const id of summary.leafIds) {
+          const at = indexOfLeaf.get(id)!;
+          if (at < lowest) lowest = at;
+          if (at > highest) highest = at;
+          count++;
+        }
+        if (count > 0 && highest - lowest + 1 !== count) {
+          contiguityIssues.push({
+            code: 'non-contiguous-ownership',
+            message: `summary ${summary.id} owns non-contiguous live leaves`,
+            leafIds: [...summary.leafIds],
+            summaryIds: [summary.id],
+          });
         }
       }
       if (contiguityIssues.length === 0) break;
@@ -518,24 +539,25 @@ export class CanonicalSummaryForest {
     }
 
     const summaryMap = new Map<SummaryId, CanonicalSummary>();
+    // rebuildOwnership inserts leaf ids in chunk (position) order, so each
+    // set already lists its leaves by position; a summary's first position
+    // is its first leaf's.
+    const firstPosition = new Map<SummaryId, number>();
     for (const summary of mutableSummaries.values()) {
-      const leafIds = [...summary.leafIds].sort(
-        (a, b) => indexOfLeaf.get(a)! - indexOfLeaf.get(b)!,
-      );
+      const first = summary.leafIds.values().next();
+      firstPosition.set(summary.id, first.done ? Infinity : indexOfLeaf.get(first.value)!);
+    }
+    for (const summary of mutableSummaries.values()) {
+      const leafIds = [...summary.leafIds];
       summaryMap.set(summary.id, {
         kind: 'summary',
         id: summary.id,
         level: summary.level,
         recallTokens: summary.recallTokens,
         parentId: summary.parentId,
-        childSummaryIds: [...summary.childSummaryIds].sort((a, b) => {
-          const aFirst = Math.min(...[...mutableSummaries.get(a)!.leafIds].map((id) => indexOfLeaf.get(id)!));
-          const bFirst = Math.min(...[...mutableSummaries.get(b)!.leafIds].map((id) => indexOfLeaf.get(id)!));
-          return aFirst - bFirst || a.localeCompare(b);
-        }),
-        directLeafIds: [...summary.directLeafIds].sort(
-          (a, b) => indexOfLeaf.get(a)! - indexOfLeaf.get(b)!,
-        ),
+        childSummaryIds: [...summary.childSummaryIds].sort((a, b) =>
+          firstPosition.get(a)! - firstPosition.get(b)! || a.localeCompare(b)),
+        directLeafIds: [...summary.directLeafIds],
         leafIds,
         firstSequence: chunkById.get(leafIds[0])!.sequence,
         lastSequence: chunkById.get(leafIds[leafIds.length - 1])!.sequence,
@@ -598,7 +620,8 @@ export class CanonicalSummaryForest {
     index: number,
   ): { leaf: CanonicalLeaf; conflict?: ConstraintConflict } {
     const availableLevels = [0, ...chain.map((id) => summaryMap.get(id)!.level)];
-    const repHashes = [`raw:${chunk.id}`, ...chain.map((id) => `summary:${id}`)];
+    // One hash string per summary object, shared by every leaf it owns.
+    const repHashes = [`raw:${chunk.id}`, ...chain.map((id) => summaryHashOf(summaryMap.get(id)!))];
     const constraints = CanonicalSummaryForest.constraintsFor(chunk, inputs, options);
     let allowedLevels = [...availableLevels];
     const requestedMissingLevels = new Set<number>();
