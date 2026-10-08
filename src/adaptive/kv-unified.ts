@@ -87,12 +87,6 @@ export interface CanonicalLeaf {
    * `raw:<id>` at level 0, `summary:<ancestor id>` above. Computed once per
    * leaf build so per-compile scoring never rebuilds these strings. */
   readonly repHashes: readonly string[];
-  /** The chunk fields the leaf was built from, so a derive compares against
-   * the build-time values and not a chunk object a caller updated in place. */
-  readonly pinned: boolean;
-  readonly lockedByAgent: boolean;
-  readonly pinLevel: number | undefined;
-  readonly pinMaxLevel: number | undefined;
   /** Position in `orderedLeaves()` (chronological). Stable across derived forests. */
   readonly index: number;
 }
@@ -315,12 +309,26 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
   return zone;
 }
 
-/** Whether `chunk` would build the leaf `leaf` was built from, by the leaf's
- * own record of its inputs (head/tail zones are compared by position). */
+/** Whether `chunk` would build the leaf `leaf` was built from, read from the
+ * leaf's own record of its inputs and not from a chunk object a caller may
+ * have updated in place: cost and carried level are leaf fields, pins and
+ * locks are its constraints (`constraintsFor`; the zone constraints are
+ * compared by position, and option constraints make `derive` decline). The
+ * leaf keeps its shape: the per-leaf loops of every compile read it. */
 function sameLeafInputs(leaf: CanonicalLeaf, chunk: PickerChunk): boolean {
-  return leaf.rawTokens === chunk.rawTokens && leaf.carriedLevel === chunk.currentResolution &&
-    leaf.lockedByAgent === chunk.lockedByAgent && leaf.pinned === chunk.pinned &&
-    leaf.pinLevel === chunk.pinLevel && leaf.pinMaxLevel === chunk.pinMaxLevel;
+  if (leaf.rawTokens !== chunk.rawTokens || leaf.carriedLevel !== chunk.currentResolution) return false;
+  let pinned = false, locked = false;
+  let pinLevel: number | undefined, pinMaxLevel: number | undefined;
+  for (const constraint of leaf.constraints) {
+    switch (constraint.source) {
+      case 'classic-pin': pinned = true; break;
+      case 'lockedByAgent': locked = true; break;
+      case 'pin-level': pinLevel = constraint.level; break;
+      case 'pin-max-level': pinMaxLevel = constraint.level; break;
+    }
+  }
+  return pinned === !!chunk.pinned && locked === !!chunk.lockedByAgent &&
+    pinLevel === chunk.pinLevel && pinMaxLevel === chunk.pinMaxLevel;
 }
 
 export class CanonicalSummaryForest {
@@ -926,10 +934,6 @@ export class CanonicalSummaryForest {
       sequence: chunk.sequence,
       rawTokens: chunk.rawTokens,
       carriedLevel: chunk.currentResolution,
-      pinned: chunk.pinned,
-      lockedByAgent: chunk.lockedByAgent,
-      pinLevel: chunk.pinLevel,
-      pinMaxLevel: chunk.pinMaxLevel,
       externallyAccounted:
         inputs.headChunkIds.has(chunk.id) || inputs.tailChunkIds.has(chunk.id),
       summaryIds: chain,
