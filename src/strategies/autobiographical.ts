@@ -8371,22 +8371,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       reuse.tree = tree;
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
+      // The forest the picker just solved on carries each leaf's hash per
+      // level; the tree is the fallback for leaves it does not know.
+      const forest = reuse.forest;
       for (const chunk of pickerInputs.chunks) {
         const level = result.finalResolutions.get(chunk.id) ?? 0;
-        const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
-        if (level > 0 && !summaryId) {
-          throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+        const leaf = forest?.leaf(chunk.id);
+        const slot = leaf ? leaf.availableLevels.indexOf(level) : -1;
+        let repHash: string;
+        if (leaf && slot >= 0) {
+          repHash = leaf.repHashes[slot];
+        } else {
+          const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
+          if (level > 0 && !summaryId) {
+            throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+          }
+          repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         }
-        const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
-        leaves.set(chunk.id, {
-          repHash,
-          level,
-          lastChangedSeq:
-            previous?.repHash === repHash && previous.level === level
-              ? previous.lastChangedSeq
-              : nextSequence,
-        });
+        // An unchanged leaf keeps its receipt object: no allocation, and the
+        // chain's diff sees identity before it compares fields.
+        leaves.set(chunk.id, previous && previous.repHash === repHash && previous.level === level
+          ? previous
+          : { repHash, level, lastChangedSeq: nextSequence });
       }
       this.kvUnifiedDraft = {
         leaves,
