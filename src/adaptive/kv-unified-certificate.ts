@@ -51,7 +51,8 @@ export interface CertificateDag {
   leafObjects: readonly CanonicalLeaf[];
   readonly nodes: DagNode[];
   readonly roots: number[];
-  readonly leafNode: Map<ChunkId, number>;
+  /** Node index per leaf position (the forest's leaf `index`), -1 if none. */
+  leafNode: Int32Array;
   /** Last compile's accepted-level check per leaf: the leaf object, the
    *  receipt entry it was checked against, and the level it fixed. A leaf
    *  seen again with the same objects passes with the same level. */
@@ -165,22 +166,27 @@ function reuseDag(
     const leaf = leaves[i];
     if (leaf === previous[i]) continue;
     if (leaf.id !== previous[i].id || leaf.summaryIds.length > 0) return null;
-    const index = cache.leafNode.get(leaf.id);
-    if (index === undefined) return null;
+    const index = cache.leafNode[i];
+    if (!(index >= 0)) return null;
     const node = cache.nodes[index];
     const fields = leafNodeFields(leaf);
     node.tokens = fields.tokens;
     node.canSelect = fields.canSelect;
   }
+  if (leaves.length > cache.leafNode.length) {
+    const grown = new Int32Array(leaves.length).fill(-1);
+    grown.set(cache.leafNode);
+    cache.leafNode = grown;
+  }
   for (let i = previous.length; i < leaves.length; i++) {
     const leaf = leaves[i];
-    if (leaf.summaryIds.length > 0 || cache.leafNode.has(leaf.id)) return null;
+    if (leaf.summaryIds.length > 0 || leaf.index !== i || cache.leafNode[i] >= 0) return null;
     const fields = leafNodeFields(leaf);
     cache.nodes.push({
-      tokens: fields.tokens, fidelity: 0, children: [], selectedChildren: [], canExpand: false,
+      tokens: fields.tokens, fidelity: 0, children: NO_CHILDREN, selectedChildren: NO_CHILDREN, canExpand: false,
       id: leaf.id, level: 0, leafIds: [leaf.id], canSelect: fields.canSelect, participants: null, leafIndex: i,
     });
-    cache.leafNode.set(leaf.id, cache.nodes.length - 1);
+    cache.leafNode[i] = cache.nodes.length - 1;
     cache.roots.push(cache.nodes.length - 1);
   }
   cache.leafObjects = leaves;
@@ -193,15 +199,18 @@ function reuseDag(
  * branches are the same as enumerateExactCuts/minimumTokens, so a linear
  * minimum is valid even with nested holes or chronological ownership gaps.
  * Returns null when the context limits are exceeded. */
+/** Leaf nodes have no edges; one shared empty list. */
+const NO_CHILDREN: readonly number[] = [];
+
 function buildDag(
   forest: CanonicalSummaryForest,
   leaves: readonly CanonicalLeaf[],
   inputs: PickerInputs,
 ): CertificateDag | null {
-  const leafIndex = new Map<ChunkId, number>();
-  for (let i = 0; i < leaves.length; i++) leafIndex.set(leaves[i].id, i);
+  // `leaves` is the forest's ordered leaf list, so a leaf's `index` is its
+  // position here and the per-summary index arrays address the same slots.
   const nodes: DagNode[] = [];
-  const leafNode = new Map<ChunkId, number>();
+  const leafNode = new Int32Array(leaves.length).fill(-1);
   // Fully owned contexts key by summary id, partial ones by a serialized id
   // list; separate tables, so no partial key can alias a summary id.
   const fullNodes = new Map<string, number>();
@@ -223,15 +232,16 @@ function buildDag(
     return nodes.length - 1;
   };
   const addLeaf = (id: string): number => {
-    const known = leafNode.get(id);
-    if (known !== undefined) return known;
     const leaf = forest.leaf(id)!;
+    const at = leaf.index;
+    const known = leafNode[at];
+    if (known >= 0) return known;
     const fields = leafNodeFields(leaf);
     const index = addNode({
-      tokens: fields.tokens, fidelity: 0, children: [], selectedChildren: [], canExpand: false,
-      id, level: 0, leafIds: [id], canSelect: fields.canSelect, participants: null, leafIndex: leafIndex.get(id)!,
+      tokens: fields.tokens, fidelity: 0, children: NO_CHILDREN, selectedChildren: NO_CHILDREN, canExpand: false,
+      id, level: 0, leafIds: [id], canSelect: fields.canSelect, participants: null, leafIndex: at,
     });
-    leafNode.set(id, index);
+    leafNode[at] = index;
     return index;
   };
   const addChildren = (id: string, activeIds: readonly string[]): number[] => {
@@ -275,17 +285,25 @@ function buildDag(
     if (known !== undefined) return known;
     const children = addChildren(id, activeIds);
     let participants: readonly string[];
+    let participantIndices: Int32Array;
     let holes: readonly string[];
     if (full && summary.level < 31) {
       const indices = forest.leafIndicesOf(summary);
       const bit = 1 << summary.level;
       let count = 0;
       for (let k = 0; k < indices.length; k++) if (allowed[indices[k]] & bit) count++;
-      participants = count === indices.length ? summary.leafIds
-        : summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) !== 0);
-      holes = count === indices.length ? [] : summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) === 0);
+      if (count === indices.length) {
+        participants = summary.leafIds;
+        participantIndices = indices;
+        holes = [];
+      } else {
+        participants = summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) !== 0);
+        participantIndices = indices.filter((at) => (allowed[at] & bit) !== 0);
+        holes = summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) === 0);
+      }
     } else {
       participants = activeIds.filter((id) => forest.leaf(id)!.allowedLevels.includes(summary.level));
+      participantIndices = Int32Array.from(participants, (leafId) => forest.leaf(leafId)!.index);
       const participantSet = new Set(participants);
       holes = activeIds.filter((id) => !participantSet.has(id));
     }
@@ -295,7 +313,7 @@ function buildDag(
       tokens: canSelect ? summary.recallTokens : Infinity,
       fidelity: 0, children, selectedChildren, canExpand: true,
       id: summary.id, level: summary.level, leafIds: participants, canSelect,
-      participants: Int32Array.from(participants, (leafId) => leafIndex.get(leafId)!), leafIndex: -1,
+      participants: participantIndices, leafIndex: -1,
     });
     table.set(key, index);
     return index;
