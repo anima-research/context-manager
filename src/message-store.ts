@@ -740,13 +740,17 @@ export class MessageStore {
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
     const branchId = this.store.currentBranch().id;
-    const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     const c = this.allStoredCache;
+    // getAllInternal already revalidates across foreign state writes (the
+    // store-global sequence moves on every receipt or resolution write) and
+    // hands back the same array; keying on that array, not the sequence,
+    // keeps this view alive across them too. Same-instance mutators bump
+    // writeVersion (edits in place, appends by push), so both still miss.
     if (
       c &&
       c.branchId === branchId &&
-      c.sequence === sequence &&
+      c.internals === internals &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
     ) {
@@ -764,7 +768,7 @@ export class MessageStore {
         ? reused
         : this.internalToStored(internal, internal.id, i);
     });
-    this.allStoredCache = { branchId, sequence, writeVersion, editVersion, stored };
+    this.allStoredCache = { branchId, internals, writeVersion, editVersion, stored };
     return stored;
   }
 
@@ -772,7 +776,7 @@ export class MessageStore {
    *  as allCache (see getAll). */
   private allStoredCache: {
     branchId: string;
-    sequence: number;
+    internals: StoredMessageInternal[];
     writeVersion: number;
     editVersion: number;
     stored: StoredMessage[];

@@ -3796,6 +3796,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Store position per message id, refreshed from every listing we see. */
   private _storeOrder = new Map<MessageId, number>();
+  /** The listing `_storeOrder` was built from (append-only refreshes extend it). */
+  private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = [];
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
   /** Merges refused by executeMerge because they would have minted a crossed node. */
@@ -3803,9 +3805,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
     if (messages.length === 0) return;
-    const order = new Map<MessageId, number>();
-    for (let i = 0; i < messages.length; i++) order.set(messages[i].id, i);
+    const prev = this._storeOrderSource;
+    if (messages === prev) return;
+    // A listing that keeps every earlier element (same object, so same id
+    // and position: the store reuses message objects until an edit) only
+    // grew at the end — add the tail instead of rehashing the whole store.
+    let from = 0;
+    if (prev.length > 0 && messages.length >= prev.length) {
+      let i = 0;
+      while (i < prev.length && messages[i] === prev[i]) i++;
+      if (i === prev.length) from = prev.length;
+    }
+    const order = from > 0 ? this._storeOrder : new Map<MessageId, number>();
+    for (let i = from; i < messages.length; i++) order.set(messages[i].id, i);
     this._storeOrder = order;
+    this._storeOrderSource = messages;
   }
 
   /**
@@ -10565,7 +10579,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
    * by a pin or document mark.
    */
-  protected getCompressibleMessages(store: MessageStoreView): StoredMessage[] {
+  protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
@@ -10575,6 +10589,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
       if (pinned.has(i)) continue;
+      if (exclude && exclude[i]) continue;
       out.push(messages[i]);
     }
     return out;
@@ -10593,21 +10608,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionQueue = [];
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
-    const byId = new Map<string, StoredMessage>();
     const listing = store.getAll();
     this.refreshStoreOrder(listing);
-    for (const m of listing) byId.set(m.id, m);
+    // id -> listing index; the same map positions the frontier below.
+    const position = listing.length === 0 ? new Map<MessageId, number>() : this._storeOrder;
 
-    const consumed = new Set<string>();
+    const consumed = new Uint8Array(listing.length);
     let orphaned = 0;
     for (const rec of this.chunkRecords) {
       const msgs: StoredMessage[] = [];
       for (const id of rec.sourceIds) {
-        const m = byId.get(id);
-        if (m) msgs.push(m);
+        const at = position.get(id);
+        if (at === undefined) continue;
+        msgs.push(listing[at]);
+        consumed[at] = 1;
       }
       if (msgs.length === 0) { orphaned++; continue; }
-      for (const m of msgs) consumed.add(m.id);
       const chunk: Chunk = {
         index: this.chunks.length,
         startIndex: -1, // record-derived; filtered-array indices are not meaningful
@@ -10664,10 +10680,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // are not the resident's, and a record written here would be compressed
     // by the resident at its next boot.
     if (this.config.auditOnly) return;
-    const messagesToChunk = this.getCompressibleMessages(store)
-      .filter(m => !consumed.has(m.id));
-    const livePosition = new Map<string, number>();
-    store.getAll().forEach((message, index) => livePosition.set(message.id, index));
+    const messagesToChunk = this.getCompressibleMessages(store, consumed);
+    const livePosition = position;
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
