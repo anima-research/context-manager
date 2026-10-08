@@ -1,7 +1,7 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import type { PresentedLeaf } from './kv-unified-policy.js';
-import { CanonicalSummaryForest, type CanonicalLeaf } from './kv-unified.js';
+import { CanonicalSummaryForest, type CanonicalLeaf, type CanonicalSummary } from './kv-unified.js';
 import { TerminalPolicyEvaluator, presentedLeavesByIndex } from './kv-unified-terminal.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -42,6 +42,10 @@ export interface DagNode {
   readonly participants: Int32Array | null;
   /** Leaf position of a leaf node, -1 for a summary node. */
   readonly leafIndex: number;
+  /** A full-context summary node's summary object and forced holes, so a
+   *  later build can reuse its participants when nothing under it changed. */
+  readonly source?: CanonicalSummary;
+  readonly holeIds?: readonly string[];
 }
 
 /** The certificate's context DAG for one ownership structure. Kept in the
@@ -53,6 +57,8 @@ export interface CertificateDag {
   readonly roots: number[];
   /** Node index per leaf position (the forest's leaf `index`), -1 if none. */
   leafNode: Int32Array;
+  /** Node index per summary id for full contexts. */
+  readonly summaryNode: ReadonlyMap<string, number>;
   /** Last compile's accepted-level check per leaf: the leaf object, the
    *  receipt entry it was checked against, and the level it fixed. A leaf
    *  seen again with the same objects passes with the same level. */
@@ -201,16 +207,32 @@ function reuseDag(
  * Returns null when the context limits are exceeded. */
 /** Leaf nodes have no edges; one shared empty list. */
 const NO_CHILDREN: readonly number[] = [];
+const idUnitsOf = new WeakMap<readonly string[], number>();
 
 function buildDag(
   forest: CanonicalSummaryForest,
   leaves: readonly CanonicalLeaf[],
   inputs: PickerInputs,
+  pool?: CertificateDag,
 ): CertificateDag | null {
   // `leaves` is the forest's ordered leaf list, so a leaf's `index` is its
   // position here and the per-summary index arrays address the same slots.
+  // Node order is the traversal order below (the passes sum in it), so a
+  // previous graph only donates node objects: a leaf node whose leaf object
+  // sits at the same position, and a full-context summary node whose
+  // summary object and leaves are unchanged (its participants and holes).
   const nodes: DagNode[] = [];
   const leafNode = new Int32Array(leaves.length).fill(-1);
+  const pooledLeaves = pool ? pool.leafObjects : null;
+  const unchangedUnder = (summary: CanonicalSummary): boolean => {
+    if (!pooledLeaves) return false;
+    const indices = forest.leafIndicesOf(summary);
+    for (let k = 0; k < indices.length; k++) {
+      const at = indices[k];
+      if (at >= pooledLeaves.length || pooledLeaves[at] !== leaves[at]) return false;
+    }
+    return true;
+  };
   // Fully owned contexts key by summary id, partial ones by a serialized id
   // list; separate tables, so no partial key can alias a summary id.
   const fullNodes = new Map<string, number>();
@@ -226,21 +248,41 @@ function buildDag(
     leaves.reduce((sum, leaf) => sum + leaf.id.length, 0) +
     [...inputs.summaries.keys()].reduce((sum, id) => sum + id.length, 0)) + 1024;
   let memberships = 0, identifierUnits = 0;
+  // Identifier units of a context's id list; a summary's own leaf list is
+  // one array per summary object, so its sum is kept.
+  const idUnits = (ids: readonly string[]): number => {
+    let units = idUnitsOf.get(ids);
+    if (units === undefined) {
+      units = 0;
+      for (const id of ids) units += id.length + 1;
+      idUnitsOf.set(ids, units);
+    }
+    return units;
+  };
   const addNode = (node: DagNode): number => {
     if (nodes.length >= contextLimit) throw contextLimitReached;
     nodes.push(node);
     return nodes.length - 1;
   };
-  const addLeaf = (id: string): number => {
-    const leaf = forest.leaf(id)!;
-    const at = leaf.index;
+  const addLeaf = (id: string): number => addLeafAt(forest.leaf(id)!.index);
+  const addLeafAt = (at: number): number => {
     const known = leafNode[at];
     if (known >= 0) return known;
-    const fields = leafNodeFields(leaf);
-    const index = addNode({
-      tokens: fields.tokens, fidelity: 0, children: NO_CHILDREN, selectedChildren: NO_CHILDREN, canExpand: false,
-      id, level: 0, leafIds: [id], canSelect: fields.canSelect, participants: null, leafIndex: at,
-    });
+    const leaf = leaves[at];
+    const id = leaf.id;
+    let node: DagNode | undefined;
+    if (pooledLeaves && at < pooledLeaves.length && pooledLeaves[at] === leaf) {
+      const pooled = pool!.leafNode[at];
+      if (pooled >= 0) node = pool!.nodes[pooled];
+    }
+    if (!node) {
+      const fields = leafNodeFields(leaf);
+      node = {
+        tokens: fields.tokens, fidelity: 0, children: NO_CHILDREN, selectedChildren: NO_CHILDREN, canExpand: false,
+        id, level: 0, leafIds: [id], canSelect: fields.canSelect, participants: null, leafIndex: at,
+      };
+    }
+    const index = addNode(node);
     leafNode[at] = index;
     return index;
   };
@@ -250,7 +292,10 @@ function buildDag(
     // means full ownership: every direct leaf and child summary is active and
     // the per-summary membership set (O(leaves) at every level) is skipped.
     if (activeIds.length === summary.leafIds.length) {
-      const children = summary.directLeafIds.map(addLeaf);
+      // Direct leaves belong to an L1 only, and are all of its leaves, so
+      // their positions are the summary's index array.
+      const children = summary.directLeafIds.length > 0
+        ? Array.from(forest.leafIndicesOf(summary), addLeafAt) : [];
       for (const childId of summary.childSummaryIds) {
         const child = forest.summary(childId)!;
         if (child.leafIds.length > 0) children.push(addSummary(childId, child.leafIds));
@@ -269,12 +314,9 @@ function buildDag(
   const addSummary = (id: string, activeIds: readonly string[]): number => {
     memberships += activeIds.length;
     if (memberships > membershipLimit) throw contextLimitReached;
-    identifierUnits += id.length + 1;
+    // Units only grow, so one check after the whole list is the same test.
+    identifierUnits += id.length + 1 + idUnits(activeIds);
     if (identifierUnits > identifierLimit) throw contextLimitReached;
-    for (const leafId of activeIds) {
-      identifierUnits += leafId.length + 1;
-      if (identifierUnits > identifierLimit) throw contextLimitReached;
-    }
     const summary = forest.summary(id)!;
     // The active set is a subset of the summary's leaves; the full set (no
     // hole above it) keys by the id alone and tests participants by bit.
@@ -287,7 +329,17 @@ function buildDag(
     let participants: readonly string[];
     let participantIndices: Int32Array;
     let holes: readonly string[];
-    if (full && summary.level < 31) {
+    let pooledNode: DagNode | undefined;
+    if (full && pool) {
+      const pooled = pool.summaryNode.get(id);
+      const candidate = pooled !== undefined ? pool.nodes[pooled] : undefined;
+      if (candidate && candidate.source === summary && candidate.holeIds && unchangedUnder(summary)) pooledNode = candidate;
+    }
+    if (pooledNode) {
+      participants = pooledNode.leafIds;
+      participantIndices = pooledNode.participants!;
+      holes = pooledNode.holeIds!;
+    } else if (full && summary.level < 31) {
       const indices = forest.leafIndicesOf(summary);
       const bit = 1 << summary.level;
       let count = 0;
@@ -314,6 +366,7 @@ function buildDag(
       fidelity: 0, children, selectedChildren, canExpand: true,
       id: summary.id, level: summary.level, leafIds: participants, canSelect,
       participants: participantIndices, leafIndex: -1,
+      ...(full ? { source: summary, holeIds: holes } : {}),
     });
     table.set(key, index);
     return index;
@@ -326,7 +379,7 @@ function buildDag(
     if (error === contextLimitReached) return null;
     throw error;
   }
-  return { ownership: forest.ownership, leafObjects: leaves, nodes, roots, leafNode };
+  return { ownership: forest.ownership, leafObjects: leaves, nodes, roots, leafNode, summaryNode: fullNodes };
 }
 
 /** Try to prove that the existing hysteresis rule selects the carried cut.
@@ -400,7 +453,7 @@ export function certifyCarriedLayout(
   // constraints, so a previous compile's graph is reused when the forest was
   // derived from the same build and no owned leaf changed. Fidelity is
   // relative to the newest leaf and is refreshed below every compile.
-  const dag = reuseDag(options.reuse?.certificate, forest, leaves) ?? buildDag(forest, leaves, inputs);
+  const dag = reuseDag(options.reuse?.certificate, forest, leaves) ?? buildDag(forest, leaves, inputs, options.reuse?.certificate);
   if (dag === null) return null;
   dag.fixed = { leaves: checkedLeaves, previous: checkedPrevious, level: fixedLevel };
   if (options.reuse) options.reuse.certificate = dag;
