@@ -2174,7 +2174,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const [id, level] of this.resolutions) {
       if (level > 0) out[id] = level;
     }
-    this.store.setStateJson(this.resolutionsStateId, out);
+    this.writeStateJson(this.resolutionsStateId, out);
   }
 
   /** This strategy has just presented, so the persisted kv-unified receipt no
@@ -8458,8 +8458,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const result = picker.run(pickerInputs, foldingBudget);
     if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
       const reuse = this.kvUnifiedReuse;
-      const tree = (reuse.tree ? SummaryTree.derive(reuse.tree, pickerInputs) : null) ?? new SummaryTree(pickerInputs);
-      reuse.tree = tree;
+      // The tree is only needed for a leaf the forest cannot hash at its
+      // level and for rendering the layout when the solver did not; build
+      // it on first use. Deriving from an older tree still works: derive
+      // only needs the previous leaves intact and new leaves ownerless.
+      let tree: SummaryTree | null = null;
+      const summaryTree = (): SummaryTree => tree ??=
+        (reuse.tree ? SummaryTree.derive(reuse.tree, pickerInputs) : null) ?? new SummaryTree(pickerInputs);
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
       // The forest the picker just solved on carries each leaf's hash per
@@ -8473,7 +8478,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (leaf && slot >= 0) {
           repHash = leaf.repHashes[slot];
         } else {
-          const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
+          const summaryId = level > 0 ? summaryTree().ancestorAt(chunk.id, level)?.id : undefined;
           if (level > 0 && !summaryId) {
             throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
           }
@@ -8486,12 +8491,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? previous
           : { repHash, level, lastChangedSeq: nextSequence });
       }
+      // With a live cache the solver's terminal evaluator already rendered the
+      // selected cut's layout (the same units, tokens and offsets renderLayout
+      // produces; asserted equal in the terminal evaluator tests). The size
+      // check ties it to this compile's applied frontier.
+      const last = this._lastKvUnified?.lastResult;
+      const solvedLayout = last?.feasible && last.cacheRelevant &&
+        last.selected.frontier.size === result.finalResolutions.size ? last.selected.layout : null;
       this.kvUnifiedDraft = {
         leaves,
-        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+        layout: solvedLayout ?? renderLayout(pickerInputs, summaryTree(), result.finalResolutions),
         immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
         markerUnitIndices: [],
       };
+      if (tree) reuse.tree = tree;
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
@@ -9129,7 +9142,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
-    this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+    this.persistKvUnifiedReceipts();
+  }
+
+  /** Write the receipt chain snapshot (one entry per leaf: 75k entries, ~5 MB
+   *  of JSON on a long history). */
+  private persistKvUnifiedReceipts(): void {
+    this.writeStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+  }
+
+  /** JSON state write through the byte setter. Handing the native store a
+   *  large JS object makes it walk the graph through napi (~100 ms for 75k
+   *  receipt leaves on Bun); JSON.stringify plus the byte setter is ~10 ms
+   *  for the same parsed value. The native JSON setter refuses `undefined`,
+   *  so no value written today depends on its handling. */
+  private writeStateJson(stateId: string, value: unknown): void {
+    const store = this.store;
+    if (!store) return;
+    if (typeof (store as { setState?: unknown }).setState === 'function') {
+      store.setState(stateId, Buffer.from(JSON.stringify(value)));
+    } else {
+      store.setStateJson(stateId, value);
+    }
   }
 
   reportKvUnifiedFailed(submissionId: string): void {
