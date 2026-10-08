@@ -231,9 +231,12 @@ interface PartialCut {
 const IMPOSSIBLE = Number.POSITIVE_INFINITY;
 
 type OrderedChild =
-  | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string }
+  | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string; index: number }
   | { kind: 'summary'; id: SummaryId; firstSequence: number; key: string };
 const orderedChildrenCache = new WeakMap<CanonicalSummary, readonly OrderedChild[]>();
+/** Positions (in `orderedLeaves()`) of a summary's leaves, parallel to its
+ *  `leafIds`; stable across derived forests. */
+const summaryLeafIndexCache = new WeakMap<CanonicalSummary, Int32Array>();
 
 /** Parts of a forest derived from a previous one (see `derive`). */
 export interface PrebuiltForestParts {
@@ -791,6 +794,29 @@ export class CanonicalSummaryForest {
     return this.leafMap.get(id) ?? null;
   }
 
+  /** Allowed levels per leaf position as bits (levels below 31). */
+  private allowedLevelMasks(): Uint32Array {
+    if (this.allowedMasksMemo) return this.allowedMasksMemo;
+    const leaves = this.orderedLeafList;
+    const masks = new Uint32Array(leaves.length);
+    for (let i = 0; i < leaves.length; i++) {
+      let mask = 0;
+      for (const level of leaves[i].allowedLevels) if (level >= 0 && level < 31) mask |= 1 << level;
+      masks[i] = mask;
+    }
+    return this.allowedMasksMemo = masks;
+  }
+  private allowedMasksMemo: Uint32Array | undefined;
+
+  private summaryLeafIndices(summary: CanonicalSummary): Int32Array {
+    let indices = summaryLeafIndexCache.get(summary);
+    if (!indices) {
+      indices = Int32Array.from(summary.leafIds, (id) => this.leafMap.get(id)!.index);
+      summaryLeafIndexCache.set(summary, indices);
+    }
+    return indices;
+  }
+
   summary(id: SummaryId): CanonicalSummary | null {
     return this.summaryMap.get(id) ?? null;
   }
@@ -1241,13 +1267,34 @@ export class CanonicalSummaryForest {
       if (!leaf.allowedLevels.includes(0)) return IMPOSSIBLE;
       return leaf.externallyAccounted ? 0 : leaf.rawTokens;
     };
+    // For a fully owned summary the participants are a bit test per leaf
+    // position; the id arrays are only built when there are holes.
+    const allowed = this.allowedLevelMasks();
+    const leaves = this.orderedLeafList;
+    const leafCostAt = (index: number): number => {
+      if ((allowed[index] & 1) === 0) return IMPOSSIBLE;
+      const leaf = leaves[index];
+      return leaf.externallyAccounted ? 0 : leaf.rawTokens;
+    };
+    const participantsOf = (summary: CanonicalSummary, activeIds: readonly ChunkId[]):
+      { count: number; ids: () => ChunkId[] } => {
+      if (activeIds.length === summary.leafIds.length && summary.level < 31) {
+        const indices = this.summaryLeafIndices(summary);
+        const bit = 1 << summary.level;
+        let count = 0;
+        for (let k = 0; k < indices.length; k++) if (allowed[indices[k]] & bit) count++;
+        return { count, ids: () => summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) !== 0) };
+      }
+      const ids = activeIds.filter((leafId) => this.leafMap.get(leafId)!.allowedLevels.includes(summary.level));
+      return { count: ids.length, ids: () => ids };
+    };
     const childrenCost = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): number => {
       let total = 0;
       if (activeIds.length === summary.leafIds.length) {
         // Every child is fully active: the same terms in the same order, with
         // no membership set and no per-child filter.
         for (const child of this.orderedChildren(summary)) {
-          if (child.kind === 'leaf') total += leafCost(child.id);
+          if (child.kind === 'leaf') total += leafCostAt(child.index);
           else {
             const childSummary = this.summaryMap.get(child.id)!;
             if (childSummary.leafIds.length > 0) total += summaryCost(child.id, childSummary.leafIds);
@@ -1277,14 +1324,12 @@ export class CanonicalSummaryForest {
       if (cached !== undefined) return cached;
       const summary = this.summaryMap.get(id)!;
       const expanded = childrenCost(summary, activeIds);
-      const participants = activeIds.filter((leafId) =>
-        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
-      );
+      const participants = participantsOf(summary, activeIds);
       let selected = IMPOSSIBLE;
-      if (participants.length === activeIds.length) {
+      if (participants.count === activeIds.length) {
         selected = summary.recallTokens + 0;
-      } else if (participants.length > 0) {
-        const participantSet = new Set(participants);
+      } else if (participants.count > 0) {
+        const participantSet = new Set(participants.ids());
         const holes = activeIds.filter((leafId) => !participantSet.has(leafId));
         const holeCost = childrenCost(summary, holes);
         if (Number.isFinite(holeCost)) selected = summary.recallTokens + holeCost;
@@ -1338,12 +1383,11 @@ export class CanonicalSummaryForest {
     const reconstructSummary = (id: SummaryId, activeIds: readonly ChunkId[]): void => {
       const summary = this.summaryMap.get(id)!;
       if (selectedChoice.get(keyOf(id, activeIds))) {
-        const participants = activeIds.filter((leafId) =>
-          this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
-        );
-        for (const leafId of participants) frontier.set(leafId, summary.level);
-        if (participants.length !== activeIds.length) {
-          const participantSet = new Set(participants);
+        const participants = participantsOf(summary, activeIds);
+        const ids = participants.ids();
+        for (const leafId of ids) frontier.set(leafId, summary.level);
+        if (participants.count !== activeIds.length) {
+          const participantSet = new Set(ids);
           reconstructChildren(summary, activeIds.filter((leafId) => !participantSet.has(leafId)));
         }
       } else {
@@ -1411,6 +1455,7 @@ export class CanonicalSummaryForest {
         id,
         firstSequence: this.leafMap.get(id)!.sequence,
         key: leafKey(id),
+        index: this.leafMap.get(id)!.index,
       })),
       ...summary.childSummaryIds.map((id) => ({
         kind: 'summary' as const,
