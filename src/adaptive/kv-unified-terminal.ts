@@ -1,9 +1,10 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
-import { CanonicalSummaryForest } from './kv-unified.js';
+import { CanonicalSummaryForest, type CanonicalLeaf } from './kv-unified.js';
 import {
   budgetPenalty, continuityLeafBase, fidelityLeafBase, normalizePolicy,
   type ExactPolicySolveOptions, type UnscoredCandidate,
+  type PresentedLeaf,
 } from './kv-unified-policy.js';
 import { tailUnits, type RenderLayout, type RenderedUnit } from './render-offsets.js';
 import { nonnegativeSumInterval, type BoundedPolicyCandidate } from './kv-unified-selective.js';
@@ -24,6 +25,27 @@ export type FrontierTraceReference = FrontierTrace | FrontierTraceSource | null;
 export interface FrontierLevels {
   readonly levels: ArrayLike<number>;
 }
+
+/** The per-slot facts that depend only on a leaf and its receipt entry:
+ * whether the slot matches the accepted presentation, which unit it emits,
+ * and the representation distance its continuity loss is scaled by. Kept per
+ * forest ownership across compiles; a leaf whose objects did not change
+ * keeps its slots. Unit codes are relative to `chunkCount` (summary codes
+ * follow the leaf codes), so a longer leaf list shifts them. */
+interface EvaluatorStructure {
+  readonly stride: number;
+  readonly summaryCount: number;
+  chunkCount: number;
+  leaves: (CanonicalLeaf | undefined)[];
+  previous: (PresentedLeaf | undefined)[];
+  matches: Uint8Array;
+  representations: Uint32Array;
+  /** 0 when the slot carries no continuity loss, else max(1, |level - previous.level|). */
+  distance: Uint16Array;
+  previousUnits?: { layout: RenderLayout; units: Uint32Array };
+}
+
+const structures = new WeakMap<object, EvaluatorStructure>();
 
 interface CompiledAction {
   readonly fidelity: number;
@@ -133,20 +155,55 @@ export class TerminalPolicyEvaluator {
     this.unitTokens[this.tailCode] = tail.find((unit) => unit.kind === 'tail')?.tokens ?? 0;
     this.unitKeys[this.headCode] = this.unitKinds[this.headCode] = 'head';
     this.unitKeys[this.tailCode] = this.unitKinds[this.tailCode] = 'tail';
-    this.previousUnits = Uint32Array.from(options.cache?.layout.units ?? [], (unit) => {
-      if (unit.kind === 'head') return this.headCode;
-      if (unit.kind === 'tail') return this.tailCode;
-      if (unit.kind !== 'raw') return summaryCode.get(unit.key) ?? 0;
-      const at = this.leafIndex(unit.key);
-      return at === undefined ? 0 : at + 1;
-    });
+    // The slots that depend only on leaf and receipt objects come from the
+    // structure kept for this forest's ownership; each evaluator works on its
+    // own copy, so an older evaluator's layout stays readable.
+    const n = this.chunks.length;
+    let structure = fromForest ? structures.get(forest.ownership) : undefined;
+    if (structure && (structure.stride !== this.stride || structure.summaryCount !== summaries.length)) structure = undefined;
+    const leafCount = structure?.leaves.length ?? 0;
+    const shift = structure ? n - structure.chunkCount : 0;
+    if (structure && leafCount >= n) {
+      this.matches = structure.matches.slice(0, n * this.stride);
+      this.representations = structure.representations.slice(0, n * this.stride);
+      if (shift !== 0) {
+        const codes = this.representations;
+        for (let at = 0; at < codes.length; at++) if (codes[at] > leafCount) codes[at] += shift;
+      }
+    } else if (structure) {
+      this.matches.set(structure.matches);
+      this.representations.set(structure.representations);
+      if (shift !== 0) {
+        const codes = this.representations;
+        for (let at = 0, end = leafCount * this.stride; at < end; at++) if (codes[at] > leafCount) codes[at] += shift;
+      }
+    }
+    const distance = new Uint16Array(this.fidelity.length);
+    if (structure) distance.set(structure.distance.subarray(0, Math.min(structure.distance.length, distance.length)));
+    const known = structure?.leaves ?? [];
+    const knownPrevious = structure?.previous ?? [];
+    const layout = options.cache?.layout;
+    const keptUnits = structure?.previousUnits;
+    if (layout && keptUnits && keptUnits.layout === layout) {
+      this.previousUnits = shift === 0 ? keptUnits.units : keptUnits.units.map((code) => code > leafCount ? code + shift : code);
+    } else {
+      this.previousUnits = Uint32Array.from(layout?.units ?? [], (unit) => {
+        if (unit.kind === 'head') return this.headCode;
+        if (unit.kind === 'tail') return this.tailCode;
+        if (unit.kind !== 'raw') return summaryCode.get(unit.key) ?? 0;
+        const at = this.leafIndex(unit.key);
+        return at === undefined ? 0 : at + 1;
+      });
+    }
     this.markerUnits = new Set(options.cache?.markers.map((marker) => marker.unitIndex));
     this.cacheRelevant = options.cache !== undefined && options.currentImmutablePrefixHash !== undefined &&
       options.cache.immutablePrefixHash === options.currentImmutablePrefixHash;
     const newest = this.chunks.at(-1)?.sequence ?? 0;
     const currentSeq = presentation?.currentSeq ?? 0;
+    const nextLeaves: (CanonicalLeaf | undefined)[] = new Array(n);
+    const nextPrevious: (PresentedLeaf | undefined)[] = new Array(n);
     let age = 0;
-    for (let i = this.chunks.length - 1; i >= 0; i--) {
+    for (let i = n - 1; i >= 0; i--) {
       const chunk = this.chunks[i];
       const midpoint = age + chunk.rawTokens / 2;
       age += chunk.rawTokens;
@@ -156,22 +213,43 @@ export class TerminalPolicyEvaluator {
       this.unitKeys[i + 1] = chunk.id;
       this.unitKinds[i + 1] = 'raw';
       this.unitExtension[i + 1] = presentation && !previous ? 1 : 0;
+      nextLeaves[i] = leaf;
+      nextPrevious[i] = previous;
       // The level-independent factors once per leaf; the per-level loss is
       // the same product as the policy functions, in the same order.
       const fidelityBase = leaf.externallyAccounted ? 0 : fidelityLeafBase(chunk, newest, this.policy);
       const continuityBase = previous ? continuityLeafBase(chunk, previous, currentSeq, midpoint, this.policy) : 0;
+      if (known[i] === leaf && knownPrevious[i] === previous) {
+        for (const level of leaf.allowedLevels) {
+          const at = i * this.stride + level;
+          this.fidelity[at] = leaf.externallyAccounted ? 0 : fidelityBase * level;
+          const d = distance[at];
+          this.continuity[at] = d === 0 ? 0 : continuityBase * d;
+        }
+        continue;
+      }
       for (const level of leaf.allowedLevels) {
         const at = i * this.stride + level;
         const slot = leaf.availableLevels.indexOf(level);
         const summary = slot > 0 ? leaf.summaryIds[slot - 1] : undefined;
         const hash = leaf.repHashes[slot];
         this.fidelity[at] = leaf.externallyAccounted ? 0 : fidelityBase * level;
-        this.continuity[at] = !previous || (hash === previous.repHash && level === previous.level) ? 0
-          : continuityBase * Math.max(1, Math.abs(level - previous.level));
+        const d = !previous || (hash === previous.repHash && level === previous.level) ? 0
+          : Math.max(1, Math.abs(level - previous.level));
+        distance[at] = d;
+        this.continuity[at] = d === 0 ? 0 : continuityBase * d;
         this.matches[at] = !previous || (previous.level === level && previous.repHash === hash) ? 1 : 0;
         this.representations[at] = leaf.externallyAccounted ? 0 :
           (chunk.pinned || level === 0 ? i + 1 : summaryCode.get(summary!)!);
       }
+    }
+    if (fromForest) {
+      structures.set(forest.ownership, {
+        stride: this.stride, summaryCount: summaries.length, chunkCount: n,
+        leaves: nextLeaves, previous: nextPrevious,
+        matches: this.matches, representations: this.representations, distance,
+        previousUnits: layout ? { layout, units: this.previousUnits } : undefined,
+      });
     }
   }
 

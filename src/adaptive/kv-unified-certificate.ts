@@ -56,6 +56,93 @@ export interface CertificateDag {
    *  receipt entry it was checked against, and the level it fixed. A leaf
    *  seen again with the same objects passes with the same level. */
   fixed?: { leaves: CanonicalLeaf[]; previous: (PresentedLeaf | undefined)[]; level: Int32Array };
+  /** The graph's edges and per-node constants as flat typed arrays, rebuilt
+   *  when the node count changes (see `flatten`). */
+  flat?: FlatDag;
+}
+
+/** The DAG's structure in CSR form: the per-pass walks, the fidelity refresh
+ * and the coverage check touch only these arrays. Node order, child order and
+ * participant order are the node objects' own, so every sum runs in the same
+ * order as before. */
+interface FlatDag {
+  length: number;
+  /** Per-node arrays hold `length + 1` or more entries; appended leaf nodes
+   *  (see `reuseDag`) extend them in place. */
+  childStart: Int32Array;
+  readonly children: Int32Array;
+  selectedStart: Int32Array;
+  readonly selectedChildren: Int32Array;
+  participantStart: Int32Array;
+  readonly participants: Int32Array;
+  /** -1 for a summary node. */
+  leafIndex: Int32Array;
+  level: Float64Array;
+  canExpand: Uint8Array;
+}
+
+function grown<T extends Int32Array | Float64Array | Uint8Array>(array: T, needed: number): T {
+  if (array.length >= needed) return array;
+  const next = new (array.constructor as new (length: number) => T)(Math.max(needed, array.length * 2));
+  next.set(array);
+  return next;
+}
+
+function flatten(dag: CertificateDag): FlatDag {
+  const nodes = dag.nodes;
+  const flat = dag.flat;
+  if (flat && flat.length === nodes.length) return flat;
+  if (flat && flat.length < nodes.length) {
+    // Nodes past the flattened length are ownerless leaves appended by
+    // `reuseDag`: no edges, so only the per-node arrays extend.
+    let leavesOnly = true;
+    for (let i = flat.length; leavesOnly && i < nodes.length; i++) {
+      const node = nodes[i];
+      leavesOnly = node.participants === null && node.children.length === 0 && node.selectedChildren.length === 0;
+    }
+    if (leavesOnly) {
+      const n = nodes.length;
+      flat.childStart = grown(flat.childStart, n + 1);
+      flat.selectedStart = grown(flat.selectedStart, n + 1);
+      flat.participantStart = grown(flat.participantStart, n + 1);
+      flat.leafIndex = grown(flat.leafIndex, n);
+      flat.level = grown(flat.level, n);
+      flat.canExpand = grown(flat.canExpand, n);
+      const c = flat.childStart[flat.length], s = flat.selectedStart[flat.length], p = flat.participantStart[flat.length];
+      for (let i = flat.length; i < n; i++) {
+        flat.childStart[i + 1] = c; flat.selectedStart[i + 1] = s; flat.participantStart[i + 1] = p;
+        flat.leafIndex[i] = nodes[i].leafIndex; flat.level[i] = nodes[i].level; flat.canExpand[i] = 0;
+      }
+      flat.length = n;
+      return flat;
+    }
+  }
+  const n = nodes.length;
+  let childCount = 0, selectedCount = 0, participantCount = 0;
+  for (const node of nodes) {
+    childCount += node.children.length;
+    selectedCount += node.selectedChildren.length;
+    participantCount += node.participants?.length ?? 0;
+  }
+  const childStart = new Int32Array(n + 1), children = new Int32Array(childCount);
+  const selectedStart = new Int32Array(n + 1), selectedChildren = new Int32Array(selectedCount);
+  const participantStart = new Int32Array(n + 1), participants = new Int32Array(participantCount);
+  const leafIndex = new Int32Array(n), level = new Float64Array(n), canExpand = new Uint8Array(n);
+  let c = 0, s = 0, p = 0;
+  for (let i = 0; i < n; i++) {
+    const node = nodes[i];
+    childStart[i] = c;
+    for (const child of node.children) children[c++] = child;
+    selectedStart[i] = s;
+    for (const child of node.selectedChildren) selectedChildren[s++] = child;
+    participantStart[i] = p;
+    if (node.participants) { participants.set(node.participants, p); p += node.participants.length; }
+    leafIndex[i] = node.leafIndex;
+    level[i] = node.level;
+    canExpand[i] = node.canExpand ? 1 : 0;
+  }
+  childStart[n] = c; selectedStart[n] = s; participantStart[n] = p;
+  return dag.flat = { length: n, childStart, children, selectedStart, selectedChildren, participantStart, participants, leafIndex, level, canExpand };
 }
 
 function leafNodeFields(leaf: CanonicalLeaf): { tokens: number; canSelect: boolean } {
@@ -279,16 +366,28 @@ export function certifyCarriedLayout(
   dag.fixed = { leaves: checkedLeaves, previous: checkedPrevious, level: fixedLevel };
   if (options.reuse) options.reuse.certificate = dag;
   const { nodes, roots } = dag;
+  const flat = flatten(dag);
+  const nodeCount = flat.length;
   const leafFidelity = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     leafFidelity[i] = leaves[i].externallyAccounted ? 0 : fidelityLeafLoss(chunks[i], 1, newest, policy);
   }
-  for (const node of nodes) {
-    if (node.participants === null) { node.fidelity = 0; continue; }
+  // Per-node constants for this compile: a leaf node's tokens/canSelect can
+  // change between compiles (reuseDag patches them), so read them fresh.
+  const nodeTokens = new Float64Array(nodeCount);
+  const nodeCanSelect = new Uint8Array(nodeCount);
+  const nodeFidelity = new Float64Array(nodeCount);
+  for (let i = 0; i < nodeCount; i++) {
+    const node = nodes[i];
+    nodeTokens[i] = node.tokens;
+    nodeCanSelect[i] = node.canSelect ? 1 : 0;
+    if (flat.leafIndex[i] >= 0) { node.fidelity = 0; continue; }
     let fidelity = 0;
-    for (let k = 0; k < node.participants.length; k++) {
-      fidelity += leafFidelity[node.participants[k]] * node.level;
+    const level = flat.level[i];
+    for (let k = flat.participantStart[i], end = flat.participantStart[i + 1]; k < end; k++) {
+      fidelity += leafFidelity[flat.participants[k]] * level;
     }
+    nodeFidelity[i] = fidelity;
     node.fidelity = fidelity;
   }
 
@@ -298,21 +397,23 @@ export function certifyCarriedLayout(
   // level, forced holes matching) or expanded (every child matching). Token
   // accounting alone would wrongly admit mixed cuts through unconstrained
   // siblings, so this validates coverage before anything is materialized.
-  const matches = new Uint8Array(nodes.length);
+  const matches = new Uint8Array(nodeCount);
   let freeAreRootLeaves = true;
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    if (node.participants === null) {
-      const level = fixedLevel[node.leafIndex];
-      matches[i] = node.canSelect && (level === 0 || level === -1) ? 1 : 0;
-      if (level === -1 && (!node.canSelect || leaves[node.leafIndex].summaryIds.length > 0)) freeAreRootLeaves = false;
+  for (let i = 0; i < nodeCount; i++) {
+    const leafAt = flat.leafIndex[i];
+    if (leafAt >= 0) {
+      const level = fixedLevel[leafAt];
+      const canSelect = nodeCanSelect[i] === 1;
+      matches[i] = canSelect && (level === 0 || level === -1) ? 1 : 0;
+      if (level === -1 && (!canSelect || leaves[leafAt].summaryIds.length > 0)) freeAreRootLeaves = false;
       continue;
     }
-    let selected = node.canSelect;
-    for (let k = 0; selected && k < node.participants.length; k++) selected = fixedLevel[node.participants[k]] === node.level;
-    for (let k = 0; selected && k < node.selectedChildren.length; k++) selected = matches[node.selectedChildren[k]] === 1;
-    let expanded = node.canExpand;
-    for (let k = 0; expanded && k < node.children.length; k++) expanded = matches[node.children[k]] === 1;
+    let selected = nodeCanSelect[i] === 1;
+    const level = flat.level[i];
+    for (let k = flat.participantStart[i], end = flat.participantStart[i + 1]; selected && k < end; k++) selected = fixedLevel[flat.participants[k]] === level;
+    for (let k = flat.selectedStart[i], end = flat.selectedStart[i + 1]; selected && k < end; k++) selected = matches[flat.selectedChildren[k]] === 1;
+    let expanded = flat.canExpand[i] === 1;
+    for (let k = flat.childStart[i], end = flat.childStart[i + 1]; expanded && k < end; k++) expanded = matches[flat.children[k]] === 1;
     matches[i] = selected || expanded ? 1 : 0;
   }
   const rootsMatch = roots.every((root) => matches[root] === 1);
@@ -448,24 +549,27 @@ export function certifyCarriedLayout(
       : tangentAt > high
         ? 2 * policy.budgetOverLambda * (tangentAt - high) / overScale ** 2 : 0;
     let magnitude = 1;
-    for (let i = 0; i < nodes.length; i++) {
-      const node = nodes[i];
-      let selected = Number.isFinite(node.tokens) ? node.fidelity + slope * node.tokens : Infinity;
-      let selectedTokens = node.tokens;
-      for (const child of node.selectedChildren) {
+    for (let i = 0; i < nodeCount; i++) {
+      const ownTokens = nodeTokens[i];
+      const ownFidelity = nodeFidelity[i];
+      let selected = Number.isFinite(ownTokens) ? ownFidelity + slope * ownTokens : Infinity;
+      let selectedTokens = ownTokens;
+      for (let k = flat.selectedStart[i], end = flat.selectedStart[i + 1]; k < end; k++) {
+        const child = flat.selectedChildren[k];
         selected += costs[child];
         selectedTokens += tokens[child];
       }
-      let expanded = node.canExpand ? 0 : Infinity;
+      let expanded = flat.canExpand[i] === 1 ? 0 : Infinity;
       let expandedTokens = 0;
-      for (const child of node.children) {
+      for (let k = flat.childStart[i], end = flat.childStart[i + 1]; k < end; k++) {
+        const child = flat.children[k];
         expanded += costs[child];
         expandedTokens += tokens[child];
       }
       const select = selected < expanded;
       costs[i] = select ? selected : expanded;
       tokens[i] = select ? selectedTokens : expandedTokens;
-      if (Number.isFinite(selected)) magnitude += Math.abs(node.fidelity) + Math.abs(slope * node.tokens);
+      if (Number.isFinite(selected)) magnitude += Math.abs(ownFidelity) + Math.abs(slope * ownTokens);
     }
     const fixed = inputs.headTokens + inputs.tailTokens;
     let linearCost = slope * fixed;
