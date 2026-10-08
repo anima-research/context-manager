@@ -241,6 +241,17 @@ export interface PrebuiltForestParts {
   readonly constraintConflicts: readonly ConstraintConflict[];
   readonly treeifiedSummaryIds: readonly SummaryId[];
   readonly gapBearingSummaryIds: readonly SummaryId[];
+  readonly leafZone: Uint8Array;
+}
+
+/** Head/tail membership per ordered chunk: bit 0 head, bit 1 tail. */
+function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8Array {
+  const zone = new Uint8Array(chunks.length);
+  for (let i = 0; i < chunks.length; i++) {
+    const id = chunks[i].id;
+    zone[i] = (inputs.headChunkIds.has(id) ? 1 : 0) | (inputs.tailChunkIds.has(id) ? 2 : 0);
+  }
+  return zone;
 }
 
 export class CanonicalSummaryForest {
@@ -251,6 +262,9 @@ export class CanonicalSummaryForest {
   readonly gapBearingSummaryIds: readonly SummaryId[];
   /** True when this forest was derived from a previous compile's forest. */
   readonly derived: boolean;
+  /** Head/tail membership per ordered leaf (bit 0 head, bit 1 tail), so a
+   *  derive compares zones without four set lookups per chunk. */
+  private readonly leafZone: Uint8Array;
   /** Identity of the ownership structure: shared by every forest derived
    * from the same full build, new on each full build. */
   readonly ownership: object;
@@ -276,6 +290,7 @@ export class CanonicalSummaryForest {
     this.ownership = prebuilt?.ownership ?? {};
     if (prebuilt) {
       this.sourceChunks = prebuilt.chunks;
+      this.leafZone = prebuilt.leafZone;
       this.leafMap = prebuilt.leafMap;
       this.summaryMap = prebuilt.summaryMap;
       this.orderedLeafList = prebuilt.orderedLeafList;
@@ -302,6 +317,7 @@ export class CanonicalSummaryForest {
     const chunks = [...inputs.chunks].sort(
       (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
     );
+    this.leafZone = leafZones(chunks, inputs);
     const chunkById = new Map<ChunkId, PickerChunk>();
     const sequenceOwner = new Map<number, ChunkId>();
     for (const chunk of chunks) {
@@ -647,7 +663,14 @@ export class CanonicalSummaryForest {
       if (!old || old.level !== entry.level || getSummaryParentId(old) !== getSummaryParentId(entry)) return null;
       if ((inputs.recallPairTokens?.get(id) ?? entry.tokens) !== (pi.recallPairTokens?.get(id) ?? old.tokens)) return null;
     }
-    const chunks = [...inputs.chunks].sort(
+    // Chunks usually arrive already in (sequence, id) order; sorting a sorted
+    // list still pays a comparator call per element.
+    let ordered = true;
+    for (let i = 1; ordered && i < inputs.chunks.length; i++) {
+      const a = inputs.chunks[i - 1], b = inputs.chunks[i];
+      ordered = a.sequence < b.sequence || (a.sequence === b.sequence && a.id.localeCompare(b.id) < 0);
+    }
+    const chunks = ordered ? inputs.chunks.slice() : [...inputs.chunks].sort(
       (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
     );
     const old = previous.sourceChunks;
@@ -664,12 +687,13 @@ export class CanonicalSummaryForest {
       lastSequence = chunk.sequence;
     }
 
-    const sameLeaf = (a: PickerChunk, b: PickerChunk): boolean =>
+    const zone = leafZones(chunks, inputs);
+    const oldZone = previous.leafZone;
+    const sameLeaf = (a: PickerChunk, b: PickerChunk, i: number): boolean =>
       a.rawTokens === b.rawTokens && a.currentResolution === b.currentResolution &&
       a.lockedByAgent === b.lockedByAgent && a.pinned === b.pinned &&
       a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
-      pi.headChunkIds.has(a.id) === inputs.headChunkIds.has(b.id) &&
-      pi.tailChunkIds.has(a.id) === inputs.tailChunkIds.has(b.id);
+      oldZone[i] === zone[i];
     // The derived forest takes over the previous forest's leaf map and
     // extends it in place (appended leaves added, changed leaves replaced):
     // the previous forest is superseded by this one, and nothing reads it
@@ -677,24 +701,28 @@ export class CanonicalSummaryForest {
     const leafMap = previous.leafMap as Map<ChunkId, CanonicalLeaf>;
     const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
     const conflicts: ConstraintConflict[] = [];
-    const ordered: CanonicalLeaf[] = new Array(chunks.length);
+    const orderedLeaves: CanonicalLeaf[] = new Array(chunks.length);
+    const oldLeaves = previous.orderedLeafList;
     const roots = [...previous.roots];
     let ownedLeafChanged = false;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-      if (i < old.length && sameLeaf(old[i], chunk)) {
-        const leaf = previous.leafMap.get(chunk.id)!;
-        ordered[i] = leaf;
-        const conflict = previousConflicts.get(chunk.id);
-        if (conflict) conflicts.push(conflict);
+      // Ids match positionally (checked above), so the previous leaf list
+      // answers without a map lookup per chunk.
+      if (i < old.length && sameLeaf(old[i], chunk, i)) {
+        orderedLeaves[i] = oldLeaves[i];
+        if (previousConflicts.size > 0) {
+          const conflict = previousConflicts.get(chunk.id);
+          if (conflict) conflicts.push(conflict);
+        }
         continue;
       }
       if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
-      const chain = i < old.length ? previous.leafMap.get(chunk.id)!.summaryIds : [];
+      const chain = i < old.length ? oldLeaves[i].summaryIds : [];
       if (chain.length > 0) ownedLeafChanged = true;
       const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap, i);
       leafMap.set(chunk.id, built.leaf);
-      ordered[i] = built.leaf;
+      orderedLeaves[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
       if (i >= old.length) {
         // Appended leaves carry sequences above every previous leaf (checked
@@ -704,10 +732,11 @@ export class CanonicalSummaryForest {
     }
     const derived = new CanonicalSummaryForest(inputs, options, {
       ownership: previous.ownership,
-      chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: ordered, roots,
+      chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: orderedLeaves, roots,
       constraintConflicts: conflicts,
       treeifiedSummaryIds: previous.treeifiedSummaryIds,
       gapBearingSummaryIds: previous.gapBearingSummaryIds,
+      leafZone: zone,
     });
     if (!ownedLeafChanged) derived.internalHolesMemo = previous.internalHolesMemo;
     return derived;

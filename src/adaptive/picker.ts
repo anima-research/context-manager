@@ -286,15 +286,22 @@ export function accountFrontier(
   const levelOf = typeof frontier === 'function' ? frontier : (c: PickerChunk) => frontier.get(c.id) ?? 0;
   const summaries = inputs.summaries;
   const recallPairTokens = inputs.recallPairTokens ?? new Map<SummaryId, number>();
+  // The walk from an L1 to its ancestor at a level is the same for every
+  // chunk under that L1; answer it once per (L1, level).
+  const ancestors = new Map<SummaryId, (SummaryEntry | null | undefined)[]>();
   const ancestorAt = (chunk: PickerChunk, level: number): SummaryEntry | null => {
     if (level <= 0 || !chunk.l1Id) return null;
+    let known = ancestors.get(chunk.l1Id);
+    if (known === undefined) ancestors.set(chunk.l1Id, known = []);
+    const cached = known[level];
+    if (cached !== undefined) return cached;
     let current: SummaryEntry | undefined = summaries.get(chunk.l1Id);
     while (current && current.level < level) {
       const parentId = getSummaryParentId(current);
-      if (!parentId) return null;
+      if (!parentId) { current = undefined; break; }
       current = summaries.get(parentId);
     }
-    return current && current.level === level ? current : null;
+    return known[level] = current && current.level === level ? current : null;
   };
 
   let total = inputs.headTokens + inputs.tailTokens;

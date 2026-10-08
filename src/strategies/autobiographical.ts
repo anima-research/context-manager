@@ -5128,13 +5128,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * rather than budget-driven loss, and is out of scope for this invariant.
    */
   protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[], regions?: { headStart: number; headEnd: number; recentStart: number }): void {
-    const covered = new Set<string>();
+    // Coverage by store position: marking is a lookup in the shared position
+    // index instead of a set insert per covered id.
+    const positionOf = this.positionIndex(messages);
+    const covered = new Uint8Array(messages.length);
+    const mark = (id: string): void => {
+      const at = positionOf.get(id);
+      if (at !== undefined) covered[at] = 1;
+    };
     for (const e of entries) {
       const one = (e as { sourceMessageId?: string }).sourceMessageId;
-      if (one) covered.add(one);
+      if (one) mark(one);
       // Composites (merged body-group shards) stand for several messages.
       const many = (e as { sourceMessageIds?: string[] }).sourceMessageIds;
-      if (many) for (const id of many) covered.add(id);
+      if (many) for (const id of many) mark(id);
     }
 
     // Expand emitted summaries down to the message ids they stand for.
@@ -5148,14 +5155,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sum = byId.get(id);
       if (!sum) continue;
       if (sum.sourceLevel === 0) {
-        for (const mid of sum.sourceIds) covered.add(mid);
+        for (const mid of sum.sourceIds) mark(mid);
       } else {
         for (const child of sum.sourceIds) stack.push(child);
       }
     }
 
     const missing: string[] = [];
-    for (const m of messages) if (!covered.has(m.id)) missing.push(m.id);
+    for (const m of messages) if (covered[positionOf.get(m.id)!] !== 1) missing.push(m.id);
     if (missing.length === 0) return;
 
     const site = this._uncoveredSite || 'unknown-site';
@@ -8322,6 +8329,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // been in this deadlock silently). L1 `sourceIds` IS the coverage
     // authority — fall back to it when the ledger has no pointer.
     const l1ByMessage = this.l1ByMessageIndex();
+    const ancestorMemo = new Map<SummaryId, (SummaryEntry | null | undefined)[]>();
 
     // The foldable middle is everything outside the LIVE head window and the
     // reserved tail — INCLUDING [0, headStart) after a head-window reset.
@@ -8414,6 +8422,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // which double-counts the head (reserves it twice: once here, once because
     // finalTokens already includes it). The old form threw ~head-tokens early at
     // tight budgets and quietly under-used the budget by ~head everywhere.
+    // Head and tail chunks were appended after the middle ones, so the
+    // middle chunks are the prefix of pickerChunks and this is their count.
+    const middleChunkCount = pickerChunks.length - headMessageIds.size - tailMessageIds.size;
     const totalBudget = maxTokens;
     const slack = this.config.compressionSlackRatio ?? 0.1;
     const foldingBudget: FoldingBudget = {
@@ -8475,9 +8486,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The forest the picker just solved on carries each leaf's hash per
       // level; the tree is the fallback for leaves it does not know.
       const forest = reuse.forest;
-      for (const chunk of pickerInputs.chunks) {
+      // A forest built from these inputs lists its leaves in the inputs'
+      // order when the chunks were already sorted, which the strategy's
+      // position-sequenced chunks are; then the leaf is a positional read.
+      const forestChunks = forest?.builtFrom(pickerInputs) ? forest.orderedChunks() : null;
+      let dense = forestChunks !== null && forestChunks.length === pickerInputs.chunks.length;
+      for (let k = 0; dense && k < forestChunks!.length; k++) dense = forestChunks![k].sequence === k;
+      const forestLeaves = dense ? forest!.orderedLeaves() : null;
+      for (let k = 0; k < pickerInputs.chunks.length; k++) {
+        const chunk = pickerInputs.chunks[k];
         const level = levelAt(chunk.sequence, chunk.id);
-        const leaf = forest?.leaf(chunk.id);
+        const leaf = forestLeaves ? forestLeaves[chunk.sequence] : forest?.leaf(chunk.id);
         const slot = leaf ? leaf.availableLevels.indexOf(level) : -1;
         let repHash: string;
         if (leaf && slot >= 0) {
@@ -8547,13 +8566,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a failed compile: they are recovery work, not presentation state.
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
-    for (const chunk of pickerChunks) {
+    // The middle chunks are the prefix of pickerChunks (head and tail were
+    // appended after them); each carries the resolution it was built with.
+    for (let k = 0; k < middleChunkCount; k++) {
+      const chunk = pickerChunks[k];
       const id = chunk.id;
-      if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
       const level = levelAt(chunk.sequence, id);
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
-      const prev = this.resolutions.get(id) ?? 0;
+      const prev = chunk.currentResolution;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
     if (plan?.override) {
@@ -8677,9 +8698,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // overrun here is estimator drift. The grace window (prefixBudget derives
     // from rejectionBudget) absorbs it; beyond that the select refuses the
     // turn rather than silently dropping whatever happened to render last.
-    const middleChunkCountDiag = pickerChunks.filter(
-      c => !headMessageIds.has(c.id) && !tailMessageIds.has(c.id),
-    ).length;
+    const middleChunkCountDiag = middleChunkCount;
     const emissionOverBudget = (attempted: number): OverBudgetError =>
       this.overBudgetError(budget, {
         stage: 'Emission overran the plan (planner/emitter estimator drift)',
@@ -8812,7 +8831,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (block.type === 'text') rawRun.parts.push(block.text);
             }
           } else {
-            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo);
             if (!ancestor) {
               // Fall back to raw
               if (currentRun?.kind !== 'raw') {
@@ -8858,7 +8877,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.rsRaw('middleRaw', tokens);
         i++;
       } else {
-        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo,
+          chunkAtPosition ? chunkAtPosition[i] ?? null : undefined);
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -9782,21 +9802,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  MUST be passed wherever the planner used the same fallback, or the
      *  emitter renders raw what the plan priced folded (emission refusal). */
     l1Fallback?: ReadonlyMap<MessageId, SummaryId>,
+    /** Per-compile memo of the walk from a start summary to its ancestor at
+     *  a level; every message under the same L1 shares it. */
+    memo?: Map<SummaryId, (SummaryEntry | null | undefined)[]>,
+    /** The message's chunk record when the caller already holds it (null
+     *  for none); undefined looks it up. */
+    knownChunk?: Chunk | null,
   ): SummaryEntry | null {
     if (level <= 0) return null;
-    const chunk = chunksByMessageId.get(messageId);
+    const chunk = knownChunk === undefined ? chunksByMessageId.get(messageId) : knownChunk ?? undefined;
     const startId = chunk?.summaryId ?? l1Fallback?.get(messageId);
     if (!startId) return null;
+    let known = memo?.get(startId);
+    if (known) {
+      const cached = known[level];
+      if (cached !== undefined) return cached;
+    } else if (memo) {
+      memo.set(startId, known = []);
+    }
     const lookup = (id: string): SummaryEntry | undefined =>
       summariesById ? summariesById.get(id) : this.summaries.find((s) => s.id === id);
     let current: SummaryEntry | undefined = lookup(startId);
     while (current && current.level < level) {
       const parentId = getSummaryParentId(current);
-      if (!parentId) return null;
+      if (!parentId) { current = undefined; break; }
       current = lookup(parentId);
     }
-    if (!current || current.level !== level) return null;
-    return current;
+    const found = current && current.level === level ? current : null;
+    if (known) known[level] = found;
+    return found;
   }
 
   /**
@@ -11066,8 +11100,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // policy disabled
 
     const messages = store.getAll();
-    const posById = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) posById.set(messages[i].id, i);
+    const posById = this.positionIndex(messages);
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
 
     // Same region windows select() bucketed by, so a stripped image's reclaimed
