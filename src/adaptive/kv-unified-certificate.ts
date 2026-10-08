@@ -566,9 +566,24 @@ export function certifyCarriedLayout(
       : tangentAt > high
         ? 2 * policy.budgetOverLambda * (tangentAt - high) / overScale ** 2 : 0;
     let magnitude = 1;
+    const leafAt = flat.leafIndex;
     for (let i = 0; i < nodeCount; i++) {
       const ownTokens = nodeTokens[i];
       const ownFidelity = nodeFidelity[i];
+      if (leafAt[i] >= 0) {
+        // A leaf node has no children and cannot expand: the same arithmetic
+        // as below with both child sums empty and `expanded` infinite.
+        if (Number.isFinite(ownTokens)) {
+          const selected = ownFidelity + slope * ownTokens;
+          costs[i] = selected;
+          tokens[i] = ownTokens;
+          magnitude += Math.abs(ownFidelity) + Math.abs(slope * ownTokens);
+        } else {
+          costs[i] = Infinity;
+          tokens[i] = 0;
+        }
+        continue;
+      }
       let selected = Number.isFinite(ownTokens) ? ownFidelity + slope * ownTokens : Infinity;
       let selectedTokens = ownTokens;
       for (let k = flat.selectedStart[i], end = flat.selectedStart[i + 1]; k < end; k++) {
