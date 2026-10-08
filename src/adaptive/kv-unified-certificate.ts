@@ -1,6 +1,7 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import { CanonicalSummaryForest } from './kv-unified.js';
+import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import {
   ExactKvUnifiedPolicySolver,
   budgetPenalty,
@@ -250,12 +251,28 @@ export function certifyCarriedLayout(
   if (candidates.length === 0) return null;
   const witness = candidates.reduce((best, candidate) => candidate.renderedTokens < best.renderedTokens ? candidate : best);
 
-  const scored = new ExactKvUnifiedPolicySolver(inputs, forest).scoreCandidates(
-    candidates, options,
+  // Score through the same terminal evaluator the solver uses. It computes
+  // churn from emitted unit codes, so no SummaryTree or rendered layout is
+  // built here; the old exact scorer rebuilt both on every compile.
+  // Every enumerated cut is structurally valid under the wall (witness:
+  // ${witness.renderedTokens} tokens), so no minimum-token floor is needed.
+  void witness;
+  const evaluator = new TerminalPolicyEvaluator(inputs, forest, options);
+  const unscored = candidates.map((candidate) => {
+    const byLevel = new Map<number, ChunkId[]>();
+    for (const [id, level] of candidate.frontier) {
+      let ids = byLevel.get(level);
+      if (!ids) byLevel.set(level, ids = []);
+      ids.push(id);
+    }
+    return evaluator.candidate({
+      forEachAssignment(visit) { for (const [level, ids] of byLevel) visit(ids, level); },
+    }, candidate.renderedTokens);
+  });
+  const scored = new ExactKvUnifiedPolicySolver(inputs, forest).scorePreparedCandidates(
+    unscored, options,
     { statesVisited: 0, candidatesGenerated: candidates.length, maxCandidatesAtState: candidates.length, terminalCandidates: candidates.length },
-    // Every enumerated cut is structurally valid under the wall; the scorer
-    // only checks feasible and does not use the minimum-token floor.
-    { feasible: true, floorTokens: witness.renderedTokens, frontier: witness.frontier },
+    evaluator.cacheRelevant,
   );
   // Every enumerated cut matches the accepted presentation, so the policy's
   // carried candidate is exactly `scored.selected`. Carried continuity is zero
