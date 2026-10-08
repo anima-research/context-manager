@@ -11,8 +11,9 @@
  *
  * These tests pin that every edit, drop and move the context manager makes
  * releases exactly the raw forms it made untrue: the edited block's own, from
- * it and from every block sharing it. A raw form no edit touched stays, so
- * verbatim replay survives wherever it is still true.
+ * it and from every block sharing it, and a Responses reasoning item paired
+ * with it. A raw form no edit touched stays, so verbatim replay survives
+ * wherever it is still true.
  */
 
 import { describe, it, before, after, beforeEach } from 'node:test';
@@ -108,6 +109,35 @@ describe('raw forms: keys and release', () => {
     assert.equal(withoutRawForms(block, new Set(['xml:other'])), block);
   });
 
+  it('releasing an item releases the reasoning paired with it, and only that pairing', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const rs2 = { type: 'redacted_thinking', data: 'two', rawItem: { type: 'reasoning', id: 'rs_2' } } as ContentBlock;
+    const part1 = itemText('first part');
+    const part2 = itemText('second part');
+    const before = [rs1, fc1, rs2, part1, part2];
+    const edited = { ...part2, text: 'second, cut' } as ContentBlock;
+    const after = releaseEditedRawForms(before, [rs1, fc1, rs2, part1, edited]);
+    assert.equal(after[0], rs1, 'the other pairing is untouched');
+    assert.equal(after[1], fc1);
+    assert.equal(rawOf(after[2]).rawItem, undefined, 'the reasoning that led to the edited item');
+    assert.equal((after[2] as { data: string }).data, 'two', 'keeps its encrypted content');
+    assert.equal(rawOf(after[3]).rawItem, undefined);
+    assert.equal(rawOf(after[4]).rawItem, undefined);
+  });
+
+  it('dropping a reasoning item releases the item it led to', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const after = releaseEditedRawForms([rs1, fc1], [fc1]);
+    assert.equal(rawOf(after[0]).rawItem, undefined, 'its id would name a reasoning item no longer sent');
+    // Reasoning at the end of a message has no follower here, and pairs with nothing.
+    const tail = { type: 'redacted_thinking', data: 'x', rawItem: { type: 'reasoning', id: 'rs_9' } } as ContentBlock;
+    const text = itemText('first part');
+    const kept = releaseEditedRawForms([text, tail], [{ ...text, text: 'cut' } as ContentBlock, tail]);
+    assert.equal(kept[1], tail);
+  });
+
   it('a moved block keeps a raw form it carries alone and gives up one it shares', () => {
     const alone = xmlResult('a', 'only', '<function_results>only</function_results>');
     assert.equal(releaseSharedRawFormsOnMove(alone, [alone, { type: 'text', text: 'x' }]), alone);
@@ -195,8 +225,9 @@ describe('raw forms: the strategies\' edits', () => {
     assert.equal((texts[0] as { text: string }).text, 'first part');
     assert.ok((texts[1] as { text: string }).text.includes('[truncated'), 'the cap applied');
     for (const t of texts) assert.equal(rawOf(t).rawItem, undefined, 'no part replays the uncut item');
-    const kept = reply.content.find((b) => b.type === 'redacted_thinking')!;
-    assert.deepEqual(rawOf(kept).rawItem, REASONING_ITEM, 'the reasoning item keeps its own raw form');
+    const paired = reply.content.find((b) => b.type === 'redacted_thinking')!;
+    assert.equal(rawOf(paired).rawItem, undefined, 'the reasoning paired with the cut item is released with it');
+    assert.equal((paired as { data: string }).data, 'opaque', 'and keeps its encrypted content');
     await manager.close();
   });
 
@@ -287,17 +318,69 @@ describe('raw forms: structural repair', () => {
   });
 });
 
+describe('raw forms: the compression input', () => {
+  before(cleanup);
+  after(cleanup);
+
+  it('stripping a reasoning item from the summarizer input releases the item it led to', async () => {
+    const calls: Array<{ messages: Array<{ participant: string; content: ContentBlock[] }> }> = [];
+    const membrane = {
+      complete: async (request: { messages: Array<{ participant: string; content: ContentBlock[] }> }) => {
+        calls.push({ messages: request.messages });
+        return {
+          stopReason: 'end_turn',
+          content: [{ type: 'text', text: 'a summary of the turns ' + 'x '.repeat(20) }],
+          usage: { input_tokens: 100, output_tokens: 20 },
+        };
+      },
+    };
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(8) }]);
+      const item = { type: 'message', id: `msg_${i}`, role: 'assistant', content: [{ type: 'output_text', text: `reply ${i}` }] };
+      manager.addMessage('agent', [
+        { type: 'redacted_thinking', data: `opaque-${i}`, rawItem: { type: 'reasoning', id: `rs_${i}` } } as ContentBlock,
+        { type: 'text', text: `reply ${i} ` + 'word '.repeat(10), rawItem: item } as ContentBlock,
+      ]);
+    }
+    for (let i = 0; i < 500 && !manager.isReady(); i++) await manager.tick();
+    assert.ok(calls.length > 0, 'expected at least one compression call');
+    let replies = 0;
+    for (const call of calls) {
+      for (const m of call.messages) {
+        for (const b of m.content) {
+          assert.ok(b.type !== 'redacted_thinking', 'reasoning never reaches the summarizer');
+          if (b.type === 'text' && /^reply \d/.test((b as { text: string }).text)) {
+            replies++;
+            assert.equal(rawOf(b).rawItem, undefined, 'a reply whose reasoning was stripped is sent without its id');
+          }
+        }
+      }
+    }
+    assert.ok(replies > 0, 'the agent replies reached the summarizer');
+    await manager.close();
+  });
+});
+
 describe('raw forms: the recall envelope', () => {
   const summary: SummaryEntry = {
     id: 'L1-7', level: 1, content: 'memory', tokens: 4, sourceLevel: 0,
     sourceIds: ['m-1'], sourceRange: { first: 'm-1', last: 'm-4' }, created: 0,
   };
 
-  it('wrapped parts release their message item; a reasoning carrier keeps its own', () => {
+  it('wrapped parts release their message item, and the reasoning paired with it', () => {
     const think = reasoning();
     const content = [think, itemText('first part'), itemText('second part'), itemText('third part')];
     const wrapped = wrapRecallAnswerContent(content, summary, 'xml');
-    assert.equal(wrapped[0], think, 'the carrier is passed through by reference, raw form and all');
+    assert.equal(rawOf(wrapped[0]).rawItem, undefined, 'the paired reasoning item is released');
+    assert.equal((wrapped[0] as { data: string }).data, 'opaque', 'with its content byte for byte');
     assert.match((wrapped[1] as { text: string }).text, /^<cm-recall/);
     assert.match((wrapped[3] as { text: string }).text, /<\/cm-recall>$/);
     for (const part of wrapped.slice(1)) {

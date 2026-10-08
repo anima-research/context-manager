@@ -806,6 +806,11 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
  * an empty content array.
+ *
+ * Deliberately not followed by releaseEditedRawForms: an empty part dropped
+ * from a Responses message item still rides inside its siblings' raw item, but
+ * only whitespace can ship that way, and releasing would re-render the whole
+ * item (and its reasoning pairing) from fields for no content change.
  */
 function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.filter((b) => {
@@ -836,9 +841,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**

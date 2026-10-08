@@ -25,6 +25,15 @@
  * block gives it up, and the formatter renders those blocks from their fields.
  * A raw form no edited block carried is untouched, so verbatim replay
  * survives wherever it is still true.
+ *
+ * A Responses reasoning item and the item it leads to (the next non-reasoning
+ * item in the same message) are one pairing: the provider ties them together
+ * by id, and a reasoning item replayed with its id but without that follower,
+ * or a follower replayed with its id but without its reasoning, is a pairing
+ * the provider didn't produce. So releasing either releases both. Released,
+ * both are rendered from their fields without ids (membrane's converter sends
+ * a `redacted_thinking` block as an id-less reasoning item), which is the shape
+ * membrane already sends for any history without raw items.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -35,6 +44,11 @@ function xmlKey(block: ContentBlock): string | undefined {
   const raw = (block as RawFormCarrier).rawXml;
   // The XML formatter replays only a non-empty string.
   return typeof raw === 'string' && raw.length > 0 ? `xml:${raw}` : undefined;
+}
+
+function isReasoningItem(block: ContentBlock): boolean {
+  const raw = (block as RawFormCarrier).rawItem;
+  return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type === 'reasoning';
 }
 
 function itemKey(block: ContentBlock): string | undefined {
@@ -97,6 +111,7 @@ export function releaseEditedRawForms(
     for (const key of rawFormKeys(block)) released.add(key);
   }
   if (released.size === 0) return after;
+  releasePairings(before, released);
   let changed = false;
   const result = after.map((block) => {
     const next = withoutRawForms(block, released);
@@ -104,6 +119,46 @@ export function releaseEditedRawForms(
     return next;
   });
   return changed ? result : after;
+}
+
+/**
+ * Widen `released` to whole reasoning pairings, read from the message's
+ * content as it was: each run of reasoning items pairs with the next
+ * non-reasoning item, and a pairing with any member released is released
+ * whole.
+ */
+function releasePairings(before: readonly ContentBlock[], released: Set<string>): void {
+  const pairings: string[][] = [];
+  let pending: string[] = [];
+  let lastFollower: string | undefined;
+  for (const block of before) {
+    const key = itemKey(block);
+    if (!key) continue;
+    if (isReasoningItem(block)) {
+      if (!pending.includes(key)) pending.push(key);
+      lastFollower = undefined;
+      continue;
+    }
+    // A later part of the same item continues the pairing it already joined.
+    if (key === lastFollower) continue;
+    if (pending.length > 0) pairings.push([...pending, key]);
+    pending = [];
+    lastFollower = key;
+  }
+  // Reasoning with no follower in this message pairs with nothing here.
+  let widened = true;
+  while (widened) {
+    widened = false;
+    for (const pairing of pairings) {
+      if (!pairing.some((key) => released.has(key))) continue;
+      for (const key of pairing) {
+        if (!released.has(key)) {
+          released.add(key);
+          widened = true;
+        }
+      }
+    }
+  }
 }
 
 /**

@@ -66,8 +66,9 @@ export function recallEnvelopeAddedText(
  * would also break the provider's thinking-first turn shape. Blocks that are
  * not rewritten are passed through by reference; rewritten ones are copies, so
  * the stored entry is never mutated. A rewritten block gives up its raw replay
- * form, along with every block that shares it, so the tags reach the wire
- * (see raw-forms.ts); a carrier with its own raw form keeps it.
+ * form, along with every block that shares it and a Responses reasoning item
+ * paired with it, so the tags reach the wire (see raw-forms.ts). A released
+ * carrier keeps its content fields byte for byte; only its raw item goes.
  */
 export function wrapRecallAnswerContent(
   content: ContentBlock[],
