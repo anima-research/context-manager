@@ -137,8 +137,9 @@ export class TerminalPolicyEvaluator {
       this.unitExtension[i + 1] = presentation && !previous ? 1 : 0;
       for (const level of leaf.allowedLevels) {
         const at = i * this.stride + level;
-        const summary = level === 0 ? undefined : leaf.summaryIds.find((id) => forest.summary(id)!.level === level);
-        const hash = level === 0 ? `raw:${chunk.id}` : `summary:${summary}`;
+        const slot = leaf.availableLevels.indexOf(level);
+        const summary = slot > 0 ? leaf.summaryIds[slot - 1] : undefined;
+        const hash = leaf.repHashes[slot];
         this.fidelity[at] = leaf.externallyAccounted ? 0 : fidelityLeafLoss(chunk, level, newest, this.policy);
         this.continuity[at] = continuityLeafLoss(chunk, level, hash, previous,
           options.presentation?.currentSeq ?? 0, midpoint, this.policy);

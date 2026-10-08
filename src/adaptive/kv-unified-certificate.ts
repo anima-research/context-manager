@@ -242,11 +242,7 @@ export function certifyCarriedLayout(
     const previous = presentation.leaves.get(leaf.id);
     if (previous) {
       if (!leaf.allowedLevels.includes(previous.level)) return null;
-      const summaryId = previous.level === 0 ? undefined : leaf.summaryIds.find(
-        (id) => forest.summary(id)!.level === previous.level,
-      );
-      const hash = previous.level === 0 ? `raw:${leaf.id}` : `summary:${summaryId}`;
-      if (hash !== previous.repHash) return null;
+      if (leaf.repHashes[leaf.availableLevels.indexOf(previous.level)] !== previous.repHash) return null;
       fixedLevel[i] = previous.level;
       fixedCount++;
     } else {

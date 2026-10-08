@@ -83,6 +83,12 @@ export interface CanonicalLeaf {
   readonly availableLevels: readonly number[];
   readonly allowedLevels: readonly number[];
   readonly constraints: readonly CanonicalLeafConstraint[];
+  /** Representation hash per available level (parallel to `availableLevels`):
+   * `raw:<id>` at level 0, `summary:<ancestor id>` above. Computed once per
+   * leaf build so per-compile scoring never rebuilds these strings. */
+  readonly repHashes: readonly string[];
+  /** Position in `orderedLeaves()` (chronological). Stable across derived forests. */
+  readonly index: number;
 }
 
 export interface CanonicalSummary {
@@ -502,8 +508,9 @@ export class CanonicalSummaryForest {
 
     const leafMap = new Map<ChunkId, CanonicalLeaf>();
     const conflicts: ConstraintConflict[] = [];
-    for (const chunk of chunks) {
-      const built = CanonicalSummaryForest.buildLeaf(chunk, chains.get(chunk.id) ?? [], inputs, options, summaryMap);
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const built = CanonicalSummaryForest.buildLeaf(chunk, chains.get(chunk.id) ?? [], inputs, options, summaryMap, i);
       leafMap.set(chunk.id, built.leaf);
       if (built.conflict) conflicts.push(built.conflict);
     }
@@ -551,8 +558,10 @@ export class CanonicalSummaryForest {
     inputs: PickerInputs,
     options: CanonicalForestOptions,
     summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>,
+    index: number,
   ): { leaf: CanonicalLeaf; conflict?: ConstraintConflict } {
     const availableLevels = [0, ...chain.map((id) => summaryMap.get(id)!.level)];
+    const repHashes = [`raw:${chunk.id}`, ...chain.map((id) => `summary:${id}`)];
     const constraints = CanonicalSummaryForest.constraintsFor(chunk, inputs, options);
     let allowedLevels = [...availableLevels];
     const requestedMissingLevels = new Set<number>();
@@ -587,6 +596,8 @@ export class CanonicalSummaryForest {
       availableLevels,
       allowedLevels,
       constraints,
+      repHashes,
+      index,
     };
     if (allowedLevels.length === 0) {
       return {
@@ -675,7 +686,7 @@ export class CanonicalSummaryForest {
       if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
       const chain = i < old.length ? previous.leafMap.get(chunk.id)!.summaryIds : [];
       if (chain.length > 0) ownedLeafChanged = true;
-      const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap);
+      const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap, i);
       leafMap.set(chunk.id, built.leaf);
       ordered[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
