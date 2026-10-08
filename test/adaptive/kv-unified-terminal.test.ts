@@ -206,3 +206,62 @@ test('a presentation map changed between solves is read again', () => {
     .candidate({ levels: Uint32Array.of(0) }, 100);
   assert.ok(after.continuityLoss > 0);
 });
+
+function live(chronicle: MockChronicle): PickerInputs {
+  return {
+    chunks: chronicle.chunks.map((chunk) => ({ ...chunk })),
+    summaries: new Map([...chronicle.summaries].map(([id, entry]) => [id, { ...entry }])),
+    recallPairTokens: new Map(chronicle.recallPairTokens), headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+}
+
+test('an evaluator reuses a kept layout translation only where the structure holds the same leaves', () => {
+  for (const viaLineage of [false, true]) {
+    const chronicle = new MockChronicle({ recallPairTokens: 10 });
+    chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    const a = chronicle.produceL1(['a']);
+    const b = chronicle.produceL1(['b']);
+    const p = chronicle.produceUpper(2, [b.id]);
+    const baseInputs = live(chronicle);
+    const base = new CanonicalSummaryForest(baseInputs);
+    // A sibling that appended two ownerless leaves writes this ownership's structure.
+    chronicle.addChunk({ id: 'x', rawTokens: 100 });
+    chronicle.addChunk({ id: 'y', rawTokens: 100 });
+    const grownInputs = live(chronicle);
+    const grown = CanonicalSummaryForest.derive(base, grownInputs)!;
+    assert.ok(grown);
+    const layout = renderLayout(grownInputs, new SummaryTree(grownInputs), new Map([['a', 1], ['b', 1], ['x', 0], ['y', 0]]));
+    const options = {
+      maxTokens: 150, policy: { cacheLambda: 10000, cacheScale: 100 },
+      cache: { immutablePrefixHash: 'same', layout,
+        markers: layout.units.map((_, i) => ({ unitIndex: i + 1, offset: layout.units[i + 1]?.offset ?? layout.totalTokens })) },
+      currentImmutablePrefixHash: 'same',
+    };
+    new TerminalPolicyEvaluator(grownInputs, grown, options);
+    // Another forest from the same base: one appended leaf under a different
+    // id at the sibling's position, with or without an ownership extension.
+    const next = live(chronicle);
+    next.chunks.splice(2, 2, { ...grownInputs.chunks[2], id: 'z' });
+    if (viaLineage) {
+      next.summaries.get(a.id)!.parentId = p.id;
+      next.summaries.get(p.id)!.sourceIds = [a.id, b.id];
+    }
+    const derived = CanonicalSummaryForest.derive(base, next)!;
+    assert.ok(derived);
+    assert.equal(derived.lineage !== undefined, viaLineage);
+    const reused = new TerminalPolicyEvaluator(next, derived, options);
+    const fresh = new TerminalPolicyEvaluator(next, new CanonicalSummaryForest(next), options);
+    for (const candidate of derived.enumerateExactCuts().candidates) {
+      const trace = traceFor(candidate.frontier);
+      const actual = reused.candidate(trace, candidate.renderedTokens);
+      const expected = fresh.candidate(trace, candidate.renderedTokens);
+      const at = `${viaLineage ? 'lineage' : 'ownership'} ${[...candidate.frontier].join(' ')}`;
+      assert.equal(actual.cacheChurn, expected.cacheChurn, `churn at ${at}`);
+      assert.equal(actual.fidelityLoss, expected.fidelityLoss, `F at ${at}`);
+      assert.equal(actual.continuityLoss, expected.continuityLoss, `K at ${at}`);
+      assert.deepEqual(actual.layout, expected.layout, `layout at ${at}`);
+    }
+  }
+});

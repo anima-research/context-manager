@@ -68,6 +68,10 @@ export class SummaryTree {
   private readonly summaries: ReadonlyMap<SummaryId, SummaryEntry>;
   private readonly recallPairTokens: ReadonlyMap<SummaryId, number>;
   private rootCache: TreeNode[] | null = null;
+  /** Source ids that no chunk or summary resolved when a node was built. A
+   *  node's coverage depends on them: should one arrive later, `derive`
+   *  declines instead of keeping nodes computed without it. */
+  private readonly unresolved: Set<string>;
   /** The chunks this tree was built from, for `derive`. */
   private readonly sourceChunks: readonly PickerChunk[];
 
@@ -81,6 +85,7 @@ export class SummaryTree {
       // patching only what moved, so the previous tree stays a coherent
       // snapshot.
       this.leaves = new Map(previous.leaves);
+      this.unresolved = new Set(previous.unresolved);
       for (const c of inputs.chunks) {
         const leaf = this.leaves.get(c.id);
         if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence && leaf.l1Id === c.l1Id) continue;
@@ -96,6 +101,7 @@ export class SummaryTree {
       return;
     }
 
+    this.unresolved = new Set();
     for (const c of inputs.chunks) {
       this.leaves.set(c.id, {
         kind: 'leaf',
@@ -127,7 +133,11 @@ export class SummaryTree {
     const rebuild: SummaryEntry[] = [];
     for (const [id, s] of inputs.summaries) {
       const node = previous.nodes.get(id);
-      if (!node) { rebuild.push(s); continue; }
+      if (!node) {
+        if (previous.unresolved.has(id)) return null;
+        rebuild.push(s);
+        continue;
+      }
       if (
         node.level !== s.level || node.childrenAreLeaves !== (s.sourceLevel === 0) ||
         node.recallTokens !== (recall.get(id) ?? s.tokens) ||
@@ -147,7 +157,7 @@ export class SummaryTree {
         // an owner is a full build.
         if (leaf.l1Id !== c.l1Id && leaf.l1Id !== undefined) return null;
         matched++;
-      }
+      } else if (previous.unresolved.has(c.id)) return null;
     }
     if (matched !== previous.leaves.size) return null;
     return new SummaryTree(inputs, previous, rebuild);
@@ -309,7 +319,7 @@ export class SummaryTree {
       if (s.sourceLevel === 0) {
         for (const mid of s.sourceIds) {
           const leaf = this.leaves.get(mid);
-          if (!leaf) continue; // ghost of a surgically removed chunk
+          if (!leaf) { this.unresolved.add(mid); continue; } // ghost of a surgically removed chunk
           if (!seenLeaves.has(mid)) {
             seenLeaves.add(mid);
             visited.push(mid);
@@ -320,7 +330,7 @@ export class SummaryTree {
       } else {
         for (const sid of s.sourceIds) {
           const child = this.summaries.get(sid);
-          if (!child) continue;
+          if (!child) { this.unresolved.add(sid); continue; }
           const known = collected?.get(child.id);
           if (known && known.summaries.every((id) => !seenSummaries.has(id))) {
             for (const id of known.summaries) seenSummaries.add(id);

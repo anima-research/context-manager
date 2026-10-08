@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import type { PickerInputs, PickerChunk } from '../../src/adaptive/picker.js';
 import { MockChronicle } from './harness.js';
+import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
 
 // Ten leaves: c0..c5 under two L1s and one L2, c6..c9 ownerless. c8, c9 in the tail.
 function fixture(): PickerInputs {
@@ -328,4 +329,40 @@ test('derive extensions match a fresh build over random evolutions', () => {
     }
   }
   assert.ok(extensions > 50, `extensions ${extensions}, full builds ${fullBuilds}`);
+});
+
+test('derive reads leaf fields from its own leaves, not from chunk objects updated in place', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  for (const id of ['a', 'b', 'c']) chronicle.addChunk({ id, rawTokens: 100 });
+  chronicle.produceL1(['a']);
+  const first = new CanonicalSummaryForest(live(chronicle), options);
+  // Same ownership: a pin set on the retained chunk object.
+  chronicle.chunks[0].pinned = true;
+  const pinned = live(chronicle);
+  const derived = CanonicalSummaryForest.derive(first, pinned, options);
+  assert.ok(derived);
+  assert.deepEqual(shape(derived), shape(new CanonicalSummaryForest(pinned, options)));
+  assert.deepEqual(derived.leaf('a')!.allowedLevels, [0]);
+  // Extended ownership: leaves off the changed chain edited in place beside a new L1.
+  chronicle.chunks[0].pinned = false;
+  chronicle.chunks[2].rawTokens = 7;
+  chronicle.produceL1(['b']);
+  const next = live(chronicle);
+  const extended = CanonicalSummaryForest.derive(derived, next, options);
+  assert.ok(extended?.lineage);
+  assert.deepEqual(shape(extended), shape(new CanonicalSummaryForest(next, options)));
+  // Through the strategy: a reused solve agrees with a fresh one after an in-place pin.
+  const again = new MockChronicle({ recallPairTokens: 10 });
+  again.addChunk({ id: 'a', rawTokens: 100 });
+  again.addChunk({ id: 'b', rawTokens: 100 });
+  again.produceL1(['a']);
+  const strategy = new KvUnifiedStrategy({ reuse: {} });
+  strategy.solve(live(again), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+  again.chunks[0].pinned = true;
+  again.produceL1(['b']);
+  const budget = { totalBudget: 50, targetBudget: 45, slack: 0.1 };
+  const reused = strategy.solve(live(again), budget);
+  const fresh = new KvUnifiedStrategy().solve(live(again), budget);
+  assert.equal(reused.exhausted, fresh.exhausted);
+  assert.deepEqual(reused.frontier, fresh.frontier);
 });

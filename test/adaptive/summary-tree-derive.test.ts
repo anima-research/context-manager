@@ -173,3 +173,30 @@ test('SummaryTree.derive extensions match a fresh build over random evolutions',
   }
   assert.ok(derivations > 300, `derivations ${derivations}`);
 });
+
+// A derived tree is either a fresh build or null.
+function freshOrDeclined(derived: SummaryTree | null, inputs: PickerInputs): void {
+  if (derived) assert.deepEqual(shape(derived, inputs), shape(new SummaryTree(inputs), inputs));
+}
+
+test('SummaryTree.derive does not keep coverage computed while a source was missing', () => {
+  // An upper summary whose L1 source arrives after the tree was built.
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  const s = chronicle.produceL1(['a']);
+  chronicle.produceUpper(2, [s.id]);
+  const after = nextCompile(live(chronicle));
+  const before = nextCompile(after);
+  (before.summaries as Map<string, unknown>).delete(s.id);
+  before.chunks[0].l1Id = undefined;
+  freshOrDeclined(SummaryTree.derive(new SummaryTree(before), after), after);
+  // An L1 listing a chunk that arrives after the tree was built.
+  const other = new MockChronicle({ recallPairTokens: 10 });
+  other.addChunk({ id: 'a', rawTokens: 100 });
+  other.addChunk({ id: 'b', rawTokens: 100 });
+  other.produceL1(['a', 'b']);
+  const whole = nextCompile(live(other));
+  const missing = nextCompile(whole);
+  missing.chunks.pop();
+  freshOrDeclined(SummaryTree.derive(new SummaryTree(missing), whole), whole);
+});

@@ -220,6 +220,12 @@ export class TerminalPolicyEvaluator {
     if (structure && remap === null && (structure.stride !== this.stride || structure.summaryCount !== summaries.length)) structure = undefined;
     const leafCount = structure?.leaves.length ?? 0;
     const shift = structure ? n - structure.chunkCount : 0;
+    // Raw codes are positions. The kept layout translation is reused only
+    // when every position the structure knows still holds the same leaf id:
+    // a sibling forest of this ownership may have appended other leaves, and
+    // a structure longer than this forest names positions it does not have.
+    let aligned = structure !== undefined && leafCount <= n;
+    for (let i = 0; aligned && i < leafCount; i++) aligned = structure!.leaves[i]?.id === this.ids[i];
     if (structure && leafCount >= n) {
       this.matches = structure.matches.slice(0, n * this.stride);
       this.representations = structure.representations.slice(0, n * this.stride);
@@ -245,7 +251,7 @@ export class TerminalPolicyEvaluator {
     const knownPrevious = structure?.previous ?? [];
     const layout = options.cache?.layout;
     const keptUnits = structure?.previousUnits;
-    if (layout && keptUnits && keptUnits.layout === layout) {
+    if (layout && keptUnits && keptUnits.layout === layout && aligned) {
       const table = remap;
       this.previousUnits = table ? keptUnits.units.map((code) => table[code])
         : shift === 0 ? keptUnits.units : keptUnits.units.map((code) => code > leafCount ? code + shift : code);

@@ -87,6 +87,12 @@ export interface CanonicalLeaf {
    * `raw:<id>` at level 0, `summary:<ancestor id>` above. Computed once per
    * leaf build so per-compile scoring never rebuilds these strings. */
   readonly repHashes: readonly string[];
+  /** The chunk fields the leaf was built from, so a derive compares against
+   * the build-time values and not a chunk object a caller updated in place. */
+  readonly pinned: boolean;
+  readonly lockedByAgent: boolean;
+  readonly pinLevel: number | undefined;
+  readonly pinMaxLevel: number | undefined;
   /** Position in `orderedLeaves()` (chronological). Stable across derived forests. */
   readonly index: number;
 }
@@ -307,6 +313,14 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
     zone[i] = (inputs.headChunkIds.has(id) ? 1 : 0) | (inputs.tailChunkIds.has(id) ? 2 : 0);
   }
   return zone;
+}
+
+/** Whether `chunk` would build the leaf `leaf` was built from, by the leaf's
+ * own record of its inputs (head/tail zones are compared by position). */
+function sameLeafInputs(leaf: CanonicalLeaf, chunk: PickerChunk): boolean {
+  return leaf.rawTokens === chunk.rawTokens && leaf.carriedLevel === chunk.currentResolution &&
+    leaf.lockedByAgent === chunk.lockedByAgent && leaf.pinned === chunk.pinned &&
+    leaf.pinLevel === chunk.pinLevel && leaf.pinMaxLevel === chunk.pinMaxLevel;
 }
 
 export class CanonicalSummaryForest {
@@ -668,7 +682,6 @@ export class CanonicalSummaryForest {
     chunks: readonly PickerChunk[],
   ): CanonicalSummaryForest | null {
     if (previous.treeifiedSummaryIds.length > 0 || previous.gapBearingSummaryIds.length > 0) return null;
-    const old = previous.sourceChunks;
     const oldLeaves = previous.orderedLeafList;
     const oldMap = previous.summaryMap;
     // One chain walk per L1, validated as the full build validates it; the
@@ -708,11 +721,6 @@ export class CanonicalSummaryForest {
     };
     const zone = leafZones(chunks, inputs);
     const oldZone = previous.leafZone;
-    const sameLeaf = (a: PickerChunk, b: PickerChunk, i: number): boolean =>
-      a.rawTokens === b.rawTokens && a.currentResolution === b.currentResolution &&
-      a.lockedByAgent === b.lockedByAgent && a.pinned === b.pinned &&
-      a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
-      oldZone[i] === zone[i];
     const n = chunks.length;
     const chainOf: (readonly SummaryId[])[] = new Array(n);
     const rebuilt = new Uint8Array(n);
@@ -725,7 +733,7 @@ export class CanonicalSummaryForest {
       const chain = chunk.l1Id === undefined ? noChain : walk(chunk.l1Id);
       if (chain === null) return null;
       chainOf[i] = chain;
-      const before = i < old.length ? oldLeaves[i].summaryIds : null;
+      const before = i < oldLeaves.length ? oldLeaves[i].summaryIds : null;
       // `walk` returns the previous chain array when the ids match, so a
       // different non-empty array is a different chain; empty chains are
       // one per leaf in a full build and compare by length.
@@ -742,7 +750,7 @@ export class CanonicalSummaryForest {
           positions.push(i);
         }
       }
-      if (ownedChanged || before === null || !sameLeaf(old[i], chunk, i)) rebuilt[i] = 1;
+      if (ownedChanged || before === null || !sameLeafInputs(oldLeaves[i], chunk) || oldZone[i] !== zone[i]) rebuilt[i] = 1;
     }
     if (changedSummaryIds.size === 0) return null;
     // An L1 that gained leaves keeps its previous ones too (disjoint sets).
@@ -822,7 +830,7 @@ export class CanonicalSummaryForest {
     const changedLeaves: number[] = [];
     for (let i = 0; i < n; i++) {
       const chunk = chunks[i];
-      if (i >= old.length) appendedIndex.set(chunk.id, i);
+      if (i >= oldLeaves.length) appendedIndex.set(chunk.id, i);
       if (rebuilt[i] === 0) {
         orderedLeaves[i] = oldLeaves[i];
         if (previousConflicts.size > 0) {
@@ -831,7 +839,7 @@ export class CanonicalSummaryForest {
         }
         continue;
       }
-      if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
+      if (i < oldLeaves.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
       const result = CanonicalSummaryForest.buildLeaf(chunk, chainOf[i], inputs, options, summaryMap, i, chainLevels);
       orderedLeaves[i] = result.leaf;
       if (result.conflict) conflicts.push(result.conflict);
@@ -918,6 +926,10 @@ export class CanonicalSummaryForest {
       sequence: chunk.sequence,
       rawTokens: chunk.rawTokens,
       carriedLevel: chunk.currentResolution,
+      pinned: chunk.pinned,
+      lockedByAgent: chunk.lockedByAgent,
+      pinLevel: chunk.pinLevel,
+      pinMaxLevel: chunk.pinMaxLevel,
       externallyAccounted:
         inputs.headChunkIds.has(chunk.id) || inputs.tailChunkIds.has(chunk.id),
       summaryIds: chain,
@@ -989,10 +1001,9 @@ export class CanonicalSummaryForest {
       for (const id of pi.summaries.keys()) if (!inputs.summaries.has(id)) return null;
     }
     const chunks = orderedChunks(inputs.chunks);
-    const old = previous.sourceChunks;
-    if (chunks.length < old.length) return null;
     const oldLeaves = previous.orderedLeafList;
-    for (let i = 0; i < old.length; i++) {
+    if (chunks.length < oldLeaves.length) return null;
+    for (let i = 0; i < oldLeaves.length; i++) {
       // Position, id and ownership are read from the leaf the previous forest
       // built, not from the old chunk object, which a caller may have updated
       // in place since.
@@ -1005,9 +1016,9 @@ export class CanonicalSummaryForest {
         ownershipChanged = true;
       }
     }
-    let lastSequence = old.length > 0 ? old[old.length - 1].sequence : -Infinity;
-    const appendedIds = chunks.length > old.length ? new Set<ChunkId>() : null;
-    for (let i = old.length; i < chunks.length; i++) {
+    let lastSequence = oldLeaves.length > 0 ? oldLeaves[oldLeaves.length - 1].sequence : -Infinity;
+    const appendedIds = chunks.length > oldLeaves.length ? new Set<ChunkId>() : null;
+    for (let i = oldLeaves.length; i < chunks.length; i++) {
       const chunk = chunks[i];
       if (chunk.sequence <= lastSequence || previous.leaf(chunk.id) !== null) return null;
       if (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0) return null;
@@ -1020,11 +1031,6 @@ export class CanonicalSummaryForest {
 
     const zone = leafZones(chunks, inputs);
     const oldZone = previous.leafZone;
-    const sameLeaf = (a: PickerChunk, b: PickerChunk, i: number): boolean =>
-      a.rawTokens === b.rawTokens && a.currentResolution === b.currentResolution &&
-      a.lockedByAgent === b.lockedByAgent && a.pinned === b.pinned &&
-      a.pinLevel === b.pinLevel && a.pinMaxLevel === b.pinMaxLevel &&
-      oldZone[i] === zone[i];
     // The derived forest takes over the previous forest's leaf map and
     // extends it in place (appended leaves added, changed leaves replaced):
     // the previous forest is superseded by this one, and nothing reads it
@@ -1039,7 +1045,7 @@ export class CanonicalSummaryForest {
       const chunk = chunks[i];
       // Ids match positionally (checked above), so the previous leaf list
       // answers without a map lookup per chunk.
-      if (i < old.length && sameLeaf(old[i], chunk, i)) {
+      if (i < oldLeaves.length && sameLeafInputs(oldLeaves[i], chunk) && oldZone[i] === zone[i]) {
         orderedLeaves[i] = oldLeaves[i];
         if (previousConflicts.size > 0) {
           const conflict = previousConflicts.get(chunk.id);
@@ -1047,14 +1053,14 @@ export class CanonicalSummaryForest {
         }
         continue;
       }
-      if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
-      const chain = i < old.length ? oldLeaves[i].summaryIds : [];
+      if (i < oldLeaves.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
+      const chain = i < oldLeaves.length ? oldLeaves[i].summaryIds : [];
       if (chain.length > 0) ownedLeafChanged = true;
       const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap, i);
-      if (i >= old.length) appendedIndex.set(chunk.id, i);
+      if (i >= oldLeaves.length) appendedIndex.set(chunk.id, i);
       orderedLeaves[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
-      if (i >= old.length) {
+      if (i >= oldLeaves.length) {
         // Appended leaves carry sequences above every previous leaf (checked
         // above), so pushing them in chunk order keeps the roots sorted.
         roots.push({ kind: 'leaf', id: chunk.id, firstSequence: chunk.sequence });
