@@ -144,3 +144,59 @@ test('kv-unified receipt v2 encoding round-trips, reads v1, and is far smaller',
     /receipt encoding v3 is unknown/,
   );
 });
+
+test('kv-unified receipt v2 rejects malformed columns and runs', () => {
+  const empty = new KvUnifiedReceiptChain();
+  const valid = { ...empty.serialize('v2'), ids: ['a'], reps: [], runs: [0, 0, 1, 1] };
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ['missing representation', { runs: [1, 1, 1, 1] }],
+    ['non-string representation', { reps: [null], runs: [1, 1, 1, 1] }],
+    ['negative representation', { runs: [-1, 0, 1, 1] }],
+    ['fractional representation', { runs: [0.5, 0, 1, 1] }],
+    ['non-array ids', { ids: null }],
+    ['non-array representations', { reps: {} }],
+    ['non-array runs', { runs: null }],
+    ['incomplete run', { runs: [0, 0, 1] }],
+    ['trailing incomplete run', { runs: [0, 0, 1, 1, 1] }],
+    ['zero count', { runs: [0, 0, 1, 0] }],
+    ['negative count', { runs: [0, 0, 1, -1] }],
+    ['fractional count', { runs: [0, 0, 1, 0.5] }],
+    ['string count', { runs: [0, 0, 1, '1'] }],
+    ['null count', { runs: [0, 0, 1, null] }],
+    ['excessive count', { runs: [0, 0, 1, 2] }],
+    ['partial coverage', { ids: ['a', 'b'] }],
+    ['negative level', { runs: [0, -1, 1, 1] }],
+    ['fractional level', { runs: [0, 0.5, 1, 1] }],
+    ['non-finite level', { runs: [0, Infinity, 1, 1] }],
+    ['negative sequence', { runs: [0, 0, -1, 1] }],
+    ['fractional sequence', { runs: [0, 0, 0.5, 1] }],
+    ['non-finite sequence', { runs: [0, 0, NaN, 1] }],
+    ['non-string/non-numeric id', { ids: [null] }],
+    ['unsafe numeric id', { ids: [Number.MAX_SAFE_INTEGER + 1] }],
+    ['negative numeric id', { ids: [-1] }],
+    ['fractional numeric id', { ids: [0.5] }],
+    ['duplicate id', { ids: ['a', 'a'], runs: [0, 0, 1, 2] }],
+    ['duplicate numeric/string id', { ids: [1, '1'], runs: [0, 0, 1, 2] }],
+  ];
+  for (const [name, fields] of invalid) {
+    assert.throws(
+      () => KvUnifiedReceiptChain.deserialize({ ...valid, ...fields } as never),
+      /kv-unified receipt/,
+      name,
+    );
+  }
+  assert.deepEqual(KvUnifiedReceiptChain.deserialize(empty.serialize('v2')).serialize(), empty.serialize());
+});
+
+test('kv-unified receipt v2 rejects oversized counts before reading leaf ids', () => {
+  const ids = ['a'];
+  Object.defineProperty(ids, 0, { get() { throw new Error('leaf id read before validating the count'); } });
+  for (const count of [1_000_000_000_000, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => KvUnifiedReceiptChain.deserialize({
+        ...new KvUnifiedReceiptChain().serialize('v2'), ids, runs: [0, 0, 1, count],
+      }),
+      /kv-unified receipt/,
+    );
+  }
+});

@@ -265,14 +265,31 @@ function decimalInteger(id: string): number {
 
 function decodeLeaves(value: SerializedReceiptChainV2): Map<ChunkId, PresentedLeaf> {
   const { ids, reps, runs } = value;
+  if (!Array.isArray(ids) || !Array.isArray(reps) || !Array.isArray(runs) || runs.length % 4 !== 0) {
+    throw new Error('kv-unified receipt v2 has invalid columns or run length');
+  }
   const leaves = new Map<ChunkId, PresentedLeaf>();
   let i = 0;
   for (let r = 0; r < runs.length; r += 4) {
     const [rep, level, lastChangedSeq, count] = [runs[r], runs[r + 1], runs[r + 2], runs[r + 3]];
+    if (
+      !Number.isSafeInteger(rep) || rep < 0 || rep > reps.length ||
+      (rep > 0 && typeof reps[rep - 1] !== 'string') ||
+      !Number.isSafeInteger(level) || level < 0 ||
+      !Number.isSafeInteger(lastChangedSeq) || lastChangedSeq < 0 ||
+      !Number.isSafeInteger(count) || count <= 0 || count > ids.length - i
+    ) {
+      throw new Error(`kv-unified receipt v2 has invalid run at ${r / 4}`);
+    }
     // The leaves of one run are the same readonly record: one object serves them all.
     const shared = rep > 0 ? { repHash: reps[rep - 1], level, lastChangedSeq } : null;
     for (const end = i + count; i < end; i++) {
-      const id = String(ids[i]);
+      const encodedId = ids[i];
+      if (typeof encodedId !== 'string' && (!Number.isSafeInteger(encodedId) || encodedId < 0)) {
+        throw new Error(`kv-unified receipt v2 has invalid leaf id at ${i}`);
+      }
+      const id = String(encodedId);
+      if (leaves.has(id)) throw new Error(`kv-unified receipt v2 has duplicate leaf id at ${i}`);
       leaves.set(id, shared ?? { repHash: `raw:${id}`, level, lastChangedSeq });
     }
   }
