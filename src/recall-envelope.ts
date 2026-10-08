@@ -1,4 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
+import { releaseEditedRawForms } from './raw-forms.js';
 import type { RecallEnvelopeMode, SummaryEntry } from './types/strategy.js';
 
 /**
@@ -64,7 +65,9 @@ export function recallEnvelopeAddedText(
  * verify on byte-identical blocks, and a text block prepended before them
  * would also break the provider's thinking-first turn shape. Blocks that are
  * not rewritten are passed through by reference; rewritten ones are copies, so
- * the stored entry is never mutated.
+ * the stored entry is never mutated. A rewritten block gives up its raw replay
+ * form, along with every block that shares it, so the tags reach the wire
+ * (see raw-forms.ts); a carrier with its own raw form keeps it.
  */
 export function wrapRecallAnswerContent(
   content: ContentBlock[],
@@ -83,10 +86,11 @@ export function wrapRecallAnswerContent(
   }
   const firstText = textPositions[0];
   const lastText = textPositions[textPositions.length - 1];
-  return content.map((block, position) => {
+  const wrapped = content.map((block, position) => {
     if (block.type !== 'text' || (position !== firstText && position !== lastText)) return block;
     const prefix = position === firstText ? `${open}\n` : '';
     const suffix = position === lastText ? `\n${close}` : '';
     return { ...block, text: `${prefix}${block.text}${suffix}` };
   });
+  return releaseEditedRawForms(content, wrapped);
 }
