@@ -230,6 +230,11 @@ interface PartialCut {
 
 const IMPOSSIBLE = Number.POSITIVE_INFINITY;
 
+type OrderedChild =
+  | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string }
+  | { kind: 'summary'; id: SummaryId; firstSequence: number; key: string };
+const orderedChildrenCache = new WeakMap<CanonicalSummary, readonly OrderedChild[]>();
+
 /** Parts of a forest derived from a previous one (see `derive`). */
 export interface PrebuiltForestParts {
   readonly ownership: object;
@@ -1226,16 +1231,32 @@ export class CanonicalSummaryForest {
 
     const memo = new Map<string, number>();
     const selectedChoice = new Map<string, boolean>();
+    // The active set is always a subset of the summary's leaves; the full set
+    // is the common case (no hole above it) and keys by the id alone. A
+    // partial set (holes under a selected ancestor) keeps the joined key.
     const keyOf = (id: SummaryId, active: readonly ChunkId[]): string =>
-      `${id}\u0000${active.join('\u0001')}`;
+      active.length === this.summaryMap.get(id)!.leafIds.length ? id : `${id}\u0000${active.join('\u0001')}`;
     const leafCost = (id: ChunkId): number => {
       const leaf = this.leafMap.get(id)!;
       if (!leaf.allowedLevels.includes(0)) return IMPOSSIBLE;
       return leaf.externallyAccounted ? 0 : leaf.rawTokens;
     };
     const childrenCost = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): number => {
-      const active = new Set(activeIds);
       let total = 0;
+      if (activeIds.length === summary.leafIds.length) {
+        // Every child is fully active: the same terms in the same order, with
+        // no membership set and no per-child filter.
+        for (const child of this.orderedChildren(summary)) {
+          if (child.kind === 'leaf') total += leafCost(child.id);
+          else {
+            const childSummary = this.summaryMap.get(child.id)!;
+            if (childSummary.leafIds.length > 0) total += summaryCost(child.id, childSummary.leafIds);
+          }
+          if (!Number.isFinite(total)) return IMPOSSIBLE;
+        }
+        return total;
+      }
+      const active = new Set(activeIds);
       for (const child of this.orderedChildren(summary)) {
         if (child.kind === 'leaf') {
           if (!active.has(child.id)) continue;
@@ -1260,7 +1281,9 @@ export class CanonicalSummaryForest {
         this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
       );
       let selected = IMPOSSIBLE;
-      if (participants.length > 0) {
+      if (participants.length === activeIds.length) {
+        selected = summary.recallTokens + 0;
+      } else if (participants.length > 0) {
         const participantSet = new Set(participants);
         const holes = activeIds.filter((leafId) => !participantSet.has(leafId));
         const holeCost = childrenCost(summary, holes);
@@ -1291,6 +1314,16 @@ export class CanonicalSummaryForest {
     const frontier = new Map<ChunkId, number>();
     const reconstructLeaf = (id: ChunkId): void => { frontier.set(id, 0); };
     const reconstructChildren = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): void => {
+      if (activeIds.length === summary.leafIds.length) {
+        for (const child of this.orderedChildren(summary)) {
+          if (child.kind === 'leaf') reconstructLeaf(child.id);
+          else {
+            const childSummary = this.summaryMap.get(child.id)!;
+            if (childSummary.leafIds.length > 0) reconstructSummary(child.id, childSummary.leafIds);
+          }
+        }
+        return;
+      }
       const active = new Set(activeIds);
       for (const child of this.orderedChildren(summary)) {
         if (child.kind === 'leaf') {
@@ -1308,9 +1341,11 @@ export class CanonicalSummaryForest {
         const participants = activeIds.filter((leafId) =>
           this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
         );
-        const participantSet = new Set(participants);
         for (const leafId of participants) frontier.set(leafId, summary.level);
-        reconstructChildren(summary, activeIds.filter((leafId) => !participantSet.has(leafId)));
+        if (participants.length !== activeIds.length) {
+          const participantSet = new Set(participants);
+          reconstructChildren(summary, activeIds.filter((leafId) => !participantSet.has(leafId)));
+        }
       } else {
         reconstructChildren(summary, activeIds);
       }
@@ -1364,11 +1399,13 @@ export class CanonicalSummaryForest {
     return constraints;
   }
 
-  private orderedChildren(summary: CanonicalSummary): Array<
-    | { kind: 'leaf'; id: ChunkId; firstSequence: number; key: string }
-    | { kind: 'summary'; id: SummaryId; firstSequence: number; key: string }
-  > {
-    return [
+  private orderedChildren(summary: CanonicalSummary): readonly OrderedChild[] {
+    // Summary objects are shared by every forest derived from the same build
+    // and leaf sequences are fixed per id, so the order is a property of
+    // the summary object.
+    const known = orderedChildrenCache.get(summary);
+    if (known) return known;
+    const children: OrderedChild[] = [
       ...summary.directLeafIds.map((id) => ({
         kind: 'leaf' as const,
         id,
@@ -1382,6 +1419,8 @@ export class CanonicalSummaryForest {
         key: summaryKey(id),
       })),
     ].sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
+    orderedChildrenCache.set(summary, children);
+    return children;
   }
 
   private frontierSignature(
