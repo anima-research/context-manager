@@ -242,7 +242,10 @@ const summaryLeafIndexCache = new WeakMap<CanonicalSummary, Int32Array>();
 export interface PrebuiltForestParts {
   readonly ownership: object;
   readonly chunks: readonly PickerChunk[];
-  readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
+  /** Positions of the leaves present at the full build (shared, never
+   *  mutated) and of the leaves appended since (per forest). */
+  readonly baseIndex: ReadonlyMap<ChunkId, number>;
+  readonly appendedIndex: ReadonlyMap<ChunkId, number>;
   readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
   readonly orderedLeafList: readonly CanonicalLeaf[];
   readonly roots: readonly CanonicalRoot[];
@@ -278,7 +281,12 @@ export class CanonicalSummaryForest {
   readonly ownership: object;
   private internalHolesMemo: boolean | undefined;
 
-  private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
+  /** Leaf positions in `orderedLeafList`: ids present at the full build in
+   *  `baseIndex` (shared by derived forests, never mutated), ids appended by
+   *  derives in `appendedIndex` (copied per forest). `leaf()` checks the id
+   *  at the position, so no forest ever reads another forest's leaf. */
+  private readonly baseIndex: ReadonlyMap<ChunkId, number>;
+  private readonly appendedIndex: ReadonlyMap<ChunkId, number>;
   private readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
   private readonly orderedLeafList: readonly CanonicalLeaf[];
   // What this forest was built from, kept so the next compile can derive
@@ -299,7 +307,8 @@ export class CanonicalSummaryForest {
     if (prebuilt) {
       this.sourceChunks = prebuilt.chunks;
       this.leafZone = prebuilt.leafZone;
-      this.leafMap = prebuilt.leafMap;
+      this.baseIndex = prebuilt.baseIndex;
+      this.appendedIndex = prebuilt.appendedIndex;
       this.summaryMap = prebuilt.summaryMap;
       this.orderedLeafList = prebuilt.orderedLeafList;
       this.roots = prebuilt.roots;
@@ -533,12 +542,12 @@ export class CanonicalSummaryForest {
       });
     }
 
-    const leafMap = new Map<ChunkId, CanonicalLeaf>();
+    const orderedLeafList: CanonicalLeaf[] = new Array(chunks.length);
     const conflicts: ConstraintConflict[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const built = CanonicalSummaryForest.buildLeaf(chunk, chains.get(chunk.id) ?? [], inputs, options, summaryMap, i);
-      leafMap.set(chunk.id, built.leaf);
+      orderedLeafList[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
     }
 
@@ -568,9 +577,10 @@ export class CanonicalSummaryForest {
     roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
 
     this.sourceChunks = chunks;
-    this.leafMap = leafMap;
+    this.baseIndex = indexOfLeaf;
+    this.appendedIndex = new Map();
     this.summaryMap = summaryMap;
-    this.orderedLeafList = chunks.map((chunk) => leafMap.get(chunk.id)!);
+    this.orderedLeafList = orderedLeafList;
     this.roots = roots;
     this.constraintConflicts = conflicts;
     this.treeifiedSummaryIds = [...treeified].sort();
@@ -690,7 +700,7 @@ export class CanonicalSummaryForest {
     let lastSequence = old.length > 0 ? old[old.length - 1].sequence : -Infinity;
     for (let i = old.length; i < chunks.length; i++) {
       const chunk = chunks[i];
-      if (chunk.l1Id !== undefined || chunk.sequence <= lastSequence || previous.leafMap.has(chunk.id)) return null;
+      if (chunk.l1Id !== undefined || chunk.sequence <= lastSequence || previous.leaf(chunk.id) !== null) return null;
       if (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0) return null;
       lastSequence = chunk.sequence;
     }
@@ -706,7 +716,7 @@ export class CanonicalSummaryForest {
     // extends it in place (appended leaves added, changed leaves replaced):
     // the previous forest is superseded by this one, and nothing reads it
     // for leaves it did not have. Its ordered leaf list stays its own.
-    const leafMap = previous.leafMap as Map<ChunkId, CanonicalLeaf>;
+    const appendedIndex = new Map(previous.appendedIndex);
     const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
     const conflicts: ConstraintConflict[] = [];
     const orderedLeaves: CanonicalLeaf[] = new Array(chunks.length);
@@ -729,7 +739,7 @@ export class CanonicalSummaryForest {
       const chain = i < old.length ? oldLeaves[i].summaryIds : [];
       if (chain.length > 0) ownedLeafChanged = true;
       const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap, i);
-      leafMap.set(chunk.id, built.leaf);
+      if (i >= old.length) appendedIndex.set(chunk.id, i);
       orderedLeaves[i] = built.leaf;
       if (built.conflict) conflicts.push(built.conflict);
       if (i >= old.length) {
@@ -740,7 +750,7 @@ export class CanonicalSummaryForest {
     }
     const derived = new CanonicalSummaryForest(inputs, options, {
       ownership: previous.ownership,
-      chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: orderedLeaves, roots,
+      chunks, baseIndex: previous.baseIndex, appendedIndex, summaryMap: previous.summaryMap, orderedLeafList: orderedLeaves, roots,
       constraintConflicts: conflicts,
       treeifiedSummaryIds: previous.treeifiedSummaryIds,
       gapBearingSummaryIds: previous.gapBearingSummaryIds,
@@ -780,7 +790,7 @@ export class CanonicalSummaryForest {
     for (const summary of this.allSummaries()) {
       let live = 0, allowed = 0;
       for (const id of summary.leafIds) {
-        const leaf = this.leafMap.get(id)!;
+        const leaf = this.leafOf(id)!;
         if (leaf.externallyAccounted) continue;
         live++;
         if (leaf.allowedLevels.includes(summary.level)) allowed++;
@@ -791,7 +801,14 @@ export class CanonicalSummaryForest {
   }
 
   leaf(id: ChunkId): CanonicalLeaf | null {
-    return this.leafMap.get(id) ?? null;
+    const at = this.appendedIndex.get(id) ?? this.baseIndex.get(id);
+    if (at === undefined || at >= this.orderedLeafList.length) return null;
+    const leaf = this.orderedLeafList[at];
+    return leaf.id === id ? leaf : null;
+  }
+
+  private leafOf(id: ChunkId): CanonicalLeaf | undefined {
+    return this.leaf(id) ?? undefined;
   }
 
   /** Allowed levels per leaf position (`orderedLeaves()` order) as bits,
@@ -814,7 +831,7 @@ export class CanonicalSummaryForest {
   leafIndicesOf(summary: CanonicalSummary): Int32Array {
     let indices = summaryLeafIndexCache.get(summary);
     if (!indices) {
-      indices = Int32Array.from(summary.leafIds, (id) => this.leafMap.get(id)!.index);
+      indices = Int32Array.from(summary.leafIds, (id) => this.leafOf(id)!.index);
       summaryLeafIndexCache.set(summary, indices);
     }
     return indices;
@@ -861,7 +878,7 @@ export class CanonicalSummaryForest {
     for (const summary of this.allSummaries()) {
       const key = summaryKey(summary.id);
       const participants = summary.leafIds.filter((leafId) =>
-        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+        this.leafOf(leafId)!.allowedLevels.includes(summary.level),
       );
       const holes = summary.leafIds.filter((leafId) => !participants.includes(leafId));
       const expandKeys = this.orderedChildren(summary).map((child) => child.key);
@@ -937,7 +954,7 @@ export class CanonicalSummaryForest {
     };
 
     const enumerateLeaf = (id: ChunkId): Map<string, Map<ChunkId, number>> => {
-      const leaf = this.leafMap.get(id)!;
+      const leaf = this.leafOf(id)!;
       const cuts = new Map<string, Map<ChunkId, number>>();
       if (leaf.allowedLevels.includes(0)) {
         const frontier = new Map<ChunkId, number>([[id, 0]]);
@@ -994,7 +1011,7 @@ export class CanonicalSummaryForest {
       const summary = this.summaryMap.get(id)!;
       const all = enumerateChildren(summary, activeLeafIds, enumerateSummary);
       const participants = activeLeafIds.filter((leafId) =>
-        this.leafMap.get(leafId)!.allowedLevels.includes(summary.level),
+        this.leafOf(leafId)!.allowedLevels.includes(summary.level),
       );
       if (participants.length > 0) {
         const participantSet = new Set(participants);
@@ -1199,8 +1216,7 @@ export class CanonicalSummaryForest {
         for (const candidateId of summary.leafIds) {
           const candidateIndex = indexById.get(candidateId)!;
           const candidateBit = bit(candidateIndex);
-          const candidateAllowsSummary = this.leafMap
-            .get(candidateId)!
+          const candidateAllowsSummary = this.leafOf(candidateId)!
             .allowedLevels.includes(summary.level);
           if ((label.remaining & candidateBit) === 0n && candidateAllowsSummary) {
             // This leaf was already rendered at a finer choice even though it
@@ -1258,15 +1274,19 @@ export class CanonicalSummaryForest {
       };
     }
 
-    const memo = new Map<string, number>();
-    const selectedChoice = new Map<string, boolean>();
     // The active set is always a subset of the summary's leaves; the full set
-    // is the common case (no hole above it) and keys by the id alone. A
-    // partial set (holes under a selected ancestor) keeps the joined key.
+    // is the common case (no hole above it) and keys by the id alone, in its
+    // own tables, so no partial key can alias a summary id.
+    const memoFull = new Map<string, number>();
+    const memoPartial = new Map<string, number>();
+    const selectedFull = new Map<string, boolean>();
+    const selectedPartial = new Map<string, boolean>();
+    const isFull = (id: SummaryId, active: readonly ChunkId[]): boolean =>
+      active.length === this.summaryMap.get(id)!.leafIds.length;
     const keyOf = (id: SummaryId, active: readonly ChunkId[]): string =>
-      active.length === this.summaryMap.get(id)!.leafIds.length ? id : `${id}\u0000${active.join('\u0001')}`;
+      isFull(id, active) ? id : `${id}\u0000${active.join('\u0001')}`;
     const leafCost = (id: ChunkId): number => {
-      const leaf = this.leafMap.get(id)!;
+      const leaf = this.leafOf(id)!;
       if (!leaf.allowedLevels.includes(0)) return IMPOSSIBLE;
       return leaf.externallyAccounted ? 0 : leaf.rawTokens;
     };
@@ -1288,7 +1308,7 @@ export class CanonicalSummaryForest {
         for (let k = 0; k < indices.length; k++) if (allowed[indices[k]] & bit) count++;
         return { count, ids: () => summary.leafIds.filter((_, k) => (allowed[indices[k]] & bit) !== 0) };
       }
-      const ids = activeIds.filter((leafId) => this.leafMap.get(leafId)!.allowedLevels.includes(summary.level));
+      const ids = activeIds.filter((leafId) => this.leafOf(leafId)!.allowedLevels.includes(summary.level));
       return { count: ids.length, ids: () => ids };
     };
     const childrenCost = (summary: CanonicalSummary, activeIds: readonly ChunkId[]): number => {
@@ -1322,7 +1342,9 @@ export class CanonicalSummaryForest {
     };
     const summaryCost = (id: SummaryId, activeIds: readonly ChunkId[]): number => {
       if (activeIds.length === 0) return 0;
+      const full = isFull(id, activeIds);
       const key = keyOf(id, activeIds);
+      const memo = full ? memoFull : memoPartial;
       const cached = memo.get(key);
       if (cached !== undefined) return cached;
       const summary = this.summaryMap.get(id)!;
@@ -1340,7 +1362,7 @@ export class CanonicalSummaryForest {
       const useSelected = selected < expanded;
       const best = useSelected ? selected : expanded;
       memo.set(key, best);
-      selectedChoice.set(key, useSelected);
+      (full ? selectedFull : selectedPartial).set(key, useSelected);
       return best;
     };
 
@@ -1385,7 +1407,7 @@ export class CanonicalSummaryForest {
     };
     const reconstructSummary = (id: SummaryId, activeIds: readonly ChunkId[]): void => {
       const summary = this.summaryMap.get(id)!;
-      if (selectedChoice.get(keyOf(id, activeIds))) {
+      if ((isFull(id, activeIds) ? selectedFull : selectedPartial).get(keyOf(id, activeIds))) {
         const participants = participantsOf(summary, activeIds);
         const ids = participants.ids();
         for (const leafId of ids) frontier.set(leafId, summary.level);
@@ -1458,9 +1480,9 @@ export class CanonicalSummaryForest {
       ...summary.directLeafIds.map((id) => ({
         kind: 'leaf' as const,
         id,
-        firstSequence: this.leafMap.get(id)!.sequence,
+        firstSequence: this.leafOf(id)!.sequence,
         key: leafKey(id),
-        index: this.leafMap.get(id)!.index,
+        index: this.leafOf(id)!.index,
       })),
       ...summary.childSummaryIds.map((id) => ({
         kind: 'summary' as const,
@@ -1481,7 +1503,7 @@ export class CanonicalSummaryForest {
   }
 
   private coverLeaf(id: ChunkId): PartialCut | null {
-    const leaf = this.leafMap.get(id)!;
+    const leaf = this.leafOf(id)!;
     if (!leaf.allowedLevels.includes(0)) return null;
     return {
       tokens: leaf.externallyAccounted ? 0 : leaf.rawTokens,
@@ -1503,7 +1525,7 @@ export class CanonicalSummaryForest {
     const participants: ChunkId[] = [];
     const holes: ChunkId[] = [];
     for (const leafId of activeLeafIds) {
-      if (this.leafMap.get(leafId)!.allowedLevels.includes(summary.level)) {
+      if (this.leafOf(leafId)!.allowedLevels.includes(summary.level)) {
         participants.push(leafId);
       } else {
         holes.push(leafId);

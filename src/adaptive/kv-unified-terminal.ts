@@ -41,26 +41,30 @@ interface EvaluatorStructure {
   matches: Uint8Array;
   representations: Uint32Array;
   /** 0 when the slot carries no continuity loss, else max(1, |level - previous.level|). */
-  distance: Uint16Array;
+  distance: Float64Array;
   previousUnits?: { layout: RenderLayout; units: Uint32Array };
 }
 
 const structures = new WeakMap<object, EvaluatorStructure>();
 
-const presentedByLeaves = new WeakMap<ReadonlyMap<string, PresentedLeaf>, {
-  ownership: object; leaves: readonly CanonicalLeaf[]; previous: (PresentedLeaf | undefined)[];
+const presentedByScope = new WeakMap<object, {
+  presentation: ReadonlyMap<string, PresentedLeaf>; ownership: object;
+  leaves: readonly CanonicalLeaf[]; previous: (PresentedLeaf | undefined)[];
 }>();
 
 /** The accepted presentation's entry per leaf position of `forest`, looked
- * up once per (presentation map, forest) and shared by the certificate and
- * the evaluators of the same compile. The array is not to be mutated. */
+ * up once per solve (`scope` is the solve's options object) and shared by
+ * the certificate and the evaluators of that solve. A later solve reads the
+ * map again, so a caller that mutates its map between solves is seen. The
+ * array is not to be mutated. */
 export function presentedLeavesByIndex(
   presentation: ReadonlyMap<string, PresentedLeaf>,
   forest: CanonicalSummaryForest,
+  scope: object,
 ): readonly (PresentedLeaf | undefined)[] {
   const leaves = forest.orderedLeaves();
-  const known = presentedByLeaves.get(presentation);
-  if (known && known.ownership === forest.ownership && known.leaves.length === leaves.length) {
+  const known = presentedByScope.get(scope);
+  if (known && known.presentation === presentation && known.ownership === forest.ownership && known.leaves.length === leaves.length) {
     let same = true;
     for (let i = 0; same && i < leaves.length; i++) {
       const a = known.leaves[i], b = leaves[i];
@@ -70,7 +74,7 @@ export function presentedLeavesByIndex(
   }
   const previous: (PresentedLeaf | undefined)[] = new Array(leaves.length);
   for (let i = 0; i < leaves.length; i++) previous[i] = presentation.get(leaves[i].id);
-  presentedByLeaves.set(presentation, { ownership: forest.ownership, leaves, previous });
+  presentedByScope.set(scope, { presentation, ownership: forest.ownership, leaves, previous });
   return previous;
 }
 
@@ -205,7 +209,7 @@ export class TerminalPolicyEvaluator {
         for (let at = 0, end = leafCount * this.stride; at < end; at++) if (codes[at] > leafCount) codes[at] += shift;
       }
     }
-    const distance = new Uint16Array(this.fidelity.length);
+    const distance = new Float64Array(this.fidelity.length);
     if (structure) distance.set(structure.distance.subarray(0, Math.min(structure.distance.length, distance.length)));
     const known = structure?.leaves ?? [];
     const knownPrevious = structure?.previous ?? [];
@@ -229,7 +233,7 @@ export class TerminalPolicyEvaluator {
     const currentSeq = presentation?.currentSeq ?? 0;
     const nextLeaves: (CanonicalLeaf | undefined)[] = new Array(n);
     const nextPrevious: (PresentedLeaf | undefined)[] = new Array(n);
-    const previousAt = presentation && fromForest ? presentedLeavesByIndex(presentation.leaves, forest) : null;
+    const previousAt = presentation && fromForest ? presentedLeavesByIndex(presentation.leaves, forest, options) : null;
     let age = 0;
     for (let i = n - 1; i >= 0; i--) {
       const chunk = this.chunks[i];

@@ -202,7 +202,10 @@ function buildDag(
   for (let i = 0; i < leaves.length; i++) leafIndex.set(leaves[i].id, i);
   const nodes: DagNode[] = [];
   const leafNode = new Map<ChunkId, number>();
-  const summaryNodes = new Map<string, number>();
+  // Fully owned contexts key by summary id, partial ones by a serialized id
+  // list; separate tables, so no partial key can alias a summary id.
+  const fullNodes = new Map<string, number>();
+  const partialNodes = new Map<string, number>();
   const contextLimit = 4 * (leaves.length + inputs.summaries.size) + 256;
   const contextLimitReached = new Error('certificate context limit');
   // Node count alone does not bound large active sets or repeated long IDs.
@@ -267,7 +270,8 @@ function buildDag(
     // hole above it) keys by the id alone and tests participants by bit.
     const full = activeIds.length === summary.leafIds.length;
     const key = full ? id : JSON.stringify([id, activeIds]);
-    const known = summaryNodes.get(key);
+    const table = full ? fullNodes : partialNodes;
+    const known = table.get(key);
     if (known !== undefined) return known;
     const children = addChildren(id, activeIds);
     let participants: readonly string[];
@@ -293,7 +297,7 @@ function buildDag(
       id: summary.id, level: summary.level, leafIds: participants, canSelect,
       participants: Int32Array.from(participants, (leafId) => leafIndex.get(leafId)!), leafIndex: -1,
     });
-    summaryNodes.set(key, index);
+    table.set(key, index);
     return index;
   };
   let roots: number[];
@@ -350,7 +354,7 @@ export function certifyCarriedLayout(
   const checkedLeaves: CanonicalLeaf[] = new Array(n);
   // One receipt lookup per leaf position, shared with this compile's
   // evaluator.
-  const checkedPrevious = presentedLeavesByIndex(presentation.leaves, forest) as (PresentedLeaf | undefined)[];
+  const checkedPrevious = presentedLeavesByIndex(presentation.leaves, forest, options) as (PresentedLeaf | undefined)[];
   for (let i = 0; i < n; i++) {
     const leaf = leaves[i];
     const previous = checkedPrevious[i];

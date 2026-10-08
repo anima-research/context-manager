@@ -112,3 +112,29 @@ test('derive declines every ownership change and option change', () => {
   assert.equal(CanonicalSummaryForest.derive(first, nextCompile(fixture()), { treeifyNonContiguousSummaries: true }), null, 'option change');
   assert.equal(CanonicalSummaryForest.derive(first, nextCompile(fixture()), { ...options, overlapExempt: new Set(['c0']) }), null, 'overlap exempt');
 });
+
+test('deriving twice from one forest leaves every forest coherent', () => {
+  const base: PickerInputs = {
+    chunks: [{ id: 'z', sequence: 0, rawTokens: 100, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: undefined }],
+    summaries: new Map(), recallPairTokens: new Map(), headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, options);
+  const grown = nextCompile(base);
+  grown.chunks[0].rawTokens = 500;
+  grown.chunks.push({ id: 'y', sequence: 1, rawTokens: 7, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: undefined });
+  const sibling = CanonicalSummaryForest.derive(first, grown, options);
+  assert.ok(sibling);
+  const again = CanonicalSummaryForest.derive(first, nextCompile(base), options);
+  assert.ok(again);
+  for (const forest of [first, again]) {
+    assert.equal(forest.leaf('z')!.rawTokens, 100);
+    assert.equal(forest.leaf('z'), forest.orderedLeaves()[0]);
+    assert.equal(forest.leaf('y'), null);
+    const floor = forest.minimumTokens(150);
+    assert.ok(floor.feasible);
+    assert.equal(floor.floorTokens, 100);
+  }
+  assert.equal(sibling.leaf('z')!.rawTokens, 500);
+  assert.equal(sibling.leaf('y'), sibling.orderedLeaves()[1]);
+});

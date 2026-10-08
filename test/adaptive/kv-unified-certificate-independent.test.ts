@@ -145,7 +145,9 @@ for (const [name, depth, width, longId] of [
   const membershipsLimit = 32 * count + 1024;
   const identifierLimit = 32 * (count + fixture.inputs.chunks.reduce((n, c) => n + c.id.length, 0) +
     [...fixture.inputs.summaries.keys()].reduce((n, id) => n + id.length, 0)) + 1024;
-  const stringify = JSON.stringify; let memberships = 0, identifiers = 0;
+  const stringify = JSON.stringify; let memberships = 0, identifiers = 0, entered = 0;
+  const masks = fixture.forest.allowedLevelMasks.bind(fixture.forest);
+  (fixture.forest as unknown as { allowedLevelMasks: () => Uint32Array }).allowedLevelMasks = () => { entered++; return masks(); };
   // Observe actual context-key inputs and stop the unfixed implementation
   // before it allocates excessive strings. The guard must decline first.
   JSON.stringify = ((value: unknown, ...rest: unknown[]) => {
@@ -160,12 +162,11 @@ for (const [name, depth, width, longId] of [
   try {
     assert.equal(certifyCarriedLayout(fixture.inputs, fixture.forest, fixture.options), null);
   } finally { JSON.stringify = stringify; }
-  // Every precondition holds (no conflicts, ownership depth under the cap, no
-  // extensions), so the decline can only come from context construction.
-  // Fully owned contexts key by summary id alone and never serialize; the
-  // hook observes the partial (hole) contexts when the chain reaches them.
-  assert.ok(fixture.forest.orderedLeaves().every((leaf) => leaf.summaryIds.length <= 256));
-  if (longId) assert.ok(memberships > 0, 'exercise context construction rather than an earlier precondition decline');
+  // Fully owned contexts key by summary id alone and never serialize, so the
+  // hook cannot see them; context construction is observed through the
+  // builder's first forest read instead.
+  assert.ok(entered > 0, 'exercise context construction rather than an earlier precondition decline');
+  if (longId) assert.ok(memberships > 0, 'partial contexts still serialize under the bound');
   if (longId) {
     const solver = new ParetoKvUnifiedPolicySolver(fixture.inputs, fixture.forest);
     const ordinary = solver.solve(fixture.options);
@@ -222,4 +223,41 @@ test('evolving accepted history recomputes pins, locks, receipts, fresh L1 and r
     cache = { immutablePrefixHash: 'same', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] };
   }
   assert.ok(certificates && fallbacks); console.log(JSON.stringify({ historyCertificates: certificates, historyFallbacks: fallbacks }));
+});
+
+// A summary id may spell another context's memo key. Full contexts (keyed by
+// summary id) and partial contexts (keyed by a serialized id list) live in
+// separate tables in the DAG builder and in the minimum-token floor, so such
+// an id never aliases a hole context of another summary.
+for (const mode of ['certificate', 'minimum'] as const) test(`summary ids that spell a partial-context key do not alias it (${mode})`, () => {
+  const c = new MockChronicle({ recallPairTokens: 10 });
+  c.addChunk({ id: 'a', rawTokens: 100, pinned: true });
+  c.addChunk({ id: 'b', rawTokens: 1000 });
+  c.addChunk({ id: 'c', rawTokens: mode === 'minimum' ? 1000 : 100 });
+  const s = c.produceL1(['a', 'b']); c.recallPairTokens.set(s.id, 200);
+  const p = c.produceUpper(2, [s.id]); c.recallPairTokens.set(p.id, 5);
+  const t = c.produceL1(['c']);
+  c.summaries.delete(t.id); c.recallPairTokens.delete(t.id);
+  t.id = mode === 'minimum' ? `${s.id}\u0000a` : JSON.stringify([s.id, ['a']]);
+  c.summaries.set(t.id, t); c.recallPairTokens.set(t.id, 10);
+  c.chunks[2].l1Id = t.id;
+  const inputs = inputsFor(c);
+  const forest = new CanonicalSummaryForest(inputs);
+  if (mode === 'minimum') {
+    const floor = forest.minimumTokens(150);
+    assert.ok(floor.feasible);
+    assert.equal(floor.floorTokens, 115);
+    assert.equal(forest.tokensForFrontier(floor.frontier), floor.floorTokens, 'the floor prices its own frontier');
+    return;
+  }
+  const options = {
+    maxTokens: 1000, adoptEpsilon: 1,
+    policy: { alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0, budgetUnderLambda: 0, budgetOverLambda: 1_000_000, continuityLambda: 0, cacheLambda: 0 },
+    presentation: presentation(inputs, new Map([['a', 0], ['b', 2], ['c', 0]])), reuse: {},
+  };
+  const exact = new ExactKvUnifiedPolicySolver(inputs, forest).solve(options);
+  assert.ok(exact.feasible);
+  assert.deepEqual([...exact.selected.frontier], [['a', 0], ['b', 2], ['c', 1]]);
+  const certified = certifyCarriedLayout(inputs, forest, options);
+  assert.equal(certified, null, 'the carried layout is far from optimal and must not certify');
 });

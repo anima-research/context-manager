@@ -164,3 +164,45 @@ test('DAG solves nested protected holes and interleaved ownership with exact cac
     assert.equal(result.continuityFloor, exact.continuityFloor, `continuity floor at ${run}`);
   }
 });
+
+test('cached continuity distances keep full precision across evaluators', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'x', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['x']);
+  const upper = chronicle.produceUpper(2, [l1.id]);
+  (upper as { level: number }).level = 65_537; // the forest reads the entry's level as given
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs);
+  const presentation: AcceptedPresentationReference = {
+    currentSeq: 5, leaves: new Map([['x', { level: 65_537, repHash: `summary:${upper.id}`, lastChangedSeq: 1 }]]),
+  };
+  const options = { maxTokens: 10_000, presentation };
+  const first = new TerminalPolicyEvaluator(inputs, forest, options).candidate({ levels: Uint32Array.of(1) }, 10);
+  const second = new TerminalPolicyEvaluator(inputs, forest, options).candidate({ levels: Uint32Array.of(1) }, 10);
+  assert.ok(first.continuityLoss > 0);
+  assert.equal(second.continuityLoss, first.continuityLoss);
+});
+
+test('a presentation map changed between solves is read again', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'x', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['x']);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs);
+  const leaves = new Map([['x', { level: 0, repHash: 'raw:x', lastChangedSeq: 1 }]]);
+  const presentation: AcceptedPresentationReference = { currentSeq: 5, leaves };
+  const before = new TerminalPolicyEvaluator(inputs, forest, { maxTokens: 10_000, presentation })
+    .candidate({ levels: Uint32Array.of(0) }, 100);
+  assert.equal(before.continuityLoss, 0);
+  leaves.set('x', { level: 1, repHash: `summary:${l1.id}`, lastChangedSeq: 1 });
+  // A new solve (new options object) sees the replaced entry.
+  const after = new TerminalPolicyEvaluator(inputs, forest, { maxTokens: 10_000, presentation })
+    .candidate({ levels: Uint32Array.of(0) }, 100);
+  assert.ok(after.continuityLoss > 0);
+});
