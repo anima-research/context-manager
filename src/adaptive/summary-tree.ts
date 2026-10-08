@@ -71,21 +71,28 @@ export class SummaryTree {
   /** The chunks this tree was built from, for `derive`. */
   private readonly sourceChunks: readonly PickerChunk[];
 
-  constructor(inputs: PickerInputs, previous?: SummaryTree) {
+  constructor(inputs: PickerInputs, previous?: SummaryTree, rebuild?: readonly SummaryEntry[]) {
     this.summaries = inputs.summaries;
     this.recallPairTokens = inputs.recallPairTokens ?? new Map();
     this.sourceChunks = inputs.chunks;
     if (previous) {
-      // `derive` verified ownership did not change: share the (immutable)
-      // summary nodes and copy the leaf map, patching only what moved, so
-      // the previous tree stays a coherent snapshot.
-      this.nodes = previous.nodes;
+      // `derive` verified what changed: share the (immutable) summary nodes
+      // except the ones listed for rebuilding, and copy the leaf map,
+      // patching only what moved, so the previous tree stays a coherent
+      // snapshot.
       this.leaves = new Map(previous.leaves);
       for (const c of inputs.chunks) {
         const leaf = this.leaves.get(c.id);
-        if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence) continue;
+        if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence && leaf.l1Id === c.l1Id) continue;
         this.leaves.set(c.id, { kind: 'leaf', chunkId: c.id, sequence: c.sequence, rawTokens: c.rawTokens, l1Id: c.l1Id });
       }
+      if (!rebuild || rebuild.length === 0) {
+        this.nodes = previous.nodes;
+        return;
+      }
+      this.nodes = new Map(previous.nodes);
+      const collected = new Map<SummaryId, LeafCollection>();
+      for (const s of rebuild) this.nodes.set(s.id, this.buildNode(s, collected));
       return;
     }
 
@@ -111,29 +118,39 @@ export class SummaryTree {
    * full build is needed.
    */
   static derive(previous: SummaryTree, inputs: PickerInputs): SummaryTree | null {
-    if (inputs.summaries.size !== previous.summaries.size) return null;
+    // Entries are compared with the previous tree's own nodes: the strategy
+    // updates a child's parent link on the entry object itself when an
+    // upper summary arrives. A new summary, or one whose parent link
+    // changed, gets a new node; any other difference is a full build.
+    if (inputs.summaries.size < previous.nodes.size) return null;
     const recall = inputs.recallPairTokens ?? new Map<SummaryId, number>();
+    const rebuild: SummaryEntry[] = [];
     for (const [id, s] of inputs.summaries) {
-      const o = previous.summaries.get(id);
+      const node = previous.nodes.get(id);
+      if (!node) { rebuild.push(s); continue; }
       if (
-        !o || o.level !== s.level || o.sourceLevel !== s.sourceLevel ||
-        getSummaryParentId(o) !== getSummaryParentId(s) ||
-        (recall.get(id) ?? s.tokens) !== (previous.recallPairTokens.get(id) ?? o.tokens) ||
-        o.sourceRange.first !== s.sourceRange.first || o.sourceRange.last !== s.sourceRange.last ||
-        o.sourceIds.length !== s.sourceIds.length
+        node.level !== s.level || node.childrenAreLeaves !== (s.sourceLevel === 0) ||
+        node.recallTokens !== (recall.get(id) ?? s.tokens) ||
+        node.sourceRange.first !== s.sourceRange.first || node.sourceRange.last !== s.sourceRange.last ||
+        node.childIds.length !== s.sourceIds.length
       ) return null;
-      for (let i = 0; i < s.sourceIds.length; i++) if (o.sourceIds[i] !== s.sourceIds[i]) return null;
+      for (let i = 0; i < s.sourceIds.length; i++) if (node.childIds[i] !== s.sourceIds[i]) return null;
+      if (node.parentId !== getSummaryParentId(s)) rebuild.push(s);
     }
+    if (inputs.summaries.size !== previous.nodes.size + rebuild.filter((s) => !previous.nodes.has(s.id)).length) return null;
     let matched = 0;
     for (const c of inputs.chunks) {
       const leaf = previous.leaves.get(c.id);
       if (leaf) {
-        if (leaf.sequence !== c.sequence || leaf.l1Id !== c.l1Id) return null;
+        if (leaf.sequence !== c.sequence) return null;
+        // A leaf may become owned (its node is replaced); losing or changing
+        // an owner is a full build.
+        if (leaf.l1Id !== c.l1Id && leaf.l1Id !== undefined) return null;
         matched++;
-      } else if (c.l1Id !== undefined) return null;
+      }
     }
     if (matched !== previous.leaves.size) return null;
-    return new SummaryTree(inputs, previous);
+    return new SummaryTree(inputs, previous, rebuild);
   }
 
   // ---- node access ----

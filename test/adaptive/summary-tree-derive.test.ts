@@ -65,20 +65,111 @@ test('SummaryTree.derive matches a fresh build across appends, reorders and toke
   assert.deepEqual(shape(d2, third), shape(new SummaryTree(third), third));
 });
 
-test('SummaryTree.derive declines ownership changes', () => {
+test('SummaryTree.derive declines structural changes and extends ownership additions', () => {
   const first = new SummaryTree(fixture());
-  const cases: Array<[string, (next: PickerInputs) => void]> = [
-    ['new L1 link', (next) => { next.chunks.find((c) => c.id === 'c6')!.l1Id = [...next.summaries.keys()][0]; }],
-    ['parent change', (next) => { const e = [...next.summaries.values()].find((s) => s.level === 1)!; (e as { parentId?: string }).parentId = undefined; }],
+  const declined: Array<[string, (next: PickerInputs) => void]> = [
     ['recall change', (next) => { (next.recallPairTokens as Map<string, number>).set([...next.summaries.keys()][0], 1); }],
     ['sourceIds change', (next) => { const e = [...next.summaries.values()].find((s) => s.level === 1)!; e.sourceIds[0] = 'c9'; }],
     ['leaf removed', (next) => { next.chunks.pop(); }],
     ['sequence change', (next) => { next.chunks[0]!.sequence = 99; }],
-    ['appended with owner', (next) => { next.chunks.push({ id: 'c10', sequence: 10, rawTokens: 5, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: [...next.summaries.keys()][0] }); }],
+    ['owner changed', (next) => { next.chunks.find((c) => c.id === 'c0')!.l1Id = [...next.summaries.keys()][1]; }],
   ];
-  for (const [name, mutate] of cases) {
+  for (const [name, mutate] of declined) {
     const next = nextCompile(fixture());
     mutate(next);
     assert.equal(SummaryTree.derive(first, next), null, name);
   }
+  const extended: Array<[string, (next: PickerInputs) => void]> = [
+    ['new L1 link', (next) => { next.chunks.find((c) => c.id === 'c6')!.l1Id = [...next.summaries.keys()][0]; }],
+    ['parent change', (next) => { const e = [...next.summaries.values()].find((s) => s.level === 1)!; (e as { parentId?: string }).parentId = undefined; }],
+    ['appended with owner', (next) => { next.chunks.push({ id: 'c10', sequence: 10, rawTokens: 5, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: [...next.summaries.keys()][0] }); }],
+  ];
+  for (const [name, mutate] of extended) {
+    const next = nextCompile(fixture());
+    mutate(next);
+    const derived = SummaryTree.derive(first, next);
+    assert.ok(derived, name);
+    assert.deepEqual(shape(derived, next), shape(new SummaryTree(next), next), name);
+  }
+});
+
+// The chronicle's own objects: entries and chunks it updates in place.
+function live(chronicle: MockChronicle, tail: string[] = []): PickerInputs {
+  return {
+    chunks: [...chronicle.chunks], summaries: new Map(chronicle.summaries),
+    recallPairTokens: new Map(chronicle.recallPairTokens), headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set(tail),
+  };
+}
+
+test('SummaryTree.derive extends for an added L1 and an upper summary re-parenting children in place', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 10; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 90 + i });
+  const a = chronicle.produceL1(['c0', 'c1', 'c2']);
+  const b = chronicle.produceL1(['c3', 'c4', 'c5']);
+  const first = new SummaryTree(live(chronicle));
+  const upper = chronicle.produceUpper(2, [a.id, b.id]);
+  assert.equal(a.parentId, upper.id);
+  const c = chronicle.produceL1(['c6', 'c7']);
+  const next = live(chronicle, ['c9']);
+  const derived = SummaryTree.derive(first, next);
+  assert.ok(derived);
+  assert.deepEqual(shape(derived, next), shape(new SummaryTree(next), next));
+  assert.equal(derived.ancestorAt('c6', 1)?.id, c.id);
+  assert.equal(derived.ancestorAt('c0', 2)?.id, upper.id);
+  chronicle.addChunk({ id: 'c10', rawTokens: 12 });
+  chronicle.produceL1(['c8', 'c9', 'c10']);
+  const again = SummaryTree.derive(derived, live(chronicle, ['c10']));
+  assert.ok(again);
+  assert.deepEqual(shape(again, live(chronicle, ['c10'])), shape(new SummaryTree(live(chronicle, ['c10'])), live(chronicle, ['c10'])));
+});
+
+test('SummaryTree.derive extensions match a fresh build over random evolutions', () => {
+  let seed = 0x2545f491;
+  const random = (): number => {
+    seed = (seed + 0x6d2b79f5) >>> 0;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = (n: number): number => Math.floor(random() * n);
+  let derivations = 0;
+  for (let round = 0; round < 60; round++) {
+    const chronicle = new MockChronicle({ recallPairTokens: 40 + pick(30) });
+    let nextId = 0;
+    const add = (): void => { chronicle.addChunk({ id: `m${nextId}`, rawTokens: 20 + pick(200) }); nextId++; };
+    for (let i = 0, n = 4 + pick(8); i < n; i++) add();
+    let tail: string[] = [];
+    let previous = new SummaryTree(nextCompile(live(chronicle, tail)));
+    for (let step = 0; step < 7; step++) {
+      switch (pick(5)) {
+        case 0: for (let i = 0, n = 1 + pick(3); i < n; i++) add(); break;
+        case 1: {
+          const free = chronicle.chunks.filter((chunk) => chunk.l1Id === undefined);
+          if (free.length < 2) break;
+          const start = pick(free.length - 1);
+          chronicle.produceL1(free.slice(start, start + 2 + pick(free.length - start - 1)).map((chunk) => chunk.id));
+          break;
+        }
+        case 2: case 3: {
+          const level = 2 + pick(2);
+          const orphans = [...chronicle.summaries.values()].filter((s) => s.level === level - 1 && !s.parentId);
+          if (orphans.length < 2) break;
+          const start = pick(orphans.length - 1);
+          chronicle.produceUpper(level, orphans.slice(start, start + 2 + pick(Math.min(2, orphans.length - start - 1))).map((s) => s.id));
+          break;
+        }
+        case 4: { const chunk = chronicle.chunks[pick(chronicle.chunks.length)]; chunk.rawTokens += 1 + pick(50); break; }
+      }
+      const inputs = nextCompile(live(chronicle, tail));
+      const fresh = new SummaryTree(inputs);
+      const derived = SummaryTree.derive(previous, inputs);
+      if (derived) derivations++;
+      const next = derived ?? fresh;
+      assert.deepEqual(shape(next, inputs), shape(fresh, inputs), `round ${round} step ${step}`);
+      previous = next;
+    }
+  }
+  assert.ok(derivations > 300, `derivations ${derivations}`);
 });
