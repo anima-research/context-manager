@@ -5127,6 +5127,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * remove content to satisfy API shape rules, which is a structural edit
    * rather than budget-driven loss, and is out of scope for this invariant.
    */
+  /** Store positions of the live messages under each emitted summary, kept
+   *  while the store order and the summaries array are the ones they were
+   *  read from. */
+  private _coverageMemo: {
+    order: ReadonlyMap<MessageId, number>;
+    source: readonly SummaryEntry[];
+    length: number;
+    positions: Map<string, Int32Array>;
+  } | null = null;
+
   protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[], regions?: { headStart: number; headEnd: number; recentStart: number }): void {
     // Coverage by store position: marking is a lookup in the shared position
     // index instead of a set insert per covered id.
@@ -5144,25 +5154,53 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (many) for (const id of many) mark(id);
     }
 
-    // Expand emitted summaries down to the message ids they stand for.
-    const byId = new Map(this.summaries.map(x => [x.id, x]));
-    const seen = new Set<string>();
-    const stack: string[] = [...this._emittedSummaryIds];
-    while (stack.length > 0) {
-      const id = stack.pop();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const sum = byId.get(id);
-      if (!sum) continue;
-      if (sum.sourceLevel === 0) {
-        for (const mid of sum.sourceIds) mark(mid);
-      } else {
-        for (const child of sum.sourceIds) stack.push(child);
+    // Expand emitted summaries down to the message ids they stand for. On the
+    // store listing the positions under a summary are remembered, so a
+    // summary emitted again marks a position list instead of re-walking its
+    // sources through the index.
+    const byStore = positionOf === this._storeOrder;
+    let memo = byStore ? this._coverageMemo : null;
+    if (byStore && (!memo || memo.order !== positionOf || memo.source !== this.summaries || memo.length !== this.summaries.length)) {
+      memo = { order: positionOf, source: this.summaries, length: this.summaries.length, positions: new Map() };
+      this._coverageMemo = memo;
+    }
+    for (const rootId of this._emittedSummaryIds) {
+      const kept = memo?.positions.get(rootId);
+      if (kept) {
+        for (let k = 0; k < kept.length; k++) covered[kept[k]] = 1;
+        continue;
       }
+      const found: number[] = [];
+      const seen = new Set<string>();
+      const stack: string[] = [rootId];
+      while (stack.length > 0) {
+        const id = stack.pop();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const sum = this.summaryById(id);
+        if (!sum) continue;
+        if (sum.sourceLevel === 0) {
+          for (const mid of sum.sourceIds) {
+            const at = positionOf.get(mid);
+            if (at !== undefined) { covered[at] = 1; found.push(at); }
+          }
+        } else {
+          for (const child of sum.sourceIds) stack.push(child);
+        }
+      }
+      memo?.positions.set(rootId, Int32Array.from(found));
     }
 
     const missing: string[] = [];
-    for (const m of messages) if (covered[positionOf.get(m.id)!] !== 1) missing.push(m.id);
+    if (byStore) {
+      // The store listing sits at its own positions; a position not marked is
+      // re-read through the index so a repeated id resolves as before.
+      for (let i = 0; i < messages.length; i++) {
+        if (covered[i] !== 1 && covered[positionOf.get(messages[i].id)!] !== 1) missing.push(messages[i].id);
+      }
+    } else {
+      for (const m of messages) if (covered[positionOf.get(m.id)!] !== 1) missing.push(m.id);
+    }
     if (missing.length === 0) return;
 
     const site = this._uncoveredSite || 'unknown-site';
