@@ -92,6 +92,8 @@ export {
   type PresentationReceipt,
   type ReceiptChainSnapshot,
   type SerializedReceiptChain,
+  type SerializedReceiptChainV2,
+  type ReceiptEncoding,
   type ObservedCacheWireReceipt,
 } from './kv-unified-receipts.js';
 export {

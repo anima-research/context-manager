@@ -98,3 +98,49 @@ test('kv-unified receipt state round-trips through a Chronicle-safe JSON shape',
     duplicate: true,
   });
 });
+
+const summarized = (count: number, seq: number) => {
+  // Numeric ids in blocks of 1000 under one summary each (two levels), then
+  // raw leaves and ids the encoder must keep as strings: a leading zero, a
+  // non-number, and a raw leaf whose hash is not derived from its id.
+  const out = new Map<string, { repHash: string; level: number; lastChangedSeq: number }>();
+  for (let k = 0; k < count; k++) {
+    const block = Math.floor(k / 1000);
+    const level = block % 2 === 0 ? 2 : 1;
+    out.set(String(k), { repHash: `summary:L${level}-${block}`, level, lastChangedSeq: seq });
+  }
+  out.set(String(count), { repHash: `raw:${count}`, level: 0, lastChangedSeq: seq });
+  out.set('007', { repHash: 'raw:007', level: 0, lastChangedSeq: seq });
+  out.set('msg-x', { repHash: 'summary:L2-0', level: 2, lastChangedSeq: seq });
+  out.set('9', { repHash: 'raw:other', level: 0, lastChangedSeq: seq });
+  return out;
+};
+
+test('kv-unified receipt v2 encoding round-trips, reads v1, and is far smaller', () => {
+  const chain = new KvUnifiedReceiptChain();
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: summarized(3_000, 1) });
+  chain.accept('s1', 100, null);
+  const next = summarized(3_000, 1);
+  next.set('msg-x', { repHash: 'raw:msg-x', level: 0, lastChangedSeq: 2 });
+  chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: next });
+  chain.accept('s2', 200, { immutablePrefixHash: 'tools', layout: { units: [], totalTokens: 0 }, markers: [] }, {
+    requestHash: 'wire',
+    markers: [{ ordinal: 0, prefixHash: 'prefix', estimatedOffset: 123 }],
+  });
+  const v1 = JSON.stringify(chain.serialize());
+  const v2 = JSON.stringify(chain.serialize('v2'));
+  assert.ok(v2.length * 8 < v1.length, `v2 ${v2.length} bytes, v1 ${v1.length} bytes`);
+  for (const encoded of [v1, v2]) {
+    const restored = KvUnifiedReceiptChain.deserialize(JSON.parse(encoded));
+    assert.deepEqual([...restored.leaves], [...chain.leaves]);
+    assert.deepEqual(restored.head, chain.head);
+    assert.deepEqual(restored.cache, chain.cache);
+    assert.deepEqual(restored.wireReceipt, chain.wireReceipt);
+    assert.deepEqual(restored.accept('s1', 100, null), { presentationAdvanced: false, duplicate: true });
+    assert.deepEqual(restored.serialize(), chain.serialize(), 'the v1 shape is the same from either source');
+  }
+  assert.throws(
+    () => KvUnifiedReceiptChain.deserialize({ ...chain.serialize('v2'), v: 3 } as never),
+    /receipt encoding v3 is unknown/,
+  );
+});

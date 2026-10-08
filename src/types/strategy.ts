@@ -618,6 +618,13 @@ export interface KvUnifiedConfig {
    * full solve would. Off unless set.
    */
   hysteresisCertificate?: boolean;
+  /**
+   * Shape of the persisted presentation receipt (`kvunified:presentation-receipt`,
+   * rewritten after every accepted turn). `'v2'` (default) is columnar: the leaf
+   * ids once plus runs of `(rep, level, lastChangedSeq)`, about a tenth of
+   * `'v1'`, which lists one entry per leaf. Both shapes are always read.
+   */
+  receiptEncoding?: 'v1' | 'v2';
 }
 
 export interface AutobiographicalConfig {

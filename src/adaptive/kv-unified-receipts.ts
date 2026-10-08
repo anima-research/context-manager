@@ -38,6 +38,9 @@ export interface ObservedCacheWireReceipt {
   markers: Array<{ ordinal: number; prefixHash: string; estimatedOffset: number }>;
 }
 
+/** Persisted shape, one `[id, leaf]` entry per leaf (~69 bytes each: 5 MB
+ * for a 75k-leaf history, rewritten on every accepted turn). Read forever;
+ * written when `receiptEncoding` is `'v1'`. */
 export interface SerializedReceiptChain {
   head: PresentationReceipt | null;
   leaves: Array<[ChunkId, PresentedLeaf]>;
@@ -45,6 +48,25 @@ export interface SerializedReceiptChain {
   settledSubmissionIds: string[];
   wireReceipt: ObservedCacheWireReceipt | null;
 }
+
+/** Columnar persisted shape: the leaf ids in map order, then `runs` of
+ * `rep, level, lastChangedSeq, count` over that order. `rep` 0 is the raw
+ * hash `raw:<id>`; `rep` k > 0 is `reps[k - 1]`. Consecutive leaves under
+ * one summary share rep, level and sequence, so a history is a few hundred
+ * runs. A decimal integer id is written as a number. Still JSON, so the
+ * Chronicle view renders it unchanged. */
+export interface SerializedReceiptChainV2 {
+  v: 2;
+  head: PresentationReceipt | null;
+  cache: ProviderCacheReference | null;
+  settledSubmissionIds: string[];
+  wireReceipt: ObservedCacheWireReceipt | null;
+  ids: Array<ChunkId | number>;
+  reps: string[];
+  runs: number[];
+}
+
+export type ReceiptEncoding = 'v1' | 'v2';
 
 /** Pure single-flight receipt state machine. Persistence is layered on its
  * serializable snapshots by the strategy. Identical-layout keepalives update
@@ -64,13 +86,13 @@ export class KvUnifiedReceiptChain {
     this.wireReceiptValue = snapshot?.wireReceipt ?? null;
   }
 
-  static deserialize(value: SerializedReceiptChain): KvUnifiedReceiptChain {
-    const chain = new KvUnifiedReceiptChain({
-      head: value.head,
-      leaves: new Map(value.leaves),
-      cache: value.cache,
-      wireReceipt: value.wireReceipt,
-    });
+  /** Reads every shape ever written; the writer is `serialize(encoding)`. */
+  static deserialize(value: SerializedReceiptChain | SerializedReceiptChainV2): KvUnifiedReceiptChain {
+    let leaves: Map<ChunkId, PresentedLeaf>;
+    if (!('v' in value)) leaves = new Map(value.leaves);
+    else if (value.v === 2) leaves = decodeLeaves(value);
+    else throw new Error(`kv-unified receipt encoding v${String((value as { v: unknown }).v)} is unknown`);
+    const chain = new KvUnifiedReceiptChain({ head: value.head, leaves, cache: value.cache, wireReceipt: value.wireReceipt });
     chain.settled = new Set(value.settledSubmissionIds);
     return chain;
   }
@@ -151,13 +173,27 @@ export class KvUnifiedReceiptChain {
     };
   }
 
-  serialize(): SerializedReceiptChain {
+  serialize(): SerializedReceiptChain;
+  serialize(encoding: 'v1'): SerializedReceiptChain;
+  serialize(encoding: 'v2'): SerializedReceiptChainV2;
+  serialize(encoding: ReceiptEncoding): SerializedReceiptChain | SerializedReceiptChainV2;
+  serialize(encoding: ReceiptEncoding = 'v1'): SerializedReceiptChain | SerializedReceiptChainV2 {
+    if (encoding === 'v1') {
+      return {
+        head: this.headValue,
+        leaves: [...this.leavesValue],
+        cache: this.cacheValue,
+        settledSubmissionIds: [...this.settled].slice(-256),
+        wireReceipt: this.wireReceiptValue,
+      };
+    }
     return {
+      v: 2,
       head: this.headValue,
-      leaves: [...this.leavesValue],
       cache: this.cacheValue,
       settledSubmissionIds: [...this.settled].slice(-256),
       wireReceipt: this.wireReceiptValue,
+      ...encodeLeaves(this.leavesValue),
     };
   }
 
@@ -186,4 +222,65 @@ function diffLeaves(
 
 function sameLeaf(a: PresentedLeaf | undefined, b: PresentedLeaf | undefined): boolean {
   return a?.repHash === b?.repHash && a?.level === b?.level && a?.lastChangedSeq === b?.lastChangedSeq;
+}
+
+function encodeLeaves(leaves: ReadonlyMap<ChunkId, PresentedLeaf>): Pick<SerializedReceiptChainV2, 'ids' | 'reps' | 'runs'> {
+  const ids: Array<ChunkId | number> = [];
+  const reps: string[] = [];
+  const repCodes = new Map<string, number>();
+  const runs: number[] = [];
+  let rep = -1, level = -1, seq = -1, count = 0;
+  let lastHash = '', lastCode = 0;
+  for (const [id, leaf] of leaves) {
+    const n = decimalInteger(id);
+    ids.push(n >= 0 ? n : id);
+    let code = 0;
+    if (leaf.repHash === lastHash) code = lastCode;
+    else if (!isRawHash(leaf.repHash, id)) {
+      code = repCodes.get(leaf.repHash) ?? 0;
+      if (code === 0) { code = reps.push(leaf.repHash); repCodes.set(leaf.repHash, code); }
+      lastHash = leaf.repHash; lastCode = code;
+    }
+    if (code === rep && leaf.level === level && leaf.lastChangedSeq === seq) { count++; continue; }
+    if (count > 0) runs.push(rep, level, seq, count);
+    rep = code; level = leaf.level; seq = leaf.lastChangedSeq; count = 1;
+  }
+  if (count > 0) runs.push(rep, level, seq, count);
+  return { ids, reps, runs };
+}
+
+/** The value of `id` when it is a plain decimal integer whose `String()` is
+ * `id` again (no sign, no leading zero, within safe-integer range), else -1. */
+function decimalInteger(id: string): number {
+  const length = id.length;
+  if (length === 0 || length > 15 || (length > 1 && id.charCodeAt(0) === 48)) return -1;
+  let n = 0;
+  for (let i = 0; i < length; i++) {
+    const digit = id.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return -1;
+    n = n * 10 + digit;
+  }
+  return n;
+}
+
+function decodeLeaves(value: SerializedReceiptChainV2): Map<ChunkId, PresentedLeaf> {
+  const { ids, reps, runs } = value;
+  const leaves = new Map<ChunkId, PresentedLeaf>();
+  let i = 0;
+  for (let r = 0; r < runs.length; r += 4) {
+    const [rep, level, lastChangedSeq, count] = [runs[r], runs[r + 1], runs[r + 2], runs[r + 3]];
+    // The leaves of one run are the same readonly record: one object serves them all.
+    const shared = rep > 0 ? { repHash: reps[rep - 1], level, lastChangedSeq } : null;
+    for (const end = i + count; i < end; i++) {
+      const id = String(ids[i]);
+      leaves.set(id, shared ?? { repHash: `raw:${id}`, level, lastChangedSeq });
+    }
+  }
+  if (i !== ids.length) throw new Error(`kv-unified receipt runs cover ${i} of ${ids.length} leaves`);
+  return leaves;
+}
+
+/** `repHash === \`raw:${id}\`` without building the string for every leaf. */
+function isRawHash(repHash: string, id: ChunkId): boolean {
+  return repHash.length === id.length + 4 && repHash.startsWith('raw:') && repHash.endsWith(id);
 }

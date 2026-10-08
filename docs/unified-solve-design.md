@@ -608,7 +608,11 @@ model, or cached.
   historyEnd, changedLeaves: [{leafId, repHash, level, lastChangedSeq}]}`.
   Deltas carry only appended, removed, or changed leaves; a periodic full
   snapshot (configured cadence / max replay depth, tested) holds the whole
-  live-leaf representation map plus the current sequence. Stability clocks
+  live-leaf representation map plus the current sequence. The snapshot is
+  persisted as JSON in a columnar encoding (`v: 2`: the leaf ids once, then
+  runs of `(rep, level, lastChangedSeq)` over them, ~0.5 MB for 75k leaves);
+  the earlier one-entry-per-leaf shape is read forever and
+  `kvUnified.receiptEncoding: 'v1'` still writes it. Stability clocks
   are not per-leaf counters: `τ_i = currentSeq − lastChangedSeq_i`, so only
   changed leaves are written. **Commit semantics — single flight.** AF
   serializes turns per agent, so at most one provider-bound stream-lane

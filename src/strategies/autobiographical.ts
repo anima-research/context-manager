@@ -9029,7 +9029,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
-    this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+    // The v2 encoding is ~0.5 MB for a 75k-leaf history, v1 ~5 MB; both are
+    // read back. Every accepted turn appends this to the store's record log.
+    this.store?.setStateJson(
+      this.kvUnifiedReceiptStateId,
+      this.kvUnifiedReceipts.serialize(this.config.kvUnified?.receiptEncoding ?? 'v2'),
+    );
   }
 
   reportKvUnifiedFailed(submissionId: string): void {
