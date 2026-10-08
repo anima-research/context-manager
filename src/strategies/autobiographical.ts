@@ -11534,7 +11534,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -11549,9 +11550,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pruneToolEntries(entries: ContextEntry[]): void {
     // Each edited entry's content as it was, so the edit's raw replay forms can
     // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
     const originals = new Map<ContextEntry, ContentBlock[]>();
     const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
-      if (!originals.has(entry)) originals.set(entry, entry.content.slice());
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
       entry.content[index] = block;
     };
 

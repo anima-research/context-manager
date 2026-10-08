@@ -183,6 +183,38 @@ describe('raw forms: the strategies\' edits', () => {
     await manager.close();
   });
 
+  it('a second compile with no store writes caps and releases again, and the store keeps its messages', async () => {
+    // With no message cap cutting it, an entry holds its message's content
+    // array from the store's cached view. An edit written into that array
+    // would outlive the compile: the next one, before any write, would find
+    // the marker already in place and under the cap, neither cap nor release
+    // it, and replay the original input from the raw form the marker kept.
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      toolUseInputMaxTokens: 20,
+      toolResultMaxLastN: { 'fs:read': 1 },
+    });
+    const manager = await ContextManager.open({ path: STORE, strategy });
+    manager.addMessage('Claude', [
+      { type: 'tool_use', id: 'a', name: 'fs:read', input: { path: 'x'.repeat(400) }, rawXml: CALLS_XML } as ContentBlock,
+      xmlUse('b', '/small'),
+    ]);
+    manager.addMessage('user', [xmlResult('a', 'big file'), xmlResult('b', 'small file')]);
+    const stored = (): ContentBlock[] => manager.getAllMessages().flatMap((m) => m.content);
+    const asStored = structuredClone(stored());
+    const budget = { maxTokens: 100_000, reserveForResponse: 0 };
+    const first = await manager.compile(budget);
+    const second = await manager.compile(budget);
+    const [a, b] = second.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_use');
+    assert.equal((a as { input: { _truncated?: boolean } }).input._truncated, true, 'the cap applied again');
+    assert.equal(rawOf(a).rawXml, undefined, 'the capped invoke still doesn\'t replay the original');
+    assert.equal(rawOf(b).rawXml, undefined, 'nor does its sibling');
+    assert.deepEqual(second.messages, first.messages, 'the second compile ships what the first did');
+    assert.deepEqual(stored(), asStored, 'compiling left the store\'s messages as they were');
+    await manager.close();
+  });
+
   it('the last-N tool_result marker releases the <function_results> it shares', async () => {
     const strategy = new AutobiographicalStrategy({
       headWindowTokens: 0,
