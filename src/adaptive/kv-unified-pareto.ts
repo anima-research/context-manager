@@ -146,7 +146,7 @@ export class ParetoKvUnifiedPolicySolver {
 
   solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
     this.summaryMetricCache = new WeakMap();
-    const internalHoles = this.hasInternalProtectedHoles();
+    const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
       const started = performance.now();
@@ -639,15 +639,6 @@ export class ParetoKvUnifiedPolicySolver {
         approximationCacheErrorBound: approximation.cache,
       },
     };
-  }
-
-  private hasInternalProtectedHoles(): boolean {
-    for (const summary of this.forest.allSummaries()) {
-      const live = summary.leafIds.filter((id) => !this.forest.leaf(id)!.externallyAccounted);
-      const allowed = live.filter((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level));
-      if (allowed.length > 0 && allowed.length < live.length) return true;
-    }
-    return false;
   }
 
   private approximationBound(

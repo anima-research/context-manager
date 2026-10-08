@@ -10964,10 +10964,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
     const messages = store.getAll();
-    const out = new Array<number>(messages.length);
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
     const maxLive = this.config.maxLiveImages ?? 0;
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    // A compile asks for this pass more than once (recent-window scan, then
+    // the picker inputs). The listing array is the store's own cached view,
+    // so its identity plus the knobs read here identify the answer. Callers
+    // treat the array as read-only.
+    const memoCalibration = store.getTokenCalibration?.() ?? 1;
+    const memo = this._postStripMemo;
+    if (
+      memo && memo.messages === messages && memo.calibration === memoCalibration &&
+      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes
+    ) return memo.out;
+    const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
     const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
     // `store.estimateTokens` prices every block at round(raw × calibration);
@@ -11005,8 +11015,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, out };
     return out;
   }
+
+  private _postStripMemo: {
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; out: number[];
+  } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -11653,6 +11668,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected estimateTextOnlyTokens(msg: StoredMessage): number {
+    const cached = AutobiographicalStrategy._textOnlyTokens.get(msg);
+    if (cached !== undefined) return cached;
+    const tokens = AutobiographicalStrategy.computeTextOnlyTokens(msg);
+    AutobiographicalStrategy._textOnlyTokens.set(msg, tokens);
+    return tokens;
+  }
+
+  /** Pure per-message text-only estimate, cached on the message object like
+   *  staticSalience (immutable content; the store keeps the object across
+   *  appends). */
+  private static _textOnlyTokens = new WeakMap<StoredMessage, number>();
+
+  private static computeTextOnlyTokens(msg: StoredMessage): number {
     let tokens = 0;
     for (const block of msg.content) {
       if (block.type === 'text') {

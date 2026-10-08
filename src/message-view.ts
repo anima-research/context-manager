@@ -28,7 +28,17 @@ export function filterMessageStoreView(
   view: MessageStoreView,
   keep: (message: StoredMessage) => boolean,
 ): MessageStoreView {
-  const all = () => view.getAll().filter(keep);
+  // The underlying listing is the store's cached array while nothing was
+  // written, and `keep` is a pure function of the message, so one filtered
+  // array per listing serves every getAll/length/getTail of a compile.
+  let last: { source: readonly StoredMessage[]; out: StoredMessage[] } | null = null;
+  const all = () => {
+    const source = view.getAll();
+    if (last && last.source === source) return last.out;
+    const out = source.filter(keep);
+    last = { source, out };
+    return out;
+  };
   return {
     getAll: all,
     get: (id: MessageId) => {

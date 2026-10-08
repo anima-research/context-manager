@@ -244,6 +244,7 @@ export class CanonicalSummaryForest {
   readonly gapBearingSummaryIds: readonly SummaryId[];
   /** True when this forest was derived from a previous compile's forest. */
   readonly derived: boolean;
+  private internalHolesMemo: boolean | undefined;
 
   private readonly leafMap: ReadonlyMap<ChunkId, CanonicalLeaf>;
   private readonly summaryMap: ReadonlyMap<SummaryId, CanonicalSummary>;
@@ -656,6 +657,7 @@ export class CanonicalSummaryForest {
     const ordered: CanonicalLeaf[] = new Array(chunks.length);
     const roots = [...previous.roots];
     let appended = false;
+    let ownedLeafChanged = false;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       if (i < old.length && sameLeaf(old[i], chunk)) {
@@ -667,6 +669,7 @@ export class CanonicalSummaryForest {
       }
       if (i < old.length && (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0)) return null;
       const chain = i < old.length ? previous.leafMap.get(chunk.id)!.summaryIds : [];
+      if (chain.length > 0) ownedLeafChanged = true;
       const built = CanonicalSummaryForest.buildLeaf(chunk, chain, inputs, options, previous.summaryMap);
       leafMap.set(chunk.id, built.leaf);
       ordered[i] = built.leaf;
@@ -677,16 +680,38 @@ export class CanonicalSummaryForest {
       }
     }
     if (appended) roots.sort((a, b) => a.firstSequence - b.firstSequence || a.id.localeCompare(b.id));
-    return new CanonicalSummaryForest(inputs, options, {
+    const derived = new CanonicalSummaryForest(inputs, options, {
       chunks, leafMap, summaryMap: previous.summaryMap, orderedLeafList: ordered, roots,
       constraintConflicts: conflicts,
       treeifiedSummaryIds: previous.treeifiedSummaryIds,
       gapBearingSummaryIds: previous.gapBearingSummaryIds,
     });
+    if (!ownedLeafChanged) derived.internalHolesMemo = previous.internalHolesMemo;
+    return derived;
   }
 
   orderedLeaves(): readonly CanonicalLeaf[] {
     return this.orderedLeafList;
+  }
+
+  /** Some summary has a live participant and a live non-participant leaf: a
+   * protected hole inside its span. Depends only on this forest's leaves and
+   * summaries, so it is computed once and inherited by derived forests whose
+   * owned leaves did not change. */
+  hasInternalProtectedHoles(): boolean {
+    if (this.internalHolesMemo !== undefined) return this.internalHolesMemo;
+    let holes = false;
+    for (const summary of this.allSummaries()) {
+      let live = 0, allowed = 0;
+      for (const id of summary.leafIds) {
+        const leaf = this.leafMap.get(id)!;
+        if (leaf.externallyAccounted) continue;
+        live++;
+        if (leaf.allowedLevels.includes(summary.level)) allowed++;
+      }
+      if (allowed > 0 && allowed < live) { holes = true; break; }
+    }
+    return this.internalHolesMemo = holes;
   }
 
   leaf(id: ChunkId): CanonicalLeaf | null {
