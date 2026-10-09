@@ -775,6 +775,61 @@ describe('fold journal size', () => {
     cm.close();
   });
 
+  /**
+   * A journal over this store whose syncs cost nothing: these tests are about
+   * which records are written, and the sync order has its own test.
+   */
+  function fastJournal(cm: ContextManager): { journal: FoldJournal; records: () => Array<{ kind: string; chain: number; sb: number; db: number }> } {
+    const real = cm.getStore();
+    const fast = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'sync') return () => {};
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    return {
+      journal: new FoldJournal(fast, 'agents/tester'),
+      records: () => real.getRecordIdsByType('context-manager/accepted-layout')
+        .map((id) => JSON.parse(real.getRecord(id)!.payload.toString('utf8')) as { kind: string; chain: number; sb: number; db: number }),
+    };
+  }
+
+  it('writes a snapshot once the deltas since the last one would outweigh it', async () => {
+    // A small window: each unchanged round writes a small delta, so the deltas
+    // soon outweigh the snapshot, and a rebuild never reads more than about
+    // two snapshots' worth.
+    const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    for (let i = 0; i < 10; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
+    const { journal, records } = fastJournal(cm);
+    for (let round = 0; round < 60; round++) {
+      journal.accept((await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
+    }
+    const all = records();
+    assert.ok(all.filter((r) => r.kind === 'snapshot').length >= 2, 'a later snapshot follows the first');
+    for (const r of all.filter((x) => x.kind === 'delta')) {
+      assert.ok(r.db <= r.sb, `the deltas since a snapshot never outweigh it: ${r.db} > ${r.sb}`);
+    }
+    cm.close();
+  });
+
+  it('writes a snapshot after 256 deltas, however small they are', async () => {
+    // A window large enough that unchanged rounds would take hundreds more
+    // deltas to outweigh its snapshot: the chain cap bounds a rebuild instead.
+    const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    for (let i = 0; i < 200; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
+    const { journal, records } = fastJournal(cm);
+    for (let round = 0; round < 258; round++) {
+      journal.accept((await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
+    }
+    const all = records();
+    assert.equal(all[256]!.chain, 256, 'the 256th delta');
+    assert.ok(all[256]!.db * 1.25 < all[256]!.sb, `far from outweighing the snapshot: ${all[256]!.db} of ${all[256]!.sb}`);
+    assert.equal(all[257]!.kind, 'snapshot', 'then a snapshot all the same');
+    assert.equal(all.filter((r) => r.kind === 'snapshot').length, 2);
+    cm.close();
+  });
+
   it('a fold deep in a long history costs the units it changes, not the history', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 1200);
