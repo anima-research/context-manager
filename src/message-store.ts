@@ -353,6 +353,15 @@ export class MessageStore {
     return this.idToIndex.get(messageId);
   }
 
+  /** Whether the materialized cache reflects every write to the slot so far, through any instance. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
     this.indexBranchId = this.store.currentBranch().id;
     this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
@@ -439,7 +448,20 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    // Whether this instance's id index and materialized cache reflected
+    // every write to the slot BEFORE this append — including writes made
+    // through a sibling MessageStore on the same store. A local write may
+    // re-certify only state that was current going in; a stale index or
+    // cache stays stale and is rebuilt on the next lookup. Previously the
+    // append stamped both as current regardless: after a sibling removed
+    // an earlier message, a lookup by id here returned the wrong message
+    // under the right id (Astra's reproducer, 2026-10-07).
+    const branchId = this.store.currentBranch().id;
+    const indexWasCurrent =
+      this.indexBranchId === branchId &&
+      this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -478,6 +500,7 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
       this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
@@ -492,13 +515,18 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
+    if (indexWasCurrent) {
+      // This instance made the write and its index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = version;
+    }
+    // Else: left stale on purpose; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
@@ -538,6 +566,7 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
@@ -556,6 +585,12 @@ export class MessageStore {
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the version, as append does, so the next read is a hit rather than
+      // a whole-slot reload — but only if the cache was current before the
+      // write, so a sibling's earlier edit still forces the rebuild it is
+      // owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -585,6 +620,7 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
@@ -597,6 +633,8 @@ export class MessageStore {
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full reload.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -973,6 +1011,40 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -1024,7 +1096,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
