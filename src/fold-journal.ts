@@ -413,7 +413,13 @@ export class FoldJournal {
     const newestReceipt = branch?.receipts[branch.receipts.length - 1];
     if (newestReceipt && !this.notified.has(newestReceipt.id)) {
       const receipt = this.loadReceipt(newestReceipt.id);
-      if (receipt) this.announce(receipt);
+      if (receipt) {
+        // Its write may have failed at the sync after the append, leaving it
+        // in the log with its durability unknown: durable before heard of,
+        // on this path too. (A sync with nothing pending is cheap.)
+        this.store.sync();
+        this.announce(receipt);
+      }
     }
     // A compile is accepted once, whichever journal accepted it, and whether
     // or not that acceptance changed the layout or reported success.

@@ -852,6 +852,48 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('a receipt whose sync failed after it landed is synced before it is announced', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    const calls: string[] = [];
+    let failNextSyncAfterAppend = false;
+    let appended = false;
+    const flaky = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') return (type: string, payload: unknown) => { appended = true; calls.push('append'); return target.appendJson(type, payload); };
+        if (prop === 'sync') {
+          return () => {
+            if (failNextSyncAfterAppend && appended) {
+              failNextSyncAfterAppend = false;
+              calls.push('sync failed');
+              throw new Error('fsync failed');
+            }
+            calls.push('sync');
+            target.sync();
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const journal = new FoldJournal(flaky, 'agents/tester');
+    journal.storeId();
+    journal.onReceipt((r) => calls.push(`announce ${r.kind}`));
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    strategy.plan.set(ids[0]!, 'omit');
+    calls.length = 0;
+    const folded = (await cm.compile(BUDGET)).provenance!;
+    appended = false;
+    failNextSyncAfterAppend = true;
+    assert.throws(() => journal.accept(folded, Date.now(), undefined), /fsync failed/);
+    assert.deepEqual(calls, ['sync', 'append', 'sync failed'], 'the receipt landed, unannounced');
+    calls.length = 0;
+    assert.equal(journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null, 'the same layout: no new receipt');
+    assert.deepEqual(calls.slice(0, 2), ['sync', 'announce change'], 'synced, then heard of');
+    cm.close();
+  });
+
   it('lists the store\'s records once, and reads only the receipts a query returns', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 40);
