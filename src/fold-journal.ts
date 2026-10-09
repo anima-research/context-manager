@@ -160,7 +160,13 @@ export interface FoldReceipt {
 export type Presentation = 'verbatim' | 'altered' | 'unknown';
 
 export interface FoldQuery {
-  /** Only receipts after this receipt id (a receipt's `id`, or a result's `latestId`). */
+  /**
+   * Only receipts after this receipt id, OLDEST first: a continuation. Pass
+   * the last receipt a previous query returned to read on from it (`more`
+   * says whether there is more), a result's `latestId` to see only new
+   * receipts, or `'0'` to page through the whole record from its start.
+   * Without it, a query returns the newest receipts first.
+   */
   afterId?: string;
   /** Only receipts accepted at or after this ISO 8601 time, such as
    *  `2026-10-09T14:00:00Z`. A bare number is refused: it could be either an
@@ -173,9 +179,16 @@ export interface FoldQuery {
 
 export interface FoldQueryResult {
   branch: BranchRef | null;
+  /** Newest first; with `afterId`, oldest first from just after it. */
   receipts: FoldReceipt[];
   /** Newest receipt id on that branch, if any. */
   latestId: string | null;
+  /**
+   * The query matched more receipts than `limit` let it return. With
+   * `afterId`, continue from the last receipt returned; without, the newest
+   * `limit` were returned and the older ones were left out.
+   */
+  more: boolean;
   /** Explains an empty or unknown answer (unknown branch, no layout reporting). */
   note?: string;
 }
@@ -462,6 +475,7 @@ export class FoldJournal {
         branch: null,
         receipts: [],
         latestId: null,
+        more: false,
         note: `No branch named ${JSON.stringify(query.branch)} exists in this store.`,
       };
     }
@@ -470,15 +484,26 @@ export class FoldJournal {
     const since = query.since !== undefined ? parseSince(query.since) : undefined;
     const list = this.index().branches.get(branchKey(branch))?.receipts ?? [];
     const latestId = list.length > 0 ? list[list.length - 1]!.id : null;
+    const matches = (entry: { at: number }) => since === undefined || entry.at >= since;
     const receipts: FoldReceipt[] = [];
-    for (let i = list.length - 1; i >= 0 && receipts.length < limit; i--) {
-      const entry = list[i]!;
-      if (after !== undefined && Number(entry.id) <= after) break;
-      if (since !== undefined && !(entry.at >= since)) continue;
+    let more = false;
+    const take = (entry: { id: string; at: number }): boolean => {
+      if (!matches(entry)) return true;
+      if (receipts.length === limit) {
+        more = true;
+        return false;
+      }
       const receipt = this.loadReceipt(entry.id);
       if (receipt) receipts.push(receipt);
+      return true;
+    };
+    if (after !== undefined) {
+      // Ids ascend: start just after the cursor and read forward.
+      for (let i = firstAfter(list, after); i < list.length && take(list[i]!); i++);
+    } else {
+      for (let i = list.length - 1; i >= 0 && take(list[i]!); i--);
     }
-    return { branch, receipts, latestId };
+    return { branch, receipts, latestId, more };
   }
 
   /** Every receipt of a branch, oldest first: what a projection writes. */
@@ -730,6 +755,18 @@ function clampLimit(limit: number | undefined): number {
     throw new Error(`limit must be a positive integer (got ${String(limit)})`);
   }
   return Math.min(limit, FOLD_QUERY_MAX_LIMIT);
+}
+
+/** The index of the first entry whose id is above `after` (ids ascend). */
+function firstAfter(list: ReadonlyArray<{ id: string }>, after: number): number {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (Number(list[mid]!.id) <= after) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /** A receipt id: Chronicle record ids are decimal integers. */

@@ -1197,7 +1197,11 @@ export class ContextManager {
     return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
   }
 
-  /** Fold receipts of one branch (default: the selected one), newest first. */
+  /**
+   * Fold receipts of one branch (default: the selected one): newest first,
+   * or, with `afterId`, oldest first from just after it, so a reader can page
+   * forward; `more` says whether the query matched more than it returned.
+   */
   listFoldReceipts(query?: FoldQuery): FoldQueryResult {
     return this.foldJournal.query(query);
   }

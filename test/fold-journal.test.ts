@@ -351,9 +351,16 @@ describe('fold journal', () => {
     assert.equal(all.latestId, all.receipts[0]!.id);
     assert.equal(cm.listFoldReceipts().receipts.length, 5, 'default limit 10');
     assert.equal(cm.listFoldReceipts({ limit: 2 }).receipts.length, 2);
+    assert.equal(all.more, false);
+    // afterId continues: oldest first from just after the cursor.
     const after = cm.listFoldReceipts({ afterId: all.receipts[2]!.id });
-    assert.deepEqual(after.receipts.map((r) => r.id), all.receipts.slice(0, 2).map((r) => r.id));
-    assert.deepEqual(cm.listFoldReceipts({ afterId: all.receipts[2]!.id, limit: 1 }).receipts.map((r) => r.id), [all.receipts[0]!.id], 'newest first within the window');
+    assert.deepEqual(after.receipts.map((r) => r.id), [all.receipts[1]!.id, all.receipts[0]!.id]);
+    assert.equal(after.more, false);
+    const step = cm.listFoldReceipts({ afterId: all.receipts[2]!.id, limit: 1 });
+    assert.deepEqual(step.receipts.map((r) => r.id), [all.receipts[1]!.id], 'the next one, not the newest');
+    assert.equal(step.more, true);
+    assert.equal(cm.listFoldReceipts({ limit: 2 }).more, true, 'newest first, three older ones left out');
+    assert.deepEqual(cm.listFoldReceipts({ afterId: all.latestId! }).receipts, [], 'nothing after the newest');
     assert.equal(cm.listFoldReceipts({ since: '2000-01-01T00:00:00Z' }).receipts.length, 5);
     assert.equal(cm.listFoldReceipts({ since: '2000-01-01' }).receipts.length, 5, 'a date alone is a time');
     assert.equal(cm.listFoldReceipts({ since: '2999-01-01T00:00:00Z' }).receipts.length, 0);
@@ -364,6 +371,28 @@ describe('fold journal', () => {
     assert.throws(() => cm.listFoldReceipts({ since: String(Date.now()) }), /pass its id as afterId/);
     assert.throws(() => cm.listFoldReceipts({ since: all.receipts[2]!.id }), /pass its id as afterId/);
     assert.throws(() => cm.listFoldReceipts({ afterId: '2026-10-09' }), /decimal integer/);
+    cm.close();
+  });
+
+  it('pages forward through a whole record with afterId, without skipping or repeating any receipt', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 30);
+    await acceptCompile(cm);
+    for (let i = 0; i < 24; i++) {
+      strategy.plan.set(ids[i]!, 'omit');
+      await acceptCompile(cm);
+    }
+    const everything = cm.foldReceiptsFor(cm.currentBranchRef()).map((r) => r.id);
+    assert.equal(everything.length, 25);
+    const seen: string[] = [];
+    let cursor = '0';
+    for (let page = 0; page < 10; page++) {
+      const result = cm.listFoldReceipts({ afterId: cursor, limit: 10 });
+      seen.push(...result.receipts.map((r) => r.id));
+      if (!result.more) break;
+      cursor = result.receipts.at(-1)!.id;
+    }
+    assert.deepEqual(seen, everything, 'oldest to newest, each once');
     cm.close();
   });
 
