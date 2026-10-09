@@ -538,6 +538,23 @@ export interface RenderStats {
    * window — which is how tail eviction becomes reachable despite the picker
    * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
    */
+  /**
+   * Nesting health of the summary tree, measured on the RENDER rather than
+   * the topology. A nested tree lists every message under exactly one L1;
+   * `overlapLeaves` counts messages listed by more than one (a non-nested
+   * tree — overlapping L1 production, store surgery). Whether that costs the
+   * agent anything is `renderedTwice`: messages this compile represented under
+   * two emitted summaries at once, and `extraTokens`, what the second copies
+   * cost. A non-nested tree with `renderedTwice: 0` is a planner-stability
+   * concern (exempt leaves skip group unanimity), not a memory defect.
+   * Absent when the strategy keeps no summaries.
+   */
+  nesting?: {
+    overlapLeaves: number;
+    renderedTwice: number;
+    extraTokens: number;
+  };
+
   planVsActual?: {
     planned: number;
     actual: number;
