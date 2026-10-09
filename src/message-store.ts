@@ -959,6 +959,40 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -1010,7 +1044,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
