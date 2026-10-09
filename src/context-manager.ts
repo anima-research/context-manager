@@ -1206,7 +1206,15 @@ export class ContextManager {
     return this.foldJournal.query(query);
   }
 
-  /** Be told after each fold receipt is appended. Returns a detacher. */
+  /**
+   * Be told of fold receipts, each once it is durable: every receipt this
+   * manager's `acceptRound` returns, and, at its next acceptance on a
+   * branch, that branch's newest receipt if this manager hasn't announced it
+   * (one whose write reported a failure, one another manager on the store
+   * wrote, or one from before a reopen). So a listener can hear a receipt
+   * again, and needn't hear every receipt: key on `receipt.id`, and read
+   * `listFoldReceipts` for the whole record. Returns a detacher.
+   */
   onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
     return this.foldJournal.onReceipt(listener);
   }

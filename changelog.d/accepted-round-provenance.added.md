@@ -65,7 +65,14 @@
     after it, so a reader pages forward from the last receipt it got, with
     `more` saying whether there is more, and `afterId: '0'` pages a branch's
     whole record from its start; `since` is an ISO 8601 time (a bare number
-    is refused rather than guessed at). Subscribe with `onFoldReceipt`, and
-    label receipts with `setReceiptSource`.
+    is refused rather than guessed at). Label receipts with
+    `setReceiptSource`.
+  - Subscribe with `onFoldReceipt`. A listener hears each receipt its
+    manager's `acceptRound` returns, and, at that manager's next acceptance
+    on a branch, the branch's newest receipt if the manager hasn't announced
+    it: one whose write reported a failure, one another manager wrote, or one
+    from before a reopen. So it can hear a receipt again, and needn't hear
+    every receipt: key on the receipt's id, and read `listFoldReceipts` for
+    the whole record.
   - `getStoreId`, `currentBranchRef` and `describeRenderedForms` support hosts
     that export or explain them.
