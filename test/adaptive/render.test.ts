@@ -86,18 +86,19 @@ test('render: multiple bodyGroups remain separate', () => {
   assert.equal((concatenated[1].content[0] as { type: 'text'; text: string }).text, 'foo bar');
 });
 
-test('render: shard order honored even if input is out of order', () => {
-  const s0 = makeShard('A', 'g', 0);
-  const s1 = makeShard('B', 'g', 1);
-  const s2 = makeShard('C', 'g', 2);
-  // Note: the input order here would actually break grouping because we
-  // group by *consecutive* same-bodyGroupId — out-of-order input means
-  // the group is broken if a different one interrupts. But within a
-  // contiguous run, shardIndex determines concat order.
-  const concatenated = concatBodyGroups([s2, s0, s1], placeholderRecallText);
-  assert.equal(concatenated.length, 1);
-  const text = (concatenated[0].content[0] as { type: 'text'; text: string }).text;
-  assert.equal(text, 'ABC');
+test('render: input is read in store order, where a shard index that does not rise starts another body', () => {
+  // The same text ingested twice shares a group id; each ingestion writes
+  // shards 0..n-1, so the second starts again at 0 and is its own body. A
+  // cut that begins mid-body (a render region) keeps its remainder apart
+  // from the copy after it. Nothing reorders a body's shards, so an index
+  // that doesn't rise is never read as an earlier shard of the same body.
+  const a = [makeShard('A', 'g', 0), makeShard('B', 'g', 1), makeShard('C', 'g', 2)];
+  const b = [makeShard('A', 'g', 0), makeShard('B', 'g', 1), makeShard('C', 'g', 2)];
+  const texts = (out: ReturnType<typeof concatBodyGroups>) =>
+    out.map((m) => (m.content[0] as { type: 'text'; text: string }).text);
+  assert.deepEqual(texts(concatBodyGroups([...a, ...b], placeholderRecallText)), ['ABC', 'ABC']);
+  assert.deepEqual(texts(concatBodyGroups([a[2]!, ...b], placeholderRecallText)), ['C', 'ABC']);
+  assert.deepEqual(texts(concatBodyGroups([a[2]!, a[0]!, a[1]!], placeholderRecallText)), ['C', 'AB']);
 });
 
 test('render: interleaved plain + grouped messages preserve order', () => {

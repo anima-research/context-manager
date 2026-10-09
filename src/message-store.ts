@@ -18,6 +18,7 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { bodyBounds, bodyBoundsIn } from './body-runs.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -646,15 +647,11 @@ export class MessageStore {
       this.emit({ type: 'remove', messageId });
       return;
     }
-    // Find the contiguous run of shards with this bodyGroupId. Shards are
-    // stored consecutively (they're appended one after the other at
-    // ingestion), so we can scan outward from `index`.
-    const groupId = target.bodyGroupId;
+    // Find this body's shards: stored consecutively, one ingestion at a
+    // time. Another ingestion of the same text carries the same group id
+    // and is another body (see body-runs.ts), so the run stops there.
     const all = this.getAllInternal();
-    let from = index;
-    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
-    let to = index;
-    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
@@ -682,18 +679,17 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a bodyGroup.
+    // Verify the range doesn't bisect a body. The boundary between two
+    // ingestions of the same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    const startGroup = all[fromIndex].bodyGroupId;
-    const endGroup = all[toIndex].bodyGroupId;
-    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+    if (bodyBoundsIn(all, fromIndex).from < fromIndex) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+        `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+    if (bodyBoundsIn(all, toIndex).to > toIndex) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+        `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
     }
 
@@ -802,25 +798,13 @@ export class MessageStore {
     }
 
     if (opts.alignToBodyGroups) {
-      // Shards of a bodyGroup are contiguous by construction (removeRange
-      // refuses to bisect a group). Walk edges outward with O(item) point
-      // lookups until the group boundary.
-      const first = this.getInternal(start);
-      if (first?.bodyGroupId !== undefined) {
-        while (start > 0) {
-          const prev = this.getInternal(start - 1);
-          if (prev?.bodyGroupId !== first.bodyGroupId) break;
-          start--;
-        }
-      }
-      const last = this.getInternal(end - 1);
-      if (last?.bodyGroupId !== undefined) {
-        while (end < totalCount) {
-          const next = this.getInternal(end);
-          if (next?.bodyGroupId !== last.bodyGroupId) break;
-          end++;
-        }
-      }
+      // A body's shards are contiguous by construction (removeRange refuses
+      // to bisect one). Walk the edges outward with O(item) point lookups to
+      // the body boundary, which falls between two ingestions of the same
+      // text too (see body-runs.ts).
+      const at = (i: number) => this.getInternal(i);
+      start = bodyBounds(totalCount, at, start).from;
+      end = bodyBounds(totalCount, at, end - 1).to + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);

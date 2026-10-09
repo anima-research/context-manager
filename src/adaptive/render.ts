@@ -10,12 +10,14 @@
 
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '../types/message.js';
+import { bodyEnd } from '../body-runs.js';
 
 /**
- * Group consecutive messages that share a bodyGroupId into composite
- * messages whose body is the byte-faithful concatenation of the shards'
- * text content. Messages with a null/undefined bodyGroupId pass through
- * unchanged.
+ * Join each body's consecutive shards into one composite message whose body
+ * is the byte-faithful concatenation of the shards' text content. A body is
+ * one ingestion: a later ingestion of the same text carries the same
+ * bodyGroupId and is a body of its own (see body-runs.ts). Messages with a
+ * null/undefined bodyGroupId pass through unchanged.
  *
  * For a shard at non-zero currentResolution, the shard's text in the
  * concatenation is replaced by `getRecallText(shard)`. The renderer is
@@ -26,11 +28,12 @@ import type { StoredMessage } from '../types/message.js';
  *  - **Byte-faithful** when all shards in a group are at L0 and getRecallText
  *    is not called: the concatenated body equals the original message body
  *    byte-for-byte. Verified by tests in test/adaptive/render.test.ts.
- *  - **One API message per group**, regardless of shard count. No turn
+ *  - **One API message per body**, regardless of shard count. No turn
  *    markers between shards.
- *  - **Order preserved**: shards within a group are sorted by `shardIndex`
- *    before concatenation; if shardIndex is missing, the order in the input
- *    array is used.
+ *  - **Store order**: `messages` is read in store order, where a body's
+ *    shard indices rise. A shard whose index doesn't rise starts another
+ *    body, so a cut through a body, or a second copy right after it, is
+ *    never joined to it.
  */
 export function concatBodyGroups(
   messages: readonly StoredMessage[],
@@ -45,17 +48,12 @@ export function concatBodyGroups(
       i++;
       continue;
     }
-    // Collect all consecutive messages with the same bodyGroupId.
+    // Collect this body's consecutive shards.
     const groupId = m.bodyGroupId;
     const groupStart = i;
-    while (i < messages.length && messages[i].bodyGroupId === groupId) {
-      i++;
-    }
-    const group = messages.slice(groupStart, i);
-    // Sort by shardIndex if present.
-    const sorted = [...group].sort(
-      (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
-    );
+    i = bodyEnd(messages.length, (k) => messages[k], groupStart) + 1;
+    // A body's shards are already in rising shard order (body-runs.ts).
+    const sorted = messages.slice(groupStart, i);
 
     const concatenated = sorted.map((shard) => {
       const res = shard.currentResolution ?? 0;
