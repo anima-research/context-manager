@@ -53,6 +53,8 @@ import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
 
+type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
+
 /**
  * Base configuration for ContextManager.
  */
@@ -160,6 +162,12 @@ export type ContextManagerConfig = ContextManagerPathConfig | ContextManagerStor
  *
  * Sits between the application/agent layer and Membrane, managing what goes
  * into the context window. Uses Chronicle for persistent storage.
+ *
+ * Mutations and strategy operations require a completed initialization attempt.
+ * Pending or failed attempts refuse that work; raw reads and branch inspection
+ * remain available for recovery with switchBranch() or setStrategy(). Transitions
+ * do not roll back earlier writes. Direct Chronicle switches retain their existing
+ * strategy-specific semantics; this fence does not pin a manager to a branch.
  */
 export class ContextManager {
   private store: JsStore;
@@ -167,7 +175,8 @@ export class ContextManager {
   private contextLog: ContextLog;
   private strategy: ContextStrategy;
   private membrane?: Membrane;
-  private initialized = false;
+  private initializationAttempt = 0;
+  private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
   private debugLogContext: boolean;
@@ -377,17 +386,14 @@ export class ContextManager {
     // Initialize strategy. A strategy that refuses the store (e.g.
     // StoreTopologyError) must not leave a store we opened locked behind a
     // rejected promise: release it, then rethrow.
-    const openingBranch = observeStoreBranch(store);
     try {
-      await manager.initializeStrategy(openingBranch);
+      await manager.initializeStrategy();
     } catch (error) {
       if (ownsStore) {
         try { store.close(); } catch { /* the initialize error is the one to report */ }
       }
       throw error;
     }
-    manager.initialized = true;
-
     return manager;
   }
 
@@ -443,6 +449,7 @@ export class ContextManager {
     metadata?: MessageMetadata,
     causedBy?: MessageId[]
   ): MessageId {
+    this.requireInitialized('addMessage');
     // Optional strategy-driven ingestion-time chunking
     const strategyAny = this.strategy as unknown as {
       chunkIngressMessage?: (
@@ -483,6 +490,7 @@ export class ContextManager {
    * addMessage `holdCompression`) until after the edit.
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
+    this.requireInitialized('editMessage');
     this.messageStore.edit(messageId, content);
     // Propagation handled by event listener
   }
@@ -616,7 +624,7 @@ export class ContextManager {
    */
   private notifyHoldsReleased(): void {
     if (!this.strategy.onCompressionHoldsReleased) return;
-    if (!this.initialized) {
+    if (this.initializedAttempt !== this.initializationAttempt) {
       this.holdReleaseNotifyPending = true;
       return;
     }
@@ -654,6 +662,7 @@ export class ContextManager {
    * Remove a message from the store. Propagates to context log.
    */
   removeMessage(messageId: MessageId): void {
+    this.requireInitialized('removeMessage');
     this.messageStore.remove(messageId);
     // Propagation handled by event listener
   }
@@ -662,6 +671,7 @@ export class ContextManager {
    * Remove a range of messages from the store.
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
+    this.requireInitialized('removeMessages');
     this.messageStore.removeRange(fromId, toId);
     // Propagation handled by event listener
   }
@@ -805,6 +815,7 @@ export class ContextManager {
    * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
+    this.requireInitialized('branchAt');
     const message = this.messageStore.get(messageId);
     if (!message) {
       throw new Error(`Message not found: ${messageId}`);
@@ -829,6 +840,11 @@ export class ContextManager {
    * stored on Chronicle is reloaded. Strategies that hold derived in-memory
    * caches (e.g. AutobiographicalStrategy.summaries) need this to avoid
    * showing the previous branch's state on the new branch.
+   *
+   * Transitions are nontransactional: if initialization rejects, the selected
+   * branch and any initialization writes remain. Inspect currentBranch();
+   * mutations and strategy operations stay blocked until a successful
+   * switchBranch() or setStrategy(). Inspection and close remain available.
    */
   async switchBranch(branchId: string): Promise<void> {
     this.store.switchBranch(branchId);
@@ -848,9 +864,12 @@ export class ContextManager {
    * `branchAt(messageId, name?)` instead, then `switchBranch(name)`.
    *
    * Returns the new branch's name. The strategy is re-initialized on the
-   * new branch so it picks up the forked state.
+   * new branch so it picks up the forked state. If initialization rejects,
+   * the new branch remains present and selected unless another operation
+   * switches it. The same recovery contract as switchBranch() applies.
    */
   async fork(name?: string): Promise<string> {
+    this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
@@ -896,6 +915,7 @@ export class ContextManager {
    * Check if compile() will block waiting for background work.
    */
   isReady(): boolean {
+    this.requireInitialized('isReady');
     return this.strategy.checkReadiness().ready;
   }
 
@@ -903,6 +923,7 @@ export class ContextManager {
    * Get info about pending background work.
    */
   getPendingWork(): PendingWork | null {
+    this.requireInitialized('getPendingWork');
     const state = this.strategy.checkReadiness();
     if (state.ready) {
       return null;
@@ -930,6 +951,7 @@ export class ContextManager {
     injections?: ContextInjection[],
     opts?: SelectOptions
   ): Promise<CompileResult> {
+    this.requireInitialized('compile');
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -1081,7 +1103,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Set the context management strategy.
+   * Set the context management strategy and initialize it on the selected branch.
+   * Also recovers a manager after failed initialization. A failure leaves work
+   * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.strategy = strategy;
@@ -1097,12 +1121,14 @@ export class ContextManager {
 
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
+    this.requireInitialized('getHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) return null;
     return this.strategy.getHotContextSettings();
   }
 
   /** Update only settings the active strategy explicitly declares hot-safe. */
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    this.requireInitialized('updateHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support live context settings');
     }
@@ -1119,6 +1145,7 @@ export class ContextManager {
     overrides?: Record<string, unknown>,
     opts?: { render?: boolean },
   ): PreviewResult | null {
+    this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
@@ -1149,6 +1176,7 @@ export class ContextManager {
    * Throws if the active strategy doesn't support pins.
    */
   pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('pinRange');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -1171,6 +1199,7 @@ export class ContextManager {
    * with `kind: 'document'`. Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('markDocument');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support documents');
     }
@@ -1179,6 +1208,7 @@ export class ContextManager {
 
   /** Remove a pin or document mark. Returns true if removed. */
   unpin(pinId: string): boolean {
+    this.requireInitialized('unpin');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -1187,6 +1217,7 @@ export class ContextManager {
 
   /** List all current pins. Returns empty array if strategy is not pinnable. */
   listPins(): ReadonlyArray<ProtectedRange> {
+    this.requireInitialized('listPins');
     if (!isPinnableStrategy(this.strategy)) return [];
     return this.strategy.listPins();
   }
@@ -1203,12 +1234,14 @@ export class ContextManager {
    * — see e.g. agent-framework's MCPL host integration.
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
+    this.requireInitialized('searchSummaries');
     if (!isSearchableStrategy(this.strategy)) return [];
     return this.strategy.searchSummaries(query);
   }
 
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
+    this.requireInitialized('getSummary');
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
   }
@@ -1226,6 +1259,7 @@ export class ContextManager {
    * see e.g. agent-framework's MCPL host integration.
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
+    this.requireInitialized('getSummariesInRange');
     if (!isSummaryOverviewStrategy(this.strategy)) return [];
     return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
   }
@@ -1235,6 +1269,7 @@ export class ContextManager {
    * doesn't support the summary table-of-contents, or none exist yet.
    */
   getMaxSummaryLevel(): number {
+    this.requireInitialized('getMaxSummaryLevel');
     return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
@@ -1247,6 +1282,7 @@ export class ContextManager {
    * agent's context is folded vs raw" at a glance.
    */
   getRenderStats(): RenderStats | null {
+    this.requireInitialized('getRenderStats');
     if (!isRenderStatsCapable(this.strategy)) return null;
     return this.strategy.getRenderStats(this.strategyMessageView());
   }
@@ -1261,6 +1297,7 @@ export class ContextManager {
    * Returns the transition summary text used.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
+    const attempt = this.requireInitialized('resetHeadWindow');
     if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
     }
@@ -1269,6 +1306,7 @@ export class ContextManager {
 
     // Generate transition summary if not provided
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
+    this.requireInitialized('resetHeadWindow', attempt);
 
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
@@ -1286,6 +1324,7 @@ export class ContextManager {
    * Call this periodically to allow strategies to do compression, etc.
    */
   async tick(): Promise<void> {
+    this.requireInitialized('tick');
     this.expireCompressionHolds();
     if (this.strategy.tick) {
       await this.strategy.tick(this.createStrategyContext());
@@ -1297,26 +1336,57 @@ export class ContextManager {
   // ==========================================================================
 
   private async initializeStrategy(
-    expectedBranch: StoreBranchGeneration = observeStoreBranch(this.store),
+    expectedBranch?: StoreBranchGeneration,
   ): Promise<void> {
-    this.initialized = false;
-    if (this.strategy.initialize) {
-      await this.strategy.initialize(this.createStrategyContext());
+    const attempt = ++this.initializationAttempt;
+    this.initializedAttempt = null;
+    const strategy = this.strategy;
+    expectedBranch ??= observeStoreBranch(this.store);
+    const branchId = this.store.currentBranch().id;
+    if (strategy.initialize) {
+      await strategy.initialize(this.createStrategyContext());
+    }
+    if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      throw new Error('Strategy initialization was superseded by a newer initialization');
     }
     const current = observeStoreBranch(this.store);
+    const currentBranchId = this.store.currentBranch().id;
     if (
       current.name !== expectedBranch.name ||
       current.generation !== expectedBranch.generation ||
-      this.store.currentBranch().name !== expectedBranch.name
+      currentBranchId !== branchId
     ) {
       throw new Error(
         `Branch changed during strategy initialization: requested ${expectedBranch.name} ` +
-        `(generation ${expectedBranch.generation}), now ${current.name} ` +
-        `(generation ${current.generation})`,
+        `(id ${branchId}, generation ${expectedBranch.generation}), now ${current.name} ` +
+        `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
-    this.initialized = true;
+    this.initializedAttempt = attempt;
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
+  }
+
+  /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
+  private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+    const current: InitializationStamp = {
+      ...observeStoreBranch(this.store),
+      id: this.store.currentBranch().id,
+      attempt: this.initializationAttempt,
+    };
+    if (this.initializedAttempt !== current.attempt) {
+      throw new Error(
+        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}). ` +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+      );
+    }
+    if (expected && (
+      expected.attempt !== current.attempt ||
+      expected.name !== current.name || expected.generation !== current.generation ||
+      expected.id !== current.id
+    )) {
+      throw new Error(`Branch or strategy changed during ContextManager.${operation}; retry on the intended branch.`);
+    }
+    return current;
   }
 
   /**

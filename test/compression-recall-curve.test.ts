@@ -2230,7 +2230,7 @@ describe('compression refusal recall curves', () => {
       assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale mirrors are cleared');
       await assert.rejects(
         fx.manager.tick(),
-        /requires reinitialization for the current branch generation/,
+        /requires successful strategy initialization/,
       );
       const currentCtx = managerContext(fx.manager);
       await assert.rejects(
@@ -2239,7 +2239,7 @@ describe('compression refusal recall curves', () => {
       );
       await assert.rejects(
         fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }),
-        /requires reinitialization for the current branch generation/,
+        /requires successful strategy initialization/,
       );
       assert.deepEqual(snapshot(), expectedState, 'stale entrypoints write no durable state');
       assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale entrypoints rebuild no mirrors');
