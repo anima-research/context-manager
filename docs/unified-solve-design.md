@@ -608,7 +608,13 @@ model, or cached.
   historyEnd, changedLeaves: [{leafId, repHash, level, lastChangedSeq}]}`.
   Deltas carry only appended, removed, or changed leaves; a periodic full
   snapshot (configured cadence / max replay depth, tested) holds the whole
-  live-leaf representation map plus the current sequence. Stability clocks
+  live-leaf representation map plus the current sequence. On disk the
+  snapshot is `format: 2` (#148): the leaf map as runs of consecutive leaves
+  sharing a representative (raw leaves as runs of `{raw, level,
+  lastChangedSeq}` whose `raw:<id>` hashes are derived on load), ids
+  gap-coded inside a run, and the head's change list the same way, so a write
+  costs bytes in the number of summaries presented, not messages; the earlier
+  one-entry-per-leaf shape is still read. Stability clocks
   are not per-leaf counters: `τ_i = currentSeq − lastChangedSeq_i`, so only
   changed leaves are written. **Commit semantics — single flight.** AF
   serializes turns per agent, so at most one provider-bound stream-lane

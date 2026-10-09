@@ -30,3 +30,13 @@ npx tsc scripts/<file>.ts --outDir dist --target ES2022 \
   --module NodeNext --moduleResolution NodeNext \
   --esModuleInterop --skipLibCheck --resolveJsonModule
 ```
+
+## records-log-bytes-by-state.py
+
+Stream a Chronicle `records.log` and print bytes per state, per (state,
+operation) and per UTC day, without opening the store. Use it when a store is
+larger than its content explains (#148).
+
+```bash
+python3 scripts/records-log-bytes-by-state.py <store-dir-or-records.log> [--top 25]
+```
