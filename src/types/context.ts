@@ -49,6 +49,15 @@ export interface ContextEntry {
    * compile's layout derives each message's rendered form from it.
    */
   summaries?: Array<{ id: string; level: number; partial?: true }>;
+  /**
+   * The tool_use ids whose results a structural repair moved out of this
+   * entry into the entry that answers their tool_use. The request still
+   * carries each result, in that other entry: attribution looks for it
+   * there by its tool_use id, so moving a result is not a loss, while a
+   * moved result that was later altered, or is missing from the request,
+   * still is.
+   */
+  relocatedResults?: string[];
 }
 
 /**
@@ -144,16 +153,19 @@ export interface CompileResult {
   provenance?: CompileProvenance;
 
   /**
-   * The stored messages behind every raw body in `provenance`, as this
-   * compile read them: each body's head and, for a sharded body, every
-   * shard, including any the view filter hid from the strategy. The view may
-   * merge auxiliary stores (another namespace's slot), whose messages
-   * `getMessage` cannot resolve, so callers that need a body's metadata or
-   * content read it here. The map is bound to this compile: a later edit
-   * doesn't show through it. It's transient and isn't part of the persisted
-   * provenance.
+   * The stored messages of every raw body in `provenance`, as this compile
+   * read them, keyed by the body's head (`RawBodySource.messageId`): the
+   * body's members in shard order, head first — one message for an unsharded
+   * body; for a sharded one, every shard of that ingestion, including any the
+   * view filter hid from the strategy. Two ingestions of the same text are
+   * two bodies, each with only its own shards (a group id names content, not
+   * an ingestion). The view may merge auxiliary stores (another namespace's
+   * slot), whose messages `getMessage` cannot resolve, so callers that need
+   * a body's metadata or content read it here. The map is bound to this
+   * compile: a later edit doesn't show through it. It's transient and isn't
+   * part of the persisted provenance.
    */
-  rawSources?: ReadonlyMap<MessageId, StoredMessage>;
+  rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */
@@ -222,13 +234,22 @@ export interface CompileProvenance {
 }
 
 /**
- * A rendered layout: the forms every message of the strategy's view took in
- * one compile, as ordered units. Raw messages are individual units; summary
- * and omitted spans are ranges. Token estimates are base estimates (before
- * the store's calibration multiplier), so they compare across compiles.
+ * A rendered layout: the form every message of the strategy's view took in
+ * one compile. Membership and form are kept apart: `members` lists the
+ * view's messages by sequence, ascending, and `units` partition them in
+ * that order, each covering its `n` next members (a raw unit, one). A
+ * message the view lacked (removed, filtered out) is in no unit, however
+ * near a range it lies. Token estimates are base estimates (before the
+ * store's calibration multiplier), so they compare across compiles.
  */
 export interface RenderedLayout {
-  v: 1;
+  v: 2;
+  /** The view's message sequences, ascending: the layout's exact membership. */
+  members: number[];
+  /** The members' message ids, parallel to `members`. In memory only: an
+   *  accepted layout persists sequences, and receipts take ids from the
+   *  compile being accepted. */
+  memberIds: MessageId[];
   units: LayoutUnit[];
   /** Base-estimate tokens of everything this compile rendered. */
   totalTokens: number;
@@ -238,30 +259,25 @@ export interface RenderedLayout {
   cause?: string;
 }
 
-/** One unit of a rendered layout. Field names are short: layouts persist. */
+/**
+ * One unit of a rendered layout: a form and how many consecutive members it
+ * covers. Units carry no membership, so their size follows what was
+ * rendered, not how much history lies behind it. Field names are short:
+ * units persist.
+ */
 export type LayoutUnit =
-  /** A message rendered raw. `p` is set when the copy was partial. */
-  | { k: 'r'; s: number; id: string; t: number; p?: 1 }
+  /** One message rendered raw: its rendered tokens; `p` when the copy was partial. */
+  | { k: 'r'; t: number; p?: 1 }
   /**
-   * A run of view messages rendered through these summaries, each as
+   * `n` members rendered through these summaries, each as
    * `[id, level, method, partial, tokens]` (partial 1 when the summary's
    * text was cut; tokens: the summary's rendered tokens in this compile),
    * sorted by id. A summary that renders several units names its tokens in
-   * each; comparisons count it once per side. `a`/`b` are the first and
-   * last member; `m` is the exact membership (see MemberRun).
+   * each; comparisons count it once per side.
    */
-  | { k: 's'; a: number; ai: string; b: number; bi: string; m: MemberRun[]; sm: Array<[string, number, string, 0 | 1, number]> }
-  /** A run of view messages not rendered at all; `m` is its exact membership. */
-  | { k: 'o'; a: number; ai: string; b: number; bi: string; m: MemberRun[] };
-
-/**
- * `[firstSequence, firstId, lastSequence, lastId]`: every integer sequence
- * from first to last is a member. A range unit's members are exactly the
- * union of its runs, so a message the view lacked (removed, filtered out)
- * is never counted as part of a range just because it lies between the
- * range's endpoints.
- */
-export type MemberRun = [number, string, number, string];
+  | { k: 's'; n: number; sm: Array<[string, number, string, 0 | 1, number]> }
+  /** `n` members not rendered at all. */
+  | { k: 'o'; n: number };
 
 /**
  * Branch information.

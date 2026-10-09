@@ -39,7 +39,6 @@ export type {
   CompileProvenance,
   RenderedLayout,
   LayoutUnit,
-  MemberRun,
 } from './context.js';
 
 // Strategy types

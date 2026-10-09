@@ -6,7 +6,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { attributeEntries, coversStoredContent, rawSourcesOf } from '../src/compile-provenance.js';
+import { attributeEntries, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
 import type { ContextEntry, StoredMessage } from '../src/index.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -146,7 +146,7 @@ describe('attributeEntries', () => {
     const result = attributeEntries([copy(h1)], [h0, h1]);
     assert.deepEqual(result.sources[0], { kind: 'raw', bodies: [{ messageId: 'f0', sequence: 1, complete: false, missing: ['shards'] }] });
     assert.equal(result.rawComplete.get('f1'), false);
-    assert.deepEqual([...rawSourcesOf(result.sources, [h0, h1]).keys()], ['f0', 'f1']);
+    assert.deepEqual([...rawBodiesOf(result.sources, [h0, h1]).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['f0', ['f0', 'f1']]]);
 
     // A group written before sizes were declared: complete means every
     // stored member was carried, and a hidden one was not.
@@ -175,11 +175,142 @@ describe('attributeEntries', () => {
   });
 });
 
-describe('rawSources', () => {
+describe('a body is an ingestion, not its content hash', () => {
+  it('separates two ingestions of the same text, apart or back to back, each with only its own shards', () => {
+    const g = { bodyGroupId: 'bg-same', shardCount: 2 };
+    const a0 = msg('a0', 1, [text('same ')], { ...g, shardIndex: 0 });
+    const a1 = msg('a1', 2, [text('text')], { ...g, shardIndex: 1 });
+    const mid = msg('mid', 3, [text('between')]);
+    const b0 = msg('b0', 4, [text('same ')], { ...g, shardIndex: 0 });
+    const b1 = msg('b1', 5, [text('text')], { ...g, shardIndex: 1 });
+    const c0 = msg('c0', 6, [text('same ')], { ...g, shardIndex: 0 });
+    const c1 = msg('c1', 7, [text('text')], { ...g, shardIndex: 1 });
+    const stored = [a0, a1, mid, b0, b1, c0, c1];
+    const result = attributeEntries([copy(a0), copy(a1), copy(mid), copy(b0), copy(b1), copy(c0), copy(c1)], stored);
+    const heads = result.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : []));
+    assert.deepEqual(heads, [['a0', true], ['a0', true], ['mid', true], ['b0', true], ['b0', true], ['c0', true], ['c0', true]]);
+    const bodies = rawBodiesOf(result.sources, stored);
+    assert.deepEqual([...bodies.entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [
+      ['a0', ['a0', 'a1']], ['mid', ['mid']], ['b0', ['b0', 'b1']], ['c0', ['c0', 'c1']],
+    ]);
+
+    // Carrying only the later ingestion's shards says nothing about the
+    // earlier one, and does not borrow it.
+    const later = attributeEntries([copy(c0), copy(c1)], stored);
+    assert.deepEqual(later.sources[0], { kind: 'raw', bodies: [{ messageId: 'c0', sequence: 6, complete: true }] });
+  });
+
+  it('keeps an interrupted ingestion and its re-ingestion apart', () => {
+    const g = { bodyGroupId: 'bg-retry', shardCount: 3 };
+    const cut0 = msg('cut0', 1, [text('x')], { ...g, shardIndex: 0 });
+    const cut1 = msg('cut1', 2, [text('y')], { ...g, shardIndex: 1 });
+    const r0 = msg('r0', 3, [text('x')], { ...g, shardIndex: 0 });
+    const r1 = msg('r1', 4, [text('y')], { ...g, shardIndex: 1 });
+    const r2 = msg('r2', 5, [text('z')], { ...g, shardIndex: 2 });
+    const stored = [cut0, cut1, r0, r1, r2];
+    const result = attributeEntries(stored.map((m) => copy(m)), stored);
+    const heads = result.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(heads.map((b) => [b.messageId, b.complete, b.missing]), [
+      ['cut0', false, ['shards']], ['cut0', false, ['shards']],
+      ['r0', true, undefined], ['r0', true, undefined], ['r0', true, undefined],
+    ]);
+  });
+
+  it('through addMessage and the real chunker: a reposted document is its own complete body, and its first copy does not change form', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { chunkMessage } = await import('../src/adaptive/chunker.js');
+    const { rmSync } = await import('node:fs');
+    class Chunked extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        const body = content.map((b) => (b.type === 'text' ? b.text : '')).join('');
+        const sharded = chunkMessage(body, { chunkThreshold: 20, chunkSize: 10, charsPerToken: 4 });
+        if (!sharded.wasSharded) return null;
+        return { bodyGroupId: sharded.bodyGroupId, shards: sharded.shards.map((s) => ({ content: [text(s.content)], shardIndex: s.index })) };
+      }
+    }
+    const path = './test-reposted-body';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Chunked() });
+      const doc = Array.from({ length: 12 }, (_, i) => `Paragraph ${i} of the shared document, long enough to shard. `).join('');
+      const first = cm.addMessage('alice', [text(doc)]);
+      const firstShards = cm.getAllMessages().filter((m) => m.bodyGroupId).length;
+      assert.ok(firstShards > 2, 'the document was sharded');
+      const accepted = await cm.compile();
+      cm.acceptRound({ provenance: accepted.provenance! });
+
+      cm.addMessage('bob', [text('a reply in between')]);
+      const second = cm.addMessage('alice', [text(doc)]);
+      const stored = cm.getAllMessages();
+      const groups = new Set(stored.filter((m) => m.bodyGroupId).map((m) => m.bodyGroupId));
+      assert.equal(groups.size, 1, 'both ingestions share one content-hash group id');
+
+      const result = await cm.compile();
+      const bodies = result.provenance!.messages
+        .flatMap((m) => (m.kind === 'raw' ? m.bodies : []))
+        .filter((b, i, all) => all.findIndex((x) => x.messageId === b.messageId) === i);
+      const byHead = new Map(bodies.map((b) => [b.messageId, b]));
+      assert.equal(byHead.get(first)?.complete, true, 'the first copy is still complete');
+      assert.equal(byHead.get(second)?.complete, true, 'the repost is its own complete body');
+      assert.equal(result.rawBodies!.get(first)!.length, firstShards);
+      assert.equal(result.rawBodies!.get(second)!.length, firstShards);
+      assert.ok(result.rawBodies!.get(second)!.every((m) => m.sequence > result.rawBodies!.get(first)!.at(-1)!.sequence), 'the repost carries only its own shards');
+      assert.equal(cm.acceptRound({ provenance: result.provenance! }), null, 'arrivals only: the first copy did not change form');
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a tool result moved by repair is still carried', () => {
+  const use = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} } as ContentBlock);
+  const result = (id: string, body: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: body } as ContentBlock);
+
+  async function repaired(entries: ContextEntry[]): Promise<ContextEntry[]> {
+    const { AutobiographicalStrategy } = await import('../src/index.js');
+    const strategy = new AutobiographicalStrategy({});
+    (strategy as unknown as { enforceToolPairing: (e: ContextEntry[]) => void }).enforceToolPairing(entries);
+    return entries;
+  }
+
+  it('credits the body with its result where repair put it, next to the tool_use', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const moved = entries.find((e) => e.sourceMessageId === 'r')!;
+    assert.deepEqual(moved.relocatedResults, ['tu-1'], 'repair records what it moved');
+    assert.ok(!moved.content.some((b) => b.type === 'tool_result'), 'the result left its entry');
+    const result1 = attributeEntries(entries, [u, r]);
+    const body = result1.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((b) => b.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
+  });
+
+  it('still reports missing content when the moved result was altered afterwards, or is not in the request', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const placed = entries.find((e) => e.content.some((b) => b.type === 'tool_result'))!;
+    const i = placed.content.findIndex((b) => b.type === 'tool_result');
+    placed.content[i] = result('tu-1', '[older result elided]');
+    const altered = attributeEntries(entries, [u, r]);
+    assert.deepEqual(altered.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((b) => b.messageId === 'r'),
+      { messageId: 'r', sequence: 3, complete: false, missing: ['content'] });
+
+    // An entry that claims a move with no result for it in the request.
+    const claimed: ContextEntry = { ...copy(r, [text('[tool result moved during context repair]')]), relocatedResults: ['tu-1'] };
+    const lost = attributeEntries([copy(u), claimed], [u, r]);
+    assert.deepEqual(lost.sources[1], { kind: 'raw', bodies: [{ messageId: 'r', sequence: 3, complete: false, missing: ['content'] }] });
+  });
+});
+
+describe('rawBodies', () => {
   it('resolves a body compiled from an auxiliary slot, which getMessage cannot see', async () => {
     const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
     const { rmSync } = await import('node:fs');
-    const path = './test-raw-sources-aux';
+    const path = './test-raw-bodies-aux';
     rmSync(path, { recursive: true, force: true });
     try {
       const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
@@ -195,8 +326,8 @@ describe('rawSources', () => {
       const raw = result.provenance!.messages.find((m) => m.kind === 'raw' && m.bodies[0]!.messageId === auxId);
       assert.ok(raw, 'the reader compiled the auxiliary body raw');
       assert.equal(side.getMessage(auxId), null, 'getMessage cannot resolve it');
-      const resolved = result.rawSources!.get(auxId);
-      assert.ok(resolved, 'rawSources does');
+      const resolved = result.rawBodies!.get(auxId)?.[0];
+      assert.ok(resolved, 'rawBodies does');
       assert.deepEqual((resolved!.metadata as { inboundSource?: unknown }).inboundSource, { kind: 'channel' });
       side.close();
       main.close();
@@ -268,7 +399,7 @@ describe('sharded writes declare their group size', () => {
     });
   });
 
-  it('a view filter that hides shard 0 leaves the body its identity, all its shards in rawSources, and no whole-delivery claim', async () => {
+  it('a view filter that hides shard 0 leaves the body its identity, all its shards in rawBodies, and no whole-delivery claim', async () => {
     const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
     const { rmSync } = await import('node:fs');
     class Halves extends PassthroughStrategy {
@@ -291,9 +422,11 @@ describe('sharded writes declare their group size', () => {
       const result = await cm.compile();
       const raw = result.provenance!.messages.filter((m) => m.kind === 'raw');
       assert.deepEqual(raw, [{ kind: 'raw', bodies: [{ messageId: id, sequence: head!.sequence, complete: false, missing: ['shards'] }] }]);
-      assert.deepEqual([...result.rawSources!.keys()].sort(), [head!.id, tail!.id].sort(), 'the head and every shard, hidden or not');
+      assert.deepEqual([...result.rawBodies!.entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [[head!.id, [head!.id, tail!.id]]], 'the head and every shard, hidden or not');
       // The layout is the strategy's view: only the visible shard, as partial.
-      assert.deepEqual(result.provenance!.layout!.units.map((u) => u.k === 'r' && [u.id, u.p]), [[tail!.id, 1]]);
+      const layout = result.provenance!.layout!;
+      assert.deepEqual(layout.memberIds, [tail!.id]);
+      assert.deepEqual(layout.units.map((u) => u.k === 'r' && u.p), [1]);
       cm.close();
     } finally {
       rmSync(path, { recursive: true, force: true });

@@ -12,8 +12,9 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '../src/index.js';
-import { FoldJournal } from '../src/fold-journal.js';
+import { ContextManager, PassthroughStrategy } from '../src/index.js';
+import { FoldJournal, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
+import type { StoredLayout } from '../src/fold-journal.js';
 import type {
   ContextEntry,
   ContextLogView,
@@ -235,8 +236,9 @@ describe('fold journal', () => {
     // m2's raw tokens are not charged: the three bodies are the same size, so
     // the run's "before" is two thirds of the baseline's three raw messages.
     assert.ok(Math.abs(change.estimatedTokensBefore * 3 - threeRaw * 2) <= 3, `${change.estimatedTokensBefore} vs ${threeRaw}`);
-    const units = (await cm.compile(BUDGET)).provenance!.layout!.units;
-    assert.ok(units.some((u) => u.k === 's' && u.m.length === 2), 'the summary unit records its two runs');
+    const layout = (await cm.compile(BUDGET)).provenance!.layout!;
+    assert.deepEqual(layout.memberIds, [m1, m3], 'm2 is in no unit: it is not a member');
+    assert.deepEqual(layout.units.map((u) => [u.k, u.k === 'r' ? 1 : u.n]), [['s', 2]], 'one summary unit covering the two');
     cm.close();
   });
 
@@ -335,7 +337,7 @@ describe('fold journal', () => {
     cm.close();
   });
 
-  it('filters by since (id or ISO time) and limit, newest first, and validates limit', async () => {
+  it('filters by afterId and by since (an ISO time only) and limit, newest first, and validates them', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 6);
     await acceptCompile(cm);
@@ -349,13 +351,19 @@ describe('fold journal', () => {
     assert.equal(all.latestId, all.receipts[0]!.id);
     assert.equal(cm.listFoldReceipts().receipts.length, 5, 'default limit 10');
     assert.equal(cm.listFoldReceipts({ limit: 2 }).receipts.length, 2);
-    const since = cm.listFoldReceipts({ since: all.receipts[2]!.id });
-    assert.deepEqual(since.receipts.map((r) => r.id), all.receipts.slice(0, 2).map((r) => r.id));
+    const after = cm.listFoldReceipts({ afterId: all.receipts[2]!.id });
+    assert.deepEqual(after.receipts.map((r) => r.id), all.receipts.slice(0, 2).map((r) => r.id));
+    assert.deepEqual(cm.listFoldReceipts({ afterId: all.receipts[2]!.id, limit: 1 }).receipts.map((r) => r.id), [all.receipts[0]!.id], 'newest first within the window');
     assert.equal(cm.listFoldReceipts({ since: '2000-01-01T00:00:00Z' }).receipts.length, 5);
+    assert.equal(cm.listFoldReceipts({ since: '2000-01-01' }).receipts.length, 5, 'a date alone is a time');
     assert.equal(cm.listFoldReceipts({ since: '2999-01-01T00:00:00Z' }).receipts.length, 0);
     assert.equal(cm.listFoldReceipts({ limit: 500 }).receipts.length, 5, 'capped, not refused');
     assert.throws(() => cm.listFoldReceipts({ limit: 0 }), /positive integer/);
-    assert.throws(() => cm.listFoldReceipts({ since: 'yesterday' }), /receipt id or an ISO time/);
+    assert.throws(() => cm.listFoldReceipts({ since: 'yesterday' }), /ISO 8601 time/);
+    // Epoch milliseconds are not a time and not an id: refused, not misread.
+    assert.throws(() => cm.listFoldReceipts({ since: String(Date.now()) }), /pass its id as afterId/);
+    assert.throws(() => cm.listFoldReceipts({ since: all.receipts[2]!.id }), /pass its id as afterId/);
+    assert.throws(() => cm.listFoldReceipts({ afterId: '2026-10-09' }), /decimal integer/);
     cm.close();
   });
 
@@ -455,14 +463,17 @@ describe('fold journal', () => {
     mode = 'landed';
     assert.throws(() => nextActivation.accept(fourth, Date.now(), undefined), /after landing/);
     mode = 'ok';
-    const landed = cm.listFoldReceipts({ limit: 1 }).receipts[0]!;
+    // Journals on one store object share its index; a reader on the same
+    // (wrapped) store sees what they wrote.
+    const reader = new FoldJournal(flaky, 'agents/tester');
+    const landed = reader.query({ limit: 1 }).receipts[0]!;
     assert.ok(!heard.includes(landed.id), 'the uncertain receipt is not announced yet');
     const sameLayout = (await cm.compile(BUDGET)).provenance!;
     assert.notEqual(sameLayout.compileId, fourth.compileId);
     assert.equal(nextActivation.accept(sameLayout, Date.now(), undefined), null, 'identical layout: no new receipt');
     assert.equal(heard.filter((id) => id === landed.id).length, 1, 'the recovered receipt is announced, once');
     void third;
-    const kinds = cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind);
+    const kinds = reader.query({ limit: 100 }).receipts.map((r) => r.kind);
     assert.deepEqual(kinds, ['change', 'change', 'baseline'], 'one receipt per committed change, none duplicated');
     cm.close();
   });
@@ -499,12 +510,14 @@ describe('fold journal', () => {
     const folded = (await cm.compile(BUDGET)).provenance!;
     landThenThrow = true;
     assert.throws(() => a.accept(folded, Date.now(), undefined), /after landing/);
-    const change = cm.listFoldReceipts({ limit: 1 }).receipts[0]!;
+    // Every journal here is on the one (wrapped) store object, as journals
+    // on a store always are: Chronicle opens a store once.
+    const change = new FoldJournal(flaky, 'agents/tester').query({ limit: 1 }).receipts[0]!;
     assert.equal(change.kind, 'change');
 
     // Another journal, with no listener, then records an unchanged layout
     // and an arrival: two newer records, neither with a receipt.
-    const b = new FoldJournal(real, 'agents/tester');
+    const b = new FoldJournal(flaky, 'agents/tester');
     assert.equal(b.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
     add(cm, 1, 'late');
     assert.equal(b.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
@@ -515,7 +528,7 @@ describe('fold journal', () => {
     assert.deepEqual(heard, [baseline!.id, change.id]);
 
     // A journal opened later hears the branch's newest receipt too.
-    const later = new FoldJournal(real, 'agents/tester');
+    const later = new FoldJournal(flaky, 'agents/tester');
     const laterHeard: string[] = [];
     later.onReceipt((r) => laterHeard.push(r.id));
     assert.equal(later.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined), null);
@@ -572,12 +585,13 @@ describe('fold journal', () => {
     const store = cm.getStore();
     const branch = cm.currentBranchRef();
     const records = () => store.getRecordIdsByType('context-manager/accepted-layout').length;
-    const handMade = (compileId: string, units: LayoutUnit[]): CompileProvenance => ({
-      compileId, namespace: 'agents/tester', branch, messages: [], strategy: 'hand', layout: { v: 1, units, totalTokens: 0, calibration: 1 },
-    });
     const lost = '999999';
-    const raw = handMade('before-crash', [{ k: 'r', s: 1, id: lost, t: 3 }]);
-    const omitted = handMade('after-crash', [{ k: 'o', a: 1, ai: lost, b: 1, bi: lost, m: [[1, lost, 1, lost]] }]);
+    const handMade = (compileId: string, units: LayoutUnit[]): CompileProvenance => ({
+      compileId, namespace: 'agents/tester', branch, messages: [], strategy: 'hand',
+      layout: { v: 2, members: [1], memberIds: [lost], units, totalTokens: 0, calibration: 1 },
+    });
+    const raw = handMade('before-crash', [{ k: 'r', t: 3 }]);
+    const omitted = handMade('after-crash', [{ k: 'o', n: 1 }]);
     const journal = new FoldJournal(store, 'agents/tester');
     assert.equal(journal.accept(raw, Date.now(), undefined)?.kind, 'baseline');
     assert.deepEqual(journal.accept(omitted, Date.now(), undefined)?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']]);
@@ -676,6 +690,198 @@ describe('compile provenance', () => {
       costs.push([unit.t, layout.totalTokens]);
     }
     assert.deepEqual(costs, [[10, 10], [10, 10], [10, 10]]);
+    cm.close();
+  });
+});
+
+/** Each accepted-layout record: its kind, and the bytes of its layout part. */
+function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; chain: number; members: number }> {
+  return store.getRecordIdsByType('context-manager/accepted-layout').map((id) => {
+    const record = JSON.parse(store.getRecord(id)!.payload.toString('utf8'));
+    const { receipt: _receipt, ns: _ns, branch: _branch, compileId: _compileId, ...layout } = record;
+    return { kind: record.kind, bytes: JSON.stringify(layout).length, chain: record.chain, members: record.m ? decodeSequences(record.m).length : 0 };
+  });
+}
+
+const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
+
+describe('fold journal size', () => {
+  beforeEach(cleanup);
+  afterEach(cleanup);
+
+  it('a window advancing over a growing omitted prefix costs the same each round, however long the history', async () => {
+    // Anarchid's passthrough probe: one message and one accepted round per
+    // turn, a 6k budget, other records between the messages (gapped
+    // sequences, the journal's own records among them).
+    const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    const store = cm.getStore();
+    const budget: TokenBudget = { maxTokens: 6000, reserveForResponse: 0 };
+    let filled = -1;
+    for (let turn = 0; turn < 600; turn++) {
+      cm.addMessage('user', [{ type: 'text', text: `turn ${turn} ${'word '.repeat(40)}` }]);
+      if (turn % 3 === 0) store.appendJson('test/other-record', { turn });
+      const result = await cm.compile(budget);
+      if (filled < 0 && result.provenance!.layout!.units[0]!.k === 'o') filled = turn;
+      cm.acceptRound({ provenance: result.provenance! });
+    }
+    assert.ok(filled > 50 && filled < 300, `the window filled (at turn ${filled})`);
+    const records = layoutRecords(store);
+    assert.equal(records.length, 600, 'one record per accepted round');
+    const deltas = records.map((r, turn) => ({ ...r, turn })).filter((r) => r.kind === 'delta');
+    const early = deltas.filter((r) => r.turn > filled + 20 && r.turn <= filled + 120).map((r) => r.bytes);
+    const late = deltas.filter((r) => r.turn >= 500).map((r) => r.bytes);
+    assert.ok(early.length > 50 && late.length > 50);
+    assert.ok(Math.max(...late) <= 200, `a delta stays small: ${Math.max(...late)} bytes`);
+    assert.ok(mean(late) <= mean(early) * 1.2 + 4, `deltas do not grow with the history: ${mean(early).toFixed(1)} then ${mean(late).toFixed(1)}`);
+    const snapshots = records.filter((r) => r.kind === 'snapshot');
+    for (const snap of snapshots) {
+      // Members at about a byte and a third each, plus the rendered units.
+      assert.ok(snap.bytes <= snap.members * 2 + 2000, `snapshot of ${snap.members} members: ${snap.bytes} bytes`);
+    }
+    const total = records.reduce((sum, r) => sum + r.bytes, 0);
+    const deltaTotal = deltas.reduce((sum, r) => sum + r.bytes, 0);
+    assert.ok(total <= 3 * deltaTotal + 4 * 2000, `snapshots cost about what the deltas since them do: ${total} bytes in all, ${deltaTotal} in deltas`);
+    cm.close();
+  });
+
+  it('a fold deep in a long history costs the units it changes, not the history', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 1200);
+    // History in sixty summaries of twenty messages each, the newest 20 raw.
+    const plan = (rename: number | null) => {
+      for (let s = 0; s < 59; s++) {
+        const id = s === rename ? `s${s}-renamed` : `s${s}`;
+        for (let k = 0; k < 20; k++) strategy.plan.set(ids[s * 20 + k]!, { summary: id, level: 1 });
+      }
+    };
+    plan(null);
+    await acceptCompile(cm);
+    plan(30);
+    const receipt = await acceptCompile(cm);
+    assert.equal(receipt?.changes?.length, 1, 'one summary replaced');
+    assert.equal(receipt!.changes![0]!.messages, 20);
+    const last = layoutRecords(cm.getStore()).at(-1)!;
+    assert.equal(last.kind, 'delta');
+    assert.ok(last.bytes <= 250, `one changed unit: ${last.bytes} bytes for a 1,200-message history`);
+    cm.close();
+  });
+
+  it('a removed message costs one member in the delta, wherever it is', async () => {
+    const { cm } = await open();
+    const ids = add(cm, 400);
+    await acceptCompile(cm);
+    cm.removeMessage(ids[10]!);
+    assert.equal(await acceptCompile(cm), null, 'a removal is not a fold');
+    const last = layoutRecords(cm.getStore()).at(-1)!;
+    assert.equal(last.kind, 'delta');
+    // The record's fixed fields (format, kind, previous record, tokens,
+    // chain and sizes) and one removed member: the history adds nothing.
+    assert.ok(last.bytes <= 160, `${last.bytes} bytes`);
+    cm.close();
+  });
+
+  it('encodes ascending sequences exactly, and refuses anything else', () => {
+    const cases = [[], [0], [7], [1, 2, 3], [5, 130, 131, 20_000, 2 ** 40, 2 ** 52]];
+    for (const seqs of cases) assert.deepEqual(decodeSequences(encodeSequences(seqs)), seqs);
+    let x = 0;
+    const gapped = Array.from({ length: 5000 }, (_, i) => (x += 1 + ((i * 7919) % 5)));
+    const text = encodeSequences(gapped);
+    assert.deepEqual(decodeSequences(text), gapped);
+    assert.ok(text.length <= gapped.length * 1.4, `${text.length} chars for ${gapped.length} small gaps`);
+    assert.throws(() => encodeSequences([3, 3]), /ascending/);
+    assert.throws(() => encodeSequences([5, 4]), /ascending/);
+    assert.throws(() => decodeSequences(Buffer.from([0x81]).toString('base64url')), /truncated/);
+  });
+
+  it('a delta rebuilds the next layout exactly, for random edits of members and units', () => {
+    let seed = 12345;
+    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+    const unit = (): LayoutUnit => {
+      const k = rand(3);
+      if (k === 0) return { k: 'r', t: rand(4) };
+      if (k === 1) return { k: 's', n: 1 + rand(4), sm: [[`s${rand(3)}`, 1, 'm', 0, rand(5)]] };
+      return { k: 'o', n: 1 + rand(4) };
+    };
+    const layout = (units: LayoutUnit[], pool: number[]): StoredLayout => {
+      const count = units.reduce((n, u) => n + (u.k === 'r' ? 1 : u.n), 0);
+      const members = [...pool].sort((a, b) => a - b).slice(0, count);
+      while (members.length < count) members.push((members.at(-1) ?? 0) + 1 + rand(3));
+      return { members, units };
+    };
+    for (let round = 0; round < 2000; round++) {
+      const prevUnits = Array.from({ length: rand(8) + 1 }, unit);
+      const nextUnits = rand(2) === 0 ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
+      const pool = Array.from({ length: 60 }, () => rand(200));
+      const unique = [...new Set(pool)];
+      const prev = layout(prevUnits, unique.filter(() => rand(4) > 0));
+      const next = layout(nextUnits, unique.filter(() => rand(4) > 0));
+      const delta = layoutDelta(prev, next);
+      if (!delta) continue;
+      assert.deepEqual(applyLayoutDelta(prev, delta), next, `round ${round}`);
+    }
+  });
+});
+
+describe('fold journal durability and index', () => {
+  beforeEach(cleanup);
+  afterEach(cleanup);
+
+  it('syncs the state a record names before appending it, and the record before anyone hears of it', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    const calls: string[] = [];
+    const watched = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'sync') return () => { calls.push('sync'); target.sync(); };
+        if (prop === 'appendJson') return (type: string, payload: unknown) => { calls.push(`append ${type}`); return target.appendJson(type, payload); };
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const journal = new FoldJournal(watched, 'agents/tester');
+    journal.storeId();
+    journal.onReceipt(() => calls.push('announce'));
+    calls.length = 0;
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    assert.deepEqual(calls, ['sync', 'append context-manager/accepted-layout', 'sync', 'announce']);
+    calls.length = 0;
+    strategy.plan.set(ids[0]!, 'omit');
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    assert.deepEqual(calls, ['sync', 'append context-manager/accepted-layout', 'sync', 'announce']);
+    cm.close();
+  });
+
+  it('lists the store\'s records once, and reads only the receipts a query returns', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 40);
+    const real = cm.getStore();
+    let listings = 0;
+    let reads = 0;
+    const counted = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'getRecordIdsByType') return (type: string) => { if (type === 'context-manager/accepted-layout') listings++; return target.getRecordIdsByType(type); };
+        if (prop === 'getRecord') return (id: string) => { reads++; return target.getRecord(id); };
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const journal = new FoldJournal(counted, 'agents/tester');
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    for (let i = 0; i < 30; i++) {
+      strategy.plan.set(ids[i]!, 'omit');
+      journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    }
+    assert.equal(listings, 1, 'one listing, at first use; later records are added as they are written');
+    reads = 0;
+    const page = journal.query({ limit: 3 });
+    assert.equal(page.receipts.length, 3);
+    assert.equal(reads, 3, 'a query reads the receipts it returns, no others');
+    assert.equal(journal.receiptsFor(page.branch!).length, 31);
+    // A fresh journal on the same store object shares the index.
+    const other = new FoldJournal(counted, 'agents/tester');
+    assert.equal(other.query({ limit: 100 }).receipts.length, 31);
+    assert.equal(listings, 1);
     cm.close();
   });
 });

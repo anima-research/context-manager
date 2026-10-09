@@ -53,7 +53,7 @@ import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
-import { attributeEntries, buildRenderedLayout, rawSourcesOf } from './compile-provenance.js';
+import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf } from './fold-journal.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
@@ -1038,7 +1038,7 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
-      result.rawSources = rawSourcesOf(attribution.sources, storedMessages);
+      result.rawBodies = rawBodiesOf(attribution.sources, storedMessages);
       result.provenance = {
         compileId: randomUUID(),
         namespace: this.strategyNamespace,

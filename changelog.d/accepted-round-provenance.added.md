@@ -8,9 +8,12 @@
   id is shard 0's (the id `addMessage` returned), and a shard the view filter
   hid from the strategy counts as missing. A composite that merged a body's
   shards is complete when it carries their text in order and their media
-  unaltered. `rawSources` maps every raw body named there to the stored
-  messages the compile read (its head and every shard, including any the view
-  filter hid), auxiliary-store messages included.
+  unaltered, and a tool result that pairing repair moved next to its tool_use
+  still counts as carried there. A body is one ingestion: the same text
+  ingested twice is two bodies, though a group id (a hash of the content)
+  names both. `rawBodies` maps each raw body's head to its stored messages as
+  the compile read them (head first, then every shard of that ingestion,
+  including any the view filter hid), auxiliary-store messages included.
 - Strategies can report their rendered layout. A strategy declares `renderedForms`
   and names the summaries behind derived entries in `ContextEntry.summaries`, with
   `describeRenderedSummaries(ids)` giving each summary's level, covered messages and
@@ -28,16 +31,26 @@
   Arrivals are not folds.
   - Each acceptance, an unchanged layout included, commits the branch's new
     layout and its receipt as one Chronicle typed record, alongside a
-    once-minted store-id record. These are unbranched, survive branch
-    deletion, and are written only after the store syncs. A compile is
-    accepted once: a retry writes nothing, whether its first acceptance
-    reported success or an uncertain failure, ran in another manager on the
-    store, or ran before a reopen.
-  - Every manager on one store object shares an index of these records. The
-    first acceptance or receipt query after the store opens reads every
-    record once; later ones read only the records added since.
-  - Layout ranges carry exact membership, so a message missing from either
-    view is never counted inside a range.
+    once-minted store-id record. Typed records are enumerable from any branch
+    and survive branch deletion, though each takes the next sequence of the
+    branch selected when it is written. The store syncs before the record is
+    appended, so the state it names is durable first, and again after, so an
+    acceptance is durable before `acceptRound` returns or announces it. A
+    compile is accepted once: a retry writes nothing, whether its first
+    acceptance reported success or an uncertain failure, ran in another
+    manager on the store, or ran before a reopen.
+  - A layout persists as its members (message sequences, gap-coded, about
+    1.3 bytes each) and its units (forms with counts), so a message missing
+    from either view is never counted inside a range, and a record's size
+    follows what changed and what was rendered, not the history behind the
+    window. An acceptance writes a delta on the branch's previous record
+    until the deltas since the last snapshot would outweigh it; then a
+    snapshot.
+  - Every manager on one store object shares an index of these records: the
+    first acceptance or receipt query after the store opens lists and reads
+    them once, and each manager adds its own records as it writes them. The
+    index keeps record ids and acceptance times; a receipt is read from the
+    store when a query returns it.
   - Layouts persist base token estimates, taken before the store's
     calibration, so identical content costs the same in every compile. A
     receipt's estimated token counts apply the calibration its compile
@@ -46,7 +59,9 @@
   - `presentation` (`verbatim`, `altered` or `unknown`) records how the
     confirming round carried the compile, as its producer reported.
   - Usage is the confirming round's own, with unreported fields `unknown`.
-  - Query with `listFoldReceipts({ since, limit, branch })`, read a branch's whole
+  - Query with `listFoldReceipts({ afterId, since, limit, branch })`
+    (`afterId` a receipt id, `since` an ISO 8601 time; a bare number is
+    refused rather than guessed at), read a branch's whole
     record with `foldReceiptsFor(branch)`, subscribe with `onFoldReceipt`, and
     label receipts with `setReceiptSource`.
   - `getStoreId`, `currentBranchRef` and `describeRenderedForms` support hosts

@@ -55,6 +55,41 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
 }
 
 /**
+ * Every stored body, as the messages of one ingestion: a message's own body
+ * is itself; a sharded body is one write of a group's shards. A group id is
+ * a hash of the content, so the same text ingested twice shares one, and a
+ * group's members can hold several bodies. Shards are written in index
+ * order, 0..n-1, one ingestion at a time, so in sequence order a group's
+ * next body begins where a shard's index does not follow its predecessor's:
+ * the members of each body, in shard order, are a run of the group's
+ * members in which the index only rises. A body whose shard 0 was removed
+ * keeps its other shards, and its head is then the first of them.
+ *
+ * Returns, for each stored message, its body's members in shard order (one
+ * array per body, shared by its members); the head is the first.
+ * `stored` must be in sequence order.
+ */
+export function storedBodies(stored: readonly StoredMessage[]): ReadonlyMap<MessageId, readonly StoredMessage[]> {
+  const out = new Map<MessageId, StoredMessage[]>();
+  const open = new Map<string, StoredMessage[]>();
+  for (const msg of stored) {
+    if (!msg.bodyGroupId) {
+      out.set(msg.id, [msg]);
+      continue;
+    }
+    let body = open.get(msg.bodyGroupId);
+    const last = body?.[body.length - 1];
+    if (!body || (msg.shardIndex ?? 0) <= (last!.shardIndex ?? 0)) {
+      body = [];
+      open.set(msg.bodyGroupId, body);
+    }
+    body.push(msg);
+    out.set(msg.id, body);
+  }
+  return out;
+}
+
+/**
  * Attribute every entry of one compile. `stored` is every message the
  * compile read, before any view filter (ordered by sequence): a body is
  * judged as stored, so a shard the filter hid from the strategy still
@@ -62,32 +97,25 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
  */
 export function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]): EntryProvenance {
   const byId = new Map<MessageId, StoredMessage>();
-  const groups = new Map<string, StoredMessage[]>();
-  for (const msg of stored) {
-    byId.set(msg.id, msg);
-    if (msg.bodyGroupId) {
-      const list = groups.get(msg.bodyGroupId);
-      if (list) list.push(msg);
-      else groups.set(msg.bodyGroupId, [msg]);
-    }
-  }
-  for (const list of groups.values()) list.sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));
+  for (const msg of stored) byId.set(msg.id, msg);
+  const bodyMembers = storedBodies(stored);
 
-  const bodies = new Map<string, BodyState>();
-  const bodyKeyOf = (msg: StoredMessage): string => msg.bodyGroupId ? `g:${msg.bodyGroupId}` : `m:${msg.id}`;
+  // Keyed by the body's head: two ingestions of the same text are two bodies.
+  const bodies = new Map<MessageId, BodyState>();
   const bodyOf = (msg: StoredMessage): BodyState => {
-    const key = bodyKeyOf(msg);
-    let state = bodies.get(key);
+    const members = bodyMembers.get(msg.id) ?? [msg];
+    const head = members[0]!;
+    let state = bodies.get(head.id);
     if (!state) {
-      const members = msg.bodyGroupId ? groups.get(msg.bodyGroupId) ?? [msg] : [msg];
-      state = { head: members[0]!, members, present: new Set(), contentOk: true };
-      bodies.set(key, state);
+      state = { head, members: [...members], present: new Set(), contentOk: true };
+      bodies.set(head.id, state);
     }
     return state;
   };
 
   // Pass 1: which members each raw entry carries, and whether it carried
   // them unaltered.
+  let resultsByUse: ReadonlyMap<string, ContentBlock> | undefined;
   const entryBodies: Array<BodyState[] | null> = [];
   for (const entry of entries) {
     if (!isRawEntry(entry)) {
@@ -103,9 +131,9 @@ export function attributeEntries(entries: readonly ContextEntry[], stored: reado
       state.present.add(msg.id);
       if (!states.includes(state)) states.push(state);
     }
-    const unaltered = sourceMessages.length === 1
-      ? coversStoredContent(entry.content, sourceMessages[0]!.content)
-      : sourceMessages.length > 1 && compositeCovers(entry.content, sourceMessages);
+    const unaltered = entry.relocatedResults?.length
+      ? carriesWithRelocated(entry, sourceMessages, resultsByUse ??= toolResultsByUse(entries))
+      : carries(entry.content, sourceMessages);
     if (!unaltered) for (const state of states) state.contentOk = false;
     entryBodies.push(states);
   }
@@ -162,8 +190,9 @@ export function attributeEntries(entries: readonly ContextEntry[], stored: reado
 }
 
 /**
- * Build the rendered layout of one compile: one unit per raw message, and
- * ranges for summarized and omitted messages, in view order.
+ * Build the rendered layout of one compile: the view's members, and one unit
+ * per raw message and per run of summarized or omitted messages, in view
+ * order. `view` is in sequence order, as every message view is.
  *
  * `estimateBase` returns a base (calibration-free) token estimate for some
  * rendered content. Raw message tokens are their entry's estimate, split
@@ -216,20 +245,24 @@ export function buildRenderedLayout(opts: {
     }
   }
 
+  const members: number[] = [];
+  const memberIds: MessageId[] = [];
   const units: LayoutUnit[] = [];
   for (const msg of opts.view) {
+    members.push(msg.sequence);
+    memberIds.push(msg.id);
     if (rawTokens.has(msg.id)) {
-      const unit: LayoutUnit = { k: 'r', s: msg.sequence, id: msg.id, t: Math.round(rawTokens.get(msg.id)!) };
+      const unit: LayoutUnit = { k: 'r', t: Math.round(rawTokens.get(msg.id)!) };
       if (opts.rawComplete.get(msg.id) === false) unit.p = 1;
       units.push(unit);
       continue;
     }
+    const last = units[units.length - 1];
     const covering = coveredBy.get(msg.id);
     if (covering && covering.length > 0) {
       const ids = [...covering].sort();
-      const last = units[units.length - 1];
       if (last && last.k === 's' && sameIds(last.sm.map((s) => s[0]), ids)) {
-        extend(last, msg);
+        last.n++;
         continue;
       }
       const sm: Array<[string, number, string, 0 | 1, number]> = [];
@@ -237,22 +270,20 @@ export function buildRenderedLayout(opts: {
         const info = opts.summaryInfo.get(id)!;
         sm.push([id, info.level, info.method, partialSummaries.has(id) ? 1 : 0, Math.round(summaryTokens.get(id) ?? 0)]);
       }
-      units.push({
-        k: 's', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id,
-        m: [[msg.sequence, msg.id, msg.sequence, msg.id]], sm,
-      });
+      units.push({ k: 's', n: 1, sm });
       continue;
     }
-    const last = units[units.length - 1];
     if (last && last.k === 'o') {
-      extend(last, msg);
+      last.n++;
       continue;
     }
-    units.push({ k: 'o', a: msg.sequence, ai: msg.id, b: msg.sequence, bi: msg.id, m: [[msg.sequence, msg.id, msg.sequence, msg.id]] });
+    units.push({ k: 'o', n: 1 });
   }
 
   return {
-    v: 1,
+    v: 2,
+    members,
+    memberIds,
     units,
     totalTokens: Math.round(totalTokens),
     calibration: opts.calibration,
@@ -260,51 +291,74 @@ export function buildRenderedLayout(opts: {
   };
 }
 
-/** Add the next view message to a range unit, keeping its exact membership. */
-function extend(unit: Extract<LayoutUnit, { k: 's' | 'o' }>, msg: StoredMessage): void {
-  unit.b = msg.sequence;
-  unit.bi = msg.id;
-  const run = unit.m[unit.m.length - 1]!;
-  if (run[2] + 1 === msg.sequence) {
-    run[2] = msg.sequence;
-    run[3] = msg.id;
-  } else {
-    unit.m.push([msg.sequence, msg.id, msg.sequence, msg.id]);
-  }
-}
-
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
 /**
- * The stored messages behind every raw body the sources name, from the
- * messages the compile read (the same `stored` list attribution judged
- * bodies by): each body's head and every shard of a sharded body.
+ * The stored messages of every raw body the sources name, from the messages
+ * the compile read (the same `stored` list attribution judged bodies by):
+ * for each body's head, the body's members in shard order, head first. Two
+ * ingestions of the same text are two bodies, each with only its own shards.
  */
-export function rawSourcesOf(
+export function rawBodiesOf(
   sources: readonly CompiledMessageSources[],
   stored: readonly StoredMessage[],
-): ReadonlyMap<MessageId, StoredMessage> {
+): ReadonlyMap<MessageId, readonly StoredMessage[]> {
   const heads = new Set<MessageId>();
   for (const source of sources) {
     if (source.kind === 'raw') for (const body of source.bodies) heads.add(body.messageId);
   }
-  const out = new Map<MessageId, StoredMessage>();
+  const out = new Map<MessageId, readonly StoredMessage[]>();
   if (heads.size === 0) return out;
-  const groups = new Set<string>();
-  for (const msg of stored) {
-    if (heads.has(msg.id)) {
-      out.set(msg.id, msg);
-      if (msg.bodyGroupId) groups.add(msg.bodyGroupId);
-    }
+  const bodies = storedBodies(stored);
+  for (const head of heads) {
+    const members = bodies.get(head);
+    if (members) out.set(head, members);
   }
-  if (groups.size > 0) {
-    for (const msg of stored) {
-      if (msg.bodyGroupId && groups.has(msg.bodyGroupId)) out.set(msg.id, msg);
+  return out;
+}
+
+/** Whether rendered content carries its source messages unaltered. */
+function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage[]): boolean {
+  if (sourceMessages.length === 1) return coversStoredContent(content, sourceMessages[0]!.content);
+  return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
+}
+
+/** Every tool_result block of the compile, by the tool_use it answers. */
+function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string, ContentBlock> {
+  const out = new Map<string, ContentBlock>();
+  for (const entry of entries) {
+    for (const block of entry.content) {
+      if (block.type === 'tool_result' && !out.has(block.toolUseId)) out.set(block.toolUseId, block);
     }
   }
   return out;
+}
+
+/**
+ * An entry a structural repair moved tool results out of carries its body
+ * when it carries the rest unaltered and each moved result reached the
+ * request unaltered where the repair put it. A result altered there, or
+ * missing from the request, does not carry it.
+ */
+function carriesWithRelocated(
+  entry: ContextEntry,
+  sourceMessages: readonly StoredMessage[],
+  resultsByUse: ReadonlyMap<string, ContentBlock>,
+): boolean {
+  const moved = new Set(entry.relocatedResults);
+  const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
+  const rest = sourceMessages.map((m) => ({ ...m, content: m.content.filter((b) => !isMoved(b)) }));
+  if (!carries(entry.content, rest)) return false;
+  for (const m of sourceMessages) {
+    for (const block of m.content) {
+      if (!isMoved(block)) continue;
+      const placed = resultsByUse.get((block as { toolUseId: string }).toolUseId);
+      if (!placed || !covers(placed, block)) return false;
+    }
+  }
+  return true;
 }
 
 /**

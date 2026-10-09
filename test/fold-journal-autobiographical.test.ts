@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
-import type { AutobiographicalOptions, LayoutUnit, SummaryEntry } from '../src/index.js';
+import type { AutobiographicalOptions, LayoutUnit, RenderedLayout, SummaryEntry } from '../src/index.js';
 
 class SeedableStrategy extends AutobiographicalStrategy {
   seed(entry: Omit<SummaryEntry, 'created'>): void {
@@ -55,10 +55,22 @@ function seedAll(strategy: SeedableStrategy, ids: string[]): void {
   strategy.seed({ id: 'L1-102', level: 1, content: 'plain prose four with even more words to cut away', tokens: 6, sourceLevel: 0, sourceIds: [d], sourceRange: { first: d, last: d } });
 }
 
-function summaryUnits(units: LayoutUnit[]): Array<[string, string, string[]]> {
-  return units
-    .filter((u): u is Extract<LayoutUnit, { k: 's' }> => u.k === 's')
-    .map((u) => [u.ai, u.bi, u.sm.map((s) => `${s[0]}@${s[1]}${s[3] ? '~' : ''}`)]);
+/** Each unit with the ids of the first and last message it covers. */
+function spans(layout: RenderedLayout): Array<{ unit: LayoutUnit; first: string; last: string }> {
+  const out: Array<{ unit: LayoutUnit; first: string; last: string }> = [];
+  let at = 0;
+  for (const unit of layout.units) {
+    const n = unit.k === 'r' ? 1 : unit.n;
+    out.push({ unit, first: layout.memberIds[at]!, last: layout.memberIds[at + n - 1]! });
+    at += n;
+  }
+  return out;
+}
+
+function summaryUnits(layout: RenderedLayout): Array<[string, string, string[]]> {
+  return spans(layout)
+    .filter(({ unit }) => unit.k === 's')
+    .map(({ unit, first, last }) => [first, last, (unit as Extract<LayoutUnit, { k: 's' }>).sm.map((s) => `${s[0]}@${s[1]}${s[3] ? '~' : ''}`)]);
 }
 
 describe('autobiographical rendered layout', () => {
@@ -69,14 +81,14 @@ describe('autobiographical rendered layout', () => {
       const result = await cm.compile(BUDGET);
       const layout = result.provenance?.layout;
       assert.ok(layout, 'autobiographical reports a layout');
-      assert.deepEqual(summaryUnits(layout.units), [
+      assert.deepEqual(summaryUnits(layout), [
         [ids[0], ids[1], ['L2-100@2']],
         [ids[2], ids[2], ['L1-101@1']],
         [ids[3], ids[3], ['L1-102@1']],
       ]);
-      const tail = layout.units[layout.units.length - 1]!;
-      assert.equal(tail.k, 'r');
-      assert.equal((tail as { id: string }).id, ids[4]);
+      const tail = spans(layout).at(-1)!;
+      assert.equal(tail.unit.k, 'r');
+      assert.equal(tail.first, ids[4]);
       // Each recall question and answer names its summary.
       const kinds = result.provenance!.messages.map((m) => m.kind);
       assert.equal(kinds.filter((k) => k === 'summary').length, 6);
@@ -111,8 +123,8 @@ describe('autobiographical rendered layout', () => {
         const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 12, recallEnvelope });
         seedAll(strategy, ids);
         const result = await cm.compile(BUDGET);
-        const units = result.provenance!.layout!.units.map((u) =>
-          u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${u.ai}..${u.bi}` : `raw ${u.s}`,
+        const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
+          u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
         );
         // L2-100 whole, L1-101 cut by the cap, L1-102 dropped: its message is omitted.
         assert.deepEqual(units.slice(0, 3), ['s[L2-100]', 's[L1-101~]', `omit ${ids[3]}..${ids[3]}`], recallEnvelope);
@@ -137,7 +149,7 @@ describe('autobiographical rendered layout', () => {
       const answer = JSON.stringify(result.messages);
       assert.ok(answer.includes('retained reasoning'), 'the truncator kept B\'s thinking block');
       assert.ok(!answer.includes('second summary text'), 'and dropped its text');
-      const named = summaryUnits(result.provenance!.layout!.units).flatMap(([, , sm]) => sm);
+      const named = summaryUnits(result.provenance!.layout!).flatMap(([, , sm]) => sm);
       assert.ok(named.includes('L1-b@1~'), `B is named as partially rendered: ${JSON.stringify(named)}`);
       assert.ok(named.includes('L1-a@1~'), 'A was cut');
       cm.close();

@@ -11524,6 +11524,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         src.content = rest.length > 0
           ? rest
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
+        // The result still reaches the request, next to its tool_use:
+        // provenance credits the source body with it there.
+        (src.relocatedResults ??= []).push(id);
         return real;
       }
       return this.createToolResultStub(id);
