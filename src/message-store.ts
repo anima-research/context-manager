@@ -312,7 +312,7 @@ export class MessageStore {
 
 
   private indexWriteVersion = -1;
-  private indexBranch = '';
+  private indexBranchId = '';
 
   /**
    * Id→index lookup that survives both sibling-instance writes and Chronicle
@@ -320,14 +320,16 @@ export class MessageStore {
    * stamp indexWriteVersion at their bump; a version the stamp hasn't seen
    * means a SIBLING MessageStore on this JsStore wrote. Branches can expose
    * different append-log shapes without changing that process-local version,
-   * so branch name is an independent freshness key. Rebuild once, then
+   * so native branch ID is an independent freshness key. Names can be reused
+   * after deletion, including through direct Chronicle calls with no observed
+   * intermediate switch (issue #92). Rebuild once, then
    * resolve. O(1) on every same-instance, same-branch path (2026-07-25 review
    * class: a stale index previously threw "Message not found" or, after
    * shifts, would have mutated or branched from the wrong item).
    */
   private lookupIndex(messageId: MessageId): number | undefined {
     if (
-      this.indexBranch !== this.store.currentBranch().name ||
+      this.indexBranchId !== this.store.currentBranch().id ||
       this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
     ) {
       this.rebuildIndex();
@@ -335,8 +337,17 @@ export class MessageStore {
     return this.idToIndex.get(messageId);
   }
 
+  /** Whether the materialized cache reflects every write to the slot so far, through any instance. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
-    this.indexBranch = this.store.currentBranch().name;
+    this.indexBranchId = this.store.currentBranch().id;
     this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
@@ -357,7 +368,7 @@ export class MessageStore {
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
-   * Freshness tokens: (branch, head sequence) — with a cheap same-slot
+   * Freshness tokens: (native branch ID, head sequence) — with a cheap same-slot
    * revalidation for foreign-state writes — PLUS the process-wide
    * per-(store, stateId) write version (sharedWriteVersions above), which
    * makes edits/removals through SIBLING MessageStore instances visible:
@@ -372,7 +383,7 @@ export class MessageStore {
    * spreads; image cap/strip replace blocks rather than mutating).
    */
   private allCache: {
-    branch: string;
+    branchId: string;
     sequence: number;
     internals: StoredMessageInternal[];
     writeVersion: number;
@@ -421,7 +432,20 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    // Whether this instance's id index and materialized cache reflected
+    // every write to the slot BEFORE this append — including writes made
+    // through a sibling MessageStore on the same store. A local write may
+    // re-certify only state that was current going in; a stale index or
+    // cache stays stale and is rebuilt on the next lookup. Previously the
+    // append stamped both as current regardless: after a sibling removed
+    // an earlier message, a lookup by id here returned the wrong message
+    // under the right id (Astra's reproducer, 2026-10-07).
+    const branchId = this.store.currentBranch().id;
+    const indexWasCurrent =
+      this.indexBranchId === branchId &&
+      this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -460,8 +484,9 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
     ) {
       this.allCache.internals.push(canonical);
@@ -474,13 +499,18 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branch !== this.store.currentBranch().name ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
+    if (indexWasCurrent) {
+      // This instance made the write and its index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = version;
+    }
+    // Else: left stale on purpose; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
@@ -520,6 +550,7 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
@@ -532,11 +563,17 @@ export class MessageStore {
     if (
       canonicalEdit &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals[index]
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the version, as append does, so the next read is a hit rather than
+      // a whole-slot reload — but only if the cache was current before the
+      // write, so a sibling's earlier edit still forces the rebuild it is
+      // owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -566,17 +603,20 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
     if (
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === this.length() + 1
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full reload.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -713,16 +753,16 @@ export class MessageStore {
     // view (internalToStored + resolveBlobs + new Date() per message) each time
     // dominated large moves:0 compiles (Sol, 2026-07-31). Key on the same
     // freshness tokens as allCache: appends bump sequence, edits/redacts bump
-    // the shared writeVersion, branch switches change branch — any of which
+    // the shared writeVersion, branch switches change branch ID — any of which
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
-    const branch = this.store.currentBranch().name;
+    const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     const c = this.allStoredCache;
     if (
       c &&
-      c.branch === branch &&
+      c.branchId === branchId &&
       c.sequence === sequence &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
@@ -732,14 +772,14 @@ export class MessageStore {
     const stored = internals.map((internal, i) =>
       this.internalToStored(internal, internal.id, i)
     );
-    this.allStoredCache = { branch, sequence, writeVersion, stored };
+    this.allStoredCache = { branchId, sequence, writeVersion, stored };
     return stored;
   }
 
   /** Cached mapped view for getAll(), invalidated by the same freshness tokens
    *  as allCache (see getAll). */
   private allStoredCache: {
-    branch: string;
+    branchId: string;
     sequence: number;
     writeVersion: number;
     stored: StoredMessage[];
@@ -1600,19 +1640,19 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const branch = this.store.currentBranch().name;
+    const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     let missReason = 'no-cache';
     if (this.allCache) {
       missReason =
-        this.allCache.branch !== branch
-          ? `branch ${this.allCache.branch}→${branch}`
+        this.allCache.branchId !== branchId
+          ? `branch ${this.allCache.branchId}→${branchId}`
           : this.allCache.writeVersion !== writeVersion
             ? `writeVersion ${this.allCache.writeVersion}→${writeVersion}`
             : 'revalidate-fail';
     }
-    if (this.allCache && this.allCache.branch === branch && this.allCache.writeVersion === writeVersion) {
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
         return this.allCache.internals;
       }
@@ -1656,7 +1696,7 @@ export class MessageStore {
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branch, sequence, internals, writeVersion };
+    this.allCache = { branchId, sequence, internals, writeVersion };
     cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
     return internals;
   }

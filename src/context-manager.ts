@@ -4,6 +4,9 @@ import type {
   MessageId,
   Sequence,
   MessageMetadata,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
   StoredMessage,
   ContextEntry,
   TokenBudget,
@@ -79,6 +82,11 @@ interface ContextManagerBaseConfig {
    * When true, log the compiled context to stderr for debugging.
    */
   debugLogContext?: boolean;
+  /**
+   * Clock for compression-hold timeouts (ms). Defaults to Date.now; tests
+   * inject a fake clock.
+   */
+  now?: () => number;
   /**
    * Strategy-facing exclusion predicate: return true to keep a message
    * visible. When set, the view handed to the strategy — for compile,
@@ -176,6 +184,21 @@ export class ContextManager {
   private strategyNamespace: string;
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
+  /**
+   * Compression holds (see holdCompression). Transient by design: never
+   * persisted, so a restart can never leave compression permanently stalled.
+   */
+  private compressionHolds = new Set<MessageId>();
+  /** Sharded adds held on ingress: first-shard id -> every shard id. */
+  private compressionHoldGroups = new Map<MessageId, MessageId[]>();
+  /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
+  private compressionHoldInfo = new Map<MessageId, CompressionHoldInfo>();
+  private now: () => number = Date.now;
+  /** Hold options + shared heldAt for the addMessage currently appending. */
+  private holdingAddOptions: CompressionHoldOptions | undefined;
+  private holdingAddAt = 0;
+  /** Set while addMessage(..., { holdCompression: true }) appends. */
+  private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
 
@@ -221,6 +244,11 @@ export class ContextManager {
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    // Live predicate (strategies capture views across long drains). Every
+    // view built above is a fresh object, so this never leaks into a store.
+    const holds = this.compressionHolds;
+    view.isCompressionHeld = (id: MessageId) => holds.has(id);
+    view.hasCompressionHolds = () => holds.size > 0;
     return view;
   }
 
@@ -353,6 +381,7 @@ export class ContextManager {
       config.viewFilter,
       auxiliaryStores,
     );
+    if (config.now) manager.now = config.now;
 
     // Initialize strategy. A strategy that refuses the store (e.g.
     // StoreTopologyError) must not leave a store we opened locked behind a
@@ -379,8 +408,42 @@ export class ContextManager {
    * a non-null sharding decision, the message is stored as multiple records
    * sharing a `bodyGroupId` (per the adaptive-resolution design §3.6). The
    * returned MessageId is the first shard's id.
+   *
+   * `options.holdCompression` places a compression hold (see
+   * holdCompression) on the new message BEFORE the strategy's onNewMessage
+   * fires, so not even the ingress chunk rebuild can fold it. Release it
+   * with releaseCompression([returnedId]) (releases every shard).
    */
   addMessage(
+    participant: string,
+    content: ContentBlock[],
+    metadata?: MessageMetadata,
+    causedBy?: MessageId[],
+    options?: AddMessageOptions
+  ): MessageId {
+    this.expireCompressionHolds();
+    if (!options?.holdCompression) {
+      return this.appendMessage(participant, content, metadata, causedBy);
+    }
+    const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
+    this.validateHoldOptions(holdOptions);
+    const held: MessageId[] = [];
+    this.holdingAdds = held;
+    this.holdingAddOptions = holdOptions;
+    // One clock read per add: every shard shares heldAt and expiresAt.
+    this.holdingAddAt = this.now();
+    let id: MessageId;
+    try {
+      id = this.appendMessage(participant, content, metadata, causedBy);
+    } finally {
+      this.holdingAdds = null;
+      this.holdingAddOptions = undefined;
+    }
+    if (held.length > 1) this.compressionHoldGroups.set(id, held);
+    return id;
+  }
+
+  private appendMessage(
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
@@ -420,11 +483,179 @@ export class ContextManager {
 
   /**
    * Edit a message in the store. Propagates to context log based on source relation.
+   *
+   * Edits do not reach `derived` entries and do not notify the strategy: a
+   * summary already built from the old content keeps it. To replace content
+   * that must reach compressed memory, hold the message (holdCompression /
+   * addMessage `holdCompression`) until after the edit.
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
     this.requireInitialized('editMessage');
     this.messageStore.edit(messageId, content);
     // Propagation handled by event listener
+  }
+
+  // ==========================================================================
+  // Compression holds
+  // ==========================================================================
+
+  /**
+   * Keep messages out of compression until released.
+   *
+   * While any message is held, strategies that compress (Autobiographical and
+   * subclasses) treat the earliest held message as the start of the protected
+   * recent window: it, everything after it, and the tool_use it answers stay
+   * raw and are never cut into a compressible chunk. History before it
+   * compresses normally. Rendering is unaffected apart from that longer raw
+   * tail.
+   *
+   * Intended for content that is provisional and will be replaced with
+   * editMessage (e.g. a tool_result staged with a placeholder): edits never
+   * reach `derived` context entries or summaries, so an edit is only safe
+   * while the message is held — edit first, then release.
+   *
+   * Holds are in-memory only and are not persisted; a reopened manager starts
+   * with none. Unknown ids are ignored. Removing a message drops its hold.
+   * A hold that is never released stalls compression of everything after it,
+   * so callers must release on every settle path — or pass `timeoutMs`.
+   *
+   * `options.timeoutMs`: the hold is released automatically once it has been
+   * in place that long (checked lazily on tick(), compile() and hold queries;
+   * no timer is armed). Expiry releases exactly like releaseCompression —
+   * the strategy is notified — and logs a warning naming the ids and how
+   * long they were held. Without `timeoutMs` a hold never expires.
+   *
+   * Deadlines are per message id. One call (or one sharded addMessage) reads
+   * the clock once, so every id it holds shares one deadline; expiry releases
+   * only the ids whose own deadline passed (it never expands to a shard
+   * group, unlike an explicit releaseCompression of the add's id).
+   *
+   * Re-holding an already-held id REPLACES its hold: `heldAt` resets to now
+   * and the new options apply — a timeout restarts (refresh/extend/shorten),
+   * and re-holding without `timeoutMs` makes it indefinite.
+   */
+  holdCompression(messageIds: Iterable<MessageId>, options?: CompressionHoldOptions): void {
+    this.validateHoldOptions(options);
+    const heldAt = this.now(); // one deadline per call
+    for (const id of messageIds) {
+      if (this.messageStore.get(id)) this.placeHold(id, options, heldAt);
+    }
+  }
+
+  private validateHoldOptions(options?: CompressionHoldOptions): void {
+    const t = options?.timeoutMs;
+    if (t !== undefined && !(Number.isFinite(t) && t > 0)) {
+      throw new Error(`holdCompression: timeoutMs must be a positive finite number (got ${t})`);
+    }
+  }
+
+  private placeHold(id: MessageId, options: CompressionHoldOptions | undefined, heldAt: number): void {
+    this.compressionHolds.add(id);
+    this.compressionHoldInfo.set(id, options?.timeoutMs !== undefined
+      ? { heldAt, expiresAt: heldAt + options.timeoutMs }
+      : { heldAt });
+  }
+
+  /**
+   * Release holds whose timeout has passed (lazy; called from tick, compile
+   * and hold queries). Also drops bookkeeping for holds removed elsewhere.
+   */
+  private expireCompressionHolds(): void {
+    if (this.compressionHoldInfo.size === 0) return;
+    const now = this.now();
+    const expired: Array<{ id: MessageId; heldFor: number }> = [];
+    for (const [id, info] of this.compressionHoldInfo) {
+      if (!this.compressionHolds.has(id)) { this.compressionHoldInfo.delete(id); continue; }
+      if (info.expiresAt !== undefined && now >= info.expiresAt) {
+        expired.push({ id, heldFor: now - info.heldAt });
+      }
+    }
+    if (expired.length === 0) return;
+    console.warn(
+      `[context-manager] compression hold timeout: releasing ${expired.length} hold(s) — ` +
+        expired.map((e) => `${e.id} (held ${e.heldFor}ms)`).join(', '),
+    );
+    // Per-id deadlines: release exactly the expired ids. Unlike an explicit
+    // releaseCompression of a sharded add's id, this does NOT expand to the
+    // whole shard group — a shard whose hold was re-placed (extended) keeps
+    // it. Shards of one add share a deadline, so they expire together.
+    for (const { id } of expired) {
+      this.compressionHolds.delete(id);
+      this.compressionHoldInfo.delete(id);
+    }
+    for (const [key, members] of [...this.compressionHoldGroups]) {
+      if (!members.some((mid) => this.compressionHolds.has(mid))) this.compressionHoldGroups.delete(key);
+    }
+    this.notifyHoldsReleased();
+  }
+
+  /**
+   * Release compression holds. Idempotent; unknown ids are ignored. Releasing
+   * the id returned by a sharded addMessage releases every shard. Releasing
+   * notifies the strategy (onCompressionHoldsReleased), which re-queues the
+   * deferred chunks so the next tick — or the auto-tick drain — compresses
+   * the now-final content.
+   */
+  releaseCompression(messageIds: Iterable<MessageId>): void {
+    const before = this.compressionHolds.size;
+    for (const id of messageIds) {
+      const group = this.compressionHoldGroups.get(id);
+      if (group) {
+        for (const member of group) {
+          this.compressionHolds.delete(member);
+          this.compressionHoldInfo.delete(member);
+        }
+        this.compressionHoldGroups.delete(id);
+      }
+      this.compressionHolds.delete(id);
+      this.compressionHoldInfo.delete(id);
+    }
+    if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+  }
+
+  /** Set when a hold went away while the strategy was (re)initializing. */
+  private holdReleaseNotifyPending = false;
+
+  /**
+   * Tell the strategy holds went away (release or removal) so it re-queues
+   * deferred work. Never throws into the caller (a settle path); while the
+   * strategy is initializing, the notification is deferred until it is
+   * ready rather than dropped.
+   */
+  private notifyHoldsReleased(): void {
+    if (!this.strategy.onCompressionHoldsReleased) return;
+    if (this.initializedAttempt !== this.initializationAttempt) {
+      this.holdReleaseNotifyPending = true;
+      return;
+    }
+    this.holdReleaseNotifyPending = false;
+    try {
+      this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
+    } catch (err) {
+      // Holds are already gone; the strategy's next rebuild (addMessage,
+      // compile) re-queues the work.
+      console.error('Strategy onCompressionHoldsReleased failed:', err);
+    }
+  }
+
+  /** Currently held message ids (snapshot; expired timed holds released first). */
+  getCompressionHolds(): ReadonlySet<MessageId> {
+    this.expireCompressionHolds();
+    return new Set(this.compressionHolds);
+  }
+
+  /**
+   * Currently held message ids with `heldAt` and, for timed holds,
+   * `expiresAt` (snapshot; expired timed holds released first).
+   */
+  getCompressionHoldDetails(): ReadonlyMap<MessageId, CompressionHoldInfo> {
+    this.expireCompressionHolds();
+    const out = new Map<MessageId, CompressionHoldInfo>();
+    for (const id of this.compressionHolds) {
+      const info = this.compressionHoldInfo.get(id);
+      out.set(id, info ? { ...info } : { heldAt: 0 });
+    }
+    return out;
   }
 
   /**
@@ -721,6 +952,7 @@ export class ContextManager {
     opts?: SelectOptions
   ): Promise<CompileResult> {
     this.requireInitialized('compile');
+    this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
     // now; the next compile picks up the freshly-formed L1.
@@ -1093,6 +1325,7 @@ export class ContextManager {
    */
   async tick(): Promise<void> {
     this.requireInitialized('tick');
+    this.expireCompressionHolds();
     if (this.strategy.tick) {
       await this.strategy.tick(this.createStrategyContext());
     }
@@ -1130,6 +1363,7 @@ export class ContextManager {
       );
     }
     this.initializedAttempt = attempt;
+    if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
   }
 
   /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
@@ -1229,6 +1463,18 @@ export class ContextManager {
         this.handleMessageRemove(event.messageId);
         break;
       case 'removeRange':
+        // Ids of the removed span aren't in the event; prune holds whose
+        // message no longer exists.
+        {
+          const before = this.compressionHolds.size;
+          for (const id of [...this.compressionHolds]) {
+            if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
+          }
+          for (const [key, members] of [...this.compressionHoldGroups]) {
+            if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+          }
+          if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+        }
         // For range removes, we need to check all affected messages
         // This is a simplification - in practice we'd need to track the IDs
         break;
@@ -1236,6 +1482,10 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
+    if (this.holdingAdds) {
+      this.holdingAdds.push(message.id);
+      this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
+    }
     // Notify strategy of new message
     if (this.strategy.onNewMessage) {
       // Fire and forget - don't block on strategy processing
@@ -1272,6 +1522,12 @@ export class ContextManager {
   }
 
   private handleMessageRemove(messageId: MessageId): void {
+    if (this.compressionHolds.delete(messageId)) {
+      for (const [key, members] of [...this.compressionHoldGroups]) {
+        if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+      }
+      this.notifyHoldsReleased();
+    }
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 

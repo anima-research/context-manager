@@ -90,6 +90,9 @@ export type {
   ResettableStrategy,
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
 } from './types/index.js';
 
 export {

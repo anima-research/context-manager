@@ -12,6 +12,219 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.13.0 — 2026-10-03
+
+### Added
+
+- Optional compression-hold timeouts: `holdCompression(ids, { timeoutMs })`
+  and `addMessage(..., { holdCompression: { timeoutMs } })`. A timed hold is
+  released automatically once expired — checked lazily on `tick()`,
+  `compile()` and hold queries (no timers) — through the same path as
+  `releaseCompression` (strategy notified), with a warning naming the ids
+  and how long they were held. Re-holding an id replaces its hold (timeout
+  restarts; re-holding without `timeoutMs` makes it indefinite).
+  `getCompressionHoldDetails()` reports `heldAt`/`expiresAt` per hold; the
+  manager clock is injectable via `ContextManager.open({ now })`. Holds
+  without a timeout behave exactly as before.
+  Deadlines are per message id; one call or one sharded `addMessage` reads
+  the clock once, so its ids share a deadline, and expiry releases only the
+  ids past their own deadline (never the rest of a shard group). Expiry is
+  also checked on `addMessage`.
+
+### Fixed
+
+- Key MessageStore message-ID indexes and materialized caches by native Chronicle branch ID, so deleting and recreating a branch under the same name cannot return stale content or edit/remove the wrong message.
+
+- Budget refusals report the configured window, response reserve, and input budget alongside the effective hard limit. Diagnostics label adaptive picker-chunk counts, hierarchical selection-item/raw-message counts, and planned versus attempted depth explicitly; preflight refusals report that no fold plan was computed and count pre-head history after a reset. Available summary inventory remains separate, and KV escalation logs include planned and available depths.
+
+- Recognize Bedrock-prefixed Fable/Mythos summarizer model IDs when deferring compression until the host supplies tool definitions.
+
+- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Generated missing-result placeholders no longer consume last-N retention slots, while genuine output with identical text still counts. Displaced or duplicate results are counted only after repair.
+
+- Coverage-repair warnings report the skipped summary counts and possible budget or interrupted-merge causes without diagnosing healthy stores as corrupt. Empty entries left by tool-result relocation now say the result moved during context repair.
+
+## 0.12.0 — 2026-10-03
+
+### Added
+
+- Compression holds: `ContextManager.holdCompression(ids)` /
+  `releaseCompression(ids)` / `getCompressionHolds()`, and
+  `addMessage(..., { holdCompression: true })` to place the hold before the
+  strategy sees the message. Autobiographical (and Knowledge) treat the
+  earliest held message as the start of the protected recent window: it,
+  everything after it, and the tool_use it answers stay raw and out of every
+  chunk; a chunk that closed before a late hold waits for release. Intended
+  for provisional content later replaced with `editMessage` (agent-framework's
+  tool-result guard stages a placeholder tool_result) — edits never reach
+  summaries, so edit while held, then release. Holds are in-memory only; a
+  reopened manager starts with none. With no holds, chunking, compression
+  requests and compiled context are unchanged.
+  Held content is also kept out of compression, merge and transition-summary
+  prompts' head context (a reset head window can sit past the hold), and
+  hold checks cost nothing when no hold exists (one timeline scan per pass
+  otherwise).
+  Releasing a hold notifies the strategy (`onCompressionHoldsReleased`), which
+  re-queues deferred chunks so `tick()` resumes without a new message. An L1
+  or merge whose span gains a hold mid-request is discarded and retried after
+  release; queued merges reaching a hold wait. A held tool_result keeps a
+  sharded (adaptive-resolution) tool_use message's whole body group with it.
+  Range removals drop holds on removed messages.
+  Removing a held message also resumes deferred compression, and a release
+  during branch (re)initialization never throws into the caller — the
+  strategy is notified once initialization completes.
+
+- `compressionToolProseFallback: { intoTool, fromTools, field?, result?, minChars? }`
+  — an opt-in L1 compression fallback rung. Long prose kept in an argument of a
+  private-reasoning tool (`skip_reply.reason`, `think.content`) makes replayed
+  history read as a reasoning trace, and the memory-write is refused
+  `reasoning_extraction` regardless of content. On a canonical **refusal** the
+  request is retried once with each such argument moved into a call to
+  `intoTool` — a note-taking tool the agent really has (agent-framework's
+  `journal`) — placed as its own round just before the original call, with a
+  short stub left behind; if the source-only final rung is enabled and also
+  refuses, it gets the same rewrite once. Nothing the agent wrote is dropped.
+  The rung is skipped unless `intoTool` is among the declared tools and at least
+  one argument qualifies. Enabling or changing it is a new request regime, so
+  already-quarantined chunks earn a fresh bounded attempt without a manual
+  clear. Off by default: with the option unset, canonical requests, request
+  hashes and quarantine identity are byte-identical.
+
+- Store topology fails loudly. Every load audits the summary archive for
+  crossed ownership (a summary whose leaves are not contiguous among
+  chunk-owned messages in store order — issue #122's cross-era merges,
+  restore/branch interleavings, hand surgery). `topologyPolicy: 'reject'`
+  (default) throws `StoreTopologyError` from `initialize`, so
+  `ContextManager.open` refuses the store until it is repaired;
+  `'report'` logs the violations at error level and reports them through
+  `getCompressionDebt().topologyViolations` (state `critical`). A kv-unified
+  config that opts into gap handling (`preserveGapBearingSummaries` or
+  `treeifyNonContiguousSummaries`) defaults to `'report'`.
+  `scripts/audit-topology.ts` runs the same audit read-only on a store path.
+- Merge adjacency is judged in store order, not chunk-record order, so a chunk
+  minted late over an early message can no longer join the frontier's merge run
+  (the second half of #122). Demand-path merges (`enqueueMergeForRange`, #95)
+  are split into strictly adjacent runs like the threshold path. `executeMerge`
+  refuses any group that is not one level below the target and strictly adjacent
+  in store order: no model call, the entry moves into the merge quarantine with
+  outcome `topology_violation`, and `getCompressionDebt().topologyRefusals` /
+  state `critical` say so. A crossed node is never minted.
+
+- `repair-topology --rebuild-since <messageId|ISO date>`: in rebuild mode,
+  only crossed summaries whose span starts at or after that message are
+  dissolved for the ladder to re-fold; older ones get the compact treatment,
+  so regions that were repaired by hand are never re-summarized. The plan
+  reports where the cutoff landed and how the crossed set split.
+- compact mode adopts hole owners downward: a root of any lower level that
+  owns a hole is taken into the descendant one level above it whose span is
+  adjacent, so a small hole deep inside a tall tower closes where it is and
+  nothing above unravels.
+
+- `planTopologyRepair` (`src/repair/topology.ts`) and `scripts/repair-topology.ts`:
+  a general, regeneration-free repair for crossed summary ownership (the
+  stores `topologyPolicy: 'reject'` refuses). A crossed summary keeps the run
+  of children carrying the most leaves and detaches the rest as roots; a
+  crossed L1 keeps its largest run and releases the stray messages from its
+  chunk record; single-source parents dissolve; touched ancestors get their
+  `sourceRange` recomputed; kv-stable resolutions are clamped to the leaf's
+  remaining chain. `--release-head` removes detached opening L1s (and
+  uncompressed prefix records) so the head window takes those messages back
+  verbatim. Dry-run by default; `--apply` writes and re-opens the store under
+  `'reject'` to verify. `scripts/audit-topology.ts` now prints summary,
+  chunk and chunk→L1 link counts and warns when it has nothing to audit.
+- `auditOnly` strategy config: `initialize` loads and audits the store but
+  never chunks the uncovered frontier, enqueues merges, or rewrites the
+  persisted merge queue. The audit and repair scripts open stores this way;
+  a plain open under a config that is not the resident's own mints chunk
+  records with the wrong head window and chunk size, which the resident then
+  compresses at its next boot. `--release-head=all` (with
+  `--release-head-limit <n>`) also releases pre-existing prefix L1s.
+- `--mode rebuild`: dissolves each crossed summary and its ancestors (plus,
+  for a child run left without an unparented same-level neighbour, the
+  tower over the smaller adjacent neighbour) back to roots, so the merge
+  ladder re-folds the affected regions bottom-up with real summaries —
+  faithful and compact, at the price of summarizer calls. Reports
+  `dissolvedForRebuild` (≈ merges to regenerate) and `exposedL1Leaves`;
+  re-fold offline with `drain-autobiographical` before restarting.
+
+### Changed
+
+- `kvUnified.hysteresisCertificate` is now a strategy config key (passed
+  through by the adapter like the other `kvUnified` fields), so the certified
+  hysteresis exit can be switched on from a recipe. The certificate also no
+  longer declines when an appended leaf has a fold option (a freshly minted
+  L1 over new messages): it enumerates every cut that keeps each accepted
+  leaf at its accepted level (capped at 256, else it declines as before),
+  scores them exactly, and certifies the best one — which is what the full
+  solve's hysteresis rule selects. On a copy of Sill's store, 24 of 25
+  unchanged turns certified at ~0.4 s instead of a 4–6 s solve.
+
+- Compile overhead on large stores: `mergeAdjacentBodyGroupRaw` no longer
+  fetches every raw entry's message from chronicle (with blob resolution) to
+  read two shard fields; it indexes the caller's message listing once (~0.7 s
+  saved per compile on a 75k-message store).
+
+### Fixed
+
+- `scripts/drain-autobiographical.ts` now passes the four split-fallback keys
+  (`compressionSplitFallback`, `compressionSplitPlaceholder`,
+  `compressionSplitMaxCallsPerChunk`, `compressionSplitMaxCallsPer10Min`)
+  through from the recipe, so an offline drain honours them; previously they
+  were silently dropped and a drain ran without the split-stitch rung even when
+  the resident had it on. (`compressionToolProseFallback` is passed through too.)
+
+- The head window no longer ratchets down under calibration drift (#122).
+  When a calibration rise moved the token-derived head boundary onto
+  messages no chunk owned, those messages were minted into small, late L1s
+  that merged with the open frontier: summaries mixing the chronicle's
+  opening with much later material, rendered at the opening's position. The
+  boundary now extends over that uncovered run to the first owned message
+  (bounded at 2× `headWindowTokens`). Stores with no coverage after the
+  boundary, and heads that grew over owned messages, keep the stock boundary.
+
+- Post-strip token estimates now subtract a stripped image at the store's
+  calibrated price. `MessageStore.estimateTokens` prices every block as
+  `round(raw × calibration)`, but `postStripEstimates` took the uncalibrated
+  `tokenEstimate ?? 1600` (minus the placeholder) back off. With the
+  calibration multiplier below ~0.995, an image-only message whose image had
+  aged out of the live window came out NEGATIVE (e.g. 0.925: 1480 − 1591 =
+  −111), and kv-unified's canonical-forest check rejected every compile with
+  `chunk <id> has invalid raw cost -…` — a hard-down that could not heal,
+  since calibration only updates after a successful call. Above 1.0 the same
+  mismatch over-counted each stripped image (≈ 450 tokens at 1.28). Each
+  per-message estimate is also clamped at zero.
+
+- kv-unified latent demand keeps no ranking state between compiles: it is ranked on every compile, so appended messages, policy changes and branch switches always reach it. It has no candidates, and costs nothing, while fewer than `mergeThreshold` same-level summaries line up.
+
+- kv-unified leaf engine: token buckets no longer let it drop a label with a different token count while reporting a zero error bound (#109). Reached only through an explicit `engine: 'leaf'`; the default route is unchanged. Such callers may need a larger `labelCeiling`, since the leaf engine now keeps more labels.
+- kv-unified latent demand: `approximate` is now true only when the solve reports a nonzero score error bound, instead of whenever a bucket size is configured.
+
+- kv-unified cache model: the raw tail now renders as one unit per message
+  (keyed by chunk id, the same identity a message keeps after it slides into
+  the middle) instead of one opaque `tail` unit. With the opaque unit every
+  append shifted the tail's position — the messages leaving the tail became
+  new raw units in front of it — so the end-of-tail marker fell outside the
+  identical prefix and an unchanged layout was priced as the whole tail
+  (~100k tokens on Sill) recomputed on every turn, although the wire bytes
+  were identical. Selection was unaffected (the false churn was the same for
+  every candidate and cancelled in the floor normalization), but reported
+  churn and `cacheFloor` were wrong and the opt-in hysteresis certificate's
+  zero-churn precondition could never hold in steady state. Applies to
+  `renderLayout`, both solver storages and the terminal evaluator; cache
+  markers on tail messages now map to that message's unit. Tail tokens not
+  attributed to any tail chunk (synthetic inputs only) keep the opaque block,
+  so token totals are unchanged. The first solve after upgrading sees the
+  persisted opaque-tail layout diverge once; subsequent receipts are per-message.
+
+- The L1 mint builder's compression-image byte cap now applies to the
+  post-split wire messages instead of the pre-split `llmMessages` list.
+  `splitMixedToolMessages`/collapse rebuild message objects, so the cap was
+  logging its strips against copies the request never shipped — a mixed tool
+  round carrying an image kept its image on the wire under ANY
+  `maxCompressionImageBytes` (field repro 2026-09-21: "replaced 1 older
+  image ... kept 0MB" logged while the same mint failed with the provider's
+  image-input 400). The merge builder has always capped its post-split list;
+  the L1 builder now matches it.
+
 ## 0.11.0 — 2026-09-25
 
 ### Changed
