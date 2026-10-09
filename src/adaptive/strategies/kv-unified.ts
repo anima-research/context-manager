@@ -196,8 +196,20 @@ export class KvUnifiedStrategy implements FoldingSolver {
       };
       const baseBest = best(base);
       const evaluations: LatentDemandEvaluation[] = [];
-      for (const { candidate, conservative } of solved) {
+      const undecided: typeof solved = [];
+      for (const entry of solved) {
+        const { candidate, conservative } = entry;
         const conservativeImprovement = baseBest - best(conservative);
+        // A certified what-if exposes only the carried layout and its
+        // extensions, up to certificate.maxImprovement above the what-if's
+        // best cut, so its improvement is understated by that much. When
+        // that gap spans the gate, the what-if is solved again without the
+        // certificate (see below); the pool is decided once that is done.
+        if (conservative.certificate && conservativeImprovement <= epsilon &&
+            conservativeImprovement + conservative.certificate.maxImprovement > epsilon) {
+          undecided.push(entry);
+          continue;
+        }
         let expectedImprovement = conservativeImprovement;
         // Pass 2: the expected (p50) solve only orders emitted requests among
         // themselves, so candidates the gate rejects never pay for it, and it
@@ -235,6 +247,20 @@ export class KvUnifiedStrategy implements FoldingSolver {
         a.request.level - b.request.level ||
         a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
       );
+      if (undecided.length > 0) {
+        for (const entry of undecided) {
+          const full = solveWithLatentCandidate(
+            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
+            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
+          );
+          this.demandSolves++;
+          if (full.feasible) entry.conservative = full;
+          else solved.splice(solved.indexOf(entry), 1);
+        }
+        // The frame may have moved with the new pools; rank everything again
+        // (no certified what-if is left undecided, so this ends).
+        return rank(base, withExpected);
+      }
       return evaluations;
     };
     let base = baseline;

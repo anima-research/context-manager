@@ -1432,3 +1432,47 @@ test('latent demand gates a certified base solve against the unrestricted best c
   assert.equal(unrestricted.strategy.lastTimings?.demandSolves, 1);
   assert.equal(certified.strategy.lastTimings?.demandSolves, 2);
 });
+
+test('latent demand decides a certified what-if solve against its unrestricted solve', () => {
+  // Eight leaves under four L1s; the accepted presentation covers c0/c1 at
+  // their L1, the rest are new. The base solve is unrestricted; the what-if
+  // for c4..c7 certifies its carried layout, whose pool understates the
+  // merge by up to the certificate's slack, which here spans the gate.
+  const raw = [50, 50, 200, 100, 100, 200, 50, 200];
+  const salience = [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1];
+  const build = (hysteresisCertificate: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 150 });
+    for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: raw[i] });
+    chronicle.chunks.forEach((chunk, i) => { chunk.salience = salience[i]; });
+    const l1s = [];
+    for (let i = 0; i < 8; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map([
+      ['c0', { level: 1, repHash: `summary:${l1s[0].id}`, lastChangedSeq: 1 }],
+      ['c1', { level: 1, repHash: `summary:${l1s[0].id}`, lastChangedSeq: 1 }],
+    ]);
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0.2, budgetHighRatio: 0.5, budgetUnderLambda: 4000, budgetOverLambda: 4000,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 1, continuityBucketSize: 1, fidelityBucketSize: 1, labelCeiling: 100_000,
+      adoptEpsilon: 200, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 800, targetBudget: 800, slack: 0 });
+    return { strategy, result };
+  };
+  const certified = build(true);
+  const unrestricted = build(false);
+  assert.equal(certified.strategy.lastResult?.certificate, undefined, 'the base solve is unrestricted');
+  const describe = (s: KvUnifiedStrategy) => s.lastDemandEvaluations.map((e) =>
+    [`L${e.request.level} ${e.request.range.firstChunkId}..${e.request.range.lastChunkId}`, Math.round(e.conservativeImprovement)]);
+  assert.deepEqual(describe(certified.strategy), describe(unrestricted.strategy));
+  assert.deepEqual(certified.result.produced, unrestricted.result.produced);
+  assert.ok(unrestricted.result.produced.some((r) => r.range.firstChunkId === 'c4'), 'the c4..c7 merge is worth more than epsilon');
+});

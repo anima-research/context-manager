@@ -1037,10 +1037,9 @@ export class CanonicalSummaryForest {
 
     const zone = leafZones(chunks, inputs);
     const oldZone = previous.leafZone;
-    // The derived forest takes over the previous forest's leaf map and
-    // extends it in place (appended leaves added, changed leaves replaced):
-    // the previous forest is superseded by this one, and nothing reads it
-    // for leaves it did not have. Its ordered leaf list stays its own.
+    // The derived forest shares the full build's immutable base index and
+    // copies the appended index (appended leaves added, changed leaves
+    // replaced), so the previous forest stays readable for what it had.
     const appendedIndex = new Map(previous.appendedIndex);
     const previousConflicts = new Map(previous.constraintConflicts.map((conflict) => [conflict.leafId, conflict]));
     const conflicts: ConstraintConflict[] = [];
