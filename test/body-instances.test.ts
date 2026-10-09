@@ -18,11 +18,12 @@ import {
   ContextManager,
   AutobiographicalStrategy,
   concatBodyGroups,
+  bodyStart,
   bodyEnd,
   bodyBoundsIn,
   type Chunk,
 } from '../src/index.js';
-import type { StoredMessage } from '../src/types/index.js';
+import type { StoredMessage, StrategyContext, SummaryEntry } from '../src/types/index.js';
 
 const STORE = './test-body-instances';
 const cleanup = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
@@ -112,6 +113,9 @@ describe('body runs', () => {
     const seq = [s(undefined), s('g', 0), s('g', 1), s('g', 2), s('g', 0), s('g', 1), s('h', 0), s('g', 0), s('g', 1), s('g', 0), s(undefined), s(undefined)];
     assert.deepEqual(bounds(seq), ['0-0', '1-3', '1-3', '1-3', '4-5', '4-5', '6-6', '7-8', '7-8', '9-9', '10-10', '11-11']);
     assert.equal(bodyEnd(seq.length, (i) => seq[i], 4), 5);
+    assert.equal(bodyEnd(3, (i) => seq[i], 1), 2, 'read no further than the length given');
+    assert.equal(bodyStart((i) => seq[i], 5), 4);
+    assert.equal(bodyStart((i) => seq[i], 3), 1);
   });
 
   it('an interrupted write and its retry are two bodies', () => {
@@ -193,8 +197,9 @@ describe('two copies of one document', () => {
     const { cm, all, first, second } = await twoCopies();
     cm.removeMessages(all[0]!.id, first.at(-1)!.id);
     assert.deepEqual(cm.getAllMessages().map((m) => m.id).slice(0, second.length), second.map((m) => m.id));
-    // A range that does cut a body is still refused.
-    assert.throws(() => cm.removeMessages(second[0]!.id, second[1]!.id), /bisect/);
+    // A range that does cut a body is still refused, at either edge.
+    assert.throws(() => cm.removeMessages(second[0]!.id, second[1]!.id), /bisect bodyGroup .* at end/);
+    assert.throws(() => cm.removeMessages(second[1]!.id, second.at(-1)!.id), /bisect bodyGroup .* at start/);
     cm.close();
   });
 
@@ -204,6 +209,9 @@ describe('two copies of one document', () => {
     const window = cm.getMessageWindow(start + 1, 1, { alignToBodyGroups: true });
     assert.equal(window.startIndex, start, 'back to the second copy\'s first shard, not the first copy\'s');
     assert.deepEqual(window.messages.map((m) => m.id), second.map((m) => m.id));
+    // A window inside the first copy ends with it, not with the second.
+    const inFirst = cm.getMessageWindow(2, 1, { alignToBodyGroups: true });
+    assert.deepEqual(inFirst.messages.map((m) => m.id), first.map((m) => m.id));
     cm.close();
   });
 
@@ -238,6 +246,99 @@ describe('two copies of one document', () => {
     // A chunk spanning the two copies is not part of one document.
     const across = [cm.getAllMessages()[second.length], second[0]!] as StoredMessage[];
     assert.equal(strategy.docContext({ messages: across } as unknown as Chunk, ctx), null);
+    cm.close();
+  });
+});
+
+/**
+ * Reading mode in a merge: when every leaf of a merge is a shard of one body,
+ * the merge asks what reading that stretch was like and gives the document's
+ * size as that body's tokens. Another ingestion of the same text shares the
+ * group id but is not part of the document.
+ */
+class MergeProbe extends AutobiographicalStrategy {
+  /** The document sizes given to reading-mode merge instructions. */
+  reading: number[] = [];
+  /** Plain merge instructions built. */
+  plain = 0;
+  seed(entry: SummaryEntry): void {
+    this.pushSummary(entry);
+  }
+  merge(level: 2, sourceIds: string[], ctx: StrategyContext): Promise<void> {
+    return this.executeMerge(level, sourceIds, ctx);
+  }
+  protected override getReadingMergeInstruction(...args: Parameters<AutobiographicalStrategy['getReadingMergeInstruction']>): string {
+    this.reading.push(args[2]);
+    return super.getReadingMergeInstruction(...args);
+  }
+  protected override getMergeInstruction(...args: Parameters<AutobiographicalStrategy['getMergeInstruction']>): string {
+    this.plain++;
+    return super.getMergeInstruction(...args);
+  }
+}
+
+describe('reading mode in a merge over two copies of one document', () => {
+  beforeEach(cleanup);
+  afterEach(cleanup);
+
+  /** Two copies, two L1s over the stretches `pick` chooses, and the real executeMerge over them. */
+  async function mergeOver(pick: (first: StoredMessage[], second: StoredMessage[]) => [StoredMessage[], StoredMessage[]]) {
+    const strategy = new MergeProbe({
+      adaptiveResolution: true,
+      targetChunkTokens: 60,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      compressionModel: 'test-model',
+      hierarchical: true,
+      autoTickOnNewMessage: false,
+      mergeThreshold: 99,
+    });
+    const membrane = {
+      complete: async () => ({
+        stopReason: 'end_turn',
+        content: [{ type: 'text', text: 'What reading it was like.' }],
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    };
+    const cm = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+    cm.addMessage('user', text('before'));
+    cm.addMessage('user', text(DOCUMENT));
+    cm.addMessage('user', text(DOCUMENT));
+    const all = cm.getAllMessages();
+    const perCopy = all.filter((m) => m.bodyGroupId).length / 2;
+    const first = all.slice(1, 1 + perCopy);
+    const second = all.slice(1 + perCopy, 1 + 2 * perCopy);
+    const l1 = (id: string, messages: StoredMessage[]): SummaryEntry => ({
+      id,
+      level: 1,
+      content: `authored ${id}`,
+      tokens: 20,
+      sourceLevel: 0,
+      sourceIds: messages.map((m) => m.id),
+      sourceRange: { first: messages[0]!.id, last: messages.at(-1)!.id },
+      created: 1,
+    });
+    const [a, b] = pick(first, second);
+    strategy.seed(l1('L1-a', a));
+    strategy.seed(l1('L1-b', b));
+    await strategy.merge(2, ['L1-a', 'L1-b'], (cm as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext());
+    return { cm, strategy, second };
+  }
+
+  it('reads a merge over one copy as that copy alone', async () => {
+    const half = (copy: StoredMessage[]) => Math.floor(copy.length / 2);
+    const { cm, strategy, second } = await mergeOver((_first, second) => [second.slice(0, half(second)), second.slice(half(second))]);
+    const store = (cm as unknown as { messageStore: { estimateTokens(m: StoredMessage): number } }).messageStore;
+    const copyTokens = second.reduce((n, m) => n + store.estimateTokens(m), 0);
+    assert.deepEqual(strategy.reading, [copyTokens], 'the document is one copy, not both');
+    assert.equal(strategy.plain, 0);
+    cm.close();
+  });
+
+  it('gives a merge across both copies the plain merge instruction', async () => {
+    const { cm, strategy } = await mergeOver((first, second) => [first.slice(-4), second.slice(0, 4)]);
+    assert.deepEqual(strategy.reading, [], 'its leaves are not one document');
+    assert.equal(strategy.plain, 1);
     cm.close();
   });
 });

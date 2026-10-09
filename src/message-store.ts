@@ -18,7 +18,7 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
-import { bodyBounds, bodyBoundsIn } from './body-runs.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -679,15 +679,16 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a body. The boundary between two
-    // ingestions of the same text (one group id) is not a bisection.
+    // Verify the range doesn't bisect a body: neither edge may sit between
+    // two shards of one body. The boundary between two ingestions of the
+    // same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    if (bodyBoundsIn(all, fromIndex).from < fromIndex) {
+    if (fromIndex > 0 && continuesBody(all[fromIndex - 1], all[fromIndex])) {
       throw new Error(
         `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (bodyBoundsIn(all, toIndex).to > toIndex) {
+    if (toIndex + 1 < all.length && continuesBody(all[toIndex], all[toIndex + 1])) {
       throw new Error(
         `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
@@ -803,8 +804,8 @@ export class MessageStore {
       // the body boundary, which falls between two ingestions of the same
       // text too (see body-runs.ts).
       const at = (i: number) => this.getInternal(i);
-      start = bodyBounds(totalCount, at, start).from;
-      end = bodyBounds(totalCount, at, end - 1).to + 1;
+      start = bodyStart(at, start);
+      end = bodyEnd(totalCount, at, end - 1) + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);

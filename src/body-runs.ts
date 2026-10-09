@@ -35,21 +35,33 @@ export function continuesBody(prev: BodyShard | null | undefined, next: BodyShar
 }
 
 /**
- * The last position (inclusive) of the body that starts at `start`, in a
- * sequence of `length` read through `at` (a store's point lookups, or an
- * array's). A message outside any group is a body of its own.
+ * The first position of the body holding `index`, read backward from it
+ * through `at` (a store's point lookups, or an array's). A message outside
+ * any group is a body of its own.
  */
-export function bodyEnd(length: number, at: At, start: number): number {
-  let end = start;
+export function bodyStart(at: At, index: number): number {
+  let start = index;
+  while (start > 0 && continuesBody(at(start - 1), at(start))) start--;
+  return start;
+}
+
+/**
+ * The last position (inclusive) of the body holding `index`, read forward
+ * from it in a sequence of `length`: the scan stops at `length`, so a
+ * caller that can use nothing past some point passes that point.
+ */
+export function bodyEnd(length: number, at: At, index: number): number {
+  let end = index;
   while (end + 1 < length && continuesBody(at(end), at(end + 1))) end++;
   return end;
 }
 
-/** The first and last positions (inclusive) of the body holding `index`. */
+/**
+ * The first and last positions (inclusive) of the body holding `index`.
+ * A reader that needs only one edge asks `bodyStart` or `bodyEnd`.
+ */
 export function bodyBounds(length: number, at: At, index: number): { from: number; to: number } {
-  let from = index;
-  while (from > 0 && continuesBody(at(from - 1), at(from))) from--;
-  return { from, to: bodyEnd(length, at, index) };
+  return { from: bodyStart(at, index), to: bodyEnd(length, at, index) };
 }
 
 /** The body holding `messages[index]`, as positions in `messages`. */

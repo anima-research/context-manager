@@ -67,7 +67,7 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
-import { bodyBoundsIn, bodyEnd } from '../body-runs.js';
+import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -8572,7 +8572,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // same text right after it shares the group id but is its own body:
         // run together and sorted by shard index, the two used to interleave.
         const groupStart = i;
-        i = Math.min(bodyEnd(messages.length, (k) => messages[k], groupStart) + 1, segEnd);
+        // Read no further than this segment: nothing past it is emitted here.
+        i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k], groupStart) + 1;
         // Store order: a body's shards are already in rising shard order, and
         // the walk stops where an index doesn't rise, which also keeps a
         // region that starts mid-body apart from the next copy (body-runs.ts).
@@ -11097,7 +11098,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Adaptive-resolution ingress puts a sharded message's tool_use on
           // its FIRST shard: step back to the start of that body (not over an
           // earlier ingestion of the same text, which shares the group id).
-          b = bodyBoundsIn(messages, b).from;
+          b = bodyStart((k) => messages[k], b);
         }
         return b;
       }

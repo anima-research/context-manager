@@ -19,4 +19,5 @@
   its shards 0..n-1, so the next one starts again at 0). The rule is read
   pairwise, so it also holds where a render region begins inside a body: the
   cut body's remainder is never joined to the next copy. `continuesBody`,
-  `bodyEnd`, `bodyBounds` and `bodyBoundsIn` give that reading to hosts.
+  `bodyStart`, `bodyEnd`, `bodyBounds` and `bodyBoundsIn` give that reading
+  to hosts.
