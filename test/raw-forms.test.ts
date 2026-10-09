@@ -13,13 +13,15 @@
  * releases exactly the raw forms it made untrue: the edited block's own, from
  * it and from every block sharing it, and a Responses reasoning item paired
  * with it. A raw form no edit touched stays, so verbatim replay survives
- * wherever it is still true.
+ * wherever it is still true. The last group sends compiles through membrane's
+ * own formatters and asserts what reaches the provider: the edit, once.
  */
 
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
-import type { ContentBlock } from '@animalabs/membrane';
+import { AnthropicXmlFormatter, Membrane, MockAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
+import type { ContentBlock, PrefillFormatter, ToolDefinition } from '@animalabs/membrane';
 import {
   AutobiographicalStrategy,
   ContextManager,
@@ -423,5 +425,162 @@ describe('raw forms: the recall envelope', () => {
   it('leaves content untouched when it is not wrapped', () => {
     const content = [itemText('first part')];
     assert.equal(wrapRecallAnswerContent(content, summary, undefined), content);
+  });
+});
+
+describe('raw forms: on the wire, through membrane\'s formatters', () => {
+  // Each test hands a compile to membrane's own formatter and request path,
+  // over a mock transport that records the provider messages it is given. Each
+  // also sends the same compile with the raw forms put back, as a spread edit
+  // kept them, to show that this formatter replays them: what the release
+  // changes is then seen on the wire, not assumed.
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  type Sent = Array<{ participant: string; content: ContentBlock[] }>;
+  const READ_TOOL: ToolDefinition = {
+    name: 'fs:read',
+    description: 'Read a file.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+  };
+
+  async function wire(formatter: PrefillFormatter, messages: Sent): Promise<unknown[]> {
+    const adapter = new MockAdapter({ defaultResponse: 'ok' });
+    const membrane = new Membrane(adapter, { formatter, assistantParticipant: 'Claude' });
+    await membrane.complete({
+      messages: messages.map(({ participant, content }) => ({ participant, content })),
+      config: { model: 'test-model', maxTokens: 16 },
+      tools: [READ_TOOL],
+    });
+    const request = adapter.getLastRequest();
+    assert.ok(request, 'the transport was called');
+    return request.messages as unknown[];
+  }
+  /** How often `text` appears in what was sent, escaped as the rendered request holds it. */
+  const occurrences = (sent: unknown[], text: string): number =>
+    JSON.stringify(sent).split(JSON.stringify(text).slice(1, -1)).length - 1;
+  /** The messages with `restore`'s raw form given back to each block it names. */
+  const withRawForms = (messages: Sent, restore: (block: ContentBlock) => Raw | undefined): Sent =>
+    messages.map((m) => ({ ...m, content: m.content.map((b) => ({ ...b, ...restore(b) } as ContentBlock)) }));
+  const xml = (): PrefillFormatter => new AnthropicXmlFormatter({ toolMode: 'xml' });
+
+  it('XML prefill: a capped tool_use input ships capped, and its sibling ships once', async () => {
+    const big = 'x'.repeat(400);
+    const calls =
+      `<function_calls>\n<invoke name="fs:read">\n<parameter name="path">${big}</parameter>\n</invoke>\n` +
+      '<invoke name="fs:read">\n<parameter name="path">/small</parameter>\n</invoke>\n</function_calls>';
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      toolUseInputMaxTokens: 20,
+    });
+    const manager = await ContextManager.open({ path: STORE, strategy });
+    manager.addMessage('Claude', [
+      { type: 'tool_use', id: 'a', name: 'fs:read', input: { path: big }, rawXml: calls } as ContentBlock,
+      { type: 'tool_use', id: 'b', name: 'fs:read', input: { path: '/small' }, rawXml: calls } as ContentBlock,
+    ]);
+    manager.addMessage('user', [xmlResult('a', 'big file'), xmlResult('b', 'small file')]);
+    const compiled = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).messages;
+    await manager.close();
+
+    const sent = await wire(xml(), compiled);
+    assert.equal(occurrences(sent, big), 0, 'the original input is not on the wire');
+    assert.equal(occurrences(sent, '_truncated'), 1, 'the cap is');
+    assert.equal(occurrences(sent, '/small'), 1, 'the sibling ships its own input, once');
+    assert.equal(occurrences(sent, RESULTS_XML), 1, 'the untouched results replay verbatim');
+
+    const kept = await wire(xml(), withRawForms(compiled, (b) => (b.type === 'tool_use' ? { rawXml: calls } : undefined)));
+    assert.equal(occurrences(kept, big), 1, 'with the raw form kept, the formatter replays the original input');
+    assert.equal(occurrences(kept, '_truncated'), 0, 'and the cap never ships');
+  });
+
+  it('XML prefill: a result moved next to its use ships once, and so does the one it left behind', async () => {
+    const strategy = new AutobiographicalStrategy({});
+    const entries: ContextEntry[] = [
+      { index: 0, participant: 'Claude', content: [{ type: 'tool_use', id: 'a', name: 'fs:read', input: { path: '/big' } } as ContentBlock] },
+      { index: 1, participant: 'user', content: [{ type: 'text', text: 'an interleaved turn' }] },
+      { index: 2, participant: 'Claude', content: [{ type: 'tool_use', id: 'b', name: 'fs:read', input: { path: '/small' } } as ContentBlock] },
+      // 'a''s result sits here, sharing one <function_results> with 'b''s.
+      { index: 3, participant: 'user', content: [xmlResult('a', 'big file'), xmlResult('b', 'small file')] },
+    ];
+    (strategy as unknown as { enforceToolPairing: (e: ContextEntry[]) => void }).enforceToolPairing(entries);
+
+    const sent = await wire(xml(), entries);
+    assert.equal(occurrences(sent, 'big file'), 1);
+    assert.equal(occurrences(sent, 'small file'), 1);
+
+    const kept = await wire(xml(), withRawForms(entries, (b) => (b.type === 'tool_result' ? { rawXml: RESULTS_XML } : undefined)));
+    assert.equal(occurrences(kept, 'big file'), 2, 'with the shared raw form kept, both results ship from both places');
+    assert.equal(occurrences(kept, 'small file'), 2);
+  });
+
+  it('Responses: a message cap that cuts an item ships the cut part once, and the reasoning without its id', async () => {
+    const long = 'y'.repeat(200);
+    const item = {
+      type: 'message', id: 'msg_1', role: 'assistant',
+      content: [
+        { type: 'output_text', text: 'first part' },
+        { type: 'output_text', text: `second ${long}` },
+        { type: 'output_text', text: `third ${long}` },
+      ],
+    };
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 30,
+    });
+    const manager = await ContextManager.open({ path: STORE, strategy });
+    manager.addMessage('user', [{ type: 'text', text: 'go' }]);
+    // The first part fits; the second is cut; the third is dropped.
+    manager.addMessage('Claude', [
+      reasoning(),
+      itemText('first part', item),
+      itemText(`second ${long}`, item),
+      itemText(`third ${long}`, item),
+    ]);
+    const compiled = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).messages;
+    await manager.close();
+
+    const sent = (await wire(new OpenAIResponsesFormatter(), compiled)) as Array<Record<string, unknown>>;
+    assert.equal(occurrences(sent, 'msg_1'), 0, 'the uncut item is not replayed');
+    assert.equal(occurrences(sent, 'rs_1'), 0, 'nor is the reasoning that led to it, by its id');
+    assert.equal(occurrences(sent, 'third'), 0, 'the dropped part is not on the wire');
+    assert.equal(occurrences(sent, 'second y'), 1, 'the cut part ships once');
+    assert.equal(occurrences(sent, '[truncated'), 1, 'with its marker');
+    const thinking = sent.filter((i) => i.type === 'reasoning');
+    assert.deepEqual(
+      thinking.map((i) => [i.id, i.encrypted_content]),
+      [[undefined, 'opaque']],
+      'the reasoning ships id-less, with its encrypted content',
+    );
+
+    const kept = await wire(new OpenAIResponsesFormatter(), withRawForms(compiled, (b) =>
+      b.type === 'redacted_thinking' ? { rawItem: REASONING_ITEM }
+        : b.type === 'text' && b.text !== 'go' ? { rawItem: item }
+          : undefined));
+    assert.equal(occurrences(kept, 'msg_1'), 1, 'with the raw forms kept, the formatter replays the uncut item');
+    assert.equal(occurrences(kept, `third ${long}`), 1, 'dropped part and all');
+  });
+
+  it('Responses: a wrapped recall answer ships wrapped', async () => {
+    const summary: SummaryEntry = {
+      id: 'L1-7', level: 1, content: 'memory', tokens: 4, sourceLevel: 0,
+      sourceIds: ['m-1'], sourceRange: { first: 'm-1', last: 'm-4' }, created: 0,
+    };
+    const answer = [itemText('first part'), itemText('second part'), itemText('third part')];
+    const wrapped = wrapRecallAnswerContent(answer, summary, 'xml');
+    const ask = { participant: 'user', content: [{ type: 'text', text: 'what do you remember?' } as ContentBlock] };
+
+    const sent = await wire(new OpenAIResponsesFormatter(), [ask, { participant: 'Claude', content: wrapped }]);
+    assert.equal(occurrences(sent, '<cm-recall'), 1, 'the envelope is on the wire');
+    assert.equal(occurrences(sent, 'msg_1'), 0, 'the unwrapped item is not');
+
+    const kept = await wire(new OpenAIResponsesFormatter(), [
+      ask,
+      { participant: 'Claude', content: wrapped.map((b) => ({ ...b, rawItem: MESSAGE_ITEM } as ContentBlock)) },
+    ]);
+    assert.equal(occurrences(kept, '<cm-recall'), 0, 'with the raw form kept, the envelope never ships');
+    assert.equal(occurrences(kept, 'msg_1'), 1);
   });
 });
