@@ -689,6 +689,27 @@ export interface AutobiographicalConfig {
    * them by name."
    */
   identityReminder?: string;
+  /**
+   * Identity reminder for WHOLLY inherited targets: an L1 chunk entirely
+   * before `witnessedBeforeSequence`, or a merge whose every source is
+   * witnessed. When set, those targets use it instead of `identityReminder`;
+   * everything the agent lived, and every mixed inherited/live merge, keeps
+   * `identityReminder`.
+   *
+   * For residents whose Chronicle begins with reviewed inherited history:
+   * the inherited reminder can stay frozen (it was reviewed with the import)
+   * while the live one stays neutral and revisable by the resident — e.g. a
+   * future rename changes the live guidance without rewriting how inherited
+   * history is attributed. Unset: every target uses `identityReminder`
+   * (unchanged behavior).
+   */
+  witnessedIdentityReminder?: string;
+  /**
+   * Follow the identity reminder with an instruction to apply it silently
+   * (shape the memory; don't quote or recite the guidance in it). Default
+   * false: the reminder is appended bare (unchanged behavior).
+   */
+  identityReminderSilent?: boolean;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
 
