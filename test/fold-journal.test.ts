@@ -376,7 +376,9 @@ describe('fold journal', () => {
 
   it('pages forward through a whole record with afterId, without skipping or repeating any receipt', async () => {
     const { cm, strategy } = await open();
-    const ids = add(cm, 30);
+    // Enough records first that the receipts' ids cross a digit boundary:
+    // ids compare as numbers, and as strings "100" sorts before "99".
+    const ids = add(cm, 80);
     await acceptCompile(cm);
     for (let i = 0; i < 24; i++) {
       strategy.plan.set(ids[i]!, 'omit');
@@ -384,6 +386,7 @@ describe('fold journal', () => {
     }
     const everything = cm.foldReceiptsFor(cm.currentBranchRef()).map((r) => r.id);
     assert.equal(everything.length, 25);
+    assert.ok(new Set(everything.map((id) => id.length)).size > 1, `ids cross a digit boundary: ${everything[0]}..${everything.at(-1)}`);
     const seen: string[] = [];
     let cursor = '0';
     for (let page = 0; page < 10; page++) {

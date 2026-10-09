@@ -162,10 +162,12 @@ export type Presentation = 'verbatim' | 'altered' | 'unknown';
 export interface FoldQuery {
   /**
    * Only receipts after this receipt id, OLDEST first: a continuation. Pass
-   * the last receipt a previous query returned to read on from it (`more`
-   * says whether there is more), a result's `latestId` to see only new
-   * receipts, or `'0'` to page through the whole record from its start.
-   * Without it, a query returns the newest receipts first.
+   * the last receipt a previous `afterId` query returned to read on from it
+   * (`more` says whether there is more), a result's `latestId` to see only
+   * new receipts, or `'0'` to page through the whole record from its start.
+   * Without it, a query returns the newest receipts first; the last receipt
+   * of such a page is its oldest, so reading on from it would repeat newer
+   * ones.
    */
   afterId?: string;
   /** Only receipts accepted at or after this ISO 8601 time, such as
