@@ -156,3 +156,46 @@ describe('autobiographical rendered layout', () => {
     });
   });
 });
+
+describe('kv-unified rendered layout', () => {
+  const kvUnified = {
+    policy: {
+      alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+      cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+      continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+      continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+    },
+    tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+    treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+  };
+
+  it('covers every view message in exactly one unit, names the summaries it folds into, and records the fold', async () => {
+    await withStore(async (path) => {
+      const strategy = new SeedableStrategy({ adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 100, kvUnified } as AutobiographicalOptions);
+      const cm = await ContextManager.open({ path, strategy });
+      const ids: string[] = [];
+      for (let i = 0; i < 40; i++) ids.push(cm.addMessage(i % 2 ? 'Claude' : 'user', text(`turn ${i} ${'lorem ipsum dolor sit amet '.repeat(20)}`)));
+      for (let s = 0; s < 4; s++) {
+        const span = ids.slice(s * 8, s * 8 + 8);
+        strategy.seed({ id: `L1-${s}`, level: 1, content: `summary of span ${s}`, tokens: 8, sourceLevel: 0, sourceIds: span, sourceRange: { first: span[0]!, last: span[7]! } });
+      }
+      const covered = (layout: RenderedLayout) => layout.units.reduce((n, u) => n + (u.k === 'r' ? 1 : u.n), 0);
+
+      const wide = (await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 })).provenance!;
+      assert.deepEqual(wide.layout!.memberIds, ids, 'the whole view, in order');
+      assert.equal(covered(wide.layout!), 40);
+      assert.ok(wide.layout!.units.every((u) => u.k === 'r'), 'everything fits raw');
+      assert.equal(cm.acceptRound({ provenance: wide })?.kind, 'baseline');
+
+      const tight = (await cm.compile({ maxTokens: 3000, reserveForResponse: 0 })).provenance!;
+      assert.equal(covered(tight.layout!), 40, 'no message is silently left out');
+      assert.deepEqual(summaryUnits(tight.layout!), [0, 1, 2, 3].map((s) => [ids[s * 8]!, ids[s * 8 + 7]!, [`L1-${s}@1`]]));
+      assert.ok(!tight.layout!.units.some((u) => u.k === 'o'), 'history is folded, not omitted');
+      const receipt = cm.acceptRound({ provenance: tight });
+      assert.deepEqual(receipt?.changes?.map((c) => [c.first.messageId, c.last.messageId, c.messages, c.after.form]),
+        [0, 1, 2, 3].map((s) => [ids[s * 8]!, ids[s * 8 + 7]!, 8, 'summary']));
+      cm.close();
+    });
+  });
+});
+
