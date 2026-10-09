@@ -21,11 +21,16 @@ after(() => rmSync(dir, { recursive: true, force: true }));
 
 type Internals = {
   _calibration: number;
+  calibrationStateId: string;
+  store: { setStateJson(id: string, value: unknown): void; getStateJson(id: string): unknown } | null;
   _lastCompileEstimate: number;
   applyCalibration(): void;
 };
 
-async function openManager(name: string) {
+/** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
+const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
+
+async function openManager(name: string, opts: { signedThinking?: boolean } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
@@ -35,7 +40,10 @@ async function openManager(name: string) {
   });
   const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane });
   for (let i = 0; i < 6; i++) {
-    cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `turn ${i} ${'lorem ipsum '.repeat(120)}` }]);
+    cm.addMessage(i % 2 ? 'Claude' : 'User', [
+      ...(i % 2 && opts.signedThinking ? [SIGNED_THINKING as never] : []),
+      { type: 'text', text: `turn ${i} ${'lorem ipsum '.repeat(120)}` },
+    ]);
   }
   return { cm, strategy, internals: strategy as unknown as Internals };
 }
@@ -72,6 +80,162 @@ describe('estimator calibration band', () => {
     const est = internals._lastCompileEstimate;
     strategy.reportRealInputTokens(est * 1.5);
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('the startup wedge: a stale-epoch 1.8 no longer makes the first compile throw', async () => {
+    // A store that pinned 1.8 under flat-600 thinking pricing reopens
+    // estimating ~1.8x its real size; if that is over the hard budget the
+    // first compile throws OverBudgetError, so no inference runs and no sample
+    // can ever decay it. Size a budget that fits at 1.0 but not at 1.8.
+    // Measure what the hard-budget check counts at 1.0 (the OverBudgetError's
+    // `actual`), rather than inferring it from the estimator's own fields.
+    // (openManager appends six messages per open, so the probe goes through the
+    // same open → close → reopen as the stores under test, to hold the same content.)
+    const ST = { signedThinking: true };
+    const probeFirst = await openManager('wedge-probe', ST);
+    await probeFirst.cm.compile(BUDGET);
+    probeFirst.cm.close();
+    const probe = await openManager('wedge-probe', ST);
+    const reserve = 500;
+    const raw = await probe.cm.compile({ maxTokens: reserve + 1, reserveForResponse: reserve }).then(
+      () => { throw new Error('probe budget unexpectedly fit'); },
+      (e: { actual?: number }) => e.actual!,
+    );
+    probe.cm.close();
+    assert.ok(raw > 0);
+    const tight = { maxTokens: Math.ceil(raw * 1.35) + reserve, reserveForResponse: reserve };
+
+    // Control: the SAME budget with a current-epoch 1.8 does throw, so the
+    // assertion below can't pass vacuously.
+    const control = await openManager('wedge-control', ST);
+    await control.cm.compile(BUDGET);
+    control.internals.store!.setStateJson(control.internals.calibrationStateId, {
+      multiplier: 1.8, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+    });
+    control.cm.close();
+    const controlReopened = await openManager('wedge-control', ST);
+    await assert.rejects(controlReopened.cm.compile(tight), /budget/i);
+    controlReopened.cm.close();
+
+    // The wedge case: an unstamped (epoch 0) 1.8 is discarded and the first
+    // compile resolves; the reset is persisted, so a rollback can't reload 1.8.
+    const first = await openManager('wedge', ST);
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.8, at: Date.now() });
+    first.cm.close();
+    const reopened = await openManager('wedge', ST);
+    await reopened.cm.compile(tight);
+    assert.equal(reopened.internals._calibration, 1);
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.equal(saved.multiplier, 1, 'the reset must be persisted');
+    assert.equal(saved.pricing, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH);
+    reopened.cm.close();
+  });
+
+  it('a record from a newer pricing epoch is not used, and is left on disk', async () => {
+    const first = await openManager('newer-epoch');
+    await first.cm.compile(BUDGET);
+    const future = { multiplier: 1.4, at: 123, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH + 1 };
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
+    first.cm.close();
+
+    const reopened = await openManager('newer-epoch');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, 1);
+    assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), future);
+    reopened.cm.close();
+  });
+
+  it('a multiplier learned under the current pricing epoch survives reopen', async () => {
+    const first = await openManager('current-epoch');
+    await first.cm.compile(BUDGET);
+    first.strategy.reportRealInputTokens(first.internals._lastCompileEstimate * 1.5);
+    const learned = first.internals._calibration;
+    assert.ok(learned > 1);
+    const saved = first.internals.store!.getStateJson(first.internals.calibrationStateId) as { pricing?: number };
+    assert.equal(saved.pricing, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH);
+    first.cm.close();
+
+    const reopened = await openManager('current-epoch');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, learned);
+    reopened.cm.close();
+  });
+
+  it('a discard is visible in render stats and survives restarts and learning, until re-stamped', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    // An unstamped 0.6: e.g. a store on another provider's tokenizer, where
+    // the old value was still accurate. The discard must not be silent.
+    const first = await openManager('visible', { signedThinking: true });
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 0.6, at: 1 });
+    first.cm.close();
+
+    const reopened = await openManager('visible', { signedThinking: true });
+    await reopened.cm.compile(BUDGET);
+    const cal = reopened.cm.getRenderStats()!.calibration!;
+    assert.equal(cal.multiplier, 1);
+    assert.equal(cal.pricingEpoch, epoch);
+    assert.equal(cal.reset?.discardedMultiplier, 0.6);
+    assert.equal(cal.reset?.fromEpoch, 0);
+    const resetAt = cal.reset!.at;
+    // Learning after the reset keeps the record (it is a fact about this
+    // store's history, not about the current value).
+    reopened.strategy.reportRealInputTokens(reopened.internals._lastCompileEstimate * 1.5);
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { reset?: { at: number } };
+    assert.equal(saved.reset?.at, resetAt);
+    reopened.cm.close();
+
+    // Still visible after another restart, with no second discard.
+    const again = await openManager('visible', { signedThinking: true });
+    await again.cm.compile(BUDGET);
+    assert.equal(again.cm.getRenderStats()!.calibration!.reset?.at, resetAt);
+    // An operator re-stamp (the old value, checked against provider billing)
+    // clears it.
+    again.internals.store!.setStateJson(again.internals.calibrationStateId, { multiplier: 0.6, at: Date.now(), pricing: epoch });
+    again.cm.close();
+    const restamped = await openManager('visible', { signedThinking: true });
+    await restamped.cm.compile(BUDGET);
+    const after = restamped.cm.getRenderStats()!.calibration!;
+    assert.equal(after.multiplier, 0.6);
+    assert.equal(after.reset, undefined);
+    restamped.cm.close();
+  });
+
+  it('an unstamped multiplier is kept and re-stamped when nothing in the store was repriced', async () => {
+    // A store with no signed thinking (e.g. a resident on another provider's
+    // tokenizer): epoch 1 changed nothing it holds, so its 0.6 still holds.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const first = await openManager('kept');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 0.6, at: 1 });
+    first.cm.close();
+    const reopened = await openManager('kept');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, 0.6);
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.6, pricingEpoch: epoch });
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.equal(saved.multiplier, 0.6);
+    assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
+    reopened.cm.close();
+
+    // Control: the same record in a store holding signed thinking is discarded.
+    const signed = await openManager('kept-control', { signedThinking: true });
+    await signed.cm.compile(BUDGET);
+    signed.internals.store!.setStateJson(signed.internals.calibrationStateId, { multiplier: 0.6, at: 1 });
+    signed.cm.close();
+    const signedReopened = await openManager('kept-control', { signedThinking: true });
+    await signedReopened.cm.compile(BUDGET);
+    assert.equal(signedReopened.internals._calibration, 1);
+    assert.equal(signedReopened.cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 0.6);
+    signedReopened.cm.close();
+  });
+
+  it('a store with no calibration history reports its multiplier and no reset', async () => {
+    const { cm } = await openManager('no-history');
+    await cm.compile(BUDGET);
+    assert.deepEqual(cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
     cm.close();
   });
 });
