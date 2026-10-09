@@ -67,6 +67,7 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -805,6 +806,11 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
  * an empty content array.
+ *
+ * Deliberately not followed by releaseEditedRawForms: an empty part dropped
+ * from a Responses message item still rides inside its siblings' raw item, but
+ * only whitespace can ship that way, and releasing would re-render the whole
+ * item (and its reasoning pairing) from fields for no content change.
  */
 function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.filter((b) => {
@@ -835,9 +841,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**
@@ -11039,8 +11052,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // browser carries most of its image bytes NESTED in tool results, not as
     // top-level blocks. Capping only the top level left those untouched and
     // membrane's transport shed kept firing at 27MB (2026-07-12).
-    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((b) => {
+    // A block is copied only when an image in it is replaced, so an untouched
+    // block keeps its identity and its raw replay form (see raw-forms.ts).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const capped = blocks.map((b) => {
         if (b.type === 'image') {
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           if (kept + bytes <= capBytes) {
@@ -11048,14 +11064,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return b;
           }
           dropped++;
+          changed = true;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         const nested = (b as { type: string; content?: unknown }).content;
         if (b.type === 'tool_result' && Array.isArray(nested)) {
-          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+          const inner = capBlocks(nested as ContentBlock[]);
+          if (inner === nested) return b;
+          changed = true;
+          return { ...b, content: inner } as ContentBlock;
         }
         return b;
       });
+      return changed ? releaseEditedRawForms(blocks, capped) : blocks;
+    };
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
@@ -11398,7 +11420,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? filtered
+            ? releaseEditedRawForms(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -11496,19 +11518,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => b.type === 'tool_result' && b.toolUseId === id,
         );
         if (bi === -1) continue;
-        const real = src.content[bi];
-        const rest = src.content.filter((_, k) => k !== bi);
+        const source = src.content;
+        const real = source[bi];
+        const rest = source.filter((_, k) => k !== bi);
+        // A raw replay form shared with the results left behind (one
+        // <function_results> holding several) is true of neither side once
+        // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? rest
+          ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
-        return real;
+        return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
     });
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -11521,6 +11548,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * affect chunk formation or the recall/pin layout.
    */
   protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Each edited entry's content as it was, so the edit's raw replay forms can
+    // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
+    const originals = new Map<ContextEntry, ContentBlock[]>();
+    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
+      entry.content[index] = block;
+    };
+
     // Pass 1: build toolUseId → toolName map and apply input truncation
     const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
     const toolUseIdToName = new Map<string, string>();
@@ -11536,14 +11581,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const inputTokens = Math.ceil(inputJson.length / 4);
           if (inputTokens > toolUseInputCap) {
             const keys = Object.keys(block.input).slice(0, 5);
-            entry.content[i] = {
+            replaceBlock(entry, i, {
               ...block,
               input: {
                 _truncated: true,
                 _originalTokens: inputTokens,
                 _keys: keys,
               },
-            };
+            });
           }
         }
       }
@@ -11571,27 +11616,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pass 3: apply per-tool max-last-N
     const cfg = this.config.toolResultMaxLastN;
-    if (cfg === undefined) return;
+    if (cfg !== undefined) {
+      for (const [toolName, occs] of occurrencesByTool) {
+        let limit: number | undefined;
+        if (typeof cfg === 'number') limit = cfg;
+        else if (typeof cfg === 'object') limit = cfg[toolName];
+        if (limit === undefined || limit < 0) continue;
 
-    for (const [toolName, occs] of occurrencesByTool) {
-      let limit: number | undefined;
-      if (typeof cfg === 'number') limit = cfg;
-      else if (typeof cfg === 'object') limit = cfg[toolName];
-      if (limit === undefined || limit < 0) continue;
+        const excessCount = occs.length - limit;
+        if (excessCount <= 0) continue;
 
-      const excessCount = occs.length - limit;
-      if (excessCount <= 0) continue;
-
-      for (let i = 0; i < excessCount; i++) {
-        const { entry, blockIndex } = occs[i];
-        const orig = entry.content[blockIndex];
-        if (orig.type !== 'tool_result') continue;
-        const fresherCount = occs.length - i - 1;
-        entry.content[blockIndex] = {
-          ...orig,
-          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
-        };
+        for (let i = 0; i < excessCount; i++) {
+          const { entry, blockIndex } = occs[i];
+          const orig = entry.content[blockIndex];
+          if (orig.type !== 'tool_result') continue;
+          const fresherCount = occs.length - i - 1;
+          replaceBlock(entry, blockIndex, {
+            ...orig,
+            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+          });
+        }
       }
+    }
+
+    for (const [entry, before] of originals) {
+      entry.content = releaseEditedRawForms(before, entry.content);
     }
   }
 
@@ -11889,6 +11938,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return content;
   }
 
+  /**
+   * Cut a message's text and string tool-result content to `maxTokens`. A cut
+   * or dropped block gives up its raw replay form, along with every block
+   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
@@ -11942,6 +11996,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    return result;
+    return releaseEditedRawForms(content, result);
   }
 }
