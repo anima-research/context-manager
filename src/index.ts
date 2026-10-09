@@ -10,7 +10,7 @@ export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './messa
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 export { concatBodyGroups } from './adaptive/render.js';
 export { ContextLog } from './context-log.js';
-export { BlobManager } from './blob-manager.js';
+export { BlobManager, blockAsStored } from './blob-manager.js';
 export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,

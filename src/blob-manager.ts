@@ -41,6 +41,92 @@ function canonicalImageMediaTypeFromBase64(data: string, declared: string): stri
 }
 
 /**
+ * The blob a block is kept as, by its original type, or null for a block the
+ * store keeps as given. Inline media becomes a blob: an image whose source
+ * isn't a URL, and every document, audio or video block.
+ */
+function blobKindOf(block: ContentBlock): BlobReference['originalType'] | null {
+  switch (block.type) {
+    case 'image':
+      return block.source.type === 'url' ? null : 'image';
+    case 'document':
+    case 'audio':
+    case 'video':
+      return block.type;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The media type a blob is written under. Transport MIME is testimony, not
+ * authority over the bytes: a wrong image label otherwise survives in the
+ * BlobReference and causes permanent provider 400s every time the message is
+ * rendered. Only raster formats with unambiguous signatures are relabeled;
+ * any other type is kept as declared.
+ */
+function blobMediaType(bytes: Uint8Array, declared: string, kind: BlobReference['originalType']): string {
+  return kind === 'image' ? sniffRasterImageMediaType(bytes) ?? declared : declared;
+}
+
+/** The block a blob reads back as, from its base64 data and its reference's media type. */
+function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaType: string): ContentBlock {
+  const source: Base64Source = {
+    type: 'base64',
+    data,
+    // Repair legacy references on read as well as new ingress on write.
+    // This changes only the provider-facing MIME label, never blob bytes or
+    // persisted source state.
+    mediaType: kind === 'image' ? canonicalImageMediaTypeFromBase64(data, mediaType) : mediaType,
+  };
+  switch (kind) {
+    case 'image':
+      return { type: 'image', source } as ImageContent;
+    case 'document':
+      return { type: 'document', source } as DocumentContent;
+    case 'audio':
+      return { type: 'audio', source } as AudioContent;
+    case 'video':
+      return { type: 'video', source } as VideoContent;
+  }
+}
+
+/**
+ * A content block as the store hands it back once it is stored: what
+ * `getMessage`, `getAllMessages` and `getMessageWindow` return for it with
+ * blobs resolved (their default), live and after reopening.
+ *
+ * Inline media is kept as a blob: an image whose source isn't a URL, and
+ * every document, audio or video block. It comes back as
+ * `{ type, source: { type: 'base64', data, mediaType } }` and nothing else:
+ * its data is re-encoded from the decoded bytes, and an image's media type
+ * is taken from its bytes' signature where they have one (png, jpeg, gif,
+ * webp), any other type staying as declared. Every other block comes back as
+ * it was given. This is built from the same helpers as the store's own write
+ * and read, and no option shapes that round trip: `resolveBlobs: false` only
+ * skips the read side, and a blob reference never equals this.
+ *
+ * The store's serialization applies to every block as well, and this
+ * doesn't model it: undefined fields are dropped, keys come back in another
+ * order, and strings are written as UTF-8, so a lone surrogate comes back as
+ * U+FFFD. Compare or hash JSON-shaped values with those normalized.
+ *
+ * A block the store refuses on write, such as a media block without base64
+ * data or without a media type, has no stored form: what this returns for it
+ * is unspecified, and it may throw.
+ *
+ * Pure and synchronous: no store and no I/O, so a body can be hashed as the
+ * store will keep it before anything is written.
+ */
+export function blockAsStored(block: ContentBlock): ContentBlock {
+  const kind = blobKindOf(block);
+  if (!kind) return block;
+  const { data, mediaType } = (block as { source: Base64Source }).source;
+  const bytes = Buffer.from(data, 'base64');
+  return blockFromBlob(kind, bytes.toString('base64'), blobMediaType(bytes, mediaType, kind));
+}
+
+/**
  * Manages blob storage for media content.
  * Extracts base64 data from content blocks and stores them in Chronicle's blob storage.
  * Resolves blob references back to inline content on retrieval.
@@ -120,44 +206,11 @@ export class BlobManager {
   }
 
   private extractBlobFromBlock(block: ContentBlock): StoredContentBlock {
-    switch (block.type) {
-      case 'image':
-        return this.extractFromImage(block);
-      case 'document':
-        return this.extractFromDocument(block);
-      case 'audio':
-        return this.extractFromAudio(block);
-      case 'video':
-        return this.extractFromVideo(block);
-      default:
-        // Other block types pass through unchanged
-        return block as StoredContentBlock;
-    }
-  }
-
-  private extractFromImage(block: ImageContent): StoredContentBlock {
-    if (block.source.type === 'url') {
-      // URL sources don't need blob storage - pass through unchanged
-      return block;
-    }
-
-    const ref = this.storeBase64(block.source, 'image');
-    return { type: 'blob_ref', ref };
-  }
-
-  private extractFromDocument(block: DocumentContent): StoredContentBlock {
-    const ref = this.storeBase64(block.source, 'document');
-    return { type: 'blob_ref', ref };
-  }
-
-  private extractFromAudio(block: AudioContent): StoredContentBlock {
-    const ref = this.storeBase64(block.source, 'audio');
-    return { type: 'blob_ref', ref };
-  }
-
-  private extractFromVideo(block: VideoContent): StoredContentBlock {
-    const ref = this.storeBase64(block.source, 'video');
-    return { type: 'blob_ref', ref };
+    // Which blocks become blobs, and how they read back, is shared with
+    // blockAsStored, so the store and that export can't disagree.
+    const kind = blobKindOf(block);
+    if (!kind) return block as StoredContentBlock;
+    return { type: 'blob_ref', ref: this.storeBase64((block as { source: Base64Source }).source, kind) };
   }
 
   private storeBase64(
@@ -165,13 +218,7 @@ export class BlobManager {
     originalType: BlobReference['originalType']
   ): BlobReference {
     const buffer = Buffer.from(source.data, 'base64');
-    // Transport MIME is testimony, not authority over the bytes. A wrong
-    // image label otherwise survives in BlobReference and causes permanent
-    // provider 400s every time the message is rendered. Canonicalize only
-    // raster formats with unambiguous signatures; preserve unknown types.
-    const mediaType = originalType === 'image'
-      ? sniffRasterImageMediaType(buffer) ?? source.mediaType
-      : source.mediaType;
+    const mediaType = blobMediaType(buffer, source.mediaType, originalType);
     const hash = this.store.storeBlob(buffer, mediaType);
 
     return {
@@ -193,27 +240,7 @@ export class BlobManager {
       throw new Error(`Blob not found: ${ref.hash}`);
     }
 
-    const source: Base64Source = {
-      type: 'base64',
-      data,
-      // Repair legacy references on read as well as new ingress on write.
-      // This changes only the provider-facing MIME label, never blob bytes or
-      // persisted source state.
-      mediaType: ref.originalType === 'image'
-        ? canonicalImageMediaTypeFromBase64(data, ref.mediaType)
-        : ref.mediaType,
-    };
-
-    switch (ref.originalType) {
-      case 'image':
-        return { type: 'image', source } as ImageContent;
-      case 'document':
-        return { type: 'document', source } as DocumentContent;
-      case 'audio':
-        return { type: 'audio', source } as AudioContent;
-      case 'video':
-        return { type: 'video', source } as VideoContent;
-    }
+    return blockFromBlob(ref.originalType, data, ref.mediaType);
   }
 
   /**
