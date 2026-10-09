@@ -98,6 +98,15 @@ export interface StoredMessage {
   shardIndex?: number;
 
   /**
+   * How many shards its bodyGroup was written with, declared on every shard
+   * when the group is written. Only meaningful when `bodyGroupId` is set.
+   * Members are immutable, but an interrupted write can leave a group short;
+   * this lets a reader tell a whole group from a partial one, after a reopen
+   * too. Absent on groups written before it was recorded.
+   */
+  shardCount?: number;
+
+  /**
    * Current display resolution for this chunk:
    *  - 0  = render raw content
    *  - k>0 = render the L_k summary that covers this chunk
@@ -156,6 +165,8 @@ export interface StoredMessageInternal {
   bodyGroupId?: string;
   /** See StoredMessage.shardIndex */
   shardIndex?: number;
+  /** See StoredMessage.shardCount */
+  shardCount?: number;
   /** See StoredMessage.currentResolution */
   currentResolution?: number;
   /** See StoredMessage.lockedByAgent */

@@ -394,14 +394,15 @@ export class MessageStore {
    * adaptive-resolution metadata (bodyGroupId for shards, initial
    * resolution state, etc.) at ingestion time.
    */
-  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'shardCount', 'currentResolution', 'lockedByAgent'] as const;
 
   /**
    * Append a new message to the store.
    *
    * `extra` is an optional bag of adaptive-resolution metadata
-   * (bodyGroupId / shardIndex / currentResolution / lockedByAgent) that
-   * callers may set at ingestion. Field semantics match StoredMessage.
+   * (bodyGroupId / shardIndex / shardCount / currentResolution /
+   * lockedByAgent) that callers may set at ingestion. Field semantics match
+   * StoredMessage.
    */
   append(
     participant: string,
@@ -411,6 +412,7 @@ export class MessageStore {
     extra?: {
       bodyGroupId?: string;
       shardIndex?: number;
+      shardCount?: number;
       currentResolution?: number;
       lockedByAgent?: boolean;
     }
@@ -867,6 +869,21 @@ export class MessageStore {
     let tokens = 0;
     for (const block of message.content) {
       tokens += this.estimateBlockTokens(block);
+    }
+    return tokens;
+  }
+
+  /**
+   * Base token estimate of some content: the sum of each block's raw
+   * estimate, before the calibration multiplier and its per-block rounding
+   * (which `estimateTokens` applies, so dividing its result by the
+   * calibration does not recover this). Identical content estimates the same
+   * at any calibration.
+   */
+  estimateBaseTokens(content: readonly ContentBlock[]): number {
+    let tokens = 0;
+    for (const block of content) {
+      tokens += this.estimateBlockTokensRaw(block);
     }
     return tokens;
   }
@@ -1802,6 +1819,7 @@ export class MessageStore {
     // Carry adaptive-resolution fields through unchanged.
     if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
     if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
+    if (internal.shardCount !== undefined) stored.shardCount = internal.shardCount;
     if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
     if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
     return stored;
