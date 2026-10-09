@@ -80,6 +80,17 @@ export interface PendingWork {
 /**
  * An injection into the compiled context.
  * Source-agnostic: may come from MCPL servers, local strategies, or application code.
+ *
+ * @deprecated Context injection is deprecated
+ * (anima-research/agent-framework#171). Injections are never stored: each
+ * `compile()` splices them in fresh, re-anchored to the latest
+ * user-participant message, so the rendered prefix changes at every
+ * activation and prompt caches stop hitting past that point (head-only
+ * hits on OpenAI Responses/Codex). After a mid-activation recompile the
+ * anchor can also fall between a tool call and its result. Prefer content
+ * that is stored once at its own position — system prompt for durable
+ * instructions, ordinary messages for changing state. Still accepted by
+ * `compile()` for now.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
@@ -122,6 +133,9 @@ export interface CompileResult {
    * System-position injections, grouped by namespace.
    * Caller should append these to the system prompt.
    * Separated because the system prompt is outside context-manager's scope.
+   *
+   * @deprecated Only populated by deprecated `system`-position
+   * {@link ContextInjection}s; empty when no injections are passed.
    */
   systemInjections: ContentBlock[];
 }
