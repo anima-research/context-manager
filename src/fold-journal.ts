@@ -29,8 +29,8 @@
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
  *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts), so a record's size follows what changed
- *   and what was rendered, not how much history lies behind the window.
+ *   its units (forms with counts): a delta's size follows what changed, and
+ *   the history behind the window costs only its members, in snapshots.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
@@ -612,14 +612,15 @@ export class FoldJournal {
    *
    * Every acceptance writes its record, an unchanged layout included (an
    * empty delta), so every accepted compile is in the index. The layout is a
-   * delta on the branch's previous record until the deltas written since the
-   * last snapshot would outweigh it (or MAX_CHAIN of them), then a snapshot:
-   * storage stays proportional to what changed, and rebuilding a layout
-   * reads at most about two snapshots' worth. A failed append may or may not
-   * have landed, so the branch's cached latest layout is dropped and the
-   * index is listed again at its next use: the next acceptance finds this
-   * compile already accepted if its record did land, instead of writing a
-   * second receipt.
+   * delta on the branch's previous record, or a snapshot once the deltas
+   * written since the last snapshot would outweigh it, after MAX_CHAIN of
+   * them, or when no delta can express the change (layoutDelta returns
+   * null). The deltas after a snapshot never outweigh it, so rebuilding a
+   * layout reads at most two snapshots' worth of layout. A failed append may
+   * or may not have landed, so the branch's cached latest layout is dropped
+   * and the index is listed again at its next use: the next acceptance finds
+   * this compile already accepted if its record did land, instead of writing
+   * a second receipt.
    */
   private commit(
     provenance: CompileProvenance,

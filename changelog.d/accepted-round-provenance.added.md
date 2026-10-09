@@ -21,14 +21,14 @@
   Passthrough, windowed passthrough and autobiographical (with its subclasses)
   report layouts, and autobiographical marks a summary whose rendered text a cap
   cut as `partial`.
-- Fold receipts: `acceptRound({ provenance, usage })` accepts a compile whose
-  provider round succeeded. It compares the layout with the last layout accepted
-  on the compile's own branch, by any manager on the store, even when another
-  branch has since been selected, over messages present in both. When any
-  changed form (raw, partial raw, summary, a different summary, omitted), it
-  appends a receipt naming each changed run's boundaries, forms, summaries and
-  estimated tokens. It writes a baseline when the branch has no record.
-  Arrivals are not folds.
+- Fold receipts: `acceptRound({ provenance, usage, presentation })` accepts a
+  compile whose provider round succeeded. It compares the layout with the last
+  layout accepted on the compile's own branch, by any manager on the store,
+  even when another branch has since been selected, over messages present in
+  both. When any message changed form (raw, partial raw, summary, a different
+  summary, omitted), it appends a receipt naming each changed run's
+  boundaries, forms, summaries and estimated tokens. It writes a baseline when
+  the branch has no record. Arrivals are not folds.
   - Each acceptance, an unchanged layout included, commits the branch's new
     layout and its receipt as one Chronicle typed record, alongside a
     once-minted store-id record. Typed records are enumerable from any branch
@@ -41,11 +41,12 @@
     manager on the store, or ran before a reopen.
   - A layout persists as its members (message sequences, gap-coded, about
     1.3 bytes each) and its units (forms with counts), so a message missing
-    from either view is never counted inside a range, and a record's size
-    follows what changed and what was rendered, not the history behind the
-    window. An acceptance writes a delta on the branch's previous record
-    until the deltas since the last snapshot would outweigh it; then a
-    snapshot.
+    from either view is never counted inside a range. An acceptance writes a
+    delta on the branch's previous record, whose size follows what changed,
+    or a snapshot once the deltas since the last one would outweigh it,
+    after 256 deltas, or when no delta can express the change. The history
+    behind the window costs only its members, in snapshots, and rebuilding a
+    layout reads at most two snapshots' worth of layout.
   - Every manager on one store object shares an index of these records: the
     first acceptance or receipt query after the store opens lists and reads
     them once, and each manager adds its own records as it writes them. The
