@@ -228,6 +228,49 @@ describe('ContextManager initialization fence', () => {
     });
   });
 
+  // Compression holds stay usable while fenced; a release that lands during an
+  // attempt is delivered by the attempt that succeeds, never by one that fails.
+  class HoldAwareStrategy extends GatedStrategy {
+    releases = 0;
+    onCompressionHoldsReleased(): void { this.releases++; }
+  }
+
+  it('a hold released while initialization is pending reaches the strategy once that attempt succeeds', async () => {
+    const strategy = new HoldAwareStrategy();
+    await fixture(strategy, async (manager, store) => {
+      const id = manager.addMessage('user', text('held'), undefined, undefined, { holdCompression: true });
+      store.createBranch('target');
+      const pending = gate();
+      strategy.nextInitialization = pending.promise;
+      const switching = manager.switchBranch('target');
+      manager.releaseCompression([id]);
+      assert.equal(strategy.releases, 0, 'not delivered while the attempt is pending');
+      pending.resolve();
+      await switching;
+      assert.equal(strategy.releases, 1, 'delivered once the attempt succeeds');
+    });
+  });
+
+  it('a failed attempt keeps a release pending until a later attempt succeeds', async () => {
+    const strategy = new HoldAwareStrategy();
+    await fixture(strategy, async (manager, store) => {
+      const main = manager.currentBranch().name;
+      const id = manager.addMessage('user', text('held'), undefined, undefined, { holdCompression: true });
+      store.createBranch('target');
+      const pending = gate();
+      strategy.nextInitialization = pending.promise;
+      const switching = manager.switchBranch('target');
+      manager.releaseCompression([id]);
+      const failure = new Error('initializer rejected');
+      pending.reject(failure);
+      await assert.rejects(switching, error => error === failure);
+      assert.equal(strategy.releases, 0, 'a failed attempt does not deliver it');
+      strategy.nextInitialization = Promise.resolve();
+      await manager.switchBranch(main);
+      assert.equal(strategy.releases, 1, 'the next successful attempt delivers it');
+    });
+  });
+
   it('a rejected native branch selection leaves the loaded branch usable', async () => {
     await fixture(new PassthroughStrategy(), async (manager) => {
       const current = manager.currentBranch().name;
