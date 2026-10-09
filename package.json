@@ -16,6 +16,9 @@
     "dist",
     "src"
   ],
+  "bin": {
+    "context-manager-migrate": "./dist/src/migration/migrate-cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
