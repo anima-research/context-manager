@@ -187,10 +187,14 @@ describe('split-stitch L1 fallback', () => {
     }
   });
 
-  it('a provider error on a sub-request aborts the rung: nothing installed, no further sub-calls', async () => {
+  it('a transient error on a sub-request interrupts the rung: nothing installed, no further sub-calls, family not exhausted', async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
     const fx = await build(membrane, { split: true, placeholder: true });
-    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // An untyped transport error says nothing about the request (room-225
+    // L3): the rung is one atomic retry unit, so it propagates and the rung
+    // runs again later instead of exhausting the family.
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted by a transport error');
     assert.equal(fx.strategy.entries().length, 0, 'nothing installed after a transport error');
     const subs = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
     const idx = subs.findIndex((c) => texts(c).some((t) => t.startsWith('raw-1 ')) && texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
@@ -200,6 +204,26 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(att.calls, subs.length, 'attempted.calls counts the thrown sub-call too');
     assert.equal(att.errors, 1);
     assert.equal(att.complete, false);
+  });
+
+  it('a deterministic rejection of a sub-request aborts the rung: nothing installed, family exhausted', async () => {
+    const calls: NormalizedRequest[] = [];
+    const base = cumulativeMembrane({ refuseAt: 2 }).membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length === 1 && targets[0]!.startsWith('raw-1')) {
+          throw Object.assign(new Error('400 too long'), { type: 'context_length', retryable: false });
+        }
+        return base.complete(request);
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, placeholder: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.strategy.entries().length, 0, 'nothing installed after a rejected piece');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the ladder ended deterministically');
+    assert.equal(fx.strategy.attempted()!.complete, false);
   });
 
   it('per-window call cap aborts the rung and installs nothing', async () => {

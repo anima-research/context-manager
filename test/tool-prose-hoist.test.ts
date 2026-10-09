@@ -192,9 +192,13 @@ describe('tool-prose hoist rung', () => {
       return { calls, membrane: { complete: async (request: NormalizedRequest) => { calls.push(structuredClone(request)); const r = plan[Math.min(n++, plan.length - 1)]!; if ('throw' in r) throw r.throw; return r; } } as never };
     })();
     const a = await build(thrown.membrane, { hoist: true, sourceOnlyFallback: true });
-    await a.strategy.run(a.target(), managerContext(a.manager));
+    // An unclassified thrown error says nothing about the request: the ladder
+    // stops there and the failure propagates, without exhausting the family
+    // (room-225 L3; compression-transient-ladder.test.ts covers resumption).
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)));
     assert.deepEqual(thrown.calls.map(names), ['skip_reply', 'journal+skip_reply', 'skip_reply'],
       'no source-only hoist after a provider error: the rewrite cannot address it');
+    assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted by a transient failure');
     // a truncated source-only generation is not a refusal either
     const truncated = scripted([REFUSAL, REFUSAL, { content: [text('a partial mem')], stopReason: 'max_tokens', usage: { inputTokens: 80, outputTokens: 20 } } as ReturnType<typeof OK>]);
     const b = await build(truncated.membrane, { hoist: true, sourceOnlyFallback: true });

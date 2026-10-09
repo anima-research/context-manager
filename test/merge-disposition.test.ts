@@ -16,7 +16,9 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -444,13 +446,76 @@ describe('Merge terminal-disposition gate', () => {
 
     const LIMIT = (AutobiographicalStrategy as unknown as { MERGE_SERVER_ERROR_STREAK_LIMIT: number })
       .MERGE_SERVER_ERROR_STREAK_LIMIT;
+    // Each failure also pauses the compression lane (room-225 L3): a tick
+    // during the pause makes no call. Expire it between ticks to stand for
+    // the time passing, so this test still sees one call per tick.
+    const lane = fx.strategy as unknown as { compressionPause: { backoffUntil: number; statedUntil: number | null } | null };
     for (let i = 1; i < LIMIT; i++) {
       await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows (transient tier)`);
       assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burn below the bound');
+      const calls = mock.calls.length;
+      await fx.strategy.tick(ctx(fx.manager));
+      assert.equal(mock.calls.length, calls, 'no call while the lane is paused');
+      lane.compressionPause!.backoffUntil = 0;
+      lane.compressionPause!.statedUntil = null;
     }
     await fx.strategy.tick(ctx(fx.manager)); // streak hits the bound: recorded, not thrown
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the streak limit');
     await fx.manager.close();
+  });
+
+  it('a non-retryable failure that says nothing about the request (credentials) pauses the lane, spending no merge attempt', async () => {
+    // Only a request-attributable rejection is evidence about the merge
+    // request (room-225 L3). An expired key fails every request identically
+    // until fixed: it pauses the lane instead of walking the bounded policy
+    // toward quarantine.
+    const authErr = Object.assign(new Error('401 invalid x-api-key'), { type: 'auth', retryable: false });
+    const mock = scripted([{ error: authErr }]);
+    const fx = await fixture(mock.membrane);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /401/);
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no merge attempt spent');
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 1, 'paused: no second call');
+    await fx.manager.close();
+  });
+
+  it('any provider answer resets the pause, a refusal included (room-225 #46271 #4)', async () => {
+    const network = Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
+    const mock = scripted([{ error: network }, { stop: 'refusal' }, { error: network }]);
+    const fx = await fixture(mock.membrane);
+    const lane = fx.strategy as unknown as { compressionPause: { backoffUntil: number; statedUntil: number | null; failures: number } | null };
+    const pause = () => lane.compressionPause;
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(pause()?.failures, 1);
+    pause()!.backoffUntil = 0;
+    await fx.strategy.tick(ctx(fx.manager)); // answered: a refusal
+    assert.equal(mock.calls.length, 2);
+    assert.equal(pause(), null, 'the answer ended the pause');
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(pause()?.failures, 1, 'the next outage starts the backoff afresh');
+    await fx.manager.close();
+  });
+
+  it("the merge's compression-log record bounds its error (room-225 #46271 #5)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'merge-log-'));
+    const logPath = join(dir, 'compression.jsonl');
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    try {
+      const huge = Object.assign(new Error(`zz ${'e'.repeat(1_000_000)}`), { type: 'network', retryable: true });
+      const mock = scripted([{ error: huge }]);
+      const fx = await fixture(mock.membrane);
+      await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)));
+      const records = readFileSync(logPath, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as { operation?: string; error?: string });
+      const merge = records.filter((r) => typeof r.operation === 'string' && r.operation.startsWith('merge_l') && typeof r.error === 'string');
+      assert.ok(merge.length > 0, 'the merge failure is logged');
+      for (const r of merge) assert.ok(r.error!.length <= 2_000, `bounded: ${r.error!.length}`);
+      await fx.manager.close();
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('quarantine debt is swept once the sources are covered by a parent', async () => {
