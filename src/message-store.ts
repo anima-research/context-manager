@@ -135,6 +135,22 @@ function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
 }
 
+/** Bumped by every mutation except append. An append leaves every earlier
+ *  record untouched, so caches of per-message facts can survive it; an edit
+ *  or removal cannot be told apart from an append by the write version. */
+const sharedEditVersions = new WeakMap<object, Map<string, number>>();
+function bumpEditVersion(store: object, stateId: string): void {
+  let m = sharedEditVersions.get(store);
+  if (!m) {
+    m = new Map();
+    sharedEditVersions.set(store, m);
+  }
+  m.set(stateId, (m.get(stateId) ?? 0) + 1);
+}
+function currentEditVersion(store: object, stateId: string): number {
+  return sharedEditVersions.get(store)?.get(stateId) ?? 0;
+}
+
 /** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
  *  cost, every invalidating mutation, and every write-through fallback. The
  *  full rebuild is ~20s of CPU on a large store on production hardware —
@@ -552,6 +568,7 @@ export class MessageStore {
 
     const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
     // Write-through the materialized cache (see append — the cached entry
@@ -605,6 +622,7 @@ export class MessageStore {
 
     const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
@@ -640,6 +658,7 @@ export class MessageStore {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
       this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+      bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
@@ -658,6 +677,7 @@ export class MessageStore {
     const firstId = all[from].id;
     const lastId = all[to].id;
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -698,6 +718,7 @@ export class MessageStore {
     }
 
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -757,22 +778,35 @@ export class MessageStore {
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
     const branchId = this.store.currentBranch().id;
-    const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     const c = this.allStoredCache;
+    // getAllInternal already revalidates across foreign state writes (the
+    // store-global sequence moves on every receipt or resolution write) and
+    // hands back the same array; keying on that array, not the sequence,
+    // keeps this view alive across them too. Same-instance mutators bump
+    // writeVersion (edits in place, appends by push), so both still miss.
     if (
       c &&
       c.branchId === branchId &&
-      c.sequence === sequence &&
+      c.internals === internals &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
     ) {
       return c.stored;
     }
-    const stored = internals.map((internal, i) =>
-      this.internalToStored(internal, internal.id, i)
-    );
-    this.allStoredCache = { branchId, sequence, writeVersion, stored };
+    // An append changes only the sequence. Every earlier message is still
+    // the same record under the same writeVersion, so keep its mapped object:
+    // per-message caches keyed on the object (salience, token estimates) then
+    // survive appends instead of missing on every compile.
+    const editVersion = currentEditVersion(this.store, this.stateId);
+    const previous = c && c.branchId === branchId && c.editVersion === editVersion ? c.stored : null;
+    const stored = internals.map((internal, i) => {
+      const reused = previous?.[i];
+      return reused && reused.id === internal.id && reused.sequence === internal.sequence
+        ? reused
+        : this.internalToStored(internal, internal.id, i);
+    });
+    this.allStoredCache = { branchId, internals, writeVersion, editVersion, stored };
     return stored;
   }
 
@@ -780,8 +814,9 @@ export class MessageStore {
    *  as allCache (see getAll). */
   private allStoredCache: {
     branchId: string;
-    sequence: number;
+    internals: StoredMessageInternal[];
     writeVersion: number;
+    editVersion: number;
     stored: StoredMessage[];
   } | null = null;
 
@@ -864,12 +899,29 @@ export class MessageStore {
    * Estimate tokens for a message.
    */
   estimateTokens(message: StoredMessage): number {
+    const content = message.content;
+    const hit = this._messageTokens.get(message);
+    if (hit && hit.calibration === this.tokenCalibration && hit.blocks.length === content.length) {
+      let same = true;
+      for (let i = 0; same && i < content.length; i++) same = hit.blocks[i] === content[i];
+      if (same) return hit.tokens;
+    }
     let tokens = 0;
-    for (const block of message.content) {
+    for (const block of content) {
       tokens += this.estimateBlockTokens(block);
     }
+    this._messageTokens.set(message, { blocks: content.slice(), calibration: this.tokenCalibration, tokens });
     return tokens;
   }
+
+  /** Whole-message estimate per mapped message object. Guarded by the
+   *  identity of every block (a caller may replace one inside the same
+   *  content array) and by the calibration factor, so a changed block or a
+   *  recalibration never serves a stale sum. Entries die with the message
+   *  objects. */
+  private _messageTokens = new WeakMap<StoredMessage, {
+    blocks: readonly ContentBlock[]; calibration: number; tokens: number;
+  }>();
 
   /**
    * Closed-loop calibration multiplier applied to every estimate (default 1).

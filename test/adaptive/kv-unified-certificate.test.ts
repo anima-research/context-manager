@@ -166,12 +166,18 @@ test('new raw-only leaves extend the certificate; a foldable extension is enumer
   assert.equal(result.selected.score, oracle.selected.score);
 });
 
-test('protected internal holes fall back, while externally accounted holes have exact bounds', () => {
+test('protected internal and externally accounted holes have exact bounds', () => {
   const inputs = fixture();
   inputs.chunks[0].pinned = true;
   const forest = new CanonicalSummaryForest(inputs);
   const options = { maxTokens: 400, presentation: presentation(forest), adoptEpsilon: 2000 };
-  assert.equal(certifyCarriedLayout(inputs, forest, options), null);
+  const internal = certifyCarriedLayout(inputs, forest, options);
+  assert.ok(internal);
+  const internalOracle = new ExactKvUnifiedPolicySolver(inputs, forest).solve(options);
+  assert.ok(internalOracle.feasible);
+  assert.deepEqual(internal.selected.frontier, internalOracle.selected.frontier);
+  assert.equal(internal.selected.score, internalOracle.selected.score);
+  assert.ok(internal.certificate.lowerBound <= Math.min(...internalOracle.candidates.map((c) => c.fidelityLoss + c.budgetPenalty)));
   const external = { ...inputs, headTokens: 90, headChunkIds: new Set(['c0']) };
   const externalForest = new CanonicalSummaryForest(external);
   const result = certifyCarriedLayout(external, externalForest, options);

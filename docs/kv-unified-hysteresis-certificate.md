@@ -25,7 +25,15 @@ L(t) = min_cuts(F + B'(t) * T) + B(t) - B'(t) * t
 ```
 
 The minimum of the linear objective is a bottom-up select/expand pass over
-the canonical ownership forest. All constraints remain in that pass. Allowing
+active-leaf contexts of the canonical ownership forest. In a context `(s, A)`,
+selecting `s` covers every leaf in `A` that allows its level; the other leaves
+are constraint-forced holes and expand recursively through the child contexts.
+Expanding `s` visits all active child contexts. The participant and hole sets
+are disjoint. This is the same cut recurrence as the exhaustive oracle and the
+minimum-token solver, so each realizable cut is covered and each recall pair
+and raw hole is charged once within that cut. The carried cut is validated
+against this recurrence; legal leaf levels and token accounting alone do not
+establish coverage. All current constraints remain in that pass. Allowing
 over-budget cuts only relaxes the optimization and lowers the bound. Fixed
 head/tail costs are included once. Chronological gaps do not affect additive
 token and fidelity accounting.
@@ -48,8 +56,19 @@ A conservative floating-point allowance is subtracted from each bound.
 - Carried continuity loss and actual cache churn must both be zero. These
   witnesses prove the global normalization floors are zero. In particular,
   checking the cache *excess* of a singleton candidate would be insufficient.
-- Internal protected holes fall back. Externally accounted head/tail holes and
-  preserved gap-bearing ownership are supported.
+- Internal protected holes, externally accounted head/tail holes and preserved
+  gap-bearing ownership are supported, including nested holes. Contexts are
+  rebuilt from today's inputs. More than `4 * (leaves + summaries) + 256`
+  context nodes declines the certificate and uses the existing solver.
+- Context construction also limits aggregate active-leaf memberships to
+  `32 * (leaves + summaries) + 1024`, including repeated memo lookups. Before
+  building each JSON key or child lists, it charges identifier lengths plus
+  one unit per identifier against `32 * (leaves + summaries + input identifier
+  lengths) + 1024`. This bounds repeated leaf sets and long serialized IDs;
+  JSON escaping adds at most a constant factor. Exceeding either storage-work
+  limit declines the certificate and retains the full solver's behavior.
+- Ownership chains deeper than 256 summaries decline before recursive context
+  construction, independently of the context-node and extension caps.
 - Initial/blank-slate solves, forced budget transitions, and unsuccessful
   certificates retain the existing solver. This does not implement cost-to-go
   pruning for real transitions.
@@ -68,7 +87,33 @@ with both the exhaustive oracle and the existing bucketed solver, checks every
 lower bound against the exhaustive
 minimum of `F+B`, and exercises cache, extensions, protected holes, stale hashes,
 malformed hysteresis, and forced-budget fallback. The 57 certificate, forest,
-policy, receipt, and live-adapter tests pass under Node after a TypeScript build.
+policy, receipt, and live-adapter tests passed under Node after the original
+prototype's TypeScript build. Additional hole regressions exhaust all carried
+cuts across 64 constrained nested forests, with raw pins, exact-level locks,
+positive-level and maximum-level pins, head/tail accounting, interleaved
+ownership, ties and current cache receipts. Sixteen append/mint/refolding cases
+compare the entire carried extension family with the exhaustive oracle.
+Narrow-epsilon cases compare both successful proofs and unchanged fallback
+results with the full solver; stale pins, locks and summary identities decline.
+
+An additional checker enumerates Cartesian leaf-level assignments and tests a
+global atomic-coverage predicate using input ownership chains. It does not call
+the canonical select/expand recurrence. Its legal cuts and independently counted
+tokens agree with the forest oracle; certified lower bounds are checked against
+every feasible cut. Eight evolving turns exercise acceptance, changed pins and
+locks, fresh L1, refolding, cache receipts, a tighter wall and a changed prefix.
+Explicit regressions cover context/extension/depth caps, aggregate storage
+before key serialization (wide pin chains and repeated long identifiers),
+full-solver fallback and numeric boundaries.
+
+The certificate proves the exact hysteresis policy. Universal identity with a
+bucketed approximate optimizer is not its contract. The existing six-leaf hole
+fixture, without a carried presentation, selects 436 tokens / score 134.533394
+exactly versus 420 tokens / score 155.817964 with 100-token buckets; the latter
+difference is within its reported approximation envelope. Removing the buckets
+restores the exact result. This is existing approximate behavior, not evidence
+of an inadmissible certificate bound. Measured A/B runs still require identical
+frontiers, scores, floors and rendered content under their fixed configuration.
 
 The offline benchmark captures the inputs at the pinned runtime's first solver
 call, then stops the compile. It uses no provider. Always supply a disposable,
@@ -133,6 +178,5 @@ the solver policy or the live resident. Do not use that incomplete run to
 claim a measured speedup ratio. The full-frontier comparison above is against
 the saved resolutions, not a result from the interrupted replay.
 
-Local fixture and reports:
-`/Users/antra/sill-cm/data/solver-fixtures/hysteresis-20260920.yXh4p1/`.
+The local fixture and reports are not included in this repository.
 The original repro store and live resident were not modified.

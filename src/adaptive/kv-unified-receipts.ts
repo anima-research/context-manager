@@ -111,7 +111,7 @@ export class KvUnifiedReceiptChain {
   private leavesValue: Map<ChunkId, PresentedLeaf>;
   private cacheValue: ProviderCacheReference | null;
   private wireReceiptValue: ObservedCacheWireReceipt | null;
-  private pending: PendingPresentationSubmission | null = null;
+  private pending: (Omit<PendingPresentationSubmission, 'leaves'> & { leaves: Map<ChunkId, PresentedLeaf> }) | null = null;
   private settled = new Set<string>();
 
   constructor(snapshot?: ReceiptChainSnapshot) {
@@ -216,7 +216,9 @@ export class KvUnifiedReceiptChain {
     };
     const receiptHash = createHash('sha256').update(JSON.stringify(receiptPayload)).digest('hex');
     this.headValue = { ...receiptPayload, receiptHash };
-    this.leavesValue = new Map(pending.leaves);
+    // `begin` already copied the submission's leaves into `pending`, which
+    // nothing else references, so the chain takes that map as its own.
+    this.leavesValue = pending.leaves;
     return { presentationAdvanced: true, duplicate: false };
   }
 
@@ -258,7 +260,7 @@ export class KvUnifiedReceiptChain {
     }
   }
 
-  private requirePending(submissionId: string): PendingPresentationSubmission {
+  private requirePending(submissionId: string): NonNullable<KvUnifiedReceiptChain['pending']> {
     if (!this.pending || this.pending.submissionId !== submissionId) {
       throw new Error(`kv-unified callback ${submissionId} does not match the in-flight submission`);
     }
@@ -270,14 +272,18 @@ function diffLeaves(
   previous: ReadonlyMap<ChunkId, PresentedLeaf>,
   next: ReadonlyMap<ChunkId, PresentedLeaf>,
 ): PresentationDelta[] {
-  const ids = new Set([...previous.keys(), ...next.keys()]);
+  // Only the changed leaves need ordering; sorting every id on each accept
+  // was most of the cost on large histories. Same order as sorting all ids.
   const changes: PresentationDelta[] = [];
-  for (const leafId of [...ids].sort(compareLeafIds)) {
+  for (const [leafId, after] of next) {
     const before = previous.get(leafId);
-    const after = next.get(leafId);
-    if (sameLeaf(before, after)) continue;
-    changes.push({ leafId, value: after ?? null });
+    if (before === after || sameLeaf(before, after)) continue;
+    changes.push({ leafId, value: after });
   }
+  for (const [leafId, before] of previous) {
+    if (!next.has(leafId) && !sameLeaf(before, undefined)) changes.push({ leafId, value: null });
+  }
+  changes.sort((a, b) => compareLeafIds(a.leafId, b.leafId));
   return changes;
 }
 

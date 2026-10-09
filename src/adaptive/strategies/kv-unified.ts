@@ -13,6 +13,9 @@ import {
   type ParetoPolicySolveResult,
   type ParetoSolveOptions,
 } from '../kv-unified-pareto.js';
+import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
+
+export type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
   /** Live adapter refuses missing policy/grid fields when true. */
@@ -24,6 +27,15 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
     fallbackRecallTokens: number;
     maxCandidates: number;
   };
+}
+
+export interface KvUnifiedTimings {
+  readonly forestMs: number;
+  readonly forestDerived: boolean;
+  readonly certificateMs: number;
+  readonly baseSolveMs: number;
+  readonly demandMs: number;
+  readonly demandSolves: number;
 }
 
 export interface LatentDemandEvaluation {
@@ -43,6 +55,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
   readonly name = 'kv-unified';
   private last: ParetoPolicySolveResult | null = null;
   private demandEvaluations: LatentDemandEvaluation[] = [];
+  private timings: KvUnifiedTimings | null = null;
+  private requests: ProduceRequest[] = [];
+  private demandSolves = 0;
 
   constructor(private readonly options: KvUnifiedOptions = {}) {}
 
@@ -54,19 +69,38 @@ export class KvUnifiedStrategy implements FoldingSolver {
     return this.demandEvaluations;
   }
 
+  get lastTimings(): KvUnifiedTimings | null {
+    return this.timings;
+  }
+
+  get lastRequests(): readonly ProduceRequest[] {
+    return this.requests;
+  }
+
   solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
     if (this.options.requireExplicitPolicy) validateExplicitOptions(this.options);
-    const forest = new CanonicalSummaryForest(inputs, {
+    const t0 = performance.now();
+    const forestOptions = {
       treeifyNonContiguousSummaries: this.options.treeifyNonContiguousSummaries,
       preserveGapBearingSummaries: this.options.preserveGapBearingSummaries,
-    });
+    };
+    const reuse = this.options.reuse;
+    const forest =
+      (reuse?.forest ? CanonicalSummaryForest.derive(reuse.forest, inputs, forestOptions) : null) ??
+      new CanonicalSummaryForest(inputs, forestOptions);
+    if (reuse) reuse.forest = forest;
+    const t1 = performance.now();
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
     const result = solver.solve({
       ...this.options,
       maxTokens: budget.totalBudget,
     });
+    const t2 = performance.now();
     this.last = result;
     this.demandEvaluations = [];
+    this.requests = [];
+    this.demandSolves = 0;
+    this.timings = { forestMs: t1 - t0, forestDerived: forest.derived, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1, demandMs: 0, demandSolves: 0 };
     if (!result.feasible) {
       if (result.feasibility.frontier) {
         return {
@@ -86,10 +120,25 @@ export class KvUnifiedStrategy implements FoldingSolver {
       );
     }
     const produced = this.options.latentDemand
-      ? this.rankLatentDemand(inputs, forest, result, budget)
+      ? this.rankLatentDemand(inputs, forest, solver, result, budget)
       : [];
+    this.requests = produced;
+    this.timings = { ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves };
+    // The selected cut as a level per leaf; the forest's leaf order is by
+    // sequence, so when the sequences are dense (0..n-1) the array is
+    // indexed by sequence. The frontier map is built only if someone reads it.
+    const selected = result.selected;
+    let levelsBySequence: ArrayLike<number> | undefined;
+    const levels = selected.levels;
+    if (levels) {
+      const chunks = forest.orderedChunks();
+      let dense = chunks.length === levels.length;
+      for (let k = 0; dense && k < chunks.length; k++) if (chunks[k].sequence !== k) dense = false;
+      if (dense) levelsBySequence = levels;
+    }
     return {
-      frontier: result.selected.frontier,
+      get frontier() { return selected.frontier; },
+      levelsBySequence,
       produced,
       exhausted: false,
     };
@@ -101,50 +150,135 @@ export class KvUnifiedStrategy implements FoldingSolver {
   private rankLatentDemand(
     inputs: PickerInputs,
     forest: CanonicalSummaryForest,
+    solver: ParetoKvUnifiedPolicySolver,
     baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
     budget: FoldingBudget,
   ): ProduceRequest[] {
     const config = this.options.latentDemand!;
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
-    const evaluations: LatentDemandEvaluation[] = [];
-    for (const candidate of candidates) {
-      const expected = solveWithLatentCandidate(
-        inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
+    // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
+    const solved = candidates.flatMap((candidate) => {
+      const conservative = solveWithLatentCandidate(
+        inputs, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
       );
-      const conservative = candidate.conservativeRecallTokens === candidate.expectedRecallTokens
-        ? expected
-        : solveWithLatentCandidate(
-            inputs, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
+      this.demandSolves++;
+      return conservative.feasible ? [{ candidate, conservative }] : [];
+    });
+    const policy = normalizePolicy(this.options.policy);
+    const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
+    // Merges worth less than adoptEpsilon are not demanded; that is the
+    // hysteresis policy's own tolerance, applied here to best-vs-best.
+    const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
+      ? this.options.adoptEpsilon!
+      : 0;
+    const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>, withExpected: boolean): LatentDemandEvaluation[] => {
+      // One frame for the whole compile. Each solve measures its penalties
+      // from its own pool's floors, so raw scores from two solves are not
+      // comparable: a what-if whose forest reaches a lower continuity floor
+      // looks worse, not better. Every what-if forest contains the base forest,
+      // so the lowest floors any pool reached are the frame for all of them,
+      // and both sides are rescored there before subtracting.
+      let cacheFloor = base.cacheFloor;
+      let continuityFloor = base.continuityFloor;
+      for (const { conservative } of solved) {
+        cacheFloor = Math.min(cacheFloor, conservative.cacheFloor);
+        continuityFloor = Math.min(continuityFloor, conservative.continuityFloor);
+      }
+      const best = (result: Extract<ParetoPolicySolveResult, { feasible: true }>): number => {
+        if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
+        let score = Infinity;
+        for (const c of result.candidates) {
+          score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
+            cacheFloor, continuityFloor, policy, multiplier));
+        }
+        return score;
+      };
+      const baseBest = best(base);
+      const evaluations: LatentDemandEvaluation[] = [];
+      const undecided: typeof solved = [];
+      for (const entry of solved) {
+        const { candidate, conservative } = entry;
+        const conservativeImprovement = baseBest - best(conservative);
+        // A certified what-if exposes only the carried layout and its
+        // extensions, up to certificate.maxImprovement above the what-if's
+        // best cut, so its improvement is understated by that much. When
+        // that gap spans the gate, the what-if is solved again without the
+        // certificate (see below); the pool is decided once that is done.
+        if (conservative.certificate && conservativeImprovement <= epsilon &&
+            conservativeImprovement + conservative.certificate.maxImprovement > epsilon) {
+          undecided.push(entry);
+          continue;
+        }
+        let expectedImprovement = conservativeImprovement;
+        // Pass 2: the expected (p50) solve only orders emitted requests among
+        // themselves, so candidates the gate rejects never pay for it, and it
+        // runs once, against the base the gate is final on.
+        if (withExpected && conservativeImprovement > epsilon &&
+            candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
+          const expected = solveWithLatentCandidate(
+            inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
           );
-      if (!expected.feasible || !conservative.feasible) continue;
-      evaluations.push({
-        request: candidate.request,
-        sourceIds: candidate.sourceIds,
-        expectedRecallTokens: candidate.expectedRecallTokens,
-        conservativeRecallTokens: candidate.conservativeRecallTokens,
-        expectedImprovement: baseline.selected.score - expected.selected.score,
-        conservativeImprovement: baseline.selected.score - conservative.selected.score,
-        // Approximate only when pruning could have cost score: a bucket that
-        // merged nothing, or an exact engine, reports a zero bound.
-        approximate: Boolean(
-          conservative.propagation &&
-          (
-            !conservative.propagation.approximationBounded ||
-            conservative.propagation.approximationScoreErrorBound > 0
+          this.demandSolves++;
+          if (!expected.feasible) continue;
+          expectedImprovement = baseBest - best(expected);
+        }
+        evaluations.push({
+          request: candidate.request,
+          sourceIds: candidate.sourceIds,
+          expectedRecallTokens: candidate.expectedRecallTokens,
+          conservativeRecallTokens: candidate.conservativeRecallTokens,
+          expectedImprovement,
+          conservativeImprovement,
+          // Approximate only when pruning could have cost score: a bucket that
+          // merged nothing, or an exact engine, reports a zero bound.
+          approximate: Boolean(
+            conservative.propagation &&
+            (
+              !conservative.propagation.approximationBounded ||
+              conservative.propagation.approximationScoreErrorBound > 0
+            ),
           ),
-        ),
-      });
+        });
+      }
+      evaluations.sort((a, b) =>
+        b.conservativeImprovement - a.conservativeImprovement ||
+        b.expectedImprovement - a.expectedImprovement ||
+        a.request.level - b.request.level ||
+        a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
+      );
+      if (undecided.length > 0) {
+        for (const entry of undecided) {
+          const full = solveWithLatentCandidate(
+            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
+            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
+          );
+          this.demandSolves++;
+          if (full.feasible) entry.conservative = full;
+          else solved.splice(solved.indexOf(entry), 1);
+        }
+        // The frame may have moved with the new pools; rank everything again
+        // (no certified what-if is left undecided, so this ends).
+        return rank(base, withExpected);
+      }
+      return evaluations;
+    };
+    let base = baseline;
+    // A certified base solve exposes only the carried layout and its
+    // extensions, which the certificate allows to score up to adoptEpsilon
+    // above the best cut. A merge gated against that score could be worth
+    // less than epsilon against the true best. Decide such a merge against
+    // the unrestricted base solve; it runs only when a merge would otherwise
+    // be requested, which is followed by a summarizer call anyway.
+    if (baseline.certificate && rank(baseline, false).some((evaluation) => evaluation.conservativeImprovement > epsilon)) {
+      const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+      this.demandSolves++;
+      if (unrestricted.feasible) base = unrestricted;
     }
-    evaluations.sort((a, b) =>
-      b.conservativeImprovement - a.conservativeImprovement ||
-      b.expectedImprovement - a.expectedImprovement ||
-      a.request.level - b.request.level ||
-      a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
-    );
+    const evaluations = rank(base, true);
     this.demandEvaluations = evaluations;
     return evaluations
-      .filter((evaluation) => evaluation.conservativeImprovement > 0)
+      .filter((evaluation) => evaluation.conservativeImprovement > epsilon)
       .map((evaluation) => evaluation.request);
   }
 }
@@ -269,6 +403,7 @@ function solveWithLatentCandidate(
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,
+    reuse: undefined,
   });
 }
 
