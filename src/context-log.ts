@@ -314,7 +314,10 @@ export class ContextLog {
       case 'video':
         return 1000;
       default:
-        return 0;
+        // Mirrors MessageStore.computeBlockTokensRaw: membrane's XML-history
+        // carriers (tool_attempt, tool_notice) are priced as the markup they
+        // replay as; any other unknown block stays at 0.
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
