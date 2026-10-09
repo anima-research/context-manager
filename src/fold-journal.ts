@@ -508,17 +508,6 @@ export class FoldJournal {
     return { branch, receipts, latestId, more };
   }
 
-  /** Every receipt of a branch, oldest first: what a projection writes. */
-  receiptsFor(branch: BranchRef): FoldReceipt[] {
-    const list = this.index().branches.get(branchKey(branch))?.receipts ?? [];
-    const out: FoldReceipt[] = [];
-    for (const entry of list) {
-      const receipt = this.loadReceipt(entry.id);
-      if (receipt) out.push(receipt);
-    }
-    return out;
-  }
-
   /** The store's id (minted on first use). */
   storeId(): string {
     return storeIdentity(this.store);

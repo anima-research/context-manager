@@ -62,9 +62,9 @@
   - Query with `listFoldReceipts({ afterId, since, limit, branch })`:
     newest first, or with `afterId` (a receipt id) oldest first from just
     after it, so a reader pages forward from the last receipt it got, with
-    `more` saying whether there is more; `since` is an ISO 8601 time (a bare
-    number is refused rather than guessed at). Read a branch's whole
-    record with `foldReceiptsFor(branch)`, subscribe with `onFoldReceipt`, and
+    `more` saying whether there is more, and `afterId: '0'` pages a branch's
+    whole record from its start; `since` is an ISO 8601 time (a bare number
+    is refused rather than guessed at). Subscribe with `onFoldReceipt`, and
     label receipts with `setReceiptSource`.
   - `getStoreId`, `currentBranchRef` and `describeRenderedForms` support hosts
     that export or explain them.

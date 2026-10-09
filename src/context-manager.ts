@@ -1206,11 +1206,6 @@ export class ContextManager {
     return this.foldJournal.query(query);
   }
 
-  /** Every fold receipt of a branch, oldest first: what a projection writes. */
-  foldReceiptsFor(branch: BranchRef): FoldReceipt[] {
-    return this.foldJournal.receiptsFor(branch);
-  }
-
   /** Be told after each fold receipt is appended. Returns a detacher. */
   onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
     return this.foldJournal.onReceipt(listener);

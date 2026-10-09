@@ -314,7 +314,6 @@ describe('fold journal', () => {
 
     assert.equal(cm.listFoldReceipts().receipts.length, 1, 'main still has only its baseline');
     assert.equal(cm.listFoldReceipts({ branch: 'side' }).receipts.length, 2);
-    assert.equal(cm.foldReceiptsFor(main).length, 1);
 
     cm.getStore().deleteBranch('side');
     const deleted = cm.listFoldReceipts({ branch: 'side' });
@@ -384,7 +383,7 @@ describe('fold journal', () => {
       strategy.plan.set(ids[i]!, 'omit');
       await acceptCompile(cm);
     }
-    const everything = cm.foldReceiptsFor(cm.currentBranchRef()).map((r) => r.id);
+    const everything = cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.id).reverse();
     assert.equal(everything.length, 25);
     assert.ok(new Set(everything.map((id) => id.length)).size > 1, `ids cross a digit boundary: ${everything[0]}..${everything.at(-1)}`);
     const seen: string[] = [];
@@ -951,7 +950,7 @@ describe('fold journal durability and index', () => {
     const page = journal.query({ limit: 3 });
     assert.equal(page.receipts.length, 3);
     assert.equal(reads, 3, 'a query reads the receipts it returns, no others');
-    assert.equal(journal.receiptsFor(page.branch!).length, 31);
+    assert.equal(journal.query({ limit: 100 }).receipts.length, 31);
     // A fresh journal on the same store object shares the index.
     const other = new FoldJournal(counted, 'agents/tester');
     assert.equal(other.query({ limit: 100 }).receipts.length, 31);
