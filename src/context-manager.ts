@@ -454,6 +454,12 @@ export class ContextManager {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
         let firstId: MessageId | null = null;
+        // These appends must stay synchronous: one body's shards in one loop, in
+        // shard order, with no await between them. The body-runs rule (body-runs.ts)
+        // reads a body as consecutive messages of one group id whose shard indices
+        // rise, so a body's shards must land together. Any message appended between
+        // them splits the body, and since a group id is a content hash, a second
+        // ingestion of the same text would interleave with it (P00 P00 P01 P01).
         for (const shard of decision.shards) {
           const message = this.messageStore.append(
             participant,
