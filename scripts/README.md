@@ -23,12 +23,11 @@ identically across the close/reopen.
 node dist/scripts/reopen-test.js <store-path>
 ```
 
-Both scripts are compiled by running:
+`npm run build` compiles both, with the other TypeScript scripts in
+`scripts/`, into `dist/scripts/`, using the project's own `tsconfig.json`:
 
 ```bash
-npx tsc scripts/<file>.ts --outDir dist --target ES2022 \
-  --module NodeNext --moduleResolution NodeNext \
-  --esModuleInterop --skipLibCheck --resolveJsonModule
+npm run build
 ```
 
 ## records-log-bytes-by-state.py
