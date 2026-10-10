@@ -52,6 +52,19 @@ import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
+import { randomUUID } from 'node:crypto';
+import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
+import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { ThinkingBinding, chainSeed, isThinkingBlock, thinkingBindingFor, type BindingResult } from './thinking-binding.js';
+import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
+import type {
+  BranchRef,
+  CompiledMessageSources,
+  CompileProvenance,
+  MessageStoreView,
+  RenderedLayout,
+  RenderedSummaryInfo,
+} from './types/index.js';
 
 /**
  * Base configuration for ContextManager.
@@ -192,6 +205,10 @@ export class ContextManager {
   private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
+  /** Fold receipts for this manager's namespace (see fold-journal.ts). */
+  private foldJournal: FoldJournal;
+  /** Which thinking each compile can still send (see thinking-binding.ts). */
+  private thinkingBinding: ThinkingBinding;
 
   private constructor(
     store: JsStore,
@@ -215,6 +232,8 @@ export class ContextManager {
     this.debugLogContext = debugLogContext;
     this.viewFilter = viewFilter;
     this.auxiliaryStores = auxiliaryStores;
+    this.foldJournal = new FoldJournal(store, strategyNamespace);
+    this.thinkingBinding = thinkingBindingFor(store, strategyNamespace);
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
@@ -228,19 +247,27 @@ export class ContextManager {
    * filter sees (and can exclude from) the merged world.
    */
   private strategyMessageView() {
-    let view = mergeMessageStoreViews(
-      this.messageStore.createView(),
-      this.auxiliaryStores.map((s) => s.createView()),
-    );
+    let view = this.mergedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    // Thinking the binding pass has released on this branch is no longer
+    // sent, so the strategy's world reads those messages without it.
+    view = this.thinkingBinding.releasedView(view, branchRefOf(this.store));
     // Live predicate (strategies capture views across long drains). Every
     // view built above is a fresh object, so this never leaks into a store.
     const holds = this.compressionHolds;
     view.isCompressionHeld = (id: MessageId) => holds.has(id);
     view.hasCompressionHolds = () => holds.size > 0;
     return view;
+  }
+
+  /** This manager's messages merged with its auxiliary slots, before the view filter. */
+  private mergedMessageView(): MessageStoreView {
+    return mergeMessageStoreViews(
+      this.messageStore.createView(),
+      this.auxiliaryStores.map((s) => s.createView()),
+    );
   }
 
   /**
@@ -453,8 +480,23 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
+        // Every shard declares its group's size, so a group an interrupted
+        // write left short reads as partial, not whole (compile provenance).
+        // That needs indices exactly 0..n-1: refuse anything else before
+        // writing a shard.
+        const shardCount = decision.shards.length;
+        const indices = new Set(decision.shards.map((s) => s.shardIndex));
+        if (indices.size !== shardCount || ![...indices].every((i) => Number.isInteger(i) && i >= 0 && i < shardCount)) {
+          throw new Error(
+            `chunkIngressMessage returned shard indices ${JSON.stringify(decision.shards.map((s) => s.shardIndex))}; ` +
+              `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
+          );
+        }
+        // Shards are written in index order, so the id returned (the first
+        // written) is shard 0's: the body's identity in compile provenance.
+        const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         let firstId: MessageId | null = null;
-        for (const shard of decision.shards) {
+        for (const shard of ordered) {
           const message = this.messageStore.append(
             participant,
             shard.content,
@@ -463,6 +505,7 @@ export class ContextManager {
             {
               bodyGroupId: decision.bodyGroupId,
               shardIndex: shard.shardIndex,
+              shardCount,
             }
           );
           if (firstId === null) firstId = message.id;
@@ -950,14 +993,35 @@ export class ContextManager {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
 
+    // Once thinking is bound, by an acceptance through any manager on this
+    // store, the strategy renders the live window for it (the hook is
+    // idempotent).
+    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
+
+    // The branch and view this compile reads; provenance binds to both.
+    const branch = branchRefOf(this.store);
+    const view = this.strategyMessageView();
+
     // Get selected entries from strategy
     const entries = this.strategy.select(
-      this.strategyMessageView(),
+      view,
       this.contextLog.createView(),
       effectiveBudget,
       opts
     );
+    const selectionCause = this.strategy.takeSelectionCause?.();
     if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
+
+    const viewMessages = view.getAll();
+    // Raw bodies are judged as stored: the view filter can hide a shard of a
+    // body from the strategy, and the binding pass can have released a
+    // message's thinking from its view, but the body's identity (shard 0, the
+    // id addMessage returned), its membership and its content are the stored
+    // group's. The layout stays on the view the strategy rendered.
+    const storedMessages = this.viewFilter || this.thinkingBinding.releasedOn(branch).size > 0
+      ? this.mergedMessageView().getAll()
+      : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -968,8 +1032,11 @@ export class ContextManager {
     // non-user message containing `tool_result` blocks becomes a sequence
     // of agent/user/agent turns so the API accepts it. Already-API-shape
     // messages pass through untouched. See `src/normalize-tool-messages.ts`.
+    // Every part of a split entry carries that entry's sources.
     const messages: NormalizedMessage[] = [];
-    for (const entry of entries) {
+    const messageSources: CompiledMessageSources[] = [];
+    for (let e = 0; e < entries.length; e++) {
+      const entry = entries[e]!;
       const splitParts = splitMixedToolMessages([
         { participant: entry.participant, content: entry.content },
       ]);
@@ -981,14 +1048,69 @@ export class ContextManager {
           content: part.content,
           ...(entry.cacheMarker && isLast ? { cacheBreakpoint: true } : {}),
         });
+        messageSources.push(attribution.sources[e]!);
       }
     }
 
-    // If no injections, log and return early
-    if (!injections || injections.length === 0) {
-      const result: CompileResult = { messages, systemInjections: [] };
+    const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
+      // Thinking goes out only while the prefix it was minted under holds
+      // (thinking-binding.ts). The seed covers what the host sends before the
+      // messages and the system injections this compile adds to it.
+      const dryRun = opts?.dryRun === true;
+      const compileId = randomUUID();
+      const seed = chainSeed(opts?.prefixIdentity, result.systemInjections);
+      const bound = this.thinkingBinding.bind({
+        branch,
+        compileId: dryRun ? undefined : compileId,
+        messages: result.messages,
+        sources: messageSources,
+        seed,
+        own: this.messageStore.getAll(),
+        head: storedMessages.reduce((max, m) => Math.max(max, m.sequence), 0),
+      });
+      // The layout describes what goes out: an entry the pass changed is
+      // priced as sent, and one it left nothing of renders as omitted.
+      let layoutEntries: ContextEntry[] = entries;
+      if (bound.kept.length !== result.messages.length || bound.stripped > 0) {
+        // Every part of an entry carries that entry's sources object.
+        const entryIndex = new Map<CompiledMessageSources, number>(attribution.sources.map((source, e) => [source, e]));
+        layoutEntries = sentEntries(entries, messageSources.map((source) => entryIndex.get(source) ?? -1), result.messages, bound);
+        result.messages = bound.kept.map((i, k) => ({ ...result.messages[i]!, content: bound.messages[k]!.content }));
+        messageSources.splice(0, messageSources.length, ...bound.sources);
+      }
+      for (const source of messageSources) {
+        if (source.kind !== 'raw') continue;
+        for (const body of source.bodies) {
+          if (!bound.strippedFrom.has(body.messageId)) continue;
+          body.complete = false;
+          if (!(body.missing ?? []).includes('content')) body.missing = [...(body.missing ?? []), 'content'];
+        }
+      }
+      for (const id of bound.strippedFrom.keys()) attribution.rawComplete.set(id, false);
+      result.thinkingStripped = bound.stripped;
+      if (bound.strippedBlocks.length > 0) {
+        // The strategy priced these blocks; the request won't carry them. A
+        // dry run's select records its estimate too, so it hears this too.
+        const strippedTokens = bound.strippedBlocks.reduce(
+          (acc, block) => acc + this.messageStore.estimateTokens({ content: [block] } as StoredMessage), 0);
+        this.strategy.noteStrippedTokens?.(strippedTokens);
+      }
+      result.rawBodies = rawBodiesOf(attribution.sources, storedMessages);
+      result.provenance = {
+        compileId,
+        namespace: this.strategyNamespace,
+        branch,
+        messages: messageSources,
+        layout: this.renderedLayoutFor(viewMessages, layoutEntries, attribution.rawComplete, injected, selectionCause),
+        strategy: this.strategy.name,
+      };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
+    };
+
+    // If no injections, log and return early
+    if (!injections || injections.length === 0) {
+      return finish({ messages, systemInjections: [] }, []);
     }
 
     // Separate injections by position
@@ -1019,6 +1141,10 @@ export class ContextManager {
       }
     }
 
+    const injectedContent: ContentBlock[][] = [];
+    const injectionSources = (list: ContextInjection[]): CompiledMessageSources[] =>
+      list.map((inj) => ({ kind: 'injection', namespace: inj.namespace }));
+
     // Insert beforeUser injections before last user message
     if (beforeUser.length > 0 && lastUserIdx >= 0) {
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
@@ -1026,6 +1152,8 @@ export class ContextManager {
         content: inj.content,
       }));
       messages.splice(lastUserIdx, 0, ...injectedMessages);
+      messageSources.splice(lastUserIdx, 0, ...injectionSources(beforeUser));
+      injectedContent.push(...beforeUser.map((inj) => inj.content));
       // Adjust lastUserIdx to account for inserted messages
       lastUserIdx += injectedMessages.length;
     }
@@ -1038,11 +1166,199 @@ export class ContextManager {
         content: inj.content,
       }));
       messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(afterUser));
+      injectedContent.push(...afterUser.map((inj) => inj.content));
     }
 
-    const result: CompileResult = { messages, systemInjections };
-    if (this.debugLogContext) this.logCompiledContext(result);
-    return result;
+    return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * The rendered layout of one compile, or null when the strategy does not
+   * report its layout, or names a summary it cannot describe (a layout that
+   * would read covered history as omitted is worse than none).
+   */
+  private renderedLayoutFor(
+    viewMessages: StoredMessage[],
+    entries: ContextEntry[],
+    rawComplete: ReadonlyMap<MessageId, boolean>,
+    injected: ContentBlock[][],
+    cause: string | undefined,
+  ): RenderedLayout | null {
+    if (!this.strategy.renderedForms) return null;
+    const summaryIds = new Set<string>();
+    for (const entry of entries) for (const s of entry.summaries ?? []) summaryIds.add(s.id);
+    const summaryInfo = summaryIds.size > 0
+      ? this.strategy.describeRenderedSummaries?.([...summaryIds]) ?? new Map<string, RenderedSummaryInfo>()
+      : new Map<string, RenderedSummaryInfo>();
+    const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
+    if (undescribed.length > 0) {
+      console.warn(
+        `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+        `(${undescribed.slice(0, 5).join(', ')}${undescribed.length > 5 ? ', …' : ''}); ` +
+        'no rendered layout is reported for this compile',
+      );
+      return null;
+    }
+    // Estimators are store-level: the strategy view's estimates and its
+    // calibration are this store's (auxiliary slots delegate to it). Layouts
+    // keep base estimates, taken before the calibration multiplier and its
+    // per-block rounding, so identical content costs the same in every
+    // compile whatever the calibration was.
+    const calibration = this.messageStore.getTokenCalibration();
+    const factor = Number.isFinite(calibration) && calibration > 0 ? calibration : 1;
+    const estimateBase = (content: ContentBlock[]): number => this.messageStore.estimateBaseTokens(content);
+    let extraTokens = 0;
+    for (const content of injected) extraTokens += estimateBase(content);
+    return buildRenderedLayout({
+      view: viewMessages,
+      entries,
+      rawComplete,
+      summaryInfo,
+      estimateBase,
+      extraTokens,
+      calibration: factor,
+      cause,
+    });
+  }
+
+  // ==========================================================================
+  // Accepted rounds and fold receipts
+  // ==========================================================================
+
+  /**
+   * Stop sending a stored message's thinking on the current branch, from its
+   * block `fromBlock` on (an index into the message's content as stored).
+   * From the next compile, the strategy's view reads the message without
+   * it, as after the thinking-binding pass releases what it strips, so
+   * budgets and estimates count what is sent. For thinking the provider
+   * refused, which every request would otherwise send again: a signature
+   * that was altered, or a block bound to another conversation.
+   *
+   * Thinking before `fromBlock` stays; thinking after it in the message goes
+   * too, since it was minted after the refused block. The replies after the
+   * message lose their thinking at the next compile, as for any change
+   * before them. The branch's next accepted compile records the release;
+   * until then it holds in this process. It acts whether or not the pass is
+   * engaged. A second call keeps the earlier block. Throws for a message the
+   * current branch doesn't hold, or a `fromBlock` that isn't one of its
+   * blocks.
+   */
+  releaseThinking(messageId: MessageId, fromBlock = 0): void {
+    if (!Number.isInteger(fromBlock) || fromBlock < 0) {
+      throw new Error(`releaseThinking: fromBlock must be a block index, not ${fromBlock}`);
+    }
+    const message = this.mergedMessageView().get(messageId);
+    if (!message) {
+      throw new Error(`releaseThinking: the current branch holds no message ${messageId}`);
+    }
+    if (fromBlock >= message.content.length) {
+      throw new Error(
+        `releaseThinking: message ${messageId} has ${message.content.length} blocks, so block ${fromBlock} names none`,
+      );
+    }
+    this.thinkingBinding.release(branchRefOf(this.store), messageId, fromBlock);
+  }
+
+  /**
+   * Accept a compile whose provider round succeeded. Call once a round that
+   * carried `provenance`'s messages has stood. A compile is accepted once:
+   * repeat calls (later rounds of the same compile, or a retry after an
+   * uncertain failure, from this manager or another on the store, before or
+   * after a reopen) are no-ops. Compares the compile's rendered layout with
+   * the last layout accepted on the compile's own branch, by any manager on
+   * the store — even when another branch is selected by now — and appends a
+   * fold receipt when any message changed form, or a baseline when that
+   * branch has no record.
+   * `usage` is the confirming round's own usage as the provider reported it;
+   * leave a field undefined when it was not reported. `presentation` is how
+   * that round carried the compile, as its producer reported (`verbatim`,
+   * `altered`, or `unknown`, the default); receipts record it beside the
+   * layout, which is the compile's.
+   *
+   * It also records the chain the compile's messages were sent under, so the
+   * replies minted under it keep their thinking at later compiles while that
+   * prefix holds (thinking-binding.ts). The first acceptance on a store's
+   * namespace engages that pass. From then on a reply keeps its thinking
+   * when this manager can vouch for what it was minted under: the chain of
+   * the branch's latest accepted compile, extended by what the manager
+   * stored after it, provided every compile it bound in between sent the
+   * same. It remembers its 32 most recent compiles until they are accepted,
+   * and accepting one it has forgotten records nothing.
+   * The host's part: what it stores in this manager's own slot after a
+   * compile, up to a reply, is taken as what the round's request carried
+   * after the compile's messages, in that order and as it stands when the
+   * reply is stored. Store each round as it went out, and defer other
+   * writes to the slot (a message heard mid-tool-loop) until the turn ends.
+   * An edit after a reply is stored strips the reply's thinking.
+   *
+   * Returns the receipt written, or null (no change, already accepted, or a
+   * strategy that does not report its layout).
+   */
+  acceptRound(args: {
+    provenance: CompileProvenance;
+    acceptedAt?: number;
+    usage?: RoundUsage;
+    presentation?: Presentation;
+  }): FoldReceipt | null {
+    // The thinking-binding record first: the chain this compile was sent
+    // under, which stamps the replies that follow it. The first one engages
+    // the pass, and the strategy then renders the live window for it (a
+    // manager whose store another manager's acceptance engaged tells its
+    // strategy at its next compile).
+    this.thinkingBinding.accept(args.provenance.compileId);
+    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
+    const receipt = this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
+    // The journal syncs when it writes; when it writes nothing, this makes
+    // the binding record durable before the acceptance is reported.
+    this.store.sync();
+    return receipt;
+  }
+
+  /**
+   * Fold receipts of one branch (default: the selected one): newest first,
+   * or, with `afterId`, oldest first from just after it, so a reader can page
+   * forward; `more` says whether the query matched more than it returned.
+   */
+  listFoldReceipts(query?: FoldQuery): FoldQueryResult {
+    return this.foldJournal.query(query);
+  }
+
+  /**
+   * Be told of fold receipts, each once it is durable: every receipt this
+   * manager's `acceptRound` returns, and, at its next acceptance on a
+   * branch, that branch's newest receipt if this manager hasn't announced it
+   * (one whose write reported a failure, one another manager on the store
+   * wrote, or one from before a reopen). So a listener can hear a receipt
+   * again, and needn't hear every receipt: key on `receipt.id`, and read
+   * `listFoldReceipts` for the whole record. Returns a detacher.
+   */
+  onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
+    return this.foldJournal.onReceipt(listener);
+  }
+
+  /** Deployment facts recorded in every receipt from now on. */
+  setReceiptSource(source: ReceiptSource): void {
+    this.foldJournal.setSource(source);
+  }
+
+  /** The store's id, minted once per store on first use. */
+  getStoreId(): string {
+    return this.foldJournal.storeId();
+  }
+
+  /** The selected branch as receipts name it (id, name, creation time). */
+  currentBranchRef(): BranchRef {
+    return branchRefOf(this.store);
+  }
+
+  /**
+   * How the active strategy can render history, for an honest answer when
+   * there are no receipts: which forms it uses, or null when it does not
+   * report its rendered layout at all.
+   */
+  describeRenderedForms(): { strategy: string; forms: ReadonlyArray<'raw' | 'summary' | 'omitted'> | null } {
+    return { strategy: this.strategy.name, forms: this.strategy.renderedForms ?? null };
   }
 
   /**
@@ -1303,6 +1619,7 @@ export class ContextManager {
     if (this.strategy.initialize) {
       await this.strategy.initialize(this.createStrategyContext());
     }
+    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
     const current = observeStoreBranch(this.store);
     if (
       current.name !== expectedBranch.name ||
@@ -1412,6 +1729,11 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
+    // A reply's thinking is stamped as its round left the store: what it was
+    // minted after is what is stored before it now (thinking-binding.ts).
+    if (message.content.some(isThinkingBlock)) {
+      this.thinkingBinding.stampStored(branchRefOf(this.store), this.messageStore.getAll());
+    }
     if (this.holdingAdds) {
       this.holdingAdds.push(message.id);
       this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
@@ -1538,4 +1860,40 @@ export class ContextManager {
       branches: this.listBranches().length,
     };
   }
+}
+
+/**
+ * The compile's entries as the bound messages carry them (`entryOf[i]` is the
+ * entry message `i` renders): an entry the thinking-binding pass changed has
+ * the content sent for it, and one it left nothing of is gone.
+ */
+function sentEntries(
+  entries: readonly ContextEntry[],
+  entryOf: readonly number[],
+  before: readonly NormalizedMessage[],
+  bound: BindingResult,
+): ContextEntry[] {
+  const sent = new Map<number, ContentBlock[]>();
+  const changed = new Set<number>();
+  const keptAt = new Map<number, number>();
+  bound.kept.forEach((i, k) => keptAt.set(i, k));
+  for (let i = 0; i < before.length; i++) {
+    const e = entryOf[i];
+    if (e === undefined || e < 0) continue;
+    const k = keptAt.get(i);
+    if (k === undefined) {
+      changed.add(e);
+      continue;
+    }
+    const content = bound.messages[k]!.content;
+    if (content !== before[i]!.content) changed.add(e);
+    const acc = sent.get(e);
+    if (acc) acc.push(...content);
+    else sent.set(e, [...content]);
+  }
+  return entries.flatMap((entry, e) => {
+    if (!changed.has(e)) return [entry];
+    const content = sent.get(e);
+    return content ? [{ ...entry, content }] : [];
+  });
 }

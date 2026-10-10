@@ -126,6 +126,27 @@ export interface ReadinessState {
  * Strategies control how context is selected, compressed, and maintained.
  */
 export interface ContextStrategy {
+  /**
+   * The compile just returned left out this many estimated tokens of thinking
+   * that this strategy rendered and priced: its prefix changed since the
+   * thinking was minted (see the context manager's thinking binding). A
+   * strategy that calibrates its estimates against real usage should compare
+   * that usage with what was sent. Called after every compile that strips, a
+   * dry run included, so it follows whichever select ran last.
+   */
+  noteStrippedTokens?(tokens: number): void;
+
+  /**
+   * The context manager's thinking-binding pass is engaged on this store: its
+   * host has accepted a round, so from now on a compile sends a thinking block
+   * only while the prefix it was minted under holds. Called at each
+   * initialization once that is so, and at the acceptance that engages it.
+   * Thinking minted in another request (a summary's captured reasoning
+   * carriers) can never be sent in the live window from then on, so a
+   * strategy should stop rendering and pricing it there.
+   */
+  noteThinkingBound?(): void;
+
   /** Strategy name for identification */
   readonly name: string;
 
@@ -198,6 +219,39 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * Declares that select() reports its rendered layout completely, and which
+   * forms history can take under this strategy. Reporting completely means:
+   * every message it renders raw is a `copy` entry naming its source ids, and
+   * every entry that represents history through summaries names them in
+   * `ContextEntry.summaries`; a message of the view represented by neither
+   * is reported as omitted. A strategy that does not declare this gets no
+   * rendered layout, so no fold receipts are written for it.
+   */
+  readonly renderedForms?: ReadonlyArray<'raw' | 'summary' | 'omitted'>;
+
+  /**
+   * For layout reporting: which messages each named summary covers, at what
+   * level, and by what method it was written ('unknown' when the strategy
+   * does not record authorship). Required when select() names summaries.
+   */
+  describeRenderedSummaries?(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo>;
+
+  /**
+   * Why the last select() changed what it renders, when the strategy knows
+   * (for example 'budget-fit' or 'window'). Reading clears it.
+   */
+  takeSelectionCause?(): string | undefined;
+}
+
+/** What a rendered summary covers, for layout reporting. */
+export interface RenderedSummaryInfo {
+  level: number;
+  /** The stored message ids the summary covers. */
+  leaves: readonly MessageId[];
+  /** 'authored' | 'summarizer' | 'harness' | 'unknown'. */
+  method: string;
 }
 
 /**
@@ -218,6 +272,15 @@ export interface SelectOptions {
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
+  /**
+   * The host's identity for what it sends before the compiled messages: its
+   * system prompt and tool definitions, as a digest or any string that
+   * changes exactly when they do. It seeds the thinking-binding chain, so a
+   * change strips the thinking minted before it. Leave it out and a change
+   * there goes unseen: the provider then refuses, or drops, the thinking the
+   * change invalidated.
+   */
+  prefixIdentity?: string;
   /** Audited, expiring continuity relaxation for disruptive transitions.
    * Invalid or expired values fail closed to normal continuity weight. */
   kvUnifiedContinuityRelaxation?: {
@@ -778,6 +841,15 @@ export interface AutobiographicalConfig {
    * its own agents without waiting; flipping the default is a fleet-wide
    * change to what every instance reads back and belongs to whoever lives
    * under it.
+   *
+   * ONCE THINKING IS BOUND, THE LIVE WINDOW IS `'live-strip'`. A carrier was
+   * minted in the summarizer's request, under another conversation, so an
+   * account that enforces thinking binding refuses or drops it in the live
+   * window, and the context manager's binding pass never sends thinking it
+   * can't vouch for. Once that pass is engaged (`noteThinkingBound`), this
+   * strategy renders and prices the live window as under `'live-strip'`,
+   * whatever this says. `'full'` still governs a store whose host has never
+   * accepted a round, and mint requests are unchanged either way.
    */
   carrierPolicy?: CarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */
