@@ -1008,4 +1008,102 @@ describe('thinking binding', () => {
       reopened.close();
     });
   });
+  describe('a host’s own release', () => {
+    const releasesRecorded = (cm: ContextManager): Array<[string, number]> =>
+      cm.getStore().getRecordIdsByType(THINKING_BINDING_RECORD).flatMap((rid) => {
+        const record = JSON.parse(cm.getStore().getRecord(rid)!.payload.toString('utf8')) as { released?: Array<[string, number]> };
+        return record.released ?? [];
+      });
+    const idOf = (cm: ContextManager, sig: string): string =>
+      cm.getAllMessages().find((m) => m.content.some((b) => (b as { signature?: string }).signature === sig))!.id;
+
+    it('stops sending what the host releases, records it with the next acceptance, and keeps it across a reopen', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        await turn(cm, 'u1', 'a1', 'S1');
+        await turn(cm, 'u2', 'a2', 'S2');
+        cm.addMessage('user', text('u3'));
+        // The provider refused S1: the host releases it.
+        cm.releaseThinking(idOf(cm, 'S1'));
+        const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(next), [], 'S1 is released, and S2 was minted after it');
+        assert.equal(next.thinkingStripped, 1, 'the view no longer holds S1; the pass strips S2');
+        assert.ok(next.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'a1')),
+          'the reply itself stays');
+        assert.deepEqual(releasesRecorded(cm), [], 'nothing recorded before an acceptance');
+        cm.acceptRound({ provenance: next.provenance! });
+        assert.deepEqual(releasesRecorded(cm).map(([id]) => id).sort(), [idOf(cm, 'S1'), idOf(cm, 'S2')].sort());
+        cm.close();
+        const reopened = await ContextManager.open({ path });
+        const after = await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(after), []);
+        assert.equal(after.thinkingStripped, 0);
+        reopened.close();
+      });
+    });
+
+    it('keeps the thinking before the block it releases from', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        cm.addMessage('user', text('u1'));
+        const first = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        cm.acceptRound({ provenance: first.provenance! });
+        const id = cm.addMessage('assistant', [
+          { type: 'thinking', thinking: '', signature: 'T1' } as ContentBlock,
+          { type: 'text', text: 'first' },
+          { type: 'thinking', thinking: '', signature: 'T2' } as ContentBlock,
+          { type: 'text', text: 'second' },
+        ]);
+        cm.addMessage('user', text('u2'));
+        cm.releaseThinking(id, 2);
+        cm.releaseThinking(id, 3);
+        const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(next), ['T1'], 'a later call keeps the earlier block');
+        cm.close();
+      });
+    });
+
+    it('releases before the pass is engaged too', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        cm.addMessage('user', text('u1'));
+        cm.addMessage('assistant', reply('a1', 'S1'));
+        cm.addMessage('user', text('u2'));
+        cm.releaseThinking(idOf(cm, 'S1'));
+        const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(next), []);
+        cm.close();
+      });
+    });
+
+    it('releases on the current branch only', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        await turn(cm, 'u1', 'a1', 'S1');
+        cm.addMessage('user', text('u2'));
+        const main = cm.currentBranch().name;
+        await cm.fork('zz-other');
+        cm.releaseThinking(idOf(cm, 'S1'));
+        const there = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(there), []);
+        await cm.switchBranch(main);
+        const here = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(here), ['S1']);
+        cm.close();
+      });
+    });
+
+    it('refuses a message the branch doesn’t hold, and a block that isn’t one of its blocks', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        cm.addMessage('user', text('u1'));
+        const id = cm.addMessage('assistant', reply('a1', 'S1'));
+        assert.throws(() => cm.releaseThinking('zz-no-such-message'), /holds no message/);
+        assert.throws(() => cm.releaseThinking(id, -1), /block index/);
+        assert.throws(() => cm.releaseThinking(id, 1.5), /block index/);
+        assert.throws(() => cm.releaseThinking(id, 2), /has 2 blocks/);
+        cm.close();
+      });
+    });
+  });
 });

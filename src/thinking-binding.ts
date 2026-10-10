@@ -72,7 +72,9 @@
  * what was minted under that seed, which renders again when the seed comes
  * back. A reply still waiting for its own compile's acceptance isn't
  * released, and a branch with no accepted compile of its own releases
- * nothing.
+ * nothing. A host releases thinking itself the same way (releaseThinking),
+ * for a block the provider refused, which every request would otherwise
+ * send again.
  *
  * Storage is Chronicle typed records, one per accepted compile: its seed,
  * chain end and head sequence, whether its acceptance made it its branch's
@@ -485,6 +487,24 @@ export class ThinkingBinding {
    *  thinking (see releaseThinkingView). */
   releasedView(view: MessageStoreView, branch: BranchRef): MessageStoreView {
     return releaseThinkingView(view, this.releasedOn(branch), this.releasedCopies);
+  }
+
+  /**
+   * Release a stored message's thinking on `branch` from its block `from`
+   * on, as the pass releases what it strips: a host's own release, for
+   * thinking the provider refused. Recorded with the branch's next accepted
+   * compile.
+   */
+  release(branch: BranchRef, id: MessageId, from: number): void {
+    this.load();
+    const key = branchKey(branch);
+    const released = this.released.get(key) ?? new Map<MessageId, number>();
+    if (addRelease(released, id, from)) {
+      const unrecorded = this.unrecordedReleases.get(key) ?? new Map<MessageId, number>();
+      unrecorded.set(id, from);
+      this.unrecordedReleases.set(key, unrecorded);
+    }
+    this.released.set(key, released);
   }
 
   /**

@@ -1227,6 +1227,40 @@ export class ContextManager {
   // ==========================================================================
 
   /**
+   * Stop sending a stored message's thinking on the current branch, from its
+   * block `fromBlock` on (an index into the message's content as stored).
+   * From the next compile, the strategy's view reads the message without
+   * it, as after the thinking-binding pass releases what it strips, so
+   * budgets and estimates count what is sent. For thinking the provider
+   * refused, which every request would otherwise send again: a signature
+   * that was altered, or a block bound to another conversation.
+   *
+   * Thinking before `fromBlock` stays; thinking after it in the message goes
+   * too, since it was minted after the refused block. The replies after the
+   * message lose their thinking at the next compile, as for any change
+   * before them. The branch's next accepted compile records the release;
+   * until then it holds in this process. It acts whether or not the pass is
+   * engaged. A second call keeps the earlier block. Throws for a message the
+   * current branch doesn't hold, or a `fromBlock` that isn't one of its
+   * blocks.
+   */
+  releaseThinking(messageId: MessageId, fromBlock = 0): void {
+    if (!Number.isInteger(fromBlock) || fromBlock < 0) {
+      throw new Error(`releaseThinking: fromBlock must be a block index, not ${fromBlock}`);
+    }
+    const message = this.mergedMessageView().get(messageId);
+    if (!message) {
+      throw new Error(`releaseThinking: the current branch holds no message ${messageId}`);
+    }
+    if (fromBlock >= message.content.length) {
+      throw new Error(
+        `releaseThinking: message ${messageId} has ${message.content.length} blocks, so block ${fromBlock} names none`,
+      );
+    }
+    this.thinkingBinding.release(branchRefOf(this.store), messageId, fromBlock);
+  }
+
+  /**
    * Accept a compile whose provider round succeeded. Call once a round that
    * carried `provenance`'s messages has stood. A compile is accepted once:
    * repeat calls (later rounds of the same compile, or a retry after an
