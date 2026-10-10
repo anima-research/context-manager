@@ -69,7 +69,7 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import type { MessageId } from '../types/message.js';
-import type { IngressChunkResult } from '../types/strategy.js';
+import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -8915,6 +8915,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _lastCompileEstimate = 0;
   private _storeView: MessageStoreView | null = null;
 
+  /** Thinking the context manager stripped after this strategy's estimate
+   *  isn't sent, so the calibration sample leaves it out. */
+  noteStrippedTokens(tokens: number): void {
+    if (Number.isFinite(tokens) && tokens > 0) this._lastCompileEstimate = Math.max(0, this._lastCompileEstimate - tokens);
+  }
+
+  /** Whether the context manager's thinking-binding pass is engaged: the live
+   *  window then renders as under `carrierPolicy: 'live-strip'`. */
+  private thinkingBound = false;
+
+  noteThinkingBound(): void {
+    this.thinkingBound = true;
+  }
+
+  /** The carrier policy the live window renders and prices under: the
+   *  configured one, until thinking is bound (see `carrierPolicy`). */
+  private liveCarrierPolicy(): CarrierPolicy {
+    return this.thinkingBound || this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+  }
+
   /**
    * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
    * for a request built from the latest compile (fresh + cache_read +
@@ -9603,7 +9623,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected recallPairCost(s: SummaryEntry): number {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
-    const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+    const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._pairCostCache.get(key);
@@ -11810,7 +11830,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected liveWindowAnswerProse(summary: SummaryEntry): ContentBlock[] {
     const prose = this.summaryAnswerProse(summary);
-    if (this.config.carrierPolicy !== 'live-strip') return prose;
+    if (this.liveCarrierPolicy() !== 'live-strip') return prose;
     const stripped = stripThinkingBlocks(prose);
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,

@@ -1,0 +1,3 @@
+- `SelectOptions.prefixIdentity`: the host's identity for what it sends before the compiled messages (its system prompt and tools). It seeds the thinking-binding chain with the system injections the compile returns, so a change to either strips the thinking minted before it.
+- `CompileResult.thinkingStripped`: the thinking blocks the compile left out. It rises at a fold and once when the pass engages, and stays above zero only while something keeps invalidating replies, such as a positional injection.
+- Strategy hooks: `noteStrippedTokens(tokens)` reports the estimated thinking a compile priced but didn't send, for calibration (`AutobiographicalStrategy` takes it out of its sample), and `noteThinkingBound()` says the pass is engaged.
