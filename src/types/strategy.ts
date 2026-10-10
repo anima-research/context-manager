@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
+import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
   ContextEntry,
   TokenBudget,
@@ -549,6 +550,11 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Which chunks moved between which levels and where in the carried
+     *  layout the first change landed (the prompt-cache re-read for the
+     *  turn). Present only when the adaptive picker changed at least one
+     *  resolution on a non-dry-run compile. */
+    foldDiff?: FoldDiff;
   };
 }
 
