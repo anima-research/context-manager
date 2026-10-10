@@ -3841,7 +3841,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
-  private summaryById(id: string): SummaryEntry | undefined {
+  protected summaryById(id: string): SummaryEntry | undefined {
     const cached = this._summaryIndex;
     if (!cached || cached.source !== this.summaries || cached.length !== this.summaries.length) {
       this._summaryIndex = { source: this.summaries, length: this.summaries.length, byId: new Map(this.summaries.map((s) => [s.id, s] as const)) };
@@ -9072,6 +9072,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected _prevCacheKeys?: string[];
 
   /**
+   * Index of the last entry of the deep band: the leading run, immediately
+   * after the head, of recall pairs rendered at the deepest summary level
+   * emitted in `[lastHead+1, historyEnd]`. A recall pair is its Context
+   * Manager question (no source id, no layout key) followed by the answer
+   * carrying `cacheLayoutKey = summary id`; a layout key that resolves to no
+   * summary (merged raw shards carry their last message id) is raw. Returns
+   * -1 when no summary is emitted or the run is empty (the first middle
+   * entry is raw or at a shallower level).
+   */
+  protected deepBandEnd(entries: readonly ContextEntry[], lastHead: number, historyEnd: number): number {
+    const levelAt = (i: number): number | undefined => {
+      const key = entries[i]?.cacheLayoutKey;
+      if (!key) return undefined;
+      return this.summaryById(key)?.level;
+    };
+    let maxLevel = 0;
+    for (let i = lastHead + 1; i <= historyEnd; i++) {
+      const lvl = levelAt(i);
+      if (lvl !== undefined && lvl > maxLevel) maxLevel = lvl;
+    }
+    if (maxLevel === 0) return -1;
+    let end = -1;
+    let i = lastHead + 1;
+    while (i <= historyEnd) {
+      const lvl = levelAt(i);
+      if (lvl === maxLevel) { end = i; i++; continue; }
+      const e = entries[i]!;
+      const isQuestion =
+        lvl === undefined && !e.sourceMessageId && !e.cacheLayoutKey &&
+        i + 1 <= historyEnd && levelAt(i + 1) === maxLevel;
+      if (isQuestion) { i++; continue; }
+      break;
+    }
+    return end;
+  }
+
+  /**
    * Place message-level `cache_control` breakpoints across the final ordered
    * entries. `kv-unified` owns all four provider slots and uses rendered-token
    * thirds of non-tail history plus the tail end. Other strategies retain the
@@ -9141,12 +9178,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const historyEnd = firstTail - 1; // last non-tail entry
 
+    // The deep band: the leading run of recall pairs, right after the head,
+    // rendered at the deepest level this compile emitted. Nothing can ARRIVE
+    // to change it — a new max-level summary lands after the run, a merge one
+    // level up is the rare exception (one event per mergeThreshold landings
+    // at that level), and the solver never re-cuts below the deepest level
+    // it already chose. It is the cheapest stable prefix after system+tools
+    // and the one the head marker was standing in for: on Fable (2026-10-06)
+    // the head marker cached 244 tokens of bootstrap messages while 14
+    // complete L3 pairs (~73k) sat unmarked behind it, and 24 of 51 large
+    // rewrites in a week re-read exactly the system+tools prefix.
+    // -1 when no summary was emitted or the run is empty.
+    const deepBandEnd = this.deepBandEnd(entries, lastHead, historyEnd);
+
     if (this.config.foldingStrategy === 'kv-unified') {
-      // CM owns all four slots in kv-unified mode. Place three history
-      // breakpoints at the nearest legal rendered-token boundaries to
-      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
-      // no separate early/system marker: every history prefix already
-      // includes tools, system, and the raw head on the provider wire.
+      // CM owns all four slots in kv-unified mode. With a deep band the
+      // layout is the design's v1 (unified-solve-design.md §5A.3):
+      // system+deep-band | mid-history | historyEnd | end — the first
+      // marker sits at the end of the deep band and the mid marker at the
+      // token midpoint of the stretch between it and historyEnd. Without
+      // one (no summaries yet), three history breakpoints at the nearest
+      // legal rendered-token boundaries to 33%/66%/100%, plus one at the
+      // end of the tail. There is deliberately no separate early/system
+      // marker: every history prefix already includes tools, system, and
+      // the raw head on the provider wire.
       const marks = new Set<number>();
       if (historyEnd >= 0) {
         const cumulative: number[] = [0];
@@ -9163,20 +9218,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? [index]
               : [],
           );
-        const nearestBoundary = (fraction: number): number => {
-          const target = cumulative[cumulative.length - 1]! * fraction;
-          let best = legalBoundaries[0]!;
-          for (const index of legalBoundaries.slice(1)) {
+        // Nearest legal boundary (by cumulative rendered tokens) to a token
+        // target, among boundaries strictly after `minIndex`.
+        const nearestBoundary = (target: number, minIndex = -1): number | undefined => {
+          let best: number | undefined;
+          for (const index of legalBoundaries) {
+            if (index <= minIndex) continue;
             if (
-              Math.abs(cumulative[index + 1]! - target) <
-              Math.abs(cumulative[best + 1]! - target)
+              best === undefined ||
+              Math.abs(cumulative[index + 1]! - target) < Math.abs(cumulative[best + 1]! - target)
             ) best = index;
           }
           return best;
         };
-        if (legalBoundaries.length > 0) {
-          marks.add(nearestBoundary(1 / 3));
-          marks.add(nearestBoundary(2 / 3));
+        const total = cumulative[cumulative.length - 1]!;
+        if (legalBoundaries.length > 0 && deepBandEnd >= 0 && legalBoundaries.includes(deepBandEnd)) {
+          marks.add(deepBandEnd);
+          const bandEndTokens = cumulative[deepBandEnd + 1]!;
+          const mid = nearestBoundary((bandEndTokens + total) / 2, deepBandEnd);
+          if (mid !== undefined) marks.add(mid);
+          marks.add(legalBoundaries.at(-1)!);
+        } else if (legalBoundaries.length > 0) {
+          marks.add(nearestBoundary(total / 3)!);
+          marks.add(nearestBoundary((total * 2) / 3)!);
           marks.add(legalBoundaries.at(-1)!);
         }
       }
@@ -9217,7 +9281,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const stableEnd = prev ? firstDiff - 1 : historyEnd;
 
     const marks = new Set<number>();
-    if (lastHead >= 0) marks.add(lastHead);            // system / head block
+    // First slot: the end of the deep band when there is one, else the head.
+    // The deep band contains the head, so this strictly extends the cached
+    // prefix the first slot buys; when the measured divergence falls inside
+    // the band (a merge one level up landed), both markers are still placed —
+    // the band entry is re-written once, the measured one covers what
+    // survived.
+    const first = deepBandEnd >= 0 ? deepBandEnd : lastHead;
+    if (first >= 0) marks.add(first);                  // system+deep band / head
     if (stableEnd > lastHead) marks.add(stableEnd);    // measured stable prefix (the big one)
     marks.add(n - 1);                                  // end → pure-append reuse
 
