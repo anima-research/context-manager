@@ -397,6 +397,17 @@ function relevanceCut(
   if (ledger.tokens > windowTokens) foldPass(true, target);
 
   // Phase C: pack youngest-first back toward the target (skip if infeasible).
+  //
+  // Youngest by POSITION, whatever its level — not deepest level first.
+  // Until 2026-10-09 the walk was `for level = max..1 { youngest-first }`,
+  // which un-folded the youngest L3 group before any L1: on a chronological
+  // layout that group sits right after the deep band, so every un-fold was a
+  // front edit. Measured on Fable (fold-diff, 2026-10-07..09): the group at
+  // the L2↔L3 boundary flapped L3→L2→L3 seven times in three days, each
+  // direction re-reading ~300k tokens, while a fold confined to the seam cost
+  // ~97k. The comment always said headroom goes to the most recent foldable
+  // content; the loop now does what it says, so an un-fold lands where the
+  // next fold will — at the seam — and the dead band can hold.
   if (ledger.tokens <= windowTokens && ledger.tokens < target) {
     // A group's un-fold verdict (eligibility + accept/revert) can only change
     // after the ledger moves — i.e. after some OTHER group's un-fold is
@@ -407,11 +418,16 @@ function relevanceCut(
     // `attempted` short-circuits repeats and is cleared whenever an accept
     // changes the ledger, so the accept SEQUENCE is exactly the naive one.
     const attempted = new Set<string>();
-    for (let level = maxFoldLevel; level >= 1 && ledger.tokens < target; level--) {
+    // Repeat passes so the youngest group can step down more than one level
+    // (L2→L1→raw) before an older one is touched; a pass with no accept ends it.
+    let progressed = true;
+    while (progressed && ledger.tokens < target) {
+      progressed = false;
       for (let oi = ordered.length - 1; oi >= 0; oi--) {
         if (ledger.tokens >= target) break;
         const c = ordered[oi]; // youngest-first
-        if ((F.get(c.id) ?? 0) !== level) continue;
+        const level = F.get(c.id) ?? 0;
+        if (level < 1) continue;
         if (rawZone.has(c.id) || immovable.has(c.id) || overlapExempt.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
@@ -467,6 +483,7 @@ function relevanceCut(
           // verdict differently — exactly when the naive loop would have
           // re-attempted them.
           attempted.clear();
+          progressed = true;
         }
       }
     }
