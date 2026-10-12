@@ -4,7 +4,9 @@
  * the prefix it is sent under; a fold before it removes it; thinking with no
  * stamp (a carrier, a message from before any accepted compile) never renders
  * once the store's host has accepted a round. Stamps, releases and engagement
- * are records, so a reopened store keeps them.
+ * are recorded at each accepted compile, so a reopened store keeps what its
+ * last record held. A target that doesn't bind thinking to its prefix
+ * (`bindsThinking: false`) gets thinking as stored, and stamping goes on.
  */
 
 import { describe, it } from 'node:test';
@@ -91,6 +93,15 @@ describe('thinking binding', () => {
       const changed = await turn(cm, 'u3', 'a3', 'S3', 'p1');
       assert.deepEqual(signaturesIn(changed), []);
       assert.equal(changed.thinkingStripped, 2);
+      // What the strip took isn't in the request, so the replies' bodies
+      // aren't carried whole: provenance says so.
+      const replyBodies = changed.provenance!.messages.flatMap((s) => (s.kind === 'raw' ? s.bodies : []))
+        .filter((b) => cm.getMessage(b.messageId)?.participant === 'assistant');
+      assert.equal(replyBodies.length, 2);
+      for (const body of replyBodies) {
+        assert.equal(body.complete, false);
+        assert.ok(body.missing?.includes('content'), 'the stripped content is named as missing');
+      }
       cm.addMessage('user', text('u4'));
       const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
       assert.deepEqual(signaturesIn(next), ['S3']);
@@ -142,19 +153,26 @@ describe('thinking binding', () => {
       cm.addMessage('user', text('u3'));
       const first = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
       assert.equal(first.thinkingStripped, 2);
+      assert.deepEqual(signaturesIn(first), []);
       cm.acceptRound({ provenance: first.provenance! });
-      // A dry run's select records its estimate too; it strips the same, and says so.
+      const firstEstimate = estimate();
+      // A dry compile strips the same and says so, and leaves the estimate
+      // the last committing compile made.
       const dry = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1', dryRun: true });
       assert.equal(dry.thinkingStripped, 2);
+      assert.equal(estimate(), firstEstimate, 'a dry compile leaves calibration as it found it');
       // The second strips the same blocks again, still counted by the view, and releases them.
-      const firstEstimate = estimate();
       const second = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
       assert.equal(second.thinkingStripped, 2);
+      assert.deepEqual(signaturesIn(second), []);
       const secondEstimate = estimate();
       assert.equal(firstEstimate, secondEstimate, 'both compiles sent the same, and both samples say so');
-      // The third never sees them: its estimate is what was sent at the second.
+      // The third never sees them: the view no longer holds them, and the
+      // request it sends is the second's, so its estimate is too.
       const third = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
       assert.equal(third.thinkingStripped, 0);
+      assert.deepEqual(third.messages.map((m) => m.content), second.messages.map((m) => m.content),
+        'the third sends what the second sent');
       assert.ok(secondEstimate > 0);
       assert.equal(secondEstimate, estimate(), 'the releasing compile’s sample leaves out what it stripped');
       cm.close();
@@ -600,6 +618,12 @@ describe('thinking binding', () => {
         cm.addMessage('user', text('u3'));
         const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
         assert.deepEqual(signaturesIn(next), ['S1', 'S2']);
+        // H1 is still sent, without its thinking, and still stored with it.
+        const quiet = next.messages.find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'quiet'));
+        assert.ok(quiet, 'H1 is in the request');
+        assert.ok(!quiet.content.some((b) => b.type === 'thinking'));
+        const stored = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'quiet'));
+        assert.ok(stored?.content.some((b) => b.type === 'thinking'), 'H1 keeps its thinking in the store');
         cm.acceptRound({ provenance: next.provenance! });
         cm.addMessage('assistant', reply('a3', 'S3'));
         cm.addMessage('user', text('u4'));
@@ -692,7 +716,9 @@ describe('thinking binding', () => {
         cm.acceptRound({ provenance: compiled.provenance! });
         cm.addMessage('assistant', reply(`a${i}`, `S${i}`));
       }
-      // Each compile strips the last two replies; the older of them it releases.
+      // From the third compile on, each strips the last two replies and
+      // releases the older of them; the first has no reply to strip, and the
+      // second only one.
       assert.deepEqual(stripped, [0, 1, 2, 2, 2]);
       cm.close();
     });
@@ -965,9 +991,17 @@ describe('thinking binding', () => {
     });
   });
 
-  it('takes a summary’s carriers out of the live window and its pricing once thinking is bound', async () => {
+  it('takes a summary’s carriers out of the live window and its pricing while thinking is bound', async () => {
     await withStore(async (path) => {
-      const strategy = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
+      /** Keeps what the manager tells it before each select. */
+      class TellingStrategy extends SeedableStrategy {
+        told: boolean[] = [];
+        override noteThinkingBound(bound: boolean): void {
+          this.told.push(bound);
+          super.noteThinkingBound(bound);
+        }
+      }
+      const strategy = new TellingStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
       const cm = await ContextManager.open({ path, strategy });
       cm.addMessage('user', text('zz-u1'));
       cm.addMessage('assistant', text('zz-a1'));
@@ -979,35 +1013,179 @@ describe('thinking binding', () => {
       strategy.seed({ id: 'L1-0', level: 1, content: 'the first exchange', tokens: 4, sourceLevel: 0,
         sourceIds: [ids[0]!, ids[1]!], sourceRange: { first: ids[0]!, last: ids[1]! },
         responseContent: [
-          { type: 'thinking', thinking: '', signature: 'C1' } as ContentBlock,
+          { type: 'thinking', thinking: 'carrier reasoning '.repeat(200), signature: 'C1' } as ContentBlock,
           { type: 'text', text: 'the first exchange' },
         ] });
+      // What the last compile priced the summary at, from its render stats.
+      const summaryTokens = () => cm.getRenderStats()!.summaries.l1.tokens;
       const unbound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
       assert.ok(unbound.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary rendered');
       assert.deepEqual(signaturesIn(unbound), ['C1'], 'carrierPolicy full: the carrier rides the live window');
-      const internals = strategy as unknown as { summaries: SummaryEntry[]; recallPairCost(s: SummaryEntry): number };
-      const summary = internals.summaries.find((x) => x.id === 'L1-0')!;
-      const pricedWithCarrier = internals.recallPairCost(summary);
+      const pricedWithCarrier = summaryTokens();
       cm.acceptRound({ provenance: unbound.provenance! });
-      assert.ok(internals.recallPairCost(summary) < pricedWithCarrier, 'the plan stops pricing the carrier');
       const bound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
       assert.ok(bound.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary still renders');
       assert.deepEqual(signaturesIn(bound), []);
       assert.equal(bound.thinkingStripped, 0, 'the strategy no longer renders the carrier for the pass to strip');
+      assert.ok(summaryTokens() < pricedWithCarrier, 'the plan stops pricing the carrier');
+      // A target that keeps thinking under a changed prefix gets the carrier back.
+      const loose = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false });
+      assert.deepEqual(signaturesIn(loose), ['C1']);
+      assert.equal(loose.thinkingStripped, 0);
+      assert.equal(summaryTokens(), pricedWithCarrier, 'and the plan prices it again');
+      // A dry compile renders for its own target, and leaves the strategy as
+      // the last committing compile left it.
+      await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      strategy.told.length = 0;
+      const dryLoose = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false, dryRun: true });
+      assert.deepEqual(signaturesIn(dryLoose), ['C1']);
+      assert.deepEqual(strategy.told, [false, true], 'told its own target, then the last committing compile’s again');
       cm.close();
-      // A strategy initialized on an engaged store knows from the start,
-      // before its first compile.
+      // A strategy that opens on an engaged store renders the live window as
+      // bound from its first compile.
       const fresh = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
       const reopened = await ContextManager.open({ path, strategy: fresh });
-      const freshInternals = fresh as unknown as { summaries: SummaryEntry[]; recallPairCost(s: SummaryEntry): number };
-      const reloaded = freshInternals.summaries.find((x) => x.id === 'L1-0')!;
-      assert.ok(freshInternals.recallPairCost(reloaded) < pricedWithCarrier, 'priced without the carrier from the start');
       const afterReopen = await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
       assert.ok(afterReopen.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary renders after a reopen');
+      assert.deepEqual(signaturesIn(afterReopen), []);
       assert.equal(afterReopen.thinkingStripped, 0);
       reopened.close();
     });
   });
+  it('sends thinking as stored for a target that doesn’t bind it, and stamps on, so a target that binds finds each stamp', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path });
+      const loose = { prefixIdentity: 'p0', bindsThinking: false };
+      for (const [u, a, sig] of [['u1', 'a1', 'S1'], ['u2', 'a2', 'S2']] as const) {
+        cm.addMessage('user', text(u));
+        const compiled = await cm.compile(BUDGET, undefined, loose);
+        cm.acceptRound({ provenance: compiled.provenance! });
+        cm.addMessage('assistant', reply(a, sig));
+      }
+      cm.addMessage('user', text('u3'));
+      const changedLoose = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1', bindsThinking: false });
+      assert.deepEqual(signaturesIn(changedLoose), ['S1', 'S2'], 'nothing is stripped for a target that keeps it');
+      assert.equal(changedLoose.thinkingStripped, 0);
+      const sameBound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.deepEqual(signaturesIn(sameBound), ['S1', 'S2'], 'replies minted under loose compiles were stamped');
+      const changedBound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
+      assert.deepEqual(signaturesIn(changedBound), []);
+      assert.equal(changedBound.thinkingStripped, 2);
+      cm.close();
+    });
+  });
+
+  it('takes only what its own namespace stored as carried, when two namespaces share a message slot', async () => {
+    await withStore(async (path) => {
+      const a = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      const b = await ContextManager.open({ store: a.getStore(), namespace: 'zz-b', strategy: new PassthroughStrategy() });
+      // What the other namespace stored before a compile, that compile carried.
+      b.addMessage('bob', text('b-before'));
+      a.addMessage('user', text('u1'));
+      const first = await a.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      a.acceptRound({ provenance: first.provenance! });
+      a.addMessage('assistant', reply('a1', 'S1'));
+      a.addMessage('user', text('u2'));
+      const second = await a.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      a.acceptRound({ provenance: second.provenance! });
+      assert.deepEqual(signaturesIn(second), ['S1']);
+      // While a's request is out, b stores into the same slot. a's live
+      // request didn't carry it, and its next compile renders it before a2.
+      b.addMessage('bob', text('b-mid'));
+      a.addMessage('assistant', reply('a2', 'S2'));
+      a.addMessage('user', text('u3'));
+      const third = await a.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      const rendered = third.messages.map((m) => (m.content.find((x) => x.type === 'text') as { text: string } | undefined)?.text);
+      assert.deepEqual(rendered, ['b-before', 'u1', 'a1', 'u2', 'b-mid', 'a2', 'u3']);
+      assert.deepEqual(signaturesIn(third), ['S1'], 'S2 was minted without b-mid before it');
+      assert.equal(third.thinkingStripped, 1);
+      b.close();
+      a.close();
+    });
+  });
+
+  it('never sends the thinking of a reply stored on a branch its round wasn’t compiled on', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path });
+      await turn(cm, 'u1', 'a1', 'S1');
+      const main = cm.currentBranch().name;
+      const fork = await cm.fork('zz-fork');
+      await turn(cm, 'u2f', 'a2f', 'F2');
+      await cm.switchBranch(main);
+      cm.addMessage('user', text('u2'));
+      const out = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      cm.acceptRound({ provenance: out.provenance! });
+      // The branch switches while main's request is out, and its reply lands on the fork.
+      await cm.switchBranch(fork);
+      cm.addMessage('assistant', reply('a2', 'R2'));
+      cm.addMessage('user', text('u3f'));
+      const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.deepEqual(signaturesIn(next), ['S1', 'F2'], 'R2 was minted under main’s prefix');
+      assert.equal(next.thinkingStripped, 1);
+      cm.close();
+    });
+  });
+
+  it('refuses to accept a dry compile, which no round carries, and records nothing', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path });
+      cm.addMessage('user', text('u1'));
+      const dry = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0', dryRun: true });
+      assert.equal(dry.provenance!.dryRun, true);
+      assert.equal(cm.acceptRound({ provenance: dry.provenance! }), null);
+      assert.equal(bindingRecords(cm), 0);
+      assert.deepEqual(cm.listFoldReceipts().receipts, []);
+      // Nothing engaged: a reply stored now still renders as before any acceptance.
+      cm.addMessage('assistant', reply('a1', 'S1'));
+      cm.addMessage('user', text('u2'));
+      const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.equal(next.provenance!.dryRun, undefined);
+      assert.deepEqual(signaturesIn(next), ['S1']);
+      cm.close();
+    });
+  });
+
+  it('moves the cache breakpoint of a message the strip empties to the message before it', async () => {
+    await withStore(async (path) => {
+      // Marks for caching the entry that carries nothing but thinking.
+      class MarkingStrategy extends PassthroughStrategy {
+        select(...args: Parameters<PassthroughStrategy['select']>) {
+          return super.select(...args).map((e) =>
+            e.content.length > 0 && e.content.every((b) => b.type === 'thinking') ? { ...e, cacheMarker: true } : e);
+        }
+      }
+      const cm = await ContextManager.open({ path, strategy: new MarkingStrategy() });
+      cm.addMessage('user', text('u1'));
+      const first = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      cm.acceptRound({ provenance: first.provenance! });
+      cm.addMessage('assistant', [{ type: 'thinking', thinking: '', signature: 'T1' } as ContentBlock]);
+      cm.addMessage('user', text('u2'));
+      const kept = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.deepEqual(kept.messages.map((m) => m.cacheBreakpoint === true), [false, true, false]);
+      const stripped = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
+      assert.equal(stripped.thinkingStripped, 1);
+      assert.deepEqual(stripped.messages.map((m) => m.cacheBreakpoint === true), [true, false],
+        'the prefix it marked ends at u1 now');
+      cm.close();
+    });
+  });
+
+  it('remembers its 32 most recent compiles, the oldest of them included', async () => {
+    for (const [count, recorded] of [[32, 1], [33, 0]] as const) {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        const compiles: CompileResult[] = [];
+        for (let i = 0; i < count; i++) {
+          cm.addMessage('user', text(`u${i}`));
+          compiles.push(await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' }));
+        }
+        cm.acceptRound({ provenance: compiles[0]!.provenance! });
+        assert.equal(bindingRecords(cm), recorded, `${count} compiles, accepting the oldest`);
+        cm.close();
+      });
+    }
+  });
+
   describe('a host’s own release', () => {
     const releasesRecorded = (cm: ContextManager): Array<[string, number]> =>
       cm.getStore().getRecordIdsByType(THINKING_BINDING_RECORD).flatMap((rid) => {
@@ -1039,6 +1217,22 @@ describe('thinking binding', () => {
         assert.deepEqual(signaturesIn(after), []);
         assert.equal(after.thinkingStripped, 0);
         reopened.close();
+      });
+    });
+
+    it('starts a fork with the releases of the branch it was made from', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        await turn(cm, 'u1', 'a1', 'S1');
+        await turn(cm, 'u2', 'a2', 'S2');
+        cm.releaseThinking(idOf(cm, 'S2'));
+        await cm.fork('zz-fork');
+        cm.addMessage('user', text('u3'));
+        const onFork = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(onFork), ['S1'], 'what the provider refused on main it refuses on the fork');
+        cm.acceptRound({ provenance: onFork.provenance! });
+        assert.ok(releasesRecorded(cm).some(([id]) => id === idOf(cm, 'S2')), 'the fork’s acceptance records it');
+        cm.close();
       });
     });
 

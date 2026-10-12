@@ -2,65 +2,77 @@
  * Thinking binding: send a signed thinking block only while the prefix it was
  * minted under is the prefix it is sent under.
  *
- * Anthropic binds each thinking / redacted_thinking block to the conversation
- * before it (system, tools, every earlier message). When anything before the
- * block changes, the block fails the binding check: a 400 by default, or a
- * removal under `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`.
- * A compile that folds, merges, caps, strips an image or releases a raw form
+ * On the models that bind it (SelectOptions.bindsThinking), Anthropic binds
+ * each thinking / redacted_thinking block to the conversation before it
+ * (system, tools, every earlier message). When anything before the block
+ * changes, the block fails the binding check: a 400 by default, or a removal
+ * under `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`. A
+ * compile that folds, merges, caps, strips an image or releases a raw form
  * rewrites the prefix of every raw message after the change, so the thinking
  * those messages carry stops being valid at that compile.
  *
  * The pass keeps a digest chain over the compiled messages, in order, seeded
- * with the host's identity for what it sends before them (system and tools)
- * and with the system injections the compile returns. A stored message that
- * carries thinking is stamped once, when it is stored (or, if a compile not
- * yet accepted fenced the walk before it, when that compile is accepted),
- * with what it was minted under: the seed, the chain before it (before each part, for a
- * bundled tool cycle a compile splits), and a digest of each of its blocks.
- * That chain is the end of the branch's owner, its latest accepted compile,
- * extended by the messages this manager stored after that compile up to this
- * one, as they stand when it is stored: what the live request carried after
- * the compile. At every compile a message's thinking renders only when the
- * chain before it equals its stamp's, and only up to the first block that
- * differs from the block minted there. So an edit made after a reply was
- * stored strips the reply, and one made before (a host writing a result
- * over its placeholder before the reply is stored) is what its round
- * carried. Thinking without a stamp does not render: recall carriers (minted
- * in the summarizer's request), messages stored before the first accepted
- * compile, and replies stored after a sharded body in the same live request,
- * whose form as sent the shards can't restore.
+ * with the host's identity for what it sends before them (system and tools,
+ * when the host passes SelectOptions.prefixIdentity) and with the system
+ * injections the compile returns. A stored message that carries thinking is
+ * stamped once, when it is stored (or, if a compile not yet accepted fenced
+ * the walk before it, at the first walk after that compile is accepted),
+ * with what it was minted under: the seed, the chain before it (before each
+ * part, for a bundled tool cycle a compile splits), and a digest of each of
+ * its blocks. That chain is the end of the branch's owner, its latest
+ * accepted compile, extended by the messages this namespace stored after
+ * that compile up to this one: what the live request carried after the
+ * compile. The walk reads each of those messages once, as it stands then:
+ * at the next compile, or when a later reply is stored. At every compile a
+ * message's thinking renders only when the chain before it equals its
+ * stamp's, and only up to the first block that differs from the block minted
+ * there. So an edit made after the walk read a message strips the replies
+ * after it, and one made before (a host writing a result over its
+ * placeholder before anything after it is stored or compiled) is what its
+ * round carried. Thinking without a stamp does not render: recall carriers
+ * (minted in the summarizer's request), messages stored before the branch's
+ * first accepted compile, replies stored after a sharded body in the same
+ * live request, whose form as sent the shards can't restore, and a reply
+ * stored on another branch than the latest compile was bound on (a branch
+ * switched while its round was out).
  *
  * Stamping vouches for a reply only through compiles that sent what it
  * walked. A compile bound after the accepted one (sent, its acceptance not
  * yet in) whose chain at its head differs from the walk's, because it ran
  * under another seed or sent the messages before its head differently, fences
  * the walk: replies stored after it wait unstamped for its acceptance, which
- * stamps them from its own chain, and lose their thinking for good if a
- * compile bound later is accepted first. What the process learned since the
- * last record is not known after a reopen: compiles bound, and stamps made.
- * So a reply stored before the reopen and not yet recorded is stamped again
- * from the store as it stands, and if it was minted under a compile that
- * sent something else, from the walk. A reply stamped late, at the
- * acceptance of a compile that fenced it, likewise reads what was stored
- * after that compile's head as it stands then: an edit to it in between is
- * taken as what the round carried.
+ * makes it the owner the next walk stamps them from, and lose their thinking
+ * for good if a compile bound later is accepted first. What the process
+ * learned since the last record is not known after a reopen: compiles bound,
+ * stamps made and a host's releases. So a reply stored before the reopen and
+ * not yet recorded is stamped again from the store as it stands, and if it
+ * was minted under a compile that sent something else, from the walk. An
+ * edit before such a reply, made in that window, is then taken as what its
+ * round carried, and the provider refuses or drops its thinking once.
  *
- * The host's part. Stamping takes what this manager stored in its own slot
- * after an accepted compile, up to a reply, as what the live request carried
- * after the compile's messages, in that order and as it stands when the
- * reply is stored. A host stores each round as it went out, and defers its
- * other writes to the slot (a message heard mid-tool-loop) until the turn
- * ends. Another writer's messages, in an auxiliary slot, aren't walked: the
- * live request didn't carry what was stored there after the compile.
+ * The host's part. Stamping takes what this namespace's managers stored in
+ * their own slot after an accepted compile, up to a reply, as what the live
+ * request carried after the compile's messages, in that order and as the
+ * walk read them. A host stores each round as it went out, stores a reply
+ * whole (thinking an edit adds to a message the walk has read never renders),
+ * and defers its other writes to the slot (a message heard mid-tool-loop)
+ * until the turn ends. Other writers' messages aren't taken as carried: an
+ * auxiliary slot isn't walked, and what another namespace's manager stores
+ * in a shared slot while this process runs is passed over, since the live
+ * request didn't carry it. A message stored before this process opened the
+ * namespace can't be told apart, and is taken as carried.
  *
  * Every manager on one store object shares a namespace's state, as the fold
  * journal's index is shared: an acceptance through one engages, stamps and
- * fences for all of them. They walk one message slot, the namespace's, as
- * long as none opens it isolated while another doesn't.
+ * fences for all of them. Managers of different namespaces keep separate
+ * state, even when they share a message slot.
  *
  * Engagement. The pass engages at the namespace's first accepted compile.
  * Only a host that calls `acceptRound` says which compile a reply was minted
- * under, so a store whose host never has renders as it always did.
+ * under, so a store whose host never has renders as it always did. A compile
+ * for a target that doesn't bind thinking (SelectOptions.bindsThinking:
+ * false) strips nothing, and stamping goes on, so a later compile for a
+ * target that binds finds each reply's stamp.
  *
  * Release. When the pass strips a message's thinking on a branch, the
  * thinking is released on the branch: a compile's rewrites move forward, so
@@ -74,7 +86,7 @@
  * released, and a branch with no accepted compile of its own releases
  * nothing. A host releases thinking itself the same way (releaseThinking),
  * for a block the provider refused, which every request would otherwise
- * send again.
+ * send again. A branch made from another starts with its releases.
  *
  * Storage is Chronicle typed records, one per accepted compile: its seed,
  * chain end and head sequence, whether its acceptance made it its branch's
@@ -184,6 +196,10 @@ export function mintStamp(seed: string, chain: string, message: ChainMessage): S
   return { seed, parts: walkMessage(chain, message).parts, blocks: message.content.map(blockDigest) };
 }
 
+/** The stamp of a reply nothing can vouch for: no chain matches it, so its
+ *  thinking never renders. */
+const UNBOUND: Stamp = { seed: '', parts: [], blocks: [] };
+
 export interface BindingResult {
   /** The compiled messages as they go out, thinking stripped where unbound. */
   messages: ChainMessage[];
@@ -212,7 +228,8 @@ export function bindThinking(args: {
   messages: readonly ChainMessage[];
   sources: readonly CompiledMessageSources[];
   seed: string;
-  /** Whether stamps are in force (the namespace has accepted a compile). */
+  /** Whether thinking without a matching stamp is stripped: the namespace
+   *  has accepted a compile, and the compile's target binds thinking. */
   engaged: boolean;
   stampOf: (id: MessageId) => Stamp | undefined;
 }): BindingResult {
@@ -464,11 +481,21 @@ export class ThinkingBinding {
   private readonly cursors = new Map<string, Cursor>();
   /** Released copies of stored messages, kept while the stored one lives. */
   private readonly releasedCopies = new WeakMap<StoredMessage, ReleasedCopy>();
+  /** The store's sequence when this state was made. A message stored before
+   *  it was stored by an earlier process, which this one can't attribute. */
+  private readonly attributedAfter: number;
+  /** Per branch, the messages this namespace's managers stored since then
+   *  that a walk may still read, with their sequence. */
+  private readonly stored = new Map<string, Map<MessageId, number>>();
+  /** The branch of the latest compile bound with an id. */
+  private lastBound: string | undefined;
 
   constructor(
     private readonly store: JsStore,
     private readonly namespace: string,
-  ) {}
+  ) {
+    this.attributedAfter = store.currentSequence();
+  }
 
   /** Whether stamps are in force: the namespace has accepted a compile. */
   engaged(): boolean {
@@ -508,19 +535,67 @@ export class ThinkingBinding {
   }
 
   /**
-   * A message carrying thinking was just stored on `branch`: stamp it now,
-   * from the store as it stands, which is what its round carried. A later
-   * edit to what came before it is then a change, which strips it.
+   * A manager of this namespace stored `message` on `branch`. What a live
+   * request carried after its compile is taken from these alone: another
+   * writer's message, stored in a shared slot mid-round, wasn't carried.
    */
-  stampStored(branch: BranchRef, own: readonly StoredMessage[]): void {
-    this.load();
-    this.stampNew(branchKey(branch), own, true);
+  noteStored(branch: BranchRef, message: StoredMessage): void {
+    const key = branchKey(branch);
+    let stored = this.stored.get(key);
+    if (!stored) this.stored.set(key, (stored = new Map()));
+    stored.set(message.id, message.sequence);
+  }
+
+  /** Whether `message`, on the branch keyed `key`, was stored while this
+   *  process ran by a writer other than this namespace's managers. */
+  private foreign(key: string, message: StoredMessage): boolean {
+    return message.sequence > this.attributedAfter && !this.stored.get(key)?.has(message.id);
   }
 
   /**
-   * Bind one compile's messages. First stamps what this manager stored on the
-   * branch since its owner and hasn't stamped yet. A compile with an id is
-   * remembered until accepted, and commits its stamps and releases; one
+   * `added`, which carries thinking, was just stored on `branch`: stamp it
+   * now, from what the walk has read, which is what its round carried. A
+   * later edit to what came before it is then a change, which strips it.
+   * Stored on another branch than the latest compile was bound on (a branch
+   * switched mid-round), it was minted under that branch's prefix, so
+   * nothing here vouches for it, and its thinking never renders.
+   */
+  stampStored(branch: BranchRef, own: readonly StoredMessage[], added: StoredMessage): void {
+    this.load();
+    const key = branchKey(branch);
+    if (this.lastBound !== undefined && this.lastBound !== key && !this.stamps.has(added.id)) {
+      this.stamps.set(added.id, UNBOUND);
+      this.unrecordedStamps.add(added.id);
+    }
+    this.stampNew(key, own, true);
+  }
+
+  /**
+   * `child` was just made from `parent`: it starts with the parent's
+   * releases. A block the provider refused on the parent is refused on the
+   * child, and a fork at the head shares the rewrites behind the rest. A
+   * branch made at an earlier message takes them all as well, so thinking
+   * whose prefix still holds there can lose it, which is the safe side.
+   * Recorded with the child's first accepted compile.
+   */
+  inherit(parent: BranchRef, child: BranchRef): void {
+    this.load();
+    const from = this.released.get(branchKey(parent));
+    if (!from || from.size === 0) return;
+    const key = branchKey(child);
+    const released = this.released.get(key) ?? new Map<MessageId, number>();
+    const unrecorded = this.unrecordedReleases.get(key) ?? new Map<MessageId, number>();
+    for (const [id, block] of from) {
+      if (addRelease(released, id, block)) unrecorded.set(id, block);
+    }
+    this.released.set(key, released);
+    this.unrecordedReleases.set(key, unrecorded);
+  }
+
+  /**
+   * Bind one compile's messages. First stamps what this namespace stored on
+   * the branch since its owner and hasn't stamped yet. A compile with an id
+   * is remembered until accepted, and commits its stamps and releases; one
    * without (a dry run) commits nothing.
    */
   bind(args: {
@@ -529,7 +604,10 @@ export class ThinkingBinding {
     messages: readonly ChainMessage[];
     sources: readonly CompiledMessageSources[];
     seed: string;
-    /** This manager's own stored messages on the branch, unfiltered, in
+    /** Whether the compile's target binds thinking to its prefix, so that
+     *  thinking without a matching stamp is stripped (default true). */
+    strip?: boolean;
+    /** The manager's own message slot on the branch, unfiltered, in
      *  sequence order. */
     own: readonly StoredMessage[];
     /** The highest message sequence the compile read. */
@@ -543,10 +621,11 @@ export class ThinkingBinding {
       messages: args.messages,
       sources: args.sources,
       seed: args.seed,
-      engaged: this.accepted,
+      engaged: this.accepted && args.strip !== false,
       stampOf: (id) => this.stamps.get(id) ?? made.get(id),
     });
     if (!commit) return result;
+    this.lastBound = key;
     const owner = this.latest.get(key);
     if (owner && result.strippedFrom.size > 0) {
       const released = this.released.get(key) ?? new Map<MessageId, number>();
@@ -666,6 +745,11 @@ export class ThinkingBinding {
     this.pending.delete(record.compileId);
     if (record.owns) {
       this.latest.set(key, { compileId: record.compileId, seed: record.seed, end: record.end, head: record.head, n });
+      // A walk on the branch starts after the owner's head from now on.
+      const stored = this.stored.get(key);
+      if (stored) {
+        for (const [id, sequence] of stored) if (sequence <= record.head) stored.delete(id);
+      }
       if (n !== undefined) {
         // Compiles bound before the owner minted nothing after it.
         const sent = this.sent.get(key);
@@ -719,6 +803,7 @@ export class ThinkingBinding {
     let fenced = false;
     for (let i = firstAfter(own, cursor.through); i < own.length; i++) {
       const message = own[i]!;
+      const foreign = this.foreign(key, message);
       if (!fenced && message.sequence > blindAfter) fenced = true;
       for (const compile of sent) {
         if (fenced) break;
@@ -727,11 +812,15 @@ export class ThinkingBinding {
         else fenced = true;
       }
       if (fenced) {
-        if (!this.stamps.has(message.id) && message.content.some(isThinkingBlock)) awaiting.add(message.id);
+        if (!foreign && !this.stamps.has(message.id) && message.content.some(isThinkingBlock)) awaiting.add(message.id);
         continue;
       }
       cursor.through = message.sequence;
       if (cursor.chain === null) continue;
+      // Another writer's message, stored mid-round in a shared slot: the
+      // live request didn't carry it. A compile that renders it differs from
+      // the walk at its head, and fences what follows until it's accepted.
+      if (foreign) continue;
       if (message.bodyGroupId !== undefined) {
         cursor.chain = null;
         continue;

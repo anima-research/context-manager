@@ -131,21 +131,25 @@ export interface ContextStrategy {
    * that this strategy rendered and priced: its prefix changed since the
    * thinking was minted (see the context manager's thinking binding). A
    * strategy that calibrates its estimates against real usage should compare
-   * that usage with what was sent. Called after every compile that strips, a
-   * dry run included, so it follows whichever select ran last.
+   * that usage with what was sent. Called after every committing compile that
+   * strips. A dry compile isn't reported, since its select leaves calibration
+   * as the last committing compile left it.
    */
   noteStrippedTokens?(tokens: number): void;
 
   /**
-   * The context manager's thinking-binding pass is engaged on this store: its
-   * host has accepted a round, so from now on a compile sends a thinking block
-   * only while the prefix it was minted under holds. Called at each
-   * initialization once that is so, and at the acceptance that engages it.
-   * Thinking minted in another request (a summary's captured reasoning
-   * carriers) can never be sent in the live window from then on, so a
-   * strategy should stop rendering and pricing it there.
+   * Whether the compile about to select sends a thinking block only while the
+   * prefix it was minted under holds: the context manager's thinking-binding
+   * pass is engaged on this store (its host has accepted a round), and the
+   * compile's target binds thinking to its prefix (`SelectOptions.bindsThinking`).
+   * Called before each compile's select. A dry compile is told its own value,
+   * and the strategy is then told the last committing compile's again, so a
+   * dry compile leaves this as it found it. While it is true, thinking minted
+   * in another request (a summary's captured reasoning carriers) can't be
+   * sent in the live window, so a strategy should stop rendering and pricing
+   * it there.
    */
-  noteThinkingBound?(): void;
+  noteThinkingBound?(bound: boolean): void;
 
   /** Strategy name for identification */
   readonly name: string;
@@ -303,6 +307,25 @@ export interface SelectOptions {
    * change invalidated.
    */
   prefixIdentity?: string;
+  /**
+   * Whether the model this compile is sent to binds a signed thinking block
+   * to the prefix it was minted under (default true). Where it does, a block
+   * sent under a changed prefix is refused, or dropped under
+   * `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, so the
+   * thinking-binding pass strips it. Set it false for a model that keeps such
+   * a block: the compile then sends thinking as stored, and the strategy
+   * renders the live window as configured. Stamping goes on either way, so a
+   * later compile for a model that binds still finds every reply's stamp.
+   *
+   * It records a provider behaviour that is measured, not promised. On
+   * 2026-10-11, on one Anthropic account, Opus 5.5, Haiku 5.5, Sonnet 5.5 and
+   * Fable 5.1 bound thinking to its prefix, and Fable 5 and Sonnet 5 kept it.
+   * A model left at the default is stripped, which is the safe side. If a
+   * model set false starts binding, an account that enforces binding refuses
+   * the first request that sends a block under a changed prefix, and one
+   * that drops loses the block: this setting is the one to check.
+   */
+  bindsThinking?: boolean;
   /** Audited, expiring continuity relaxation for disruptive transitions.
    * Invalid or expired values fail closed to normal continuity weight. */
   kvUnifiedContinuityRelaxation?: {
@@ -868,10 +891,14 @@ export interface AutobiographicalConfig {
    * minted in the summarizer's request, under another conversation, so an
    * account that enforces thinking binding refuses or drops it in the live
    * window, and the context manager's binding pass never sends thinking it
-   * can't vouch for. Once that pass is engaged (`noteThinkingBound`), this
-   * strategy renders and prices the live window as under `'live-strip'`,
-   * whatever this says. `'full'` still governs a store whose host has never
-   * accepted a round, and mint requests are unchanged either way.
+   * can't vouch for. For a compile whose thinking is bound
+   * (`noteThinkingBound`: the pass is engaged and the compile's target binds
+   * thinking), this strategy renders and prices the live window as under
+   * `'live-strip'`, whatever this says. `'full'` still governs a compile
+   * whose thinking isn't bound: on a store whose host has never accepted a
+   * round, or for a target that keeps thinking under a changed prefix
+   * (`SelectOptions.bindsThinking: false`). Mint requests are unchanged
+   * either way.
    */
   carrierPolicy?: CarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */

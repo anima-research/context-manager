@@ -8959,16 +8959,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (Number.isFinite(tokens) && tokens > 0) this._lastCompileEstimate = Math.max(0, this._lastCompileEstimate - tokens);
   }
 
-  /** Whether the context manager's thinking-binding pass is engaged: the live
-   *  window then renders as under `carrierPolicy: 'live-strip'`. */
+  /** Whether the compile selecting now sends thinking only while the prefix
+   *  it was minted under holds: the live window then renders as under
+   *  `carrierPolicy: 'live-strip'`. The context manager says so before each
+   *  compile's select. */
   private thinkingBound = false;
 
-  noteThinkingBound(): void {
-    this.thinkingBound = true;
+  noteThinkingBound(bound: boolean): void {
+    this.thinkingBound = bound;
   }
 
   /** The carrier policy the live window renders and prices under: the
-   *  configured one, until thinking is bound (see `carrierPolicy`). */
+   *  configured one, unless thinking is bound (see `carrierPolicy`). */
   private liveCarrierPolicy(): CarrierPolicy {
     return this.thinkingBound || this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
   }

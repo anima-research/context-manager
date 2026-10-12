@@ -260,6 +260,9 @@ export class ContextManager {
   private foldJournal: FoldJournal;
   /** Which thinking each compile can still send (see thinking-binding.ts). */
   private thinkingBinding: ThinkingBinding;
+  /** What each strategy was last told for a committing compile: whether its
+   *  thinking was bound (noteThinkingBound). A dry compile puts it back. */
+  private readonly thinkingBoundNoted = new WeakMap<ContextStrategy, boolean>();
 
   private constructor(
     store: JsStore,
@@ -977,6 +980,8 @@ export class ContextManager {
 
     // Use createBranchAt to branch at the message's sequence (time-travel)
     const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
+    // What the provider refused on this branch it refuses on the new one.
+    this.thinkingBinding.inherit(branchRefOf(this.store), { id: branch.id, name: branch.name, created: branch.created });
 
     return branch.name;
   }
@@ -1031,6 +1036,8 @@ export class ContextManager {
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
+    // What the provider refused on this branch it refuses on the fork.
+    this.thinkingBinding.inherit(branchRefOf(this.store), { id: branch.id, name: branch.name, created: branch.created });
     await this.selectBranch(branch.name, true);
     return branch.name;
   }
@@ -1129,22 +1136,34 @@ export class ContextManager {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
 
-    // Once thinking is bound, by an acceptance through any manager on this
-    // store, the strategy renders the live window for it (the hook is
-    // idempotent).
-    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
+    // This compile's thinking is bound once an acceptance through any manager
+    // on this store has engaged the pass, unless its target keeps thinking
+    // under a changed prefix (SelectOptions.bindsThinking). The strategy
+    // renders the live window for that; a dry compile then puts back what
+    // the last committing compile told it.
+    const dryRun = opts?.dryRun === true;
+    const binds = opts?.bindsThinking !== false;
+    const thinkingBound = this.thinkingBinding.engaged() && binds;
+    const strategy = this.strategy;
+    strategy.noteThinkingBound?.(thinkingBound);
+    if (!dryRun) this.thinkingBoundNoted.set(strategy, thinkingBound);
 
     // The branch and view this compile reads; provenance binds to both.
     const branch = branchRefOf(this.store);
     const view = this.strategyMessageView();
 
     // Get selected entries from strategy
-    const entries = this.strategy.select(
-      view,
-      this.contextLog.createView(),
-      effectiveBudget,
-      opts
-    );
+    let entries: ContextEntry[];
+    try {
+      entries = strategy.select(
+        view,
+        this.contextLog.createView(),
+        effectiveBudget,
+        opts
+      );
+    } finally {
+      if (dryRun) strategy.noteThinkingBound?.(this.thinkingBoundNoted.get(strategy) ?? false);
+    }
     const selectionCause = this.strategy.takeSelectionCause?.();
     if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
@@ -1190,9 +1209,9 @@ export class ContextManager {
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
       // Thinking goes out only while the prefix it was minted under holds
-      // (thinking-binding.ts). The seed covers what the host sends before the
-      // messages and the system injections this compile adds to it.
-      const dryRun = opts?.dryRun === true;
+      // (thinking-binding.ts), where the target binds it. The seed covers what
+      // the host sends before the messages and the system injections this
+      // compile adds to it.
       const compileId = randomUUID();
       const seed = chainSeed(opts?.prefixIdentity, result.systemInjections);
       const bound = this.thinkingBinding.bind({
@@ -1201,6 +1220,7 @@ export class ContextManager {
         messages: result.messages,
         sources: messageSources,
         seed,
+        strip: binds,
         own: this.messageStore.getAll(),
         head: storedMessages.reduce((max, m) => Math.max(max, m.sequence), 0),
       });
@@ -1211,7 +1231,17 @@ export class ContextManager {
         // Every part of an entry carries that entry's sources object.
         const entryIndex = new Map<CompiledMessageSources, number>(attribution.sources.map((source, e) => [source, e]));
         layoutEntries = sentEntries(entries, messageSources.map((source) => entryIndex.get(source) ?? -1), result.messages, bound);
-        result.messages = bound.kept.map((i, k) => ({ ...result.messages[i]!, content: bound.messages[k]!.content }));
+        const before = result.messages;
+        result.messages = bound.kept.map((i, k) => ({ ...before[i]!, content: bound.messages[k]!.content }));
+        // A message the strip left empty is dropped. Its cache breakpoint
+        // moves to the message before it, which ends the same prefix.
+        for (let i = 0, j = 0, k = -1; i < before.length; i++) {
+          if (bound.kept[j] === i) {
+            k = j++;
+            continue;
+          }
+          if (before[i]!.cacheBreakpoint && k >= 0) result.messages[k] = { ...result.messages[k]!, cacheBreakpoint: true };
+        }
         messageSources.splice(0, messageSources.length, ...bound.sources);
       }
       for (const source of messageSources) {
@@ -1242,7 +1272,8 @@ export class ContextManager {
         layout,
         strategy: this.strategy.name,
         // Only a layout is ever accepted, so only then ask where the journal stands.
-        ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
+        ...(layout && !dryRun ? { journalMark: this.foldJournal.mark() } : {}),
+        ...(dryRun ? { dryRun: true as const } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
@@ -1381,12 +1412,15 @@ export class ContextManager {
    *
    * Thinking before `fromBlock` stays; thinking after it in the message goes
    * too, since it was minted after the refused block. The replies after the
-   * message lose their thinking at the next compile, as for any change
-   * before them. The branch's next accepted compile records the release;
-   * until then it holds in this process. It acts whether or not the pass is
-   * engaged. A second call keeps the earlier block. Throws for a message the
-   * current branch doesn't hold, or a `fromBlock` that isn't one of its
-   * blocks.
+   * message lose their thinking at the next compile whose thinking is bound
+   * (the pass is engaged, and its target binds thinking), as for any change
+   * before them; until then they keep it. The release itself acts whether or
+   * not the pass is engaged. The branch's next accepted compile records it;
+   * until then it holds in this process, so after a restart the provider
+   * refuses the block again, and the host releases it again. A branch made
+   * from this one later (`fork`, `branchAt`) starts with it. A second call
+   * keeps the earlier block. Throws for a message the current branch doesn't
+   * hold, or a `fromBlock` that isn't one of its blocks.
    */
   releaseThinking(messageId: MessageId, fromBlock = 0): void {
     if (!Number.isInteger(fromBlock) || fromBlock < 0) {
@@ -1422,19 +1456,23 @@ export class ContextManager {
    *
    * It also records the chain the compile's messages were sent under, so the
    * replies minted under it keep their thinking at later compiles while that
-   * prefix holds (thinking-binding.ts). The first acceptance on a store's
-   * namespace engages that pass. From then on a reply keeps its thinking
-   * when this manager can vouch for what it was minted under: the chain of
-   * the branch's latest accepted compile, extended by what the manager
-   * stored after it, provided every compile it bound in between sent the
-   * same. It remembers its 32 most recent compiles until they are accepted,
-   * and accepting one it has forgotten records nothing.
-   * The host's part: what it stores in this manager's own slot after a
-   * compile, up to a reply, is taken as what the round's request carried
-   * after the compile's messages, in that order and as it stands when the
-   * reply is stored. Store each round as it went out, and defer other
+   * prefix holds (thinking-binding.ts). The chain's seed covers the host's
+   * system prompt and tools only when it passes `SelectOptions.prefixIdentity`.
+   * The first acceptance on a store's namespace engages that pass. From then
+   * on a reply keeps its thinking when this manager can vouch for what it was
+   * minted under: the chain of the branch's latest accepted compile, extended
+   * by what this namespace stored after it, provided every compile bound in
+   * between sent the same. It remembers its 32 most recent compiles until
+   * they are accepted, and accepting one it has forgotten records nothing.
+   * The host's part: what it stores through this namespace's managers after
+   * a compile, up to a reply, is taken as what the round's request carried
+   * after the compile's messages, in that order, each message as it stood
+   * when first read: at the next compile, or when a later reply was stored.
+   * Store each round as it went out and each reply whole, and defer other
    * writes to the slot (a message heard mid-tool-loop) until the turn ends.
-   * An edit after a reply is stored strips the reply's thinking.
+   * An edit made after that strips the thinking of the replies after it.
+   * Then the store is synced, so the record is durable before the
+   * acceptance is reported.
    *
    * Returns the receipt, or null: no change, or a compile with no layout to
    * record (`provenance.layout` is null): a strategy that doesn't report its
@@ -1447,7 +1485,8 @@ export class ContextManager {
    * back again (key on its id and compileId: a receipt lost to Chronicle's
    * rot exception can have its id go to a later receipt). A provenance of
    * another namespace is refused with an error: accept a compile on the
-   * manager that compiled it.
+   * manager that compiled it. A dry compile's provenance (`dryRun`) is
+   * refused with a warning, recording nothing, since no round carries it.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -1455,13 +1494,18 @@ export class ContextManager {
     usage?: RoundUsage;
     presentation?: Presentation;
   }): FoldReceipt | null {
+    if (args.provenance.dryRun) {
+      console.warn(
+        `[context-manager] acceptRound: compile ${args.provenance.compileId} was a dry run, ` +
+        'which no round carries; nothing is recorded',
+      );
+      return null;
+    }
     // The thinking-binding record first: the chain this compile was sent
     // under, which stamps the replies that follow it. The first one engages
-    // the pass, and the strategy then renders the live window for it (a
-    // manager whose store another manager's acceptance engaged tells its
-    // strategy at its next compile).
+    // the pass for every manager of the namespace on this store, from its
+    // next compile.
     this.thinkingBinding.accept(args.provenance.compileId);
-    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
     const receipt = this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
     // The journal syncs when it writes; when it writes nothing, this makes
     // the binding record durable before the acceptance is reported.
@@ -1798,7 +1842,6 @@ export class ContextManager {
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
       throw new InitializationSupersededError(selection);
     }
-    if (this.thinkingBinding.engaged()) strategy.noteThinkingBound?.();
     const current = observeStoreBranch(this.store);
     const currentBranchId = this.store.currentBranch().id;
     if (
@@ -1932,10 +1975,12 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
-    // A reply's thinking is stamped as its round left the store: what it was
-    // minted after is what is stored before it now (thinking-binding.ts).
+    // What this namespace stores is what its rounds carried; a reply's
+    // thinking is stamped as its round left the store (thinking-binding.ts).
+    const branch = branchRefOf(this.store);
+    this.thinkingBinding.noteStored(branch, message);
     if (message.content.some(isThinkingBlock)) {
-      this.thinkingBinding.stampStored(branchRefOf(this.store), this.messageStore.getAll());
+      this.thinkingBinding.stampStored(branch, this.messageStore.getAll(), message);
     }
     if (this.holdingAdds) {
       this.holdingAdds.push(message.id);
