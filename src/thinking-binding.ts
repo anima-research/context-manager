@@ -38,7 +38,8 @@
  * reply answers, so rounds that overlap across a switch defeat this: once a
  * compile on the new branch is bound before the old round's reply is stored,
  * that reply is stamped from the new branch, and its thinking can go out
- * there once, to be refused or dropped.
+ * with every compile there, refused or dropped each time, until the host
+ * releases it (`releaseThinking`) or removes the reply.
  *
  * Stamping vouches for a reply only through compiles that sent what it
  * walked. A compile bound after the accepted one (sent, its acceptance not
@@ -53,7 +54,8 @@
  * not yet recorded is stamped again from the store as it stands, and if it
  * was minted under a compile that sent something else, from the walk. An
  * edit before such a reply, made in that window, is then taken as what its
- * round carried, and the provider refuses or drops its thinking once.
+ * round carried, and its thinking can go out with every compile, refused or
+ * dropped each time, until the host releases it.
  *
  * The host's part. Stamping takes what this namespace's managers stored in
  * their own slot after an accepted compile, up to a reply, as what the live
@@ -569,7 +571,9 @@ export class ThinkingBinding {
    * switched mid-round), it was minted under that branch's prefix, so
    * nothing here vouches for it, and its thinking never renders. The latest
    * compile stands in for the reply's own, which holds while rounds don't
-   * overlap a switch (see the module comment).
+   * overlap a switch. When they do, the reply's thinking can go out with
+   * every compile on the new branch until the host releases it (see the
+   * module comment).
    */
   stampStored(branch: BranchRef, own: readonly StoredMessage[], added: StoredMessage): void {
     this.load();
