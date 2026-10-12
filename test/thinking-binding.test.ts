@@ -1066,6 +1066,18 @@ describe('thinking binding', () => {
       assert.ok(afterReopen.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary renders after a reopen');
       assert.deepEqual(signaturesIn(afterReopen), []);
       assert.equal(afterReopen.thinkingStripped, 0);
+      // A branch switch keeps what the last committing compile told the
+      // strategy, since neither the namespace's engagement nor the host's
+      // target changes with a branch. A dry compile after it puts that back.
+      await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false });
+      fresh.told.length = 0;
+      const home = reopened.currentBranch().name;
+      await reopened.fork('zz-loose-fork');
+      assert.deepEqual(fresh.told, [false], 'the switch keeps the last committing compile’s value');
+      await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', dryRun: true });
+      assert.deepEqual(fresh.told, [false, true, false]);
+      await reopened.switchBranch(home);
+      assert.deepEqual(fresh.told, [false, true, false, false]);
       reopened.close();
     });
   });

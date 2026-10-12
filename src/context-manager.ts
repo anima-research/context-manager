@@ -1858,10 +1858,13 @@ export class ContextManager {
         `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
-    // Until a compile tells it otherwise, the strategy holds what a compile
-    // for a target that binds would be told here, so a dry compile before any
-    // committing one, or reads between compiles, see the store's engagement.
-    const bound = this.thinkingBinding.engaged();
+    // A strategy this manager has compiled with keeps what its last committing
+    // compile told it: a branch switch changes neither the namespace's
+    // engagement nor the host's target. Until a first compile tells it
+    // otherwise, a strategy holds what a compile for a target that binds would
+    // be told here, so a dry compile before any committing one, or reads
+    // between compiles, see the store's engagement.
+    const bound = this.thinkingBoundNoted.get(strategy) ?? this.thinkingBinding.engaged();
     strategy.noteThinkingBound?.(bound);
     this.thinkingBoundNoted.set(strategy, bound);
     this.initializedAttempt = attempt;

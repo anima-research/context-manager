@@ -143,8 +143,10 @@ export interface ContextStrategy {
    * pass is engaged for its namespace (its host has accepted a round through
    * one of the namespace's managers on this store), and the
    * compile's target binds thinking to its prefix (`SelectOptions.bindsThinking`).
-   * Called at the strategy's initialization, with whether the namespace is
-   * engaged, and before each compile's select. A dry compile is told its own
+   * Called at each initialization of the strategy (open, `setStrategy`, a
+   * branch switch), with the last committing compile's value once the manager
+   * has compiled with it, and before that with whether the namespace is
+   * engaged. Also called before each compile's select. A dry compile is told its own
    * value, and the strategy is then told the last committing compile's (or
    * initialization's) again, so a dry compile leaves this as it found it. While it is true, thinking minted
    * in another request (a summary's captured reasoning carriers) can't be
