@@ -5,8 +5,9 @@
  * stamp (a carrier, a message from before any accepted compile) never renders
  * once the store's host has accepted a round. Stamps, releases and engagement
  * are recorded at each accepted compile, so a reopened store keeps what its
- * last record held. A target that doesn't bind thinking to its prefix
- * (`bindsThinking: false`) gets thinking as stored, and stamping goes on.
+ * last record held. A compile for a target that doesn't bind thinking to
+ * its prefix (`bindsThinking: false`) strips nothing more, brings back
+ * nothing the branch released, and stamping goes on.
  */
 
 import { describe, it } from 'node:test';
@@ -996,9 +997,17 @@ describe('thinking binding', () => {
       /** Keeps what the manager tells it before each select. */
       class TellingStrategy extends SeedableStrategy {
         told: boolean[] = [];
+        failNext = false;
         override noteThinkingBound(bound: boolean): void {
           this.told.push(bound);
           super.noteThinkingBound(bound);
+        }
+        override select(...args: Parameters<SeedableStrategy['select']>): ReturnType<SeedableStrategy['select']> {
+          if (this.failNext) {
+            this.failNext = false;
+            throw new Error('zz select failed');
+          }
+          return super.select(...args);
         }
       }
       const strategy = new TellingStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
@@ -1041,10 +1050,18 @@ describe('thinking binding', () => {
       assert.deepEqual(signaturesIn(dryLoose), ['C1']);
       assert.deepEqual(strategy.told, [false, true], 'told its own target, then the last committing compile’s again');
       cm.close();
-      // A strategy that opens on an engaged store renders the live window as
-      // bound from its first compile.
-      const fresh = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
+      // A strategy that opens on an engaged store is told so at its
+      // initialization, and renders the live window as bound from its first
+      // compile. A dry compile before any committing one puts that back, and
+      // so does one whose select throws.
+      const fresh = new TellingStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
       const reopened = await ContextManager.open({ path, strategy: fresh });
+      assert.deepEqual(fresh.told, [true], 'told the store’s engagement at initialization');
+      await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false, dryRun: true });
+      assert.deepEqual(fresh.told, [true, false, true]);
+      fresh.failNext = true;
+      await assert.rejects(reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false, dryRun: true }), /zz select failed/);
+      assert.deepEqual(fresh.told, [true, false, true, false, true]);
       const afterReopen = await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
       assert.ok(afterReopen.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary renders after a reopen');
       assert.deepEqual(signaturesIn(afterReopen), []);
@@ -1275,6 +1292,20 @@ describe('thinking binding', () => {
         assert.deepEqual(signaturesIn(onFork), ['S1'], 'what the provider refused on main it refuses on the fork');
         cm.acceptRound({ provenance: onFork.provenance! });
         assert.ok(releasesRecorded(cm).some(([id]) => id === idOf(cm, 'S2')), 'the fork’s acceptance records it');
+        cm.close();
+      });
+    });
+
+    it('starts a branch made at a message with the releases of the branch it was made from', async () => {
+      await withStore(async (path) => {
+        const cm = await ContextManager.open({ path });
+        await turn(cm, 'u1', 'a1', 'S1');
+        await turn(cm, 'u2', 'a2', 'S2');
+        cm.releaseThinking(idOf(cm, 'S2'));
+        await cm.switchBranch(cm.branchAt(idOf(cm, 'S2'), 'zz-at'));
+        cm.addMessage('user', text('u3'));
+        const onBranch = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        assert.deepEqual(signaturesIn(onBranch), ['S1'], 'what the provider refused there it refuses here');
         cm.close();
       });
     });

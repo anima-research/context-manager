@@ -34,7 +34,11 @@
  * first accepted compile, replies stored after a sharded body in the same
  * live request, whose form as sent the shards can't restore, and a reply
  * stored on another branch than the latest compile was bound on (a branch
- * switched while its round was out).
+ * switched while its round was out). The pass can't tell which compile a
+ * reply answers, so rounds that overlap across a switch defeat this: once a
+ * compile on the new branch is bound before the old round's reply is stored,
+ * that reply is stamped from the new branch, and its thinking can go out
+ * there once, to be refused or dropped.
  *
  * Stamping vouches for a reply only through compiles that sent what it
  * walked. A compile bound after the accepted one (sent, its acceptance not
@@ -44,7 +48,8 @@
  * makes it the owner the next walk stamps them from, and lose their thinking
  * for good if a compile bound later is accepted first. What the process
  * learned since the last record is not known after a reopen: compiles bound,
- * stamps made and a host's releases. So a reply stored before the reopen and
+ * stamps made, a host's releases, and the releases a new branch took from
+ * the one it was made from. So a reply stored before the reopen and
  * not yet recorded is stamped again from the store as it stands, and if it
  * was minted under a compile that sent something else, from the walk. An
  * edit before such a reply, made in that window, is then taken as what its
@@ -439,8 +444,9 @@ const bindings = new WeakMap<JsStore, Map<string, ThinkingBinding>>();
 
 /**
  * The thinking-binding state of `namespace` on `store`, one for every
- * manager on that store object, as the fold journal's index is: an
- * acceptance through any of them engages, stamps and fences for all.
+ * manager of that namespace on that store object, as the fold journal's
+ * index is: an acceptance through any of them engages, stamps and fences for
+ * all. Another namespace's acceptances don't engage it.
  */
 export function thinkingBindingFor(store: JsStore, namespace: string): ThinkingBinding {
   let byNamespace = bindings.get(store);
@@ -561,7 +567,9 @@ export class ThinkingBinding {
    * later edit to what came before it is then a change, which strips it.
    * Stored on another branch than the latest compile was bound on (a branch
    * switched mid-round), it was minted under that branch's prefix, so
-   * nothing here vouches for it, and its thinking never renders.
+   * nothing here vouches for it, and its thinking never renders. The latest
+   * compile stands in for the reply's own, which holds while rounds don't
+   * overlap a switch (see the module comment).
    */
   stampStored(branch: BranchRef, own: readonly StoredMessage[], added: StoredMessage): void {
     this.load();
@@ -674,8 +682,13 @@ export class ThinkingBinding {
    * Forget the writes noted on a branch that no walk can read again: those
    * at or below its owner's head or, while it has no owner, at or below the
    * lowest head among its remembered compiles, any of which could become the
-   * owner. So what is noted stays bounded for a host that never accepts a
-   * round.
+   * owner. So what is noted stays bounded, on each branch this namespace
+   * compiles on, for a host that never accepts a round. This takes it that a
+   * later owner's head isn't lower than its predecessor's, which holds while
+   * this namespace's compiles read the same messages. One that read fewer
+   * (two managers of the namespace with different view filters, say) would
+   * read the writes forgotten above its head as another writer's, and the
+   * replies among them would lose their thinking: the safe side.
    */
   private pruneStored(key: string): void {
     const stored = this.stored.get(key);

@@ -140,11 +140,13 @@ export interface ContextStrategy {
   /**
    * Whether the compile about to select sends a thinking block only while the
    * prefix it was minted under holds: the context manager's thinking-binding
-   * pass is engaged on this store (its host has accepted a round), and the
+   * pass is engaged for its namespace (its host has accepted a round through
+   * one of the namespace's managers on this store), and the
    * compile's target binds thinking to its prefix (`SelectOptions.bindsThinking`).
-   * Called before each compile's select. A dry compile is told its own value,
-   * and the strategy is then told the last committing compile's again, so a
-   * dry compile leaves this as it found it. While it is true, thinking minted
+   * Called at the strategy's initialization, with whether the namespace is
+   * engaged, and before each compile's select. A dry compile is told its own
+   * value, and the strategy is then told the last committing compile's (or
+   * initialization's) again, so a dry compile leaves this as it found it. While it is true, thinking minted
    * in another request (a summary's captured reasoning carriers) can't be
    * sent in the live window, so a strategy should stop rendering and pricing
    * it there.

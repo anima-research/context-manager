@@ -260,8 +260,9 @@ export class ContextManager {
   private foldJournal: FoldJournal;
   /** Which thinking each compile can still send (see thinking-binding.ts). */
   private thinkingBinding: ThinkingBinding;
-  /** What each strategy was last told for a committing compile: whether its
-   *  thinking was bound (noteThinkingBound). A dry compile puts it back. */
+  /** What each strategy was last told for a committing compile, or at its
+   *  initialization: whether its thinking was bound (noteThinkingBound). A
+   *  dry compile puts it back. */
   private readonly thinkingBoundNoted = new WeakMap<ContextStrategy, boolean>();
 
   private constructor(
@@ -1137,10 +1138,10 @@ export class ContextManager {
     const _t0 = _diag ? Date.now() : 0;
 
     // This compile's thinking is bound once an acceptance through any manager
-    // on this store has engaged the pass, unless its target keeps thinking
-    // under a changed prefix (SelectOptions.bindsThinking). The strategy
-    // renders the live window for that; a dry compile then puts back what
-    // the last committing compile told it.
+    // of this namespace on this store has engaged the pass, unless its target
+    // keeps thinking under a changed prefix (SelectOptions.bindsThinking). The
+    // strategy renders the live window for that; a dry compile then puts back
+    // what the last committing compile, or initialization, told it.
     const dryRun = opts?.dryRun === true;
     const binds = opts?.bindsThinking !== false;
     const thinkingBound = this.thinkingBinding.engaged() && binds;
@@ -1149,12 +1150,13 @@ export class ContextManager {
     if (!dryRun) this.thinkingBoundNoted.set(strategy, thinkingBound);
 
     // The branch and view this compile reads; provenance binds to both.
-    const branch = branchRefOf(this.store);
-    const view = this.strategyMessageView();
-
+    let branch: BranchRef;
+    let view: MessageStoreView;
     // Get selected entries from strategy
     let entries: ContextEntry[];
     try {
+      branch = branchRefOf(this.store);
+      view = this.strategyMessageView();
       entries = strategy.select(
         view,
         this.contextLog.createView(),
@@ -1234,7 +1236,8 @@ export class ContextManager {
         const before = result.messages;
         result.messages = bound.kept.map((i, k) => ({ ...before[i]!, content: bound.messages[k]!.content }));
         // A message the strip left empty is dropped. Its cache breakpoint
-        // moves to the message before it, which ends the same prefix.
+        // moves to the message before it, which ends the same prefix. The
+        // first message has none before it, so its breakpoint goes.
         for (let i = 0, j = 0, k = -1; i < before.length; i++) {
           if (bound.kept[j] === i) {
             k = j++;
@@ -1855,6 +1858,12 @@ export class ContextManager {
         `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
+    // Until a compile tells it otherwise, the strategy holds what a compile
+    // for a target that binds would be told here, so a dry compile before any
+    // committing one, or reads between compiles, see the store's engagement.
+    const bound = this.thinkingBinding.engaged();
+    strategy.noteThinkingBound?.(bound);
+    this.thinkingBoundNoted.set(strategy, bound);
     this.initializedAttempt = attempt;
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
   }
