@@ -1090,6 +1090,26 @@ describe('thinking binding', () => {
       reopened.close();
     });
   });
+  it('tells a strategy at a branch switch the engagement an acceptance since its last compile turned on', async () => {
+    await withStore(async (path) => {
+      class TellingStrategy extends SeedableStrategy {
+        told: boolean[] = [];
+        override noteThinkingBound(bound: boolean): void {
+          this.told.push(bound);
+          super.noteThinkingBound(bound);
+        }
+      }
+      const strategy = new TellingStrategy({ headWindowTokens: 0, recentWindowTokens: 8 });
+      const cm = await ContextManager.open({ path, strategy });
+      cm.addMessage('user', text('zz-u1'));
+      const out = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.deepEqual(strategy.told, [false, false], 'not engaged at initialization or at the first compile');
+      cm.acceptRound({ provenance: out.provenance! });
+      await cm.fork('zz-after-accept');
+      assert.deepEqual(strategy.told, [false, false, true], 'the acceptance engaged it, for a target that binds');
+      cm.close();
+    });
+  });
   it('strips nothing for a target that doesn’t bind it, and stamps on, so a target that binds finds each stamp', async () => {
     await withStore(async (path) => {
       const cm = await ContextManager.open({ path });

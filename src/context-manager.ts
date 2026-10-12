@@ -264,6 +264,10 @@ export class ContextManager {
    *  initialization: whether its thinking was bound (noteThinkingBound). A
    *  dry compile puts it back. */
   private readonly thinkingBoundNoted = new WeakMap<ContextStrategy, boolean>();
+  /** The target of each strategy's last committing compile: whether it bound
+   *  thinking (SelectOptions.bindsThinking). Initialization tells a strategy
+   *  the namespace's engagement for it. */
+  private readonly thinkingBindsNoted = new WeakMap<ContextStrategy, boolean>();
 
   private constructor(
     store: JsStore,
@@ -1156,7 +1160,10 @@ export class ContextManager {
       // Inside the try, so a dry compile puts the strategy back even when its
       // own hook throws after taking the value. A committing compile notes
       // the value first, so what the strategy holds and what is noted agree.
-      if (!dryRun) this.thinkingBoundNoted.set(strategy, thinkingBound);
+      if (!dryRun) {
+        this.thinkingBindsNoted.set(strategy, binds);
+        this.thinkingBoundNoted.set(strategy, thinkingBound);
+      }
       strategy.noteThinkingBound?.(thinkingBound);
       branch = branchRefOf(this.store);
       view = this.strategyMessageView();
@@ -1861,13 +1868,13 @@ export class ContextManager {
         `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
-    // A strategy this manager has compiled with keeps what its last committing
-    // compile told it: a branch switch changes neither the namespace's
-    // engagement nor the host's target. Until a first compile tells it
-    // otherwise, a strategy holds what a compile for a target that binds would
-    // be told here, so a dry compile before any committing one, or reads
-    // between compiles, see the store's engagement.
-    const bound = this.thinkingBoundNoted.get(strategy) ?? this.thinkingBinding.engaged();
+    // The strategy is told what a compile for its last committing compile's
+    // target would be told now, or for a target that binds before any compile.
+    // A branch switch doesn't change the host's target, and engagement is the
+    // namespace's, which an acceptance since that compile may have turned on.
+    // So a dry compile, or reads between compiles, see the store's engagement
+    // from here on.
+    const bound = this.thinkingBinding.engaged() && (this.thinkingBindsNoted.get(strategy) ?? true);
     strategy.noteThinkingBound?.(bound);
     this.thinkingBoundNoted.set(strategy, bound);
     this.initializedAttempt = attempt;
