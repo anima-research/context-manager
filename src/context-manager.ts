@@ -1146,8 +1146,6 @@ export class ContextManager {
     const binds = opts?.bindsThinking !== false;
     const thinkingBound = this.thinkingBinding.engaged() && binds;
     const strategy = this.strategy;
-    strategy.noteThinkingBound?.(thinkingBound);
-    if (!dryRun) this.thinkingBoundNoted.set(strategy, thinkingBound);
 
     // The branch and view this compile reads; provenance binds to both.
     let branch: BranchRef;
@@ -1155,6 +1153,11 @@ export class ContextManager {
     // Get selected entries from strategy
     let entries: ContextEntry[];
     try {
+      // Inside the try, so a dry compile puts the strategy back even when its
+      // own hook throws after taking the value. A committing compile notes
+      // the value first, so what the strategy holds and what is noted agree.
+      if (!dryRun) this.thinkingBoundNoted.set(strategy, thinkingBound);
+      strategy.noteThinkingBound?.(thinkingBound);
       branch = branchRefOf(this.store);
       view = this.strategyMessageView();
       entries = strategy.select(

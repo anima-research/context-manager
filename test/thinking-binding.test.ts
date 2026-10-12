@@ -998,9 +998,14 @@ describe('thinking binding', () => {
       class TellingStrategy extends SeedableStrategy {
         told: boolean[] = [];
         failNext = false;
+        failTellNext = false;
         override noteThinkingBound(bound: boolean): void {
           this.told.push(bound);
           super.noteThinkingBound(bound);
+          if (this.failTellNext) {
+            this.failTellNext = false;
+            throw new Error('zz tell failed');
+          }
         }
         override select(...args: Parameters<SeedableStrategy['select']>): ReturnType<SeedableStrategy['select']> {
           if (this.failNext) {
@@ -1062,6 +1067,10 @@ describe('thinking binding', () => {
       fresh.failNext = true;
       await assert.rejects(reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false, dryRun: true }), /zz select failed/);
       assert.deepEqual(fresh.told, [true, false, true, false, true]);
+      // So does one whose telling hook takes the value and then throws.
+      fresh.failTellNext = true;
+      await assert.rejects(reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false, dryRun: true }), /zz tell failed/);
+      assert.deepEqual(fresh.told, [true, false, true, false, true, false, true]);
       const afterReopen = await reopened.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
       assert.ok(afterReopen.provenance!.messages.some((s) => s.kind === 'summary'), 'the summary renders after a reopen');
       assert.deepEqual(signaturesIn(afterReopen), []);
