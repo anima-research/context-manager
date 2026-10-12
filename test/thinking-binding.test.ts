@@ -1052,7 +1052,7 @@ describe('thinking binding', () => {
       reopened.close();
     });
   });
-  it('sends thinking as stored for a target that doesn’t bind it, and stamps on, so a target that binds finds each stamp', async () => {
+  it('strips nothing for a target that doesn’t bind it, and stamps on, so a target that binds finds each stamp', async () => {
     await withStore(async (path) => {
       const cm = await ContextManager.open({ path });
       const loose = { prefixIdentity: 'p0', bindsThinking: false };
@@ -1071,6 +1071,32 @@ describe('thinking binding', () => {
       const changedBound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p1' });
       assert.deepEqual(signaturesIn(changedBound), []);
       assert.equal(changedBound.thinkingStripped, 2);
+      cm.close();
+    });
+  });
+
+  it('brings back nothing the branch released for a target that doesn’t bind it, the pass’s releases or the host’s', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path });
+      await turn(cm, 'u1', 'a1', 'S1');
+      await turn(cm, 'u2', 'a2', 'S2');
+      // An edit before both replies, under the same seed: the next bound
+      // compile strips their thinking and releases it on the branch.
+      const first = cm.getAllMessages().find((m) => m.participant === 'user')!.id;
+      cm.editMessage(first, text('u1, edited'));
+      cm.addMessage('user', text('u3'));
+      const bound = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.equal(bound.thinkingStripped, 2);
+      cm.acceptRound({ provenance: bound.provenance! });
+      cm.addMessage('assistant', reply('a3', 'S3'));
+      // The provider refused S3, so the host releases it.
+      cm.releaseThinking(cm.getAllMessages().at(-1)!.id);
+      cm.addMessage('user', text('u4'));
+      const loose = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0', bindsThinking: false });
+      assert.deepEqual(signaturesIn(loose), [], 'a release is the branch’s, whatever the target');
+      assert.equal(loose.thinkingStripped, 0, 'a compile that doesn’t bind strips nothing more');
+      const stored = cm.getAllMessages().flatMap((m) => m.content.flatMap((b) => (b.type === 'thinking' ? [(b as { signature: string }).signature] : [])));
+      assert.deepEqual(stored, ['S1', 'S2', 'S3'], 'the store keeps every block');
       cm.close();
     });
   });

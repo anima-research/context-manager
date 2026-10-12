@@ -313,8 +313,11 @@ export interface SelectOptions {
    * sent under a changed prefix is refused, or dropped under
    * `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, so the
    * thinking-binding pass strips it. Set it false for a model that keeps such
-   * a block: the compile then sends thinking as stored, and the strategy
-   * renders the live window as configured. Stamping goes on either way, so a
+   * a block: the compile then strips nothing, and the strategy renders the
+   * live window as configured. Thinking already released on the branch, by
+   * an earlier compile's strip or by `ContextManager.releaseThinking`, stays
+   * released whatever a compile's target, since the strategy's view of the
+   * branch reads the message without it. Stamping goes on either way, so a
    * later compile for a model that binds still finds every reply's stamp.
    *
    * It records a provider behaviour that is measured, not promised. On

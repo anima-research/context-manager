@@ -72,12 +72,15 @@
  * under, so a store whose host never has renders as it always did. A compile
  * for a target that doesn't bind thinking (SelectOptions.bindsThinking:
  * false) strips nothing, and stamping goes on, so a later compile for a
- * target that binds finds each reply's stamp.
+ * target that binds finds each reply's stamp. It brings back nothing the
+ * branch has released (below).
  *
  * Release. When the pass strips a message's thinking on a branch, the
  * thinking is released on the branch: a compile's rewrites move forward, so
  * its prefix almost never comes back, and from then on the strategy's view
  * reads the message without it, so budgets and estimates count what is sent.
+ * A release is the branch's, whatever a later compile's target: one for a
+ * target that keeps thinking reads the same view, and sends none of it.
  * A release runs from the first block the strip took, so thinking before an
  * edited block stays. The exception is a compile under a seed other than the
  * branch's latest accepted one (a host's one-turn system change): it keeps
