@@ -663,7 +663,28 @@ export class ThinkingBinding {
       n,
     });
     while (this.pending.size > PENDING_LIMIT) this.pending.delete(this.pending.keys().next().value!);
+    this.pruneStored(key);
     return result;
+  }
+
+  /**
+   * Forget the writes noted on a branch that no walk can read again: those
+   * at or below its owner's head or, while it has no owner, at or below the
+   * lowest head among its remembered compiles, any of which could become the
+   * owner. So what is noted stays bounded for a host that never accepts a
+   * round.
+   */
+  private pruneStored(key: string): void {
+    const stored = this.stored.get(key);
+    if (!stored || stored.size === 0) return;
+    let floor = this.latest.get(key)?.head;
+    if (floor === undefined) {
+      floor = Infinity;
+      for (const compile of this.pending.values()) {
+        if (branchKey(compile.branch) === key) floor = Math.min(floor, compile.head);
+      }
+    }
+    for (const [id, sequence] of stored) if (sequence <= floor) stored.delete(id);
   }
 
   /**
@@ -746,10 +767,7 @@ export class ThinkingBinding {
     if (record.owns) {
       this.latest.set(key, { compileId: record.compileId, seed: record.seed, end: record.end, head: record.head, n });
       // A walk on the branch starts after the owner's head from now on.
-      const stored = this.stored.get(key);
-      if (stored) {
-        for (const [id, sequence] of stored) if (sequence <= record.head) stored.delete(id);
-      }
+      this.pruneStored(key);
       if (n !== undefined) {
         // Compiles bound before the owner minted nothing after it.
         const sent = this.sent.get(key);

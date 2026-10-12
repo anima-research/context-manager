@@ -1170,6 +1170,23 @@ describe('thinking binding', () => {
     });
   });
 
+  it('keeps what its namespace stored before any acceptance, for the compile that becomes the owner', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path });
+      cm.addMessage('user', text('u1'));
+      const first = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      // Before the first acceptance: another message, and a compile that renders it.
+      cm.addMessage('user', text('u1b'));
+      await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      cm.acceptRound({ provenance: first.provenance! });
+      cm.addMessage('assistant', reply('a1', 'S1'));
+      cm.addMessage('user', text('u2'));
+      const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+      assert.deepEqual(signaturesIn(next), ['S1'], 'u1b was noted as this namespace’s, so the walk carries it');
+      cm.close();
+    });
+  });
+
   it('remembers its 32 most recent compiles, the oldest of them included', async () => {
     for (const [count, recorded] of [[32, 1], [33, 0]] as const) {
       await withStore(async (path) => {
