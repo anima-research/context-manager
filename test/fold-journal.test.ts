@@ -10,10 +10,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { JsStore } from '@animalabs/chronicle';
+import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
-import { FoldJournal, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
+import { FoldJournal, applyLayoutChain, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
 import type { StoredLayout } from '../src/fold-journal.js';
 import type {
   ContextEntry,
@@ -27,6 +28,7 @@ import type {
   CompileProvenance,
   FoldReceipt,
   LayoutUnit,
+  RenderedLayout,
 } from '../src/index.js';
 
 const STORE = './test-fold-journal';
@@ -44,6 +46,8 @@ class ScriptedStrategy implements ContextStrategy {
   /** Message ids rendered raw although their plan names a summary that
    *  still covers them (a pin keeps a covered message raw). */
   pinned = new Set<string>();
+  /** Summary ids describeRenderedSummaries leaves out (it can't describe them). */
+  undescribed = new Set<string>();
   cause: string | undefined;
 
   checkReadiness(): ReadinessState {
@@ -75,6 +79,7 @@ class ScriptedStrategy implements ContextStrategy {
   describeRenderedSummaries(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo> {
     const out = new Map<string, RenderedSummaryInfo>();
     for (const id of ids) {
+      if (this.undescribed.has(id)) continue;
       const leaves: string[] = [];
       let level = 0;
       for (const [mid, form] of this.plan) {
@@ -93,6 +98,17 @@ class ScriptedStrategy implements ContextStrategy {
     this.cause = undefined;
     return c;
   }
+}
+
+/** The store with some of its methods replaced, the rest bound to it. */
+function wrapStore(real: JsStore, overrides: Partial<Record<keyof JsStore, unknown>>): JsStore {
+  return new Proxy(real, {
+    get(target, prop, receiver) {
+      if (prop in overrides) return overrides[prop as keyof JsStore];
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as JsStore;
 }
 
 function textOf(msg: StoredMessage): string {
@@ -271,7 +287,7 @@ describe('fold journal', () => {
     const second = await cm.compile(BUDGET);
     const r = cm.acceptRound({ provenance: second.provenance! });
     assert.equal(r?.changes?.length, 1);
-    assert.equal(cm.acceptRound({ provenance: second.provenance! }), null, 'a later round of the same compile adds nothing');
+    assert.equal(cm.acceptRound({ provenance: second.provenance! })?.id, r!.id, 'a later round of the same compile adds nothing: the same receipt');
     assert.equal(cm.listFoldReceipts().receipts.length, 2);
     cm.close();
   });
@@ -319,6 +335,18 @@ describe('fold journal', () => {
     const deleted = cm.listFoldReceipts({ branch: 'side' });
     assert.equal(deleted.receipts.length, 2, 'a deleted branch stays queryable');
     assert.match(cm.listFoldReceipts({ branch: 'nope' }).note ?? '', /No branch named/);
+
+    // A new 'side' reuses the name: the name finds it, and the deleted one is
+    // reached by its id, as its receipts name it.
+    const oldSide = late!.source.branch;
+    await cm.switchBranch(main.name);
+    await cm.fork('side');
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    assert.equal(cm.listFoldReceipts({ branch: 'side' }).receipts.length, 1, 'the live branch of that name');
+    const byId = cm.listFoldReceipts({ branch: { id: oldSide.id, created: oldSide.created } });
+    assert.deepEqual(byId.receipts.map((r) => r.id), deleted.receipts.map((r) => r.id), 'the deleted one, by id');
+    assert.equal(byId.branch?.name, 'side');
+    assert.match(cm.listFoldReceipts({ branch: { id: 'no-such-branch', created: 1 } }).note ?? '', /No branch with id/);
     cm.close();
   });
 
@@ -398,6 +426,20 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it('records how the confirming round carried the compile, as its producer reported', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const verbatim = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance!, presentation: 'verbatim' });
+    assert.equal(verbatim?.presentation, 'verbatim');
+    strategy.plan.set(ids[0]!, 'omit');
+    const altered = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance!, presentation: 'altered' });
+    assert.equal(altered?.presentation, 'altered');
+    strategy.plan.set(ids[1]!, 'omit');
+    assert.equal((await acceptCompile(cm))?.presentation, 'unknown', 'unknown when not reported');
+    assert.deepEqual(cm.listFoldReceipts({ limit: 10 }).receipts.map((r) => r.presentation), ['unknown', 'altered', 'verbatim'], 'and as listed');
+    cm.close();
+  });
+
   it('records the source the host supplies, and names its store', async () => {
     const { cm } = await open();
     cm.setReceiptSource({ runtime: 'connectome-host', dataDirectory: '/data/linn', agent: 'Linn' });
@@ -422,7 +464,7 @@ describe('fold journal', () => {
     cm.close();
   });
 
-  it('reconstructs a long delta chain exactly across a restart', async () => {
+  it('reconstructs its records exactly across a restart', async () => {
     let { cm, strategy } = await open();
     add(cm, 2);
     await acceptCompile(cm);
@@ -430,12 +472,20 @@ describe('fold journal', () => {
       add(cm, 1, `t${i}-`);
       await acceptCompile(cm);
     }
+    const kinds = layoutRecords(cm.getStore()).map((r) => r.kind);
+    assert.ok(kinds.filter((k) => k === 'snapshot').length >= 2 && kinds.at(-1) === 'delta', `snapshots and deltas both: ${kinds.join(',')}`);
     cm.close();
     ({ cm, strategy } = await open());
     const all = cm.getAllMessages();
     strategy.plan.set(all[40]!.id, 'omit');
     const r = await acceptCompile(cm);
     assert.deepEqual(r?.changes?.map((c) => [c.first.messageId, c.before.form, c.after.form]), [[all[40]!.id, 'raw', 'omitted']]);
+    // Every message omitted: one run from the first to the newest, which only
+    // a rebuild holding every arrival, in its form, reports whole.
+    for (const m of all) strategy.plan.set(m.id, 'omit');
+    const whole = await acceptCompile(cm);
+    assert.deepEqual(whole?.changes?.map((c) => [c.first.messageId, c.last.messageId, c.messages, c.before.form, c.after.form]),
+      [[all[0]!.id, all[39]!.id, 40, 'raw', 'omitted'], [all[41]!.id, all.at(-1)!.id, all.length - 41, 'raw', 'omitted']]);
     cm.close();
   });
 
@@ -464,8 +514,9 @@ describe('fold journal', () => {
     const first = (await cm.compile(BUDGET)).provenance!;
     assert.throws(() => journal.accept(first, Date.now(), undefined), /disk full/);
     mode = 'ok';
-    assert.equal(journal.accept(first, Date.now(), undefined)?.kind, 'baseline', 'the retry writes the baseline once');
-    assert.equal(journal.accept(first, Date.now(), undefined), null);
+    const baseline = journal.accept(first, Date.now(), undefined);
+    assert.equal(baseline?.kind, 'baseline', 'the retry writes the baseline once');
+    assert.equal(journal.accept(first, Date.now(), undefined)?.id, baseline!.id, 'and a later retry gets it back');
 
     strategy.plan.set(ids[0]!, 'omit');
     const second = (await cm.compile(BUDGET)).provenance!;
@@ -476,11 +527,18 @@ describe('fold journal', () => {
     assert.deepEqual(announced, [], 'nothing announced while the write is uncertain');
     mode = 'ok';
     const retry = new FoldJournal(flaky, 'agents/tester');
-    assert.equal(journal.accept(second, Date.now(), undefined), null, 'the landed record is found on reread');
-    assert.equal(announced.length, 1, 'and its receipt is announced once, so a projection converges');
-    assert.equal(journal.accept(second, Date.now(), undefined), null);
+    const landedReceipt = journal.accept(second, Date.now(), undefined);
+    assert.equal(landedReceipt?.kind, 'change', 'the landed record is found on reread, and its receipt returned');
+    assert.deepEqual(announced, [landedReceipt!.id], 'and announced once, so a projection converges');
+    assert.equal(journal.accept(second, Date.now(), undefined)?.id, landedReceipt!.id);
     assert.equal(announced.length, 1, 'never twice');
-    assert.equal(retry.accept(second, Date.now(), undefined), null, 'a fresh journal finds it too');
+    // Only each branch's newest announced receipt is kept, so an older one a
+    // retry finds is heard again (listeners key on ids), and the newest stays once.
+    assert.equal(journal.accept(first, Date.now(), undefined)?.id, baseline!.id);
+    assert.deepEqual(announced, [landedReceipt!.id, baseline!.id], 'an older receipt a retry finds is heard again');
+    assert.equal(journal.accept(second, Date.now(), undefined)?.id, landedReceipt!.id);
+    assert.deepEqual(announced, [landedReceipt!.id, baseline!.id], 'and the newest still once');
+    assert.equal(retry.accept(second, Date.now(), undefined)?.id, landedReceipt!.id, 'a fresh journal finds it too');
 
     // The ordinary next-activation path: the uncertain write was on the
     // stream's last round, and the next accepted compile is a new compile
@@ -599,10 +657,12 @@ describe('fold journal', () => {
     cm.close();
 
     ({ cm, strategy } = await open());
-    assert.equal(cm.acceptRound({ provenance: first }), null, 'an older compile that wrote a receipt');
+    const receipts = cm.listFoldReceipts({ limit: 100 }).receipts;
+    assert.deepEqual(receipts.map((r) => r.kind), ['change', 'baseline']);
+    assert.equal(cm.acceptRound({ provenance: first })?.id, receipts[1]!.id, 'an older compile that wrote a receipt gets it back');
     assert.equal(cm.acceptRound({ provenance: unchanged }), null, 'an older compile whose layout was unchanged');
-    assert.equal(cm.acceptRound({ provenance: folded }), null, 'the newest');
-    assert.deepEqual(cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.kind), ['change', 'baseline'], 'no false unfold');
+    assert.equal(cm.acceptRound({ provenance: folded })?.id, receipts[0]!.id, 'the newest');
+    assert.deepEqual(cm.listFoldReceipts({ limit: 100 }).receipts.map((r) => r.id), receipts.map((r) => r.id), 'no false unfold, nothing written');
     strategy.plan.set(ids[0]!, 'omit');
     assert.equal(await acceptCompile(cm), null, "the branch's last accepted layout is still the folded one");
     cm.close();
@@ -628,8 +688,8 @@ describe('fold journal', () => {
     assert.deepEqual(journal.accept(omitted, Date.now(), undefined)?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']]);
     assert.equal(records(), 2);
     const fresh = new FoldJournal(store, 'agents/tester');
-    assert.equal(fresh.accept(raw, Date.now(), undefined), null, 'no false omitted-to-raw receipt');
-    assert.equal(fresh.accept(omitted, Date.now(), undefined), null);
+    assert.equal(fresh.accept(raw, Date.now(), undefined)?.kind, 'baseline', 'no false omitted-to-raw receipt: its own baseline, back');
+    assert.deepEqual(fresh.accept(omitted, Date.now(), undefined)?.changes?.map((c) => [c.before.form, c.after.form]), [['raw', 'omitted']]);
     assert.equal(records(), 2, 'both retries found their acceptance and wrote nothing');
     cm.close();
   });
@@ -726,12 +786,49 @@ describe('compile provenance', () => {
 });
 
 /** Each accepted-layout record: its kind, and the bytes of its layout part. */
-function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; chain: number; members: number }> {
+/**
+ * Each accepted-layout record: `bytes` is its layout part (without the
+ * receipt, namespace, branch and compile id), `stored` its whole payload,
+ * and `json` the whole record as JSON, the size the byte rule counts.
+ */
+function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; stored: number; json: number; chain: number; sb: number; db: number; members: number }> {
   return store.getRecordIdsByType('context-manager/accepted-layout').map((id) => {
-    const record = JSON.parse(store.getRecord(id)!.payload.toString('utf8'));
+    const payload = store.getRecord(id)!.payload;
+    const record = JSON.parse(payload.toString('utf8'));
     const { receipt: _receipt, ns: _ns, branch: _branch, compileId: _compileId, ...layout } = record;
-    return { kind: record.kind, bytes: JSON.stringify(layout).length, chain: record.chain, members: record.m ? decodeSequences(record.m).length : 0 };
+    return {
+      kind: record.kind, bytes: JSON.stringify(layout).length, stored: payload.length, json: Buffer.byteLength(JSON.stringify(record)),
+      chain: record.chain, sb: record.sb, db: record.db, members: record.m ? decodeSequences(record.m).length : 0,
+    };
   });
+}
+
+/**
+ * The byte rule, chain by chain: the delta records after a snapshot never
+ * outweigh it, and the next snapshot comes only once one more record would
+ * have (so no snapshot is written early, by a count or otherwise). Sizes are
+ * the records' JSON as context-manager measures it (the stored payload may
+ * be serialized a few bytes differently).
+ */
+function assertSnapshotsAmortized(records: ReturnType<typeof layoutRecords>): void {
+  const largest = Math.max(...records.filter((r) => r.kind === 'delta').map((r) => r.json));
+  let snapshot = records[0]!;
+  let since = 0;
+  assert.equal(snapshot.json, snapshot.sb, 'a snapshot counts its own bytes exactly');
+  for (const r of records.slice(1)) {
+    if (r.kind === 'delta') {
+      since += r.json;
+      assert.equal(r.db, since, 'the deltas count their own bytes exactly');
+      assert.ok(r.db <= r.sb, `the records since a snapshot never outweigh it: ${r.db} > ${r.sb}`);
+      continue;
+    }
+    assert.equal(r.json, r.sb, 'a snapshot counts its own bytes exactly');
+    // The record that tipped it went into the new snapshot, not a delta, so
+    // allow it as up to twice the largest delta written.
+    assert.ok(since + 2 * largest + 16 >= snapshot.json, `a snapshot comes only once the records since the last would outweigh it: ${since} + 2 x ${largest} < ${snapshot.json}`);
+    snapshot = r;
+    since = 0;
+  }
 }
 
 const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
@@ -765,13 +862,18 @@ describe('fold journal size', () => {
     assert.ok(Math.max(...late) <= 200, `a delta stays small: ${Math.max(...late)} bytes`);
     assert.ok(mean(late) <= mean(early) * 1.2 + 4, `deltas do not grow with the history: ${mean(early).toFixed(1)} then ${mean(late).toFixed(1)}`);
     const snapshots = records.filter((r) => r.kind === 'snapshot');
+    assert.ok(snapshots.length >= 3, `several snapshot rollovers: ${snapshots.length}`);
     for (const snap of snapshots) {
       // Members at about a byte and a third each, plus the rendered units.
       assert.ok(snap.bytes <= snap.members * 2 + 2000, `snapshot of ${snap.members} members: ${snap.bytes} bytes`);
     }
-    const total = records.reduce((sum, r) => sum + r.bytes, 0);
-    const deltaTotal = deltas.reduce((sum, r) => sum + r.bytes, 0);
-    assert.ok(total <= 3 * deltaTotal + 4 * 2000, `snapshots cost about what the deltas since them do: ${total} bytes in all, ${deltaTotal} in deltas`);
+    assertSnapshotsAmortized(records);
+    // What each acceptance costs in all, snapshots included, stays flat as the
+    // history grows: a late stretch costs no more per round than an early one.
+    const perRound = (from: number, to: number) => records.slice(from, to).reduce((sum, r) => sum + r.stored, 0) / (to - from);
+    const earlyPerRound = perRound(filled + 20, filled + 220);
+    const latePerRound = perRound(400, 600);
+    assert.ok(latePerRound <= earlyPerRound * 1.25, `stored bytes per acceptance don't grow with the history: ${earlyPerRound.toFixed(0)} then ${latePerRound.toFixed(0)}`);
     cm.close();
   });
 
@@ -795,38 +897,78 @@ describe('fold journal size', () => {
     };
   }
 
-  it('writes a snapshot once the deltas since the last one would outweigh it', async () => {
-    // A small window: each unchanged round writes a small delta, so the deltas
-    // soon outweigh the snapshot, and a rebuild never reads more than about
-    // two snapshots' worth.
+  it('writes a snapshot once the records since the last one would outweigh it', async () => {
+    // A small window: each unchanged round writes a small delta record, so the
+    // records soon outweigh the snapshot, and a rebuild never reads more than
+    // about two snapshots' worth.
     const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
     for (let i = 0; i < 10; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
-    const { journal, records } = fastJournal(cm);
+    const { journal } = fastJournal(cm);
     for (let round = 0; round < 60; round++) {
       journal.accept((await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
     }
-    const all = records();
+    const all = layoutRecords(cm.getStore());
     assert.ok(all.filter((r) => r.kind === 'snapshot').length >= 2, 'a later snapshot follows the first');
-    for (const r of all.filter((x) => x.kind === 'delta')) {
-      assert.ok(r.db <= r.sb, `the deltas since a snapshot never outweigh it: ${r.db} > ${r.sb}`);
+    assert.ok(all.filter((r) => r.kind === 'delta').length >= 20, 'and deltas between them');
+    // Each delta counts its whole record, receipt and envelope included (the
+    // counters' own digits aside: a record is measured before they're set).
+    let since = 0;
+    for (const r of all) {
+      since = r.kind === 'snapshot' ? 0 : since + r.json;
+      if (r.kind === 'delta') assert.ok(Math.abs(r.db - since) <= 8 * r.chain, `db counts the records since the snapshot: ${r.db} against ${since}`);
     }
+    assertSnapshotsAmortized(all);
     cm.close();
   });
 
-  it('writes a snapshot after 256 deltas, however small they are', async () => {
-    // A window large enough that unchanged rounds would take hundreds more
-    // deltas to outweigh its snapshot: the chain cap bounds a rebuild instead.
-    const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
-    for (let i = 0; i < 200; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
-    const { journal, records } = fastJournal(cm);
-    for (let round = 0; round < 258; round++) {
-      journal.accept((await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
+  it('a long chain of small deltas behind a large snapshot stays a chain, and rebuilds exactly after a reopen', async () => {
+    // A history of 100,000 messages behind a raw window, sequences two apart,
+    // and arrivals only (no fold, so no receipt). Its snapshot outweighs 300
+    // small deltas, so no snapshot follows, however many deltas there are.
+    let cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    const branch = cm.currentBranchRef();
+    const omitted = 99_950;
+    let members = Array.from({ length: 100_000 }, (_, i) => 2 * (i + 1));
+    let ids = members.map((m) => `m${m}`);
+    const layoutOf = (tail?: LayoutUnit): RenderedLayout => ({
+      v: 2, members, memberIds: ids, totalTokens: (members.length - omitted) * 10, calibration: 1,
+      units: [
+        { k: 'o', n: omitted },
+        ...Array.from({ length: members.length - omitted - (tail ? 1 : 0) }, (): LayoutUnit => ({ k: 'r', t: 10 })),
+        ...(tail ? [tail] : []),
+      ],
+    });
+    const provenance = (layout: RenderedLayout): CompileProvenance => ({
+      compileId: randomUUID(), namespace: 'agents/tester', branch, messages: [], layout, strategy: 'synthetic',
+    });
+    const { journal } = fastJournal(cm);
+    journal.accept(provenance(layoutOf()), Date.now(), undefined);
+    for (let round = 0; round < 300; round++) {
+      const next = members.at(-1)! + 2;
+      members = [...members, next];
+      ids = [...ids, `m${next}`];
+      journal.accept(provenance(layoutOf()), Date.now(), undefined);
     }
-    const all = records();
-    assert.equal(all[256]!.chain, 256, 'the 256th delta');
-    assert.ok(all[256]!.db * 1.25 < all[256]!.sb, `far from outweighing the snapshot: ${all[256]!.db} of ${all[256]!.sb}`);
-    assert.equal(all[257]!.kind, 'snapshot', 'then a snapshot all the same');
-    assert.equal(all.filter((r) => r.kind === 'snapshot').length, 2);
+    const all = layoutRecords(cm.getStore());
+    assert.deepEqual(all.map((r) => r.kind), ['snapshot', ...Array<string>(300).fill('delta')], 'no count of deltas forces a snapshot');
+    assert.equal(all.at(-1)!.chain, 300);
+    assert.ok(all.at(-1)!.db <= all.at(-1)!.sb, `${all.at(-1)!.db} of ${all.at(-1)!.sb}`);
+
+    // The records rebuild the last layout exactly, members and units.
+    const store = cm.getStore();
+    const payloads = store.getRecordIdsByType('context-manager/accepted-layout').map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')));
+    const rebuilt = applyLayoutChain({ members: decodeSequences(payloads[0].m), units: payloads[0].units }, payloads.slice(1));
+    const written = layoutOf();
+    assert.deepEqual(rebuilt, { members: written.members, units: written.units });
+
+    // And a fresh store object's journal rebuilds it the same way: the newest
+    // message turning omitted is one change, which it reports only when the
+    // rebuild holds every arrival, and every unit in place.
+    cm.close();
+    cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    const receipt = fastJournal(cm).journal.accept(provenance(layoutOf({ k: 'o', n: 1 })), Date.now(), undefined);
+    assert.deepEqual(receipt?.changes?.map((c) => [c.first.sequence, c.last.sequence, c.before.form, c.after.form]),
+      [[members.at(-1), members.at(-1), 'raw', 'omitted']]);
     cm.close();
   });
 
@@ -894,6 +1036,7 @@ describe('fold journal size', () => {
       while (members.length < count) members.push((members.at(-1) ?? 0) + 1 + rand(3));
       return { members, units };
     };
+    let asserted = 0;
     for (let round = 0; round < 2000; round++) {
       const prevUnits = Array.from({ length: rand(8) + 1 }, unit);
       const nextUnits = rand(2) === 0 ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
@@ -901,9 +1044,21 @@ describe('fold journal size', () => {
       const unique = [...new Set(pool)];
       const prev = layout(prevUnits, unique.filter(() => rand(4) > 0));
       const next = layout(nextUnits, unique.filter(() => rand(4) > 0));
-      const delta = layoutDelta(prev, next);
-      if (!delta) continue;
-      assert.deepEqual(applyLayoutDelta(prev, delta), next, `round ${round}`);
+      assert.deepEqual(applyLayoutDelta(prev, layoutDelta(prev, next)), next, `round ${round}`);
+      asserted++;
+    }
+    assert.equal(asserted, 2000, 'every pair of layouts has a delta');
+
+    // A chain rebuilt in one pass equals the same deltas applied one at a time,
+    // across chains that remove and re-add the same sequences.
+    for (let chain = 0; chain < 200; chain++) {
+      const pool = [...new Set(Array.from({ length: 40 }, () => rand(120)))];
+      const layouts = Array.from({ length: 2 + rand(12) }, () => layout(Array.from({ length: rand(8) + 1 }, unit), pool.filter(() => rand(3) > 0)));
+      const deltas = layouts.slice(1).map((l, i) => layoutDelta(layouts[i]!, l));
+      let stepwise = layouts[0]!;
+      for (const d of deltas) stepwise = applyLayoutDelta(stepwise, d);
+      assert.deepEqual(stepwise, layouts.at(-1), `chain ${chain}, one at a time`);
+      assert.deepEqual(applyLayoutChain(layouts[0]!, deltas), layouts.at(-1), `chain ${chain}, in one pass`);
     }
   });
 });
@@ -1010,6 +1165,577 @@ describe('fold journal durability and index', () => {
     const other = new FoldJournal(counted, 'agents/tester');
     assert.equal(other.query({ limit: 100 }).receipts.length, 31);
     assert.equal(listings, 1);
+    cm.close();
+  });
+
+  it('after a reopen, an acceptance reads the records it needs, not the history', async () => {
+    let { cm } = await open();
+    add(cm, 4);
+    const quiet = new FoldJournal(wrapStore(cm.getStore(), { sync: () => {} }), 'agents/tester');
+    for (let i = 0; i < 200; i++) {
+      add(cm, 1, `r${i}-`);
+      quiet.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    }
+    const before = layoutRecords(cm.getStore());
+    assert.equal(before.length, 200);
+    cm.close();
+
+    ({ cm } = await open());
+    const real = cm.getStore();
+    let reads = 0;
+    let listings = 0;
+    let syncs = 0;
+    const counted = wrapStore(real, {
+      getRecord: (id: string) => { reads++; return real.getRecord(id); },
+      getRecordIdsByType: (type: string) => { if (type === 'context-manager/accepted-layout') listings++; return real.getRecordIdsByType(type); },
+      sync: () => { syncs++; real.sync(); },
+    });
+    const journal = new FoldJournal(counted, 'agents/tester');
+    add(cm, 1, 'after-');
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(provenance.journalMark?.recordId, real.getRecordIdsByType('context-manager/accepted-layout').at(-1), 'the compile carries the newest durable record');
+    reads = 0;
+    assert.equal(journal.accept(provenance, Date.now(), undefined), null, 'an arrival');
+    assert.equal(syncs, 3, 'one at first use, making the records present at open durable, then the two of the commit');
+    // The newest record (for its branch, and its mark), the receipt to
+    // announce, and the chain back to its snapshot: none of the history.
+    const chain = before.at(-1)!.chain;
+    assert.ok(reads <= chain + 6, `${reads} records read, with ${before.length} in the journal and a chain of ${chain}`);
+    assert.equal(listings, 1);
+    reads = 0;
+    add(cm, 1, 'next-');
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    assert.ok(reads <= 2, `the next acceptance reads almost nothing: ${reads}`);
+    cm.close();
+  });
+
+  it('looks for an earlier acceptance only after the compile\'s mark, unless the mark proves nothing', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    for (let i = 0; i < 30; i++) {
+      add(cm, 1, `r${i}-`);
+      await acceptCompile(cm);
+    }
+    const real = cm.getStore();
+    let reads = 0;
+    const counted = wrapStore(real, { getRecord: (id: string) => { reads++; return real.getRecord(id); } });
+    const fresh = new FoldJournal(counted, 'agents/tester');
+    add(cm, 1, 'first-');
+    fresh.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+
+    // A compile not accepted before: only its mark and the records after it are read.
+    add(cm, 1, 'marked-');
+    const marked = (await cm.compile(BUDGET)).provenance!;
+    assert.ok(marked.journalMark, 'a compile carries its mark');
+    reads = 0;
+    fresh.accept(marked, Date.now(), undefined);
+    assert.ok(reads <= 2, `the mark and the record after it: ${reads} reads`);
+    // With no mark, or one whose id now names another compile's record,
+    // every record is read.
+    add(cm, 1, 'unmarked-');
+    const unmarked = (await cm.compile(BUDGET)).provenance!;
+    reads = 0;
+    fresh.accept({ ...unmarked, journalMark: null }, Date.now(), undefined);
+    assert.ok(reads >= 32, `every record: ${reads} reads`);
+    add(cm, 1, 'forged-');
+    const forged = (await cm.compile(BUDGET)).provenance!;
+    reads = 0;
+    fresh.accept({ ...forged, journalMark: { recordId: forged.journalMark!.recordId, compileId: 'another-compile' } }, Date.now(), undefined);
+    assert.ok(reads >= 33, `every record: ${reads} reads`);
+    // And a retry under a mark that proves nothing, or is gone, still finds
+    // its acceptance and writes nothing.
+    const count = layoutRecords(real).length;
+    assert.equal(fresh.accept({ ...marked, journalMark: { recordId: marked.journalMark!.recordId, compileId: 'another-compile' } }, Date.now(), undefined), null);
+    assert.equal(fresh.accept({ ...marked, journalMark: { recordId: '999999999', compileId: 'x' } }, Date.now(), undefined), null);
+    assert.equal(layoutRecords(real).length, count);
+    cm.close();
+  });
+
+  it('acknowledges a retried acceptance only once its record is durable', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const real = cm.getStore();
+    const calls: string[] = [];
+    let failNextSyncAfterAppend = false;
+    let appended = false;
+    const flaky = wrapStore(real, {
+      appendJson: (type: string, payload: unknown) => { appended = true; calls.push('append'); return real.appendJson(type, payload); },
+      sync: () => {
+        if (failNextSyncAfterAppend && appended) {
+          failNextSyncAfterAppend = false;
+          throw new Error('fsync failed');
+        }
+        calls.push('sync');
+        real.sync();
+      },
+    });
+    const journal = new FoldJournal(flaky, 'agents/tester');
+    journal.storeId();
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+
+    // An unchanged layout writes a record without a receipt; its sync fails
+    // after the append, so the record is in the log, durable or not.
+    const unchanged = (await cm.compile(BUDGET)).provenance!;
+    appended = false;
+    failNextSyncAfterAppend = true;
+    assert.throws(() => journal.accept(unchanged, Date.now(), undefined), /fsync failed/);
+    calls.length = 0;
+    assert.equal(journal.accept(unchanged, Date.now(), undefined), null, 'found: its acceptance wrote no receipt');
+    assert.deepEqual(calls, ['sync'], 'and synced before it is acknowledged');
+    calls.length = 0;
+    assert.equal(journal.accept(unchanged, Date.now(), undefined), null);
+    assert.deepEqual(calls, [], 'known durable now, so no sync');
+
+    // The same through another journal on the store object.
+    const again = (await cm.compile(BUDGET)).provenance!;
+    appended = false;
+    failNextSyncAfterAppend = true;
+    assert.throws(() => journal.accept(again, Date.now(), undefined), /fsync failed/);
+    calls.length = 0;
+    assert.equal(new FoldJournal(flaky, 'agents/tester').accept(again, Date.now(), undefined), null);
+    assert.deepEqual(calls, ['sync']);
+    cm.close();
+  });
+
+  it('refuses a compile of another namespace, and writes nothing', async () => {
+    const { cm } = await open();
+    add(cm, 2);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    assert.throws(() => new FoldJournal(cm.getStore(), 'agents/other').accept(provenance, Date.now(), undefined),
+      /namespace "agents\/tester" can't be accepted by the manager of "agents\/other"/);
+    const other = await ContextManager.open({ store: cm.getStore(), strategy: new ScriptedStrategy(), namespace: 'agents/other' });
+    assert.throws(() => other.acceptRound({ provenance }), /accept it on the manager that compiled it/);
+    assert.equal(layoutRecords(cm.getStore()).length, 0);
+    other.close();
+    cm.close();
+  });
+
+  it('a branch whose newest record cannot be read gets a baseline, never a diff against an older layout', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const branch = cm.currentBranchRef();
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      strategy.plan.set(ids[0]!, 'omit');
+      // A newer format's record (as after a rollback past it), then a broken
+      // chain, then a chain that rebuilds into members its units don't cover.
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ['another format', { v: 99, ns: 'agents/tester', branch, compileId: 'newer-format', kind: 'snapshot' }],
+        ['a broken chain', { v: 3, ns: 'agents/tester', branch, compileId: 'broken-chain', kind: 'delta', prev: '987654321', p: 0, totalTokens: 0, chain: 1, sb: 10_000, db: 10 }],
+        ['members its units do not cover', { v: 3, ns: 'agents/tester', branch, compileId: 'ill-formed', kind: 'snapshot', m: encodeSequences([1, 2, 3]), units: [{ k: 'r', t: 1 }], totalTokens: 0, chain: 0, sb: 100, db: 0 }],
+      ];
+      for (const [what, record] of cases) {
+        // Written outside this journal, as a record a past process left.
+        cm.getStore().appendJson('context-manager/accepted-layout', record);
+        cm.close();
+        ({ cm } = await open(strategy));
+        const receipt = await acceptCompile(cm);
+        assert.equal(receipt?.kind, 'baseline', `${what}: a baseline`);
+        assert.ok(errors.some((e) => e.includes('is unreadable')), `${what}: and it is reported`);
+        errors.length = 0;
+      }
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a compile never fails because the journal cannot be read: it carries no mark, and a later compile tries again', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    cm.close();
+
+    const real = JsStore.openOrCreate({ path: STORE });
+    let failSync = false;
+    const flaky = wrapStore(real, { sync: () => { if (failSync) throw new Error('EIO (injected)'); real.sync(); } });
+    cm = await ContextManager.open({ store: flaky, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      failSync = true;
+      const first = await cm.compile(BUDGET);
+      assert.equal(first.provenance?.journalMark, null, 'the compile stands, without a mark');
+      await cm.compile(BUDGET);
+      assert.equal(errors.filter((e) => e.includes("can't tell where the journal stands")).length, 1, 'reported once');
+      failSync = false;
+      const later = await cm.compile(BUDGET);
+      assert.equal(later.provenance?.journalMark?.recordId, real.getRecordIdsByType('context-manager/accepted-layout').at(-1), 'the index was not kept half-built: the next compile has its mark');
+    } finally {
+      console.error = error;
+      cm.close();
+    }
+  });
+
+  it('reads the records present at open at most once, however many branches and namespaces look', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    const quiet = new FoldJournal(wrapStore(cm.getStore(), { sync: () => {} }), 'agents/tester');
+    for (let i = 0; i < 60; i++) {
+      add(cm, 1, `r${i}-`);
+      quiet.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    }
+    cm.close();
+    ({ cm } = await open());
+    const real = cm.getStore();
+    let reads = 0;
+    const counted = wrapStore(real, { getRecord: (id: string) => { reads++; return real.getRecord(id); } });
+    // Two namespaces new to the store: the first reads the history, the second nothing more of it.
+    const first = await ContextManager.open({ store: counted, strategy: new ScriptedStrategy(), namespace: 'agents/first' });
+    const second = await ContextManager.open({ store: counted, strategy: new ScriptedStrategy(), namespace: 'agents/second' });
+    for (const m of [first, second]) m.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    reads = 0;
+    assert.equal((await acceptCompile(first))?.kind, 'baseline');
+    const firstReads = reads;
+    assert.ok(firstReads >= 60, `the first new namespace reads the history: ${firstReads}`);
+    reads = 0;
+    assert.equal((await acceptCompile(second))?.kind, 'baseline');
+    assert.ok(reads <= 3, `the second reads none of it again: ${reads}`);
+    // The branch the history holds was noted on the way: it still compares
+    // with its newest record, not as unrecorded.
+    const original = await ContextManager.open({ store: counted, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    original.addMessage('user', [{ type: 'text', text: 'and more' }]);
+    assert.equal(await acceptCompile(original), null, 'an arrival, compared with the branch\'s newest record');
+    original.close();
+    // A deleted branch looked up by name, twice: answered from what was noted.
+    reads = 0;
+    assert.match(first.listFoldReceipts({ branch: 'no-such-branch' }).note ?? '', /No branch named/);
+    assert.match(first.listFoldReceipts({ branch: 'no-such-branch' }).note ?? '', /No branch named/);
+    assert.equal(reads, 0, 'no record read for a name');
+    first.close();
+    second.close();
+    cm.close();
+  });
+
+  it('a receipt is durable before a query hands it out', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    const calls: string[] = [];
+    let failNextSyncAfterAppend = false;
+    let appended = false;
+    const flaky = wrapStore(real, {
+      appendJson: (type: string, payload: unknown) => { appended = true; return real.appendJson(type, payload); },
+      sync: () => {
+        if (failNextSyncAfterAppend && appended) { failNextSyncAfterAppend = false; throw new Error('fsync failed'); }
+        calls.push('sync');
+        real.sync();
+      },
+    });
+    const journal = new FoldJournal(flaky, 'agents/tester');
+    journal.storeId();
+    journal.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    strategy.plan.set(ids[0]!, 'omit');
+    const folded = (await cm.compile(BUDGET)).provenance!;
+    appended = false;
+    failNextSyncAfterAppend = true;
+    assert.throws(() => journal.accept(folded, Date.now(), undefined), /fsync failed/);
+    calls.length = 0;
+    const listed = journal.query({ limit: 10 });
+    assert.equal(listed.receipts[0]?.kind, 'change', 'the landed receipt is listed');
+    assert.deepEqual(calls, ['sync'], 'after a sync');
+    calls.length = 0;
+    journal.query({ limit: 10 });
+    assert.deepEqual(calls, [], 'and only once');
+    cm.close();
+  });
+
+  it('a newest record that cannot be read at all, or is a well-formed record of another format, gives a baseline', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, 'omit');
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      // A record with no envelope at all, then a format-2 copy of a real record.
+      const real = layoutRecords(cm.getStore());
+      const newest = JSON.parse(cm.getStore().getRecord(cm.getStore().getRecordIdsByType('context-manager/accepted-layout').at(-1)!)!.payload.toString('utf8'));
+      const cases: Array<[string, unknown]> = [
+        ['no envelope', { hello: 'world' }],
+        ['format 2', { ...newest, v: 2, compileId: 'older-format' }],
+      ];
+      assert.ok(real.length > 0);
+      for (const [what, record] of cases) {
+        cm.getStore().appendJson('context-manager/accepted-layout', record);
+        cm.close();
+        ({ cm } = await open(strategy));
+        assert.equal((await acceptCompile(cm))?.kind, 'baseline', `${what}: a baseline`);
+        assert.ok(errors.some((e) => /unreadable|treating the branch as unrecorded/.test(e)), `${what}: reported`);
+        errors.length = 0;
+        // Another round compares with the baseline just written, and the
+        // record that couldn't be read lends the branch no receipts.
+        strategy.plan.set(ids[1]!, strategy.plan.get(ids[1]!) === 'omit' ? 'raw' : 'omit');
+        assert.equal((await acceptCompile(cm))?.kind, 'change', `${what}: then changes again`);
+        assert.equal(cm.listFoldReceipts({ limit: 10 }).note, undefined, `${what}: every listed receipt reads`);
+      }
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('reports a record the store no longer has as missing, not as damaged', async () => {
+    const { cm } = await open();
+    add(cm, 2);
+    await acceptCompile(cm);
+    add(cm, 1, 'n');
+    await acceptCompile(cm);
+    const real = cm.getStore();
+    const gone = real.getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      // As after a rot: the id is listed, but the store has no record for it.
+      const journal = new FoldJournal(wrapStore(real, { getRecord: (id: string) => (id === gone ? null : real.getRecord(id)) }), 'agents/tester');
+      journal.query({ limit: 10 });
+      assert.ok(errors.some((e) => e.includes(`accepted-layout record ${gone} is missing`)), errors.join('\n'));
+      assert.ok(!errors.some((e) => e.includes(`record ${gone} is unreadable`)), 'not reported as damaged');
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a store whose identity record cannot be read mints a new id, says so, and keeps it', async () => {
+    let { cm } = await open();
+    cm.getStore().appendJson('context-manager/store-identity', { v: 1 });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let minted: string;
+    try {
+      minted = cm.getStoreId();
+      assert.ok(errors.some((e) => e.includes("identity record") && e.includes("can't be read") && e.includes(minted)), errors.join('\n'));
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+    ({ cm } = await open());
+    assert.equal(cm.getStoreId(), minted!, 'the new id is the store\'s from then on');
+    cm.close();
+  });
+
+  it('listing says when the newest record, unreadable or of another format, may hide receipts', async () => {
+    let { cm, strategy } = await open();
+    add(cm, 3);
+    const baseline = await acceptCompile(cm);
+    assert.equal(baseline?.kind, 'baseline');
+    const layoutIds = () => cm.getStore().getRecordIdsByType('context-manager/accepted-layout');
+    const error = console.error;
+    console.error = () => {};
+    try {
+      // An unreadable record above the branch's newest readable one: the
+      // readable history is listed, and the note says what may be missing.
+      const newest = JSON.parse(cm.getStore().getRecord(layoutIds().at(-1)!)!.payload.toString('utf8'));
+      cm.getStore().appendJson('context-manager/accepted-layout', { hello: 'world' });
+      const unreadable = layoutIds().at(-1)!;
+      cm.close();
+      ({ cm } = await open(strategy));
+      let listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts.map((r) => r.id), [baseline!.id], 'the readable receipts are listed');
+      assert.match(listed.note ?? '', new RegExp(`Record ${unreadable}, newer than this branch's newest readable record, can't be read`));
+      // A newest record of another format: its links aren't read, so nothing
+      // is listed, and the note says why.
+      cm.getStore().appendJson('context-manager/accepted-layout', { ...newest, v: 2, compileId: 'older-format' });
+      const other = layoutIds().at(-1)!;
+      cm.close();
+      ({ cm } = await open(strategy));
+      listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts, []);
+      assert.match(listed.note ?? '', new RegExp(`newest record, ${other}, is of another format`));
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a compile that renders a summary its strategy cannot describe has no layout, records nothing, and is reported once per summary', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, { summary: 's1', level: 1 });
+    strategy.undescribed.add('s1');
+    const layoutCount = () => cm.getStore().getRecordIdsByType('context-manager/accepted-layout').length;
+    const before = layoutCount();
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 2; i++) {
+        const { provenance } = await cm.compile(BUDGET);
+        assert.equal(provenance?.layout, null, 'no layout is reported');
+        assert.equal(provenance?.journalMark, undefined, 'so no mark is asked for');
+        assert.equal(cm.acceptRound({ provenance: provenance! }), null, 'and nothing is recorded');
+      }
+      assert.equal(layoutCount(), before, 'nothing written');
+      assert.equal(warnings.filter((w) => w.includes('cannot describe') && w.includes('s1')).length, 1, 'reported once for that summary');
+      // Described again, the next compile records its layout, and its receipt
+      // carries the change since the last layout recorded.
+      strategy.undescribed.delete('s1');
+      const receipt = await acceptCompile(cm);
+      assert.equal(receipt?.kind, 'change');
+      assert.ok(receipt?.changes?.some((c) => c.after.form === 'summary'), 'the summary the dropped compiles rendered');
+    } finally {
+      console.warn = warn;
+    }
+    cm.close();
+  });
+
+  it('a chain that leaves its branch gives a baseline', async () => {
+    let { cm, strategy } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    const main = cm.currentBranchRef();
+    await cm.fork('side');
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    const sideId = cm.getStore().getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    await cm.switchBranch(main.name);
+    add(cm, 1, 'arrival-');
+    assert.equal(await acceptCompile(cm), null, 'an arrival, written as a delta');
+    // Main's newest delta, copied with its link moved onto the side branch's record.
+    const store = cm.getStore();
+    const newest = JSON.parse(store.getRecord(store.getRecordIdsByType('context-manager/accepted-layout').at(-1)!)!.payload.toString('utf8'));
+    assert.equal(newest.kind, 'delta');
+    store.appendJson('context-manager/accepted-layout', { ...newest, compileId: 'foreign-link', prev: sideId });
+    const error = console.error;
+    const errors: string[] = [];
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      cm.close();
+      ({ cm } = await open(strategy));
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      assert.ok(errors.some((e) => e.includes('another namespace or branch')));
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a query whose history is cut short by an unreadable link says so', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, 'omit');
+    assert.equal((await acceptCompile(cm))?.kind, 'change');
+    strategy.plan.set(ids[1]!, 'omit');
+    const newest = await acceptCompile(cm);
+    const record = JSON.parse(cm.getStore().getRecord(newest!.id)!.payload.toString('utf8'));
+    // A newest receipt whose link names no record, and then one whose link
+    // points forward, past itself.
+    for (const [what, pr] of [['a link to no record', '0'], ['a link forward', '999999999']] as const) {
+      cm.getStore().appendJson('context-manager/accepted-layout', { ...record, compileId: `cut-${pr}`, pr });
+      const cutAt = cm.getStore().getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+      cm.close();
+      ({ cm } = await open(strategy));
+      const result = cm.listFoldReceipts({ limit: 10 });
+      assert.equal(result.receipts.length, 1, what);
+      assert.match(
+        result.note ?? '',
+        pr === '0'
+          ? /aren't listed: record 0, which links to them, can't be read as a receipt/
+          : new RegExp(`aren't listed: record ${cutAt} links to ${pr}, which isn't before it`),
+        what,
+      );
+    }
+    // A newest record with no receipt whose link names no record: nothing is
+    // listed, and the note doesn't read as if the newest were.
+    const { receipt: _receipt, ...noReceipt } = record;
+    cm.getStore().appendJson('context-manager/accepted-layout', { ...noReceipt, compileId: 'cut-empty', pr: '0' });
+    cm.close();
+    ({ cm } = await open(strategy));
+    const empty = cm.listFoldReceipts({ limit: 10 });
+    assert.deepEqual(empty.receipts, []);
+    assert.match(empty.note ?? '', /^No receipts are listed: record 0, where the branch's receipts start, can't be read as a receipt\./);
+    cm.close();
+  });
+
+  it('caps a query at 100 receipts, with more to come', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 2);
+    const quiet = new FoldJournal(wrapStore(cm.getStore(), { sync: () => {} }), 'agents/tester');
+    for (let i = 0; i < 102; i++) {
+      strategy.plan.set(ids[0]!, i % 2 === 0 ? 'omit' : 'raw');
+      quiet.accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    }
+    const listed = quiet.query({ limit: 500 });
+    assert.equal(listed.receipts.length, 100);
+    assert.equal(listed.more, true);
+    cm.close();
+  });
+
+  it('refuses a since time without its offset, which would be read in the host zone', async () => {
+    const { cm } = await open();
+    add(cm, 2);
+    await acceptCompile(cm);
+    assert.throws(() => cm.listFoldReceipts({ since: '2026-10-09T14:00:00' }), /Give its offset/);
+    assert.equal(cm.listFoldReceipts({ since: '2026-10-09' }).receipts.length, 1, 'a date is midnight UTC');
+    assert.equal(cm.listFoldReceipts({ since: '2026-10-09T14:00:00+02:00' }).receipts.length, 1);
+    cm.close();
+  });
+
+  it('a listener that accepts another round inside an acceptance leaves the journal whole', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const real = cm.getStore();
+    let failNextSyncAfterAppend = false;
+    let appended = false;
+    const flaky = wrapStore(real, {
+      appendJson: (type: string, payload: unknown) => { appended = true; return real.appendJson(type, payload); },
+      sync: () => {
+        if (failNextSyncAfterAppend && appended) { failNextSyncAfterAppend = false; throw new Error('fsync failed'); }
+        real.sync();
+      },
+    });
+    // Another journal's receipt, which this journal will announce at its next acceptance.
+    new FoldJournal(flaky, 'agents/tester').accept((await cm.compile(BUDGET)).provenance!, Date.now(), undefined);
+    const journal = new FoldJournal(flaky, 'agents/tester');
+    strategy.plan.set(ids[0]!, 'omit');
+    const inner = (await cm.compile(BUDGET)).provenance!;
+    strategy.plan.set(ids[1]!, 'omit');
+    const outer = (await cm.compile(BUDGET)).provenance!;
+    let entered = false;
+    journal.onReceipt(() => {
+      if (entered) return;
+      entered = true;
+      appended = false;
+      failNextSyncAfterAppend = true;
+      journal.accept(inner, Date.now(), undefined); // its write lands, then its sync fails
+    });
+    const error = console.error;
+    console.error = () => {};
+    let outerReceipt: FoldReceipt | null;
+    try {
+      outerReceipt = journal.accept(outer, Date.now(), undefined);
+    } finally {
+      console.error = error;
+    }
+    assert.ok(entered);
+    const before = layoutRecords(real).length;
+    const innerAgain = journal.accept(inner, Date.now(), undefined);
+    assert.equal(layoutRecords(real).length, before, 'the inner acceptance is found, not written again');
+    assert.equal(innerAgain?.kind, 'change');
+    assert.deepEqual(outerReceipt?.changes?.map((c) => c.first.messageId), [ids[1]], 'the outer round compares with the inner one');
+    cm.close();
+  });
+
+  it('a store id found rather than minted is made durable before it is handed out', async () => {
+    const { cm } = await open();
+    const minted = cm.getStoreId();
+    const real = cm.getStore();
+    const calls: string[] = [];
+    const watched = wrapStore(real, { sync: () => { calls.push('sync'); real.sync(); } });
+    const journal = new FoldJournal(watched, 'agents/tester');
+    assert.equal(journal.storeId(), minted);
+    assert.deepEqual(calls, ['sync']);
+    assert.equal(journal.storeId(), minted);
+    assert.deepEqual(calls, ['sync'], 'once per store object');
     cm.close();
   });
 });

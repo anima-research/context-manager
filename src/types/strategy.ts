@@ -191,10 +191,13 @@ export interface ContextStrategy {
    *
    * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
    * what a real compile at this budget would produce, but no fold resolutions
-   * are persisted, no compression/merge work is enqueued, and no transition
-   * bookkeeping is advanced. Implementations that cannot honour it must
-   * ignore it only if they are already side-effect-free (see
-   * `selectHierarchical`); any path that commits state MUST gate on it.
+   * or chunk records are persisted, no compression/merge work is enqueued, no transition
+   * bookkeeping is advanced, and what a select leaves for the next one or for
+   * observers (its cache-marker baseline, transition status, render stats,
+   * and calibration's estimate and arming) stays as the last committing
+   * select left it. Implementations that cannot
+   * honour it must ignore it only if they are already side-effect-free; any
+   * path that commits state MUST gate on it.
    */
   select(
     store: MessageStoreView,
@@ -257,16 +260,35 @@ export interface RenderedSummaryInfo {
 /**
  * Per-call options for `select()` / `compile()`.
  *
- * `dryRun` exists because the adaptive path is NOT side-effect-free: it
- * commits fold resolutions to Chronicle and enqueues real compression work.
- * An operator UI that previews a hypothetical budget must not do either, or
- * every slider drag would rewrite the fold plan and spend LLM tokens.
+ * `dryRun` exists because a select is NOT side-effect-free: it commits fold
+ * resolutions and chunk records to Chronicle, enqueues real compression work,
+ * and leaves state the next compile and observers read. An operator UI that
+ * previews a hypothetical budget must change none of it, or every slider drag
+ * would rewrite the fold plan, spend LLM tokens and change what the next real
+ * compile sends. The field's doc gives the whole contract.
  */
 export interface SelectOptions {
   /**
    * Compute the layout without committing anything: no resolution persistence,
-   * no produce/merge enqueue, no shadow production pick, and no transition
-   * bookkeeping. Over-budget becomes a reported condition rather than a throw.
+   * no chunk record and no compression queued for a chunk the select's
+   * rebuild closes, no produce/merge enqueue, no shadow production pick, no
+   * transition bookkeeping, and nothing a select leaves for the next one or for
+   * observers (the cache-marker baseline, the transition status, the render
+   * stats, calibration's estimate, arming and store view, the store order, the
+   * head-window memo, and whether chunk records are trusted), all on every
+   * path out, throws included.
+   *
+   * What a dry select refuses is what a real compile refuses, with one
+   * exception: an over-budget plan is not thrown at the plan check. A plain
+   * dry compile then returns that plan's entries with no verdict, and
+   * `previewContext` is where infeasibility is reported. The head-and-tail
+   * check before the plan check, and any later stage that can't fit, still
+   * throw as for a real compile, leaving nothing behind; `previewContext`
+   * reports an over-budget throw and passes any other throw through.
+   *
+   * A compression hold ends at its deadline, whoever looks: the manager
+   * releases an expired hold at any compile or hold query, a dry compile
+   * included, and that release is the one thing a dry compile can leave.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the

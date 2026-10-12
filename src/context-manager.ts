@@ -44,6 +44,7 @@ import {
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './types/index.js';
+import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -65,6 +66,8 @@ import type {
   RenderedLayout,
   RenderedSummaryInfo,
 } from './types/index.js';
+
+type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
 
 /**
  * Base configuration for ContextManager.
@@ -169,10 +172,55 @@ interface ContextManagerStoreConfig extends ContextManagerBaseConfig {
 export type ContextManagerConfig = ContextManagerPathConfig | ContextManagerStoreConfig;
 
 /**
+ * Rejection of a strategy initialization that a newer one superseded.
+ *
+ * From switchBranch() or fork(), the call's branch selection, and a fork's
+ * branch creation, had already happened: `branch` names the branch, and
+ * `created` says whether this call created it. A caller never needs to retry
+ * a fork to learn whether it happened. From setStrategy(), `branch` is
+ * undefined.
+ */
+export class InitializationSupersededError extends Error {
+  readonly branch: string | undefined;
+  readonly created: boolean;
+
+  constructor(selection?: { branch: string; created: boolean }) {
+    super(
+      selection
+        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+          `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
+        : 'Strategy initialization was superseded by a newer initialization',
+    );
+    this.name = 'InitializationSupersededError';
+    this.branch = selection?.branch;
+    this.created = selection?.created ?? false;
+  }
+}
+
+/**
  * Context Manager - the main interface for managing conversation context.
  *
  * Sits between the application/agent layer and Membrane, managing what goes
  * into the context window. Uses Chronicle for persistent storage.
+ *
+ * Mutations and strategy operations require a completed initialization attempt.
+ * Pending or failed attempts refuse that work. They also refuse the
+ * strategy-state queries, whose answers could then belong to another branch or
+ * be partial: isReady, getPendingWork, getHotContextSettings, previewContext,
+ * listPins, searchSummaries, getSummary, getSummariesInRange,
+ * getMaxSummaryLevel and getRenderStats. Raw message reads and branch
+ * inspection remain available for recovery with switchBranch() or
+ * setStrategy(). So do compression holds (holdCompression,
+ * releaseCompression) and request settings (setToolDefinitions,
+ * setSystemPrompt): they live in memory, and the strategy hears of a released
+ * hold only once an attempt succeeds.
+ *
+ * The fence governs operations that start while an attempt is pending or
+ * failed. Work already in flight when a transition begins, and a superseded
+ * initializer's own writes before it returns, are the strategy's to guard;
+ * transitions do not roll back earlier writes. Direct Chronicle switches retain
+ * their existing strategy-specific semantics; this fence does not pin a manager
+ * to a branch.
  */
 export class ContextManager {
   private store: JsStore;
@@ -180,7 +228,8 @@ export class ContextManager {
   private contextLog: ContextLog;
   private strategy: ContextStrategy;
   private membrane?: Membrane;
-  private initialized = false;
+  private initializationAttempt = 0;
+  private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
   private debugLogContext: boolean;
@@ -193,6 +242,8 @@ export class ContextManager {
    * persisted, so a restart can never leave compression permanently stalled.
    */
   private compressionHolds = new Set<MessageId>();
+  /** Summaries the strategy rendered but couldn't describe, already reported. */
+  private undescribedSummariesReported = new Set<string>();
   /** Sharded adds held on ingress: first-shard id -> every shard id. */
   private compressionHoldGroups = new Map<MessageId, MessageId[]>();
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
@@ -299,16 +350,37 @@ export class ContextManager {
       throw new Error('ContextManagerConfig must have either "path" or "store"');
     }
 
+    // Opening can fail from here on: a registration Chronicle refuses, a
+    // configuration error, or a strategy that refuses the store (e.g.
+    // StoreTopologyError). A store we opened must not stay locked behind a
+    // rejected promise: release it, then rethrow.
+    try {
+      return await ContextManager.openOn(store, ownsStore, config);
+    } catch (error) {
+      if (ownsStore) {
+        try { store.close(); } catch { /* the open error is the one to report */ }
+      }
+      throw error;
+    }
+  }
+
+  private static async openOn(
+    store: JsStore,
+    ownsStore: boolean,
+    config: ContextManagerConfig,
+  ): Promise<ContextManager> {
     // Namespace for messages: only when `isolate` is true
     if (config.isolate && !config.namespace) {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
     }
     const messageNamespace = config.isolate ? config.namespace : undefined;
 
-    // Register states if needed (idempotent)
+    // Register states if needed. A slot that already exists is kept; any
+    // other registration failure propagates (see isStateExistsFor).
     try {
       MessageStore.register(store, messageNamespace);
-    } catch {
+    } catch (error) {
+      if (!isStateExistsFor(error, MessageStore.registrationFor(messageNamespace).id)) throw error;
       // State already registered. Registrations persist in the store, so
       // on existing stores the snapshot cadence stays pinned to whatever
       // the FIRST registration said — retune it to the current constants
@@ -337,8 +409,8 @@ export class ContextManager {
 
     try {
       ContextLog.register(store, config.namespace);
-    } catch {
-      // State already registered
+    } catch (error) {
+      if (!isStateExistsFor(error, ContextLog.stateIdFor(config.namespace))) throw error;
     }
 
     const messageStore = new MessageStore(store, {
@@ -373,8 +445,8 @@ export class ContextManager {
       seenAuxSlots.add(slotId);
       try {
         MessageStore.register(store, aux.namespace);
-      } catch {
-        /* already registered */
+      } catch (error) {
+        if (!isStateExistsFor(error, slotId)) throw error;
       }
       return [new MessageStore(store, {
         estimator: config.tokenEstimator,
@@ -401,20 +473,7 @@ export class ContextManager {
     );
     if (config.now) manager.now = config.now;
 
-    // Initialize strategy. A strategy that refuses the store (e.g.
-    // StoreTopologyError) must not leave a store we opened locked behind a
-    // rejected promise: release it, then rethrow.
-    const openingBranch = observeStoreBranch(store);
-    try {
-      await manager.initializeStrategy(openingBranch);
-    } catch (error) {
-      if (ownsStore) {
-        try { store.close(); } catch { /* the initialize error is the one to report */ }
-      }
-      throw error;
-    }
-    manager.initialized = true;
-
+    await manager.initializeStrategy();
     return manager;
   }
 
@@ -470,6 +529,7 @@ export class ContextManager {
     metadata?: MessageMetadata,
     causedBy?: MessageId[]
   ): MessageId {
+    this.requireInitialized('addMessage');
     // Optional strategy-driven ingestion-time chunking
     const strategyAny = this.strategy as unknown as {
       chunkIngressMessage?: (
@@ -496,19 +556,52 @@ export class ContextManager {
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         let firstId: MessageId | null = null;
-        for (const shard of ordered) {
-          const message = this.messageStore.append(
-            participant,
-            shard.content,
-            metadata,
-            causedBy,
-            {
-              bodyGroupId: decision.bodyGroupId,
-              shardIndex: shard.shardIndex,
-              shardCount,
+        const lengthBefore = this.messageStore.length();
+        // These appends must stay synchronous: one body's shards in one loop, in
+        // shard order, with no await between them. The body-runs rule (body-runs.ts)
+        // reads a body as consecutive messages of one group id whose shard indices
+        // rise, so a body's shards must land together: a message appended between
+        // them would split the body. Nothing in context-manager appends a message
+        // anywhere but here and below, so nothing of its own can. A host's
+        // onMessage listener runs inside each append, and its contract rules out
+        // adding a message from there synchronously.
+        try {
+          for (const shard of ordered) {
+            const message = this.messageStore.append(
+              participant,
+              shard.content,
+              metadata,
+              causedBy,
+              {
+                bodyGroupId: decision.bodyGroupId,
+                shardIndex: shard.shardIndex,
+                shardCount,
+              }
+            );
+            if (firstId === null) firstId = message.id;
+          }
+        } catch (err) {
+          // A write that fails partway leaves no part of the body in the
+          // store: remove what it wrote (the failing shard too, if it
+          // landed), so a retry writes one body. If that fails as well, the
+          // shards may stay, and shardCount marks the body short. The first
+          // shard's own append can throw after it landed: then it's the
+          // store's last. Nothing here replaces the write's own error.
+          let landed = firstId;
+          try {
+            if (landed === null && this.messageStore.length() > lengthBefore) {
+              const last = this.messageStore.getTail(1)[0];
+              if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
             }
-          );
-          if (firstId === null) firstId = message.id;
+            if (landed !== null) this.messageStore.removeBodyGroup(landed);
+          } catch (removal) {
+            console.error(
+              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
+                `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
+                (removal instanceof Error ? removal.message : String(removal)),
+            );
+          }
+          throw err;
         }
         return firstId!;
       }
@@ -526,6 +619,7 @@ export class ContextManager {
    * addMessage `holdCompression`) until after the edit.
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
+    this.requireInitialized('editMessage');
     this.messageStore.edit(messageId, content);
     // Propagation handled by event listener
   }
@@ -659,7 +753,7 @@ export class ContextManager {
    */
   private notifyHoldsReleased(): void {
     if (!this.strategy.onCompressionHoldsReleased) return;
-    if (!this.initialized) {
+    if (this.initializedAttempt !== this.initializationAttempt) {
       this.holdReleaseNotifyPending = true;
       return;
     }
@@ -697,6 +791,7 @@ export class ContextManager {
    * Remove a message from the store. Propagates to context log.
    */
   removeMessage(messageId: MessageId): void {
+    this.requireInitialized('removeMessage');
     this.messageStore.remove(messageId);
     // Propagation handled by event listener
   }
@@ -705,6 +800,7 @@ export class ContextManager {
    * Remove a range of messages from the store.
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
+    this.requireInitialized('removeMessages');
     this.messageStore.removeRange(fromId, toId);
     // Propagation handled by event listener
   }
@@ -750,9 +846,28 @@ export class ContextManager {
    * Subscribe to message-store mutations (add/edit/remove/removeRange).
    * Returns a detacher. Unlike trace events, this fires for ALL stored
    * messages including assistant turns and tool results.
+   *
+   * A listener runs synchronously inside the write that emitted its event,
+   * so it can run while a sharded addMessage is still storing that body's
+   * remaining shards. It must not add a message synchronously: one added there
+   * would land between a body's shards and split the body (body-runs.ts).
+   * Add it after the call returns (a microtask or later) instead. A listener
+   * that throws is logged, naming the message it missed, and the write it
+   * heard stands: the throw doesn't reach the caller. Each call registers
+   * its own listener and returns its own unsubscribe, so a function
+   * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
-    return this.messageStore.addListener(listener);
+    // A host's listener observes; its throw isn't the write's failure. The
+    // manager's own listener (the context log's propagation) stays outside
+    // this, so a failure there still fails the write as before.
+    return this.messageStore.addListener((event) => {
+      try {
+        listener(event);
+      } catch (err) {
+        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+      }
+    });
   }
 
   /**
@@ -848,6 +963,7 @@ export class ContextManager {
    * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
+    this.requireInitialized('branchAt');
     const message = this.messageStore.get(messageId);
     if (!message) {
       throw new Error(`Message not found: ${messageId}`);
@@ -872,11 +988,22 @@ export class ContextManager {
    * stored on Chronicle is reloaded. Strategies that hold derived in-memory
    * caches (e.g. AutobiographicalStrategy.summaries) need this to avoid
    * showing the previous branch's state on the new branch.
+   *
+   * Transitions are nontransactional: if initialization rejects, the selected
+   * branch and any initialization writes remain. Inspect currentBranch();
+   * mutations and strategy operations stay blocked until a successful
+   * switchBranch() or setStrategy(). Inspection and close remain available.
+   * If a newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it selected.
    */
   async switchBranch(branchId: string): Promise<void> {
-    this.store.switchBranch(branchId);
+    await this.selectBranch(branchId, false);
+  }
+
+  private async selectBranch(name: string, created: boolean): Promise<void> {
+    this.store.switchBranch(name);
     const requested = markStoreBranchSwitch(this.store);
-    await this.initializeStrategy(requested);
+    await this.initializeStrategy(requested, { branch: requested.name, created });
   }
 
   /**
@@ -891,14 +1018,20 @@ export class ContextManager {
    * `branchAt(messageId, name?)` instead, then `switchBranch(name)`.
    *
    * Returns the new branch's name. The strategy is re-initialized on the
-   * new branch so it picks up the forked state.
+   * new branch so it picks up the forked state. If initialization rejects,
+   * the new branch remains present and selected unless another operation
+   * switches it. The same recovery contract as switchBranch() applies. If a
+   * newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it created, so a caller
+   * never retries a fork to learn whether it happened.
    */
   async fork(name?: string): Promise<string> {
+    this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
-    await this.switchBranch(branch.name);
+    await this.selectBranch(branch.name, true);
     return branch.name;
   }
 
@@ -939,6 +1072,7 @@ export class ContextManager {
    * Check if compile() will block waiting for background work.
    */
   isReady(): boolean {
+    this.requireInitialized('isReady');
     return this.strategy.checkReadiness().ready;
   }
 
@@ -946,6 +1080,7 @@ export class ContextManager {
    * Get info about pending background work.
    */
   getPendingWork(): PendingWork | null {
+    this.requireInitialized('getPendingWork');
     const state = this.strategy.checkReadiness();
     if (state.ready) {
       return null;
@@ -973,6 +1108,7 @@ export class ContextManager {
     injections?: ContextInjection[],
     opts?: SelectOptions
   ): Promise<CompileResult> {
+    this.requireInitialized('compile');
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -1088,21 +1224,25 @@ export class ContextManager {
       }
       for (const id of bound.strippedFrom.keys()) attribution.rawComplete.set(id, false);
       result.thinkingStripped = bound.stripped;
-      if (bound.strippedBlocks.length > 0) {
+      if (bound.strippedBlocks.length > 0 && !dryRun) {
         // The strategy priced these blocks; the request won't carry them. A
-        // dry run's select records its estimate too, so it hears this too.
+        // dry select puts back the estimate it found, so only a committing
+        // compile's estimate hears this.
         const strippedTokens = bound.strippedBlocks.reduce(
           (acc, block) => acc + this.messageStore.estimateTokens({ content: [block] } as StoredMessage), 0);
         this.strategy.noteStrippedTokens?.(strippedTokens);
       }
-      result.rawBodies = rawBodiesOf(attribution.sources, storedMessages);
+      result.rawBodies = rawBodiesOf(attribution);
+      const layout = this.renderedLayoutFor(viewMessages, layoutEntries, attribution.rawComplete, injected, selectionCause);
       result.provenance = {
         compileId,
         namespace: this.strategyNamespace,
         branch,
         messages: messageSources,
-        layout: this.renderedLayoutFor(viewMessages, layoutEntries, attribution.rawComplete, injected, selectionCause),
+        layout,
         strategy: this.strategy.name,
+        // Only a layout is ever accepted, so only then ask where the journal stands.
+        ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
@@ -1193,11 +1333,15 @@ export class ContextManager {
       : new Map<string, RenderedSummaryInfo>();
     const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
     if (undescribed.length > 0) {
-      console.warn(
-        `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
-        `(${undescribed.slice(0, 5).join(', ')}${undescribed.length > 5 ? ', …' : ''}); ` +
-        'no rendered layout is reported for this compile',
-      );
+      const fresh = undescribed.filter((id) => !this.undescribedSummariesReported.has(id));
+      if (fresh.length > 0) {
+        for (const id of fresh) this.undescribedSummariesReported.add(id);
+        console.warn(
+          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+          `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
+          'no rendered layout is reported for a compile that renders them',
+        );
+      }
       return null;
     }
     // Estimators are store-level: the strategy view's estimates and its
@@ -1264,12 +1408,12 @@ export class ContextManager {
    * Accept a compile whose provider round succeeded. Call once a round that
    * carried `provenance`'s messages has stood. A compile is accepted once:
    * repeat calls (later rounds of the same compile, or a retry after an
-   * uncertain failure, from this manager or another on the store, before or
-   * after a reopen) are no-ops. Compares the compile's rendered layout with
-   * the last layout accepted on the compile's own branch, by any manager on
-   * the store — even when another branch is selected by now — and appends a
-   * fold receipt when any message changed form, or a baseline when that
-   * branch has no record.
+   * uncertain failure, from this manager or another of its namespace on the
+   * store, before or after a reopen) are no-ops. Compares the compile's
+   * rendered layout with the last layout accepted on the compile's own branch
+   * in its namespace, by any manager of it on the store — even when another
+   * branch is selected by now — and appends a fold receipt when any message
+   * changed form, or a baseline when that branch has no record it can read.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
@@ -1292,8 +1436,18 @@ export class ContextManager {
    * writes to the slot (a message heard mid-tool-loop) until the turn ends.
    * An edit after a reply is stored strips the reply's thinking.
    *
-   * Returns the receipt written, or null (no change, already accepted, or a
-   * strategy that does not report its layout).
+   * Returns the receipt, or null: no change, or a compile with no layout to
+   * record (`provenance.layout` is null): a strategy that doesn't report its
+   * layout, or one that rendered a summary it can't describe, reported once
+   * per summary. Nothing is recorded for such a compile, so the next one
+   * accepted is compared with the last layout recorded before it, and its
+   * receipt carries the changes of both rounds. A compile accepted before
+   * returns what that acceptance returned, its receipt or null, so a retry
+   * after an uncertain failure learns the outcome, and a receipt can come
+   * back again (key on its id and compileId: a receipt lost to Chronicle's
+   * rot exception can have its id go to a later receipt). A provenance of
+   * another namespace is refused with an error: accept a compile on the
+   * manager that compiled it.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -1397,7 +1551,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Set the context management strategy.
+   * Set the context management strategy and initialize it on the selected branch.
+   * Also recovers a manager after failed initialization. A failure leaves work
+   * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.strategy = strategy;
@@ -1413,12 +1569,14 @@ export class ContextManager {
 
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
+    this.requireInitialized('getHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) return null;
     return this.strategy.getHotContextSettings();
   }
 
   /** Update only settings the active strategy explicitly declares hot-safe. */
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    this.requireInitialized('updateHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support live context settings');
     }
@@ -1435,6 +1593,7 @@ export class ContextManager {
     overrides?: Record<string, unknown>,
     opts?: { render?: boolean },
   ): PreviewResult | null {
+    this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
@@ -1465,6 +1624,7 @@ export class ContextManager {
    * Throws if the active strategy doesn't support pins.
    */
   pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('pinRange');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -1487,6 +1647,7 @@ export class ContextManager {
    * with `kind: 'document'`. Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('markDocument');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support documents');
     }
@@ -1495,6 +1656,7 @@ export class ContextManager {
 
   /** Remove a pin or document mark. Returns true if removed. */
   unpin(pinId: string): boolean {
+    this.requireInitialized('unpin');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -1503,6 +1665,7 @@ export class ContextManager {
 
   /** List all current pins. Returns empty array if strategy is not pinnable. */
   listPins(): ReadonlyArray<ProtectedRange> {
+    this.requireInitialized('listPins');
     if (!isPinnableStrategy(this.strategy)) return [];
     return this.strategy.listPins();
   }
@@ -1519,12 +1682,14 @@ export class ContextManager {
    * — see e.g. agent-framework's MCPL host integration.
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
+    this.requireInitialized('searchSummaries');
     if (!isSearchableStrategy(this.strategy)) return [];
     return this.strategy.searchSummaries(query);
   }
 
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
+    this.requireInitialized('getSummary');
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
   }
@@ -1542,6 +1707,7 @@ export class ContextManager {
    * see e.g. agent-framework's MCPL host integration.
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
+    this.requireInitialized('getSummariesInRange');
     if (!isSummaryOverviewStrategy(this.strategy)) return [];
     return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
   }
@@ -1551,6 +1717,7 @@ export class ContextManager {
    * doesn't support the summary table-of-contents, or none exist yet.
    */
   getMaxSummaryLevel(): number {
+    this.requireInitialized('getMaxSummaryLevel');
     return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
@@ -1563,6 +1730,7 @@ export class ContextManager {
    * agent's context is folded vs raw" at a glance.
    */
   getRenderStats(): RenderStats | null {
+    this.requireInitialized('getRenderStats');
     if (!isRenderStatsCapable(this.strategy)) return null;
     return this.strategy.getRenderStats(this.strategyMessageView());
   }
@@ -1577,6 +1745,7 @@ export class ContextManager {
    * Returns the transition summary text used.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
+    const attempt = this.requireInitialized('resetHeadWindow');
     if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
     }
@@ -1585,6 +1754,7 @@ export class ContextManager {
 
     // Generate transition summary if not provided
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
+    this.requireInitialized('resetHeadWindow', attempt);
 
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
@@ -1602,6 +1772,7 @@ export class ContextManager {
    * Call this periodically to allow strategies to do compression, etc.
    */
   async tick(): Promise<void> {
+    this.requireInitialized('tick');
     this.expireCompressionHolds();
     if (this.strategy.tick) {
       await this.strategy.tick(this.createStrategyContext());
@@ -1613,27 +1784,59 @@ export class ContextManager {
   // ==========================================================================
 
   private async initializeStrategy(
-    expectedBranch: StoreBranchGeneration = observeStoreBranch(this.store),
+    expectedBranch?: StoreBranchGeneration,
+    selection?: { branch: string; created: boolean },
   ): Promise<void> {
-    this.initialized = false;
-    if (this.strategy.initialize) {
-      await this.strategy.initialize(this.createStrategyContext());
+    const attempt = ++this.initializationAttempt;
+    this.initializedAttempt = null;
+    const strategy = this.strategy;
+    expectedBranch ??= observeStoreBranch(this.store);
+    const branchId = this.store.currentBranch().id;
+    if (strategy.initialize) {
+      await strategy.initialize(this.createStrategyContext());
     }
-    if (this.thinkingBinding.engaged()) this.strategy.noteThinkingBound?.();
+    if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      throw new InitializationSupersededError(selection);
+    }
+    if (this.thinkingBinding.engaged()) strategy.noteThinkingBound?.();
     const current = observeStoreBranch(this.store);
+    const currentBranchId = this.store.currentBranch().id;
     if (
       current.name !== expectedBranch.name ||
       current.generation !== expectedBranch.generation ||
-      this.store.currentBranch().name !== expectedBranch.name
+      currentBranchId !== branchId
     ) {
       throw new Error(
         `Branch changed during strategy initialization: requested ${expectedBranch.name} ` +
-        `(generation ${expectedBranch.generation}), now ${current.name} ` +
-        `(generation ${current.generation})`,
+        `(id ${branchId}, generation ${expectedBranch.generation}), now ${current.name} ` +
+        `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
-    this.initialized = true;
+    this.initializedAttempt = attempt;
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
+  }
+
+  /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
+  private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+    const current: InitializationStamp = {
+      ...observeStoreBranch(this.store),
+      id: this.store.currentBranch().id,
+      attempt: this.initializationAttempt,
+    };
+    if (this.initializedAttempt !== current.attempt) {
+      throw new Error(
+        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}). ` +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+      );
+    }
+    if (expected && (
+      expected.attempt !== current.attempt ||
+      expected.name !== current.name || expected.generation !== current.generation ||
+      expected.id !== current.id
+    )) {
+      throw new Error(`Branch or strategy changed during ContextManager.${operation}; retry on the intended branch.`);
+    }
+    return current;
   }
 
   /**
@@ -1896,4 +2099,17 @@ function sentEntries(
     const content = sent.get(e);
     return content ? [{ ...entry, content }] : [];
   });
+}
+
+/** What a store event was about, for a log line: its message (and body group), or its span. */
+function describeStoreEvent(event: MessageStoreEvent): string {
+  switch (event.type) {
+    case 'add':
+      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+    case 'edit':
+    case 'remove':
+      return `message ${event.messageId}`;
+    case 'removeRange':
+      return `messages ${event.fromId} to ${event.toId}`;
+  }
 }

@@ -11,8 +11,8 @@
  * to raw, rendered to omitted, omitted to rendered, or a raw copy becoming
  * partial or complete. Messages that arrived since the last accepted round
  * are arrivals, not folds. The first accepted round on a branch the journal
- * has never recorded writes a baseline receipt that says history before it
- * is unknown.
+ * has never recorded, or whose newest record it can't read, writes a
+ * baseline receipt that says history before it is unknown.
  *
  * Storage is Chronicle typed records, not branch state: typed records are
  * enumerable from any branch and survive branch deletion, so every branch's
@@ -29,20 +29,28 @@
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
  *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts): a delta's size follows what changed, and
- *   the history behind the window costs only its members, in snapshots.
+ *   its units (forms with counts). A delta's size follows what changed. A
+ *   snapshot holds the whole layout, the history behind the window as its
+ *   members; it is written only once the records since the last one would
+ *   outweigh it, so snapshots cost about as much again as the deltas between
+ *   them. On average, then, the bytes stored per acceptance don't grow with
+ *   the session, though each snapshot holds the whole view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
  * the journal's own records sit between a branch's messages.
  *
- * The records are the journal's only truth. A journal indexes them, reading
- * each once, oldest first, so every acceptance compares with the branch's
- * newest record whichever journal on the store wrote it, and a compile is
- * accepted once: a retry finds the record its first acceptance wrote,
- * whether that acceptance changed the layout or not, reported success or
- * failure after landing, ran in another journal, or ran before a reopen.
- * The index keeps ids and times; a receipt's body is read when asked for.
+ * The records are the journal's only truth, and a use reads only the ones
+ * it needs. Every acceptance compares with the branch's newest record in its
+ * namespace, whichever journal on the store wrote it, read back from the
+ * store's newest record; the records present at open are read back at most
+ * once per store object, each branch noted as it's met. A compile is accepted once: it carries where the journal stood
+ * when it ran (a durable record, see JournalMark), and a retry finds the
+ * record its first acceptance wrote among the records after that, whether
+ * that acceptance changed the layout or not, reported success or failure
+ * after landing, ran in another journal, or ran before a reopen. Each record
+ * names its branch's previous receipt, so reading a branch's receipts reads
+ * only receipts.
  *
  * An acceptance is durable before it is reported, and never outlives what it
  * names: the store syncs before the record is appended (so the messages and
@@ -52,17 +60,15 @@
 
 import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
-import type { BranchRef, CompileProvenance, LayoutUnit, RenderedLayout } from './types/index.js';
+import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
 
 /** The accepted-layout record format. Records of another format are not
- *  read: format 1 was never released. */
-const RECORD_VERSION = 2;
-/** At most this many deltas follow a snapshot, however small they are. */
-const MAX_CHAIN = 256;
-/** history--folds' limit bounds. */
+ *  read: formats 1 and 2 were never released. */
+const RECORD_VERSION = 3;
+/** How many receipts listFoldReceipts returns when no limit is given, and the most it returns for any limit. */
 export const FOLD_QUERY_DEFAULT_LIMIT = 10;
 export const FOLD_QUERY_MAX_LIMIT = 100;
 
@@ -124,7 +130,11 @@ export interface FoldReceiptSource {
 
 export interface FoldReceipt {
   v: 1;
-  /** The journal record's id: stable, ordered, usable as `afterId`. */
+  /**
+   * The journal record's id: ordered, usable as `afterId`, and stable, with
+   * one exception Chronicle allows: if the store's last record rots, open
+   * drops it, and its id goes to the next record written.
+   */
   id: string;
   kind: 'baseline' | 'change';
   /** When the confirming round was accepted. Context only, never identity. */
@@ -175,15 +185,20 @@ export interface FoldQuery {
    *  id or epoch milliseconds, and an id goes in `afterId`. */
   since?: string;
   limit?: number;
-  /** Branch name; the selected branch when omitted. */
-  branch?: string;
+  /**
+   * The branch: a name, or a branch as receipts name it (`{ id, created }`);
+   * the selected branch when omitted. A name finds the live branch first,
+   * then the most recently recorded deleted branch of that name with
+   * receipts. An older branch whose name was reused is reached by its id.
+   */
+  branch?: string | Pick<BranchRef, 'id' | 'created'>;
 }
 
 export interface FoldQueryResult {
   branch: BranchRef | null;
   /** Newest first; with `afterId`, oldest first from just after it. */
   receipts: FoldReceipt[];
-  /** Newest receipt id on that branch, if any. */
+  /** Newest receipt id on that branch in this namespace, if any. */
   latestId: string | null;
   /**
    * The query matched more receipts than `limit` let it return. With
@@ -196,7 +211,7 @@ export interface FoldQueryResult {
 }
 
 /**
- * One accepted-layout record (format 2). Every acceptance writes one: the
+ * One accepted-layout record (format 3). Every acceptance writes one: the
  * branch's new last accepted layout, as a snapshot or as a delta on the
  * branch's previous record, together with the receipt it produced, if any.
  *
@@ -230,9 +245,13 @@ interface AcceptedLayoutRecord {
   totalTokens: number;
   /** Deltas since the snapshot, this one included (0 for a snapshot). */
   chain: number;
-  /** Layout bytes of the snapshot, and of the deltas since it (this one included). */
+  /** The snapshot record's size, and the delta records' since it (this one
+   *  included; 0 for a snapshot), each as its JSON, receipt and all. */
   sb: number;
   db: number;
+  /** The branch's newest receipt before this record, if any: receipts link
+   *  back through it, so a branch's receipts are found by reading only them. */
+  pr?: string;
   /** The receipt this acceptance produced; its id is the record's id. */
   receipt?: Omit<FoldReceipt, 'id'>;
 }
@@ -261,11 +280,19 @@ export function storeIdentity(store: JsStore): string {
   for (const id of ids) {
     const parsed = readRecord<{ storeId?: unknown }>(store, id);
     if (parsed && typeof parsed.storeId === 'string' && parsed.storeId) {
+      // It may be the record of a mint whose sync failed, durable or not:
+      // make it durable before anyone is told it, as after a mint.
+      store.sync();
       storeIdentityCache.set(store, parsed.storeId);
       return parsed.storeId;
     }
   }
   const storeId = randomUUID();
+  if (ids.length > 0) {
+    // Refusing would fail every acceptance on this store for good; a new id
+    // splits its receipts' storeId instead, so say why it changed.
+    console.error(`[fold-journal] the store's identity record${ids.length === 1 ? '' : 's'} ${ids.join(', ')} can't be read; receipts from now on name a new storeId, ${storeId}`);
+  }
   store.appendJson(STORE_IDENTITY_RECORD, { v: 1, storeId, mintedAt: new Date().toISOString() });
   store.sync();
   storeIdentityCache.set(store, storeId);
@@ -282,7 +309,10 @@ export function branchKey(branch: BranchRef): string {
 }
 
 function readRecord<T>(store: JsStore, id: string): T | null {
-  const record = store.getRecord(id);
+  return parseRecord<T>(store.getRecord(id));
+}
+
+function parseRecord<T>(record: ReturnType<JsStore['getRecord']>): T | null {
   if (!record) return null;
   try {
     return JSON.parse(record.payload.toString('utf8')) as T;
@@ -291,88 +321,253 @@ function readRecord<T>(store: JsStore, id: string): T | null {
   }
 }
 
+/** A record's size as stored: its JSON, in UTF-8 bytes. */
+function recordBytes(record: AcceptedLayoutRecord): number {
+  return Buffer.byteLength(JSON.stringify(record), 'utf8');
+}
+
+/**
+ * The record's size with `field` set to `base` plus that size: a counter
+ * that includes its own record counts its own digits too.
+ */
+function sizeCounting(record: AcceptedLayoutRecord, field: 'sb' | 'db', base: number): number {
+  let size = recordBytes({ ...record, [field]: base });
+  for (;;) {
+    const next = recordBytes({ ...record, [field]: base + size });
+    if (next === size) return size;
+    size = next;
+  }
+}
+
 function isLayoutRecord(record: AcceptedLayoutRecord | null): record is AcceptedLayoutRecord {
   return !!record && record.v === RECORD_VERSION && typeof record.ns === 'string'
     && typeof record.compileId === 'string' && !!record.branch;
 }
 
-/** One branch's accepted layouts, as the records say. */
-interface BranchIndex {
-  ref: BranchRef;
-  /** The branch's newest record: its last accepted layout. */
-  newestRecord: string;
-  /** Its receipts' record ids, ascending, with each one's acceptance time
-   *  (ms). Receipt bodies stay in the store until asked for. */
-  receipts: Array<{ id: string; at: number }>;
+/** What a record's envelope says: enough to place it, without its layout. */
+interface RecordHead {
+  id: string;
+  ns: string;
+  branch: BranchRef;
+  compileId: string;
+  /** Its receipt's acceptance time (ms) when it holds one, else null. */
+  receiptAt: number | null;
+  /** The branch's newest receipt before it, if any. */
+  prevReceipt: string | null;
+  /** Of this format, so its layout can be rebuilt. */
+  readable: boolean;
 }
 
-/** What one namespace's accepted-layout records say. */
-interface NamespaceIndex {
-  /** Every compile the namespace has accepted. */
-  compiles: Set<string>;
-  branches: Map<string, BranchIndex>;
+function headOf(id: string, record: Partial<AcceptedLayoutRecord> | null): RecordHead | null {
+  if (!record || typeof record !== 'object' || typeof record.ns !== 'string'
+    || typeof record.compileId !== 'string' || !record.branch || typeof record.branch.id !== 'string') return null;
+  return {
+    id,
+    ns: record.ns,
+    branch: record.branch,
+    compileId: record.compileId,
+    // Another format's receipt and links aren't read: only its envelope places it.
+    receiptAt: record.v === RECORD_VERSION && record.receipt ? Date.parse(record.receipt.acceptedAt) : null,
+    prevReceipt: record.v === RECORD_VERSION && typeof record.pr === 'string' ? record.pr : null,
+    readable: record.v === RECORD_VERSION,
+  };
+}
+
+/** One branch's records, as far as a use has needed them. */
+interface BranchState {
+  ref: BranchRef;
+  /** Its newest record, whatever its format. */
+  newest: RecordHead;
+  /** Its newest receipt's record id, if any. */
+  newestReceipt: string | null;
+  /** Its receipts, oldest first: walked back from the newest the first time
+   *  a query needs them, or kept from the branch's first record when this
+   *  store object wrote it; extended as records are written. */
+  receipts?: Array<{ id: string; at: number }>;
+  /** Where that walk stopped short: a record a link named that couldn't be
+   *  read as a receipt (`at`), or a receipt whose link doesn't point to an
+   *  earlier record (`at`, and the record it names, `linksTo`). */
+  receiptsCut?: { at: string; linksTo?: string };
+  /** A record after `newest` that couldn't be read at all, so it may have
+   *  been this branch's newest: the next acceptance writes a baseline. */
+  shadowedBy?: string;
 }
 
 /**
- * An index of a store's accepted-layout records, shared by every journal on
- * the same store object. It lists the store's record ids once, reading each
- * record once, oldest first; after that, each journal adds its own records
- * as it writes them. That sees every record: Chronicle locks a store to one
- * open object, so every writer is a journal on this one. An append that
- * throws may still have landed, so it leaves the index stale, and the next
- * use lists again from where the index stopped. A reopened store is a new
- * object, indexed afresh.
+ * What the journals on one store object know of its accepted-layout
+ * records. Chronicle locks a store to one open object, so every writer is a
+ * journal on it. The index lists the type's ids once (in log order, which is
+ * ascending by id, after a torn tail's truncation too) and adds each record
+ * a journal writes; it reads a record only when a use needs it. An append
+ * that throws may still have landed, so it leaves the index stale, and the
+ * next use lists again, reading only the records it didn't have. A reopened
+ * store is a new object, indexed afresh.
  */
 interface StoreIndex {
-  /** How many of the store's accepted-layout record ids have been read. */
-  read: number;
-  /** Until the first listing, and after an append that threw. */
+  ids: string[];
+  /** Until the records after an append that threw are listed. */
   stale: boolean;
-  namespaces: Map<string, NamespaceIndex>;
+  /** How many of `ids` are known durable: those before the last successful sync. */
+  durable: number;
+  /** The newest durable record whose compile is known, for compiles to carry. */
+  mark: JournalMark | null;
+  /** The newest record's envelope, when it could be read. */
+  newest: RecordHead | null;
+  /** Each branch found so far, by namespace and branch key; null when the
+   *  records hold none of it. */
+  branches: Map<string, BranchState | null>;
+  /** How far back the records present at open have been read, by position:
+   *  every record from here on is known, its branch noted. Reading back
+   *  notes every branch it meets, so the history is read at most once per
+   *  store object, whichever lookups need it; at 0, every branch is known. */
+  unread: number;
+  /** The newest unreadable record a backward read has passed, if any. */
+  unreadableAbove: string | null;
+  /** Records already reported as unreadable. */
+  warned: Set<string>;
 }
 
 const storeIndexes = new WeakMap<JsStore, StoreIndex>();
+/** Store objects whose index couldn't be read for a compile's mark, already reported. */
+const markFailures = new WeakSet<JsStore>();
 
-function namespaceIndex(index: StoreIndex, namespace: string): NamespaceIndex {
-  let ns = index.namespaces.get(namespace);
-  if (!ns) {
-    ns = { compiles: new Set(), branches: new Map() };
-    index.namespaces.set(namespace, ns);
-  }
-  return ns;
+function stateKey(namespace: string, branch: Pick<BranchRef, 'id' | 'created'>): string {
+  return `${namespace}\u0000${branch.id}@${branch.created}`;
 }
 
-function ingest(index: StoreIndex, id: string, record: AcceptedLayoutRecord): void {
-  const ns = namespaceIndex(index, record.ns);
-  ns.compiles.add(record.compileId);
-  const key = branchKey(record.branch);
-  let branch = ns.branches.get(key);
-  if (!branch) {
-    branch = { ref: record.branch, newestRecord: id, receipts: [] };
-    ns.branches.set(key, branch);
-  }
-  branch.ref = record.branch;
-  branch.newestRecord = id;
-  if (record.receipt) branch.receipts.push({ id, at: Date.parse(record.receipt.acceptedAt) });
-}
-
-/** The store's index, listing the store's records first if it must. */
+/** The store's index, listing its records first if it must. */
 function storeIndex(store: JsStore): StoreIndex {
   let index = storeIndexes.get(store);
   if (!index) {
-    index = { read: 0, stale: true, namespaces: new Map() };
-    storeIndexes.set(store, index);
-  }
-  if (index.stale) {
     const ids = store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
-    for (let i = index.read; i < ids.length; i++) {
-      const record = readRecord<AcceptedLayoutRecord>(store, ids[i]!);
-      if (isLayoutRecord(record)) ingest(index, ids[i]!, record);
+    const built: StoreIndex = { ids, stale: false, durable: 0, mark: null, newest: null, branches: new Map(), unread: ids.length, unreadableAbove: null, warned: new Set() };
+    if (built.ids.length > 0) {
+      // One sync makes everything present at open durable, so a compile can
+      // carry any of it as its mark: a record a crash could still take might
+      // have its id reissued.
+      store.sync();
+      built.durable = built.ids.length;
+      built.newest = readHead(store, built, built.ids[built.ids.length - 1]!);
+      for (let i = built.ids.length - 1; i >= 0 && !built.mark; i--) {
+        const head = i === built.ids.length - 1 ? built.newest : readHead(store, built, built.ids[i]!);
+        if (head) built.mark = { recordId: head.id, compileId: head.compileId };
+      }
     }
-    index.read = ids.length;
+    // Kept only once every step above has succeeded, so a failed one is
+    // tried again at the next use.
+    storeIndexes.set(store, built);
+    index = built;
+  } else if (index.stale) {
+    // Only an append of this object's can have added to the list: one at a
+    // time, so a read that throws partway counts nothing twice. One that
+    // can't be read is the record of an acceptance that failed to its
+    // caller, which a retry redoes (findAccepted can't find it), so the
+    // branches keep the newest records they had. After a reopen nobody knows
+    // whose it was, and readBack shadows the branches below it instead.
+    const ids = store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
+    for (let i = index.ids.length; i < ids.length; i++) {
+      const head = readHead(store, index, ids[i]!);
+      index.ids.push(ids[i]!);
+      index.newest = head;
+      if (head) noteRecord(index, head);
+    }
     index.stale = false;
   }
   return index;
+}
+
+/** A record's envelope, or null when it has none to read (reported once). */
+function readHead(store: JsStore, index: StoreIndex, id: string): RecordHead | null {
+  const stored = store.getRecord(id);
+  const head = headOf(id, parseRecord<AcceptedLayoutRecord>(stored));
+  if (!head) {
+    // Gone is not damaged: a record at the end of the log can rot, and open drops it.
+    if (stored) warnUnreadable(index, id, 'it does not parse as an accepted-layout record');
+    else warnRecord(index, id, 'is missing: the store no longer has it');
+  }
+  return head;
+}
+
+function warnUnreadable(index: StoreIndex, id: string, why: string): void {
+  warnRecord(index, id, `is unreadable (${why})`);
+}
+
+function warnRecord(index: StoreIndex, id: string, problem: string): void {
+  warnOnce(index, id, `[fold-journal] accepted-layout record ${id} ${problem}`);
+}
+
+/** Report something once per store object, by key (a record's id, or a situation's). */
+function warnOnce(index: StoreIndex, key: string, message: string): void {
+  if (index.warned.has(key)) return;
+  index.warned.add(key);
+  console.error(message);
+}
+
+/** A record now the newest of its branch: its envelope says what came before. */
+function noteRecord(index: StoreIndex, head: RecordHead): void {
+  const key = stateKey(head.ns, head.branch);
+  const known = index.branches.get(key);
+  const newestReceipt = head.receiptAt !== null ? head.id : head.prevReceipt;
+  if (known) {
+    known.ref = head.branch;
+    known.newest = head;
+    known.newestReceipt = newestReceipt;
+    delete known.shadowedBy;
+    if (known.receipts && head.receiptAt !== null) known.receipts.push({ id: head.id, at: head.receiptAt });
+    return;
+  }
+  // A branch the records held none of starts here, so its receipts are known.
+  const receipts = known === null ? (head.receiptAt !== null ? [{ id: head.id, at: head.receiptAt }] : []) : undefined;
+  index.branches.set(key, { ref: head.branch, newest: head, newestReceipt, ...(receipts ? { receipts } : {}) });
+}
+
+/**
+ * Read back through the records present at open, from where the last read
+ * stopped, noting each branch the first time it's met (its newest record),
+ * until `until`'s branch is met or every record has been read. A record
+ * that can't be read at all may have been any branch's newest, so a branch
+ * first met below one is shadowed by it.
+ */
+function readBack(store: JsStore, index: StoreIndex, until?: string): void {
+  while (index.unread > 0) {
+    const position = index.unread - 1;
+    const id = index.ids[position]!;
+    const head = readHead(store, index, id);
+    index.unread = position;
+    if (!head) {
+      index.unreadableAbove ??= id;
+      continue;
+    }
+    const key = stateKey(head.ns, head.branch);
+    if (index.branches.get(key) === undefined) {
+      index.branches.set(key, {
+        ref: head.branch,
+        newest: head,
+        newestReceipt: head.receiptAt !== null ? head.id : head.prevReceipt,
+        ...(index.unreadableAbove !== null ? { shadowedBy: index.unreadableAbove } : {}),
+      });
+    }
+    if (key === until) return;
+  }
+}
+
+/** Everything listed is durable now: a sync has just succeeded. */
+function markDurable(index: StoreIndex): void {
+  index.durable = index.ids.length;
+  if (index.newest) index.mark = { recordId: index.newest.id, compileId: index.newest.compileId };
+}
+
+/** The position just after `id` in an ascending id list (ids are decimal integers). */
+function positionAfter(ids: readonly string[], id: string): number {
+  const after = Number(id);
+  let lo = 0;
+  let hi = ids.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (Number(ids[mid]!) <= after) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 export class FoldJournal {
@@ -381,17 +576,33 @@ export class FoldJournal {
    *  it, used only while its record is still the branch's newest. */
   private readonly latest = new Map<string, LatestLayout>();
   private readonly listeners = new Set<(receipt: FoldReceipt) => void>();
-  /** Receipt ids this journal has announced to its listeners. */
-  private readonly notified = new Set<string>();
+  /** The newest receipt this journal has announced on each branch (by
+   *  branch key): a branch's newest receipt is announced once, and only
+   *  that is ever asked, so this holds one id a branch, however long the
+   *  history. An older receipt a retry finds may be heard again. */
+  private readonly announced = new Map<string, string>();
 
   constructor(
     private readonly store: JsStore,
     private readonly namespace: string,
   ) {}
 
-  /** This namespace's records as the store holds them now. */
-  private index(): NamespaceIndex {
-    return namespaceIndex(storeIndex(this.store), this.namespace);
+  /**
+   * Where the journal stands, for a compile to carry (see JournalMark).
+   * Called inside every compile, so it never throws: when the store can't
+   * be read or synced, the compile carries no mark (an acceptance of it then
+   * reads every record), and the failure is reported once per store object.
+   */
+  mark(): JournalMark | null {
+    try {
+      return storeIndex(this.store).mark;
+    } catch (err) {
+      if (!markFailures.has(this.store)) {
+        markFailures.add(this.store);
+        console.error(`[fold-journal] can't tell where the journal stands (${err instanceof Error ? err.message : String(err)}); compiles carry no mark until it can`);
+      }
+      return null;
+    }
   }
 
   setSource(source: ReceiptSource): void {
@@ -406,9 +617,11 @@ export class FoldJournal {
   /**
    * Accept the layout of a compile whose provider round succeeded. Writes a
    * receipt when the layout changed form relative to the last accepted layout
-   * on the compile's branch (or a baseline when that branch has none), and
-   * records the layout as the branch's last accepted one. Idempotent per
-   * compile. Returns the receipt written, if any.
+   * on the compile's branch (or a baseline when that branch has none, or its
+   * newest record can't be read), and records the layout as the branch's
+   * last accepted one. Idempotent per compile: a compile accepted before
+   * returns the receipt that acceptance wrote, or null when it wrote none.
+   * Returns the receipt, if any. A compile of another namespace is refused.
    */
   accept(
     provenance: CompileProvenance,
@@ -416,30 +629,45 @@ export class FoldJournal {
     usage: RoundUsage | undefined,
     presentation: Presentation = 'unknown',
   ): FoldReceipt | null {
+    if (provenance.namespace !== this.namespace) {
+      throw new Error(
+        `a compile of namespace ${JSON.stringify(provenance.namespace)} can't be accepted by the manager of ` +
+          `${JSON.stringify(this.namespace)}: accept it on the manager that compiled it`,
+      );
+    }
     const layout = provenance.layout;
-    if (!layout || provenance.namespace !== this.namespace) return null;
-    const index = this.index();
-    const branch = index.branches.get(branchKey(provenance.branch));
+    if (!layout) return null;
+    const index = storeIndex(this.store);
+    const branch = this.branchState(index, provenance.branch);
     // The branch's newest receipt may be one this journal never announced:
     // its write reported failure after landing, in this stream or the turn
     // before, or another journal wrote it, whether or not records without a
     // receipt followed it. Announce it now, whatever this compile turns out
     // to be, so listeners (a projection) converge on the canonical record.
-    const newestReceipt = branch?.receipts[branch.receipts.length - 1];
-    if (newestReceipt && !this.notified.has(newestReceipt.id)) {
-      const receipt = this.loadReceipt(newestReceipt.id);
+    if (branch?.newestReceipt && this.announced.get(branchKey(branch.ref)) !== branch.newestReceipt) {
+      const receipt = this.loadReceipt(branch.newestReceipt);
       if (receipt) {
         // Its write may have failed at the sync after the append, leaving it
-        // in the log with its durability unknown: durable before heard of,
-        // on this path too. (A sync with nothing pending is cheap.)
-        this.store.sync();
+        // in the log with its durability unknown: durable before heard of.
+        this.makeDurable(index, receipt.id);
         this.announce(receipt);
+        // A listener may have accepted another round meanwhile, and if that
+        // write failed after landing, the index is stale: list what it left
+        // before reading the branch's newest record or writing after it.
+        if (index.stale) storeIndex(this.store);
       }
     }
     // A compile is accepted once, whichever journal accepted it, and whether
-    // or not that acceptance changed the layout or reported success.
-    if (index.compiles.has(provenance.compileId)) return null;
-    const prev = branch ? this.loadLatest(branch) : null;
+    // or not that acceptance changed the layout or reported success: a retry
+    // gets the first acceptance's answer, once its record is durable.
+    const accepted = this.findAccepted(index, provenance);
+    if (accepted) {
+      this.makeDurable(index, accepted.id);
+      const receipt = accepted.receiptAt !== null ? this.loadReceipt(accepted.id) : null;
+      if (receipt) this.announce(receipt);
+      return receipt;
+    }
+    const prev = branch ? this.loadLatest(index, branch) : null;
 
     let draft: Omit<FoldReceipt, 'id'> | null = null;
     if (!prev) {
@@ -448,15 +676,85 @@ export class FoldJournal {
       const changes = diffLayouts(prev, layout, layout.calibration);
       if (changes.length > 0) draft = this.changeReceipt(provenance, layout, prev, changes, acceptedAt, usage, presentation);
     }
-    const receipt = this.commit(provenance, layout, prev, draft);
+    const receipt = this.commit(index, branch, provenance, layout, prev, draft);
     if (receipt) this.announce(receipt);
     return receipt;
   }
 
-  /** Tell listeners about a receipt, once per receipt per journal. */
+  /**
+   * This namespace's record of a compile's acceptance, if one exists. Only a
+   * record after the compile's mark can hold it: the mark was durable when
+   * the compile ran, so it outlives a crash with its id and precedes every
+   * record written since, unless it was the log's last record and rotted,
+   * when open drops it and its id can go to a later record. A mark that is
+   * gone, or whose id now names another compile's record, proves nothing,
+   * and every record is read. One whose id went to its own compile's
+   * acceptance again still holds: that record was then the log's last, so
+   * nothing that carried the mark had been accepted before it.
+   */
+  private findAccepted(index: StoreIndex, provenance: CompileProvenance): RecordHead | null {
+    let from = 0;
+    const mark = provenance.journalMark;
+    if (mark) {
+      const head = readHead(this.store, index, mark.recordId);
+      if (head && head.compileId === mark.compileId) from = positionAfter(index.ids, mark.recordId);
+    }
+    for (let i = index.ids.length - 1; i >= from; i--) {
+      const head = readHead(this.store, index, index.ids[i]!);
+      if (head && head.ns === this.namespace && head.compileId === provenance.compileId) return head;
+    }
+    return null;
+  }
+
+  /** Sync, unless the record is known durable already. */
+  private makeDurable(index: StoreIndex, id: string): void {
+    if (positionAfter(index.ids, id) <= index.durable) return;
+    this.store.sync();
+    markDurable(index);
+  }
+
+  /** The branch as far as the records say, read back from the newest record. */
+  private branchState(index: StoreIndex, ref: Pick<BranchRef, 'id' | 'created'>): BranchState | null {
+    const key = stateKey(this.namespace, ref);
+    const known = index.branches.get(key);
+    if (known !== undefined) return known;
+    readBack(this.store, index, key);
+    const found = index.branches.get(key);
+    if (found !== undefined) return found;
+    index.branches.set(key, null);
+    return null;
+  }
+
+  /** A branch's receipts, oldest first, walked back once from its newest. */
+  private receiptsOf(index: StoreIndex, branch: BranchState): Array<{ id: string; at: number }> {
+    if (branch.receipts) return branch.receipts;
+    const list: Array<{ id: string; at: number }> = [];
+    let id = branch.newestReceipt;
+    while (id !== null) {
+      const head = readHead(this.store, index, id);
+      if (!head || head.receiptAt === null) {
+        branch.receiptsCut = { at: id };
+        break;
+      }
+      list.push({ id, at: head.receiptAt });
+      // Each link points to an earlier record; anything else ends the walk.
+      if (head.prevReceipt !== null && Number(head.prevReceipt) >= Number(id)) {
+        branch.receiptsCut = { at: id, linksTo: head.prevReceipt };
+        break;
+      }
+      id = head.prevReceipt;
+    }
+    branch.receipts = list.reverse();
+    return branch.receipts;
+  }
+
+  /** Tell listeners about a receipt: a branch's newest once per journal. */
   private announce(receipt: FoldReceipt): void {
-    if (this.notified.has(receipt.id)) return;
-    this.notified.add(receipt.id);
+    const key = branchKey(receipt.source.branch);
+    const newest = this.announced.get(key);
+    if (newest === receipt.id) return;
+    // Ids ascend, so an older receipt (a retry's) leaves the newest standing.
+    if (newest === undefined || Number(receipt.id) > Number(newest)) this.announced.set(key, receipt.id);
     for (const listener of this.listeners) {
       try {
         listener(receipt);
@@ -467,24 +765,29 @@ export class FoldJournal {
   }
 
   /**
-   * Receipts of one branch, newest first, filtered per `query`. Reads only
-   * the receipts it returns.
+   * This namespace's receipts on one branch, newest first, filtered per
+   * `query`. The first query of a branch walks its receipts back once,
+   * reading only receipts; a branch not yet seen is found by reading back
+   * through the records present at open, once per store object. A history
+   * that can't be read whole says so in `note`.
    */
   query(query: FoldQuery = {}): FoldQueryResult {
-    const branch = this.resolveBranch(query.branch);
+    const index = storeIndex(this.store);
+    const branch = this.resolveBranch(index, query.branch);
     if (!branch) {
-      return {
-        branch: null,
-        receipts: [],
-        latestId: null,
-        more: false,
-        note: `No branch named ${JSON.stringify(query.branch)} exists in this store.`,
-      };
+      const named = typeof query.branch === 'string'
+        ? `named ${JSON.stringify(query.branch)}`
+        : `with id ${JSON.stringify(query.branch?.id)} created ${String(query.branch?.created)}`;
+      return { branch: null, receipts: [], latestId: null, more: false, note: `No branch ${named} exists in this store.` };
     }
     const limit = clampLimit(query.limit);
     const after = query.afterId !== undefined ? parseAfterId(query.afterId) : undefined;
     const since = query.since !== undefined ? parseSince(query.since) : undefined;
-    const list = this.index().branches.get(branchKey(branch))?.receipts ?? [];
+    const state = this.branchState(index, branch);
+    const list = state ? this.receiptsOf(index, state) : [];
+    // A receipt is durable before anyone hears of it, here as in accept: one
+    // whose write failed after landing is synced before it's handed out.
+    if (list.length > 0) this.makeDurable(index, list[list.length - 1]!.id);
     const latestId = list.length > 0 ? list[list.length - 1]!.id : null;
     const matches = (entry: { at: number }) => since === undefined || entry.at >= since;
     const receipts: FoldReceipt[] = [];
@@ -497,15 +800,36 @@ export class FoldJournal {
       }
       const receipt = this.loadReceipt(entry.id);
       if (receipt) receipts.push(receipt);
+      else unloadable.push(entry.id);
       return true;
     };
+    const unloadable: string[] = [];
     if (after !== undefined) {
       // Ids ascend: start just after the cursor and read forward.
       for (let i = firstAfter(list, after); i < list.length && take(list[i]!); i++);
     } else {
       for (let i = list.length - 1; i >= 0 && take(list[i]!); i--);
     }
-    return { branch, receipts, latestId, more };
+    // A history that couldn't be read whole says so, rather than passing as complete.
+    const notes: string[] = [];
+    if (state && !state.newest.readable) {
+      // Another format's links aren't read, so the walk has nowhere to start.
+      notes.push(`The branch's newest record, ${state.newest.id}, is of another format, so receipts before it aren't listed.`);
+    } else if (state?.shadowedBy) {
+      notes.push(`Record ${state.shadowedBy}, newer than this branch's newest readable record, can't be read: it may have been this branch's newest, and any receipt it held isn't listed.`);
+    }
+    const cut = state?.receiptsCut;
+    if (cut) {
+      // A forward link is found on a receipt already listed, so only an
+      // unreadable one can leave the list empty.
+      notes.push(list.length === 0
+        ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`
+        : cut.linksTo === undefined
+          ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
+          : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
+    }
+    if (unloadable.length > 0) notes.push(`Receipt${unloadable.length === 1 ? '' : 's'} ${unloadable.join(', ')} can't be read and ${unloadable.length === 1 ? 'is' : 'are'} left out.`);
+    return { branch, receipts, latestId, more, ...(notes.length > 0 ? { note: notes.join(' ') } : {}) };
   }
 
   /** The store's id (minted on first use). */
@@ -520,16 +844,25 @@ export class FoldJournal {
     return isLayoutRecord(record) && record.receipt ? ({ ...record.receipt, id } as FoldReceipt) : null;
   }
 
-  private resolveBranch(name: string | undefined): BranchRef | null {
-    if (name === undefined) return branchRefOf(this.store);
-    const match = this.store.listBranches().find((b) => b.name === name);
+  private resolveBranch(index: StoreIndex, branch: FoldQuery['branch']): BranchRef | null {
+    if (branch === undefined) return branchRefOf(this.store);
+    const live = this.store.listBranches();
+    if (typeof branch !== 'string') {
+      // As receipts name it: live or deleted, whatever its name now.
+      const match = live.find((b) => b.id === branch.id && b.created === branch.created);
+      if (match) return { id: match.id, name: match.name, created: match.created };
+      return this.branchState(index, branch)?.ref ?? null;
+    }
+    const match = live.find((b) => b.name === branch);
     if (match) return { id: match.id, name: match.name, created: match.created };
-    // A deleted branch's receipts remain in the journal: find it there, the
-    // most recently recorded first if the name was reused.
-    let found: BranchIndex | null = null;
-    for (const branch of this.index().branches.values()) {
-      if (branch.ref.name !== name || branch.receipts.length === 0) continue;
-      if (!found || Number(branch.newestRecord) > Number(found.newestRecord)) found = branch;
+    // A deleted branch's receipts remain in the journal: the most recently
+    // recorded branch of that name that has any. Every branch is noted once
+    // the records have all been read, which happens once per store object.
+    readBack(this.store, index);
+    let found: BranchState | null = null;
+    for (const [key, state] of index.branches) {
+      if (!state || !key.startsWith(`${this.namespace}\u0000`) || state.ref.name !== branch || state.newestReceipt === null) continue;
+      if (!found || Number(state.newest.id) > Number(found.newest.id)) found = state;
     }
     return found ? found.ref : null;
   }
@@ -612,17 +945,23 @@ export class FoldJournal {
    *
    * Every acceptance writes its record, an unchanged layout included (an
    * empty delta), so every accepted compile is in the index. The layout is a
-   * delta on the branch's previous record, or a snapshot once the deltas
-   * written since the last snapshot would outweigh it, after MAX_CHAIN of
-   * them, or when no delta can express the change (layoutDelta returns
-   * null). The deltas after a snapshot never outweigh it, so rebuilding a
-   * layout reads at most two snapshots' worth of layout. A failed append may
-   * or may not have landed, so the branch's cached latest layout is dropped
-   * and the index is listed again at its next use: the next acceptance finds
-   * this compile already accepted if its record did land, instead of writing
-   * a second receipt.
+   * delta on the branch's previous record, or a snapshot once the delta
+   * records written since the last snapshot, this one included, would
+   * outweigh that snapshot's record. Sizes are whole records as JSON,
+   * receipts included, so the bound holds on what is stored. The records
+   * after a snapshot never outweigh it, and every snapshot but the newest is
+   * outweighed by the records after it plus the one that tipped the next:
+   * snapshots in all cost about as much again as the deltas between them,
+   * and rebuilding a layout reads at most two snapshots' worth. No count of
+   * deltas forces a snapshot, so a chain of small deltas behind a large
+   * snapshot stays a chain. A failed append may or may not have landed, so
+   * the branch's cached latest layout is dropped and the index is listed
+   * again at its next use: the next acceptance finds this compile already
+   * accepted if its record did land, instead of writing a second receipt.
    */
   private commit(
+    index: StoreIndex,
+    branch: BranchState | null,
     provenance: CompileProvenance,
     layout: RenderedLayout,
     prev: LatestLayout | null,
@@ -630,28 +969,33 @@ export class FoldJournal {
   ): FoldReceipt | null {
     const key = branchKey(provenance.branch);
     const next: StoredLayout = { members: layout.members, units: layout.units };
+    const pr = branch?.newestReceipt ?? null;
     const base = {
       v: RECORD_VERSION as typeof RECORD_VERSION,
       ns: this.namespace,
       branch: provenance.branch,
       compileId: provenance.compileId,
       totalTokens: layout.totalTokens,
+      ...(pr !== null ? { pr } : {}),
     };
-    const delta = prev && prev.chain < MAX_CHAIN ? layoutDelta(prev, next) : null;
-    const deltaBytes = delta ? JSON.stringify(delta).length : 0;
-    let record: AcceptedLayoutRecord;
-    if (prev && delta && prev.deltaBytes + deltaBytes <= prev.snapshotBytes) {
-      record = {
-        ...base, kind: 'delta', prev: prev.recordId, ...delta,
-        chain: prev.chain + 1, sb: prev.snapshotBytes, db: prev.deltaBytes + deltaBytes,
+    const receipt = draft ? { receipt: draft } : {};
+    let record: AcceptedLayoutRecord | null = null;
+    if (prev) {
+      const delta: AcceptedLayoutRecord = {
+        ...base, kind: 'delta', prev: prev.recordId, ...layoutDelta(prev, next),
+        chain: prev.chain + 1, sb: prev.snapshotBytes, db: 0, ...receipt,
       };
-    } else {
-      const snapshot = { m: encodeSequences(next.members), units: next.units };
-      record = { ...base, kind: 'snapshot', ...snapshot, chain: 0, sb: JSON.stringify(snapshot).length, db: 0 };
+      const db = prev.deltaBytes + sizeCounting(delta, 'db', prev.deltaBytes);
+      if (db <= prev.snapshotBytes) record = { ...delta, db };
     }
-    if (draft) record.receipt = draft;
+    if (!record) {
+      const snapshot: AcceptedLayoutRecord = {
+        ...base, kind: 'snapshot', m: encodeSequences(next.members), units: next.units,
+        chain: 0, sb: 0, db: 0, ...receipt,
+      };
+      record = { ...snapshot, sb: sizeCounting(snapshot, 'sb', 0) };
+    }
 
-    const index = storeIndex(this.store);
     let written: { id: string };
     try {
       // The record names state committed in Chronicle states (summaries,
@@ -660,6 +1004,7 @@ export class FoldJournal {
       // open, so a record synced alone could outlive the state it names
       // after an unclean stop: make that state durable first.
       this.store.sync();
+      markDurable(index);
       written = this.store.appendJson(ACCEPTED_LAYOUT_RECORD, record);
       // Then the record itself, before anyone hears of it: the caller marks
       // the round accepted and listeners project the receipt once this
@@ -670,10 +1015,11 @@ export class FoldJournal {
       index.stale = true;
       throw err;
     }
-    if (!index.stale) {
-      ingest(index, written.id, record);
-      index.read += 1;
-    }
+    const head = headOf(written.id, record)!;
+    index.ids.push(written.id);
+    index.newest = head;
+    noteRecord(index, head);
+    markDurable(index);
     this.latest.set(key, {
       recordId: written.id,
       members: next.members,
@@ -691,14 +1037,32 @@ export class FoldJournal {
    * whichever journal on the store wrote it, rebuilt unless this journal
    * already holds that record's layout.
    */
-  private loadLatest(branch: BranchIndex): LatestLayout | null {
+  private loadLatest(index: StoreIndex, branch: BranchState): LatestLayout | null {
     const key = branchKey(branch.ref);
-    const id = branch.newestRecord;
+    const id = branch.newest.id;
     const cached = this.latest.get(key);
     if (cached && cached.recordId === id) return cached;
+    if (!branch.newest.readable) {
+      warnUnreadable(index, id, `it is of another format; branch ${branch.ref.name} is treated as unrecorded`);
+      return null;
+    }
+    if (branch.shadowedBy) {
+      // The unreadable record (reported when read) may have been this
+      // branch's newest, so don't diff against what came before it.
+      // Reported once, though each acceptance until its baseline lands
+      // (one whose write fails, say) comes here again.
+      warnOnce(index, `shadowed ${id} ${branch.shadowedBy}`, `[fold-journal] branch ${branch.ref.name}'s newest readable record, ${id}, is older than unreadable record ${branch.shadowedBy}; treating the branch as unrecorded`);
+      return null;
+    }
     const record = readRecord<AcceptedLayoutRecord>(this.store, id);
-    const layout = isLayoutRecord(record) ? this.reconstruct(id, record) : null;
-    if (!record || !layout) return null;
+    let layout: StoredLayout | null = null;
+    try {
+      if (!isLayoutRecord(record)) throw new Error('it no longer reads as one');
+      layout = this.reconstruct(record);
+    } catch (err) {
+      warnUnreadable(index, id, `its layout doesn't rebuild: ${(err as Error).message}; branch ${branch.ref.name} is treated as unrecorded`);
+      return null;
+    }
     const latest: LatestLayout = {
       recordId: id,
       ...layout,
@@ -711,25 +1075,25 @@ export class FoldJournal {
     return latest;
   }
 
-  private reconstruct(id: string, record: AcceptedLayoutRecord): StoredLayout | null {
+  /** A record's layout, from its snapshot and the deltas since. Throws when the chain doesn't rebuild. */
+  private reconstruct(record: AcceptedLayoutRecord): StoredLayout {
     const chain: AcceptedLayoutRecord[] = [];
     let current: AcceptedLayoutRecord | null = record;
     while (current && current.kind === 'delta') {
       chain.push(current);
-      if (!current.prev) { current = null; break; }
+      if (!current.prev) throw new Error(`delta ${current.compileId} names no record before it`);
       const older: AcceptedLayoutRecord | null = readRecord<AcceptedLayoutRecord>(this.store, current.prev);
-      current = isLayoutRecord(older) ? older : null;
+      if (!isLayoutRecord(older)) throw new Error(`record ${current.prev} in its chain can't be read`);
+      if (older.ns !== record.ns || branchKey(older.branch) !== branchKey(record.branch)) {
+        throw new Error(`record ${current.prev} in its chain belongs to another namespace or branch`);
+      }
+      current = older;
     }
-    try {
-      if (!current || current.m === undefined || !current.units) throw new Error('no snapshot');
-      let layout: StoredLayout = { members: decodeSequences(current.m), units: current.units };
-      for (let i = chain.length - 1; i >= 0; i--) layout = applyLayoutDelta(layout, chain[i]!);
-      if (!wellFormed(layout)) throw new Error('members and units disagree');
-      return layout;
-    } catch (err) {
-      console.error(`[fold-journal] accepted-layout chain from record ${id} is unreadable (${(err as Error).message}); treating the branch as unrecorded`);
-      return null;
-    }
+    if (current.kind !== 'snapshot' || current.m === undefined || !current.units) throw new Error('its chain ends in no snapshot');
+    if (chain.length !== record.chain) throw new Error(`its chain has ${chain.length} deltas where the record counts ${record.chain}`);
+    const layout = applyLayoutChain({ members: decodeSequences(current.m), units: current.units }, chain.reverse());
+    if (!wellFormed(layout)) throw new Error('members and units disagree');
+    return layout;
   }
 }
 
@@ -769,14 +1133,17 @@ function parseAfterId(afterId: string): number {
   return Number(afterId);
 }
 
-/** An ISO 8601 date or date-time; anything else, a bare number included, is refused. */
-const ISO_TIME = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+/** A date (midnight UTC), or a date and time with its offset: a time without
+ *  one would be read in the host's own zone. Anything else, a bare number
+ *  included, is refused. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))?$/;
 
 function parseSince(since: string): number {
   const ms = ISO_TIME.test(since) ? Date.parse(since) : NaN;
   if (!Number.isFinite(ms)) {
     const hint = /^\d+$/.test(since) ? ' To continue after a receipt, pass its id as afterId.' : '';
-    throw new Error(`since must be an ISO 8601 time such as 2026-10-09T14:00:00Z (got ${JSON.stringify(since)}).${hint}`);
+    const zone = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(since) ? ' Give its offset (Z for UTC), since a time without one would be read in this host\'s zone.' : '';
+    throw new Error(`since must be an ISO 8601 time such as 2026-10-09T14:00:00Z (got ${JSON.stringify(since)}).${zone}${hint}`);
   }
   return ms;
 }
@@ -848,19 +1215,17 @@ function membershipDelta(before: readonly number[], after: readonly number[]): {
   return { removed, added };
 }
 
-function applyMembership(members: readonly number[], removed: readonly number[], added: readonly number[]): number[] {
-  const kept: number[] = [];
-  let r = 0;
-  for (const s of members) {
-    while (r < removed.length && removed[r]! < s) r++;
-    if (r < removed.length && removed[r] === s) continue;
-    kept.push(s);
-  }
+/** `members` with each sequence's final change applied: false removes it, true adds it. */
+function applyMembershipChanges(members: readonly number[], changed: ReadonlyMap<number, boolean>): number[] {
+  if (changed.size === 0) return [...members];
+  const kept = members.filter((s) => changed.get(s) !== false);
+  const added = [...changed].filter(([, present]) => present).map(([s]) => s).sort((a, b) => a - b);
   const out: number[] = [];
   let i = 0;
   let j = 0;
   while (i < kept.length || j < added.length) {
     if (j >= added.length || (i < kept.length && kept[i]! < added[j]!)) out.push(kept[i++]!);
+    else if (i < kept.length && kept[i] === added[j]) { out.push(kept[i++]!); j++; }
     else out.push(added[j++]!);
   }
   return out;
@@ -1074,12 +1439,11 @@ export interface LayoutDelta {
  * and added, its units as a common prefix of `p` kept, `drop` dropped, `ins`
  * inserted, the rest of `prev` kept, then `app` appended. Arrivals become
  * added members and appended units; a fold in the middle becomes a small
- * drop/ins. Null when `prev`'s last unit is not in `next` (a snapshot is
- * simpler then). Empty parts are left out.
+ * drop/ins; a change to `prev`'s last unit replaces everything after the
+ * common prefix. Every pair of layouts has one. Empty parts are left out.
  */
-export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta | null {
+export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta {
   const units = unitsDelta(prev.units, next.units);
-  if (!units) return null;
   const { removed, added } = membershipDelta(prev.members, next.members);
   return {
     ...(removed.length > 0 ? { mr: encodeSequences(removed) } : {}),
@@ -1091,7 +1455,7 @@ export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta
   };
 }
 
-function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): { p: number; drop: number; ins: LayoutUnit[]; app: LayoutUnit[] } | null {
+function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): { p: number; drop: number; ins: LayoutUnit[]; app: LayoutUnit[] } {
   let p = 0;
   while (p < prev.length && p < next.length && unitEqual(prev[p]!, next[p]!)) p++;
   if (p === prev.length) return { p, drop: 0, ins: [], app: next.slice(p) };
@@ -1103,7 +1467,9 @@ function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): {
   for (let k = next.length - 1; k >= p; k--) {
     if (unitEqual(next[k]!, lastPrev)) { j = k; break; }
   }
-  if (j < 0) return null;
+  // prev's last unit changed (grew, re-leveled, became partial): replace
+  // everything after the common prefix.
+  if (j < 0) return { p, drop: prev.length - p, ins: next.slice(p), app: [] };
   let r = 0;
   while (
     prev.length - 1 - r >= p &&
@@ -1119,14 +1485,27 @@ function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): {
 }
 
 export function applyLayoutDelta(prev: StoredLayout, record: LayoutDelta): StoredLayout {
-  const p = record.p ?? 0;
-  const drop = record.drop ?? 0;
-  return {
-    members: applyMembership(
-      prev.members,
-      record.mr !== undefined ? decodeSequences(record.mr) : [],
-      record.ma !== undefined ? decodeSequences(record.ma) : [],
-    ),
-    units: [...prev.units.slice(0, p), ...(record.ins ?? []), ...prev.units.slice(p + drop), ...(record.app ?? [])],
-  };
+  return applyLayoutChain(prev, [record]);
+}
+
+/**
+ * Apply a chain of deltas, oldest first, in one pass: each sequence's last
+ * change wins, merged into the members once, and each unit edit applies in
+ * place. So rebuilding a long chain costs the members once plus the edits,
+ * not a pass over the members per delta.
+ */
+export function applyLayoutChain(base: StoredLayout, deltas: readonly LayoutDelta[]): StoredLayout {
+  const changed = new Map<number, boolean>();
+  let units = [...base.units];
+  for (const d of deltas) {
+    if (d.mr !== undefined) for (const s of decodeSequences(d.mr)) changed.set(s, false);
+    if (d.ma !== undefined) for (const s of decodeSequences(d.ma)) changed.set(s, true);
+    const p = d.p ?? 0;
+    const drop = d.drop ?? 0;
+    const ins = d.ins ?? [];
+    if (ins.length <= 1024) units.splice(p, drop, ...ins);
+    else units = units.slice(0, p).concat(ins, units.slice(p + drop));
+    for (const u of d.app ?? []) units.push(u);
+  }
+  return { members: applyMembershipChanges(base.members, changed), units };
 }

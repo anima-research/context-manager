@@ -210,7 +210,12 @@ export interface RawBodySource {
    * write can leave such a group short with nothing to tell it apart.
    */
   complete: boolean;
-  /** Why the copy is not complete (absent when complete). */
+  /**
+   * Why the body is not complete in this request (absent when complete):
+   * like `complete`, it describes the whole body across the request, not
+   * the copy in one entry, so an entry carrying an intact copy of one shard
+   * still names `content` when another shard arrived altered.
+   */
   missing?: Array<'shards' | 'content'>;
 }
 
@@ -242,6 +247,27 @@ export interface CompileProvenance {
   layout: RenderedLayout | null;
   /** The active strategy's name. */
   strategy: string;
+  /**
+   * Where the store's fold journal stood when this compile ran, so that
+   * accepting it again finds its first acceptance without reading the whole
+   * journal (see JournalMark). Absent or null, every record is read. Pass
+   * the provenance back as you got it.
+   */
+  journalMark?: JournalMark | null;
+}
+
+/**
+ * The newest accepted-layout record known durable when a compile ran, and
+ * the compile that record accepted. Any acceptance of the compile was
+ * written after it. A durable record outlives a crash with its id, unless it
+ * is the log's last record and rots: open drops it, and its id can go to a
+ * later record. So only the records after the mark need reading, and a mark
+ * that is gone, or whose id now names another compile, proves nothing, and
+ * every record is read.
+ */
+export interface JournalMark {
+  recordId: string;
+  compileId: string;
 }
 
 /**

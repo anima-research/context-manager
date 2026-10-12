@@ -33,9 +33,7 @@ export class ContextLog {
       namespace?: string;
     } = {}
   ) {
-    this.stateId = options.namespace
-      ? `${options.namespace}/context`
-      : DEFAULT_CONTEXT_STATE_ID;
+    this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildSourceIndex();
@@ -49,13 +47,18 @@ export class ContextLog {
    * @param namespace Optional namespace for multi-agent support
    */
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
+    const stateId = ContextLog.stateIdFor(namespace);
     store.registerState({
       id: stateId,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
     });
+  }
+
+  /** The context log's slot id for a namespace. */
+  static stateIdFor(namespace?: string): string {
+    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
   }
 
   private rebuildSourceIndex(): void {

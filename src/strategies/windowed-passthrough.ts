@@ -10,11 +10,13 @@ import type {
   SelectOptions,
   Sequence,
 } from '../types/index.js';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
+import { releaseEditedRawForms } from '../raw-forms.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -150,11 +152,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
-    try {
-      this.store.registerState({ id: this.stateId, strategy: 'snapshot' });
-    } catch {
-      /* already registered */
-    }
+    registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
     this.loadedBranch = observeStoreBranch(this.store);
   }
@@ -474,7 +472,9 @@ function safeSlice(str: string, start: number, end: number): string {
  * tokens]` marker; tool_result blocks are always kept (the API requires a
  * result for every tool_use), with their content cut or replaced by an
  * omission notice; every other block passes through. Returns the original
- * array when nothing needed cutting.
+ * array when nothing needed cutting. A cut or dropped block gives up its raw
+ * replay form, with every block sharing it, so the cut reaches the wire
+ * (see raw-forms.ts).
  */
 function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
   if (maxTokens <= 0) return content;
@@ -521,5 +521,5 @@ function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlo
       result.push(block);
     }
   }
-  return result;
+  return releaseEditedRawForms(content, result);
 }

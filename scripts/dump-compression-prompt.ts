@@ -16,7 +16,7 @@
  */
 
 import { existsSync, writeFileSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, bodyBoundsIn } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 function makeMockMembrane() {
@@ -220,26 +220,26 @@ async function main() {
     });
   }
 
-  // 5. Instruction (doc-aware if all chunk messages share a bodyGroupId)
-  const firstGroupId = chunkMessages[0].bodyGroupId;
-  const allSameGroup =
-    firstGroupId && chunkMessages.every((m) => m.bodyGroupId === firstGroupId);
+  // 5. Instruction (doc-aware if all chunk messages are one body: one
+  // ingestion, read as the strategy reads it, body-runs.ts)
+  const firstAt = allMessages.findIndex((m) => m.id === chunkMessages[0].id);
+  const body = firstAt >= 0 && allMessages[firstAt]!.bodyGroupId ? bodyBoundsIn(allMessages, firstAt) : null;
+  const bodyMessages = body ? allMessages.slice(body.from, body.to + 1) : [];
+  const allSameGroup = body !== null && chunkMessages.every((m) => bodyMessages.some((b) => b.id === m.id));
   let instructionText: string;
   if (allSameGroup) {
     // Compute doc context like the strategy does
     let originalTokens = 0;
-    for (const m of allMessages) {
-      if (m.bodyGroupId === firstGroupId) {
-        const t = m.content
-          .filter((b: ContentBlock) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('');
-        originalTokens += Math.ceil(t.length / 4);
-      }
+    for (const m of bodyMessages) {
+      const t = m.content
+        .filter((b: ContentBlock) => b.type === 'text')
+        .map((b: any) => b.text)
+        .join('');
+      originalTokens += Math.ceil(t.length / 4);
     }
     const title =
       (chunkMessages[0].metadata?.sourceId as string | undefined) ??
-      `doc-${firstGroupId!.slice(0, 16)}`;
+      `doc-${chunkMessages[0].bodyGroupId!.slice(0, 16)}`;
     instructionText = formatDocChunkInstruction(
       { title, style: 'chronological', originalTokens },
       targetTokens

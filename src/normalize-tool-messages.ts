@@ -1,4 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
+import { releaseEditedRawForms } from './raw-forms.js';
 
 /**
  * Anthropic-API shape requires `tool_use` blocks in assistant turns and
@@ -124,8 +125,11 @@ export function stripUnpairedToolBlocks<T extends { participant: string; content
     }
     return {
       participant: msg.participant,
+      // A dropped block may share its raw replay form with a block that stays
+      // (one <function_calls> holds several invokes); the survivors give it up
+      // so the dropped block doesn't ship with them (see raw-forms.ts).
       content: trimmed.length > 0
-        ? trimmed
+        ? releaseEditedRawForms(msg.content, trimmed)
         : [{ type: 'text', text: '[tool call omitted]' }],
     };
   });

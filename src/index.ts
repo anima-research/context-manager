@@ -1,5 +1,5 @@
 // Main class
-export { ContextManager } from './context-manager.js';
+export { ContextManager, InitializationSupersededError } from './context-manager.js';
 export type { ContextManagerConfig } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)
@@ -9,8 +9,9 @@ export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-cha
 export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 export { concatBodyGroups } from './adaptive/render.js';
+export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
-export { BlobManager } from './blob-manager.js';
+export { BlobManager, blockAsStored } from './blob-manager.js';
 export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,
@@ -72,6 +73,7 @@ export type {
   RawBodySource,
   CompiledMessageSources,
   CompileProvenance,
+  JournalMark,
   RenderedLayout,
   LayoutUnit,
   // Strategy types

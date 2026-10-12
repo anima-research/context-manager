@@ -307,3 +307,218 @@ describe('AutobiographicalStrategy — dry-run preview', () => {
     );
   });
 });
+
+describe('AutobiographicalStrategy — a plain dry compile commits nothing', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  // A compile with `{ dryRun: true }` and no previewContext around it: what
+  // agent-framework's previews, a host's seed of a fork and a panel's render
+  // use. Messages added between the real compile and the dry one make the dry
+  // run's frontier, stats and estimate differ from the real one's, so a dry
+  // run that left its own behind would show.
+  const calibration = (s: AutobiographicalStrategy) => ({
+    estimate: (s as unknown as { _lastCompileEstimate: number })._lastCompileEstimate,
+    armed: (s as unknown as { _calibrationArmed: boolean })._calibrationArmed,
+  });
+
+  it('leaves the transition status as the last committing compile left it', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const frontier = strategy.frontierTokens();
+    const status = JSON.stringify(manager.getHotContextSettings());
+    addConversation(manager, 10);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.strictEqual(strategy.frontierTokens(), frontier, 'the dry run\u2019s frontier must not stand');
+    assert.strictEqual(JSON.stringify(manager.getHotContextSettings()), status);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.ok(strategy.frontierTokens()! > frontier!, 'a real compile at that point does move it, or this test proves nothing');
+  });
+
+  it('leaves the live render stats', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const live = JSON.stringify(manager.getRenderStats());
+    addConversation(manager, 10);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.strictEqual(JSON.stringify(manager.getRenderStats()), live);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.notStrictEqual(JSON.stringify(manager.getRenderStats()), live, 'a real compile there changes them, or this test proves nothing');
+  });
+
+  it('leaves calibration to the compile its usage report is for, and never re-arms it', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const armed = calibration(strategy);
+    assert.strictEqual(armed.armed, true);
+    // Mid-turn: the turn's messages arrive, and something renders dry.
+    addConversation(manager, 10);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.deepStrictEqual(calibration(strategy), armed, 'the usage report must still be compared with the real compile');
+    // The report takes the one sample; a dry run after it must not arm another.
+    strategy.reportRealInputTokens(armed.estimate);
+    const spent = calibration(strategy);
+    assert.strictEqual(spent.armed, false);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.deepStrictEqual(calibration(strategy), spent);
+  });
+
+  it('leaves the next real compile\u2019s cache markers where the last sent request ended', async () => {
+    // The stable-prefix marker measures against the previous compile's
+    // entries: a dry layout must not become that baseline.
+    const markersOfNextRealCompile = async (dryBetween: boolean): Promise<number[]> => {
+      cleanup();
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: makeStrategy() });
+      addConversation(manager, 30);
+      await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+      addConversation(manager, 4);
+      if (dryBetween) {
+        await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+      }
+      addConversation(manager, 3);
+      const next = await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+      manager.close();
+      return next.messages.flatMap((m, i) => ((m as { cacheBreakpoint?: boolean }).cacheBreakpoint ? [i] : []));
+    };
+    const without = await markersOfNextRealCompile(false);
+    assert.ok(without.length > 1, 'the compile places markers, or this test proves nothing');
+    assert.deepStrictEqual(await markersOfNextRealCompile(true), without);
+  });
+
+  const chunkRecords = (s: AutobiographicalStrategy): number =>
+    (s as unknown as { chunkRecords: unknown[] }).chunkRecords.length;
+  const persistedChunkRecords = (s: AutobiographicalStrategy): number => {
+    const internals = s as unknown as { store: { getStateJson(id: string): unknown }; chunksStateId: string };
+    const stored = internals.store.getStateJson(internals.chunksStateId);
+    return Array.isArray(stored) ? stored.length : 0;
+  };
+
+  // A strategy chunks its own messages as they arrive (onNewMessage); another
+  // writer's, in an auxiliary slot, it first chunks at its next select, so a
+  // dry one is where a dry run could cut chunks for good.
+  const besideAnotherWriter = async (strategy: AutobiographicalStrategy) => {
+    const main = await ContextManager.open({ path: TEST_STORE_PATH, strategy: makeStrategy() });
+    const side = await ContextManager.open({
+      store: main.getStore(), namespace: 'zz-side', isolate: true, strategy, auxiliaryMessageViews: [{}],
+    });
+    return { main, side };
+  };
+
+  it('records no chunk and queues no compression', async () => {
+    const strategy = makeStrategy();
+    const { main, side } = await besideAnotherWriter(strategy);
+    addConversation(main, 30);
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const recordsBefore = chunkRecords(strategy);
+    const queueBefore = strategy.queuedChunkIndices();
+    addConversation(main, 40);
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.strictEqual(chunkRecords(strategy), recordsBefore, 'no chunk record from a dry run');
+    assert.strictEqual(persistedChunkRecords(strategy), recordsBefore, 'and none written to the store');
+    assert.deepStrictEqual(strategy.queuedChunkIndices(), queueBefore, 'no compression queued by a dry run');
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.ok(chunkRecords(strategy) > recordsBefore, 'a real compile closes those chunks, or this test proves nothing');
+    side.close();
+    main.close();
+  });
+
+  it('records no chunk at a preview\u2019s overridden chunk size', async () => {
+    const strategy = makeStrategy();
+    const { main, side } = await besideAnotherWriter(strategy);
+    addConversation(main, 30);
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const recordsBefore = chunkRecords(strategy);
+    addConversation(main, 40);
+    const chunksBefore = (strategy as unknown as { chunks: unknown }).chunks;
+    side.previewContext({ maxTokens: 100_000, reserveForResponse: 200 }, { targetChunkTokens: 50 });
+    assert.strictEqual(chunkRecords(strategy), recordsBefore, 'a boundary cut at the preview\u2019s size would be kept for good');
+    assert.strictEqual(persistedChunkRecords(strategy), recordsBefore);
+    assert.strictEqual((strategy as unknown as { chunks: unknown }).chunks, chunksBefore, 'the chunks are the last real rebuild\u2019s');
+    // A real compile at the preview's chunk size closes chunks here, or this test proves nothing.
+    (strategy as unknown as { config: { targetChunkTokens: number } }).config.targetChunkTokens = 50;
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.ok(chunkRecords(strategy) > recordsBefore, 'the 50-token size closes chunks');
+    side.close();
+    main.close();
+  });
+
+  it('leaves a hierarchical strategy\u2019s render stats too', async () => {
+    const strategy = makeStrategy({ adaptiveResolution: false });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    const live = JSON.stringify(manager.getRenderStats());
+    addConversation(manager, 10);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.strictEqual(JSON.stringify(manager.getRenderStats()), live);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.notStrictEqual(JSON.stringify(manager.getRenderStats()), live, 'a real compile changes them, or this test proves nothing');
+  });
+
+  it('puts back whatever a dry select wrote, on a throw too', async () => {
+    // Whatever writes a select path makes to these, now or later, the dry run
+    // must not leave them: the select path below writes every one and, on
+    // request, throws after writing.
+    class Writer extends SpyStrategy {
+      throwAfter = false;
+      protected selectAdaptive(...args: Parameters<AutobiographicalStrategy['selectAdaptive']>) {
+        const out = super.selectAdaptive(...args);
+        if (args[2]?.dryRun) {
+          const self = this as unknown as Record<string, unknown>;
+          self.chunks = [];
+          self.compressionQueue = [99];
+          self.chunkRecordsOrphaned = true;
+          self._orphanWarned = true;
+          self._prevCacheKeys = ['zz'];
+          self.lastFrontierTokens = 1;
+          self.transitionBlocked = 'transition-pace-floor';
+          self._lastRenderStats = null;
+          self._lastCompileEstimate = 1;
+          self._calibrationArmed = true;
+          self._storeView = {};
+          self._storeOrder = new Map();
+          self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
+          if (this.throwAfter) throw new Error('zz-after-writing');
+        }
+        return out;
+      }
+    }
+    const strategy = new Writer({
+      compressionModel: 'mock', headWindowTokens: 0, targetChunkTokens: 100, recentWindowTokens: 200,
+      adaptiveResolution: true, autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    addConversation(manager, 30);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    strategy.reportRealInputTokens(calibration(strategy).estimate);
+    const before = () => JSON.stringify([manager.getHotContextSettings(), manager.getRenderStats(), calibration(strategy)]);
+    const expected = before();
+    // Every field select() saves and restores, read by identity.
+    const fields = [
+      'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
+      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_storeView', '_storeOrder',
+      '_cachedHeadStartIndex',
+    ];
+    const raw = () => fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]);
+    const rawBefore = raw();
+    const assertRestored = (when: string) => raw().forEach((value, i) =>
+      assert.strictEqual(value, rawBefore[i], `${fields[i]} is put back ${when}`));
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.strictEqual(before(), expected);
+    assertRestored('after a dry compile');
+    strategy.throwAfter = true;
+    await assert.rejects(
+      manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true }),
+      /zz-after-writing/,
+    );
+    assert.strictEqual(before(), expected);
+    assertRestored('after a dry compile that throws');
+  });
+});

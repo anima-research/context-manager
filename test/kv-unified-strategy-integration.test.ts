@@ -105,6 +105,61 @@ test('kv-unified failed submission clears single flight without committing', asy
   manager.close();
 });
 
+test('a dry compile leaves the last real compile\u2019s kv-unified draft markers alone', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  for (let i = 0; i < 12; i++) {
+    manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+  }
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  const draft = () => (selected as unknown as { kvUnifiedDraft: { markerUnitIndices: number[] } | null }).kvUnifiedDraft;
+  const before = [...draft()!.markerUnitIndices];
+  for (let i = 0; i < 6; i++) {
+    manager.addMessage('user', [{ type: 'text', text: `later ${i} ` + 'word '.repeat(30) }]);
+  }
+  const draftBefore = draft();
+  const layoutBefore = (draftBefore as unknown as { layout: unknown }).layout;
+  await manager.compile(budget, undefined, { dryRun: true, kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  assert.deepEqual(draft()!.markerUnitIndices, before, 'the submission would carry markers from a layout never sent');
+  assert.strictEqual(draft(), draftBefore, 'the draft itself is the real compile\u2019s');
+  assert.strictEqual((draft() as unknown as { layout: unknown }).layout, layoutBefore, 'and so is its layout');
+  // A real compile at the same point moves the markers, or this test proves nothing.
+  await manager.compile(budget, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  assert.notDeepEqual(draft()!.markerUnitIndices, before, 'a real compile re-marks the new layout');
+  manager.close();
+});
+
+test('a dry compile refuses a kv-unified plan that selects a level with no summary, as a real compile does', async () => {
+  // A picker that selects L1 for the first chunk, which has no summary.
+  class Unavailable extends AutobiographicalStrategy {
+    protected buildPicker(...args: Parameters<AutobiographicalStrategy['buildPicker']>) {
+      const picker = super.buildPicker(...args);
+      const run = picker.run.bind(picker);
+      return Object.assign(Object.create(picker), {
+        run: (...runArgs: Parameters<typeof picker.run>) => {
+          const result = run(...runArgs);
+          const first = runArgs[0].chunks[0];
+          if (!first) return result;
+          const finalResolutions = new Map(result.finalResolutions);
+          finalResolutions.set(first.id, 1);
+          return { ...result, finalResolutions };
+        },
+      });
+    }
+  }
+  const base = strategy({ targetChunkTokens: 60 }) as unknown as { config: Record<string, unknown> };
+  const selected = new Unavailable(base.config as never);
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  for (let i = 0; i < 12; i++) {
+    manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+  }
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await assert.rejects(manager.compile(budget, undefined, { dryRun: true }), /kv-unified selected unavailable L1/);
+  await assert.rejects(manager.compile(budget), /kv-unified selected unavailable L1/, 'a real compile refuses it too');
+  manager.close();
+});
+
 test('kv-unified places token-weighted 33/66/100 history markers plus tail', () => {
   const selected = strategy();
   const entries = Array.from({ length: 12 }, (_, index) => ({

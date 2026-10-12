@@ -429,7 +429,7 @@ Walk chunks in source order. For each chunk:
 - If `currentResolution == 0`: emit raw content.
 - If `currentResolution == k > 0`: emit the L_k recall pair for the chunk's L_k ancestor. (Adjacent chunks sharing the same L_k ancestor emit the recall pair once.)
 
-After this walk, group consecutive entries with the same `bodyGroupId` and concatenate their bodies into a single API message. Pinned chunks (`pins` slot) always render at L0 regardless of `currentResolution`.
+After this walk, join each body's consecutive entries and concatenate their bodies into a single API message. A body is one ingestion: in store order, an entry continues the body before it only when it carries the same `bodyGroupId` at a higher `shardIndex` (`src/body-runs.ts`), so two copies of one text are two bodies. Pinned chunks (`pins` slot) always render at L0 regardless of `currentResolution`.
 
 The positioned-recall-pair logic from PR #15 survives: pins are interleaved with non-pinned regions in chronological order. The grouping is now driven by `currentResolution` + `bodyGroupId` instead of `mergedInto`.
 

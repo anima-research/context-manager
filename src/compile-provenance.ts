@@ -14,6 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import { continuesBody } from './body-runs.js';
 import type {
   CompiledMessageSources,
   ContextEntry,
@@ -42,6 +43,8 @@ export interface EntryProvenance {
   sources: CompiledMessageSources[];
   /** Raw message id -> whether its body was complete in this compile. */
   rawComplete: Map<MessageId, boolean>;
+  /** Every stored message's body, as storedBodies read it (see rawBodiesOf). */
+  bodies: ReadonlyMap<MessageId, readonly StoredMessage[]>;
 }
 
 function isRawEntry(entry: ContextEntry): boolean {
@@ -55,15 +58,13 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
 }
 
 /**
- * Every stored body, as the messages of one ingestion: a message's own body
- * is itself; a sharded body is one write of a group's shards. A group id is
- * a hash of the content, so the same text ingested twice shares one, and a
- * group's members can hold several bodies. Shards are written in index
- * order, 0..n-1, one ingestion at a time, so in sequence order a group's
- * next body begins where a shard's index does not follow its predecessor's:
- * the members of each body, in shard order, are a run of the group's
- * members in which the index only rises. A body whose shard 0 was removed
- * keeps its other shards, and its head is then the first of them.
+ * Every stored body, as the messages of one ingestion, read by the rule every
+ * reader of a group id shares (body-runs.ts): a message continues the body
+ * before it only when it carries the same group id at a higher shard index,
+ * so a body is a run of consecutive messages, and the same text ingested
+ * twice, back to back or apart, is two bodies. A message outside any group
+ * is a body of its own. A body whose shard 0 was removed keeps its other
+ * shards, and its head is then the first of them.
  *
  * Returns, for each stored message, its body's members in shard order (one
  * array per body, shared by its members); the head is the first.
@@ -71,18 +72,10 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
  */
 export function storedBodies(stored: readonly StoredMessage[]): ReadonlyMap<MessageId, readonly StoredMessage[]> {
   const out = new Map<MessageId, StoredMessage[]>();
-  const open = new Map<string, StoredMessage[]>();
-  for (const msg of stored) {
-    if (!msg.bodyGroupId) {
-      out.set(msg.id, [msg]);
-      continue;
-    }
-    let body = open.get(msg.bodyGroupId);
-    const last = body?.[body.length - 1];
-    if (!body || (msg.shardIndex ?? 0) <= (last!.shardIndex ?? 0)) {
-      body = [];
-      open.set(msg.bodyGroupId, body);
-    }
+  let body: StoredMessage[] = [];
+  for (let i = 0; i < stored.length; i++) {
+    const msg = stored[i]!;
+    if (i === 0 || !continuesBody(stored[i - 1], msg)) body = [];
     body.push(msg);
     out.set(msg.id, body);
   }
@@ -186,7 +179,7 @@ export function attributeEntries(entries: readonly ContextEntry[], stored: reado
     return { kind: 'other' };
   });
 
-  return { sources, rawComplete };
+  return { sources, rawComplete, bodies: bodyMembers };
 }
 
 /**
@@ -296,22 +289,18 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean {
 }
 
 /**
- * The stored messages of every raw body the sources name, from the messages
- * the compile read (the same `stored` list attribution judged bodies by):
- * for each body's head, the body's members in shard order, head first. Two
- * ingestions of the same text are two bodies, each with only its own shards.
+ * The stored messages of every raw body an attribution's sources name, from
+ * the bodies it judged them by: for each body's head, the body's members in
+ * shard order, head first. Two ingestions of the same text are two bodies,
+ * each with only its own shards.
  */
-export function rawBodiesOf(
-  sources: readonly CompiledMessageSources[],
-  stored: readonly StoredMessage[],
-): ReadonlyMap<MessageId, readonly StoredMessage[]> {
+export function rawBodiesOf(attribution: Pick<EntryProvenance, 'sources' | 'bodies'>): ReadonlyMap<MessageId, readonly StoredMessage[]> {
   const heads = new Set<MessageId>();
-  for (const source of sources) {
+  for (const source of attribution.sources) {
     if (source.kind === 'raw') for (const body of source.bodies) heads.add(body.messageId);
   }
   const out = new Map<MessageId, readonly StoredMessage[]>();
-  if (heads.size === 0) return out;
-  const bodies = storedBodies(stored);
+  const bodies = attribution.bodies;
   for (const head of heads) {
     const members = bodies.get(head);
     if (members) out.set(head, members);
@@ -386,17 +375,36 @@ function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boo
  * order. Additions are allowed (a strategy may prefix a provenance header or
  * merge it into the first text block); losses are not: a truncated text, a
  * stripped image, or a block a structural repair removed makes the copy
- * partial. Each stored block must be covered by a later rendered block of
- * the same kind — a text block by one that contains its whole text.
+ * partial. Each stored block must be covered, in order, by a rendered block
+ * of the same kind: a text block by one that contains its whole text, where
+ * consecutive stored texts may share one rendered text block that joins
+ * them, each found after the one before.
  */
 export function coversStoredContent(rendered: readonly ContentBlock[], stored: readonly ContentBlock[]): boolean {
   if (rendered === stored) return true;
   let j = 0;
+  // Within rendered[j], when it's text: where the next stored text may
+  // start, since a strategy can join several text blocks into one.
+  let from = 0;
   for (const block of stored) {
     if (block.type === 'text' && block.text === '') continue; // carries nothing
-    while (j < rendered.length && !covers(rendered[j]!, block)) j++;
-    if (j >= rendered.length) return false;
-    j++;
+    for (;;) {
+      if (j >= rendered.length) return false;
+      const r = rendered[j]!;
+      if (block.type === 'text' && r.type === 'text') {
+        const at = r.text.indexOf(block.text, from);
+        if (at !== -1) {
+          from = at + block.text.length;
+          break;
+        }
+      } else if (covers(r, block)) {
+        j++;
+        from = 0;
+        break;
+      }
+      j++;
+      from = 0;
+    }
   }
   return true;
 }

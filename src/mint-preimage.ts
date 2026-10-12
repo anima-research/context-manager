@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { NormalizedRequest } from '@animalabs/membrane';
+import { registerStateIfAbsent } from './state-registration.js';
 
 /**
  * Durable preimages for the requests that authored memories.
@@ -519,9 +520,7 @@ function readEnvelope(store: JsStore, requestHash: string): MintPreimageEnvelope
 function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHash: string): void {
   const bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
   const blobHash = store.storeBlob(bytes, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
-  try {
-    store.registerState({ id: MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, strategy: 'tree' });
-  } catch { /* already registered */ }
+  registerStateIfAbsent(store, { id: MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, strategy: 'tree' });
   store.treeSet(MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, requestHash, {
     blobHash,
     size: bytes.length,

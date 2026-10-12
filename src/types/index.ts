@@ -37,6 +37,7 @@ export type {
   RawBodySource,
   CompiledMessageSources,
   CompileProvenance,
+  JournalMark,
   RenderedLayout,
   LayoutUnit,
 } from './context.js';

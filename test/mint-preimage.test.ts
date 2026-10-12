@@ -923,3 +923,30 @@ describe('Preimage persistence never blocks the mint', () => {
     await fx.manager.close();
   });
 });
+
+describe('Mint preimage envelope registration', () => {
+  after(cleanup);
+
+  it('reports a registration failure itself, rather than swallowing it', (tc) => {
+    const store = JsStore.create({ path: freshPath() });
+    const failure = new Error('IO failure registering mint-preimage-envelopes');
+    const register = store.registerState.bind(store);
+    tc.mock.method(store, 'registerState', (registration: { id: string }) => {
+      if (registration.id === 'mint-preimage-envelopes') throw failure;
+      return register(registration as Parameters<JsStore['registerState']>[0]);
+    });
+    const reports: unknown[][] = [];
+    tc.mock.method(console, 'error', (...args: unknown[]) => { reports.push(args); });
+    const request: NormalizedRequest = {
+      messages: [{ participant: 'zz-user', content: [t('look'), zzImageBlock(zzImageBase64(7))] }],
+      config: { model: ZZ_MINT_MODEL, maxTokens: 1 },
+    };
+    const requestHash = sha256(Buffer.from(JSON.stringify(request), 'utf8'));
+    assert.doesNotThrow(() => persistMintRequestPreimage(store, request, requestHash), 'persistence never throws');
+    assert.ok(
+      reports.some(args => args.includes(failure)),
+      `the report carries the registration failure: ${JSON.stringify(reports.map(args => String(args[0])))}`,
+    );
+    store.close();
+  });
+});

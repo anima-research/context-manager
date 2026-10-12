@@ -39,6 +39,14 @@ describe('coversStoredContent', () => {
     assert.equal(coversStoredContent([text('hello world'), image('AAAA')], stored), false);
   });
 
+  it('accepts text blocks a strategy joined into one, in order, and nothing out of order', () => {
+    const stored = [text('first part. '), text('second part.'), image('AAAA')];
+    assert.ok(coversStoredContent([text('first part. second part.'), image('AAAA')], stored), 'joined into one block');
+    assert.ok(coversStoredContent([text('[h] first part. second part. [t]'), image('AAAA')], stored), 'joined, with a header and a tail');
+    assert.equal(coversStoredContent([text('second part. first part.'), image('AAAA')], stored), false, 'out of order');
+    assert.equal(coversStoredContent([text('first part. '), image('AAAA'), text('second part.')], stored), false, 'past the image');
+  });
+
   it('compares media exactly: same length and same ends are not the same bytes', () => {
     const head = 'A'.repeat(64);
     const stored = [image(`${head}${'B'.repeat(100)}${head}`)];
@@ -146,7 +154,7 @@ describe('attributeEntries', () => {
     const result = attributeEntries([copy(h1)], [h0, h1]);
     assert.deepEqual(result.sources[0], { kind: 'raw', bodies: [{ messageId: 'f0', sequence: 1, complete: false, missing: ['shards'] }] });
     assert.equal(result.rawComplete.get('f1'), false);
-    assert.deepEqual([...rawBodiesOf(result.sources, [h0, h1]).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['f0', ['f0', 'f1']]]);
+    assert.deepEqual([...rawBodiesOf(result).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['f0', ['f0', 'f1']]]);
 
     // A group written before sizes were declared: complete means every
     // stored member was carried, and a hidden one was not.
@@ -189,7 +197,7 @@ describe('a body is an ingestion, not its content hash', () => {
     const result = attributeEntries([copy(a0), copy(a1), copy(mid), copy(b0), copy(b1), copy(c0), copy(c1)], stored);
     const heads = result.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : []));
     assert.deepEqual(heads, [['a0', true], ['a0', true], ['mid', true], ['b0', true], ['b0', true], ['c0', true], ['c0', true]]);
-    const bodies = rawBodiesOf(result.sources, stored);
+    const bodies = rawBodiesOf(result);
     assert.deepEqual([...bodies.entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [
       ['a0', ['a0', 'a1']], ['mid', ['mid']], ['b0', ['b0', 'b1']], ['c0', ['c0', 'c1']],
     ]);
@@ -198,6 +206,50 @@ describe('a body is an ingestion, not its content hash', () => {
     // earlier one, and does not borrow it.
     const later = attributeEntries([copy(c0), copy(c1)], stored);
     assert.deepEqual(later.sources[0], { kind: 'raw', bodies: [{ messageId: 'c0', sequence: 6, complete: true }] });
+  });
+
+  it('reads bodies as body-runs.ts does, whatever the list', async () => {
+    const { bodyBoundsIn } = await import('../src/index.js');
+    const g = { bodyGroupId: 'bg-rule', shardCount: 2 };
+    const lists: StoredMessage[][] = [
+      // back to back, apart, and a shard 0 removed
+      [msg('a0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('a1', 2, [text('b')], { ...g, shardIndex: 1 }),
+        msg('b0', 3, [text('a')], { ...g, shardIndex: 0 }), msg('b1', 4, [text('b')], { ...g, shardIndex: 1 }),
+        msg('x', 5, [text('solo')]), msg('c1', 6, [text('b')], { ...g, shardIndex: 1 })],
+      // a list in which something sits between two rising shards of one group
+      [msg('p0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('mid', 2, [text('between')]), msg('p1', 3, [text('b')], { ...g, shardIndex: 1 })],
+    ];
+    for (const stored of lists) {
+      const { bodies } = attributeEntries(stored.map((m) => copy(m)), stored);
+      stored.forEach((m, i) => {
+        const { from, to } = bodyBoundsIn(stored, i);
+        assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), stored.slice(from, to + 1).map((b) => b.id), m.id);
+      });
+    }
+  });
+
+  it('two back-to-back ingestions merge as two composites, each its own complete body', async () => {
+    const { AutobiographicalStrategy } = await import('../src/index.js');
+    class Merger extends AutobiographicalStrategy {
+      merge(entries: ContextEntry[], messages: StoredMessage[]): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, {} as never, messages);
+      }
+    }
+    // A retried addMessage whose first call landed: the same text twice, nothing between.
+    const g = { bodyGroupId: 'bg-twice', shardCount: 2 };
+    const a0 = msg('a0', 1, [text('same ')], { ...g, shardIndex: 0 });
+    const a1 = msg('a1', 2, [text('text')], { ...g, shardIndex: 1 });
+    const b0 = msg('b0', 3, [text('same ')], { ...g, shardIndex: 0 });
+    const b1 = msg('b1', 4, [text('text')], { ...g, shardIndex: 1 });
+    const stored = [a0, a1, b0, b1];
+    const merged = new Merger({}).merge(stored.map((m) => copy(m)), stored);
+    assert.deepEqual(merged.map((e) => e.sourceMessageIds ?? [e.sourceMessageId]), [['a0', 'a1'], ['b0', 'b1']]);
+    const result = attributeEntries(merged, stored);
+    assert.deepEqual(result.sources, [
+      { kind: 'raw', bodies: [{ messageId: 'a0', sequence: 1, complete: true }] },
+      { kind: 'raw', bodies: [{ messageId: 'b0', sequence: 3, complete: true }] },
+    ]);
+    assert.deepEqual([...rawBodiesOf(result).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['a0', ['a0', 'a1']], ['b0', ['b0', 'b1']]]);
   });
 
   it('keeps an interrupted ingestion and its re-ingestion apart', () => {
@@ -256,6 +308,16 @@ describe('a body is an ingestion, not its content hash', () => {
       assert.equal(result.rawBodies!.get(second)!.length, firstShards);
       assert.ok(result.rawBodies!.get(second)!.every((m) => m.sequence > result.rawBodies!.get(first)!.at(-1)!.sequence), 'the repost carries only its own shards');
       assert.equal(cm.acceptRound({ provenance: result.provenance! }), null, 'arrivals only: the first copy did not change form');
+
+      // The same text again, straight after the repost, as a retried write would land.
+      const third = cm.addMessage('alice', [text(doc)]);
+      const again = await cm.compile();
+      const heads = new Map(again.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : [])).map((b) => [b.messageId, b]));
+      assert.equal(heads.get(second)?.complete, true, 'the repost keeps its own shards');
+      assert.equal(heads.get(third)?.complete, true, 'the back-to-back copy is its own complete body');
+      assert.equal(again.rawBodies!.get(second)!.length, firstShards);
+      assert.equal(again.rawBodies!.get(third)!.length, firstShards);
+      assert.equal(again.rawBodies!.get(third)![0]!.sequence > again.rawBodies!.get(second)!.at(-1)!.sequence, true);
       cm.close();
     } finally {
       rmSync(path, { recursive: true, force: true });
@@ -368,20 +430,36 @@ describe('sharded writes declare their group size', () => {
     });
   });
 
-  it('an interrupted group write reads as missing shards, and still does after a reopen', async () => {
+  it('a group write cut short, whose shards could not be removed either, reads as missing shards, and still does after a reopen', async () => {
     await withManager('./test-shard-count-interrupted', async (open) => {
       const cm = await open();
-      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown } }).messageStore;
+      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; removeBodyGroup: (id: string) => void } }).messageStore;
       const append = store.append.bind(store);
+      const removeBodyGroup = store.removeBodyGroup.bind(store);
       let calls = 0;
       store.append = (...args: unknown[]) => {
         calls += 1;
         if (calls === 2) throw new Error('injected failure before the second shard');
         return append(...args);
       };
-      assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure/);
+      // As when the store refuses every write: the rollback fails too (or the
+      // process stops mid-write), so the first shard stays.
+      store.removeBodyGroup = () => { throw new Error('injected failure of the removal'); };
+      const error = console.error;
+      const logged: string[] = [];
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure before the second shard/);
+      } finally {
+        console.error = error;
+      }
       store.append = append;
+      store.removeBodyGroup = removeBodyGroup;
       const [head] = cm.getAllMessages();
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes(`body group ${head!.bodyGroupId} (first shard ${head!.id})`)),
+        `the failed removal is reported, naming the short body: ${logged.join('\n')}`,
+      );
       assert.equal(head!.shardCount, 2, 'the stored shard declares the whole group');
       const first = await cm.compile();
       const raw = first.provenance!.messages.find((m) => m.kind === 'raw' && m.bodies[0]!.messageId === head!.id);
@@ -396,6 +474,37 @@ describe('sharded writes declare their group size', () => {
       assert.equal(rawAgain.bodies[0]!.complete, false);
       assert.deepEqual(rawAgain.bodies[0]!.missing, ['shards']);
       reopened.close();
+    });
+  });
+
+  it('a rollback whose own reads fail still raises the write\'s error, and reports it', async () => {
+    await withManager('./test-shard-count-recovery-read', async (open) => {
+      const cm = await open();
+      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; getTail: (n: number) => unknown[] } }).messageStore;
+      const append = store.append.bind(store);
+      const getTail = store.getTail.bind(store);
+      // The first shard lands, then its append throws, so the rollback has
+      // to read the store's tail to find it, and that read fails too.
+      store.append = (...args: unknown[]) => {
+        append(...args);
+        throw new Error('injected failure after the first shard landed');
+      };
+      store.getTail = () => { throw new Error('injected failure of the tail read'); };
+      const error = console.error;
+      const logged: string[] = [];
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure after the first shard landed/);
+      } finally {
+        console.error = error;
+        store.append = append;
+        store.getTail = getTail;
+      }
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes('injected failure of the tail read')),
+        `the failed recovery is reported: ${logged.join('\n')}`,
+      );
+      cm.close();
     });
   });
 
@@ -466,12 +575,151 @@ describe('sharded writes declare their group size', () => {
         return { bodyGroupId: 'gap', shards: content.map((block, i) => ({ content: [block], shardIndex: i * 2 })) };
       }
     }
+    class Doubled extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'dup', shards: content.map((block) => ({ content: [block], shardIndex: 0 })) };
+      }
+    }
     const path = './test-shard-count-gappy';
     rmSync(path, { recursive: true, force: true });
     try {
-      const cm = await ContextManager.open({ path, strategy: new Gappy() });
-      assert.throws(() => cm.addMessage('alice', [text('a'), text('b')]), /each index 0\.\.1 exactly once/);
-      assert.equal(cm.getAllMessages().length, 0);
+      for (const strategy of [new Gappy(), new Doubled()]) {
+        rmSync(path, { recursive: true, force: true });
+        const cm = await ContextManager.open({ path, strategy });
+        assert.throws(() => cm.addMessage('alice', [text('a'), text('b')]), /each index 0\.\.1 exactly once/, strategy.constructor.name);
+        assert.equal(cm.getAllMessages().length, 0, `${strategy.constructor.name}: nothing written`);
+        cm.close();
+      }
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a listener that throws fails neither its write nor a sharded body', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-listener-throws';
+    rmSync(path, { recursive: true, force: true });
+    const error = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Sharding() });
+      const heard: string[] = [];
+      let throwOn = -1;
+      cm.onMessage((event) => {
+        heard.push(event.type);
+        if (heard.length === throwOn) throw new Error('listener failed');
+      });
+      throwOn = 1;
+      const plain = cm.addMessage('bob', [text('plain')]);
+      // The last shard's listener throws, and then a middle one's.
+      throwOn = 4;
+      const last = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+      throwOn = 6;
+      const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
+      assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
+      assert.equal(logged.filter((l) => l.includes('onMessage listener threw')).length, 3);
+      assert.ok(logged.some((l) => l.includes(`'add' event for message ${plain};`)), 'each names the message it missed');
+      assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('(body group three);')), "and a shard's body group");
+      const result = await cm.compile();
+      const bodies = result.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : []));
+      for (const id of [plain, last, middle]) {
+        assert.equal(bodies.find((b) => b.messageId === id)?.complete, true, `${id}: stored whole`);
+      }
+      cm.close();
+    } finally {
+      console.error = error;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it("a first shard whose own append threw after it landed is removed too", async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-shard-zero-rollback';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Sharding() });
+      cm.addMessage('bob', [text('before')]);
+      // The manager's own listener fails on the first shard's add: that append throws after landing.
+      const manager = cm as unknown as { handleMessageStoreEvent: (event: { type: string }) => void };
+      const handle = manager.handleMessageStoreEvent.bind(cm);
+      let adds = 0;
+      manager.handleMessageStoreEvent = (event) => {
+        if (event.type === 'add' && ++adds === 1) throw new Error('propagation failed');
+        handle(event);
+      };
+      assert.throws(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]), /propagation failed/);
+      manager.handleMessageStoreEvent = handle;
+      assert.deepEqual(cm.getAllMessages().map((m) => textOf(m)), ['before'], 'shard 0 is gone too');
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it("the manager's own listener stays outside that: a failed propagation still fails the write", async () => {
+    await withManager('./test-own-listener', async (open) => {
+      const cm = await open();
+      const id = cm.addMessage('alice', [text('before')]);
+      const log = (cm as unknown as { contextLog: { findBySource: (id: string) => unknown } }).contextLog;
+      log.findBySource = () => { throw new Error('context log unwritable'); };
+      assert.throws(() => cm.editMessage(id, [text('after')]), /context log unwritable/);
+      cm.close();
+    });
+  });
+
+  it('a sharded write that fails partway leaves nothing behind, and a retry writes one complete body', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { JsStore } = await import('@animalabs/chronicle');
+    const { rmSync } = await import('node:fs');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-shard-rollback';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const real = JsStore.openOrCreate({ path });
+      let failOn = -1;
+      let writes = 0;
+      const flaky = new Proxy(real, {
+        get(target, prop, receiver) {
+          if (prop === 'appendToStateJsonWithIdentity') {
+            return (...args: Parameters<typeof real.appendToStateJsonWithIdentity>) => {
+              if (++writes === failOn) throw new Error('disk full');
+              return target.appendToStateJsonWithIdentity(...args);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as typeof real;
+      const cm = await ContextManager.open({ store: flaky, strategy: new Sharding() });
+      cm.addMessage('bob', [text('before')]);
+      writes = 0;
+      failOn = 2; // the second shard's append
+      assert.throws(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]), /disk full/);
+      assert.deepEqual(cm.getAllMessages().map((m) => textOf(m)), ['before'], 'no shard left behind');
+      failOn = -1;
+      const id = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+      const result = await cm.compile();
+      const bodies = result.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : []));
+      assert.deepEqual([...new Set(bodies.map((b) => b.messageId))], [cm.getAllMessages()[0]!.id, id]);
+      assert.equal(bodies.find((b) => b.messageId === id)?.complete, true, 'the retry is one complete body');
+      assert.equal(result.rawBodies!.get(id)!.length, 3);
       cm.close();
     } finally {
       rmSync(path, { recursive: true, force: true });
