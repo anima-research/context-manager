@@ -341,10 +341,15 @@ const releaseVersions = new WeakMap<ReadonlyMap<MessageId, number>, number>();
  * comes back) reads without that thinking, so selection, budgets and
  * estimates count what is sent. Copies are memoized per stored message, in
  * `copies`, so a strategy's caches keyed on a message stay warm from one
- * compile to the next. The listing `getAll` returns is memoized per store
- * listing and release state, in `listings`: the store hands out one listing
- * while nothing is written, and caches keyed on the listing's identity stay
- * warm while nothing is written or released.
+ * compile to the next. The listing `getAll` returns is memoized per source
+ * listing, under the release state it was last mapped in, in `listings`, so
+ * it keeps the source's identity: the store hands out one listing while
+ * nothing is written, and this view hands out one while nothing is written
+ * or released.
+ * A source that builds its listing afresh on every call (a manager's merged
+ * view over auxiliary stores) gets a fresh one here too. Callers must not
+ * mutate the listing, as with the store's own. `getFrom` and `getTail` map a
+ * fresh array on every call.
  */
 export function releaseThinkingView(
   view: MessageStoreView,
@@ -447,7 +452,9 @@ interface Cursor {
 const NOTHING_RELEASED: ReadonlyMap<MessageId, number> = new Map();
 
 /** Add a release to `map`, keeping the earlier first block. Returns whether
- *  it released more than `map` held. */
+ *  it released more than `map` held, and then bumps the map's version
+ *  (releaseVersions), which tells a memoized listing to map again: every
+ *  change to a released map goes through here. */
 function addRelease(map: Map<MessageId, number>, id: MessageId, from: number): boolean {
   const held = map.get(id);
   if (held !== undefined && held <= from) return false;

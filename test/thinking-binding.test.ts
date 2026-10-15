@@ -761,6 +761,31 @@ describe('thinking binding', () => {
     });
   });
 
+  it('maps the listing again when a release lowers a message\'s first block', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      cm.addMessage('User', text('zz question'));
+      const answer = cm.addMessage('Claude', [
+        { type: 'thinking', thinking: '', signature: 'sig-early' } as ContentBlock,
+        { type: 'text', text: 'zz early' },
+        { type: 'thinking', thinking: '', signature: 'sig-late' } as ContentBlock,
+        { type: 'text', text: 'zz late' },
+      ]);
+      const listing = () => (cm as unknown as { strategyMessageView(): { getAll(): Array<{ id: string; content: ContentBlock[] }> } })
+        .strategyMessageView().getAll();
+      const thinkingBlocks = (all: ReturnType<typeof listing>) =>
+        all.find((m) => m.id === answer)!.content.filter((b) => b.type === 'thinking').length;
+      cm.releaseThinking(answer, 2);
+      const late = listing();
+      assert.equal(thinkingBlocks(late), 1, 'released from block 2: the early thinking stays');
+      cm.releaseThinking(answer, 0);
+      const early = listing();
+      assert.notEqual(early, late, 'the map held the message already: lowering its block maps the listing again');
+      assert.equal(thinkingBlocks(early), 0);
+      await cm.close();
+    });
+  });
+
   it('maps a listing again under another release map, even at the same version', () => {
     const message = (id: string) =>
       ({ id, sequence: Number(id.slice(1)), participant: 'Claude', content: reply(`zz ${id}`, `sig-${id}`), timestamp: new Date(0) }) as never;
