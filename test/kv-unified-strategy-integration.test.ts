@@ -143,7 +143,10 @@ test('a dry compile refuses a kv-unified plan that selects a level with no summa
           if (!first) return result;
           const finalResolutions = new Map(result.finalResolutions);
           finalResolutions.set(first.id, 1);
-          return { ...result, finalResolutions };
+          // The positional view (levelAt, levelsBySequence) describes the
+          // original levels; a stub that replaces the map drops it so the
+          // strategy reads the map.
+          return { ...result, finalResolutions, levelAt: undefined, levelsBySequence: undefined };
         },
       });
     }
@@ -559,5 +562,63 @@ test('kv-unified latent demand keeps no ranking between compiles', async () => {
   for (const [key, value] of Object.entries(latent)) {
     assert.ok(value === null || typeof value !== 'object', `latentDemand.${key} holds state across compiles`);
   }
+  manager.close();
+});
+
+test('a usage report inside the calibration dead band keeps the kv-unified forest derived across compiles', async () => {
+  // Summaries matter here: an applied multiplier reprices every recall pair,
+  // and a changed recall cost is what makes the forest decline to derive.
+  const membrane = {
+    complete: async () => ({
+      stopReason: 'end_turn',
+      content: [{ type: 'text', text: 'summary ' + 'word '.repeat(20) }],
+      usage: { inputTokens: 100, outputTokens: 30 },
+    }),
+  };
+  const selected = strategy({ targetChunkTokens: 60, compressionModel: 'mock' });
+  const internals = selected as unknown as {
+    summaries: unknown[];
+    _lastCompileEstimate: number;
+    _calibration: number;
+    _lastKvUnified: { lastTimings: { forestDerived: boolean } | null } | null;
+  };
+  const derived = () => internals._lastKvUnified?.lastTimings?.forestDerived;
+  const manager = await ContextManager.open({ path: STORE, strategy: selected, membrane: membrane as never });
+  let turn = 0;
+  const add = () => {
+    manager.addMessage(turn % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${turn} ` + 'word '.repeat(30) }]);
+    turn++;
+  };
+  for (let i = 0; i < 12; i++) add();
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget);
+  for (let i = 0; i < 6 && internals.summaries.length === 0; i++) await manager.tick();
+  assert.ok(internals.summaries.length > 0, 'the fixture needs at least one summary');
+  // Let production settle, then take two appends: the second derives.
+  for (let i = 0; i < 6; i++) await manager.tick();
+  await manager.compile(budget);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'control: an append derives the forest from the previous compile');
+
+  // A host reports the real input total once per compile. A 0.5% miss is the
+  // normal case; it must not reprice the store and force a full build.
+  selected.reportRealInputTokens(internals._lastCompileEstimate * 1.005);
+  assert.equal(internals._calibration, 1);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'a sample inside the dead band keeps cross-compile reuse');
+
+  // A sustained 10% miss leaves the band, is applied, and reprices every
+  // recall pair: that compile builds in full, as every compile did before.
+  let applied = false;
+  for (let i = 0; i < 6 && !applied; i++) {
+    selected.reportRealInputTokens(internals._lastCompileEstimate * 1.1);
+    applied = internals._calibration !== 1;
+    add();
+    await manager.compile(budget);
+  }
+  assert.equal(applied, true);
+  assert.equal(derived(), false, 'an applied multiplier change is a full build');
   manager.close();
 });

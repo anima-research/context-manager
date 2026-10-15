@@ -269,7 +269,12 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
 /**
  * A block moved out of `source` (its message's content before the move) gives
  * up the raw forms it shares with any block that stays behind. A raw form it
- * carries alone moves with it.
+ * carries alone moves with it, unless it belongs to a reasoning pairing: moved
+ * alone, a reasoning item or the item it led to would keep the id that ties it
+ * to a partner it no longer sits with, so it gives that item up too, as an
+ * edit does. An opaque carrier keeps its item, as everywhere (see above). The
+ * blocks left behind are reconciled with releaseEditedRawForms, which
+ * releases the rest of the pairing.
  */
 export function releaseSharedRawFormsOnMove(
   moved: ContentBlock,
@@ -282,5 +287,7 @@ export function releaseSharedRawFormsOnMove(
     if (block === moved) continue;
     for (const key of rawFormKeys(block)) if (own.includes(key)) shared.add(key);
   }
+  const item = itemKey(moved);
+  if (item && pairingsOf(source).some((pairing) => pairing.includes(item))) shared.add(item);
   return shared.size === 0 ? moved : withoutRawForms(moved, shared);
 }

@@ -23,7 +23,14 @@ export interface MessageStoreView {
   length(): number;
   /** Estimate tokens for a message */
   estimateTokens(message: StoredMessage): number;
-  /** Closed-loop estimator calibration (optional — MessageStore provides it). */
+  /**
+   * Closed-loop estimator calibration (optional — MessageStore provides it).
+   * The strategy owns the factor (see MessageStore's tokenCalibration). A view
+   * supplies both of these or neither: a dry select reads the factor before
+   * its load changes it and puts it back afterwards, so it throws for a view
+   * with the setter alone rather than change a factor it can't restore. A
+   * view with neither is a fixed estimator.
+   */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
   /**
@@ -297,6 +304,8 @@ export interface SelectOptions {
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
    * included, and that release is the one thing a dry compile can leave.
+   * The release's committing rebuild includes any image-watermark advance;
+   * the dry select then restores the state it found after that rebuild.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the
@@ -615,6 +624,17 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
+export interface CalibrationReset {
+  /** The multiplier that was discarded. */
+  discardedMultiplier: number;
+  /** The pricing epoch it was learned under, or null for a record without a
+   *  stamp (written by 0.13.0 or earlier), whose epoch is unknown. */
+  fromEpoch: number | null;
+  /** When it was discarded (ms since epoch). */
+  at: number;
+}
+
 /**
  * Per-render observability stats from a strategy. Counts and token sums for
  * head / tail / summaries / pending work, suitable for TUIs and dashboards
@@ -644,6 +664,30 @@ export interface RenderStats {
    * Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
+
+  /**
+   * Estimator calibration in force for this compile: the multiplier applied
+   * to every token estimate and the pricing epoch it was learned under.
+   * `provisional` is true while the multiplier is a guess rather than a value
+   * learned under this epoch's pricing: one kept from a record without a
+   * stamp, or the 1 a discard restarts from. The first provider sample
+   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * `reset` is present once a multiplier from an older or unknown epoch has
+   * been discarded, on load or when a provisional one above 1 put the first
+   * compile over budget. It is kept
+   * in the persisted calibration state, so it stays visible across restarts,
+   * learning and a later epoch's re-stamp until an operator re-stamps the
+   * record without it; a later discard replaces it, and an older binary
+   * after a rollback writes its own record, without it, over a newer one. A
+   * discard shrinks (or grows) the window by the old multiplier's ratio, so
+   * it should be seen, not only logged once.
+   */
+  calibration?: {
+    multiplier: number;
+    pricingEpoch: number;
+    provisional?: true;
+    reset?: CalibrationReset;
+  };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
@@ -729,8 +773,8 @@ export interface KvUnifiedConfig {
   /**
    * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
    * when the accepted presentation provably remains the policy's selection,
-   * skip label propagation. Exact — never chooses a different layout than the
-   * full solve would. Off unless set.
+   * skip label propagation. Proves the exact hysteresis policy; it does not
+   * guarantee identity with every bucketed approximate solve. Off unless set.
    */
   hysteresisCertificate?: boolean;
 }
@@ -972,6 +1016,19 @@ export interface AutobiographicalConfig {
    * Default 20MB (of base64; the API cap is 32MB total).
    */
   maxLiveImageBytes?: number;
+
+  /**
+   * Opt-in, cost-conscious image trimming (default off). Without it the live
+   * image window slides one image at a time: once a limit binds
+   * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
+   * image strips the oldest live one, a change mid-history that invalidates
+   * the prompt cache from that message on, on every image. With a ratio in
+   * (0, 1), a binding limit instead trims down to ratio × each limit and
+   * records a watermark (a message sequence, persisted): every image at or
+   * before it stays stripped, so the stripped set changes once per trim, not
+   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   */
+  imageStripHysteresisRatio?: number;
 
   /**
    * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the

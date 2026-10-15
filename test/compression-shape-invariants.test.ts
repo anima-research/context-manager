@@ -41,7 +41,14 @@ interface ApiMessage { participant: string; content: ContentBlock[] }
 // API-shape validator: mirrors what the Anthropic API enforces.
 // ---------------------------------------------------------------------------
 
-function validateApiShape(messages: readonly ApiMessage[]): void {
+/** How a tool_result names its call, which depends on where it is read. */
+type ResultIdReader = (block: ContentBlock) => string | undefined;
+/** Context-manager's own messages are Membrane-shaped: `toolUseId`. */
+const membraneResultId: ResultIdReader = (block) => (block as { toolUseId?: string }).toolUseId;
+/** On the wire the API reads `tool_use_id`, and only that. */
+const wireResultId: ResultIdReader = (block) => (block as { tool_use_id?: string }).tool_use_id;
+
+function validateApiShape(messages: readonly ApiMessage[], resultId: ResultIdReader): void {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const isUser = msg.participant.toLowerCase() === 'user';
@@ -57,9 +64,7 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
         const id = (block as { id: string }).id;
         const next = messages[i + 1];
         const matched = next?.content.some(
-          (b) =>
-            b.type === 'tool_result' &&
-            (b as { toolUseId: string }).toolUseId === id,
+          (b) => b.type === 'tool_result' && resultId(b) === id,
         );
         if (!matched) {
           throw new Error(
@@ -69,14 +74,14 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
       }
 
       if (block.type === 'tool_result') {
-        const tid = (block as { toolUseId: string }).toolUseId;
+        const tid = resultId(block);
         const prev = messages[i - 1];
         const matched = prev?.content.some(
           (b) => b.type === 'tool_use' && (b as { id: string }).id === tid,
         );
         if (!matched) {
           throw new Error(
-            `messages[${i}]: tool_result toolUseId=${tid} was not preceded by a matching tool_use in messages[${i - 1}]`,
+            `messages[${i}]: tool_result id=${tid} was not preceded by a matching tool_use in messages[${i - 1}]`,
           );
         }
       }
@@ -88,14 +93,14 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
 // Mock membrane: validates shape, returns deterministic compressed text.
 // ---------------------------------------------------------------------------
 
-function createValidatingMembrane(compressionRatio = 5) {
+function createValidatingMembrane(compressionRatio = 5, resultId: ResultIdReader = membraneResultId) {
   const calls: Array<{ messages: ApiMessage[]; outputChars: number }> = [];
   const membrane = {
     complete: async (request: {
       messages: ApiMessage[];
       config?: { maxTokens?: number };
     }) => {
-      validateApiShape(request.messages);
+      validateApiShape(request.messages, resultId);
       const inputChars = request.messages
         .flatMap((m) => m.content)
         .map((b) => (b as { text?: string }).text ?? '')
@@ -119,16 +124,48 @@ function createValidatingMembrane(compressionRatio = 5) {
 }
 
 /**
+ * A tool_result naming its call as the wire does, `tool_use_id`: Membrane's
+ * formatters write that before the tool-pair normalizer runs. (They also map
+ * `isError` and sanitize content, which this validator doesn't read.)
+ */
+function toWireBlock(block: ContentBlock): ContentBlock {
+  if (block.type !== 'tool_result') return block;
+  const { toolUseId, ...rest } = block as ContentBlock & { toolUseId?: string };
+  return { ...rest, tool_use_id: toolUseId } as unknown as ContentBlock;
+}
+
+/**
+ * Normalizer repairs that stand in for a missing or duplicated half of a
+ * tool cycle, which context-manager should have sent whole and once:
+ * - `synthetic_pending_result`: a result invented for a call whose result
+ *   is missing;
+ * - `orphan_tool_result_textified`: a result turned to text because its
+ *   call is missing;
+ * - `stray_tool_result_textified` (from membrane#54 on): a duplicate result
+ *   turned to text.
+ * The API accepts the repaired request, but it no longer says what happened.
+ * A new normalizer kind belongs here when it stands in for a missing or
+ * extra call or result. Repairs that only move blocks don't.
+ */
+const STAND_IN_REPAIRS = new Set([
+  'synthetic_pending_result',
+  'orphan_tool_result_textified',
+  'stray_tool_result_textified',
+]);
+
+/**
  * Wire-boundary variant: validates the shape a request would have AFTER
  * Membrane's tool-pair normalizer — i.e. what actually goes to the API.
  * `createValidatingMembrane` above holds CM to producing raw-valid shapes
  * on its own; this one holds the CM+Membrane stack to shipping a valid
  * payload. Use it for scenarios where the split responsibility is the
  * point (either CM's splitMixedToolMessages or Membrane's normalizer must
- * handle the shape — the API only sees their composition).
+ * handle the shape — the API only sees their composition). The
+ * normalizer may move blocks to the right turns; it may not have to stand
+ * in for a result or a call that context-manager dropped.
  */
 function createWireValidatingMembrane(compressionRatio = 5) {
-  const { membrane: inner, calls } = createValidatingMembrane(compressionRatio);
+  const { membrane: inner, calls } = createValidatingMembrane(compressionRatio, wireResultId);
   const membrane = {
     complete: async (request: {
       messages: ApiMessage[];
@@ -136,14 +173,22 @@ function createWireValidatingMembrane(compressionRatio = 5) {
     }) => {
       // Mirror Membrane's wire boundary: every message starts user-roled
       // (the default assistantParticipant is 'Claude', which matches none
-      // of the participants used here), then the normalizer re-roles
-      // tool_use / thinking blocks onto assistant turns and enforces
-      // pairing. Validate the post-normalization shape.
+      // of the participants used here) and in wire form, then the
+      // normalizer re-roles tool_use / thinking blocks onto assistant turns
+      // and enforces pairing. Validate the post-normalization shape.
       const provider = request.messages.map((m) => ({
         role: 'user' as const,
-        content: m.content as any,
+        content: m.content.map(toWireBlock) as any,
       }));
-      const normalized = normalizeToolPairs(provider);
+      const repairs: string[] = [];
+      const normalized = normalizeToolPairs(provider, {
+        onEvent: (event: { kind: string }) => {
+          if (STAND_IN_REPAIRS.has(event.kind)) repairs.push(event.kind);
+        },
+      });
+      if (repairs.length > 0) {
+        throw new Error(`the normalizer stood in for halves of tool cycles: ${repairs.join(', ')}`);
+      }
       const asApiShape = normalized.messages.map((m) => ({
         participant: m.role,
         content: m.content as ContentBlock[],
@@ -442,9 +487,12 @@ describe('Compression pipeline: API shape invariants', () => {
 
     await drain(manager);
     assert.ok(calls.length > 0, 'expected at least one compression call to land');
-    // validateApiShape throwing inside the mock membrane is the failure
-    // mode — no throw means every request shipped was API-valid, i.e. the
-    // bundled cycles were split before reaching the membrane.
+    // A throw inside the mock fails the drain: the shape validator's, or the
+    // mock's own when the normalizer stood in for half of a cycle. So no
+    // throw means every request shipped was API-valid after Membrane's
+    // normalizer, which stood in for nothing. It doesn't show context-manager
+    // split the bundled cycles itself: the normalizer re-roles a whole
+    // bundled cycle too, as the mock's own cases below pin.
     await manager.close();
   });
 
@@ -516,5 +564,58 @@ describe('Compression pipeline: API shape invariants', () => {
 
     assert.ok(calls.length > 0, 'adaptive path produced no compression calls');
     await manager.close();
+  });
+});
+
+describe('the wire-validating mock', () => {
+  // The postmortem case relies on this mock to tell a whole composition from
+  // one the normalizer had to patch; pin both directions here, and the
+  // spelling each side's validator reads.
+  const send = (messages: ApiMessage[]) =>
+    createWireValidatingMembrane().membrane.complete({ messages });
+
+  it('reads one spelling of a result\'s call on each side: toolUseId in context-manager, tool_use_id on the wire', () => {
+    const cycle = (result: ContentBlock): ApiMessage[] => [
+      { participant: 'assistant', content: [u('S1')] },
+      { participant: 'user', content: [result] },
+    ];
+    const wire = { type: 'tool_result', tool_use_id: 'S1', content: 'ok' } as unknown as ContentBlock;
+    validateApiShape(cycle(r('S1')), membraneResultId);
+    validateApiShape(cycle(wire), wireResultId);
+    assert.throws(() => validateApiShape(cycle(wire), membraneResultId), /not followed by a matching tool_result/);
+    assert.throws(() => validateApiShape(cycle(r('S1')), wireResultId), /not followed by a matching tool_result/);
+  });
+
+  it('accepts whole tool cycles bundled into one user-roled message (the normalizer re-roles them)', async () => {
+    await send([
+      { participant: 'user', content: [t('look'), u('W1'), r('W1'), t('done')] },
+      { participant: 'agent', content: [t('ok')] },
+    ]);
+  });
+
+  it('accepts a whole cycle whose result sits in a later message (the normalizer moves what lies between)', async () => {
+    await send([
+      { participant: 'user', content: [t('look'), u('W4')] },
+      { participant: 'user', content: [t('meanwhile')] },
+      { participant: 'user', content: [r('W4'), t('done')] },
+    ]);
+  });
+
+  it('refuses a tool_use whose result was lost, though the normalizer can invent one', async () => {
+    await assert.rejects(
+      send([{ participant: 'user', content: [t('look'), u('W2')] }]),
+      /synthetic_pending_result/,
+    );
+  });
+
+  it('refuses a tool_result whose call was lost, though the normalizer can turn it to text', async () => {
+    await assert.rejects(
+      send([
+        { participant: 'user', content: [t('look')] },
+        { participant: 'agent', content: [t('ok')] },
+        { participant: 'user', content: [r('W3'), t('more')] },
+      ]),
+      /orphan_tool_result_textified/,
+    );
   });
 });

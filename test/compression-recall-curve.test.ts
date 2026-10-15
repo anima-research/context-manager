@@ -1729,6 +1729,135 @@ describe('compression refusal recall curves', () => {
     first.manager.close();
   });
 
+  it("a waiter on another instance's compression keeps its own kv-unified submission in flight, and still takes up the store (#166)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const producing = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    const concurrent = {
+      complete: async () => {
+        calls++;
+        entered();
+        await gate;
+        return response('end_turn', 'one durable result');
+      },
+    } as never;
+    const path = freshPath();
+    const first = await fixture(concurrent, { compressionRefusalCurveFallbacks: 0 }, path);
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 100,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+      adaptiveResolution: true,
+      foldingStrategy: 'kv-unified',
+      kvUnified: {
+        policy: {
+          alpha: 0.7,
+          budgetLowRatio: 0.5,
+          budgetHighRatio: 0.9,
+          budgetUnderLambda: 10,
+          budgetOverLambda: 10,
+          cacheLambda: 1,
+          cacheScale: 1000,
+          cacheReadPrice: 0.1,
+          cacheWritePrice: 1.25,
+          continuityLambda: 1,
+          continuityScale: 1000,
+          continuityRecencyHalfLifeTokens: 1000,
+          continuityRecencyFloor: 0.2,
+          continuityStableHalfLife: 10,
+          continuityStableFloor: 0.25,
+        },
+        tokenBucketSize: 100,
+        continuityBucketSize: 100,
+        fidelityBucketSize: 100,
+        labelCeiling: 10_000,
+        adoptEpsilon: 0,
+        treeifyNonContiguousSummaries: false,
+        preserveGapBearingSummaries: false,
+      },
+    } as never);
+    const secondManager = await ContextManager.open({
+      store: first.manager.getStore(),
+      strategy: second,
+      membrane: concurrent,
+    });
+    // The waiter has a presentation in flight: compiled and submitted, not yet accepted.
+    await secondManager.compile(
+      { maxTokens: 10_000, reserveForResponse: 0 },
+      undefined,
+      { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+    );
+    second.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    const presentation = second as unknown as {
+      kvUnifiedDraft: unknown;
+      kvUnifiedPendingLayout: unknown;
+      kvUnifiedPendingMarkerUnitIndices: number[];
+    };
+    const draft = presentation.kvUnifiedDraft;
+    const submittedLayout = presentation.kvUnifiedPendingLayout;
+    assert.ok(draft && submittedLayout, 'compiled and submitted');
+    const markerCount = presentation.kvUnifiedPendingMarkerUnitIndices.length;
+
+    const secondCtx = managerContext(secondManager);
+    const secondMessages = first.target.messages.map(
+      (message) => secondCtx.messageStore.get(message.id),
+    ).filter(Boolean) as StoredMessage[];
+    const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
+    // The waiter's reloads, to show its compression took the coalesced path.
+    const reloads: unknown[] = [];
+    const probe = second as unknown as { loadPersistedState(options?: unknown): void };
+    const reload = probe.loadPersistedState.bind(second);
+    probe.loadPersistedState = (options?: unknown) => {
+      reloads.push(options);
+      reload(options);
+    };
+    // The first instance's compression is the producer: the second starts only
+    // once the first is in its provider call, so it finds the family in flight.
+    // compressChunkHierarchical reaches that wait before its first await, so
+    // the second has joined it when run() returns its promise.
+    const producer = first.strategy.run(first.target, managerContext(first.manager));
+    await producing;
+    const waiter = second.run(secondChunk, secondCtx);
+    // While the second waits, the first writes to the store's shared mirrors.
+    const pinId = first.strategy.pinRange(first.ids[12]!, first.ids[13]!);
+    release();
+    await Promise.all([producer, waiter]);
+    assert.equal(calls, 1, 'the second compression waited on the first');
+    assert.equal(secondChunk.compressed, true, 'the waiter took up the durable L1');
+    assert.ok(second.pinsView().some((pin) => pin.id === pinId), "the waiter took up the other instance's pin");
+    const chain = (second as unknown as {
+      kvUnifiedReceipts: { inFlightSubmissionId: string | null; head: unknown; cache: { layout: unknown } | null };
+    }).kvUnifiedReceipts;
+    assert.equal(chain.inFlightSubmissionId, 's1', 'the submission begun before the wait is still in flight');
+    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'it took the coalesced path, reloading once');
+    assert.equal(presentation.kvUnifiedDraft, draft, 'the draft is kept');
+    assert.equal(presentation.kvUnifiedPendingLayout, submittedLayout, 'the submitted layout is kept');
+
+    second.reportKvUnifiedAccepted({
+      submissionId: 's1',
+      acceptedAt: 123,
+      wireReceipt: {
+        requestHash: 'wire1',
+        markers: Array.from({ length: markerCount }, (_, ordinal) => ({
+          ordinal,
+          prefixHash: `prefix-${ordinal}`,
+          estimatedOffset: ordinal + 1,
+        })),
+      },
+    });
+    assert.ok(chain.head, 'the acceptance committed the presentation');
+    assert.equal(chain.cache?.layout, submittedLayout, 'with the layout it was submitted with');
+    secondManager.close();
+    first.manager.close();
+  });
+
   it('same-key concurrent exhaustion makes one provider call and one keyed alert attempt', async () => {
     const mock = scriptedMembrane(['refusal']);
     const path = freshPath();

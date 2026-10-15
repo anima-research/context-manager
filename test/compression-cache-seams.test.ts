@@ -186,7 +186,7 @@ describe('Compression requests: cache seams (issue #37)', () => {
     }
   });
 
-  it('a budget-capped recall ladder suppresses all markers', async () => {
+  it('a budget-capped recall ladder with no head window carries no markers', async () => {
     const calls = await runWorkload({ compressionRecallBudgetTokens: 150 }, 60);
     const capped = calls.filter((c) => {
       const headers = recallHeaderIndices(c.request);
@@ -204,6 +204,24 @@ describe('Compression requests: cache seams (issue #37)', () => {
         'capped (marker-less) request must not carry cacheTtl');
     }
     assert.ok(capped.length > 0, 'expected at least one laddered call in the capped run');
+  });
+
+  it('a budget-capped recall ladder keeps the head seam and drops the pair seams', async () => {
+    const calls = await runWorkload({ compressionRecallBudgetTokens: 150, headWindowTokens: 200 }, 60);
+    const late = calls.slice(-3).filter((c) => !isMerge(c.request));
+    assert.ok(late.length > 0, 'expected late compress calls');
+    for (const { request } of late) {
+      const headers = recallHeaderIndices(request);
+      assert.ok(headers[0]! > 0, 'expected a head window ahead of the ladder');
+      // Eviction shifts the pairs, never what precedes them: one marker, on
+      // the last head message.
+      assert.deepStrictEqual(breakpointIndices(request), [headers[0]! - 1]);
+      assert.strictEqual(request.cacheTtl, '1h');
+    }
+    // The cached prefix is the same bytes on consecutive capped mints.
+    const [a, b] = late.slice(-2).map(({ request }) =>
+      JSON.stringify(request.messages.slice(0, recallHeaderIndices(request)[0]).map((m) => [m.participant, m.content])));
+    assert.ok(late.length < 2 || a === b, 'head prefix must not move between capped mints');
   });
 
   it('compressionCacheMarkers: false restores the complete pre-seam request shape', async () => {

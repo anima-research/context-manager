@@ -29,12 +29,14 @@
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
  *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts). A delta's size follows what changed. A
- *   snapshot holds the whole layout, the history behind the window as its
- *   members; it is written only once the records since the last one would
- *   outweigh it, so snapshots cost about as much again as the deltas between
- *   them. On average, then, the bytes stored per acceptance don't grow with
- *   the session, though each snapshot holds the whole view's members.
+ *   its units (forms with counts). A delta holds the members that changed
+ *   and the units from the first that changed to the last, so changes far
+ *   apart re-send the units between them. A snapshot holds the whole layout,
+ *   the history behind the window as its members; it is written only once
+ *   the records since the last one would outweigh it, so snapshots are
+ *   amortized against the deltas between them, and on average the bytes
+ *   stored per acceptance stay bounded while the deltas do, though each
+ *   snapshot holds the whole view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
@@ -61,6 +63,7 @@
 import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
@@ -321,7 +324,7 @@ function parseRecord<T>(record: ReturnType<JsStore['getRecord']>): T | null {
   }
 }
 
-/** A record's size as stored: its JSON, in UTF-8 bytes. */
+/** A record's size as counted for the snapshot rule: its whole record as JavaScript's JSON, in UTF-8 bytes. */
 function recordBytes(record: AcceptedLayoutRecord): number {
   return Buffer.byteLength(JSON.stringify(record), 'utf8');
 }
@@ -599,7 +602,7 @@ export class FoldJournal {
     } catch (err) {
       if (!markFailures.has(this.store)) {
         markFailures.add(this.store);
-        console.error(`[fold-journal] can't tell where the journal stands (${err instanceof Error ? err.message : String(err)}); compiles carry no mark until it can`);
+        console.error(`[fold-journal] can't tell where the journal stands (${describeThrown(err)}); compiles carry no mark until it can`);
       }
       return null;
     }
@@ -759,7 +762,7 @@ export class FoldJournal {
       try {
         listener(receipt);
       } catch (err) {
-        console.error('[fold-journal] receipt listener failed:', err);
+        logThrown('[fold-journal] receipt listener failed:', err);
       }
     }
   }
@@ -948,11 +951,12 @@ export class FoldJournal {
    * delta on the branch's previous record, or a snapshot once the delta
    * records written since the last snapshot, this one included, would
    * outweigh that snapshot's record. Sizes are whole records as JSON,
-   * receipts included, so the bound holds on what is stored. The records
-   * after a snapshot never outweigh it, and every snapshot but the newest is
-   * outweighed by the records after it plus the one that tipped the next:
-   * snapshots in all cost about as much again as the deltas between them,
-   * and rebuilding a layout reads at most two snapshots' worth. No count of
+   * receipts included (recordBytes). The records after a snapshot never
+   * outweigh it, and every snapshot but the newest is outweighed by the
+   * records after it plus the one that tipped the next: snapshots are
+   * amortized against the deltas between them, so the bytes per acceptance
+   * stay bounded on average while the deltas do, and rebuilding a layout
+   * reads at most two snapshots' worth. No count of
    * deltas forces a snapshot, so a chain of small deltas behind a large
    * snapshot stays a chain. A failed append may or may not have landed, so
    * the branch's cached latest layout is dropped and the index is listed
@@ -1060,7 +1064,7 @@ export class FoldJournal {
       if (!isLayoutRecord(record)) throw new Error('it no longer reads as one');
       layout = this.reconstruct(record);
     } catch (err) {
-      warnUnreadable(index, id, `its layout doesn't rebuild: ${(err as Error).message}; branch ${branch.ref.name} is treated as unrecorded`);
+      warnUnreadable(index, id, `its layout doesn't rebuild: ${describeThrown(err)}; branch ${branch.ref.name} is treated as unrecorded`);
       return null;
     }
     const latest: LatestLayout = {
@@ -1078,10 +1082,14 @@ export class FoldJournal {
   /** A record's layout, from its snapshot and the deltas since. Throws when the chain doesn't rebuild. */
   private reconstruct(record: AcceptedLayoutRecord): StoredLayout {
     const chain: AcceptedLayoutRecord[] = [];
+    const linked = new Set<string>();
     let current: AcceptedLayoutRecord | null = record;
     while (current && current.kind === 'delta') {
       chain.push(current);
       if (!current.prev) throw new Error(`delta ${current.compileId} names no record before it`);
+      // A link back into the chain would keep this walk going forever.
+      if (linked.has(current.prev)) throw new Error(`record ${current.prev} comes twice in its chain`);
+      linked.add(current.prev);
       const older: AcceptedLayoutRecord | null = readRecord<AcceptedLayoutRecord>(this.store, current.prev);
       if (!isLayoutRecord(older)) throw new Error(`record ${current.prev} in its chain can't be read`);
       if (older.ns !== record.ns || branchKey(older.branch) !== branchKey(record.branch)) {
@@ -1440,7 +1448,9 @@ export interface LayoutDelta {
  * inserted, the rest of `prev` kept, then `app` appended. Arrivals become
  * added members and appended units; a fold in the middle becomes a small
  * drop/ins; a change to `prev`'s last unit replaces everything after the
- * common prefix. Every pair of layouts has one. Empty parts are left out.
+ * common prefix. Two changes far apart re-send every unit between them,
+ * since only the common prefix and suffix are kept. Every pair of layouts
+ * has one. Empty parts are left out.
  */
 export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta {
   const units = unitsDelta(prev.units, next.units);

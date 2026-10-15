@@ -482,9 +482,17 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           self._lastRenderStats = null;
           self._lastCompileEstimate = 1;
           self._calibrationArmed = true;
+          self._calibrationLoaded = false;
+          self._calibration = 1.5;
+          self._calibrationReset = { discardedMultiplier: 9, fromEpoch: 0, at: 1 };
+          // The multiplier the store prices by, which the dry load applies.
+          (args[0] as { setTokenCalibration?(factor: number): void }).setTokenCalibration?.(3);
           self._storeView = {};
           self._storeOrder = new Map();
+          self._storeOrderSource = [];
           self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
+          self._imageWatermark = 99;
+          self._postStripMemo = { zz: true };
           if (this.throwAfter) throw new Error('zz-after-writing');
         }
         return out;
@@ -503,13 +511,19 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     // Every field select() saves and restores, read by identity.
     const fields = [
       'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
-      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_storeView', '_storeOrder',
-      '_cachedHeadStartIndex',
+      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_calibrationLoaded',
+      '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_storeOrderSource', '_cachedHeadStartIndex',
+      '_imageWatermark', '_postStripMemo',
     ];
-    const raw = () => fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]);
+    const storeCalibration = () =>
+      (manager as unknown as { messageStore: { getTokenCalibration(): number } }).messageStore.getTokenCalibration();
+    const raw = () => [
+      ...fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]),
+      storeCalibration(),
+    ];
     const rawBefore = raw();
     const assertRestored = (when: string) => raw().forEach((value, i) =>
-      assert.strictEqual(value, rawBefore[i], `${fields[i]} is put back ${when}`));
+      assert.strictEqual(value, rawBefore[i], `${fields[i] ?? 'the store\'s token calibration'} is put back ${when}`));
     await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
     assert.strictEqual(before(), expected);
     assertRestored('after a dry compile');
@@ -520,5 +534,101 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     );
     assert.strictEqual(before(), expected);
     assertRestored('after a dry compile that throws');
+  });
+
+  // The store order holds each message's position in the listing it was
+  // built from, and nothing else.
+  type OrderState = { _storeOrder: Map<string, number>; _storeOrderSource: ReadonlyArray<{ id: string }> };
+  const assertOrderMatchesItsListing = (strategy: AutobiographicalStrategy, label: string) => {
+    const self = strategy as unknown as OrderState;
+    const expected = new Map<string, number>();
+    self._storeOrderSource.forEach((m, i) => expected.set(m.id, i));
+    assert.deepStrictEqual(self._storeOrder, expected, `${label}: the store order matches its listing`);
+  };
+  const budget = { maxTokens: 100_000, reserveForResponse: 1_000 };
+
+  it('leaves later compiles working when it is the first compile after a removal', async () => {
+    // The first compile after a removal builds the store order from the
+    // shorter listing. A dry one puts the order back, and must put back the
+    // listing it was built from too: an order from before the removal,
+    // beside the listing from after it, reads as current. With the middle of
+    // three messages removed, every later select then left the last message
+    // unrendered and refused the compile (UncoveredDropError); in the other
+    // layouts here the positions were stale without a throw.
+    const layouts = [{ count: 3, remove: 1 }, { count: 3, remove: 0 }, { count: 3, remove: 2 }, { count: 5, remove: 2 }];
+    for (const adaptiveResolution of [false, true]) {
+      for (const { count, remove } of layouts) {
+        for (const compiledBefore of [false, true]) {
+          for (const next of ['dry', 'commit'] as const) {
+            const label = `${count} messages, m${remove + 1} removed${compiledBefore ? ' after a compile' : ''}, ` +
+              `adaptiveResolution ${adaptiveResolution}, then ${next} compiles`;
+            cleanup();
+            const strategy = new AutobiographicalStrategy({ recentWindowTokens: 30_000, adaptiveResolution });
+            const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+            try {
+              const ids = Array.from({ length: count }, (_, i) => manager.addMessage('user', textBlock(`m${i + 1}`)));
+              if (compiledBefore) await manager.compile(budget);
+              manager.removeMessage(ids[remove]);
+              const kept = ids.filter((_, i) => i !== remove);
+              const first = await manager.compile(budget, undefined, { dryRun: true });
+              assert.strictEqual(first.messages.length, count - 1, label);
+              assertOrderMatchesItsListing(strategy, label);
+              for (let i = 1; i <= 2; i++) {
+                const r = await manager.compile(budget, undefined, { dryRun: next === 'dry' });
+                assert.strictEqual(r.messages.length, count - 1, `${label} (${i})`);
+                assertOrderMatchesItsListing(strategy, `${label} (${i})`);
+                if (next === 'commit') {
+                  const listed = (strategy as unknown as OrderState)._storeOrderSource.map((m) => m.id);
+                  assert.deepStrictEqual(listed, kept, `${label} (${i}): a committing compile orders the current listing`);
+                }
+              }
+            } finally {
+              manager.close();
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('extends a copy of the store order when a dry select reads a longer listing', async () => {
+    // refreshStoreOrder extends the order in place when the listing it's given
+    // starts with the one the order was built from. A dry select puts the
+    // order it found back by reference, so a dry refresh must extend a copy:
+    // written into in place, the order put back would hold a position for a
+    // message its listing doesn't have.
+    cleanup();
+    const strategy = new AutobiographicalStrategy({ recentWindowTokens: 30_000 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    type Refresh = OrderState & {
+      _dryRunSelect: boolean;
+      refreshStoreOrder(messages: ReadonlyArray<{ id: string }>): void;
+    };
+    const self = strategy as unknown as Refresh;
+    try {
+      manager.addMessage('user', textBlock('m1'));
+      manager.addMessage('user', textBlock('m2'));
+      await manager.compile(budget);
+      const committedListing = self._storeOrderSource;
+      const order = self._storeOrder;
+      const entries = new Map(order);
+      const longer = [...committedListing, { id: 'appended' }];
+      self._dryRunSelect = true;
+      try {
+        self.refreshStoreOrder(longer);
+      } finally {
+        self._dryRunSelect = false;
+      }
+      assert.deepStrictEqual(order, entries, 'a dry refresh leaves the order it found as it was');
+      assert.strictEqual(self._storeOrder.get('appended'), 2, 'and orders the longer listing');
+      // What the dry select does on its way out:
+      self._storeOrder = order;
+      self._storeOrderSource = committedListing;
+      self.refreshStoreOrder(longer);
+      assert.strictEqual(self._storeOrder, order, 'a committing refresh still extends the order in place');
+      assert.strictEqual(self._storeOrder.get('appended'), 2);
+    } finally {
+      manager.close();
+    }
   });
 });

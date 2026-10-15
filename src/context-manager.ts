@@ -56,6 +56,7 @@ import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
 import { ThinkingBinding, chainSeed, isThinkingBlock, thinkingBindingFor, type BindingResult } from './thinking-binding.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
@@ -606,7 +607,7 @@ export class ContextManager {
             console.error(
               `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
                 `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
-                (removal instanceof Error ? removal.message : String(removal)),
+                describeThrown(removal),
             );
           }
           throw err;
@@ -873,7 +874,7 @@ export class ContextManager {
       try {
         listener(event);
       } catch (err) {
-        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
       }
     });
   }

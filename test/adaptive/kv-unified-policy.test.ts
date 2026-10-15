@@ -12,7 +12,7 @@ import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
-import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type KvUnifiedReuse } from '../../src/adaptive/strategies/kv-unified.js';
 import { Picker } from '../../src/adaptive/picker.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
 
@@ -1374,4 +1374,235 @@ test('latent demand is re-ranked on every solve: appended messages and policy ch
   const third = rank(shared, appended);
   assert.deepEqual(third.produced, fresh(appended, { budgetOverLambda: 0 }).produced);
   assert.equal(third.produced.length, 0);
+});
+
+test('latent demand gates a certified base solve against the unrestricted best cut', () => {
+  // Four raw leaves under two L1s. The accepted raw layout certifies under a
+  // wide adoptEpsilon, so the base solve exposes only that layout, scored up
+  // to epsilon above the best cut. A merge compared with that score alone
+  // would look worth more than epsilon; against the best cut it is not.
+  const build = (hysteresisCertificate: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 100 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+    for (const chunk of chronicle.chunks) chunk.salience = 0.2;
+    chronicle.produceL1(['c0', 'c1']);
+    chronicle.produceL1(['c2', 'c3']);
+    // Earlier L2 costs elsewhere in the history: the merge's expected (p50)
+    // recall cost then differs from its conservative (p80) one.
+    for (const [k, tokens] of [10, 20, 30, 40].entries()) {
+      const id = `L2-seen-${k}`;
+      chronicle.summaries.set(id, {
+        id, level: 2, content: 'seen', tokens, sourceLevel: 1, sourceIds: [],
+        sourceRange: { first: 'none', last: 'none' }, created: 0,
+      });
+      chronicle.recallPairTokens.set(id, tokens);
+    }
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map(chronicle.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }]));
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.125, budgetUnderLambda: 0, budgetOverLambda: 1600,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      adoptEpsilon: 1300, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4 },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 });
+    return { strategy, result };
+  };
+  const certified = build(true);
+  const unrestricted = build(false);
+  assert.ok(certified.strategy.lastResult?.certificate, 'the base solve certifies the accepted layout');
+  assert.equal(unrestricted.strategy.lastResult?.certificate, undefined);
+  assert.deepEqual(certified.result.produced, unrestricted.result.produced);
+  assert.deepEqual(
+    certified.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
+    unrestricted.strategy.lastDemandEvaluations.map((e) => [e.request.level, Math.round(e.conservativeImprovement)]),
+  );
+  const candidate = certified.strategy.lastDemandEvaluations[0]!;
+  assert.notEqual(candidate.expectedRecallTokens, candidate.conservativeRecallTokens);
+  // One conservative what-if each; the certified run adds the unrestricted
+  // base solve and nothing else: the expected-cost solve waits for the final
+  // gate, which neither run passes.
+  assert.equal(unrestricted.strategy.lastTimings?.demandSolves, 1);
+  assert.equal(certified.strategy.lastTimings?.demandSolves, 2);
+});
+
+test('latent demand decides a certified what-if solve against its unrestricted solve', () => {
+  // Eight leaves under four L1s; the accepted presentation covers c0/c1 at
+  // their L1, the rest are new. The base solve is unrestricted; the what-if
+  // for c4..c7 certifies its carried layout, whose pool understates the
+  // merge by up to the certificate's slack, which here spans the gate.
+  const raw = [50, 50, 200, 100, 100, 200, 50, 200];
+  const salience = [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1];
+  const build = (hysteresisCertificate: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 150 });
+    for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: raw[i] });
+    chronicle.chunks.forEach((chunk, i) => { chunk.salience = salience[i]; });
+    const l1s = [];
+    for (let i = 0; i < 8; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map([
+      ['c0', { level: 1, repHash: `summary:${l1s[0].id}`, lastChangedSeq: 1 }],
+      ['c1', { level: 1, repHash: `summary:${l1s[0].id}`, lastChangedSeq: 1 }],
+    ]);
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0.2, budgetHighRatio: 0.5, budgetUnderLambda: 4000, budgetOverLambda: 4000,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 1, continuityBucketSize: 1, fidelityBucketSize: 1, labelCeiling: 100_000,
+      adoptEpsilon: 200, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 800, targetBudget: 800, slack: 0 });
+    return { strategy, result };
+  };
+  const certified = build(true);
+  const unrestricted = build(false);
+  assert.equal(certified.strategy.lastResult?.certificate, undefined, 'the base solve is unrestricted');
+  const describe = (s: KvUnifiedStrategy) => s.lastDemandEvaluations.map((e) =>
+    [`L${e.request.level} ${e.request.range.firstChunkId}..${e.request.range.lastChunkId}`, Math.round(e.conservativeImprovement)]);
+  assert.deepEqual(describe(certified.strategy), describe(unrestricted.strategy));
+  assert.deepEqual(certified.result.produced, unrestricted.result.produced);
+  assert.ok(unrestricted.result.produced.some((r) => r.range.firstChunkId === 'c4'), 'the c4..c7 merge is worth more than epsilon');
+});
+
+/** Eight leaves under four L1s, with earlier L2 costs elsewhere in the
+ * history so a merge's expected (p50) recall cost differs from its
+ * conservative (p80) one. `covered` leaves are presented at their L1. */
+function certifiedWhatIfFixture(o: {
+  raw: number[]; salience: number[]; pairTokens: number; seenL2: number[]; covered: number;
+  budget: number; adoptEpsilon: number; hysteresisCertificate: boolean;
+  /** Cross-compile holder, and ownerless raw leaves appended after the eight. */
+  reuse?: KvUnifiedReuse; appended?: number;
+  /** All three bucket sizes; 1 (the default) makes the uncertified solve exact. */
+  bucket?: number;
+}) {
+  const chronicle = new MockChronicle({ recallPairTokens: o.pairTokens });
+  for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: o.raw[i] });
+  chronicle.chunks.forEach((chunk, i) => { chunk.salience = o.salience[i]; });
+  const l1s: Array<{ id: string }> = [];
+  for (let i = 0; i < 8; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+  for (let i = 0; i < (o.appended ?? 0); i++) chronicle.addChunk({ id: `n${i}`, rawTokens: 40 });
+  for (const [k, tokens] of o.seenL2.entries()) {
+    const id = `L2-seen-${k}`;
+    chronicle.summaries.set(id, {
+      id, level: 2, content: 'seen', tokens, sourceLevel: 1, sourceIds: [],
+      sourceRange: { first: 'none', last: 'none' }, created: 0,
+    });
+    chronicle.recallPairTokens.set(id, tokens);
+  }
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const leaves = new Map(Array.from({ length: o.covered }, (_, i) =>
+    [`c${i}`, { level: 1, repHash: `summary:${l1s[i >> 1].id}`, lastChangedSeq: 1 }] as const));
+  const strategy = new KvUnifiedStrategy({
+    policy: {
+      alpha: 0, budgetLowRatio: 0.2, budgetHighRatio: 0.5, budgetUnderLambda: 4000, budgetOverLambda: 4000,
+      cacheLambda: 0, continuityLambda: 0,
+    },
+    tokenBucketSize: o.bucket ?? 1, continuityBucketSize: o.bucket ?? 1, fidelityBucketSize: o.bucket ?? 1,
+    labelCeiling: 100_000,
+    adoptEpsilon: o.adoptEpsilon, hysteresisCertificate: o.hysteresisCertificate,
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
+    presentation: { currentSeq: 1, leaves },
+    ...(o.reuse ? { reuse: o.reuse } : {}),
+  });
+  const result = strategy.solve(inputs, { totalBudget: o.budget, targetBudget: o.budget, slack: 0 });
+  return { strategy, result };
+}
+
+test('latent demand orders emitted merges the same with the certificate as an exact solve without it', () => {
+  // Two merges pass the gate with equal conservative gains, so the expected
+  // (p50) gain orders them. A certified expected solve understates its gain
+  // by up to the certificate's slack, which here is enough to hide the lead
+  // of c4..c7 and let the weaker request be summarized first. Bucket size 1
+  // makes the uncertified solve exact.
+  const build = (hysteresisCertificate: boolean) => certifiedWhatIfFixture({
+    raw: [150, 150, 50, 100, 100, 100, 50, 150], salience: [1, 0.2, 1, 0.2, 0.5, 1, 0.5, 0.5],
+    pairTokens: 100, seenL2: [10, 30, 100, 150], covered: 4, budget: 500, adoptEpsilon: 50, hysteresisCertificate,
+  });
+  const certified = build(true);
+  const unrestricted = build(false);
+  const order = (r: typeof certified) => r.result.produced.map((p) => p.range.firstChunkId);
+  assert.ok(order(unrestricted).length >= 2, 'two merges are requested');
+  assert.deepEqual(order(certified), order(unrestricted));
+  assert.deepEqual(
+    certified.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
+    unrestricted.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
+  );
+});
+
+test('latent demand keeps a certified what-if pool that its pruned re-solve does not beat', () => {
+  // Both certified what-ifs overlap, so both are solved again without the
+  // certificate. With bucket size 1000 that solve prunes and comes back
+  // worse than the certified pools, which are real layouts: taking it would
+  // lower c0..c3 from 350 to 222.5 and drop c4..c7 (202.5) below the gate.
+  const base = {
+    raw: [30, 50, 100, 100, 150, 100, 200, 30], salience: [1, 1, 0.2, 0.2, 0.2, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 0, budget: 800, adoptEpsilon: 200,
+  };
+  const certified = certifiedWhatIfFixture({ ...base, hysteresisCertificate: true, bucket: 1000 });
+  const exact = certifiedWhatIfFixture({ ...base, hysteresisCertificate: false });
+  const gains = (r: typeof certified) =>
+    r.strategy.lastDemandEvaluations.map((e) => [e.request.range.firstChunkId, e.conservativeImprovement]);
+  assert.deepEqual(gains(certified), [['c0', 350], ['c4', 202.5]]);
+  assert.deepEqual(gains(certified), gains(exact));
+  assert.deepEqual(certified.result.produced, exact.result.produced);
+});
+
+test('latent demand runs each expected-cost solve once when a certified what-if is decided late', () => {
+  // The c4..c7 what-if certifies and its slack spans the gate, so it is
+  // solved again without the certificate. The expected (p50) solve of the
+  // already-decided c0..c3 merge must not run a second time for that.
+  const { strategy, result } = certifiedWhatIfFixture({
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: true,
+  });
+  assert.equal(result.produced.length, 2);
+  // Two conservative what-ifs, the unrestricted c4..c7 one, one p50 each.
+  assert.equal(strategy.lastTimings?.demandSolves, 5);
+});
+
+test('latent demand what-if solves reuse their own forests across compiles without changing the ranking', () => {
+  const base = {
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: true,
+  };
+  const describe = (r: ReturnType<typeof certifiedWhatIfFixture>) => ({
+    produced: r.result.produced,
+    evaluations: r.strategy.lastDemandEvaluations.map((e) => [e.request, e.conservativeImprovement, e.expectedImprovement]),
+    frontier: [...r.result.frontier],
+  });
+  const reuse: KvUnifiedReuse = {};
+  // Each compile builds its own inputs, as the host does; only `reuse` lives on.
+  for (const appended of [0, 0, 1, 2]) {
+    const before = new Map(reuse.whatIf ?? []);
+    const held = certifiedWhatIfFixture({ ...base, appended, reuse });
+    assert.deepEqual(describe(held), describe(certifiedWhatIfFixture({ ...base, appended })), `appended=${appended}`);
+    assert.ok(reuse.whatIf && reuse.whatIf.size > 0, 'what-if holders are kept for the next compile');
+    // A candidate scored again keeps its holder, and with it the forest to derive from.
+    if (before.size > 0) {
+      const carried = [...reuse.whatIf.entries()].filter(([key, holder]) => before.get(key) === holder);
+      assert.ok(carried.length > 0, `appended=${appended}`);
+      for (const [, holder] of carried) assert.equal(holder.forest?.derived, true, `appended=${appended}`);
+    }
+    // The live entries belong to the live solve alone.
+    for (const holder of reuse.whatIf.values()) {
+      assert.notEqual(holder.forest, reuse.forest);
+      assert.ok(holder.certificate === undefined || holder.certificate !== reuse.certificate);
+    }
+  }
 });

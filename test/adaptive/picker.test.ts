@@ -391,3 +391,54 @@ test('picker: hits soft target with slack-bounded room', () => {
   assert.ok(result.budgetMet);
   assert.ok(result.finalTokens <= 1800, `finalTokens ${result.finalTokens} should be ≤ targetBudget 1800`);
 });
+
+for (const [name, make] of [['flat-profile', () => new FlatProfileStrategy()], ['oldest-first', () => new OldestFirstStrategy()]] as const) {
+  test(`picker (${name}): a chunk pinned after it was folded renders raw`, () => {
+    const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100, mergeThreshold: 6, recallPairTokens: 200 });
+    const tailInfo = chronicle.computeHeadTail({ headTokens: 0, tailTokens: 200 });
+    // Folded to L1 before a pin was added over it.
+    const pinned = chronicle.chunks[1];
+    pinned.currentResolution = 1;
+    pinned.pinned = true;
+    const result = new Picker(make()).run(
+      { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens, ...tailInfo },
+      BUDGET(100_000),
+    );
+    assert.equal(result.levelAt(pinned.sequence, pinned.id), 0);
+    assert.equal(result.finalResolutions.get(pinned.id), 0);
+  });
+
+  test(`picker (${name}): under pressure, a chunk pinned after it was folded stays raw while another chunk folds`, () => {
+    const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100, mergeThreshold: 6, recallPairTokens: 200 });
+    const tailInfo = chronicle.computeHeadTail({ headTokens: 0, tailTokens: 200 });
+    const pinned = chronicle.chunks[1];
+    pinned.currentResolution = 1;
+    pinned.pinned = true;
+    const result = new Picker(make()).run(
+      { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens, ...tailInfo },
+      BUDGET(700),
+    );
+    assert.ok(chronicle.chunks.some((c) => c !== pinned && result.levelAt(c.sequence, c.id) > 0), 'another chunk folded');
+    assert.equal(result.levelAt(pinned.sequence, pinned.id), 0);
+  });
+
+  test(`picker (${name}): a pin outranks the agent's lock on a chunk folded before the pin`, () => {
+    const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100, mergeThreshold: 6, recallPairTokens: 200 });
+    const tailInfo = chronicle.computeHeadTail({ headTokens: 0, tailTokens: 200 });
+    // Locked at L1, then pinned: the accounting prices it raw, so it renders raw.
+    const pinned = chronicle.chunks[1];
+    pinned.currentResolution = 1;
+    pinned.lockedByAgent = true;
+    pinned.pinned = true;
+    // Locked at L1 and not pinned: it keeps its level.
+    const lockedOnly = chronicle.chunks[3];
+    lockedOnly.currentResolution = 1;
+    lockedOnly.lockedByAgent = true;
+    const result = new Picker(make()).run(
+      { chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens, ...tailInfo },
+      BUDGET(100_000),
+    );
+    assert.equal(result.levelAt(pinned.sequence, pinned.id), 0);
+    assert.equal(result.levelAt(lockedOnly.sequence, lockedOnly.id), 1);
+  });
+}

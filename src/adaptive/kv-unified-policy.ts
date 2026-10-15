@@ -7,6 +7,7 @@
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import type { KvUnifiedReuse } from './kv-unified-reuse.js';
 import {
   CanonicalSummaryForest,
   type ExactCutCandidate,
@@ -78,6 +79,8 @@ export class KvUnifiedPolicyError extends Error {
 }
 
 export interface ExactPolicySolveOptions {
+  /** Cross-compile reuse holder (see kv-unified-reuse.ts). Never read by what-if solves. */
+  readonly reuse?: KvUnifiedReuse;
   readonly maxTokens: number;
   readonly policy?: Partial<KvUnifiedWelfarePolicy>;
   readonly presentation?: AcceptedPresentationReference;
@@ -96,6 +99,10 @@ export interface ExactPolicySolveOptions {
 export interface ExactPolicyCandidate {
   readonly frontier: ReadonlyMap<ChunkId, number>;
   readonly layout: RenderLayout;
+  /** The cut as the level per leaf in `leafIds` order, when the candidate
+   *  came through the terminal evaluator (the same assignment as `frontier`). */
+  readonly levels?: ArrayLike<number>;
+  readonly leafIds?: readonly ChunkId[];
   readonly renderedTokens: number;
   readonly cacheChurn: number;
   readonly continuityLoss: number;
@@ -119,11 +126,17 @@ export type ExactPolicySolveResult =
       readonly continuityFloor: number;
       readonly cacheRelevant: boolean;
       readonly enumeration: ExactCutEnumerationStats;
+      /** Best score this pool reaches when both penalties are measured from
+       * the given floors instead of the pool's own. Scores from different
+       * solves are comparable only through a shared frame like this. */
+      readonly bestScoreUnder?: (cacheFloor: number, continuityFloor: number) => number;
     };
 
 export interface UnscoredCandidate {
   frontier: ReadonlyMap<ChunkId, number>;
   layout: RenderLayout;
+  levels?: ArrayLike<number>;
+  leafIds?: readonly ChunkId[];
   renderedTokens: number;
   cacheChurn: number;
   continuityLoss: number;
@@ -137,12 +150,13 @@ export class ExactKvUnifiedPolicySolver {
   readonly forest: CanonicalSummaryForest;
 
   private tree: SummaryTree | null = null;
-  private readonly orderedChunks: PickerInputs['chunks'];
+  private readonly orderedChunks: readonly PickerInputs['chunks'][number][];
   private readonly summaryLeaves = new Map<SummaryId, readonly ChunkId[]>();
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
-    this.orderedChunks = [...inputs.chunks].sort(
+    // A forest built from these inputs already holds this sort of them.
+    this.orderedChunks = this.forest.builtFrom(inputs) ? this.forest.orderedChunks() : [...inputs.chunks].sort(
       (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id),
     );
     for (const summary of this.forest.allSummaries()) {
@@ -241,11 +255,15 @@ export class ExactKvUnifiedPolicySolver {
         fidelityLoss: candidate.fidelityLoss, budgetPenalty: candidate.budgetPenalty,
         cacheExcess, continuityExcess, score,
       };
+      Object.defineProperty(result, 'levels', { get: () => candidate.levels, enumerable: false });
+      Object.defineProperty(result, 'leafIds', { get: () => candidate.leafIds, enumerable: false });
       matching.set(result, candidate.matchesPresentation);
-      return result;
+      return result as ExactPolicyCandidate;
     });
-    const leafIds = this.orderedChunks.map((chunk) => chunk.id);
-    candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
+    if (candidates.length > 1) {
+      const leafIds = this.orderedChunks.map((chunk) => chunk.id);
+      candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
+    }
     let selected = candidates[0];
     const epsilon =
       Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
@@ -257,7 +275,7 @@ export class ExactKvUnifiedPolicySolver {
       );
       if (carried && carried.score <= selected.score + epsilon) selected = carried;
     }
-    return {
+    return withBestScoreUnder({
       feasible: true,
       selected,
       candidates,
@@ -265,7 +283,13 @@ export class ExactKvUnifiedPolicySolver {
       continuityFloor,
       cacheRelevant,
       enumeration: stats,
-    };
+    }, (kf, cf) => {
+      let best = Infinity;
+      for (const c of unscored) {
+        best = Math.min(best, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, continuityMultiplier));
+      }
+      return best;
+    });
   }
 
   private fidelityLoss(
@@ -416,15 +440,48 @@ export function normalizePolicy(
   return policy;
 }
 
+/** The level-independent factor of `fidelityLeafLoss`: the loss at level L is
+ * exactly `fidelityLeafBase(...) * L` (same operations, same order). */
+export function fidelityLeafBase(
+  chunk: PickerInputs['chunks'][number],
+  newestSequence: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
+  return salience * age ** (-policy.alpha) * chunk.rawTokens;
+}
+
 export function fidelityLeafLoss(
   chunk: PickerInputs['chunks'][number],
   level: number,
   newestSequence: number,
   policy: KvUnifiedWelfarePolicy,
 ): number {
-  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  return fidelityLeafBase(chunk, newestSequence, policy) * level;
+}
+
+/** The level-independent factor of `continuityLeafLoss` for a leaf with an
+ * accepted presentation: the loss at a level that moves the leaf is exactly
+ * `continuityLeafBase(...) * max(1, |level - previous.level|)`. */
+export function continuityLeafBase(
+  chunk: PickerInputs['chunks'][number],
+  previous: PresentedLeaf,
+  currentSeq: number,
+  midpointAgeTokens: number,
+  policy: KvUnifiedWelfarePolicy,
+): number {
+  const recency =
+    policy.continuityRecencyFloor +
+    (1 - policy.continuityRecencyFloor) *
+      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
+  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
+  const stability =
+    policy.continuityStableFloor +
+    (1 - policy.continuityStableFloor) *
+      2 ** (-tau / positive(policy.continuityStableHalfLife));
   const salience = clamp(chunk.salience ?? 1, 0.2, 1);
-  return salience * age ** (-policy.alpha) * chunk.rawTokens * level;
+  return salience * chunk.rawTokens * recency * stability;
 }
 
 export function continuityLeafLoss(
@@ -437,18 +494,8 @@ export function continuityLeafLoss(
   policy: KvUnifiedWelfarePolicy,
 ): number {
   if (!previous || (repHash === previous.repHash && level === previous.level)) return 0;
-  const recency =
-    policy.continuityRecencyFloor +
-    (1 - policy.continuityRecencyFloor) *
-      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
-  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
-  const stability =
-    policy.continuityStableFloor +
-    (1 - policy.continuityStableFloor) *
-      2 ** (-tau / positive(policy.continuityStableHalfLife));
-  const salience = clamp(chunk.salience ?? 1, 0.2, 1);
   const representationDistance = Math.max(1, Math.abs(level - previous.level));
-  return salience * chunk.rawTokens * recency * stability * representationDistance;
+  return continuityLeafBase(chunk, previous, currentSeq, midpointAgeTokens, policy) * representationDistance;
 }
 
 export function budgetPenalty(
@@ -490,6 +537,18 @@ export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyC
   leafIds: readonly ChunkId[]): number {
   return a.score - b.score || a.renderedTokens - b.renderedTokens ||
     frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds));
+}
+
+/** Attach the shared-frame scorer as a non-enumerable property: results are
+ * compared structurally in tests and serialized by diagnostics, and a
+ * per-result closure must not take part in either. Object spread drops it;
+ * callers fall back to scoring the public candidate list. */
+export function withBestScoreUnder<T extends object>(
+  result: T,
+  bestScoreUnder: (cacheFloor: number, continuityFloor: number) => number,
+): T & { readonly bestScoreUnder: typeof bestScoreUnder } {
+  Object.defineProperty(result, 'bestScoreUnder', { value: bestScoreUnder, enumerable: false, writable: false, configurable: true });
+  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder };
 }
 
 export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,

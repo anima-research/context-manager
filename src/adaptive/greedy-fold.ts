@@ -5,7 +5,8 @@
  * algorithm, so it lives here as a private implementation detail behind the
  * solver protocol — the picker never sees intermediate steps. Monotonic by
  * construction: greedy steps only raise (kv-stable is the only solver that
- * plans bidirectionally, and it solves in closed form).
+ * plans bidirectionally, and it solves in closed form). The one exception is
+ * the seed: a pinned chunk starts at 0, whatever it carried.
  *
  * Extracted from the former picker-side `MutableFoldingState` when the op
  * walk was retired (see folding-strategy.ts header).
@@ -104,7 +105,12 @@ class GreedyEngine implements GreedyState {
     this.chunkOrder = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
     for (const c of this.chunkOrder) {
       this.chunkById.set(c.id, c);
-      this.resolutions.set(c.id, c.currentResolution);
+      // A pinned chunk renders raw, as computeTokens and the picker's
+      // accounting already price it, whether or not the agent locked it. Its
+      // carried resolution can be a fold from before the pin was added, and
+      // the frontier is what renders (and what the strategy stores), so it
+      // starts at 0.
+      this.resolutions.set(c.id, c.pinned ? 0 : c.currentResolution);
     }
     this.summaries = inputs.summaries;
     this.recallPairTokens = inputs.recallPairTokens ?? new Map();

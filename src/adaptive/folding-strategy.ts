@@ -67,6 +67,13 @@ export interface FoldingSolution {
    * silently absorbed).
    */
   frontier: ReadonlyMap<ChunkId, number>;
+  /**
+   * The same assignment as `frontier`, as the level per chunk sequence, when
+   * the live chunks' sequences are exactly 0..n-1 (one per index). Lets the
+   * picker and the strategy read a level by position without building or
+   * probing a map per chunk; `frontier` stays the contract.
+   */
+  levelsBySequence?: ArrayLike<number>;
   /** Summaries the solver wanted but that don't exist yet. */
   produced: ProduceRequest[];
   /**

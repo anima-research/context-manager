@@ -508,6 +508,39 @@ describe('sharded writes declare their group size', () => {
     });
   });
 
+  it('a rollback whose removal throws a value String() cannot print still raises the write\'s error, and reports it', async () => {
+    await withManager('./test-shard-count-recovery-unprintable', async (open) => {
+      const cm = await open();
+      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; removeBodyGroup: (id: string) => void } }).messageStore;
+      const append = store.append.bind(store);
+      const removeBodyGroup = store.removeBodyGroup.bind(store);
+      let calls = 0;
+      store.append = (...args: unknown[]) => {
+        calls += 1;
+        if (calls === 2) throw new Error('injected failure before the second shard');
+        return append(...args);
+      };
+      // An object with no prototype has no toString, so String() throws on it.
+      store.removeBodyGroup = () => { throw Object.create(null); };
+      const error = console.error;
+      const logged: string[] = [];
+      const printable = (arg: unknown): string => { try { return String(arg); } catch { return '(unprintable)'; } };
+      console.error = (...args: unknown[]) => { logged.push(args.map(printable).join(' ')); };
+      try {
+        assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure before the second shard/);
+      } finally {
+        console.error = error;
+        store.append = append;
+        store.removeBodyGroup = removeBodyGroup;
+      }
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes('[object Object]')),
+        `the failed removal is reported: ${logged.join('\n')}`,
+      );
+      cm.close();
+    });
+  });
+
   it('a view filter that hides shard 0 leaves the body its identity, all its shards in rawBodies, and no whole-delivery claim', async () => {
     const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
     const { rmSync } = await import('node:fs');
@@ -635,6 +668,37 @@ describe('sharded writes declare their group size', () => {
       cm.close();
     } finally {
       console.error = error;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a listener throwing a value console.error cannot format leaves the sharded write whole, and is reported', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    const { inspect } = await import('node:util');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-listener-unprintable';
+    rmSync(path, { recursive: true, force: true });
+    // The real console formats an object through its inspect hook, which can throw.
+    const unprintable = { [inspect.custom]() { throw new Error('custom inspect failed'); } };
+    const write = process.stderr.write;
+    const written: string[] = [];
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Sharding() });
+      let adds = 0;
+      cm.onMessage(() => { if (++adds === 2) throw unprintable; });
+      process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+      cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+      process.stderr.write = write;
+      assert.equal(cm.getAllMessages().filter((m) => m.bodyGroupId === 'three').length, 3, 'every shard stays');
+      assert.ok(written.some((w) => w.includes('onMessage listener threw') && w.includes('[object Object]')), `reported: ${written.join('')}`);
+      cm.close();
+    } finally {
+      process.stderr.write = write;
       rmSync(path, { recursive: true, force: true });
     }
   });

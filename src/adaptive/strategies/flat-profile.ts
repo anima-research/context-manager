@@ -6,9 +6,10 @@
  * raisable group at that level, raise it. Tiebreak on level: lower level wins
  * (fold finer detail before consolidating coarser regions).
  *
- * Monotonic (never lowers). Memory-fading by construction: a given chunk's
- * resolution only ever increases within a solve, and the carried resolutions
- * seed the next one.
+ * Monotonic within a solve (never lowers). Memory-fading by construction: a
+ * given chunk's resolution only ever increases within a solve, and the carried
+ * resolutions seed the next one, except that a pinned chunk is seeded raw
+ * (greedy-fold.ts).
  *
  * See `docs/adaptive-resolution-design.md` §3.7.
  */

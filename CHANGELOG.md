@@ -12,6 +12,288 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.14.1 — 2026-10-15
+
+### Fixed
+
+- A calibration record without a pricing stamp is no longer counted as epoch 1 and re-stamped on load (#179). 0.11.0 to 0.13.0 wrote such records, and so did every release before 0.11.0, whose pricing `CALIBRATION_EPOCH_REPRICES` doesn't model; nothing in the record tells them apart. Five production stores upgraded from pre-0.11 runtimes to 0.14.0 kept the multiplier they had learned under the flat signed-thinking price, four at the 1.8 ceiling and one at 1.45. One refused every compile with `OverBudgetError`, and the others ran folded, the worst to about 45% of the window it could hold. An unstamped multiplier is now **provisional**:
+  - It is discarded at load, as before, when the store holds content the epochs since 1 repriced, and now also when it sits at a clamp edge (1.8 or 0.6): a residual pinned there corrected per-class rates that were off by more than the clamp allows, and says nothing about this release's. Otherwise it is kept, with one `console.warn`, and the record is left as it is: the stamp is written by the first sample, not the load.
+  - A provisional multiplier above 1 that puts a compile over budget is dropped to 1 and the select runs again, so the first compile resolves instead of wedging, unless it is over budget at 1 as well. The drop is logged, persisted as `calibration.reset`, and shown in render stats. A provisional multiplier at or below 1 is never raised.
+  - The first sample the sanity band accepts replaces a provisional multiplier outright (and writes the stamp); the learner's EMA steps only from there. The 1 any discard restarts from is provisional too, so one applied sample sets it rather than about ten, each repricing every message; it is persisted as provisional, so a restart before that sample keeps it a guess.
+  - `RenderStats.calibration.provisional` is `true` meanwhile. `CalibrationReset.fromEpoch` is `null` for a record without a stamp (it is now typed `number | null`). A dry select or preview decides and falls back as a real compile would, at the picker's refusal too (which a dry run otherwise only reports as `fits: false`), so a budget preview says what the real compile will do; it writes no record and emits no calibration log.
+  - **Operators:** this covers a record that is still unstamped. A store that already opened on 0.14.0 and ran a committing compile had its multiplier re-stamped as epoch 2, which is honoured as learned, as before; such a store keeps the folded window or the wedge and still needs the one-time reset in 0.14.0's notes.
+
+- A dry compile that is the first compile after a message is removed no
+  longer leaves later compiles reading message positions from before the
+  removal. Those stale positions could make every later compile, dry or
+  committing, throw `UncoveredDropError`, as they did with the middle one of
+  three messages removed, until something rebuilt the order, such as setting
+  the strategy again. The dry run had put the strategy's store order back
+  without the listing it was built from. A regression in 0.14.0.
+
+## 0.14.0 — 2026-10-13
+
+### Added
+
+- `blockAsStored(block)` gives a content block as the message store hands it back once stored: what `getMessage`, `getAllMessages` and `getMessageWindow` return for it with blobs resolved, live and after reopening. It needs no store and does no I/O, so a host can hash a body as the store will keep it before writing it, through a canonical serializer: the store's serialization (undefined fields dropped, key order, NaN and Infinity to null, -0 to 0, strings written as UTF-8) is outside it. Inline media comes back as its source alone, its base64 rewritten from the decoded bytes and an image relabeled by its bytes' signature (png, jpeg, gif, webp); a URL image and every other block come back as given. The store's own write and read are built from the same helpers, so the two can't disagree. It throws for a block the store refuses (inline media whose data the store can't read as base64, or without a media type: for an image, none declared and no recognized signature in its bytes) and for a `blob_ref`, which only the store can resolve. It covers one block's round trip: a strategy's ingress chunking can store one delivered message as several, which it doesn't predict. An image's stored form depends on the release's signature set, so a change to that set changes stored forms.
+- `BlobManager.hasStorableMedia` and `BlobManager.estimateMediaSize` follow the store's own rule for which blocks become blobs: an image whose source isn't a URL, not only a base64 one.
+
+- `imageStripHysteresisRatio` (opt-in, default off): when a live-image limit binds (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), trim to ratio × each limit and persist a watermark (a message sequence) below which images stay stripped. The stripped set then changes once per trim instead of once per new image. Each change rewrites the message it touches and invalidates the prompt cache from there on, which on a large window is a full-price rewrite per image. Rendering and budgeting (`postStripEstimates`) both honour the watermark, so they stay consistent; it survives reopen.
+
+### Changed
+
+- `concatBodyGroups` reads its input in store order, where a body's shard indices rise: a shard whose index doesn't rise starts another body. It no longer sorts a run of one group id by `shardIndex`, which is what interleaved two copies of one document. Pass shards in the order the store returns them.
+- A host that groups stored messages into bodies by `bodyGroupId` alone should read them through `bodyBounds` or `continuesBody`, so a reposted document is two bodies there too.
+- A listener added with `onMessage` must not add a message synchronously: it can run while a sharded add is still storing its remaining shards, and a message added there would split the body.
+
+- Compression requests whose recall ladder is capped by
+  `compressionRecallBudgetTokens` now carry one cache marker, at the end of
+  the head window, instead of none. Front-eviction shifts the recall pairs on
+  every mint, so their seams stay suppressed, but tools, system prompt and
+  head window precede the ladder and repeat unchanged, except when image
+  shedding replaces a head-window image for one payload and not for another
+  (the head marker of uncapped requests has the same exposure). A capped
+  request with no head window is unchanged (no marker, no `cacheTtl`). Capped
+  requests that gain the marker change their canonical hash.
+
+- **Estimator calibration is applied past a 2% dead band.** The closed-loop
+  multiplier (`reportRealInputTokens`) is still an EMA of real/estimated, but
+  it is applied to the store, persisted and logged only once the EMA is more
+  than 2% from the applied value, so token estimates may lag the EMA by up to
+  2%. Every applied change reprices every message and recall pair; a host
+  reports once per compile, which moved the multiplier by a fraction of a
+  percent each time and made the kv-unified forest, summary tree and
+  certificate graph rebuild on every compile (a warm compile on a production
+  store: 233 ms instead of 110 ms). A sample inside the band now leaves
+  cross-compile reuse intact.
+
+- Large-history compiles do less per-compile work over the whole store: the
+  message listing survives receipt and resolution writes (it keyed on the
+  store-global sequence), filtered views share one filtered array per
+  listing, chunk rebuilds use one id-to-position map (extended in place on
+  append) and record which chunk owns each position, pins and the picker
+  inputs read those instead of building their own maps, and the L1-by-message
+  index is rebuilt only when summaries change. The hysteresis certificate
+  prices and scores its carried cut as a levels array instead of 75k id
+  tuples and a frontier map; the terminal evaluator takes the forest's chunk
+  order instead of re-sorting and factors the per-leaf loss terms out of the
+  per-level loop (values are bit-identical). Layouts are unchanged.
+
+- kv-unified reuses what did not change between compiles: the canonical
+  forest, the receipt SummaryTree and the certificate's context DAG are
+  derived from the previous compile when no summary, recall cost or L1 link
+  changed; leaf representation hashes and positions live on the forest leaf;
+  the certificate scores through the terminal evaluator with a linear
+  compile; message token estimates, salience and the post-strip pass keep
+  their caches across appends; receipt submission reuses unchanged leaves.
+  Layouts are unchanged; a warm compile on a 75k-message history drops to
+  roughly a third of its previous wall time.
+
+- The kv-unified warm compile does less fixed work per turn. The hysteresis
+  certificate walks its DAG as flat typed arrays (grown in place when leaves
+  are appended), keys fully owned summary contexts by summary id instead of a
+  serialized id list, and tests participants by allowed-level bits; the
+  terminal evaluator keeps the per-leaf slot facts that depend only on the
+  leaf and its receipt entry across compiles and recomputes only the
+  age-dependent terms; the certificate and the evaluator share one receipt
+  lookup per leaf. The minimum-token floor (every uncertified compile and
+  every budget-wall turn of a pinned store) uses the same id keys and bit
+  tests. Forest derive compares head/tail zones with one byte per leaf and
+  reads unchanged leaves by position; the strategy's compile loops memoize
+  L1-to-ancestor walks, read forest leaves by sequence, and check coverage
+  by position. All sums run in the original order: layouts, resolutions,
+  receipts and emitted entries are unchanged.
+
+- The kv-unified compile keeps its per-compile structures across a
+  summary arrival. When a compile adds summaries, re-parents children
+  under them or owns more leaves, the forest is extended from the
+  previous one: only the leaves whose ownership chain changed and the
+  summaries on an old or new chain of such a leaf are rebuilt, every
+  other leaf and summary object is shared, and the forest names its
+  parent and what changed. The summary tree rebuilds only the nodes of
+  new or re-parented summaries. The terminal evaluator translates the
+  parent's slots instead of recomputing them, and the certificate DAG
+  and the accepted-level cache keep the nodes of leaves and fully
+  covered summaries the extension did not touch. A derive compares each
+  leaf with its own record of the chunk it was built from, so a chunk
+  changed in place (a pin, a lock, a token count) is seen; a kept
+  cache-layout translation is reused only where the structure still
+  holds the same leaf ids; a tree node built while a source was missing
+  is rebuilt when that source arrives. Forests, trees, DAGs, labels,
+  layouts, resolutions and receipts are unchanged.
+
+- Avoid a nested action-cache Map for the first level of each immutable action
+  array, allocating a fallback Map only when that array is used at more levels.
+- Reuse a shared visitor function for internal packed trace references while
+  preserving public detached-callable references, traversal order and lazy reads.
+  These changes reduce specific lookup/function-allocation work; comparative
+  wall-time, total allocation, peak-memory and GC improvements are unproven.
+
+- The kv-unified compile does less fixed work when ownership changes (a
+  new summary). The forest full build walks each L1's ownership chain
+  once, resolves a chain to its summaries once, keeps leaf lists in
+  position order (contiguity is a span check), shares level lists and
+  summary hashes per chain, and copies an already ordered chunk list
+  instead of sorting it. The summary tree walks each summary's leaves
+  once per build and keeps ordered lists unsorted. The certificate DAG
+  addresses leaves by forest position and takes a fully covered summary's
+  participants from the forest's cached index array. The packed solver
+  prices and emits actions through leaf positions its callers already
+  hold. The strategy's coverage invariant remembers each emitted
+  summary's store positions per store order. Forests, trees, DAGs,
+  labels, layouts, resolutions and receipts are unchanged.
+
+- kv-unified latent demand scores every what-if solve in one shared floor
+  frame (the lowest cache and continuity floors any pool in the compile
+  reached) and compares best-vs-best under adoptEpsilon, instead of
+  subtracting selected scores measured against each solve's own floors.
+  The expected-cost (p50) solve now runs only for candidates the
+  conservative gate emits. Timings and the emitted requests are exposed on
+  the strategy for diagnostics.
+
+- kv-unified latent demand: a what-if solve derives its forest from the live
+  forest (one parent added over existing summaries) instead of building every
+  leaf again, and keeps its own forest and certificate graph in
+  `KvUnifiedReuse.whatIf`, keyed by candidate and recall cost, for the next
+  compile that scores the same candidate. A compile that ranks latent demand
+  drops the holders of candidates it does not score, and a branch reset drops
+  all of them; a compile that ranks nothing leaves them in place. Requests, evaluations and the emitted context
+  are unchanged; on a 18.6k-message store the what-if time of a compile fell
+  by about a third (1422 ms to 909 ms over seven compiles).
+
+### Fixed
+
+- The persisted estimator-calibration multiplier is stamped with the token-pricing epoch it was learned under (`AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`), so when pricing changes, a multiplier learned under the old pricing is discarded on load (start from 1.0) instead of applied. The multiplier is a residual over the per-class rates, so it means nothing once they change: a store that had pinned 1.8 under the flat-600 signed-thinking price reopened on 0.11.0 estimating ~1.8× its real size. When that plan exceeded the hard budget, the first compile threw `OverBudgetError` before any inference, so no sample could ever decay the multiplier: a permanent startup crash loop. A record written before the stamp doesn't say which pricing it was learned under, so a store still in that loop takes the one-time reset under **Operators** below.
+- The discard is persisted (`{multiplier: 1, pricing: <current epoch>}`) for records from an older epoch, so rolling back to a binary that ignores the stamp can't reload the stale multiplier. A record from a newer epoch is left on disk and not used, without a warning, until this binary's first applied sample writes its own record over it, reset included.
+- A discard is no longer only one log line. It is a `console.warn` naming the size of the change and how to re-stamp the old value. It is also recorded as `reset: {discardedMultiplier, fromEpoch, at}` in the persisted calibration state, and exposed with the multiplier and epoch as `RenderStats.calibration` (so hosts that surface render stats, such as connectome-host's `/healthz` `contextComposition`, show it). The record survives restarts, later learning and a later epoch's re-stamp. A later discard replaces it, and an operator re-stamp without it clears it.
+- An older-epoch multiplier is discarded only if the store holds content that some epoch since then repriced (`AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES`). Epoch 1 repriced signed `thinking` blocks that carry no stamped `tokenEstimate` (a stamped block is priced by its stamp in every epoch). Epoch 2 repriced membrane's XML-history carriers (`tool_attempt`, `tool_notice`), which had estimated as 0. Otherwise the residual still means what it did, and it is kept and re-stamped with one `console.warn`. An epoch without an entry counts as repricing everything.
+- A preview or a dry compile decides the multiplier as a real compile would and prices by it, but writes and logs nothing, and leaves the strategy and the store's multiplier as it found them. The first real compile after it loads again and persists what it decides. A store view that can set its token calibration but not read it (`getTokenCalibration`) can't be put back, so a dry select through one throws before changing it. ContextManager's own views supply both methods, and a view with neither is unaffected.
+- **Operators:** a record without a stamp counts as epoch 1, since 0.11.0 to 0.13.0 learned under that pricing and wrote no stamp. Upgrading keeps such a multiplier and re-stamps it, unless the store holds XML-history carriers, in which case it restarts from 1.0. Two kinds of store can then refuse every compile with `OverBudgetError` before inference. One kept a multiplier last learned before its host moved to 0.11.0, which has no stamp either: reset it once, with the host stopped, with `setStateJson('<ns>/autobio:calibration', { multiplier: 1, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH })`. The other held carriers and a multiplier below 1, which the restart from 1.0 raised: check the old value against provider-billed input tokens, then re-stamp it the same way with that value. If a store holding unstamped signed thinking kept a multiplier last learned before 0.11.0 and still fits, it prices every message by that stale multiplier until the learner corrects it. From the 1.8 ceiling, that takes about ten applied steps, and each one reprices every message. Until then the window stays folded smaller than it needs to be. The same one-time reset avoids this. When bumping `CALIBRATION_PRICING_EPOCH`, add an entry naming what the new epoch reprices.
+
+- Bound aggregate leaf memberships and identifier storage during KV-unified
+  certificate context construction before allocating keys and child lists;
+  excessive graphs decline conservatively to the existing solver.
+
+- kv-unified no longer persists its presentation receipt as one `[id, leaf]` pair per presented chunk on every accepted call. The leaf table is now stored run-length encoded (consecutive chunks sharing a representative form one run, raw chunks with the same clock form one run with their `raw:<id>` hashes derived on load, ids gap-coded inside a run), and the head receipt's change list the same way, so a write costs bytes proportional to the number of summaries presented rather than the number of messages in the session. On a six-week production store the per-call write went from 1.68 MB to 48 KB; the old shape had put 2.8 GB of a 3.0 GB `records.log` into that one state (#148). Stores written by earlier releases still load; a persisted receipt of any other shape, or one whose runs are malformed, now fails loading loudly instead of silently restoring an empty continuity baseline. The in-memory `KvUnifiedReceiptChain` API is unchanged. Settled submission ids are now bounded in memory (256, as they already were on disk).
+- `scripts/records-log-bytes-by-state.py` streams a Chronicle `records.log` and prints bytes per state and operation (and per day), without loading the store; it is how #148 was found.
+
+- kv-unified: a receipt chain written back by a pre-format-2 build after a
+  rollback loads again. Until that build advances the presentation (only
+  keepalives or an unchanged layout were accepted), it persists the format-2
+  head it loaded in the legacy shape, without `changes`, and the next format-2
+  build threw in `serializeHead` on its first acceptance (#164). The head is
+  decoded from its `changeRuns`; a legacy head with neither shape is refused
+  as malformed.
+
+- A compression that waited on another strategy instance's in-flight
+  compression of the same family reloaded the strategy's persisted state to
+  take up that result, and under `foldingStrategy: 'kv-unified'` that reload
+  replaced the receipt chain and dropped the presentation in flight. A
+  submission begun before the wait then failed its acceptance ("kv-unified
+  callback … does not match the in-flight submission") (#166). The waiter now
+  keeps its own kv-unified receipt chain, whose pending submission is never
+  persisted, and its draft and pending layout, with the layout's marker indices
+  and immutable prefix hash, which live only in memory. It no longer reads the
+  store's receipt state there, so between initializations a kv-unified
+  instance's chain is its own. Everything else reloads as before.
+
+- Chronicle state registration failures now propagate instead of being treated as an existing state: from autobiographical strategy initialization, from `ContextManager.open` (the message, context-log and auxiliary-view slots), from the windowed-passthrough strategy, and from mint-preimage storage, whose failure `persistMintRequestPreimage` reports as before. Only `State already exists: <id>` for the same slot counts as already registered, and that slot is kept as it is, whatever strategy or cadence it was registered with. Reinitialization still preserves already-registered slots, and a failed open releases a store it opened.
+- ContextManager refuses mutations and strategy execution while initialization is pending or failed; inspect the selected branch and recover explicitly with a successful `switchBranch` or `setStrategy`. Failed transitions remain nontransactional. The strategy-state queries refuse too, where they used to answer: `isReady`, `getPendingWork`, `getHotContextSettings`, `previewContext`, `listPins`, `searchSummaries`, `getSummary`, `getSummariesInRange`, `getMaxSummaryLevel` and `getRenderStats`. The refusal reads `ContextManager.<operation> requires successful strategy initialization`, replacing the strategy's `requires reinitialization for the current branch generation`.
+- A `switchBranch()` or `fork()` whose strategy initialization a newer one supersedes rejects with the new `InitializationSupersededError`, whose `branch` names the branch the call selected or, for a fork, created.
+
+- `MessageStore.append` no longer re-certifies an id index or materialized cache that was already stale before the append because a sibling `MessageStore` on the same store had removed or edited an earlier message. Stale state is left stale and rebuilt on the next lookup. Previously, after a sibling removed an earlier message and this instance appended, a lookup by id returned the wrong message under the right id while the stored slot was correct (reported by Astra, 2026-10-07; reachable with published chronicle 0.4.0).
+- A `MessageStore`'s own edit or removal now stamps its materialized cache as current (when the cache was current before the write), so an edit or removal followed by an append no longer costs a whole-slot reload on the next read.
+
+- Two ingestions of one text are two bodies everywhere a sharded message is
+  read as a whole. The chunker names a shard group by a hash of its text, so a
+  document posted twice (or a write cut short and then retried) stores two
+  runs of shards under one `bodyGroupId`. Readers that took the group id for
+  the body ran the copies together:
+  - the autobiographical render, and `concatBodyGroups`, sorted both runs by
+    shard index and interleaved them;
+  - merging adjacent raw shards in the head and recent windows did the same;
+  - `removeBodyGroup` removed both copies, and `removeRange` refused a range
+    ending between them;
+  - `getMessageWindow` with `alignToBodyGroups` widened a window across them;
+  - reading mode counted the document twice, and a chunk spanning both
+    copies read as part of one document;
+  - the compression-hold boundary stepped back over the earlier copy;
+  - the newest-turn guard accepted an earlier copy for the newest one.
+
+  In store order a message now continues the body before it only when it
+  carries the same group id at a higher shard index (each ingestion writes
+  its shards 0..n-1, so the next one starts again at 0). The rule is read
+  pairwise, so it also holds where a render region begins inside a body: the
+  cut body's remainder is never joined to the next copy. `continuesBody`,
+  `bodyStart`, `bodyEnd`, `bodyBounds` and `bodyBoundsIn` give that reading
+  to hosts. A stored conversation holding a reposted sharded document renders
+  differently after the upgrade, so its first request misses the prompt cache.
+- The newest-turn guard no longer refuses a render that kept the newest body
+  in the middle region (which happens when its newest shard alone outgrows the
+  recent window): it now also reads a composite's `sourceMessageIds`.
+
+- A dry compile (`ContextManager.compile(…, { dryRun: true })`, with `AutobiographicalStrategy`) now leaves what a select leaves behind as the last committing compile left it, on every path out, throws included. Before, only `previewContext` put part of it back. A plain dry compile changed what the next real compile sent: its stable-prefix cache marker was measured against the dry layout, and under kv-unified the next submission carried marker indices from it. A dry select (a preview's too) also recorded chunks and queued their compression: over another writer's messages, or at a preview's overridden chunk size, whose boundaries then stayed for good. And it left readers in between the dry run's `getHotContextSettings()` (`currentFrontierTokens`, `prepared`, `blocked`) and `getRenderStats()`, and replaced calibration's estimate, or armed a second sample, between a real compile and its usage reports.
+- Chunk records an earlier dry select wrote stay as they are: they are valid chunks, sized by that preview, and compress like any other.
+- The one thing a dry compile can still leave is the release of a compression hold whose deadline has passed: a hold ends at its deadline whoever looks, and the manager releases it at any compile or hold query.
+- A dry select now refuses what a real compile refuses, with one exception: a plan over the budget isn't refused at the plan check. The stages after it still refuse what doesn't fit, so a dry compile of an adaptive plan whose middle doesn't fit throws when it emits the middle, and `previewContext` reports that plan as `fits: false`. A kv-unified plan that selects a level with no summary now throws on a dry run too. *(Corrected after release: this entry first said a dry select returns an over-budget plan.)*
+
+- The context manager's edits now reach the wire on formatters that replay a block's raw form. membrane's XML (prefill) formatter replays a tool block's `rawXml`, and its OpenAI Responses formatter emits a block's `rawItem`, instead of rendering the block's fields. An edit made by spreading a block kept that raw form, so the original shipped in place of the edit. Affected: the `toolUseInputMaxTokens` cap, the `toolResultMaxLastN` marker, `maxMessageTokens` truncation in both the autobiographical and windowed strategies, the compression prompt's image cap inside tool results and its tool-prose hoist, the reasoning stripped from compression input, the recall envelope's tags, and pairing repair (orphan drop, result relocation, `stripUnpairedToolBlocks`). A dropped or moved block also kept shipping inside a sibling's shared raw form (one `<function_calls>` holds several invokes; one Responses message item gives each text part its block), and on the Responses path a cut part could ship twice, cut and uncut. Each edit now releases the raw forms it made untrue, from the edited block and from every block sharing them; on the Responses path, a reasoning item and the item it leads to are released together, so neither is replayed with an id whose partner is gone. Both then go out id-less, as membrane sends any history without raw items: reasoning with encrypted content as an id-less reasoning item, and reasoning without it, which has no id-less form, not at all. A raw form no edit touched still replays verbatim, and an opaque Responses item (membrane's zero-width carrier, such as an encrypted compaction item or a hosted tool's call) is never released or rewritten, since its raw item is its whole content. In a pairing it is an item like any other, so where the reasoning before it is stripped and it stays, as in the live-strip recall answer, it still ships whole with its id, as before. Compression requests strip the reasoning too, but drop opaque carriers along with other empty text blocks, as they always did, so there it doesn't ship at all. The one edit with nothing to release is the line appended to the compression instruction, which is context-manager's own block. One drop releases less: an empty text part dropped from a compression request while another part of its Responses item survives leaves that item as it was, since it still ships whole through the surviving part; an item none of whose parts survive releases the reasoning that led to it. Reported by Astra, 2026-10-08; reachable with published membrane 0.5.86 when a host uses the XML prefill formatter or a Responses provider and sets one of those caps, or wraps recalls on a Responses provider, and on every compression request on a Responses provider whose history holds reasoning or whose request hoists tool prose. On those formatters a capped request now differs from before: the caps' markers ship, and the `toolResultMaxLastN` marker names how many newer results follow, which changes as results arrive, so each new one re-sends what follows the oldest marked result, as on native-formatter hosts already.
+- Compiling no longer writes the `toolUseInputMaxTokens` input marker or the `toolResultMaxLastN` marker into the message store's cached view. Where no `maxMessageTokens` cut had already copied a message's content, the edit went into the content array that `getAll()` hands every caller, so until the next write `getAllMessages()` returned the marker in place of the original, and the next compile started from the marker: with a cap below the marker's own size, each compile truncated the previous marker again, and its `_originalTokens` and `_keys` came to describe the marker rather than the input (found in review, 2026-10-08; reachable whenever a host sets either cap).
+
+- With the `flat-profile` or `oldest-first` folding strategy, a classic pin (one without a `level` or `maxLevel`) added over a message those solvers had already folded now renders the message raw. It kept rendering its summary, though the plan priced it raw. While the pin stands it outranks an agent's lock on the message, as the plan's pricing already assumed. The fold the pin replaces is dropped from the stored resolutions, as `kv-stable` already does: after the pin is removed, the message stays raw until a fold takes it again, unless it was locked, when it returns to the level it was locked at. On the first compile after upgrading, each message pinned over a fold renders raw, so the prompt is written to the cache again from the first of them, once.
+
+- With `imageStripHysteresisRatio` set, a `previewContext` call, or the select a dry compile runs, advances the image watermark for its own render only. It no longer writes the watermark or leaves it advanced, so a preview with stricter image limits can't change which images the next live compile strips, and a preview that changes only the ratio prices its images for that ratio. `getRenderStats`, when no compile has rendered on the current branch (before the first compile, or after a reopen or a branch switch), also reconstructs its window without changing or persisting the watermark or keeping the estimates priced under that temporary trim. Releasing a compression hold whose deadline has passed, which a dry compile does before its select, still commits as before, including the watermark advance made by the release's rebuild; the following dry select leaves that state unchanged.
+
+- `scripts/inspect-store` is mutation-free strategy inspection. It used to open a live `AutobiographicalStrategy` under a `ContextManager` with a config that was not the resident's, which registers state for whatever namespace it is given and can chunk the frontier with the wrong window and chunk size. It also always ran a 50K-token sample compile, which is where a household's `OverBudgetError` came from. Now it opens the store with `JsStore.open` (it never creates one), reads the strategy's persisted state as stored, and, without `--sample-compile`, constructs no strategy or `ContextManager`, so it creates no strategy, chunk or namespace state. A store whose lock is held, such as a running resident's, is refused with exit 1 and a message saying so.
+  - `--namespace <ns>` names the strategy namespace (`--ns` still works). A namespace without strategy state is reported, with the namespaces that have it, and nothing is inspected (exit 2).
+  - The invocation is checked whole before anything is opened or written. An unknown or misspelled option, a stray argument, an option given twice (`--ns` counts as `--namespace`) or an option without its value is refused (exit 1), rather than read around or replaced by a default. That includes the old `--all`, `--summaries` and `--messages`, an empty `--namespace`, and a `--sample-compile` value that isn't a plain positive whole number.
+  - `--message-slot isolated|shared` says where the resident keeps its messages (the `ContextManager`'s `isolate`), which the store doesn't record. Without it, the sole registered slot is read. When both `{namespace}/messages` and `messages` are registered, nothing is inspected until one is chosen (exit 2), because an isolated slot outlives a switch to shared messages. A chosen slot that isn't registered is refused (exit 2), never created. The overview, `messages.md` and the sample name the slot they read.
+  - The sample compile runs only with an explicit `--sample-compile <tokens>`, and compiles the same message slot. That run is a live, audit-only sample using the tool's default strategy configuration, not the resident's own, and it writes: it registers the namespace's states, re-applies the message slot's registration (its snapshot cadence; the shared slot is store-global), may migrate legacy chunk records, and may rewrite the summaries state as the strategy repairs it on load. So use it on a copy; the written sample says so too. It is now `sample-compile-<tokens>.md`, named by the budget given, where it was always `sample-compile-50k.md`. With no message slot it is refused, since there is no history to compile.
+  - It is mutation-free logically, not byte-for-byte. Chronicle has no read-only open: opening still takes the store's lock, so run it on a stopped resident's store or a copy. Reading messages re-registers the message slot's history indexes idempotently, rebuilding any that are missing or stale, and every close rewrites `state.bin`, `state-indexes.bin` and `branches.bin`, whose bytes can change even when what they hold doesn't. When the store wasn't closed cleanly, opening may also correct stale branch heads and truncate a torn tail from `records.log`; the tool reports such a truncation on stderr, even when the open then fails, since nothing records it afterwards. So copy a store before inspecting it if you need its files as they were, for forensics.
+  - Summaries and resolutions are shown as stored, before the strategy's load-time repair. A summaries state that isn't a list, or a resolutions state that isn't a map of numbers, is reported on stderr and in the overview rather than read as empty.
+
+- Allow the opt-in kv-unified hysteresis certificate to prove carried layouts
+  with nested protected internal holes, using today's canonical cut recurrence.
+  Preserve existing constraints, receipt scoring, adoption policy and fallback.
+
+- kv-unified review fixes: a certified base solve no longer overstates a
+  merge's benefit (the certificate lets the carried layout score up to
+  `adoptEpsilon` above the best cut, so a merge that passes the gate
+  against it is decided against the unrestricted base solve); the Pareto
+  engines and the certificate price a forest not built from the current
+  inputs with the current chunks; a kept cache-layout translation with an
+  unknown unit is rebuilt once the forest holds that unit; a forest derive
+  declines a placed summary deleted from the same input map; a solve's
+  per-solve caches are scoped to that solve even when the caller reuses
+  the options object; the whole-message token memo checks every block's
+  identity; a branch switch drops the cross-compile holders.
+
+- kv-unified latent demand: a certified what-if solve no longer decides the
+  order of the merge requests. A certified what-if that passes the
+  `adoptEpsilon` gate is solved again without the certificate when another
+  passing candidate's gain lies within its certificate slack, and the
+  expected-cost solve runs without the certificate for requests whose
+  conservative gains tie. Before, the weaker of two merges could be
+  summarized first. The requests are ordered by proven gains: when the
+  uncertified solve prunes and scores worse than the certified pool, the
+  certified pool is kept. That is the order of an exact solve, which a pruned
+  uncertified solve does not always give.
+- The expected-cost solve of an already decided candidate no longer runs
+  again when a certified what-if is decided late (one extra solve per
+  emitted candidate per pass). The emitted context is unchanged by both.
+
+- `MessageStore` and `ContextLog` (whose estimate strategies receive as
+  `ContextLogView.estimateTokens`) price membrane's XML-history carriers
+  instead of counting them as 0. A `tool_attempt` (a tool-call block that
+  dispatched nothing, replayed verbatim) is estimated from its `rawXml`. A
+  `tool_notice` (the harness's notice about refused or warned invokes) is
+  estimated from the `<tool_call_notice>` elements it replays as. Both are
+  read structurally, so this works with any membrane version. Other
+  unrecognized blocks still count as 0. The shared rule is
+  `MessageStore.xmlHistoryCarrierTokens`, for strategies that price content
+  themselves. The blocks come from membrane#101, persisted by
+  agent-framework.
+
 ## 0.13.0 — 2026-10-03
 
 ### Added

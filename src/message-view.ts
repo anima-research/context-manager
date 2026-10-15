@@ -24,11 +24,34 @@ import type { MessageStoreView, StoredMessage, MessageId } from './types/index.j
  * that `getFrom(index)` therefore indexes the FILTERED sequence of
  * messages, not raw-store positions.
  */
+const filteredListings = new WeakMap<
+  readonly StoredMessage[],
+  WeakMap<(message: StoredMessage) => boolean, StoredMessage[]>
+>();
+
 export function filterMessageStoreView(
   view: MessageStoreView,
   keep: (message: StoredMessage) => boolean,
 ): MessageStoreView {
-  const all = () => view.getAll().filter(keep);
+  // The underlying listing is the store's cached array while nothing was
+  // written, and `keep` is a pure function of the message, so one filtered
+  // array per (listing, predicate) serves every getAll/length/getTail of a
+  // compile — across view instances too: the host builds a fresh view for
+  // every strategy call over the same listing and the same predicate.
+  const all = () => {
+    const source = view.getAll();
+    let byKeep = filteredListings.get(source);
+    if (!byKeep) {
+      byKeep = new WeakMap();
+      filteredListings.set(source, byKeep);
+    }
+    let out = byKeep.get(keep);
+    if (!out) {
+      out = source.filter(keep);
+      byKeep.set(keep, out);
+    }
+    return out;
+  };
   return {
     getAll: all,
     get: (id: MessageId) => {

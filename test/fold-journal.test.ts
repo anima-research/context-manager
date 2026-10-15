@@ -11,6 +11,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { inspect } from 'node:util';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
@@ -1061,6 +1062,22 @@ describe('fold journal size', () => {
       assert.deepEqual(applyLayoutChain(layouts[0]!, deltas), layouts.at(-1), `chain ${chain}, in one pass`);
     }
   });
+
+  it('a delta re-sends the units from the first change to the last, so changes far apart re-send what lies between', () => {
+    // A hundred distinct units over a hundred members; `at` changes the units at those places.
+    const members = Array.from({ length: 100 }, (_, i) => i + 1);
+    const prev: StoredLayout = { members, units: Array.from({ length: 100 }, (_, i): LayoutUnit => ({ k: 'r', t: i })) };
+    const at = (...places: number[]): StoredLayout => ({ members, units: prev.units.map((u, i) => (places.includes(i) ? { k: 'r', t: 1000 + i } : u)) });
+    const sent = (next: StoredLayout): number => {
+      const delta = layoutDelta(prev, next);
+      assert.deepEqual(applyLayoutDelta(prev, delta), next);
+      return (delta.ins?.length ?? 0) + (delta.app?.length ?? 0);
+    };
+    assert.equal(sent(at(40)), 1, 'one change in the middle: one unit');
+    assert.equal(sent(at(99)), 1, 'the last unit: one unit');
+    assert.equal(sent(at(10, 90)), 81, 'two changes: every unit from the first to the last');
+    assert.equal(sent(at(0, 99)), 100, 'a change at each end: the whole view');
+  });
 });
 
 describe('fold journal durability and index', () => {
@@ -1343,6 +1360,72 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('a chain that links back into itself gives a baseline, and its walk ends', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    const written = cm.getStore();
+    const last = written.getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    // A delta whose previous record is itself, written where the next record lands.
+    const self = String(Number(last) + 1);
+    const branch = cm.currentBranchRef();
+    const landed = written.appendJson('context-manager/accepted-layout', { v: 3, ns: 'agents/tester', branch, compileId: 'self-cycle', kind: 'delta', prev: self, p: 0, totalTokens: 0, chain: 1, sb: 10_000, db: 10 });
+    assert.equal(landed.id, self, 'the record names itself');
+    cm.close();
+
+    // Reads of it are counted, so a walk that doesn't end fails here rather
+    // than hanging the suite.
+    const real = JsStore.openOrCreate({ path: STORE });
+    let reads = 0;
+    const counted = wrapStore(real, {
+      getRecord: (id: string) => {
+        if (id === self && ++reads > 100) throw new Error(`record ${self} was read ${reads} times`);
+        return real.getRecord(id);
+      },
+    });
+    cm = await ContextManager.open({ store: counted, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      assert.ok(errors.some((e) => e.includes(`record ${self} comes twice in its chain`)), `the loop is reported: ${errors.join('\n')}`);
+    } finally {
+      console.error = error;
+      cm.close();
+    }
+  });
+
+  it('a chain whose read throws a value that is not an Error still gives a baseline, and is reported', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    const branch = cm.currentBranchRef();
+    // A delta on a record no lookup reads but its chain.
+    cm.getStore().appendJson('context-manager/accepted-layout', { v: 3, ns: 'agents/tester', branch, compileId: 'odd-throw', kind: 'delta', prev: '987654321', p: 0, totalTokens: 0, chain: 1, sb: 10_000, db: 10 });
+    cm.close();
+
+    const real = JsStore.openOrCreate({ path: STORE });
+    const odd = wrapStore(real, {
+      getRecord: (id: string) => {
+        // A store may throw anything; null has no message to read.
+        if (id === '987654321') throw null;
+        return real.getRecord(id);
+      },
+    });
+    cm = await ContextManager.open({ store: odd, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null")), `reported: ${errors.join('\n')}`);
+    } finally {
+      console.error = error;
+      cm.close();
+    }
+  });
+
   it('a compile never fails because the journal cannot be read: it carries no mark, and a later compile tries again', async () => {
     let { cm } = await open();
     add(cm, 3);
@@ -1365,6 +1448,53 @@ describe('fold journal durability and index', () => {
       failSync = false;
       const later = await cm.compile(BUDGET);
       assert.equal(later.provenance?.journalMark?.recordId, real.getRecordIdsByType('context-manager/accepted-layout').at(-1), 'the index was not kept half-built: the next compile has its mark');
+    } finally {
+      console.error = error;
+      cm.close();
+    }
+  });
+
+  it('a receipt listener throwing a value console.error cannot format leaves the acceptance standing, and is reported', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    const journal = new FoldJournal(cm.getStore(), 'agents/tester');
+    // The real console formats an object through its inspect hook, which can throw.
+    const unprintable = { [inspect.custom]() { throw new Error('custom inspect failed'); } };
+    journal.onReceipt(() => { throw unprintable; });
+    const write = process.stderr.write;
+    const written: string[] = [];
+    let receipt: FoldReceipt | null;
+    process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      receipt = journal.accept(provenance, Date.now(), undefined);
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.equal(receipt?.kind, 'baseline', 'the acceptance stands');
+    assert.equal(layoutRecords(cm.getStore()).length, 1);
+    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object]')), `reported: ${written.join('')}`);
+    cm.close();
+  });
+
+  it('a compile stands when the journal\'s store throws a value String() cannot print', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    cm.close();
+
+    const real = JsStore.openOrCreate({ path: STORE });
+    // An object with no prototype has no toString, so String() throws on it.
+    const flaky = wrapStore(real, { sync: () => { throw Object.create(null); } });
+    cm = await ContextManager.open({ store: flaky, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    const errors: string[] = [];
+    const error = console.error;
+    const printable = (arg: unknown): string => { try { return String(arg); } catch { return '(unprintable)'; } };
+    console.error = (...args: unknown[]) => { errors.push(args.map(printable).join(' ')); };
+    try {
+      const compiled = await cm.compile(BUDGET);
+      assert.equal(compiled.provenance?.journalMark, null, 'the compile stands, without a mark');
+      assert.ok(errors.some((e) => e.includes("can't tell where the journal stands ([object Object])")), `reported: ${errors.join('\n')}`);
     } finally {
       console.error = error;
       cm.close();

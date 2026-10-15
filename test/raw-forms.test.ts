@@ -176,6 +176,31 @@ describe('raw forms: keys and release', () => {
     const moved = releaseSharedRawFormsOnMove(shared, [shared, xmlResult('b', 'small file')]);
     assert.equal(rawOf(moved).rawXml, undefined);
   });
+
+  it('a moved member of a reasoning pairing gives up its id, as its partner left behind does', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const source = [rs1, fc1];
+    assert.equal(rawOf(releaseSharedRawFormsOnMove(fc1, source)).rawItem, undefined, 'the call moved without its reasoning');
+    assert.equal(rawOf(releaseEditedRawForms(source, [rs1])[0]).rawItem, undefined, 'and the reasoning left behind');
+    assert.equal(rawOf(releaseSharedRawFormsOnMove(rs1, source)).rawItem, undefined, 'the reasoning moved without its call');
+    assert.equal(rawOf(releaseEditedRawForms(source, [fc1])[0]).rawItem, undefined, 'and the call left behind');
+    // An item that pairs with nothing in its message keeps its id when it moves.
+    const result = { type: 'tool_result', toolUseId: 'call_1', content: 'read', rawItem: { type: 'function_call_output', id: 'fco_1' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(result, [result, itemText('after')]), result);
+    // So does one in a message whose pairing it isn't part of: after the follower, or after it in place of reasoning.
+    const fc2 = { type: 'tool_use', id: 'call_2', name: 'fs:read', input: { path: '/b' }, rawItem: { type: 'function_call', id: 'fc_2' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(fc2, [rs1, fc1, fc2]), fc2);
+    // Reasoning at the end of a message pairs with nothing, and keeps its id.
+    const rs9 = { type: 'redacted_thinking', data: 'nine', rawItem: { type: 'reasoning', id: 'rs_9' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(rs9, [fc1, rs9]), rs9);
+  });
+
+  it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {
+    const think = reasoning();
+    const search = searchCall();
+    assert.equal(releaseSharedRawFormsOnMove(search, [think, search]), search);
+  });
 });
 
 describe('raw forms: opaque carriers, drops and appends', () => {

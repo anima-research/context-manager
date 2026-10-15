@@ -2,8 +2,7 @@ import type { ChunkId } from './folding-strategy.js';
 import type { ExactCutEnumerationStats } from './kv-unified.js';
 import {
   comparePolicyCandidates, normalizeContinuityMultiplier, normalizePolicy, policyScore,
-  type ExactPolicyCandidate, type ExactPolicySolveOptions, type ExactPolicySolveResult, type UnscoredCandidate,
-} from './kv-unified-policy.js';
+  type ExactPolicyCandidate, type ExactPolicySolveOptions, type ExactPolicySolveResult, type UnscoredCandidate, withBestScoreUnder } from './kv-unified-policy.js';
 
 export interface MetricInterval { readonly lower: number; readonly upper: number }
 export interface BoundedPolicyCandidate {
@@ -125,11 +124,35 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
   }
   if (!best) throw new Error('kv-unified score intervals failed to retain a winner');
   const selected = carried && carried.score <= best.score + epsilon ? carried : best;
-  return {
+  // Same interval pruning as the winner search, but against caller-supplied
+  // floors. Only candidates whose lower bound can still win are refined.
+  const bestScoreUnder = (kf: number, cf: number): number => {
+    const exactScore = (c: UnscoredCandidate) =>
+      policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
+    if (fullyEvaluate) {
+      let best = Infinity;
+      for (let i = 0; i < source.length; i++) best = Math.min(best, exactScore(refine(i)));
+      return best;
+    }
+    const low = new Float64Array(source.length);
+    let upperBound = Infinity;
+    for (let i = 0; i < source.length; i++) {
+      const c = source[i];
+      low[i] = policyScore(c.fidelity.lower, c.budgetPenalty, c.cacheChurn, c.continuity.lower, kf, cf, policy, multiplier);
+      upperBound = Math.min(upperBound, policyScore(c.fidelity.upper, c.budgetPenalty, c.cacheChurn, c.continuity.upper, kf, cf, policy, multiplier));
+    }
+    let best = Infinity;
+    for (let i = 0; i < source.length; i++) {
+      if (low[i] > upperBound) continue;
+      best = Math.min(best, exactScore(refine(i)));
+    }
+    return best;
+  };
+  return withBestScoreUnder({
     feasible: true, selected, cacheFloor, continuityFloor, cacheRelevant, enumeration: stats,
     get candidates() {
       return candidates ??= source.map((_candidate, index) => score(index))
         .sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     },
-  };
+  }, bestScoreUnder);
 }

@@ -53,13 +53,16 @@
   - A layout persists as its members (message sequences, gap-coded, about
     1.3 bytes each) and its units (forms with counts), so a message missing
     from either view is never counted inside a range. An acceptance writes a
-    delta on the branch's previous record, whose size follows what changed,
-    or a snapshot of the whole layout once the records since the last
-    snapshot would outweigh it, each counted whole, receipt included. So
-    snapshots cost about as much again as the deltas between them, the bytes
-    stored per acceptance don't grow with the history on average, though each
-    snapshot holds the whole view's members, and rebuilding a layout reads at
-    most about two snapshots' worth.
+    delta on the branch's previous record, holding the members that changed
+    and the units from the first that changed to the last, or a snapshot of
+    the whole layout once the records since the last snapshot would outweigh
+    it, each counted whole, receipt included. So snapshots are amortized
+    against the deltas between them, and on average the bytes stored per
+    acceptance stay bounded while the deltas do, as when messages arrive
+    and a fold changes one stretch of the view. Changes far apart re-send the
+    units between them, so a change at each end of a long view re-sends all
+    of it. Each snapshot holds the whole view's members, and rebuilding a
+    layout reads at most about two snapshots' worth.
   - A use reads the records it needs rather than every record. An
     acceptance reads its branch's newest record and the chain that rebuilds
     its layout. A branch is found by reading back from the store's newest
@@ -72,8 +75,8 @@
     Each record names its branch's previous receipt, so a branch's receipts
     are walked back reading only receipts. Every manager on one store
     object shares what has been read; the first use after the store opens
-    lists the records' ids and syncs once, making every record present
-    durable.
+    lists the records' ids and, when there are any, syncs once, making every
+    record present durable.
   - Layouts persist base token estimates, taken before the store's
     calibration, so identical content costs the same in every compile. A
     receipt's estimated token counts apply the calibration its compile

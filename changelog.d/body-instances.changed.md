@@ -1,3 +1,0 @@
-- `concatBodyGroups` reads its input in store order, where a body's shard indices rise: a shard whose index doesn't rise starts another body. It no longer sorts a run of one group id by `shardIndex`, which is what interleaved two copies of one document. Pass shards in the order the store returns them.
-- A host that groups stored messages into bodies by `bodyGroupId` alone should read them through `bodyBounds` or `continuesBody`, so a reposted document is two bodies there too.
-- A listener added with `onMessage` must not add a message synchronously: it can run while a sharded add is still storing its remaining shards, and a message added there would split the body.

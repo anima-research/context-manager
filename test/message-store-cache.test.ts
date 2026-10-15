@@ -93,6 +93,24 @@ describe('MessageStore — materialized cache write-through & revalidation', () 
     assert.deepEqual(texts(manager), ['a', 'b', 'c'], 'append after revalidation');
   });
 
+  it('foreign state-slot writes keep the mapped getAll() array; own writes replace it', async () => {
+    const manager = await openManager();
+    const store = manager.getStore();
+    manager.addMessage('user', textBlock('a'));
+    const id = manager.addMessage('user', textBlock('b'));
+    const warm = manager.getAllMessages();
+    store.setStateJson('test/foreign-slot', { tick: 1 });
+    assert.strictEqual(manager.getAllMessages(), warm, 'same array across a foreign write');
+    manager.addMessage('user', textBlock('c'));
+    const appended = manager.getAllMessages();
+    assert.notStrictEqual(appended, warm, 'append replaces the array');
+    assert.strictEqual(appended[0], warm[0], 'append keeps earlier message objects');
+    manager.editMessage(id, textBlock('B'));
+    const edited = manager.getAllMessages();
+    assert.notStrictEqual(edited, appended, 'edit replaces the array');
+    assert.deepEqual(texts(manager), ['a', 'B', 'c']);
+  });
+
   it('edit write-through: edited content is visible without re-materialization', async () => {
     const manager = await openManager();
 
