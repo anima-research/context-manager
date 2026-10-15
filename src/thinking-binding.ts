@@ -321,18 +321,36 @@ export interface ReleasedCopy {
   copy: StoredMessage;
 }
 
+/** A store listing as a released view hands it out, and the release state it was mapped under. */
+export interface ReleasedListing {
+  released: ReadonlyMap<MessageId, number>;
+  version: number;
+  mapped: StoredMessage[];
+}
+
+/**
+ * Each released map's version. addRelease, through which every change to a
+ * released map goes, bumps it whenever it releases more, so a listing mapped
+ * under an older version is mapped again.
+ */
+const releaseVersions = new WeakMap<ReadonlyMap<MessageId, number>, number>();
+
 /**
  * A view in which each released message (one whose thinking the pass has
  * stripped on this branch, from the block mapped to it; its prefix never
  * comes back) reads without that thinking, so selection, budgets and
  * estimates count what is sent. Copies are memoized per stored message, in
  * `copies`, so a strategy's caches keyed on a message stay warm from one
- * compile to the next.
+ * compile to the next. The listing `getAll` returns is memoized per store
+ * listing and release state, in `listings`: the store hands out one listing
+ * while nothing is written, and caches keyed on the listing's identity stay
+ * warm while nothing is written or released.
  */
 export function releaseThinkingView(
   view: MessageStoreView,
   released: ReadonlyMap<MessageId, number>,
   copies: WeakMap<StoredMessage, ReleasedCopy> = new WeakMap(),
+  listings: WeakMap<readonly StoredMessage[], ReleasedListing> = new WeakMap(),
 ): MessageStoreView {
   if (released.size === 0) return view;
   const strip = (m: StoredMessage): StoredMessage => {
@@ -347,7 +365,15 @@ export function releaseThinkingView(
   };
   return {
     ...view,
-    getAll: () => view.getAll().map(strip),
+    getAll: () => {
+      const source = view.getAll();
+      const version = releaseVersions.get(released) ?? 0;
+      const memo = listings.get(source);
+      if (memo && memo.released === released && memo.version === version) return memo.mapped;
+      const mapped = source.map(strip);
+      listings.set(source, { released, version, mapped });
+      return mapped;
+    },
     get: (id: MessageId) => {
       const m = view.get(id);
       return m ? strip(m) : null;
@@ -426,6 +452,7 @@ function addRelease(map: Map<MessageId, number>, id: MessageId, from: number): b
   const held = map.get(id);
   if (held !== undefined && held <= from) return false;
   map.set(id, from);
+  releaseVersions.set(map, (releaseVersions.get(map) ?? 0) + 1);
   return true;
 }
 
@@ -492,6 +519,8 @@ export class ThinkingBinding {
   private readonly cursors = new Map<string, Cursor>();
   /** Released copies of stored messages, kept while the stored one lives. */
   private readonly releasedCopies = new WeakMap<StoredMessage, ReleasedCopy>();
+  /** Released listings, kept while the store's listing lives. */
+  private readonly releasedListings = new WeakMap<readonly StoredMessage[], ReleasedListing>();
   /** The store's sequence when this state was made. A message stored before
    *  it was stored by an earlier process, which this one can't attribute. */
   private readonly attributedAfter: number;
@@ -524,7 +553,7 @@ export class ThinkingBinding {
   /** `view` as `branch` sends it: released messages read without their
    *  thinking (see releaseThinkingView). */
   releasedView(view: MessageStoreView, branch: BranchRef): MessageStoreView {
-    return releaseThinkingView(view, this.releasedOn(branch), this.releasedCopies);
+    return releaseThinkingView(view, this.releasedOn(branch), this.releasedCopies, this.releasedListings);
   }
 
   /**

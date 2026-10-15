@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
 import type { SummaryEntry, CompileResult, ContextInjection } from '../src/index.js';
-import { THINKING_BINDING_RECORD, bindThinking, chainSeed, chainStep, mintStamp } from '../src/thinking-binding.js';
+import { THINKING_BINDING_RECORD, bindThinking, chainSeed, chainStep, mintStamp, releaseThinkingView } from '../src/thinking-binding.js';
 import { chunkMessage } from '../src/adaptive/chunker.js';
 
 class SeedableStrategy extends AutobiographicalStrategy {
@@ -723,6 +723,57 @@ describe('thinking binding', () => {
       assert.deepEqual(stripped, [0, 1, 2, 2, 2]);
       cm.close();
     });
+  });
+
+  it('hands the strategy one listing while nothing is written or released, so caches keyed on it stay warm', async () => {
+    await withStore(async (path) => {
+      const cm = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      cm.addMessage('User', text('zz first question'));
+      const first = cm.addMessage('Claude', reply('zz first answer', 'sig-1'));
+      cm.addMessage('User', text('zz second question'));
+      const second = cm.addMessage('Claude', reply('zz second answer', 'sig-2'));
+      const listing = () => (cm as unknown as { strategyMessageView(): { getAll(): Array<{ id: string; content: ContentBlock[] }> } })
+        .strategyMessageView().getAll();
+      const thinkingOf = (all: ReturnType<typeof listing>, id: string) =>
+        all.find((m) => m.id === id)!.content.some((b) => b.type === 'thinking');
+
+      cm.releaseThinking(first, 0);
+      const a = listing();
+      assert.equal(listing(), a, 'the same listing, through a fresh view, while nothing changed');
+      assert.equal(thinkingOf(a, first), false);
+      assert.equal(thinkingOf(a, second), true);
+
+      cm.releaseThinking(second, 0);
+      const b = listing();
+      assert.notEqual(b, a, 'a release maps the listing again');
+      assert.equal(thinkingOf(b, second), false);
+      assert.equal(listing(), b);
+
+      cm.releaseThinking(second, 0);
+      assert.equal(listing(), b, 'a release that releases nothing more keeps the listing');
+
+      cm.addMessage('User', text('zz third question'));
+      const c = listing();
+      assert.notEqual(c, b, 'a write maps the new listing');
+      assert.equal(c.length, b.length + 1);
+      assert.equal(listing(), c);
+      await cm.close();
+    });
+  });
+
+  it('maps a listing again under another release map, even at the same version', () => {
+    const message = (id: string) =>
+      ({ id, sequence: Number(id.slice(1)), participant: 'Claude', content: reply(`zz ${id}`, `sig-${id}`), timestamp: new Date(0) }) as never;
+    const listing = [message('m1'), message('m2')];
+    const view = { getAll: () => listing, get: () => null, getFrom: () => [], getTail: () => [] } as never;
+    const copies = new WeakMap();
+    const listings = new WeakMap();
+    const thinking = (all: Array<{ id: string; content: ContentBlock[] }>) =>
+      all.filter((m) => m.content.some((b) => b.type === 'thinking')).map((m) => m.id);
+    const one = releaseThinkingView(view, new Map([['m1', 0]]), copies, listings).getAll() as never as Array<{ id: string; content: ContentBlock[] }>;
+    const other = releaseThinkingView(view, new Map([['m2', 0]]), copies, listings).getAll() as never as Array<{ id: string; content: ContentBlock[] }>;
+    assert.deepEqual(thinking(one), ['m2']);
+    assert.deepEqual(thinking(other), ['m1'], 'a listing memoized under one map is no answer for another');
   });
 
   it('engages every manager on the store when one of them accepts a round', async () => {
