@@ -2,10 +2,10 @@
  * #193: under kv-unified, a level pin whose level no summary supplies yet
  * used to make every compile fail ("kv-unified constraints are infeasible"),
  * until compression and merging happened to produce the level or the pin was
- * released. The forest now holds such a message at the deepest level a
- * summary over it supplies, raw when none does, and moves it to the pinned
- * level once that exists, as kv-stable does; the strategy logs when it starts
- * and stops holding a pin.
+ * released. The forest now holds such a message at the deepest level below
+ * the pinned one that a summary over it supplies, raw when none does, and
+ * moves it to the pinned level once that exists, as kv-stable's clamp does;
+ * the strategy logs when it starts and stops holding a pin.
  *
  * Each message here is about 150 tokens, so a chunk closes at its fourth
  * message (targetChunkTokens 200, at least four messages), and the newest

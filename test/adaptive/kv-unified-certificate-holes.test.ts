@@ -158,6 +158,9 @@ test('today\'s pins, locks, summary identities and receipt invalidate stale carr
   // the deepest level the chain supplies (#193).
   c.chunks[0].lockedByAgent = true; c.chunks[0].currentResolution = 1; c.chunks[0].pinLevel = 2;
   forest = new CanonicalSummaryForest(inputs, { preserveGapBearingSummaries: true });
-  assert.ok(forest.constraintConflicts.length);
+  assert.deepEqual(
+    forest.constraintConflicts.map((conflict) => [conflict.leafId, conflict.constraints.map((constraint) => constraint.source)]),
+    [['c0', ['lockedByAgent', 'pin-level']]],
+  );
   assert.equal(certifyCarriedLayout(inputs, forest, options), null);
 });

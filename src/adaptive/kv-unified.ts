@@ -313,29 +313,45 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
 /** The source of the constraint a picker chunk's `pinLevel` becomes. */
 const PIN_LEVEL_SOURCE = 'pin-level';
 
+/** Whether `constraint` allows a leaf at `level`, whatever its chain supplies. */
+function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolean {
+  switch (constraint.kind) {
+    case 'raw': return level === 0;
+    case 'exact': return constraint.level === level;
+    case 'max': return constraint.level !== undefined && level <= constraint.level;
+    case 'min': return constraint.level !== undefined && level >= constraint.level;
+  }
+}
+
 /**
- * The level a level pin holds a leaf at: the pinned level where the leaf's
- * ownership chain supplies it, and otherwise the deepest level the chain
- * supplies below it, raw when it supplies none. A pinned level exists only
- * once compression and merging have produced it over the leaf, and until
- * then the pin keeps the leaf finer than asked rather than making every
- * compile infeasible (design F4b).
+ * The hold a leaf's level pin is under (design F4b): the pinned level, and the
+ * level the leaf is held at, the deepest level its ownership chain supplies
+ * below the pinned one (raw when it supplies none). A pinned level exists only
+ * once compression and merging have produced it over the leaf, and until then
+ * the pin keeps the leaf finer than asked rather than making every compile
+ * infeasible. The hold relaxes only that. A pin that another constraint on the
+ * leaf contradicts at the pinned level, such as a lock at another level, isn't
+ * held, so the two conflict whether or not the pinned level exists yet. Null
+ * when the leaf has no level pin, its chain supplies the pinned level, or
+ * another constraint contradicts it.
  */
-export function pinLevelHeldAt(availableLevels: readonly number[], level: number): number {
-  let held = 0;
-  for (const candidate of availableLevels) if (candidate <= level && candidate > held) held = candidate;
-  return held;
+function levelPinHold(
+  constraints: readonly CanonicalLeafConstraint[],
+  availableLevels: readonly number[],
+): { level: number; heldAt: number } | null {
+  const pin = constraints.find((constraint) => constraint.source === PIN_LEVEL_SOURCE);
+  const level = pin?.level;
+  if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
+  if (!constraints.every((other) => other === pin || admitsLevel(other, level))) return null;
+  let heldAt = 0;
+  for (const candidate of availableLevels) if (candidate < level && candidate > heldAt) heldAt = candidate;
+  return { level, heldAt };
 }
 
 /** A leaf held below its level pin: the pinned level and the level it is
- *  held at. Null when the leaf has no level pin, or its chain supplies it. */
+ *  held at (`levelPinHold`). Null when it isn't held. */
 export function heldLevelPin(leaf: CanonicalLeaf): { level: number; heldAt: number } | null {
-  for (const constraint of leaf.constraints) {
-    if (constraint.source !== PIN_LEVEL_SOURCE || constraint.level === undefined) continue;
-    const heldAt = pinLevelHeldAt(leaf.availableLevels, constraint.level);
-    return heldAt === constraint.level ? null : { level: constraint.level, heldAt };
-  }
-  return null;
+  return levelPinHold(leaf.constraints, leaf.availableLevels);
 }
 
 /** Whether `chunk` would build the leaf `leaf` was built from, read from the
@@ -936,6 +952,7 @@ export class CanonicalSummaryForest {
     const availableLevels = levels.availableLevels;
     const repHashes = [`raw:${chunk.id}`, ...levels.hashTail];
     const constraints = CanonicalSummaryForest.constraintsFor(chunk, inputs, options);
+    const hold = levelPinHold(constraints, availableLevels);
     let allowedLevels = [...availableLevels];
     const requestedMissingLevels = new Set<number>();
     for (const constraint of constraints) {
@@ -945,10 +962,10 @@ export class CanonicalSummaryForest {
         continue;
       }
       if (constraint.kind === 'raw' || constraint.kind === 'exact') {
-        // A level pin holds the leaf at the deepest level its chain supplies
-        // until the pinned one exists (design F4b); a lock and every other
-        // exact constraint name their level.
-        const target = constraint.source === PIN_LEVEL_SOURCE ? pinLevelHeldAt(availableLevels, level) : level;
+        // A held level pin narrows the leaf to the level it's held at (design
+        // F4b); a lock, every other exact constraint and a pin that isn't
+        // held name their own level.
+        const target = hold && constraint.source === PIN_LEVEL_SOURCE ? hold.heldAt : level;
         if (!availableLevels.includes(target)) requestedMissingLevels.add(target);
         allowedLevels = allowedLevels.filter((candidate) => candidate === target);
       } else if (constraint.kind === 'max') {

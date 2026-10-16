@@ -223,16 +223,58 @@ test('kv-unified holds a level pin at the deepest level its chain supplies until
   assert.deepEqual(dropped.leaf('a')?.allowedLevels, [1]);
   assert.deepEqual(dropped.constraintConflicts, []);
 
-  // A lock stays strict: locked at its carried L0 while the pin is held at
-  // L1, the leaf has no level, as it would against a pinned level that exists.
+  // A lock stays strict, judged against the pinned level whether or not it
+  // exists: locked at its carried L0, or at the L1 the pin would be held at,
+  // the pin isn't held, the leaf has no level, and the conflict names the
+  // missing L2.
   a.lockedByAgent = true;
-  a.currentResolution = 0;
-  const locked = new CanonicalSummaryForest(inputsOf(chronicle));
-  assert.deepEqual(locked.leaf('a')?.allowedLevels, []);
-  assert.deepEqual(
-    locked.constraintConflicts.map((conflict) => [conflict.leafId, conflict.constraints.map((constraint) => constraint.source)]),
-    [['a', ['lockedByAgent', 'pin-level']]],
-  );
+  for (const carried of [0, 1]) {
+    a.currentResolution = carried;
+    const locked = new CanonicalSummaryForest(inputsOf(chronicle));
+    assert.deepEqual(locked.leaf('a')?.allowedLevels, [], `locked at L${carried}`);
+    assert.equal(heldLevelPin(locked.leaf('a')!), null, `locked at L${carried}: a contradicted pin isn't held`);
+    assert.deepEqual(
+      locked.constraintConflicts.map((conflict) => [
+        conflict.leafId,
+        conflict.constraints.map((constraint) => constraint.source),
+        conflict.requestedMissingLevels,
+      ]),
+      [['a', ['lockedByAgent', 'pin-level'], [2]]],
+      `locked at L${carried}`,
+    );
+  }
+  // Locked at the pinned level once it exists, the two agree.
+  chronicle.produceUpper(2, [ab.id, cOnly.id]);
+  a.currentResolution = 2;
+  const agreeing = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(agreeing.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(agreeing.constraintConflicts, []);
+});
+
+test('kv-unified holds a level pin only while every other constraint on its leaf allows the pinned level (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.produceL1(['a', 'b']);
+  a.pinLevel = 2;
+  // Each row: another constraint on the pinned leaf, then the leaf's allowed
+  // levels and the missing levels its conflict names (null: no conflict).
+  const cases: Array<[CanonicalLeafConstraint, number[], number[] | null]> = [
+    [{ kind: 'max', level: 3, source: 'cap' }, [1], null],
+    [{ kind: 'min', level: 1, source: 'floor' }, [1], null],
+    [{ kind: 'raw', source: 'raw' }, [], [2]],
+    [{ kind: 'max', level: 1, source: 'cap' }, [], [2]],
+    [{ kind: 'exact', level: 1, source: 'exact' }, [], [2]],
+    [{ kind: 'min', level: 3, source: 'floor' }, [], [2, 3]],
+    // Allows L2, so the pin is held at L1, which this floor excludes.
+    [{ kind: 'min', level: 2, source: 'floor' }, [], [2]],
+  ];
+  for (const [constraint, allowed, missing] of cases) {
+    const forest = new CanonicalSummaryForest(inputsOf(chronicle), { constraints: new Map([['a', [constraint]]]) });
+    const label = JSON.stringify(constraint);
+    assert.deepEqual(forest.leaf('a')?.allowedLevels, allowed, label);
+    assert.deepEqual(forest.constraintConflicts.map((conflict) => conflict.requestedMissingLevels), missing ? [missing] : [], label);
+  }
 });
 
 test('kv-unified exact feasibility prices a protected raw hole beside its recall', () => {

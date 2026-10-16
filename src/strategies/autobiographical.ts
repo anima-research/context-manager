@@ -2464,8 +2464,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
    * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
    * and `'kv-unified'` with adaptive resolution, where a message no summary
-   * supplies that level over yet is held at the deepest level one does (see
-   * `ProtectedRange.level`); under any other selector the
+   * supplies that level over yet is held at the deepest level below it that
+   * one does (see `ProtectedRange.level`); under any other selector the
    * range is raw (`resolvedPinBounds`), in the live view and in the canonical
    * L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`).
@@ -10635,11 +10635,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private readonly heldLevelPins = new Map<string, { label: string; level: number }>();
 
   /**
-   * Say once per episode when kv-unified holds a level pin below its level
-   * (`pinLevelHeldAt`): one line when the pin starts being held, naming it,
-   * its level and the level its messages are held at, and one when the level
-   * arrives or the pin goes. A message counts toward a pin only when that
-   * pin's level is the one its bound took (`resolvedPinBounds`).
+   * Say when kv-unified holds a level pin below its level (`heldLevelPin`),
+   * from what each compile finds on the loaded branch (a dry run reports
+   * nothing, since a preview isn't the live state):
+   * one line when a compile first finds the pin held, naming it, its level,
+   * the levels its messages are held at and how many are held then, and one
+   * when a later compile finds none of its messages held for it (its level
+   * arrived over them, another pin's bound took them, or they left the folded
+   * middle) or the pin gone. A message counts toward a pin only when that
+   * pin's level is the one its bound took (`resolvedPinBounds`). The record
+   * starts over with each open and branch switch (`clearBranchMirrors`), so a
+   * pin still held then is reported again, and a refused compile, which
+   * presents nothing, reports nothing: its error names the cause.
    */
   private reportHeldLevelPins(forest: CanonicalSummaryForest, messages: StoredMessage[]): void {
     const held = new Map<MessageId, { level: number; heldAt: number }>();
