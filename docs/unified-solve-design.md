@@ -194,9 +194,18 @@ Binary x_v per node. Constraints:
   compression quarantine → {0}; `lockedByAgent` → {carriedResolution}
   (a lock freezes at the *carried* level, not necessarily raw); exact pin
   `= p` → {p}; `≤ p` → produced levels ≤ p; `≥ p` → produced levels ≥ p.
+  A level pin `= p` whose p the chain doesn't produce yet is the one
+  exception (#193): the forest holds the leaf at the deepest level the
+  chain does produce below p (L0 when none), the strategy logs when it
+  starts and stops holding the pin, and the leaf moves to p once p is
+  produced. A pinned level is reached only as compression and merging
+  produce it, and refusing every compile until then made a pin able to stop
+  an agent.
   **Empty intersection = infeasible**: the certificate (§9) reports the
-  conflicting constraints and leaf ids. No constraint is weakened, clamped,
-  or selected inside the solver.
+  conflicting constraints and leaf ids. Apart from that hold, no constraint
+  is weakened, clamped, or selected inside the solver: a lock and every
+  other exact constraint stay strict, so a level pin that conflicts with a
+  lock is still infeasible.
   Restrictions on *different* sibling leaves may still yield a **protected-
   hole** emission (matches current partial-group rendering): the parent is
   selected for participating siblings while a restricted leaf is emitted at

@@ -1627,9 +1627,10 @@ export interface ProtectedRange {
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
    * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
    * it is still compressed, since only a summary can supply that level.
-   * Under kv-unified, a pinned level on a message between the head window
-   * and the recent window that no summary supplies yet is a constraint
-   * conflict, and every compile fails until one does. Under
+   * Until a summary over a message supplies it, the message is held at the
+   * deepest level one does supply, raw when none does, and it moves to the
+   * pinned level once that exists; kv-unified logs when it starts and stops
+   * holding a pin. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
    * configured selector keeps raw, where its budgets allow (see
@@ -1653,7 +1654,8 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node,
+   *  once a summary supplies it (see `ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;

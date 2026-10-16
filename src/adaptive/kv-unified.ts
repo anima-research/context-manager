@@ -310,6 +310,34 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
   return zone;
 }
 
+/** The source of the constraint a picker chunk's `pinLevel` becomes. */
+const PIN_LEVEL_SOURCE = 'pin-level';
+
+/**
+ * The level a level pin holds a leaf at: the pinned level where the leaf's
+ * ownership chain supplies it, and otherwise the deepest level the chain
+ * supplies below it, raw when it supplies none. A pinned level exists only
+ * once compression and merging have produced it over the leaf, and until
+ * then the pin keeps the leaf finer than asked rather than making every
+ * compile infeasible (design F4b).
+ */
+export function pinLevelHeldAt(availableLevels: readonly number[], level: number): number {
+  let held = 0;
+  for (const candidate of availableLevels) if (candidate <= level && candidate > held) held = candidate;
+  return held;
+}
+
+/** A leaf held below its level pin: the pinned level and the level it is
+ *  held at. Null when the leaf has no level pin, or its chain supplies it. */
+export function heldLevelPin(leaf: CanonicalLeaf): { level: number; heldAt: number } | null {
+  for (const constraint of leaf.constraints) {
+    if (constraint.source !== PIN_LEVEL_SOURCE || constraint.level === undefined) continue;
+    const heldAt = pinLevelHeldAt(leaf.availableLevels, constraint.level);
+    return heldAt === constraint.level ? null : { level: constraint.level, heldAt };
+  }
+  return null;
+}
+
 /** Whether `chunk` would build the leaf `leaf` was built from, read from the
  * leaf's own record of its inputs and not from a chunk object a caller may
  * have updated in place: cost and carried level are leaf fields, pins and
@@ -324,7 +352,7 @@ function sameLeafInputs(leaf: CanonicalLeaf, chunk: PickerChunk): boolean {
     switch (constraint.source) {
       case 'raw-pin': pinned = true; break;
       case 'lockedByAgent': locked = true; break;
-      case 'pin-level': pinLevel = constraint.level; break;
+      case PIN_LEVEL_SOURCE: pinLevel = constraint.level; break;
       case 'pin-max-level': pinMaxLevel = constraint.level; break;
     }
   }
@@ -917,8 +945,12 @@ export class CanonicalSummaryForest {
         continue;
       }
       if (constraint.kind === 'raw' || constraint.kind === 'exact') {
-        if (!availableLevels.includes(level)) requestedMissingLevels.add(level);
-        allowedLevels = allowedLevels.filter((candidate) => candidate === level);
+        // A level pin holds the leaf at the deepest level its chain supplies
+        // until the pinned one exists (design F4b); a lock and every other
+        // exact constraint name their level.
+        const target = constraint.source === PIN_LEVEL_SOURCE ? pinLevelHeldAt(availableLevels, level) : level;
+        if (!availableLevels.includes(target)) requestedMissingLevels.add(target);
+        allowedLevels = allowedLevels.filter((candidate) => candidate === target);
       } else if (constraint.kind === 'max') {
         allowedLevels = allowedLevels.filter((candidate) => candidate <= level);
       } else {
@@ -1804,7 +1836,7 @@ export class CanonicalSummaryForest {
       });
     }
     if (chunk.pinLevel !== undefined) {
-      constraints.push({ kind: 'exact', level: chunk.pinLevel, source: 'pin-level' });
+      constraints.push({ kind: 'exact', level: chunk.pinLevel, source: PIN_LEVEL_SOURCE });
     }
     if (chunk.pinMaxLevel !== undefined) {
       constraints.push({ kind: 'max', level: chunk.pinMaxLevel, source: 'pin-max-level' });

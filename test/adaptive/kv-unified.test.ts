@@ -6,6 +6,7 @@ import {
   CanonicalSummaryForest,
   ExactEnumerationLimitError,
   SparseLabelCeilingError,
+  heldLevelPin,
   type CanonicalLeafConstraint,
 } from '../../src/adaptive/kv-unified.js';
 import { accountFrontier, type PickerInputs } from '../../src/adaptive/picker.js';
@@ -177,6 +178,60 @@ test('kv-unified intersects locks and pins instead of choosing precedence', () =
   assert.deepEqual(
     result.certificate.bindingLeaves[0].constraints.map((constraint) => constraint.source),
     ['lockedByAgent', 'pin-level'],
+  );
+});
+
+test('kv-unified holds a level pin at the deepest level its chain supplies until the pinned one exists (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  const c = chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  const d = chronicle.addChunk({ id: 'd', rawTokens: 100 });
+  const ab = chronicle.produceL1(['a', 'b']);
+  const cOnly = chronicle.produceL1(['c']);
+  a.pinLevel = 2;
+  c.pinLevel = 2;
+  d.pinLevel = 2;
+
+  // Held: a and c at their L1, d (no summary) raw; nothing conflicts.
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(forest.constraintConflicts, []);
+  assert.deepEqual(forest.leaf('a')?.allowedLevels, [1]);
+  assert.deepEqual(forest.leaf('c')?.allowedLevels, [1]);
+  assert.deepEqual(forest.leaf('d')?.allowedLevels, [0]);
+  assert.deepEqual(heldLevelPin(forest.leaf('a')!), { level: 2, heldAt: 1 });
+  assert.deepEqual(heldLevelPin(forest.leaf('d')!), { level: 2, heldAt: 0 });
+  assert.equal(heldLevelPin(forest.leaf('b')!), null, 'no pin, no hold');
+  assert.ok(forest.minimumTokens(1_000).feasible);
+
+  // The L2 arrives. The next compile derives the forest, and the extension
+  // rebuilds the leaves whose chain changed: the pin is at its level.
+  const l2 = chronicle.produceUpper(2, [ab.id, cOnly.id]);
+  const merged = CanonicalSummaryForest.derive(forest, inputsOf(chronicle));
+  assert.ok(merged, 'setup: a merge extends the previous forest');
+  assert.deepEqual(merged.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(merged.leaf('c')?.allowedLevels, [2]);
+  assert.equal(heldLevelPin(merged.leaf('a')!), null);
+  assert.deepEqual(heldLevelPin(merged.leaf('d')!), { level: 2, heldAt: 0 });
+
+  // A level a summary no longer supplies is held again.
+  chronicle.summaries.delete(l2.id);
+  chronicle.recallPairTokens.delete(l2.id);
+  delete ab.parentId;
+  delete cOnly.parentId;
+  const dropped = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(dropped.leaf('a')?.allowedLevels, [1]);
+  assert.deepEqual(dropped.constraintConflicts, []);
+
+  // A lock stays strict: locked at its carried L0 while the pin is held at
+  // L1, the leaf has no level, as it would against a pinned level that exists.
+  a.lockedByAgent = true;
+  a.currentResolution = 0;
+  const locked = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(locked.leaf('a')?.allowedLevels, []);
+  assert.deepEqual(
+    locked.constraintConflicts.map((conflict) => [conflict.leafId, conflict.constraints.map((constraint) => constraint.source)]),
+    [['a', ['lockedByAgent', 'pin-level']]],
   );
 });
 
