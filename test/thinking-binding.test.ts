@@ -653,6 +653,79 @@ describe('thinking binding', () => {
       });
     });
 
+    describe('rounds that overlap on one branch: a limit the host avoids by running one round at a time', () => {
+      /** S1 under p0; then a heartbeat compile and an ordinary one at one head, both out. */
+      async function bothOut(cm: ContextManager) {
+        await turn(cm, 'u1', 'a1', 'S1');
+        cm.addMessage('user', text('u2'));
+        const heartbeat = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0+heartbeat' });
+        const ordinary = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+        return { heartbeat, ordinary };
+      }
+
+      it("stamps a reply stored while both are out from the compile bound last, so the heartbeat's reply goes out under the ordinary prefix", async () => {
+        await withStore(async (path) => {
+          const cm = await ContextManager.open({ path });
+          const { heartbeat, ordinary } = await bothOut(cm);
+          cm.addMessage('assistant', reply('quiet', 'H1'));
+          cm.acceptRound({ provenance: heartbeat.provenance! });
+          cm.acceptRound({ provenance: ordinary.provenance! });
+          cm.addMessage('user', text('u3'));
+          const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+          assert.deepEqual(signaturesIn(next), ['S1', 'H1'], 'H1, minted under p0+heartbeat, goes out under p0');
+          cm.close();
+        });
+      });
+
+      it('does the same whether the replies come between the acceptances or before both', async () => {
+        await withStore(async (path) => {
+          const cm = await ContextManager.open({ path });
+          const { heartbeat, ordinary } = await bothOut(cm);
+          cm.addMessage('assistant', reply('quiet', 'H1'));
+          cm.acceptRound({ provenance: heartbeat.provenance! });
+          cm.addMessage('assistant', reply('a2', 'S2'));
+          cm.acceptRound({ provenance: ordinary.provenance! });
+          cm.addMessage('user', text('u3'));
+          const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+          assert.deepEqual(signaturesIn(next), ['S1', 'H1', 'S2'], "S2 goes out after H1, which the ordinary compile's request never carried");
+          cm.close();
+        });
+        await withStore(async (path) => {
+          const cm = await ContextManager.open({ path });
+          const { heartbeat, ordinary } = await bothOut(cm);
+          cm.addMessage('assistant', reply('a2', 'S2'));
+          cm.acceptRound({ provenance: ordinary.provenance! });
+          cm.addMessage('assistant', reply('quiet', 'H1'));
+          cm.acceptRound({ provenance: heartbeat.provenance! });
+          cm.addMessage('user', text('u3'));
+          const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+          assert.deepEqual(signaturesIn(next), ['S1', 'S2', 'H1']);
+          assert.equal(next.thinkingStripped ?? 0, 0, 'nothing is stripped');
+          cm.close();
+        });
+      });
+
+      it("the host's release takes the misattributed reply's thinking out of every later compile", async () => {
+        await withStore(async (path) => {
+          const cm = await ContextManager.open({ path });
+          const { heartbeat, ordinary } = await bothOut(cm);
+          const h1 = cm.addMessage('assistant', reply('quiet', 'H1'));
+          cm.acceptRound({ provenance: heartbeat.provenance! });
+          cm.acceptRound({ provenance: ordinary.provenance! });
+          cm.releaseThinking(h1, 0);
+          cm.addMessage('user', text('u3'));
+          const next = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+          assert.deepEqual(signaturesIn(next), ['S1']);
+          cm.acceptRound({ provenance: next.provenance! });
+          cm.addMessage('assistant', reply('a3', 'S3'));
+          cm.addMessage('user', text('u4'));
+          const after = await cm.compile(BUDGET, undefined, { prefixIdentity: 'p0' });
+          assert.deepEqual(signaturesIn(after), ['S1', 'S3']);
+          cm.close();
+        });
+      });
+    });
+
     it('goes blind past it when more compiles than it remembers follow, until one bound later is accepted', async () => {
       await withStore(async (path) => {
         const cm = await ContextManager.open({ path });

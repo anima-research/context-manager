@@ -39,7 +39,17 @@
  * compile on the new branch is bound before the old round's reply is stored,
  * that reply is stamped from the new branch, and its thinking can go out
  * with every compile there, refused or dropped each time, until the host
- * releases it (`releaseThinking`) or removes the reply.
+ * releases it (`releaseThinking`) or removes the reply. Rounds that overlap
+ * on one branch defeat it the same way. The pass takes a compile bound
+ * before its branch's owner to have minted nothing after the owner's head,
+ * which is what lets a branch recover from a round that ended unaccepted:
+ * when a reply is stored, a compile still out and one whose round failed
+ * look the same. So when two compiles on a branch are out at once and both
+ * are accepted, a reply stored after the second is bound and before both
+ * are accepted is stamped from the one bound last. One that answered the
+ * other goes out with every compile under that one's seed, a prefix it
+ * wasn't minted under, refused or dropped each time, until the host
+ * releases it.
  *
  * Stamping vouches for a reply only through compiles that sent what it
  * walked. A compile bound after the accepted one (sent, its acceptance not
@@ -60,7 +70,9 @@
  * The host's part. Stamping takes what this namespace's managers stored in
  * their own slot after an accepted compile, up to a reply, as what the live
  * request carried after the compile's messages, in that order and as the
- * walk read them. A host stores each round as it went out, stores a reply
+ * walk read them. A host runs one round at a time on a branch: a compile is
+ * accepted, or its round has ended, before the branch's next committing
+ * compile. It stores each round as it went out, stores a reply
  * whole (thinking an edit adds to a message the walk has read never renders),
  * and defers its other writes to the slot (a message heard mid-tool-loop)
  * until the turn ends. Other writers' messages aren't taken as carried: an
