@@ -1141,9 +1141,11 @@ export class ContextManager {
     // Raw bodies are judged as stored: the view filter can hide a shard of a
     // body from the strategy, but the body's identity (shard 0, the id
     // addMessage returned) and its membership are the stored group's. The
-    // layout stays on the filtered view the strategy rendered.
-    const storedMessages = this.viewFilter ? this.mergedMessageView().getAll() : viewMessages;
-    const attribution = attributeEntries(entries, storedMessages);
+    // layout stays on the filtered view the strategy rendered. Attribution
+    // reads only around the messages the raw entries name.
+    const storedView = this.viewFilter ? this.mergedMessageView() : view;
+    const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages, (id) => storedView.get(id)?.sequence);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache

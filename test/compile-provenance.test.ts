@@ -6,8 +6,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { attributeEntries, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
+import { attributeEntries as attributeIn, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
 import type { ContextEntry, StoredMessage } from '../src/index.js';
+
+/** Attribution over `stored`, resolving an id to its sequence among those messages, as a store's lookup does. */
+function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]) {
+  return attributeIn(entries, stored, (id) => stored.find((m) => m.id === id)?.sequence);
+}
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } } as ContentBlock);
@@ -208,7 +213,7 @@ describe('a body is an ingestion, not its content hash', () => {
     assert.deepEqual(later.sources[0], { kind: 'raw', bodies: [{ messageId: 'c0', sequence: 6, complete: true }] });
   });
 
-  it('reads bodies as body-runs.ts does, whatever the list', async () => {
+  it('reads bodies as body-runs.ts does, whatever the list and whichever of its messages the entries name, in any order', async () => {
     const { bodyBoundsIn } = await import('../src/index.js');
     const g = { bodyGroupId: 'bg-rule', shardCount: 2 };
     const lists: StoredMessage[][] = [
@@ -220,11 +225,22 @@ describe('a body is an ingestion, not its content hash', () => {
       [msg('p0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('mid', 2, [text('between')]), msg('p1', 3, [text('b')], { ...g, shardIndex: 1 })],
     ];
     for (const stored of lists) {
-      const { bodies } = attributeEntries(stored.map((m) => copy(m)), stored);
-      stored.forEach((m, i) => {
-        const { from, to } = bodyBoundsIn(stored, i);
-        assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), stored.slice(from, to + 1).map((b) => b.id), m.id);
-      });
+      const selections = [
+        stored,
+        [...stored].reverse(),
+        stored.filter((_, i) => i % 2 === 1),
+        [stored[stored.length - 1]!],
+      ];
+      for (const named of selections) {
+        const { bodies, sources } = attributeEntries(named.map((m) => copy(m)), stored);
+        named.forEach((m, k) => {
+          const { from, to } = bodyBoundsIn(stored, stored.indexOf(m));
+          const body = stored.slice(from, to + 1).map((b) => b.id);
+          assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), body, m.id);
+          const source = sources[k]!;
+          assert.ok(source.kind === 'raw' && source.bodies[0]!.messageId === body[0], `${m.id}: its body's head`);
+        });
+      }
     }
   });
 
@@ -318,6 +334,86 @@ describe('a body is an ingestion, not its content hash', () => {
       assert.equal(again.rawBodies!.get(second)!.length, firstShards);
       assert.equal(again.rawBodies!.get(third)!.length, firstShards);
       assert.equal(again.rawBodies!.get(third)![0]!.sequence > again.rawBodies!.get(second)!.at(-1)!.sequence, true);
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('attribution reads what the raw entries name, not the stored history', () => {
+  it('reads the history only around the named bodies, with one lookup for each run of consecutive messages', () => {
+    // A long history whose newest messages render raw, ending in a sharded
+    // body, with one old message recalled raw ahead of them: two runs.
+    const n = 50_000;
+    const history = Array.from({ length: n }, (_, i) => msg(`m${i}`, 2 * i + 1, [text(`message ${i}`)]));
+    const g = { bodyGroupId: 'tail-doc', shardCount: 3 };
+    for (let s = 0; s < 3; s++) history[n - 3 + s] = msg(`d${s}`, 2 * (n - 3 + s) + 1, [text(`part ${s} `)], { ...g, shardIndex: s });
+    const sequences = new Map(history.map((m) => [m.id, m.sequence]));
+    let reads = 0;
+    const stored = new Proxy(history, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) reads++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    let lookups = 0;
+    const sequenceOf = (id: string) => {
+      lookups++;
+      return sequences.get(id);
+    };
+    const window = history.slice(n - 20, n - 3);
+    const doc: ContextEntry = { index: 0, sourceMessageIds: ['d0', 'd1', 'd2'], sourceRelation: 'copy', participant: 'user', content: [text('part 0 part 1 part 2 ')] };
+    const entries = [copy(history[1000]!), ...window.map((m) => copy(m)), doc];
+
+    const result = attributeIn(entries, stored, sequenceOf);
+    const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : null));
+    assert.deepEqual(heads, [[['m1000', true]], ...window.map((m) => [[m.id, true]]), [['d0', true]]]);
+    assert.deepEqual(rawBodiesOf(result).get('d0')!.map((m) => m.id), ['d0', 'd1', 'd2']);
+    assert.ok(rawBodiesOf(result).get('d0')!.every((m, s) => m === history[n - 3 + s]), "the stored array's own objects");
+    assert.ok(reads < 500, `read ${reads} of the ${n} stored messages for ${entries.length} raw entries`);
+    assert.ok(lookups <= 2, `${lookups} lookups for two runs of consecutive messages`);
+  });
+
+  it("finds nothing where the lookup answers with another message's sequence, or with one no stored message has", () => {
+    const stored = [msg('a', 1, [text('a')]), msg('b', 3, [text('b')]), msg('c', 5, [text('c')]), msg('d', 7, [text('d')])];
+    // c's lookup answers with b's sequence, d's with a sequence nothing has,
+    // and an unknown id's with nothing; b is found through its own.
+    const answers = new Map([['c', 3], ['d', 4], ['b', 3]]);
+    const entries = [copy(stored[2]!), copy(stored[3]!), copy(msg('x', 9, [text('x')])), copy(stored[1]!)];
+    const result = attributeIn(entries, stored, (id) => answers.get(id));
+    const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => b.messageId) : null));
+    assert.deepEqual(heads, [[], [], [], ['b']], "no body is credited to c or d, and b's is its own");
+    assert.deepEqual([...rawBodiesOf(result).keys()], ['b']);
+  });
+
+  it('through compile, a render that starts partway through the history finds each raw body in the store', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Halves extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        if (content.length < 2) return null;
+        return { bodyGroupId: 'late-doc', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+      }
+    }
+    const path = './test-attribution-tail';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Halves() });
+      const line = (i: number) => text(`line ${i}: ${'words of an ordinary turn '.repeat(8)}`);
+      for (let i = 0; i < 60; i++) cm.addMessage(i % 2 ? 'bob' : 'alice', [line(i)]);
+      const doc = cm.addMessage('alice', [line(60), line(61)]);
+      for (let i = 62; i < 66; i++) cm.addMessage('bob', [line(i)]);
+      const stored = cm.getAllMessages();
+
+      const result = await cm.compile({ maxTokens: 1500, reserveForResponse: 0 });
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies : []));
+      assert.ok(result.messages.length < stored.length / 2, `a tail render (${result.messages.length} of ${stored.length})`);
+      assert.ok(raw.every((bodies) => bodies.length === 1), 'every compiled message names its body');
+      const rendered = stored.slice(stored.length - result.messages.length);
+      assert.deepEqual(raw.map((bodies) => bodies[0]!.messageId), rendered.map((m) => (m.bodyGroupId ? doc : m.id)));
+      assert.ok(raw.every((bodies) => bodies[0]!.complete), 'each body complete, the document with both shards');
+      assert.deepEqual(result.rawBodies!.get(doc)!.map((m) => m.shardIndex), [0, 1]);
       cm.close();
     } finally {
       rmSync(path, { recursive: true, force: true });
