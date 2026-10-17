@@ -6239,6 +6239,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
           created: Date.now(),
           phaseType: chunk.phaseType,
+          // Stamped as an L1 of the same chunk would be, so a merge of
+          // inherited summaries that includes a quiet stretch stays witnessed.
+          ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
         };
         this.pushSummary(stub);
         chunk.compressed = true;
@@ -11472,8 +11475,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * As-of perspective pin: true when the chunk's messages are all strictly
    * before the agent's first own turn (witnessedBeforeSequence) — inherited
    * record, not lived experience. Drives both the L1 instruction and the
-   * `witnessed` stamp on the minted summary (which merge consolidation
-   * honors and propagates upward).
+   * `witnessed` stamp on the minted summary or quiet-stretch stub (which
+   * merge consolidation honors and propagates upward).
    */
   protected chunkIsWitnessed(chunk: Chunk): boolean {
     const pin = this.config.witnessedBeforeSequence;
