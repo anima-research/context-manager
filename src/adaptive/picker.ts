@@ -205,12 +205,15 @@ export interface PickerChunk {
    */
   pinned: boolean;
   /**
-   * V2 dynamic pin — fix this chunk at EXACTLY this fold level, above 0 (a
-   * level of 0 arrives as `pinned`). Set from a `ProtectedRange.level`, only
-   * under the folding strategies that read it (kv-stable, kv-unified, with
-   * adaptive resolution). Such
-   * a chunk is NOT `pinned` (the controller must be able to move it to its
-   * level), but the controller holds it there and never folds/un-folds it.
+   * V2 dynamic pin — fix this chunk at this fold level, above 0 (a level of 0
+   * arrives as `pinned`). Set from a `ProtectedRange.level`, only under the
+   * folding strategies that read it (kv-stable, kv-unified, with adaptive
+   * resolution). Such a chunk is NOT `pinned` (the controller must be able to
+   * move it to its level), but the controller holds it there and never
+   * folds/un-folds it. Under kv-stable, a level deeper than the chunk's
+   * summaries go is clamped to the deepest, and a level whose own-lineage
+   * summary exists but doesn't list the chunk is lowered until one does, or
+   * to raw. A level its lineage has no summary at is kept, and renders raw.
    */
   pinLevel?: number;
   /**

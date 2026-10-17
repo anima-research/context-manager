@@ -1514,8 +1514,11 @@ export class ContextManager {
   }
 
   /**
-   * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
-   * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
+   * V2 dynamic pin-at-level-k: fix a range to render at fold level `level`
+   * (0 = raw) — the frontier cut passes through that L_k node. Under
+   * kv-stable, a chunk whose summaries stop below `level` renders at the
+   * deepest it has, and one whose own-lineage summary at `level` doesn't list
+   * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
    * resolution; under any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see

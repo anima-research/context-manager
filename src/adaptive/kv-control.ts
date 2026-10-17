@@ -279,6 +279,7 @@ function relevanceCut(
   target: number,
   windowTokens: number,
   maxFoldLevel: number,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): { F: Map<ChunkId, number>; tokens: number } {
   const F = new Map(base);
   const byId = new Map(ordered.map((c) => [c.id, c] as const));
@@ -290,10 +291,14 @@ function relevanceCut(
   // whole group around it — one disagreeing leaf un-folded a 200-leaf group,
   // 615 leaves cascaded (+24k tokens) and the solve returned an over-W
   // frontier while a produced L4/L5 layer sat unused. Leaves whose lineage
-  // disagrees are skipped by folds and exempted from unanimity: they render
-  // raw beside the recall — exactly the renderer's existing ownership-wins
-  // semantics for boundary-cut members.
-  const overlapExempt = new Set<ChunkId>();
+  // disagrees are skipped by folds and stay at their own level beside the
+  // recall — exactly the renderer's existing ownership-wins semantics for
+  // boundary-cut members. Every pass decides it the same way, by the leaf's
+  // own lineage at the node's level: a fold's eligibility and its moves, and
+  // phase C's un-folds, count only the leaves the node renders, and the
+  // validity projection exempts the rest (projectToValidCut). The [kv-overlap]
+  // warning reads the emitted frontier (reportOverlap), not which folds ran,
+  // so a plan built on carried folds reports them as a fresh one does.
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
     const sa = salienceOf(a);
@@ -326,14 +331,18 @@ function relevanceCut(
       const cap = caps.get(leafId) ?? 0;
       // Boundary-cut tolerance (2026-07-27): a hard-protected leaf (−1
       // sentinel — raw zone / pins / locked) is EXCLUDED from the fold rather
-      // than vetoing it. The renderer's ownership machinery already renders
-      // protected messages raw alongside their chunk's recall ("ownership
+      // than vetoing it. It renders at the level it's held at (raw for the raw
+      // zone and a classic pin) alongside its group's recall ("ownership
       // wins"), so a boundary cutting through a group must not make the whole
       // group permanently unfoldable. Observed: calibration drift moved the
       // token-derived head boundary 2 messages into an L3's first chunk — the
       // 2-leaf overlap vetoed the entire 742-leaf group in every phase, and
       // the agent was OverBudget-wedged with its own L3 sitting unused.
       if (cap < 0) continue;
+      // Nor does a leaf whose own lineage at this level is another node, or
+      // none: the fold doesn't move it (see the marking loop below), so its
+      // caps aren't this fold's to keep (§13.6 overlap).
+      if (tree.ancestorAt(leafId, level)?.id !== nodeId) continue;
       foldable++;
       const pinCap = pinCaps.get(leafId);
       if (pinCap !== undefined && level > pinCap) { eligible = false; break; }
@@ -358,15 +367,12 @@ function relevanceCut(
         // bound; the soft shape cap blocks only in phase A.
         if (!groupEligible(ancestor.id, ancestor.leafChunkIds, level, ignoreShapeCaps)) continue;
         for (const leafId of ancestor.leafChunkIds) {
-          if ((caps.get(leafId) ?? 0) < 0) continue; // protected: stays raw beside the recall
+          if ((caps.get(leafId) ?? 0) < 0) continue; // protected: keeps its held level beside the recall
           // Overlap tolerance: only mark leaves whose own lineage renders as
           // part of THIS node at this level. Disagreeing leaves keep their
-          // level and become unanimity-exempt (see declaration above).
+          // level (see the note above `priority`).
           const own = tree.ancestorAt(leafId, level);
-          if (!own || own.id !== ancestor.id) {
-            overlapExempt.add(leafId);
-            continue;
-          }
+          if (!own || own.id !== ancestor.id) continue;
           const leaf = byId.get(leafId);
           const from = F.get(leafId) ?? 0;
           if (from < level) {
@@ -379,6 +385,17 @@ function relevanceCut(
     }
     return false;
   };
+
+  // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
+  // without this, the final projection undoes every boundary-cut fold the
+  // phases just made (monotone-lowering the whole group back toward carried).
+  // A leaf whose lineage disagrees with a group needs no entry: the
+  // projection leaves out of a group's unanimity every leaf whose own lineage
+  // at that level isn't the group, and every leaf above the group's level,
+  // the rule the carried frontier and suffix adoption are projected by.
+  // Phase C reads the same set where it weighs an un-fold's landing levels.
+  const projectionExempt = new Set<ChunkId>();
+  for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
 
   // FOLD → PROJECT FIXPOINT (2026-08-03). The validity projection at the end
   // can only LOWER levels; on a non-nested tree its repairs add tokens after
@@ -412,17 +429,20 @@ function relevanceCut(
         if (ledger.tokens >= target) break;
         const c = ordered[oi]; // youngest-first
         if ((F.get(c.id) ?? 0) !== level) continue;
-        if (rawZone.has(c.id) || immovable.has(c.id) || overlapExempt.has(c.id)) continue;
+        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
         const attemptKey = `${node.id}:${level}`;
         if (attempted.has(attemptKey)) continue;
         let eligible = true;
         for (const leafId of node.leafChunkIds) {
-          // Protected members sit at raw beside the recall (boundary-cut
-          // tolerance) — they neither veto nor participate in the un-fold.
-          // Overlap-exempt members likewise (their lineage disagrees).
-          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue;
+          // Protected members sit at the level they're held at beside the
+          // recall (boundary-cut tolerance): they neither veto nor take part
+          // in the un-fold.
+          // Nor does a member whose own lineage at this level is another
+          // node, or none: this node doesn't render it (§13.6 overlap).
+          if (rawZone.has(leafId) || immovable.has(leafId)) continue;
+          if (tree.ancestorAt(leafId, level)?.id !== node.id) continue;
           if ((F.get(leafId) ?? 0) !== level) {
             eligible = false;
             break;
@@ -436,15 +456,45 @@ function relevanceCut(
         // renderLayout, and every later accept decision is made on corrupt
         // arithmetic (observed: phase C walked an L3 fold all the way back to
         // carried while its ledger believed it sat on target).
-        const moved: Array<[ChunkId, number]> = [];
+        // Each leaf moves one level down, or deeper, down to raw, while the
+        // summary of its own lineage there is missing, doesn't list it, or is
+        // vetoed by a leaf below it, as projectToValidCut lowers an unheld
+        // leaf, so the accept below weighs each leaf where the projection will
+        // put it. Moved one level down regardless, a leaf that summary doesn't
+        // list, or that a leaf below vetoes, was priced at a recall the
+        // projection then took away: an un-fold the ledger said fit was
+        // accepted, then rendered the leaf lower, raw where no summary of its
+        // lineage below lists it. Only a leaf a summary lists, whose own
+        // lineage there is that summary, can make it vetoed by dropping below
+        // it, and below the summary being un-folded this loop, like the
+        // projection, takes a leaf past such a summary only where the summary
+        // is vetoed already. So the landing verdicts don't change while the
+        // un-fold moves its leaves, or when the projection runs after it.
+        // Eligibility put every leaf moved here at `level`.
+        const vetoMemo = new Map<string, boolean>();
+        const landingVetoed = (own: { id: string; leafChunkIds: readonly ChunkId[] }, at: number): boolean => {
+          const key = `${own.id}:${at}`;
+          let verdict = vetoMemo.get(key);
+          if (verdict === undefined) {
+            verdict = vetoed(tree, own, at, F, projectionExempt);
+            vetoMemo.set(key, verdict);
+          }
+          return verdict;
+        };
+        const moved: Array<[ChunkId, number, number]> = [];
         for (const leafId of node.leafChunkIds) {
-          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue; // protected: not part of the fold
+          if (rawZone.has(leafId) || immovable.has(leafId)) continue; // protected: not part of the fold
+          if (tree.ancestorAt(leafId, level)?.id !== node.id) continue; // rendered by another node
           const from = F.get(leafId) ?? 0;
-          if (from <= level - 1) continue; // already at/below the destination
+          let to = level - 1;
+          for (; to > 0; to--) {
+            const own = tree.ancestorAt(leafId, to);
+            if (own && lists(listedBy, own, leafId) && !landingVetoed(own, to)) break;
+          }
           const leaf = byId.get(leafId);
-          if (leaf) ledger.move(leaf, byId, from, level - 1);
-          F.set(leafId, level - 1);
-          moved.push([leafId, from]);
+          if (leaf) ledger.move(leaf, byId, from, to);
+          F.set(leafId, to);
+          moved.push([leafId, from, to]);
         }
         // Accept an un-fold that lands PAST the target when it still gets
         // CLOSER to it (and stays under W). Merge groups are coarse quanta
@@ -455,10 +505,11 @@ function relevanceCut(
         const nt = ledger.tokens;
         const accept = nt <= windowTokens && Math.abs(nt - target) < Math.abs(before - target);
         if (!accept) {
-          // moves away from the target (or breaches W) → revert
-          for (const [leafId, from] of moved) {
+          // moves away from the target (or breaches W) → revert, each leaf
+          // from the level it moved to
+          for (const [leafId, from, to] of moved) {
             const leaf = byId.get(leafId);
-            if (leaf) ledger.move(leaf, byId, level - 1, from);
+            if (leaf) ledger.move(leaf, byId, to, from);
             F.set(leafId, from);
           }
           attempted.add(attemptKey);
@@ -473,15 +524,7 @@ function relevanceCut(
   }
 
   const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
-  // without this, the final projection undoes every boundary-cut fold the
-  // phases just made (monotone-lowering the whole group back toward carried).
-  const projectionExempt = new Set<ChunkId>();
-  for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
-  // Overlap-exempt leaves render beside their group's recall (ownership-wins)
-  // and must not veto unanimity — same exemption as the boundary-cut set.
-  for (const id of overlapExempt) projectionExempt.add(id);
-  projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
+  projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt, listedBy);
   if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
   // projection may have moved leaves — recompute once, not per move).
@@ -489,21 +532,6 @@ function relevanceCut(
   // Fits, or a full round made no progress, or round cap → done. Otherwise
   // re-fold on the projected frontier with a resynced ledger.
   if (tokens <= windowTokens || tokens >= projTokens || round >= 2) {
-    // NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
-    // feature — every exempted leaf means the store's summary tree is
-    // NON-NESTED (two live lineages over one span), and its messages are
-    // now SEMANTICALLY DOUBLE-REPRESENTED in the window (rendered raw or
-    // via their own chain WHILE a covering recall also renders). The solve
-    // proceeding is the mitigation; the topology is the disease. Surface it
-    // on every affected compile until the store is repaired (nesting
-    // reconciler — see the 2026-08-03 opus4 incident).
-    if (overlapExempt.size > 0) {
-      console.error(
-        `[kv-overlap] ⚠️ non-nested summary tree: ${overlapExempt.size} leaf(s) with ` +
-          `conflicting lineage tolerated this compile (double-representation in window). ` +
-          `Store needs nesting repair. sample=${[...overlapExempt].slice(0, 5).join(',')}`,
-      );
-    }
     return { F, tokens };
   }
   projTokens = tokens;
@@ -530,7 +558,8 @@ function suffixAdopt(
   frozen: ReadonlySet<ChunkId>,
   fixedLevels: ReadonlyMap<ChunkId, number>,
   P: number,
-  exempt: ReadonlySet<ChunkId> = new Set(),
+  exempt: ReadonlySet<ChunkId>,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): { F: Map<ChunkId, number>; tokens: number; perturbation: number } {
   const changedSeqs: number[] = [];
   for (const c of ordered) {
@@ -542,7 +571,7 @@ function suffixAdopt(
     for (const c of ordered) {
       if (c.sequence >= boundary) F.set(c.id, ideal.get(c.id) ?? 0);
     }
-    projectToValidCut(F, tree, ordered, frozen, fixedLevels, exempt);
+    projectToValidCut(F, tree, ordered, frozen, fixedLevels, exempt, listedBy);
     const layout = renderLayout(inputs, tree, F);
     return { F, layout, pert: kvCost(prevLayout, layout) };
   };
@@ -593,9 +622,40 @@ function suffixAdopt(
  * is unanimous. Monotone (only lowers) → terminates. Any budget breach from the
  * extra raw is re-folded whole-group by the shed pass that runs afterward.
  *
- * Pinned (`fixedLevels`) and frozen (locked) leaves are already made
- * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
- * they are held here rather than lowered.
+ * Pinned (`fixedLevels`) and frozen (locked) leaves are held here rather than
+ * lowered: pin-at-level fixes a whole node's leaves at its level, and a lock
+ * keeps its carried level. The base sets both, and lowers either where its
+ * own-lineage summary doesn't list it (renderableLevel).
+ *
+ * A leaf renders at its level through its own lineage there, so it stays only
+ * where that node lists it. A level carried from before the tree's links
+ * changed can point through a summary that no longer lists the leaf, and on a
+ * non-nested tree a fresh plan's passes can leave a leaf at such a level too.
+ * The recall the leaf renders through there wouldn't hold it, so it is lowered.
+ * The base lowers a held leaf's level the same way.
+ *
+ * A leaf the node lists vetoes its unanimity only when it renders in more
+ * detail than the node, below the node's level, and the node is its own
+ * lineage at that level: the node's recall would then render over it. A
+ * hard-protected leaf (`exempt`) never vetoes. On a non-nested tree a node can
+ * list a leaf whose own lineage at the node's level is another summary, or
+ * none (§13.6 overlap tolerance). That leaf renders through its own lineage
+ * whatever the node does, so it never vetoes the node. A leaf folded above the
+ * node renders through a coarser summary of its own lineage, and that
+ * summary's unanimity decides whether it stays there. Where it stays and the
+ * node renders, the leaf is in both recalls. On a nested tree that can't last
+ * for a leaf no protection holds: the coarser summary owns the node's leaves,
+ * and those below its level veto it, bringing the leaf down to theirs, unless
+ * every one of them is hard-protected, since those never veto. A held
+ * leaf stays where the base put it. A pin-at-level holds a whole node's leaves
+ * at one level, but a lock holds one chunk, so a lock above its group stays
+ * there with the group's recall beside it, boundary-cut tolerance extended to
+ * a lock. On a non-nested tree an unheld leaf can stay too, the overlap §13.6
+ * tolerates. The rule depends only on the tree, the cut and the
+ * hard-protected leaves, which every projection is given alike: the ideal
+ * cut's, the carried frontier's and each suffix candidate's. A frontier the
+ * planner emitted therefore projects to itself on unchanged inputs, and the
+ * next compile starts from what this one rendered.
  */
 function projectToValidCut(
   F: Map<ChunkId, number>,
@@ -603,13 +663,22 @@ function projectToValidCut(
   ordered: PickerChunk[],
   frozen: ReadonlySet<ChunkId>,
   fixedLevels: ReadonlyMap<ChunkId, number>,
-  /** Hard-protected leaves (raw zone / pins / locked): rendered raw beside
-   *  their group's recall (ownership-wins), so they are exempt from the
+  /** Hard-protected leaves (raw zone / pins / locked): rendered at the level
+   *  they're held at (raw for the raw zone and a classic pin) beside their
+   *  group's recall (ownership-wins), so they are exempt from the
    *  unanimity requirement — a boundary cutting through a group must not
    *  force the whole group back to raw (boundary-cut tolerance, 2026-07-27). */
-  exempt: ReadonlySet<ChunkId> = new Set(),
+  exempt: ReadonlySet<ChunkId>,
+  /** The leaves each node lists, as sets: the planner's cache, shared by every
+   *  projection of one compile. */
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): void {
-  const maxPasses = (ordered.length + 1) * (maxAvailableLevel(tree) + 2);
+  // Each pass that changes anything lowers some leaf one level, so the deepest
+  // level in F (not only in the tree: a carried level can sit above the
+  // tree's top) bounds the passes, and the result projects to itself.
+  let deepest = maxAvailableLevel(tree);
+  for (const level of F.values()) if (level > deepest) deepest = level;
+  const maxPasses = (ordered.length + 1) * (deepest + 2);
   let changed = true;
   let pass = 0;
   while (changed && pass++ < maxPasses) {
@@ -632,26 +701,86 @@ function projectToValidCut(
     for (const c of byDepth) {
       const lvl = F.get(c.id) ?? 0;
       if (lvl <= 0) continue;
-      if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
+      if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held where the base set it
       const node = tree.ancestorAt(c.id, lvl);
       let unanimous = false;
-      if (node) {
+      // The leaf renders at this level through the node, so the node has to
+      // list it: a level carried from before the tree's links changed can
+      // point through a summary that no longer covers the leaf.
+      if (node && lists(listedBy, node, c.id)) {
         const key = `${node.id}:${lvl}`;
         const hit = unanimityMemo.get(key);
         if (hit !== undefined) {
           unanimous = hit;
         } else {
-          unanimous = true;
-          for (const leafId of node.leafChunkIds) {
-            if (exempt.has(leafId)) continue;
-            if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
-          }
+          unanimous = !vetoed(tree, node, lvl, F, exempt);
           unanimityMemo.set(key, unanimous);
         }
       }
       if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level
     }
   }
+}
+
+/**
+ * Whether a summary lists a chunk among its leaves. A chunk's lineage follows
+ * `parentId`, which can name a summary that was written again without the
+ * chunk's branch, so a node on the chunk's lineage doesn't always list it.
+ * `listedBy` caches each node's leaves as a set, so a map holds for one tree:
+ * the planner keeps one per compile, and kv-stable's pin expansion one per
+ * solve, through `renderableLevel`.
+ */
+function lists(
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
+  node: { id: string; leafChunkIds: readonly ChunkId[] },
+  chunkId: ChunkId,
+): boolean {
+  let listed = listedBy.get(node.id);
+  if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
+  return listed.has(chunkId);
+}
+
+/**
+ * Whether a leaf the node lists vetoes the node at a level: a leaf below that
+ * level, rendered in more detail than the node, whose own lineage there is
+ * the node, and that no hard protection exempts. The node's recall would
+ * render over it. A leaf above the node renders through a coarser summary of
+ * its own lineage, which that summary's verdict decides. projectToValidCut
+ * lowers a vetoed node's leaves, and phase C passes such a node by.
+ */
+function vetoed(
+  tree: SummaryTree,
+  node: { id: string; leafChunkIds: readonly ChunkId[] },
+  level: number,
+  F: ReadonlyMap<ChunkId, number>,
+  exempt: ReadonlySet<ChunkId>,
+): boolean {
+  for (const leafId of node.leafChunkIds) {
+    if (exempt.has(leafId)) continue;
+    if ((F.get(leafId) ?? 0) < level && tree.ancestorAt(leafId, level)?.id === node.id) return true;
+  }
+  return false;
+}
+
+/**
+ * A held level, lowered while the summary of the chunk's own lineage there
+ * exists but doesn't list the chunk: the recall the chunk renders through
+ * wouldn't hold it. A level with no such summary is kept, since the renderer
+ * renders it raw.
+ */
+export function renderableLevel(
+  tree: SummaryTree,
+  chunkId: ChunkId,
+  level: number,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
+): number {
+  let k = level;
+  while (k > 0) {
+    const node = tree.ancestorAt(chunkId, k);
+    if (!node || lists(listedBy, node, chunkId)) break;
+    k--;
+  }
+  return k;
 }
 
 /** Earliest source sequence whose resolution changed `prev → next`. */
@@ -744,20 +873,30 @@ export interface ControlPlanParams {
   qualityGapRatio?: number;
   /** Chunks forced to raw and never folded (flat zone / head / tail / pinned). */
   rawZone: ReadonlySet<ChunkId>;
-  /** Chunks kept at their carried resolution and never touched (locked). */
+  /**
+   * Chunks kept at their carried resolution (locked), never folded or
+   * un-folded by the solve. The base lowers a lock to its pin-max-level when
+   * that is shallower, and below a level whose own-lineage summary doesn't
+   * list the chunk, since that recall wouldn't render it.
+   */
   frozen?: ReadonlySet<ChunkId>;
   /**
-   * V2 pin-at-level-k: chunks fixed to render at EXACTLY the given fold level
+   * V2 pin-at-level-k: chunks fixed to render at the given fold level
    * (0 = raw). Held there and never folded or un-folded — the frontier cut
    * passes through that L_k node. A level deeper than the tree has produced is
-   * clamped to the deepest available. (`ProtectedRange.level`.)
+   * clamped to the deepest available, and a level whose own-lineage summary
+   * exists but doesn't list the chunk is lowered until one does, or to raw. A
+   * level its lineage has no summary at is kept, and renders raw.
+   * (`ProtectedRange.level`.)
    */
   fixedLevels?: ReadonlyMap<ChunkId, number>;
   /**
    * V2 pin-max-level: per-chunk HARD cap on fold depth — the chunk may fold no
    * deeper than this level, enforced in normal AND emergency shedding, and any
-   * carried resolution deeper than the cap is un-folded to it at plan start.
-   * (`ProtectedRange.maxLevel`.)
+   * carried resolution deeper than the cap, a locked chunk's included, is
+   * un-folded to it at plan start. A chunk in `fixedLevels` keeps its fixed
+   * level instead: kv-stable fixes a pin-at-level's whole node there, a capped
+   * leaf of it included. (`ProtectedRange.maxLevel`.)
    */
   pinCaps?: ReadonlyMap<ChunkId, number>;
   /** Newest source sequence — the age reference for the log-age fold caps. */
@@ -776,7 +915,10 @@ export interface ControlPlan {
   /** Even full folding could not fit under W (terminal — production problem). */
   escalated: boolean;
   /** Exact prefix-invalidation cost of this plan vs the carried frontier:
-   *  tokens the provider will re-read (0 on a hold/pure-append turn). */
+   *  tokens the provider will re-read for this plan's choices (0 on a
+   *  hold/pure-append turn). A change every plan must make, such as a pin
+   *  tightened since the last compile, is in the carried frontier already,
+   *  so it isn't counted here. */
   perturbation: number;
   /** Set when the trust region P did not bind normally (§13.4). Callers should
    *  log these loudly (`[kv-escalation]`):
@@ -811,6 +953,84 @@ export function planControlledFrontier(
   tree: SummaryTree,
   p: ControlPlanParams,
 ): ControlPlan {
+  const plan = planUnreported(inputs, tree, p);
+  reportOverlap(tree, inputs.chunks, plan.resolutions);
+  return plan;
+}
+
+/**
+ * NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
+ * feature. A rendered summary whose listing disagrees with the lineage of the
+ * window's leaves means the store's summary tree is NON-NESTED, and messages
+ * are SEMANTICALLY DOUBLE-REPRESENTED in the window. Either direction says so:
+ * - the summary lists a leaf whose own lineage at that level is another
+ *   summary, or none (two live lineages over one span): the summary's recall
+ *   covers the leaf while it renders raw or through its own chain;
+ * - a leaf's own lineage runs through the summary, but the summary doesn't
+ *   list it (a summary written again without one of its sources): the leaf
+ *   renders lower, and a summary of its lineage that lists it beside a leaf
+ *   held above can render in both recalls, which neither listing shows.
+ * Each direction has a line of its own: the first says a message is in the
+ * window twice, and the second only that listing and lineage disagree, which
+ * is all it shows. A leaf that disagrees both ways is named once, on the
+ * first. The solve proceeding is the mitigation; the topology is the
+ * disease. So every compile whose plan renders such a summary says so,
+ * until the store is repaired (nesting reconciler, see the 2026-08-03 opus4
+ * incident). kv-stable's shadow production pick plans through here too, in
+ * a compile that isn't a dry run with `productionBudgetTokens` set below its
+ * budget, and says so of its own plan, which no compile renders.
+ * It reads the frontier the plan emits, so a plan that keeps carried folds
+ * reports them as one that makes them does. A leaf that a lock or a pin holds
+ * beside a summary of its own lineage that lists it renders in both recalls
+ * too, and goes unreported: a protection put it there, not the topology.
+ */
+function reportOverlap(
+  tree: SummaryTree,
+  chunks: readonly PickerChunk[],
+  F: ReadonlyMap<ChunkId, number>,
+): void {
+  const rendered = new Map<string, ReadonlySet<ChunkId>>();
+  const conflicting = new Set<ChunkId>();
+  for (const c of chunks) {
+    const level = F.get(c.id) ?? 0;
+    if (level < 1) continue;
+    const node = tree.ancestorAt(c.id, level);
+    if (!node || rendered.has(node.id)) continue;
+    rendered.set(node.id, new Set(node.leafChunkIds));
+    for (const leafId of node.leafChunkIds) {
+      if (tree.ancestorAt(leafId, level)?.id !== node.id) conflicting.add(leafId);
+    }
+  }
+  const unlisted = new Set<ChunkId>();
+  for (const c of chunks) {
+    if (conflicting.has(c.id)) continue;
+    for (let k = 1, top = tree.maxLevel(c.id); k <= top; k++) {
+      const node = tree.ancestorAt(c.id, k);
+      const listed = node ? rendered.get(node.id) : undefined;
+      if (listed && !listed.has(c.id)) { unlisted.add(c.id); break; }
+    }
+  }
+  if (conflicting.size > 0) {
+    console.error(
+      `[kv-overlap] ⚠️ non-nested summary tree: ${conflicting.size} leaf(s) with ` +
+        `conflicting lineage tolerated this compile (double-representation in window). ` +
+        `Store needs nesting repair. sample=${[...conflicting].slice(0, 5).join(',')}`,
+    );
+  }
+  if (unlisted.size > 0) {
+    console.error(
+      `[kv-overlap] ⚠️ non-nested summary tree: ${unlisted.size} leaf(s) whose own lineage runs through ` +
+        `a rendered summary that doesn't list them (listing and lineage disagree). ` +
+        `Store needs nesting repair. sample=${[...unlisted].slice(0, 5).join(',')}`,
+    );
+  }
+}
+
+function planUnreported(
+  inputs: PickerInputs,
+  tree: SummaryTree,
+  p: ControlPlanParams,
+): ControlPlan {
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const frozen = p.frozen ?? EMPTY_SET;
   const fixedLevels = p.fixedLevels ?? EMPTY_LEVEL_MAP;
@@ -830,25 +1050,38 @@ export function planControlledFrontier(
 
   // Base = the non-negotiable part of every cut: raw zone raw, pins at their
   // level, frozen at their carried resolution. Everything else starts raw here;
-  // the carried frontier and the ideal cut both build on this base.
+  // the carried frontier and the ideal cut both build on this base. The
+  // projection never lowers a held leaf, so a held level whose own-lineage
+  // summary doesn't list the leaf (links changed since it was carried, or a
+  // pin on a non-nested tree) is lowered here, by renderableLevel.
+  const listedBy = new Map<string, ReadonlySet<ChunkId>>();
   const base = new Map<ChunkId, number>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id)) {
       base.set(c.id, 0);
     } else if (fixedLevels.has(c.id)) {
-      // Pin-at-k: fix to exactly k, clamped to the deepest produced level for
-      // this chunk (can't render at a level whose summary doesn't exist yet).
+      // Pin-at-k: fix to k, clamped to the deepest produced level for this
+      // chunk (can't render at a level whose summary doesn't exist yet), and
+      // lowered where its own-lineage summary there doesn't list it.
       const k = Math.max(0, fixedLevels.get(c.id)!);
-      base.set(c.id, k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id)));
+      base.set(c.id, k === 0 ? 0 : renderableLevel(tree, c.id, Math.min(k, tree.maxLevel(c.id)), listedBy));
     } else if (frozen.has(c.id)) {
-      base.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
+      // A lock keeps its carried level, lowered to a pin-max-level below it
+      // (kv-stable passes both for a capped, locked chunk) and where its
+      // own-lineage summary there no longer lists it.
+      const held = p.previous.get(c.id) ?? c.currentResolution;
+      const cap = pinCaps.get(c.id);
+      base.set(c.id, renderableLevel(tree, c.id, cap === undefined ? held : Math.min(held, Math.max(0, cap)), listedBy));
     } else {
       base.set(c.id, 0);
     }
   }
 
-  // Carried frontier (F_prev with the base enforced): what is actually
-  // rendered right now, and the reference for perturbation.
+  // Carried frontier: F_prev with the changes every plan must make applied
+  // first (the base, a pin-max-level tightened since, and the projection to a
+  // valid cut of this tree). On unchanged inputs it is what the last compile
+  // rendered. It is the reference for perturbation and the trust region, so
+  // neither counts a change no plan can avoid.
   const carried = new Map(base);
   let carriedNonEmpty = false;
   for (const c of ordered) {
@@ -865,14 +1098,17 @@ export function planControlledFrontier(
     if (v !== 0) { carriedNonEmpty = true; break; }
   }
   diagHist('carried(pre-projection)', carried, tree);
-  // Hard-protected set for boundary-cut tolerance: raw zone + immovable
-  // leaves render raw beside their group's recall and are exempt from
-  // group-unanimity everywhere.
+  // Hard-protected set for boundary-cut tolerance: raw-zone and immovable
+  // leaves render at their held level beside their group's recall (raw for the
+  // raw zone) and are exempt from group-unanimity everywhere. A leaf whose
+  // lineage disagrees with a group (overlap tolerance) needs no entry: the
+  // projection leaves it out of that group's unanimity by its lineage, exactly
+  // as for the ideal cut.
   const boundaryExempt = new Set<ChunkId>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id) || immovable.has(c.id)) boundaryExempt.add(c.id);
   }
-  projectToValidCut(carried, tree, ordered, frozen, fixedLevels, boundaryExempt);
+  projectToValidCut(carried, tree, ordered, frozen, fixedLevels, boundaryExempt, listedBy);
   diagHist('carried(projected)', carried, tree);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
@@ -897,7 +1133,7 @@ export function planControlledFrontier(
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
   const ideal = relevanceCut(
     inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-    p.targetTokens, p.windowTokens, maxFoldLevel,
+    p.targetTokens, p.windowTokens, maxFoldLevel, listedBy,
   );
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   diagHist('ideal', ideal.F, tree);
@@ -954,7 +1190,7 @@ export function planControlledFrontier(
 
   // 5. Suffix adoption: the ideal's newest changes only, within P.
   const partial = suffixAdopt(
-    inputs, tree, ordered, carried, carriedLayout, ideal.F, frozen, fixedLevels, P, boundaryExempt,
+    inputs, tree, ordered, carried, carriedLayout, ideal.F, frozen, fixedLevels, P, boundaryExempt, listedBy,
   );
   const partialLoss = relevanceLoss(partial.F, ordered, p.rawZone, caps);
   // Progress guard: when a shed is REQUIRED (carried over foldAt), a partial
