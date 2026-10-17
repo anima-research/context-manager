@@ -294,7 +294,7 @@ class MergeProbe extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {
     this.pushSummary(entry);
   }
-  merge(level: 2, sourceIds: string[], ctx: StrategyContext): Promise<void> {
+  merge(level: 2, sourceIds: string[], ctx: StrategyContext): Promise<boolean> {
     return this.executeMerge(level, sourceIds, ctx);
   }
   protected override getReadingMergeInstruction(...args: Parameters<AutobiographicalStrategy['getReadingMergeInstruction']>): string {

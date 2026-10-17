@@ -331,9 +331,11 @@ function scriptedMintMembrane(script: ScriptedAttemptOutcome[]) {
         const outcome = script[attempts.length] ?? 'accept';
         attempts.push({ request: structuredClone(request), outcome });
         if (outcome === 'carrier_reject') {
+          // As the Anthropic adapter classifies a 400 (membrane 0.5.69+):
+          // typed invalid_request, so the ladder knows it is about the request.
           throw Object.assign(
             new Error('invalid_request: thinking blocks cannot be modified'),
-            { httpStatus: 400 },
+            { httpStatus: 400, type: 'invalid_request', retryable: false },
           );
         }
         return {
@@ -412,7 +414,9 @@ const acceptedRequestCases: Array<{ label: string; script: ScriptedAttemptOutcom
 describe("a host's withdrawal of an L1 call shaped like a carrier rejection (CompressionWithdrawn)", () => {
   after(cleanup);
 
-  const carrierShape = { httpStatus: 400, message: 'invalid_request: thinking blocks cannot be modified' };
+  // A 400 invalid_request carries its type, which makes it a request-attributable rejection: the stripped retry's
+  // other precondition.
+  const carrierShape = { httpStatus: 400, type: 'invalid_request', message: 'invalid_request: thinking blocks cannot be modified' };
   const carriesReasoning = (request: NormalizedRequest): boolean =>
     request.messages.some((message) => message.content.some((block) => block.type === 'thinking'));
 

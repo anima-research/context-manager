@@ -67,7 +67,7 @@ class ProbeStrategy extends AutobiographicalStrategy {
     return this.compressChunkHierarchical(chunk, ctx);
   }
 
-  runMerge(targetLevel: number, sourceIds: string[], ctx: StrategyContext): Promise<void> {
+  runMerge(targetLevel: number, sourceIds: string[], ctx: StrategyContext): Promise<boolean> {
     return this.executeMerge(targetLevel as never, sourceIds, ctx);
   }
 

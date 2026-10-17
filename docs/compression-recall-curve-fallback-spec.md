@@ -40,7 +40,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 
 ## Non-negotiable invariants
 
-1. **Canonical first.** Always issue the current canonical compression request unchanged. Fallback activates only after canonical `stopReason === "refusal"`.
+1. **Canonical first.** Always issue the current canonical compression request unchanged. Fallback activates only after the canonical stage ends without a summary: a refusal or an incomplete answer takes the bounded curve, and a rejection attributable to the request, or a rung decided by its failures (see 10), goes to source-only-final once when that rung is configured, and otherwise exhausts the family.
 2. **Same as-of model.** Do not use a neutral observer or alternate model/provider.
 3. **No semantic omission.** Preserve head, raw middle, target chunk, tool cycles, instruction, and all leaf-history coverage selected by the canonical recall frontier.
 4. **No private-state sanitization.** Do not remove, redact, deduplicate, or placeholder `think`, `skip_reply`, thinking, tool, or other state as part of this feature.
@@ -49,7 +49,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 7. **No future leakage.** The alternate request must retain the same as-of boundary; no tail-after-chunk.
 8. **Coverage proof.** A replacement is valid only if recursively expanded leaf message IDs exactly equal the parent’s leaf coverage.
 9. **Store once.** Only the first successful response may become the chunk’s L1 summary. Refused/aborted diagnostic outputs are never persisted as memory.
-10. **Bounded retries.** Never loop indefinitely on the same chunk/frontier/request state.
+10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures: its first, and each later one after compression landed on the same membrane and model since the one before) is recorded durably and never requested again, and the family exhausts after its bounded curve. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So an outage, or a restart before the bound, retries the same request with pacing for as long as it lasts, and never spends the ladder.
 
 ## Fallback algorithm
 
@@ -121,8 +121,20 @@ fallback limit of provider attempts. An over-budget variant is recorded and
 skipped without preventing a later eligible variant.
 
 Stop at the first non-refusal response containing persistable nonempty memory
-text. A refused, empty, or provider-error variant is recorded and the bounded
-curve continues. Canonical non-refusal behavior remains unchanged.
+text. A refused, empty, or deterministically rejected variant (a provider error
+attributable to the request: `context_length`, `invalid_request`, `safety`,
+`unsupported`) is recorded and the bounded curve continues. A transient provider
+failure (capacity, transport, credentials, or anything unclassified) is not by
+itself evidence about the variant: the curve stops there, keeps the family's
+durable progress, pauses the compression lane, and a later tick resumes at that
+variant without repeating requests whose outcomes are recorded. Only
+`COMPRESSION_PERSISTENT_FAILURES` of them on one rung decide it, the first and
+each later one after compression landed on the same membrane and model since
+the one before: their outcome,
+`provider_error:persistent-<class>`, is recorded like a rejection. A canonical rejection
+attributable to the request skips the variants and the canonical hoist: it goes
+to source-only-final once when that rung is configured, and otherwise exhausts
+the family. Canonical non-refusal behavior is otherwise unchanged.
 
 ### Optional later variants
 

@@ -22,6 +22,7 @@ const stateIds = [
   'autobio:pins',
   'autobio:calibration',
   'autobio:compression-refusal-quarantine-events',
+  'autobio:compression-family-progress',
   'autobio:resolutions',
   'autobio:locks',
 ].map(id => `${namespace}/${id}`);

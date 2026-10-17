@@ -58,6 +58,7 @@ export type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
+  CompressionQuarantineSpan,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,

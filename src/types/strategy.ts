@@ -681,8 +681,53 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
  * Public quarantine status shape (health surfaces + the repeating alarm).
  */
 export interface CompressionQuarantineStatus {
+  /** Quarantine records: one per request shape a span exhausted, so a span can hold several. */
   count: number;
+  /** The records' keys, as `clearCompressionRefusalQuarantine()` takes them. */
   keys: string[];
+  /** The quarantined spans, each once however many records it holds, the longest waiting first. */
+  spans: CompressionQuarantineSpan[];
+}
+
+/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+export interface CompressionQuarantineSpan {
+  /** The span's identity: the hash of its chunk's message ids. */
+  chunkSourceHash: string;
+  /** Its first and last message ids; null when no current chunk has this span. */
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  /**
+   * How long since its chunk closed, from the newest of its messages'
+   * timestamps: how long it has stayed raw. Null when unknown.
+   */
+  closedAgeMs: number | null;
+  /**
+   * When its earliest record was made (ms since the epoch): how long it has
+   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * alarm line shows it as "refusing since". A re-cut chunk's records start
+   * over.
+   */
+  quarantinedAt: number;
+  /** Its quarantine records, one per request shape it exhausted. */
+  records: number;
+  /**
+   * Requests a provider answered for those records, none giving a summary:
+   * the canonical request and its no-tools and tools-less retries, and each
+   * fallback after them. A recall variant planned over the compression's
+   * context budget, recorded as `admission_rejected` and never sent, isn't
+   * counted, and neither is a rung its failures decided
+   * (`provider_error:persistent-<class>`), which no provider gave as an answer.
+   * A record an earlier version wrote holds one outcome for the whole
+   * canonical stage, so it counts that stage once.
+   */
+  answeredAttempts: number;
+  /**
+   * The newest record's last outcome, with its error type after a colon when
+   * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
+   * `admission_rejected`, or `provider_error:persistent-<class>` for a rung its
+   * failures decided); null when that record holds none.
+   */
+  latestOutcome: string | null;
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
