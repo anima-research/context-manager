@@ -797,9 +797,13 @@ function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesByI
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
-const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
+// 3: the provider total counts cache writes and reads for every provider
+// (#182). A record from an earlier version may hold a plan whose oversized
+// fallbacks used up the attempt limit before one that fits, so it doesn't
+// count toward the current version's shape cap.
+const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 3;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
-  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
+  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v3';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
 const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
@@ -3033,10 +3037,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private compressionResponseInputTokens(response: unknown): number | undefined {
     if (!response || typeof response !== 'object') return undefined;
-    const typed = response as {
-      usage?: unknown;
-      details?: { usage?: unknown; model?: { provider?: unknown } };
-    };
+    const typed = response as { usage?: unknown; details?: { usage?: unknown } };
     const detailed = typed.details?.usage;
     const usage = detailed && typeof detailed === 'object' ? detailed : typed.usage;
     if (!usage || typeof usage !== 'object') return undefined;
@@ -3044,22 +3045,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const value = (usage as Record<string, unknown>)[key];
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
+    // membrane (0.5.81 and later) states usage with uncached input, cache
+    // writes and cache reads as disjoint counts for every adapter whose
+    // convention it knows, so the prompt's total is their sum whatever the
+    // provider, and a full cache hit is a zero input count beside a positive
+    // cache read. An adapter whose convention membrane marks unknown keeps the
+    // counts its provider gives: of those, only Gemini reports cache reads, and
+    // until membrane counts Gemini's cache that way, the sum counts a cached
+    // Gemini prompt's cached span twice.
     const input = read('inputTokens');
-    const provider = typeof typed.details?.model?.provider === 'string'
-      ? typed.details.model.provider.toLowerCase()
-      : undefined;
-    // Anthropic and Bedrock report uncached, cache-write, and cache-read input
-    // as disjoint counters. OpenAI/Gemini/OpenRouter report cache reads as a
-    // subset of inputTokens, so summing there would double-count.
-    if (provider === 'anthropic' || provider === 'bedrock') {
-      if (input === undefined) return undefined;
-      const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
-      return total > 0 ? total : undefined;
-    }
-    // Unknown/other providers are authoritative only when they report a
-    // positive total input count. Zero/partial usage falls back to the
-    // complete normalized request bound rather than admitting blindly.
-    return input !== undefined && input > 0 ? input : undefined;
+    // Usage without an input count, or with a zero total, is no observation
+    // of the prompt: the complete normalized request bound stands instead.
+    // Through membrane the input count is always a number: the adapters whose
+    // providers can omit it report zero, and Anthropic's and Bedrock's APIs
+    // always send one. So a missing one comes only from a caller outside
+    // membrane, and a cache-only report through membrane reads as a full
+    // cache hit.
+    if (input === undefined) return undefined;
+    const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
+    return total > 0 ? total : undefined;
   }
 
   private fallbackContentBlockError(block: unknown, seen = new Set<object>()): string | undefined {

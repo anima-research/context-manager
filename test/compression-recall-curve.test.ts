@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
+import { Membrane } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
@@ -944,43 +945,132 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('does not double-count provider cache fields that are subsets of total input', async () => {
+  it('a cached non-Anthropic refusal counts its cache reads in the canonical total', async () => {
+    // membrane (0.5.81 and later) states every provider's usage with the
+    // cached span outside inputTokens: 200,000 fresh plus 150,000 read from
+    // cache is a 350,000-token prompt, on OpenAI as on Anthropic.
     const mock = flexibleMembrane([
       { stop: 'refusal', inputTokens: 200_000, cacheReadTokens: 150_000, provider: 'openai-responses-api' },
-      { stop: 'end_turn', text: 'subset-accounted fallback succeeded', inputTokens: 220_000 },
+      { stop: 'end_turn', text: 'must never be called' },
     ]);
     const fx = await fixture(mock.membrane, {
       compressionContextBudgetTokens: 350_000,
       compressionRefusalCurveFallbacks: 1,
     });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 2, 'OpenAI cached input is not added twice');
-    assert.equal(fx.target.compressed, true);
+    assert.equal(mock.calls.length, 1, 'the cached span counts, so no expansion fits the budget');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 350_000);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     fx.manager.close();
   });
 
-  it('zero or partial non-Anthropic usage falls back to the complete request bound', async () => {
+  it('a full cache hit on a non-Anthropic provider is the provider\'s count of the prompt', async () => {
+    // No fresh input beside 180,000 cached tokens: in membrane's convention a
+    // 180,000-token prompt served whole from cache. It replaces the invariant
+    // UTF-8 floor, which the huge tool catalog puts past the budget.
     const mock = flexibleMembrane([
-      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 5, provider: 'openai-responses-api' },
+      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 180_000, provider: 'openai-responses-api' },
+      { stop: 'end_turn', text: 'provider-counted fallback succeeded', inputTokens: 190_000 },
     ]);
     const fx = await fixture(mock.membrane, {
-      compressionContextBudgetTokens: 60_000,
+      compressionContextBudgetTokens: 350_000,
       compressionRefusalCurveFallbacks: 1,
+      headWindowTokens: 100_000,
     });
     fx.manager.setToolDefinitions([{
-      name: 'large_zero_usage_tool',
-      description: 'schema inventory '.repeat(20_000),
-      inputSchema: { type: 'object', properties: {} },
+      name: 'huge_invariant_tool_catalog',
+      description: 'schema inventory '.repeat(30_000),
+      inputSchema: {
+        type: 'object',
+        properties: { payload: { type: 'string', description: 'large field '.repeat(30_000) } },
+      },
     }]);
+
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 1, 'degenerate usage cannot bypass the deterministic floor');
+    assert.equal(mock.calls.length, 2, 'the cached count admits one fallback');
+    assert.equal(fx.target.compressed, true);
+    const requests = mock.calls.map((call) => Buffer.byteLength(JSON.stringify(call.request), 'utf8'));
+    assert.ok(requests[0]! > 350_000, 'invariant serialized request exceeds the token budget numerically');
+    fx.manager.close();
+  });
+
+  it('a refusal through membrane itself counts a cache-inclusive provider\'s prompt once', async () => {
+    // The sum rests on membrane's normalization, so this crosses it: a real
+    // Membrane around an adapter whose provider reports cache reads inside its
+    // input count, as OpenAI's does. 10,000 prompt tokens, 8,000 of them read
+    // from cache, are 2,000 fresh plus 8,000 cached once membrane has them.
+    const adapter = {
+      name: 'stub-cache-inclusive',
+      usageCacheConvention: 'cache-inclusive' as const,
+      calls: 0,
+      supportsModel: () => true,
+      async complete(request: { model: string }) {
+        adapter.calls++;
+        return {
+          content: [{ type: 'text', text: '' }],
+          stopReason: 'refusal',
+          usage: { inputTokens: 10_000, outputTokens: 0, cacheReadTokens: 8_000 },
+          model: request.model,
+          rawRequest: request,
+          raw: {},
+        };
+      },
+      async stream(): Promise<never> { throw new Error('the strategy does not stream'); },
+    };
+    const fx = await fixture(new Membrane(adapter as never) as never, {
+      compressionContextBudgetTokens: 10_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(adapter.calls, 1, 'no expansion of a 10,000-token prompt fits a 10,000-token budget');
     const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
       .record as Record<string, unknown>;
-    assert.equal(record.canonicalProviderInputTokens, undefined);
-    assert.ok((record.plan as Array<Record<string, unknown>>).every(
-      (item) => item.accountingSource === 'complete_normalized_request_bound',
-    ));
+    assert.equal(record.canonicalProviderInputTokens, 10_000);
     fx.manager.close();
+  });
+
+  it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
+    // Cache counts with no input count beside them are no observation of the
+    // prompt. Through membrane the input count is always a number, since the
+    // adapters whose providers can omit it report zero and Anthropic's and
+    // Bedrock's APIs always send one, so this shape comes only from a caller
+    // outside it.
+    const withoutInputCount = response('refusal');
+    (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
+    (withoutInputCount as unknown as { details: unknown }).details = {
+      usage: { outputTokens: 0, cacheReadTokens: 5 },
+      model: { provider: 'openai-responses-api' },
+    };
+    const cases: Array<[string, AttemptHandler]> = [
+      ['zero total', { stop: 'refusal', inputTokens: 0, provider: 'openai-responses-api' }],
+      ['no input count', { raw: withoutInputCount }],
+    ];
+    for (const [label, handler] of cases) {
+      const mock = flexibleMembrane([handler]);
+      const fx = await fixture(mock.membrane, {
+        compressionContextBudgetTokens: 60_000,
+        compressionRefusalCurveFallbacks: 1,
+      });
+      fx.manager.setToolDefinitions([{
+        name: 'large_zero_usage_tool',
+        description: 'schema inventory '.repeat(20_000),
+        inputSchema: { type: 'object', properties: {} },
+      }]);
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 1, `${label}: degenerate usage cannot bypass the deterministic floor`);
+      const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+        .record as Record<string, unknown>;
+      assert.equal(record.canonicalProviderInputTokens, undefined, label);
+      assert.ok((record.plan as Array<Record<string, unknown>>).every(
+        (item) => item.accountingSource === 'complete_normalized_request_bound',
+      ), label);
+      fx.manager.close();
+    }
   });
 
   it('usage absence counts complete huge tools, head, raw input, and normalized config', async () => {
@@ -1361,6 +1451,60 @@ describe('compression refusal recall curves', () => {
     };
     await retried.run(chunk, ctx);
     assert.equal(retryMock.calls.length, 1, 'v2 accounting earns one fresh canonical attempt');
+    assert.equal(chunk.compressed, true);
+    manager.close();
+  });
+
+  it('records written at accounting version 2, before every provider\'s cache reads counted, do not block the current version', async () => {
+    const path = freshPath();
+    const firstMock = scriptedMembrane(['refusal']);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    const exhausted = quarantineEvents(first.manager).find((event) => event.kind === 'exhausted')!;
+    const current = exhausted.record as Record<string, unknown>;
+    await first.strategy.clearCompressionRefusalQuarantine(String(current.key));
+    for (let i = 0; i < 3; i++) {
+      const legacyConfig = { ...(current.normalizedConfig as Record<string, unknown>) };
+      legacyConfig.accountingVersion = 2;
+      const legacy: Record<string, unknown> = {
+        ...structuredClone(current),
+        key: `legacy-key-${i}`,
+        familyKey: `legacy-family-${i}`,
+        accountingSource: 'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2',
+        normalizedConfig: legacyConfig,
+      };
+      first.manager.getStore().appendToStateJsonWithIdentity(
+        'default/autobio:compression-refusal-quarantine-events',
+        { kind: 'exhausted', key: legacy.key, record: legacy, created: Date.now() + i },
+        'eventId',
+        'sequence',
+      );
+    }
+    first.manager.close();
+
+    const retryMock = scriptedMembrane(['end_turn']);
+    const retried = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy: retried, membrane: retryMock.membrane });
+    const ctx = managerContext(manager);
+    const chunk: Chunk = {
+      index: 999,
+      startIndex: 10,
+      endIndex: 12,
+      messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+      tokens: 100,
+      compressed: false,
+    };
+    await retried.run(chunk, ctx);
+    assert.equal(retryMock.calls.length, 1, 'the current accounting earns one fresh canonical attempt');
     assert.equal(chunk.compressed, true);
     manager.close();
   });
