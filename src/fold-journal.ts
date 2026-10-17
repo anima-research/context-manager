@@ -234,7 +234,7 @@ interface AcceptedLayoutRecord {
   /** Snapshot: the members, gap-coded. */
   m?: string;
   /** Snapshot: the units. */
-  units?: LayoutUnit[];
+  units?: readonly LayoutUnit[];
   /** Delta: the record it edits. */
   prev?: string;
   /** Delta: the members removed and added, gap-coded. */
@@ -261,8 +261,8 @@ interface AcceptedLayoutRecord {
 
 /** A layout as an acceptance persists it: membership and forms, no ids. */
 export interface StoredLayout {
-  members: number[];
-  units: LayoutUnit[];
+  readonly members: readonly number[];
+  readonly units: readonly LayoutUnit[];
 }
 
 interface LatestLayout extends StoredLayout {
@@ -388,9 +388,10 @@ interface BranchState {
    *  store object wrote it; extended as records are written. */
   receipts?: Array<{ id: string; at: number }>;
   /** Where that walk stopped short: a record a link named that couldn't be
-   *  read as a receipt (`at`), or a receipt whose link doesn't point to an
+   *  read as a receipt (`at`), or that belongs to another namespace or
+   *  branch (`at`, `foreign`), or a receipt whose link doesn't point to an
    *  earlier record (`at`, and the record it names, `linksTo`). */
-  receiptsCut?: { at: string; linksTo?: string };
+  receiptsCut?: { at: string; linksTo?: string; foreign?: true };
   /** A record after `newest` that couldn't be read at all, so it may have
    *  been this branch's newest: the next acceptance writes a baseline. */
   shadowedBy?: string;
@@ -477,6 +478,16 @@ function storeIndex(store: JsStore): StoreIndex {
     index.stale = false;
   }
   return index;
+}
+
+/** A copy of a branch reference, which the journal can keep as its own. */
+function copyBranch(ref: BranchRef): BranchRef {
+  return { id: ref.id, name: ref.name, created: ref.created };
+}
+
+/** A copy of a layout unit, its summary references included. */
+function copyUnit(unit: LayoutUnit): LayoutUnit {
+  return unit.k === 's' ? { k: 's', n: unit.n, sm: unit.sm.map((ref) => [...ref] as typeof ref) } : { ...unit };
 }
 
 /** A record's envelope, or null when it has none to read (reported once). */
@@ -598,7 +609,9 @@ export class FoldJournal {
    */
   mark(): JournalMark | null {
     try {
-      return storeIndex(this.store).mark;
+      // A copy: the compile's caller holds it, and the index keeps its own.
+      const mark = storeIndex(this.store).mark;
+      return mark ? { ...mark } : null;
     } catch (err) {
       if (!markFailures.has(this.store)) {
         markFailures.add(this.store);
@@ -624,7 +637,11 @@ export class FoldJournal {
    * newest record can't be read), and records the layout as the branch's
    * last accepted one. Idempotent per compile: a compile accepted before
    * returns the receipt that acceptance wrote, or null when it wrote none.
-   * Returns the receipt, if any. A compile of another namespace is refused.
+   * Returns the receipt, if any. A compile of another namespace is refused,
+   * and so is one whose branch this store doesn't know, live or recorded,
+   * and one whose layout's members aren't in ascending order, whose units'
+   * counts aren't positive whole numbers adding up to its members, or that
+   * doesn't have one id for each member.
    */
   accept(
     provenance: CompileProvenance,
@@ -642,13 +659,28 @@ export class FoldJournal {
     if (!layout) return null;
     const index = storeIndex(this.store);
     const branch = this.branchState(index, provenance.branch);
+    // Only this store's branches. Another store's compile in the same
+    // namespace names a branch this store never had, and a record of it here
+    // would be announced and exported as this store's. A branch this
+    // namespace has records of stays known after it's deleted.
+    const ref = provenance.branch;
+    if (!branch && !this.store.listBranches().some((b) => b.id === ref.id && b.created === ref.created)) {
+      throw new Error(
+        `a compile of branch ${JSON.stringify(ref.name)} (id ${JSON.stringify(ref.id)}, created ${ref.created}) can't be ` +
+          `accepted on this store: it has no live branch with that id and creation time, and this namespace has no ` +
+          `readable record of one, so accepting it here again is refused the same way. A compile is accepted by the ` +
+          `manager that compiled it, over the store it read; a branch deleted before anything readable was recorded ` +
+          `for it can't take one`,
+      );
+    }
     // The branch's newest receipt may be one this journal never announced:
     // its write reported failure after landing, in this stream or the turn
     // before, or another journal wrote it, whether or not records without a
     // receipt followed it. Announce it now, whatever this compile turns out
     // to be, so listeners (a projection) converge on the canonical record.
     if (branch?.newestReceipt && this.announced.get(branchKey(branch.ref)) !== branch.newestReceipt) {
-      const receipt = this.loadReceipt(branch.newestReceipt);
+      // Only a receipt of this branch: a link can name another's.
+      const receipt = this.loadReceipt(branch.newestReceipt, branch.ref);
       if (receipt) {
         // Its write may have failed at the sync after the append, leaving it
         // in the log with its durability unknown: durable before heard of.
@@ -669,6 +701,19 @@ export class FoldJournal {
       const receipt = accepted.receiptAt !== null ? this.loadReceipt(accepted.id) : null;
       if (receipt) this.announce(receipt);
       return receipt;
+    }
+    // A layout persists as accepted, so one changed after its compile returned
+    // it would land, fail to rebuild later, and leave its branch to start
+    // again from a baseline; receipts name messages by its ids, member by
+    // member. Only its shape can be checked: the ids aren't stored, and a
+    // unit's form can't be told from its count, so a change that keeps the
+    // shape lands as written. Checked before anything reads it for this record.
+    if (!wellFormed(layout) || layout.memberIds.length !== layout.members.length) {
+      throw new Error(
+        `the layout of compile ${provenance.compileId} can't be accepted: its members aren't in ascending order, its ` +
+          `units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id for each ` +
+          `member, so accepting it again is refused the same way. Accept a compile's provenance as compile returned it`,
+      );
     }
     const prev = branch ? this.loadLatest(index, branch) : null;
 
@@ -735,7 +780,17 @@ export class FoldJournal {
     let id = branch.newestReceipt;
     while (id !== null) {
       const head = readHead(this.store, index, id);
-      if (!head || head.receiptAt === null) {
+      if (!head) {
+        branch.receiptsCut = { at: id };
+        break;
+      }
+      // Each link stays on its namespace and branch, as a layout chain's do,
+      // whether or not the record it names holds a receipt.
+      if (head.ns !== this.namespace || branchKey(head.branch) !== branchKey(branch.ref)) {
+        branch.receiptsCut = { at: id, foreign: true };
+        break;
+      }
+      if (head.receiptAt === null) {
         branch.receiptsCut = { at: id };
         break;
       }
@@ -824,12 +879,16 @@ export class FoldJournal {
     const cut = state?.receiptsCut;
     if (cut) {
       // A forward link is found on a receipt already listed, so only an
-      // unreadable one can leave the list empty.
+      // unreadable or foreign one can leave the list empty.
       notes.push(list.length === 0
-        ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`
-        : cut.linksTo === undefined
-          ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
-          : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
+        ? (cut.foreign
+          ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, belongs to another namespace or branch.`
+          : `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`)
+        : cut.foreign
+          ? `Receipts before ${list[0]!.id} aren't listed: its link names record ${cut.at}, which belongs to another namespace or branch.`
+          : cut.linksTo === undefined
+            ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
+            : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
     }
     if (unloadable.length > 0) notes.push(`Receipt${unloadable.length === 1 ? '' : 's'} ${unloadable.join(', ')} can't be read and ${unloadable.length === 1 ? 'is' : 'are'} left out.`);
     return { branch, receipts, latestId, more, ...(notes.length > 0 ? { note: notes.join(' ') } : {}) };
@@ -842,9 +901,12 @@ export class FoldJournal {
 
   // --------------------------------------------------------------------------
 
-  private loadReceipt(id: string): FoldReceipt | null {
+  /** The receipt record `id` holds, or null; with `on`, only a receipt of this namespace on that branch. */
+  private loadReceipt(id: string, on?: BranchRef): FoldReceipt | null {
     const record = readRecord<AcceptedLayoutRecord>(this.store, id);
-    return isLayoutRecord(record) && record.receipt ? ({ ...record.receipt, id } as FoldReceipt) : null;
+    if (!isLayoutRecord(record) || !record.receipt) return null;
+    if (on && (record.ns !== this.namespace || branchKey(record.branch) !== branchKey(on))) return null;
+    return { ...record.receipt, id } as FoldReceipt;
   }
 
   private resolveBranch(index: StoreIndex, branch: FoldQuery['branch']): BranchRef | null {
@@ -854,7 +916,9 @@ export class FoldJournal {
       // As receipts name it: live or deleted, whatever its name now.
       const match = live.find((b) => b.id === branch.id && b.created === branch.created);
       if (match) return { id: match.id, name: match.name, created: match.created };
-      return this.branchState(index, branch)?.ref ?? null;
+      // A copy, as everywhere the journal hands out a branch it keeps.
+      const known = this.branchState(index, branch)?.ref;
+      return known ? copyBranch(known) : null;
     }
     const match = live.find((b) => b.name === branch);
     if (match) return { id: match.id, name: match.name, created: match.created };
@@ -867,7 +931,7 @@ export class FoldJournal {
       if (!state || !key.startsWith(`${this.namespace}\u0000`) || state.ref.name !== branch || state.newestReceipt === null) continue;
       if (!found || Number(state.newest.id) > Number(found.newest.id)) found = state;
     }
-    return found ? found.ref : null;
+    return found ? copyBranch(found.ref) : null;
   }
 
   private sourceFor(provenance: CompileProvenance): FoldReceiptSource {
@@ -877,7 +941,7 @@ export class FoldJournal {
       agent: this.source.agent ?? 'unknown',
       namespace: this.namespace,
       dataDirectory: this.source.dataDirectory ?? 'unknown',
-      branch: provenance.branch,
+      branch: copyBranch(provenance.branch),
     };
   }
 
@@ -972,12 +1036,16 @@ export class FoldJournal {
     draft: Omit<FoldReceipt, 'id'> | null,
   ): FoldReceipt | null {
     const key = branchKey(provenance.branch);
-    const next: StoredLayout = { members: layout.members, units: layout.units };
+    // What the journal keeps of an acceptance is its own copy, so a change to
+    // the caller's provenance afterwards, which its types forbid, can't reach
+    // the layout the next acceptance diffs against or the branch the index
+    // names.
+    const next: StoredLayout = { members: [...layout.members], units: layout.units.map(copyUnit) };
     const pr = branch?.newestReceipt ?? null;
     const base = {
       v: RECORD_VERSION as typeof RECORD_VERSION,
       ns: this.namespace,
-      branch: provenance.branch,
+      branch: copyBranch(provenance.branch),
       compileId: provenance.compileId,
       totalTokens: layout.totalTokens,
       ...(pr !== null ? { pr } : {}),

@@ -171,10 +171,10 @@ export interface CompileResult {
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */
 export interface BranchRef {
-  id: string;
-  name: string;
+  readonly id: string;
+  readonly name: string;
   /** Chronicle's creation timestamp; with `id`, the branch's identity. */
-  created: number;
+  readonly created: number;
 }
 
 /**
@@ -218,32 +218,36 @@ export type CompiledMessageSources =
 
 /**
  * One compile's provenance: the per-message sources (parallel to
- * `CompileResult.messages`) and the rendered layout. Immutable once
- * returned — callers carry it with the request it describes.
+ * `CompileResult.messages`) and the rendered layout. Callers carry it with
+ * the request it describes. Everything but `messages` is read-only:
+ * acceptance reads and records what it says, and the mark steers its search
+ * for an earlier acceptance, so a write to any of it before accepting changes
+ * what the journal records. The journal keeps its own copies, so nothing
+ * here is shared with it. The per-message sources are this compile's alone.
  */
 export interface CompileProvenance {
   /** Unique per compile. */
-  compileId: string;
+  readonly compileId: string;
   /** The context manager's namespace (its agent's state scope). */
-  namespace: string;
+  readonly namespace: string;
   /** The branch this compile read. Acceptance binds to it. */
-  branch: BranchRef;
+  readonly branch: BranchRef;
   /** Parallel to `CompileResult.messages`. */
   messages: CompiledMessageSources[];
   /**
    * The rendered layout, or null when the strategy does not report one
    * (see `ContextStrategy.renderedForms`). Opaque to callers.
    */
-  layout: RenderedLayout | null;
+  readonly layout: RenderedLayout | null;
   /** The active strategy's name. */
-  strategy: string;
+  readonly strategy: string;
   /**
    * Where the store's fold journal stood when this compile ran, so that
    * accepting it again finds its first acceptance without reading the whole
    * journal (see JournalMark). Absent or null, every record is read. Pass
    * the provenance back as you got it.
    */
-  journalMark?: JournalMark | null;
+  readonly journalMark?: JournalMark | null;
 }
 
 /**
@@ -256,8 +260,8 @@ export interface CompileProvenance {
  * every record is read.
  */
 export interface JournalMark {
-  recordId: string;
-  compileId: string;
+  readonly recordId: string;
+  readonly compileId: string;
 }
 
 /**
@@ -270,20 +274,20 @@ export interface JournalMark {
  * store's calibration multiplier), so they compare across compiles.
  */
 export interface RenderedLayout {
-  v: 2;
+  readonly v: 2;
   /** The view's message sequences, ascending: the layout's exact membership. */
-  members: number[];
+  readonly members: readonly number[];
   /** The members' message ids, parallel to `members`. In memory only: an
    *  accepted layout persists sequences, and receipts take ids from the
    *  compile being accepted. */
-  memberIds: MessageId[];
-  units: LayoutUnit[];
+  readonly memberIds: readonly MessageId[];
+  readonly units: readonly LayoutUnit[];
   /** Base-estimate tokens of everything this compile rendered. */
-  totalTokens: number;
+  readonly totalTokens: number;
   /** The store calibration multiplier when the compile ran. */
-  calibration: number;
+  readonly calibration: number;
   /** Why the strategy says this compile's layout changed, when it knows. */
-  cause?: string;
+  readonly cause?: string;
 }
 
 /**
@@ -294,7 +298,7 @@ export interface RenderedLayout {
  */
 export type LayoutUnit =
   /** One message rendered raw: its rendered tokens; `p` when the copy was partial. */
-  | { k: 'r'; t: number; p?: 1 }
+  | { readonly k: 'r'; readonly t: number; readonly p?: 1 }
   /**
    * `n` members rendered through these summaries, each as
    * `[id, level, method, partial, tokens]` (partial 1 when the summary's
@@ -302,9 +306,9 @@ export type LayoutUnit =
    * sorted by id. A summary that renders several units names its tokens in
    * each; comparisons count it once per side.
    */
-  | { k: 's'; n: number; sm: Array<[string, number, string, 0 | 1, number]> }
+  | { readonly k: 's'; readonly n: number; readonly sm: ReadonlyArray<readonly [string, number, string, 0 | 1, number]> }
   /** `n` members not rendered at all. */
-  | { k: 'o'; n: number };
+  | { readonly k: 'o'; readonly n: number };
 
 /**
  * Branch information.

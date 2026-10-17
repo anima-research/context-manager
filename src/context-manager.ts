@@ -1339,8 +1339,12 @@ export class ContextManager {
    * after an uncertain failure learns the outcome, and a receipt can come
    * back again (key on its id and compileId: a receipt lost to Chronicle's
    * rot exception can have its id go to a later receipt). A provenance of
-   * another namespace is refused with an error: accept a compile on the
-   * manager that compiled it.
+   * another namespace is refused with an error, and so is one whose branch
+   * this store doesn't know, live or recorded in this namespace, such as
+   * another store's: accept a compile on the manager that compiled it. So is
+   * a layout whose shape changed after compile returned it: members out of
+   * order, unit counts that aren't positive whole numbers adding up to the
+   * members, or not one id for each member.
    */
   acceptRound(args: {
     provenance: CompileProvenance;

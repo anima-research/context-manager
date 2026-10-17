@@ -595,7 +595,7 @@ describe('raw forms: the recall envelope', () => {
 
   it('the combined recall answer releases each answer\'s trailing reasoning before the separator after it', () => {
     class Exposed extends AutobiographicalStrategy {
-      combined(entries: SummaryEntry[]): ContentBlock[] { return this.combinedRecallAnswerContent(entries, 0); }
+      combined(entries: SummaryEntry[]): ContentBlock[] { return this.renderCombinedRecallAnswer(entries, 0).content; }
     }
     const trailing = { type: 'redacted_thinking', data: 'opaque-2', rawItem: { type: 'reasoning', id: 'rs_2', encrypted_content: 'opaque-2' } } as ContentBlock;
     const first = { ...summary, id: 'L1-1', responseContent: [itemText('first answer'), trailing] };

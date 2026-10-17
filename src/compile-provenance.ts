@@ -240,14 +240,14 @@ export function buildRenderedLayout(opts: {
 
   const members: number[] = [];
   const memberIds: MessageId[] = [];
-  const units: LayoutUnit[] = [];
+  // The layout's units are read-only once returned; here each run grows.
+  const units: Array<Growing<LayoutUnit>> = [];
   for (const msg of opts.view) {
     members.push(msg.sequence);
     memberIds.push(msg.id);
     if (rawTokens.has(msg.id)) {
-      const unit: LayoutUnit = { k: 'r', t: Math.round(rawTokens.get(msg.id)!) };
-      if (opts.rawComplete.get(msg.id) === false) unit.p = 1;
-      units.push(unit);
+      const t = Math.round(rawTokens.get(msg.id)!);
+      units.push(opts.rawComplete.get(msg.id) === false ? { k: 'r', t, p: 1 } : { k: 'r', t });
       continue;
     }
     const last = units[units.length - 1];
@@ -283,6 +283,9 @@ export function buildRenderedLayout(opts: {
     ...(opts.cause ? { cause: opts.cause } : {}),
   };
 }
+
+/** A union's members with their properties writable, for a unit whose run is still growing. */
+type Growing<T> = T extends unknown ? { -readonly [K in keyof T]: T[K] } : never;
 
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);

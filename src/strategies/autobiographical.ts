@@ -125,7 +125,7 @@ const COMPRESSION_MARKER =
 /**
  * The interstitial text between two summaries in the legacy combined recall
  * answer (`positionedRecallPairs: false`). Hoisted out of
- * `combinedRecallAnswerContent` because the shared-budget path must PRICE it
+ * `renderCombinedRecallAnswer` because the shared-budget path must PRICE it
  * before deciding whether the next summary can be admitted, and the tests that
  * pin that arithmetic derive their caps from this same string: one source of
  * truth for the separator's bytes, and therefore for its cost.
@@ -13589,32 +13589,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * `summaryAnswerContent` under a `maxMessageTokens` cap: the cap is spent on
-   * the PROSE, and the envelope is applied to what survives.
-   *
-   * Ordering is the whole point. Truncating an enveloped answer retains a
-   * prefix and appends the truncator's own marker, which drops the closing
-   * tag and — under a cap smaller than the opener — emits a half-written one:
-   * a delimiter convention that sometimes lies is worse than no convention,
-   * because the reader learns to distrust the tags that ARE intact. Wrapping
-   * last makes opener and closer survive every cap by construction.
-   *
-   * The envelope is therefore NOT charged against `maxMessageTokens`; a
-   * capped enveloped answer runs over the cap by its own tag text. That is
-   * the same soft-cap overshoot the truncator already takes for granted — it
-   * appends its `[truncated — original was N tokens]` marker AFTER spending
-   * the budget — and the envelope is priced where the accounting is load
-   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
-   * the render is opener + whatever prose the cap bought + marker + closer:
-   * never an empty envelope, never a torn one.
-   */
-  protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
-    const prose = this.liveWindowAnswerProse(summary);
-    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
-    return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
-  }
-
-  /**
    * The legacy combined recall answer (`positionedRecallPairs: false`): every
    * selected summary concatenated into one assistant turn with `---`
    * separators, under a single `maxMessageTokens` cap.
@@ -13637,18 +13611,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * spends past the cap by the separator's own width plus whatever prose the
    * exhausted budget still bought, which is how one shared cap stops being
    * shared.
-   */
-  protected combinedRecallAnswerContent(
-    summaries: SummaryEntry[],
-    maxTokens: number,
-  ): ContentBlock[] {
-    return this.renderCombinedRecallAnswer(summaries, maxTokens).content;
-  }
-
-  /**
-   * The combined recall answer together with what of it survived the cap:
-   * each summary whose prose reached the answer, marked `partial` when its
-   * prose was cut. A summary the cap dropped entirely is not listed, so the
+   *
+   * Returns the answer together with what of it survived the cap: each
+   * summary whose prose reached the answer, marked `partial` when its prose
+   * was cut. A summary the cap dropped entirely is not listed, so the
    * rendered layout never claims history is represented by a summary the
    * resident was not shown.
    */
@@ -13740,7 +13706,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { content, refs };
   }
 
-  /** A single recall answer under the cap, with its layout reference. */
+  /**
+   * A single recall answer for the live window, with its layout reference:
+   * `liveWindowAnswerProse` cut to a `maxMessageTokens` cap, then wrapped in
+   * the recall envelope. The cap is spent on the PROSE, and the envelope is
+   * applied to what survives.
+   *
+   * Ordering is the whole point. Truncating an enveloped answer retains a
+   * prefix and appends the truncator's own marker, which drops the closing
+   * tag and — under a cap smaller than the opener — emits a half-written one:
+   * a delimiter convention that sometimes lies is worse than no convention,
+   * because the reader learns to distrust the tags that ARE intact. Wrapping
+   * last makes opener and closer survive every cap by construction.
+   *
+   * The envelope is therefore NOT charged against `maxMessageTokens`; a
+   * capped enveloped answer runs over the cap by its own tag text. That is
+   * the same soft-cap overshoot the truncator already takes for granted — it
+   * appends its `[truncated — original was N tokens]` marker AFTER spending
+   * the budget — and the envelope is priced where the accounting is load
+   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
+   * the render is opener + whatever prose the cap bought + marker + closer:
+   * never an empty envelope, never a torn one.
+   */
   protected renderSummaryAnswer(
     summary: SummaryEntry,
     maxTokens: number,
