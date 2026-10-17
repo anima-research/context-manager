@@ -645,10 +645,23 @@ export interface RenderStats {
     budgetMet: boolean;
     exhausted: boolean;
     moves: number;
+    /** Stored messages on the branch this compile read: the listing the
+     *  strategy chunked, before any folding. Logged as `messages=`, so a
+     *  compile time can be read against the history size it covered. Optional
+     *  so a custom strategy's stats still type-check. */
+    messages?: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Wall time of the strategy's `select()` for this compile, in whole ms:
+     *  chunk rebuild, planning (the fold solver) and emission. Logged on the
+     *  `[plan-vs-actual]` line as `compileMs=`, so a solver change is
+     *  measurable from a production journal alone. */
+    compileMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve
+     *  and latent-demand ranking inside `compileMs`, in whole ms (`solveMs=`). */
+    solveMs?: number;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a

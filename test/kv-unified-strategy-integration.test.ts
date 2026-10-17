@@ -651,6 +651,41 @@ test('a usage report inside the calibration dead band keeps the kv-unified fores
   manager.close();
 });
 
+test('every compile stamps its own elapsed time on plan-vs-actual, with the kv-unified solve inside it', async () => {
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  const added = ['time me', 'timing you', 'and again'];
+  for (const [i, text] of added.entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const pva = manager.getRenderStats()!.planVsActual!;
+  assert.equal(pva.messages, added.length, 'messages= is the number of stored messages the compile read');
+  assert.ok(Number.isInteger(pva.compileMs) && pva.compileMs! >= 0, `compileMs=${pva.compileMs}`);
+  assert.ok(Number.isInteger(pva.solveMs) && pva.solveMs! >= 0, `solveMs=${pva.solveMs}`);
+  assert.ok(pva.solveMs! <= pva.compileMs!, `solveMs=${pva.solveMs} exceeds compileMs=${pva.compileMs}`);
+  manager.close();
+});
+
+test('the production shadow pick leaves plan-vs-actual on the live kv-unified solve', async () => {
+  const selected = strategy({ productionBudgetTokens: 50 });
+  const internals = selected as unknown as {
+    buildPicker: (...args: unknown[]) => unknown;
+    _lastKvUnified: unknown;
+  };
+  const built: unknown[] = [];
+  const buildPicker = internals.buildPicker.bind(selected);
+  internals.buildPicker = (...args) => {
+    const picker = buildPicker(...args);
+    built.push(internals._lastKvUnified);
+    return picker;
+  };
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'live and shadow' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(built.length, 2, 'control: the live pick and the shadow pick each built a kv-unified solver');
+  assert.notEqual(built[0], built[1]);
+  assert.equal(internals._lastKvUnified, built[0], 'the live solver, not the shadow one, backs the stats');
+  manager.close();
+});
+
 test('the hysteresis certificate is on unless the recipe says false', async () => {
   // A kvUnified block without the key certifies the carried layout on an
   // append; the same block with `hysteresisCertificate: false` runs the full
