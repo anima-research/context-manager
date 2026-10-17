@@ -723,7 +723,8 @@ One solve, every turn. One hard constraint. Cache is a *priced quantity*, never
 an eligibility rule.
 
 ```
-build       ideal = relevanceCut(tree, target, W)   -- pure relevance, no P anywhere
+build       ideal = relevanceCut(tree, target, W, base)   -- pure relevance, no P anywhere;
+                                                      -- base = carried frontier (seedFromCarried, default) or raw
 reconcile   hold F_prev | adopt ideal | adopt a suffix of ideal | override
 subject to  render(F) ≤ W·(1+grace)   -- the enforced wall (see below)
             perturbation(F, F_prev) ≤ P   -- trust region: soft, default-on,
@@ -859,8 +860,10 @@ As shipped (`planControlledFrontier`, `kv-control.ts` — regenerated rev 5.1):
 
 ```
 solve(tree, F_prev, W, P):
-  ideal = relevanceCut(tree, target, W)
-      -- from scratch, no P anywhere:
+  ideal = relevanceCut(tree, target, W, base)
+      -- base = the carried frontier (`kvStableSeedFromCarried`, default true;
+      --   raw on bootstrap or when false), with an inverted carried profile
+      --   lowered first so it re-folds in fold order; no P anywhere:
       -- phase A: fold in salience-then-age priority order, level-by-level,
       --   under the shape prior, toward the target;
       -- phase B: if still over W, keep folding past the prior (never past
@@ -916,7 +919,13 @@ small, and the solve is indistinguishable from the old polite pass — nothing
 is legislated. The old behaviors (dead band, reach, emergency) are all regions
 of one parameter space instead of three code paths. A from-scratch solve is
 age/salience-monotone **by construction** (fold order = priority order), so
-the inversion class of bug cannot be produced.
+the inversion class of bug cannot be produced by it. A carried-seeded solve
+(the default since `kvStableSeedFromCarried`) inherits the carried profile,
+so an inverted carried profile is lowered to the older level before the
+phases run and re-folds in fold order; monotone over-depth is kept — that
+retained depth is the hysteresis, and when a budget raise would make the
+seeded plan pay ≥ 90% of a from-scratch re-read anyway, the from-scratch cut
+is taken (`seedingReleased`).
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns

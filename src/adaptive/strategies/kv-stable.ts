@@ -62,6 +62,9 @@ export interface KvStableOptions {
   goalTargetTokens?: number;
   /** Enforce reach as a hard transition pace instead of allowing quality overrides. */
   strictReach?: boolean;
+  /** Seed the ideal cut from the carried frontier (hysteresis at band
+   *  boundaries; see `planControlledFrontier`). Default true. */
+  seedFromCarried?: boolean;
 }
 
 export class KvStableStrategy implements FoldingSolver {
@@ -152,6 +155,7 @@ export class KvStableStrategy implements FoldingSolver {
       reachTokens: this.opts.reachTokens,
       strictReach: this.opts.strictReach,
       qualityGapRatio: this.opts.qualityGapRatio,
+      seedFromCarried: this.opts.seedFromCarried,
       rawZone,
       frozen,
       fixedLevels,

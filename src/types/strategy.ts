@@ -1390,6 +1390,21 @@ export interface AutobiographicalConfig {
   kvStableQualityGapRatio?: number;
 
   /**
+   * For `foldingStrategy: 'kv-stable'`: seed each turn's ideal cut from the
+   * carried frontier instead of from raw. Phases A/B then only deepen what is
+   * carried (same salience-then-oldest, level-by-level order) and only phase
+   * C — youngest position first — un-folds, so a deep group that a newly
+   * produced mid-level summary made unnecessary is kept until the seam runs
+   * out of headroom, rather than raised now and re-deepened when growth
+   * crosses W (each direction a front edit; measured 7 round trips in 3 days
+   * on one resident). An inverted carried profile is still lowered to the
+   * older level so phase A re-folds it in its own order (ascending salience,
+   * then oldest) and the quality-gap self-heal keeps working. Default true;
+   * `false` restores the from-scratch relevance ideal of design §13.4.
+   */
+  kvStableSeedFromCarried?: boolean;
+
+  /**
    * Slack ratio (hysteresis) for the picker. The picker folds until total
    * tokens ≤ budget * (1 - slack), and stays quiet while between slack
    * and budget. Default 0.1.

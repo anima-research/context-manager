@@ -919,8 +919,8 @@ Bedrock return equivalent receipts for equivalent normalized requests.
 | W (`contextBudgetTokens`) | existing | existing | the wall |
 
 Retired when active: `foldDepthCap` path, `compressionSlackRatio`,
-`kvStableReachTokens`, `kvStableQualityGapRatio`, phases A/B/C, branch
-cascade. `mergeThreshold` remains (merge fanout only — its fade-rate double
+`kvStableReachTokens`, `kvStableQualityGapRatio`, `kvStableSeedFromCarried`,
+phases A/B/C, branch cascade. `mergeThreshold` remains (merge fanout only — its fade-rate double
 duty ends). All existing estimator, byte-wall, and production knobs are
 consumed unchanged.
 
