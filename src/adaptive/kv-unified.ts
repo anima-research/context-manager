@@ -329,11 +329,14 @@ function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolea
  * below the pinned one (raw when it supplies none). A pinned level exists only
  * once compression and merging have produced it over the leaf, and until then
  * the pin keeps the leaf finer than asked rather than making every compile
- * infeasible. The hold relaxes only that. A pin that another constraint on the
- * leaf contradicts at the pinned level, such as a lock at another level, isn't
- * held, so the two conflict whether or not the pinned level exists yet. Null
- * when the leaf has no level pin, its chain supplies the pinned level, or
- * another constraint contradicts it.
+ * infeasible. The hold relaxes only that, so it applies only where every other
+ * constraint on the leaf allows both the pinned level and the level held at.
+ * A pin another constraint contradicts, such as a lock at another level, isn't
+ * held, so the two conflict whether or not the pinned level exists yet; nor is
+ * one whose held level another constraint excludes, such as a floor above it,
+ * so the conflict names the pinned level, which would clear it. Null when the
+ * leaf has no level pin, its chain supplies the pinned level, or another
+ * constraint rules the hold out.
  */
 function levelPinHold(
   constraints: readonly CanonicalLeafConstraint[],
@@ -341,11 +344,11 @@ function levelPinHold(
 ): { level: number; heldAt: number } | null {
   const pin = constraints.find((constraint) => constraint.source === PIN_LEVEL_SOURCE);
   const level = pin?.level;
-  if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
-  if (!constraints.every((other) => other === pin || admitsLevel(other, level))) return null;
+  if (level === undefined || availableLevels.includes(level)) return null;
   let heldAt = 0;
   for (const candidate of availableLevels) if (candidate < level && candidate > heldAt) heldAt = candidate;
-  return { level, heldAt };
+  const allowsHold = (other: CanonicalLeafConstraint) => admitsLevel(other, level) && admitsLevel(other, heldAt);
+  return constraints.every((other) => other === pin || allowsHold(other)) ? { level, heldAt } : null;
 }
 
 /** A leaf held below its level pin: the pinned level and the level it is

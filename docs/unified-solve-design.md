@@ -186,7 +186,11 @@ Binary x_v per node. Constraints:
   covering L2). Pin admission control is the *caller's* job (memory-tools
   spec §5); the solver's job is to honor pins absolutely or report
   infeasibility — **a pin is never silently violated.** The one exception,
-  F4b's hold of a level pin whose level isn't produced yet, is logged.
+  F4b's hold of a level pin whose level isn't produced yet, is logged. (A
+  pin over a message in the head or tail zone, the recent window included,
+  adds no restriction while the message is there: the zone keeps it raw, as
+  it did before #193, and the pin applies once the message is in the folded
+  middle.)
 - **F4b constraint composition: intersect, never pick a winner (review-3
   §1).** Pins and locks are absolute; precedence would silently violate one
   of them even if logged. Canonicalization builds, per live leaf,
@@ -204,9 +208,11 @@ Binary x_v per node. Constraints:
   no level there. A pinned level is reached only as compression and merging
   produce it, and refusing every compile until then made a pin able to stop
   an agent. The hold relaxes only that, so it applies only while every other
-  restriction on the leaf allows p itself: a lock at another level conflicts
-  with the pin whether or not p is produced yet, rather than agreeing with
-  the held level until a merge produces p.
+  restriction on the leaf allows both p and the level the leaf is held at: a
+  lock at another level conflicts with the pin whether or not p is produced
+  yet, rather than agreeing with the held level until a merge produces p, and
+  a floor above the held level makes the pin strict again, so the conflict
+  names p as the level to produce.
   **Empty intersection = infeasible**: the certificate (§9) reports the
   conflicting constraints and leaf ids. Apart from that hold, no constraint
   is weakened, clamped, or selected inside the solver: a lock and every

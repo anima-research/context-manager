@@ -1517,8 +1517,8 @@ export class ContextManager {
    * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
    * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
-   * resolution, where a message no summary supplies that level over yet is
-   * held at the deepest level below it that one does (see
+   * resolution (under kv-unified, a message no summary supplies that level
+   * over yet is held at the deepest level below it that one does; see
    * `ProtectedRange.level`); under
    * any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see

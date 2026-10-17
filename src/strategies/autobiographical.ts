@@ -2463,11 +2463,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
    * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
-   * and `'kv-unified'` with adaptive resolution, where a message no summary
-   * supplies that level over yet is held at the deepest level below it that
-   * one does (see `ProtectedRange.level`); under any other selector the
-   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
-   * L1 compression prompt where its budgets allow (see
+   * and `'kv-unified'` with adaptive resolution (under kv-unified, a message
+   * no summary supplies that level over yet is held at the deepest level
+   * below it that one does; see `ProtectedRange.level`); under any other
+   * selector the range is raw (`resolvedPinBounds`), in the live view and
+   * in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`).
    * Equivalent to `pinRange(first, last, { level })`.
    */
@@ -10645,8 +10645,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * middle) or the pin gone. A message counts toward a pin only when that
    * pin's level is the one its bound took (`resolvedPinBounds`). The record
    * starts over with each open and branch switch (`clearBranchMirrors`), so a
-   * pin still held then is reported again, and a refused compile, which
-   * presents nothing, reports nothing: its error names the cause.
+   * pin still held then is reported again. It reports what the solve found,
+   * before the frontier is presented: a compile the solver refuses reports
+   * nothing, since its error names the cause, and one refused after the
+   * solve, such as over budget, has already reported the holds its solve made.
    */
   private reportHeldLevelPins(forest: CanonicalSummaryForest, messages: StoredMessage[]): void {
     const held = new Map<MessageId, { level: number; heldAt: number }>();
