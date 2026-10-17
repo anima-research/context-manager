@@ -775,7 +775,7 @@ export interface AutobiographicalConfig {
    */
   witnessedInstruction?: string;
   /**
-   * Identity reminder appended to every compression and merge instruction
+   * Identity reminder appended to compression and merge instructions
    * (L1 chunk, reading-mode, and all merge variants). Whether a compression
    * request carries a system prompt is the HOST's call: with none declared
    * (StrategyContext.systemPrompt unset) it carries none and identity is
@@ -794,8 +794,49 @@ export interface AutobiographicalConfig {
    * <name>. Speak in the first person only for what you yourself said,
    * did, and felt; attribute other participants' words and experiences to
    * them by name."
+   *
+   * A wholly inherited target (see `witnessedBeforeSequence`) takes
+   * `witnessedIdentityReminder` instead, when that is set.
+   *
+   * For guidance the memory should follow without quoting it, end the
+   * reminder by asking for that, e.g. "Apply this guidance silently. Do not
+   * quote, restate, or recite it in the memory. Begin with the substantive
+   * record."
    */
   identityReminder?: string;
+  /**
+   * Identity reminder for WHOLLY inherited targets: an L1 chunk entirely
+   * before `witnessedBeforeSequence`, or a merge whose every source is
+   * witnessed. When set (a blank value counts as unset), those targets use
+   * it instead of `identityReminder`. Every other target keeps
+   * `identityReminder`, including a mixed one: a chunk that spans the pin,
+   * or a merge of inherited and lived sources. A mixed target's request
+   * shows inherited and lived material together under the live instruction
+   * and reminder, with no label saying which is which, so the live reminder
+   * (after a rename, the new name's) reaches the inherited material there.
+   * When the split rung (`compressionSplitFallback`) folds a chunk in
+   * pieces, every piece takes its chunk's instruction and reminder, so a
+   * piece of a mixed chunk takes the live ones even when its own messages
+   * all predate the pin.
+   *
+   * The protection is opt-in. With only `identityReminder` set, it is
+   * appended, current name included, to wholly inherited targets too, so an
+   * inherited-history migration should set this explicitly.
+   *
+   * For residents whose Chronicle begins with reviewed inherited history,
+   * the inherited reminder can stay frozen (it was reviewed with the import)
+   * while the live one stays neutral and revisable by the resident.
+   *
+   * A wholly inherited reading-mode target (a portion of a much larger
+   * message, or a merge of portions of one) gets this reminder after the
+   * reading instruction, which has no witnessed variant: it asks the agent
+   * to speak in its own voice as the reader. The split rung's pieces and a
+   * merge retried after a refusal take the witnessed instruction instead of
+   * the reading one.
+   *
+   * Unset: every target uses `identityReminder` (unchanged behavior).
+   */
+  witnessedIdentityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
 

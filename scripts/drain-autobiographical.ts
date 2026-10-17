@@ -87,6 +87,7 @@ const passthroughKeys = [
   'compressionRecallBudgetTokens',
   'summaryTargetTokens',
   'identityReminder',
+  'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
 ] as const;

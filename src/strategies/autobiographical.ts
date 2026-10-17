@@ -6496,6 +6496,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       docContext
         ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
         : this.getCompressionInstruction(chunk, targetTokens),
+      this.chunkIsWitnessed(chunk),
     );
     // Generous output ceiling so a memory-write is never truncated mid-thought:
     // targetTokens is a *target*, not a cap, and adaptive models routinely
@@ -7511,7 +7512,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const msgs = [
               { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
               ...subset.map((m) => ({ participant: m.participant, content: stripThinkingBlocks(m.content) })),
-              { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
+              { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target), this.chunkIsWitnessed(chunk)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
             // runAttempt prepares this request before dispatch and trace hashing.
@@ -8544,6 +8545,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               targetTokens,
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
+      // Only a merge whose every source is witnessed takes the witnessed
+      // reminder. A mixed merge takes the live instruction and reminder, and
+      // its request shows inherited and lived material together, with no
+      // label saying which is which. The sources' witnessed stamps decide
+      // this predicate, the merge instruction and the new summary's stamp;
+      // the request never shows them.
+      sources.length > 0 && sources.every((s) => s.witnessed),
     );
     if (mergeSourceOnly) {
       mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
@@ -11489,14 +11497,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Append the configured identity reminder (if any) to a compression or
-   * merge instruction. Applied at the two llmMessages call sites (L1 chunk
-   * and merge) rather than inside the format functions so subclass
+   * merge instruction. Applied at the llmMessages call sites (L1 chunk,
+   * split L1, and merge) rather than inside the format functions so subclass
    * instruction overrides are covered too. See
    * `AutobiographicalConfig.identityReminder` for rationale (identity flip
    * over pure-witness chunks in multi-resident channels).
+   *
+   * `witnessed`: the target is WHOLLY inherited record (an L1 chunk entirely
+   * before witnessedBeforeSequence, or a merge whose every source is
+   * witnessed). Such targets use `witnessedIdentityReminder` when one is
+   * configured. Every other target uses `identityReminder`, including a
+   * mixed one (a chunk that spans the pin, or a merge of inherited and
+   * lived sources), whose request shows both kinds of material under the
+   * live reminder with no label saying which is which.
    */
-  protected applyIdentityReminder(instruction: string): string {
-    const reminder = this.config.identityReminder?.trim();
+  protected applyIdentityReminder(instruction: string, witnessed = false): string {
+    const reminder = (witnessed && this.config.witnessedIdentityReminder?.trim())
+      ? this.config.witnessedIdentityReminder.trim()
+      : this.config.identityReminder?.trim();
     return reminder ? `${instruction}\n\n${reminder}` : instruction;
   }
 
