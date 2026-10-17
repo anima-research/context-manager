@@ -1,6 +1,6 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, getMintRequestPreimageBytes } from '../src/index.js';
@@ -24,12 +24,23 @@ function texts(req: NormalizedRequest): string[] {
   return req.messages.flatMap((m) => m.content.filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text').map((b) => b.text));
 }
 
-/** Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever. */
-function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same' }) {
+/**
+ * Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever.
+ * `refusedDetails` gives each refusal details.usage: with both cache counts (5 written, 11 read),
+ * with cache reads alone, or with input and output and no cache counts.
+ */
+function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same'; refusedDetails?: boolean | 'reads-only' | 'no-cache' }) {
   let leaf = 0;
   const calls: NormalizedRequest[] = [];
+  /** How many target messages each refused request carried, so a test can tell the split's own refusals. */
+  const refusedTargets: number[] = [];
+  const refusedCache = opts.refusedDetails === 'reads-only' ? { cacheReadTokens: 11 }
+    : opts.refusedDetails === 'no-cache' ? {}
+    : { cacheCreationTokens: 5, cacheReadTokens: 11 };
   return {
     calls,
+    refusedTargets,
+    leaves: () => leaf,
     membrane: {
       complete: async (request: NormalizedRequest) => {
         calls.push(structuredClone(request));
@@ -37,7 +48,9 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
         if (opts.throwOn !== undefined && targets.length === 1 && targets[0]!.startsWith(opts.throwOn)) throw new Error('transport-down');
         const refuse = targets.length >= opts.refuseAt || (opts.alwaysRefuse !== undefined && targets.some((t) => t.startsWith(opts.alwaysRefuse!)));
         if (refuse) {
+          refusedTargets.push(targets.length);
           return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 },
+            ...(opts.refusedDetails ? { details: { usage: { inputTokens: 100, outputTokens: 0, ...refusedCache } } } : {}),
             raw: { response: { stop_details: { category: 'bio' } } } };
         }
         const which = targets.map((t) => t.split(' ')[0]).join('+');
@@ -53,7 +66,7 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
 class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   details() { return (this as unknown as { lastSplitDetails?: { usage: Record<string, unknown>; model: { actual: string; provider: string }; cache: { tokensCreated: number; tokensRead: number; hitRatio: number } } }).lastSplitDetails; }
-  attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } }).lastSplitAttempted; }
+  attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number; complete: boolean } }).lastSplitAttempted; }
   entries(): SummaryEntry[] { return (this as unknown as { summaries: SummaryEntry[] }).summaries; }
 }
 function managerContext(manager: ContextManager): StrategyContext {
@@ -295,6 +308,109 @@ describe('split-stitch L1 fallback', () => {
     assert.ok(d.cache.hitRatio > 0 && d.cache.hitRatio < 1, 'aggregate hit ratio computed from summed counts');
     const disc = d.usage.discardedAttempts as { attempts: number };
     assert.ok(disc.attempts >= 1, 'refused leaves counted as discarded attempts');
+  });
+
+  /** The split's own refusals: refused requests over part of the four-message chunk, not all of it. */
+  const splitRefusals = (stub: { refusedTargets: number[] }) => stub.refusedTargets.filter((k) => k < 4).length;
+  const cacheOf = (o: { cacheCreationTokens?: number; cacheReadTokens?: number } | undefined) => ({ cacheCreationTokens: o?.cacheCreationTokens, cacheReadTokens: o?.cacheReadTokens });
+
+  it('discarded attempts carry the cache counts the discarded calls reported', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const refused = splitRefusals(stub);
+    assert.ok(refused >= 1, 'the split refused some of its own requests');
+    assert.equal(fx.strategy.attempted()!.refused, refused);
+    const d = fx.strategy.details()!;
+    // The stitched usage is the four successful leaves' (4×7 written, 4×3 read),
+    // and what the split's refused requests reported (5 written, 11 read each)
+    // is the discarded spend's.
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: 28, cacheReadTokens: 12 });
+    assert.deepEqual(cacheOf(d.usage.discardedAttempts as object), { cacheCreationTokens: refused * 5, cacheReadTokens: refused * 11 });
+  });
+
+  it('discarded attempts carry the refused calls\' cache counts when no successful leaf reported any', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const refused = splitRefusals(stub);
+    const d = fx.strategy.details()!;
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: undefined, cacheReadTokens: undefined }, 'no successful leaf reported cache counts');
+    assert.deepEqual(cacheOf(d.usage.discardedAttempts as object), { cacheCreationTokens: refused * 5, cacheReadTokens: refused * 11 });
+  });
+
+  it('discarded attempts carry no cache counts when only the successful leaves reported them', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, leafDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const d = fx.strategy.details()!;
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: 28, cacheReadTokens: 12 });
+    const disc = d.usage.discardedAttempts as { attempts: number };
+    assert.ok(disc.attempts >= 1);
+    assert.equal('cacheCreationTokens' in disc, false, 'no discarded call reported any, so no zero stands in for one');
+    assert.equal('cacheReadTokens' in disc, false);
+  });
+
+  it('a discarded call that reports only cache reads counts them', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: 'reads-only' });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // The pair appears together, as on the stitched usage.
+    assert.deepEqual(cacheOf(fx.strategy.details()!.usage.discardedAttempts as object), { cacheCreationTokens: 0, cacheReadTokens: splitRefusals(stub) * 11 });
+  });
+
+  it('no cache counts appear anywhere when no call reported any', async () => {
+    // The refusals carry details.usage, with input and output and no cache counts.
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: 'no-cache' });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const d = fx.strategy.details()!;
+    const disc = d.usage.discardedAttempts as { attempts: number };
+    assert.ok(disc.attempts >= 1);
+    const places: Array<[string, object]> = [
+      ['discardedAttempts', disc],
+      ['the stitched usage', d.usage],
+      ['attempted', fx.strategy.attempted()!],
+      ['the split metadata', (fx.strategy.entries()[0]!.stitched as { attempted: object }).attempted],
+    ];
+    for (const [where, value] of places) {
+      assert.equal('cacheCreationTokens' in value, false, `${where} has no cacheCreationTokens`);
+      assert.equal('cacheReadTokens' in value, false, `${where} has no cacheReadTokens`);
+    }
+  });
+
+  it('the split metadata and both split-stitch log events carry the attempted cache sums', async () => {
+    const logPath = `${freshPath()}-trace.jsonl`;
+    paths.push(logPath);
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    try {
+      const landed = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true });
+      const fx = await build(landed.membrane, { split: true });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      // A run abandoned at its last single message, after the others folded.
+      const abandoned = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true, throwOn: 'raw-3' });
+      const fy = await build(abandoned.membrane, { split: true });
+      await fy.strategy.run(fy.target, managerContext(fy.manager));
+
+      // Every completed call: the successful leaves' 7 written and 3 read, the refusals' 5 and 11.
+      const sums = (stub: ReturnType<typeof cumulativeMembrane>) => ({
+        cacheCreationTokens: stub.leaves() * 7 + splitRefusals(stub) * 5,
+        cacheReadTokens: stub.leaves() * 3 + splitRefusals(stub) * 11,
+      });
+      const events = readFileSync(logPath, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; metadata?: { attempted?: { cacheCreationTokens?: number; cacheReadTokens?: number } } });
+      const landedEvent = events.find((e) => e.event === 'compression:split-stitch');
+      const abandonedEvent = events.find((e) => e.event === 'compression:split-stitch-abandoned');
+      assert.ok(landedEvent && abandonedEvent, 'both runs logged their split-stitch event');
+      assert.ok(splitRefusals(abandoned) >= 1 && abandoned.leaves() >= 1, 'the abandoned run completed calls of both kinds first');
+      assert.deepEqual(cacheOf(landedEvent.metadata?.attempted), sums(landed));
+      assert.deepEqual(cacheOf((fx.strategy.entries()[0]!.stitched as { attempted: object }).attempted), sums(landed));
+      assert.deepEqual(cacheOf(abandonedEvent.metadata?.attempted), sums(abandoned));
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
   });
 
   it('model identity is unanimous only when every successful leaf reported it; present/missing mix is "mixed"', async () => {
