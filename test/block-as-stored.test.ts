@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { BlobManager, ContextManager, PassthroughStrategy, blockAsStored } from '../src/index.js';
+import { BlobManager, ContextManager, MessageStore, PassthroughStrategy, blockAsStored } from '../src/index.js';
 
 const STORE = './test-block-as-stored';
 function cleanup(): void {
@@ -112,32 +112,44 @@ describe('blockAsStored', () => {
     assert.equal(raw.ref.originalType, 'image');
   });
 
-  it('relabels on read a reference an older release wrote under the wrong type', async () => {
-    // Older releases wrote the declared label into the reference. Build one by hand: the store keeps a
-    // blob_ref as given, and the read side relabels it from the bytes.
+  /** Store a message holding `ref`, a block or several, as an older release stored one, past the write, which refuses a blob_ref now. */
+  function storeLegacyReference(ref: (hash: string) => unknown, mediaType: string): void {
     const store = JsStore.openOrCreate({ path: STORE });
-    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/jpeg');
+    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), mediaType);
+    MessageStore.register(store);
+    store.appendToStateJsonWithIdentity('messages', { participant: 'user', content: [ref(hash)].flat(), timestamp: Date.now() }, 'id', 'sequence');
     store.close();
-    const legacy = { type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } } as unknown as ContentBlock;
+  }
+
+  it('relabels on read a reference an older release wrote under the wrong type', async () => {
+    // Older releases wrote the declared label into the reference, and the read side relabels it from the bytes.
+    storeLegacyReference((hash) => ({ type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } }), 'image/jpeg');
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
-    const id = manager.addMessage('user', [legacy]);
-    const back = manager.getMessage(id)!.content[0];
+    const back = manager.getAllMessages()[0]!.content[0];
     manager.close();
     assert.deepStrictEqual(back, { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
   });
 
-  it('a reference of an unknown original type fails its read, naming the type', async () => {
-    const store = JsStore.openOrCreate({ path: STORE });
-    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/png');
-    store.close();
-    const odd = { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } } as unknown as ContentBlock;
-    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+  it('leaves out of its read a reference of an unknown original type, naming the type, and reads one with no media type as before', async () => {
+    storeLegacyReference((hash) => [
+      { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } },
+      { type: 'blob_ref', ref: { hash, originalType: 'image' } },
+    ], 'image/png');
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    let manager: ContextManager | undefined;
     try {
-      const id = manager.addMessage('user', [odd]);
-      assert.throws(() => manager.getMessage(id), /Blob reference of unknown original type: "hologram"/);
+      manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+      // The first reference is left out, where every read of it threw, and the second, of an image
+      // whose reference has no media type, reads relabelled from its bytes, as before.
+      assert.deepEqual(manager.getAllMessages()[0]!.content, [{ type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } }]);
+      await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
     } finally {
-      manager.close();
+      console.error = original;
+      manager?.close();
     }
+    assert.ok(lines.some((line) => line.includes('(content[0].ref.originalType is "hologram", not image, document, audio or video)')), lines.join('\n'));
   });
 
   it('throws for a block the store refuses, and for a blob_ref, rather than return a form the store would not give back', async () => {
@@ -145,16 +157,58 @@ describe('blockAsStored', () => {
     const untypedUnsniffable = { type: 'image', source: { type: 'base64', data: b64(AVIF) } } as unknown as ContentBlock;
     const noData = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } } as unknown as ContentBlock;
     const ref = { type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } } as unknown as ContentBlock;
-    assert.throws(() => blockAsStored(untypedDocument), /document block without a media type has no stored form/);
-    assert.throws(() => blockAsStored(untypedUnsniffable), /image block without a media type its bytes supply has no stored form/);
-    assert.throws(() => blockAsStored(noData), /audio block whose data the store can't read as base64 has no stored form/);
-    assert.throws(() => blockAsStored(ref), /blob_ref reads back as the media it references/);
-    // The store refuses the same blocks on write.
+    const urlDocument = { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } } as unknown as ContentBlock;
+    // Data that isn't a string, whose bytes carry no signature the store reads.
+    const untypedUnsniffableBytes = { type: 'image', source: { type: 'base64', data: Buffer.from(AVIF, 'hex') } } as unknown as ContentBlock;
+    const refusals: Array<[ContentBlock, string]> = [
+      [untypedDocument, 'source.mediaType is undefined, not a string'],
+      [untypedUnsniffable, "source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
+      [untypedUnsniffableBytes, "source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
+      [noData, 'source.data is undefined, not base64 data'],
+      [urlDocument, 'source.data is undefined, not base64 data; content[0].source.mediaType is undefined, not a string'],
+    ];
+    // blockAsStored names the block's places from `block`.
+    for (const [block, place] of refusals) {
+      assert.throws(() => blockAsStored(block), {
+        name: 'MalformedContentError',
+        message: `blockAsStored: block.${place.replaceAll('content[0].', 'block.')}.`,
+      });
+    }
+    assert.throws(() => blockAsStored(ref), {
+      name: 'MalformedContentError',
+      message: 'blockAsStored: block is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write).',
+    });
+    // A write refuses the same blocks by name, before anything is stored.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      for (const block of [untypedDocument, untypedUnsniffable, noData]) {
-        assert.throws(() => manager.addMessage('user', [block]));
+      for (const [block, place] of refusals) {
+        assert.throws(() => manager.addMessage('user', [block]), { name: 'MalformedContentError', message: `Message refused: content[0].${place}.` });
       }
+      assert.throws(() => manager.addMessage('user', [ref]), {
+        name: 'MalformedContentError',
+        message: 'Message refused: content[0] is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write).',
+      });
+      assert.equal(manager.getAllMessages().length, 0, 'nothing stored');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('a write takes inline media the store can keep, as the store reads its source', async () => {
+    // An image without a declared type whose data names one, with whitespace the decode skips before it, past
+    // the first 32 characters a short read of the data would see.
+    const spaced = { type: 'image', source: { type: 'base64', data: `${'\n'.repeat(40)}${b64(PNG)}` } } as unknown as ContentBlock;
+    // Data that isn't a string, which the store reads as bytes.
+    const bytes = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav', data: [0x52, 0x49, 0x46, 0x46] } } as unknown as ContentBlock;
+    // An image without a declared type whose data, bytes rather than a string, names one.
+    const pngBytes = { type: 'image', source: { type: 'base64', data: Buffer.from(PNG, 'hex') } } as unknown as ContentBlock;
+    assert.deepStrictEqual(blockAsStored(spaced), { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
+    assert.deepStrictEqual(blockAsStored(bytes), { type: 'audio', source: { type: 'base64', data: b64('52494646'), mediaType: 'audio/wav' } });
+    assert.deepStrictEqual(blockAsStored(pngBytes), { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('user', [spaced, bytes, pngBytes]);
+      assert.deepStrictEqual(manager.getAllMessages()[0]!.content, [blockAsStored(spaced), blockAsStored(bytes), blockAsStored(pngBytes)]);
     } finally {
       manager.close();
     }

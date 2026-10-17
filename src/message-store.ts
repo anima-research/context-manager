@@ -19,6 +19,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
+import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -222,6 +223,8 @@ export interface TokenEstimatorOptions {
  */
 export class MessageStore {
   private blobManager: BlobManager;
+  /** Messages whose malformed content a read has already logged (wellFormedContent). */
+  private malformedLogged = new Set<string>();
   private listeners: Set<MessageStoreListener> = new Set();
   private idToIndex: Map<MessageId, number> = new Map();
   private tokenEstimator: (text: string) => number;
@@ -434,6 +437,7 @@ export class MessageStore {
       lockedByAgent?: boolean;
     }
   ): StoredMessage {
+    content = contentForWrite(content, 'Message refused');
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
@@ -543,6 +547,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
+    newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);
     const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
@@ -560,7 +565,11 @@ export class MessageStore {
       );
     }
 
-    const oldContent = this.blobManager.resolveBlobs(oldMessage.content);
+    // The old content as a read gives it, so an edit can replace a message
+    // whose stored content doesn't match ContentBlock.
+    const oldContent = this.blobManager.resolveBlobs(
+      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged),
+    );
     const storedContent = this.blobManager.extractBlobs(newContent);
 
     // Update the stored message
@@ -1831,6 +1840,9 @@ export class MessageStore {
     _index: number,
     resolveBlobs: boolean = true,
   ): StoredMessage {
+    // What doesn't match ContentBlock is left out before anything reads it,
+    // blob resolution included (well-formed-content.ts).
+    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
@@ -1850,8 +1862,8 @@ export class MessageStore {
       // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
       // ContentBlock for viewer purposes).
       content: resolveBlobs
-        ? this.blobManager.resolveBlobs(internal.content)
-        : (internal.content as unknown as ContentBlock[]),
+        ? this.blobManager.resolveBlobs(content)
+        : (content as unknown as ContentBlock[]),
       metadata: internal.metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,

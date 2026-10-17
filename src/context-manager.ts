@@ -48,6 +48,7 @@ import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -495,6 +496,13 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    // First, so a message refused here changes nothing: no hold expires, no
+    // hold is placed, and the strategy's ingress chunking never reads it.
+    // What a write mends is mended here, so the strategy chunks what is
+    // stored (well-formed-content.ts). A shard of that chunking is checked
+    // later (appendMessage), once expired holds have been released, as at
+    // any add.
+    content = contentForWrite(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
       return this.appendMessage(participant, content, metadata, causedBy);
@@ -549,6 +557,16 @@ export class ContextManager {
         // Shards are written in index order, so the id returned (the first
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
+        // A shard that doesn't match is refused before any shard is stored,
+        // as the message was: the store's own refusal would meet it only once
+        // the shards before it were stored. The error names the shard, since
+        // the message as given was refused by nothing.
+        for (const shard of decision.shards) {
+          const places = malformedContentPlaces(shard.content);
+          if (places.length > 0) {
+            throw new MalformedContentError(`Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`, places);
+          }
+        }
         let firstId: MessageId | null = null;
         const lengthBefore = this.messageStore.length();
         // These appends must stay synchronous: one body's shards in one loop, in

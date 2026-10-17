@@ -12,6 +12,7 @@ export { concatBodyGroups } from './adaptive/render.js';
 export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
 export { BlobManager, blockAsStored } from './blob-manager.js';
+export { MalformedContentError, malformedContentPlaces } from './well-formed-content.js';
 export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,
