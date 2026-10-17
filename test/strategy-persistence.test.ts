@@ -32,6 +32,11 @@ function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
 
+/** A summary entry of any shape, for the persistence boundary. */
+function rawSummary(id: string, level: number, sourceIds: unknown, sourceRange: unknown) {
+  return { id, level, content: `text of ${id}`, tokens: 3, sourceLevel: level - 1, sourceIds, sourceRange, created: 1 };
+}
+
 /**
  * Test subclass that exposes the protected persistence helpers + lets the
  * test seed summaries through the same code path that production uses.
@@ -93,6 +98,11 @@ class TestableStrategy extends AutobiographicalStrategy {
 
   readPersistedSummaries(): SummaryEntry[] {
     return (this.store?.getStateJson(this.summariesStateId) as SummaryEntry[] | null) ?? [];
+  }
+
+  /** A summary through the persistence boundary, whatever its shape. */
+  pushRaw(entry: unknown): void {
+    this.pushSummary(entry as SummaryEntry);
   }
 
   persistRawChunks(records: ChunkRecord[]): void {
@@ -278,6 +288,110 @@ describe('AutobiographicalStrategy — persistence', () => {
     assert.equal(strategy.getSummariesView().length, 0);
 
     manager.close();
+  });
+
+  it('refuses a summary whose sources, or above L1 whose range, readers cannot use, at the persistence boundary', async () => {
+    const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      // #130's shape: an L1 whose sources are null.
+      assert.throws(
+        () => strategy.pushRaw(rawSummary('L1-0', 1, null, { first: 'm1', last: 'm2' })),
+        /refusing to persist summary L1-0 at L1, a bug in the code that built it: its sourceIds is null, where readers need a non-empty list of ids/,
+      );
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-5', 1, [], { first: 'm1', last: 'm2' })), /L1-5 at L1.*its sourceIds is \[\],/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-7', 1, 'm1', { first: 'm1', last: 'm1' })), /L1-7 at L1.*its sourceIds is "m1",/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-6', 2, ['L1-a', null], { first: 'm1', last: 'm2' })), /L2-6 at L2.*its sourceIds is \["L1-a",null\],/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-8', 2, ['L1-a', ''], { first: 'm1', last: 'm2' })), /L2-8 at L2.*its sourceIds is \["L1-a",""\],/);
+      // A sparse list, whose empty slot `every` would skip and the store can't write.
+      const sparse = new Array<string>(2);
+      sparse[1] = 'm1';
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-11', 1, sparse, { first: 'm1', last: 'm1' })), /L1-11 at L1.*its sourceIds is \[null,"m1"\],/);
+      assert.throws(
+        () => strategy.pushRaw(rawSummary('L2-1', 2, ['L1-a', 'L1-b'], { first: 'm1' })),
+        /refusing to persist summary L2-1 at L2, a bug in the code that built it: its sourceRange is \{"first":"m1"\}, where readers need two message ids/,
+      );
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-9', 2, ['L1-a'], { last: 'm2' })), /L2-9 at L2.*its sourceRange is \{"last":"m2"\},/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-10', 2, ['L1-a'], null)), /L2-10 at L2.*its sourceRange is null,/);
+      assert.deepEqual(strategy.getSummariesView(), [], 'none of them is held');
+      assert.deepEqual(strategy.readPersistedSummaries(), [], 'or stored');
+      // A summary readers can use is taken, with the range it holds above L1.
+      strategy.pushRaw(rawSummary('L1-3', 1, ['m1', 'm2'], { first: 'm1', last: 'm2' }));
+      strategy.pushRaw(rawSummary('L2-4', 2, ['L1-3'], { first: 'm1', last: 'm2' }));
+      assert.deepEqual(strategy.readPersistedSummaries().map((s) => [s.id, s.sourceRange]), [
+        ['L1-3', { first: 'm1', last: 'm2' }],
+        ['L2-4', { first: 'm1', last: 'm2' }],
+      ]);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('stores an L1 with its range set to its sources\' ends, as the open would make it, and warns', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    const ranges = {
+      'L1-0': { first: 'm1', last: 'm3' },
+      'L1-1': { first: 'm4', last: 'm4' },
+      'L1-2': { first: 'm5', last: 'm6' },
+      'L1-3': { first: 'm7', last: 'm8' },
+    };
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        strategy.pushRaw(rawSummary('L1-0', 1, ['m1', 'm2', 'm3'], { first: 'm1', last: 'm2' }));
+        strategy.pushRaw(rawSummary('L1-1', 1, ['m4'], null));
+        strategy.pushRaw(rawSummary('L1-2', 1, ['m5', 'm6'], { first: 'm5', last: 'm6' }));
+        strategy.pushRaw(rawSummary('L1-3', 1, ['m7', 'm8'], { first: 'm6', last: 'm8' }));
+        const rangesOf = (summaries: SummaryEntry[]) => Object.fromEntries(summaries.map((s) => [s.id, s.sourceRange]));
+        assert.deepEqual(rangesOf(strategy.getSummariesView()), ranges, 'held with its sources\' ends');
+        assert.deepEqual(rangesOf(strategy.readPersistedSummaries()), ranges, 'and stored so');
+        assert.deepEqual(warnings.filter((w) => w.includes('storing summary')), [
+          '[autobiographical] storing summary L1-0 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m1","last":"m2"}',
+          '[autobiographical] storing summary L1-1 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held null',
+          '[autobiographical] storing summary L1-3 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m6","last":"m8"}',
+        ]);
+        manager.sync();
+      } finally {
+        manager.close();
+      }
+    }
+    warnings.length = 0;
+    const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      assert.equal(warnings.find((w) => w.includes('repaired summary state')), undefined, 'an open has nothing to rebuild: ' + warnings.join('\n'));
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('takes what the package\'s own writers push, the L1 stub, an L1 compression and a merge, as they built it', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    const membrane = {
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'memory body' }], usage: { inputTokens: 10, outputTokens: 5 } }),
+    };
+    const strategy = new TestableStrategy({
+      targetChunkTokens: 20, recentWindowTokens: 0, compressionModel: 'test-model', autoTickOnNewMessage: false, mergeThreshold: 2,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    try {
+      // A thin chunk, stubbed without a model call, then chunks the model
+      // compresses; the newest closed chunk is held back.
+      for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock('word '.repeat(8)));
+      for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60)));
+      for (let i = 0; i < 100 && !manager.isReady(); i++) await manager.tick();
+      assert.ok(manager.isReady(), 'the queues drained');
+      const summaries = strategy.getSummariesView();
+      assert.ok(summaries.some((s) => s.level === 1 && s.content.startsWith('(A quiet stretch')), 'the stub');
+      assert.ok(summaries.some((s) => s.level === 1 && s.content === 'memory body'), 'an L1 compression');
+      assert.ok(summaries.some((s) => s.level === 2 && s.content === 'memory body'), 'a merge');
+      assert.deepEqual(warnings.filter((w) => w.includes('storing summary')), [], 'no write repaired a range');
+    } finally {
+      manager.close();
+    }
   });
 
   it('removes empty legacy parents and clears their child pointers on load', async () => {
