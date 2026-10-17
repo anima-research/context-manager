@@ -457,7 +457,11 @@ Given:
             budgetMet, exhausted, moves, deadFrontierIds, unrealizable }.
 
 [selectAdaptive — strategy side, after picker.run]
-5. Commit finalResolutions to strategy state; persist if changed.
+5. Stage each unlocked middle chunk's level where it differs from the level
+   it has saved. A dry run stages them too, to count them. Commit and
+   persist the staged changes only once every later stage has succeeded,
+   and never in a dry run, so neither a refused compile nor a dry run saves
+   a level.
 6. If produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the hard budget × (1 +
@@ -468,9 +472,13 @@ Given:
    shards via the rendering algorithm in §3.6.1.
 ```
 
-`moves` is the number of chunks whose resolution changed vs the carried
-state (it replaced the op walk's `iterations` in `PlanVsActual` and the
-preview surfaces when the walk was retired — see §3.5 history note).
+`moves` is the number of chunks whose resolution changed from the level
+they started the solve at. It replaced the op walk's `iterations` in
+`PlanVsActual` and the preview surfaces when the walk was retired (see §3.5
+history note). Those surfaces now report instead the changes step 5 stages,
+which are the saved levels a compile commits. They leave out locked chunks,
+which keep their saved level even while a pin renders them at another
+(#195).
 
 Token counting: each chunk's `rawTokens` is computed at picker-input
 construction time (delegated to `MessageStoreView.estimateTokens`); each

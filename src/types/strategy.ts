@@ -315,7 +315,11 @@ export interface PreviewResult {
   deepestLevel: number;
   /** Fold level per chunk the layout would settle on. */
   resolutions: Record<string, number>;
-  /** Chunks whose resolution this layout would change vs the carried state. */
+  /** Chunks whose saved fold level this layout changes, which are the levels
+   *  a compile that commits this layout saves. They're counted whether or not
+   *  the layout fits. A locked chunk keeps its saved level, so it isn't
+   *  counted. The picker's own `moves` compares each chunk with the level it
+   *  was planned from instead. */
   moves: number;
   /** Summaries the layout needs that do not exist yet — real LLM work. */
   producedCount: number;
@@ -644,6 +648,10 @@ export interface RenderStats {
     delta: number;
     budgetMet: boolean;
     exhausted: boolean;
+    /** Chunks whose saved fold level this compile changed, or for a dry run
+     *  would change. A locked chunk keeps its saved level, so it isn't
+     *  counted. The picker's own `moves` compares each chunk with the level it
+     *  was planned from instead. */
     moves: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config

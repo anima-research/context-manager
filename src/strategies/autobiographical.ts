@@ -9268,14 +9268,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // eviction becomes reachable at all. Eviction is therefore a symptom of
     // plan drift, not of scarce foldable material: the picker either reaches
     // its target or raises OverBudgetError. Record the plan so rsEnd() can
-    // compare it against what was actually committed.
+    // compare it against what was actually committed (its other figures,
+    // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;
-    this._plannedMeta = {
-      budgetMet: result.budgetMet,
-      exhausted: result.exhausted,
-      moves: result.moves,
-      solver: picker.solverName,
-    };
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.
@@ -9301,7 +9296,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // appended after them). A change is staged against the saved level, not
     // the level the chunk was planned from, which is lower when the saved
     // level's summary is gone (reachableLevel), so the commit saves what this
-    // compile presents. A locked chunk keeps its saved level.
+    // compile presents. A locked chunk keeps its saved level. A dry run stages
+    // them too, so that its `moves` counts them, and commits none (below).
     for (let k = 0; k < middleChunkCount; k++) {
       const chunk = pickerChunks[k];
       const id = chunk.id;
@@ -9309,8 +9305,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
-      if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
+      if (prev !== level) pendingResolutionChanges.push([id, level]);
     }
+    // `moves` reports the changes staged here, the saved levels the commit
+    // writes. The picker's own count compares each chunk with the level it was
+    // planned from, so it counts a locked chunk that a pin renders at another
+    // level, though the commit never stores that, and misses a chunk whose
+    // saved level's summary is gone, though the commit stores its new level
+    // (#195).
+    this._plannedMeta = {
+      budgetMet: result.budgetMet,
+      exhausted: result.exhausted,
+      moves: pendingResolutionChanges.length,
+      solver: picker.solverName,
+    };
     if (plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
@@ -9389,7 +9397,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
         deepestLevel,
         resolutions: Object.fromEntries(result.finalResolutions),
-        moves: result.moves,
+        moves: pendingResolutionChanges.length,
         producedCount: result.produced.length,
       };
     }

@@ -487,10 +487,18 @@ describe('AutobiographicalStrategy — persistence', () => {
         const kept = strategy.getSummariesView().map((s) => s.content).sort();
         assert.deepEqual(kept, ['B-SUMMARY', 'C-SUMMARY', 'D-SUMMARY', 'E-SUMMARY', 'Q-SUMMARY', 'R-SUMMARY', 'S-SUMMARY'], 'the two summaries naming missing ones are dropped');
         const before = Object.fromEntries(ids.map((id, i) => [id, level(i)]));
+        // `moves` counts the three levels the compile saves, group 0's unlocked
+        // messages, though each is planned from the L1 it renders (#195).
+        assert.equal(manager.previewContext({ maxTokens: 150, reserveForResponse: 0 })?.moves, 3, 'the preview counts the levels a compile would save');
+        // A preview of the same layout at a budget it doesn't fit counts them
+        // too, though no compile at that budget commits it.
+        const tight = manager.previewContext({ maxTokens: 60, reserveForResponse: 0 });
+        assert.deepEqual([tight?.fits, tight?.moves], [false, 3], 'a preview that doesn\'t fit counts its layout\'s levels');
         // Raw, group 0's messages are over this budget; its L1's recall is far under it.
         const dry = await manager.compile({ maxTokens: 150, reserveForResponse: 0 }, undefined, { dryRun: true });
         assert.deepEqual(strategy.readPersistedResolutions(), before, 'a dry compile saves no level');
         const live = await manager.compile({ maxTokens: 150, reserveForResponse: 0 });
+        assert.equal(manager.getRenderStats()?.planVsActual?.moves, 3, 'the compile counts the levels it saved');
         for (const context of [dry, live]) {
           const texts = context.messages.flatMap((message) => message.content).map((block) => (block as { text?: string }).text ?? '');
           // Group 0 renders through B, group 1 through Q, group 2 through D, and

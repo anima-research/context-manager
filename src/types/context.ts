@@ -127,8 +127,12 @@ export interface PlanVsActual {
   delta: number;
   budgetMet: boolean;
   exhausted: boolean;
-  /** Chunks whose resolution the applied frontier changed vs the carried
-   *  state. (Replaced the op-walk's `iterations` when the walk was retired.) */
+  /** Chunks whose saved fold level this compile changed, which is what it
+   *  commits, or for a dry run what it would commit. A locked chunk keeps its
+   *  saved level, so it isn't counted even while a classic pin renders it at
+   *  another. A chunk whose saved level's summary is gone is counted, since
+   *  the compile saves the level it presents. (Replaced the op-walk's
+   *  `iterations` when the walk was retired.) */
   moves: number;
 }
 
