@@ -149,6 +149,29 @@ export interface ContextStrategy {
   initialize?(ctx: StrategyContext): Promise<void>;
 
   /**
+   * The manager is done with this strategy: setStrategy() replaced it, the
+   * manager closed, or the open() that was initializing it failed. The
+   * strategy stops the work it still has running for that manager, so it
+   * writes nothing more to the store and starts no further provider call.
+   * It is synchronous and not awaited: a call already waiting on the
+   * provider may finish, with any retries the provider client makes of it,
+   * and its result is thrown away. A promise or other thenable it returns
+   * anyway isn't awaited either; the manager logs its rejection. A later
+   * setStrategy() of the same instance on a manager that isn't closed
+   * initializes it again, so a strategy whose detach() stops it starts again
+   * in initialize(). A setStrategy() of another strategy, or a close(), that
+   * lands while the strategy initializes detaches it at once, and again once
+   * initialize() returns or rejects, unless the manager holds it again by
+   * then: an instance set again fences its earlier initialization's work
+   * itself. So detach() can be called more than once for one instance, and
+   * must be safe to repeat. It is per instance: sharing one instance between
+   * two managers isn't supported, and either letting it go detaches it for
+   * both. A manager whose close() interrupted an initialization of the
+   * instance holds it until that initialization ends.
+   */
+  detach?(): void;
+
+  /**
    * Periodic background maintenance.
    * Called by application to trigger compression, indexing, etc.
    */

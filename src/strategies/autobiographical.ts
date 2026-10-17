@@ -699,6 +699,10 @@ interface LoadedBranchIdentity extends CompressionOperationBranch {
 
 interface CompressionInFlightResult {
   error?: unknown;
+  /** The producer's strategy generation moved (a detach or a
+   *  reinitialization) before it settled. It may have written nothing, so a
+   *  waiter that finds no L1 does the work itself. */
+  discarded?: boolean;
 }
 
 /** What preparing a compression request replaced in it. */
@@ -1827,6 +1831,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
     }
+  }
+
+  /**
+   * The manager is done with this strategy (ContextStrategy.detach). A new
+   * generation fails every compression and merge still in flight at its next
+   * isCompressionBranchCurrent() check, so each discards its result instead
+   * of writing. The loaded identity no longer matches either, so each
+   * entrypoint that requires the loaded branch throws, getSummary() and
+   * getStats() among them, and a drain tick already scheduled does nothing.
+   * None of these checks reads the store, which the manager may close next.
+   * The health reads, such as getCompressionQuarantineStatus(), still never
+   * throw. initialize() starts afresh.
+   */
+  detach(): void {
+    this.compressionBranchGeneration++;
   }
 
   /** Drop every branch-derived mirror without touching durable state. */
@@ -3568,14 +3587,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private isBranchIdentityCurrent(identity: LoadedBranchIdentity | null): boolean {
-    if (!identity || !this.store) return false;
+    // The strategy's own generation is compared first, so once it is
+    // detached or reinitialized no check reads the store, which its manager
+    // may have closed by then.
+    if (!identity || !this.store || this.compressionBranchGeneration !== identity.strategyGeneration) return false;
     const observed = observeStoreBranch(this.store);
     return this.store === identity.store &&
       this.ns === identity.namespace &&
       this.store.currentBranch().name === identity.name &&
       observed.name === identity.name &&
-      observed.generation === identity.generation &&
-      this.compressionBranchGeneration === identity.strategyGeneration;
+      observed.generation === identity.generation;
   }
 
   private isLoadedBranchCurrent(): boolean {
@@ -3611,12 +3632,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private isCompressionBranchCurrent(source: CompressionOperationBranch): boolean {
-    const observed = this.store ? observeStoreBranch(this.store) : undefined;
-    return !!this.store &&
-      this.store.currentBranch().name === source.name &&
-      observed?.name === source.name &&
-      observed.generation === source.generation &&
-      this.compressionBranchGeneration === source.strategyGeneration;
+    // Generation first, as in isBranchIdentityCurrent.
+    if (!this.store || this.compressionBranchGeneration !== source.strategyGeneration) return false;
+    const observed = observeStoreBranch(this.store);
+    return this.store.currentBranch().name === source.name &&
+      observed.name === source.name &&
+      observed.generation === source.generation;
   }
 
   private logCompressionBranchDiscard(
@@ -3632,8 +3653,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         source_branch: source.name,
         source_generation: source.generation,
         source_strategy_generation: source.strategyGeneration,
-        current_branch: this.store?.currentBranch().name,
-        current_generation: this.store ? observeStoreBranch(this.store).generation : undefined,
+        // The store is read only while the strategy's generation is the
+        // work's: a strategy detached since may have no open store.
+        ...(this.store && this.compressionBranchGeneration === source.strategyGeneration
+          ? {
+              current_branch: this.store.currentBranch().name,
+              current_generation: observeStoreBranch(this.store).generation,
+            }
+          : {}),
         current_strategy_generation: this.compressionBranchGeneration,
         ...(record ? { quarantine_key: record.key, canonical_request_hash: record.canonicalRequestHash } : {}),
       },
@@ -3722,7 +3749,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // interval and then sustains it.)
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
+    const sweptIdentity = this.loadedBranchIdentity;
     await this.sweepPaidOffQuarantineRecords();
+    // A strategy detached, or loaded again on another branch, during the
+    // sweep sounds no alarm for the branch it swept.
+    if (this.loadedBranchIdentity !== sweptIdentity || !this.isLoadedBranchCurrent()) return;
     const status = this.getCompressionQuarantineStatus();
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
@@ -3775,6 +3806,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async sweepPaidOffQuarantineRecords(): Promise<void> {
     if (!this.store) return;
+    const identity = this.loadedBranchIdentity;
     try {
       const projection = this.readCompressionQuarantineProjection();
       if (projection.size === 0) return;
@@ -3792,6 +3824,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
         await this.clearCompressionRefusalQuarantine(key);
+        // A strategy detached, loaded again on another branch, or whose
+        // branch moved, while a clear waited stops sweeping here: that clear
+        // may have written nothing, the chunk records read above are another
+        // branch's, and the records stay for the next sweep.
+        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
         console.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
@@ -3810,12 +3847,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
     if (!this.store) return;
+    const identity = this.loadedBranchIdentity;
     try {
       const hash = sha256Json(chunk.messages.map((message) => message.id));
       const projection = this.readCompressionQuarantineProjection();
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
         await this.clearCompressionRefusalQuarantine(key);
+        // As in the paid-off sweep: a strategy detached, loaded again on
+        // another branch, or whose branch moved while a clear waited stops
+        // here, since that clear may have written nothing.
+        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
         console.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
             `successfully under a newer request shape`,
@@ -4889,6 +4931,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!hasMerges && (this.isAtSpeculativeCap() || !this.shouldCompressPreflight())) return;
 
     const progressBefore = this._drainProgress;
+    const drainIdentity = this.loadedBranchIdentity;
 
     this.tick(ctx)
       .then(() => {
@@ -4909,7 +4952,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // turn start while a post-restart drain ground ~10 compiles). A
         // macrotask hop lets pending sockets/timers run between ticks,
         // capping the added wake latency at ~one tick's compile.
-        setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
+        // The next tick runs only under the loaded identity this drain
+        // started with: once the strategy is detached or reinitialized, or
+        // the store's branch moved, the drain stops here instead of throwing
+        // from requireLoadedBranch() inside a timer callback, where no caller
+        // could catch it. A strategy set again starts its own drain from its
+        // next message.
+        setTimeout(() => {
+          if (this.loadedBranchIdentity === drainIdentity && this.isLoadedBranchCurrent()) {
+            this.driveSpeculativeDrain(ctx);
+          }
+        }, 0);
       })
       .catch((err) => {
         console.error('AutobiographicalStrategy: speculative-drain error:', err);
@@ -4955,6 +5008,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the alarm on every interval for as long as ANY chunk is quarantined
     // (after sweeping records whose debt is already paid).
     await this.soundQuarantineAlarmIfNeeded();
+    // Detached, or the branch moved, during the sweep: nothing more to do.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
@@ -6921,7 +6976,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (coalescedSummary) {
         chunk.compressed = true;
         chunk.summaryId = coalescedSummary.id;
+        return;
       }
+      // Past the L1 check above, a producer whose strategy was let go of
+      // (detached, or reinitialized) left no L1 for this chunk, but it may
+      // have quarantined the chunk's request family first. The waiter takes
+      // the chunk over by compressing it afresh, through this method's own
+      // checks: the quarantine skip, and this coalescing, which waits on a
+      // waiter that took it over first. The tick's hold and cap gates passed
+      // when it started this compression. Nothing awaits from a
+      // compression's start to registering below, so only one waiter takes it.
+      if (result.discarded) return this.compressChunkHierarchical(chunk, ctx);
       return;
     }
 
@@ -7046,6 +7111,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedChildIds?: string[],
       ): Promise<unknown> => {
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
+        // Each attempt, a ladder's next rung included, checks before it calls
+        // the provider: a strategy let go of between two attempts starts no
+        // further call.
+        if (!this.isCompressionBranchCurrent(sourceBranch)) {
+          this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
+          throw Object.assign(new Error('Compression result crossed a branch boundary'), {
+            name: 'CompressionBranchDiscard',
+          });
+        }
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -7067,6 +7141,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Retry this attempt once with text-only recall pairs, loudly.
           if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
             throw error;
+          }
+          // Work that lost its branch or strategy generation while the first
+          // call was out (a detach, a branch move) makes no second one.
+          if (!this.isCompressionBranchCurrent(sourceBranch)) {
+            this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
+            throw Object.assign(new Error('Compression result crossed a branch boundary'), {
+              name: 'CompressionBranchDiscard',
+            });
           }
           console.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
@@ -7884,6 +7966,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
 
+      // The summary is written. A strategy let go of, or loaded again, while
+      // the clear above waited leaves the merge check to the strategy that
+      // holds the branch now.
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
@@ -7896,7 +7982,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       inFlightError = error;
       throw error;
     } finally {
-      settleInFlight({ ...(inFlightError !== undefined ? { error: inFlightError } : {}) });
+      settleInFlight({
+        ...(inFlightError !== undefined ? { error: inFlightError } : {}),
+        ...(inFlightError === undefined && this.compressionBranchGeneration !== sourceBranch.strategyGeneration
+          ? { discarded: true }
+          : {}),
+      });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
       for (const trace of attemptTraces) {
         logCompressionCall({
@@ -8696,6 +8787,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly.
         if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
+        // As in the L1 ladder: no second call for work that lost its currency.
+        if (!this.isCompressionBranchCurrent(sourceBranch)) return;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
