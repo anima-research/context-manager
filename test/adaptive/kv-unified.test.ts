@@ -261,7 +261,7 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
   // supplies no summary), its pinned level, the other constraints on it, then
   // the leaf's allowed levels, the missing levels its conflict names (null: no
   // conflict) and the level it's held at (null: not held).
-  const cases: Array<[string, number, CanonicalLeafConstraint[], number[], number[] | null, number | null]> = [
+  const cases: Array<[string, number | undefined, CanonicalLeafConstraint[], number[], number[] | null, number | null]> = [
     ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }], [1], null, 1],
     ['a', 2, [{ kind: 'max', level: 2, source: 'cap' }], [1], null, 1],
     ['a', 2, [{ kind: 'min', level: 1, source: 'floor' }], [1], null, 1],
@@ -284,13 +284,16 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
     ['a', 1.5, [], [], [], null],
     ['a', -1, [], [], [], null],
     ['a', Number.NaN, [], [], [], null],
+    // A caller's exact constraint that carries the pin's label isn't a level
+    // pin: only the one made from the chunk's pinLevel is held.
+    ['a', undefined, [{ kind: 'exact', level: 2, source: 'pin-level' }], [], [2], null],
   ];
   for (const [id, pinLevel, constraints, allowed, missing, heldAt] of cases) {
     a.pinLevel = undefined;
     c.pinLevel = undefined;
     (id === 'a' ? a : c).pinLevel = pinLevel;
     const forest = new CanonicalSummaryForest(inputsOf(chronicle), { constraints: new Map([[id, constraints]]) });
-    const label = `${id} pinned at L${pinLevel} beside ${JSON.stringify(constraints)}`;
+    const label = `${id} ${pinLevel === undefined ? 'unpinned' : `pinned at L${pinLevel}`} beside ${JSON.stringify(constraints)}`;
     assert.deepEqual(forest.leaf(id)?.allowedLevels, allowed, label);
     assert.deepEqual(forest.constraintConflicts.map((conflict) => conflict.requestedMissingLevels), missing ? [missing] : [], label);
     assert.deepEqual(heldLevelPin(forest.leaf(id)!), heldAt === null ? null : { level: pinLevel, heldAt }, label);

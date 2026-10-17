@@ -313,6 +313,13 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
 /** The source of the constraint a picker chunk's `pinLevel` becomes. */
 const PIN_LEVEL_SOURCE = 'pin-level';
 
+/** The constraints `constraintsFor` makes from picker chunks' `pinLevel`: the
+ *  level pins the forest may hold (design F4b). Known by identity, since a
+ *  constraint's `source` is a label any caller of `CanonicalForestOptions`
+ *  can give, and a caller's exact constraint stays strict whatever it's
+ *  labelled. */
+const levelPins = new WeakSet<CanonicalLeafConstraint>();
+
 /** Whether `constraint` allows a leaf at `level`, whatever its chain supplies. */
 function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolean {
   switch (constraint.kind) {
@@ -343,7 +350,7 @@ function levelPinHold(
   constraints: readonly CanonicalLeafConstraint[],
   availableLevels: readonly number[],
 ): { level: number; heldAt: number } | null {
-  const pin = constraints.find((constraint) => constraint.source === PIN_LEVEL_SOURCE);
+  const pin = constraints.find((constraint) => levelPins.has(constraint));
   const level = pin?.level;
   if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
   let heldAt = 0;
@@ -969,7 +976,7 @@ export class CanonicalSummaryForest {
         // A held level pin narrows the leaf to the level it's held at (design
         // F4b); a lock, every other exact constraint and a pin that isn't
         // held name their own level.
-        const target = hold && constraint.source === PIN_LEVEL_SOURCE ? hold.heldAt : level;
+        const target = hold && levelPins.has(constraint) ? hold.heldAt : level;
         if (!availableLevels.includes(target)) requestedMissingLevels.add(target);
         allowedLevels = allowedLevels.filter((candidate) => candidate === target);
       } else if (constraint.kind === 'max') {
@@ -1857,7 +1864,9 @@ export class CanonicalSummaryForest {
       });
     }
     if (chunk.pinLevel !== undefined) {
-      constraints.push({ kind: 'exact', level: chunk.pinLevel, source: PIN_LEVEL_SOURCE });
+      const pin: CanonicalLeafConstraint = { kind: 'exact', level: chunk.pinLevel, source: PIN_LEVEL_SOURCE };
+      levelPins.add(pin);
+      constraints.push(pin);
     }
     if (chunk.pinMaxLevel !== undefined) {
       constraints.push({ kind: 'max', level: chunk.pinMaxLevel, source: 'pin-max-level' });
