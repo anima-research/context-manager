@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'kv-unified-level-pin-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -223,6 +223,21 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
     assert.equal(removed.length, 2, removed.join('\n'));
     assert.match(removed[0], /^autobio: kv-unified holds pin pin-1 \("later"\), pinned at L3, at /);
     assert.equal(removed[1], 'autobio: pin pin-1 ("later"), held below its L3 by kv-unified, was removed.');
+    store.cm.close();
+  });
+
+  // The report runs after the solve and before the frontier is presented, so
+  // a compile refused as over budget has already said which ranges it holds
+  // finer than pinned, which can be why the range was too large.
+  it('logs a hold before a compile is refused as over budget', async () => {
+    const store = await conversation(24);
+    store.cm.pinAtLevel(store.ids[0], store.ids[7], 2, { name: 'tight' });
+    const lines = await holdLines(async () => {
+      await assert.rejects(store.cm.compile({ maxTokens: 600, reserveForResponse: 0 }), OverBudgetError);
+    });
+    assert.deepEqual(lines, [
+      'autobio: kv-unified holds pin pin-0 ("tight"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does.',
+    ]);
     store.cm.close();
   });
 
