@@ -1047,8 +1047,9 @@ export interface AutobiographicalConfig {
    * open, this one included, and persists the repair: it keeps one of a
    * summary's duplicate copies, rebuilds sources and ranges it can recover,
    * drops summaries that are empty, whose sources or range it can't recover,
-   * or that list a summary at their own level or above, and the summaries
-   * above them, resolves each summary's parent pointers, and
+   * that list a summary at their own level or above, or that list one they
+   * aren't the parent of, and the summaries above them, resolves each
+   * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
    * stored one trails the ids the store holds.

@@ -2193,15 +2193,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const loadedLevel = new Map([...copiesById].map(([id, copies]) => [id, (byId.get(id) ?? copies[0]!).level]));
     const notBelow = (summary: SummaryEntry) =>
       summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
-    for (let changed = true; changed;) {
-      changed = false;
-      for (const [id, summary] of byId) {
-        if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
-        byId.delete(id);
-        (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
-        changed = true;
+    const dropMissingAndMisplaced = (): void => {
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const [id, summary] of byId) {
+          if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
+          byId.delete(id);
+          (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+          changed = true;
+        }
       }
-    }
+    };
+    dropMissingAndMisplaced();
 
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
@@ -2217,8 +2220,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // reader sees the one parent that renders the summary. With no parent,
     // every pointer that isn't null is cleared, so the summary renders and
     // merges again. A null pointer counts as none.
+    //
+    // A summary that lists one it isn't the parent of is dropped, and the
+    // summaries naming it go with it, as for any dropped summary. A summary
+    // above L1 covers the messages of each summary it lists, so a summary two
+    // kept summaries list has its messages covered twice, and hierarchical
+    // mode, which shows summaries that have no parent, renders both. Two
+    // instances on one store can merge the same run, since compression
+    // coalesces across instances and merges don't: the run's pointers name
+    // the merge written last, and the other is dropped. Where a crash split
+    // the pointers between the two, each lists a source whose parent is the
+    // other, so both are dropped. A summary that two list and whose pointers
+    // name neither has no parent, so both are dropped and it merges again.
+    // Each summary's parent is chosen before any of these drops, so what is
+    // dropped doesn't depend on which summary the pass reaches first. The
+    // cost: when the pass drops a summary's chosen parent for listing another
+    // summary, the summary's other listers go too, though one of them could
+    // have been its parent, and the summary merges again.
     const reparentedIds: string[] = [];
     const clearedIds: string[] = [];
+    const notParentIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
       const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
       return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
@@ -2232,12 +2253,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         else listedBy.set(sourceId, [summary]);
       }
     }
-    this.summaries = [...byId.values()].map((summary) => {
+    const parentOf = new Map<string, string | undefined>();
+    for (const summary of byId.values()) {
       const pointers = [summary, ...copiesById.get(summary.id)!]
         .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
       const listers = (listedBy.get(summary.id) ?? []).filter((lister) => lister.level === summary.level + 1);
-      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
-        (listers.length === 1 ? listers[0]!.id : undefined);
+      parentOf.set(summary.id, pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
+        (listers.length === 1 ? listers[0]!.id : undefined));
+    }
+    for (const [id, summary] of byId) {
+      if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
+        byId.delete(id);
+        notParentIds.push(id);
+      }
+    }
+    dropMissingAndMisplaced();
+    this.summaries = [...byId.values()].map((summary) => {
+      // A parent chosen above is the one kept summary that still lists this
+      // one; where the drops took it, nothing kept lists this one.
+      const chosen = parentOf.get(summary.id);
+      const parent = chosen !== undefined && byId.has(chosen) ? chosen : undefined;
       let repaired = summary;
       const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
       if (parent === undefined) {
@@ -2263,7 +2298,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
-          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}]; ` +
+          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}], ` +
+          `naming one it isn't the parent of [${notParentIds.join(', ')}]; ` +
           `rebuilt sources or range of ` +
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
@@ -8896,8 +8932,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
       // the in-memory mirror. (If the process crashes mid-loop, restart sees
-      // the new entry plus a partial set of marked sources; un-marked sources
-      // would re-trigger a merge — accept the rare duplicate over data loss.)
+      // the new entry plus a partial set of marked sources, and the open makes
+      // the new entry the parent of each unmarked one, as the one summary a
+      // level up that lists it, unless another instance's merge lists it too:
+      // see loadPersistedState.)
       this.pushSummary(newEntry);
 
       for (const source of sources) {
