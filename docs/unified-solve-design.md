@@ -211,8 +211,8 @@ Binary x_v per node. Constraints:
   restriction on the leaf allows both p and the level the leaf is held at: a
   lock at another level conflicts with the pin whether or not p is produced
   yet, rather than agreeing with the held level until a merge produces p, and
-  a floor above the held level makes the pin strict again, so the conflict
-  names p as the level to produce.
+  a floor above the held level and at or below p makes the pin strict again,
+  so the conflict names p as the level to produce.
   **Empty intersection = infeasible**: the certificate (§9) reports the
   conflicting constraints and leaf ids. Apart from that hold, no constraint
   is weakened, clamped, or selected inside the solver: a lock and every

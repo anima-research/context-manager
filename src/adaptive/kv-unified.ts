@@ -333,10 +333,11 @@ function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolea
  * constraint on the leaf allows both the pinned level and the level held at.
  * A pin another constraint contradicts, such as a lock at another level, isn't
  * held, so the two conflict whether or not the pinned level exists yet; nor is
- * one whose held level another constraint excludes, such as a floor above it,
- * so the conflict names the pinned level, which would clear it. Null when the
- * leaf has no level pin, its chain supplies the pinned level, or another
- * constraint rules the hold out.
+ * one whose held level another constraint excludes, such as a floor above the
+ * held level and at or below the pinned one, so the conflict names the pinned
+ * level, which would clear it. Null when the leaf has no level pin, its pinned
+ * level isn't a non-negative integer (`buildLeaf` empties such a leaf), its
+ * chain supplies the pinned level, or another constraint rules the hold out.
  */
 function levelPinHold(
   constraints: readonly CanonicalLeafConstraint[],
@@ -344,7 +345,7 @@ function levelPinHold(
 ): { level: number; heldAt: number } | null {
   const pin = constraints.find((constraint) => constraint.source === PIN_LEVEL_SOURCE);
   const level = pin?.level;
-  if (level === undefined || availableLevels.includes(level)) return null;
+  if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
   let heldAt = 0;
   for (const candidate of availableLevels) if (candidate < level && candidate > heldAt) heldAt = candidate;
   const allowsHold = (other: CanonicalLeafConstraint) => admitsLevel(other, level) && admitsLevel(other, heldAt);

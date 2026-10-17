@@ -256,30 +256,44 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
   const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
   chronicle.addChunk({ id: 'b', rawTokens: 100 });
   chronicle.produceL1(['a', 'b']);
-  // Each row, on a leaf whose chain supplies L1: the pinned level, another
-  // constraint on the leaf, then the leaf's allowed levels, the missing
-  // levels its conflict names (null: no conflict) and the level it's held at
-  // (null: not held).
-  const cases: Array<[number, CanonicalLeafConstraint, number[], number[] | null, number | null]> = [
-    [2, { kind: 'max', level: 3, source: 'cap' }, [1], null, 1],
-    [2, { kind: 'max', level: 2, source: 'cap' }, [1], null, 1],
-    [2, { kind: 'min', level: 1, source: 'floor' }, [1], null, 1],
-    [2, { kind: 'raw', source: 'raw' }, [], [2], null],
-    [2, { kind: 'max', level: 1, source: 'cap' }, [], [2], null],
-    [2, { kind: 'exact', level: 1, source: 'exact' }, [], [2], null],
-    [2, { kind: 'min', level: 3, source: 'floor' }, [], [2, 3], null],
+  const c = chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  // Each row: the leaf ('a', whose chain supplies L1, or 'c', whose chain
+  // supplies no summary), its pinned level, the other constraints on it, then
+  // the leaf's allowed levels, the missing levels its conflict names (null: no
+  // conflict) and the level it's held at (null: not held).
+  const cases: Array<[string, number, CanonicalLeafConstraint[], number[], number[] | null, number | null]> = [
+    ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }], [1], null, 1],
+    ['a', 2, [{ kind: 'max', level: 2, source: 'cap' }], [1], null, 1],
+    ['a', 2, [{ kind: 'min', level: 1, source: 'floor' }], [1], null, 1],
+    ['a', 2, [{ kind: 'raw', source: 'raw' }], [], [2], null],
+    ['a', 2, [{ kind: 'max', level: 1, source: 'cap' }], [], [2], null],
+    ['a', 2, [{ kind: 'exact', level: 1, source: 'exact' }], [], [2], null],
+    ['a', 2, [{ kind: 'min', level: 3, source: 'floor' }], [], [2, 3], null],
     // These floors allow the pinned level but not the L1 it would be held
     // at, so the pin isn't held and its conflict names the pinned level.
-    [2, { kind: 'min', level: 2, source: 'floor' }, [], [2], null],
-    [3, { kind: 'min', level: 2, source: 'floor' }, [], [2, 3], null],
+    ['a', 2, [{ kind: 'min', level: 2, source: 'floor' }], [], [2], null],
+    ['a', 3, [{ kind: 'min', level: 2, source: 'floor' }], [], [2, 3], null],
+    // Every other constraint has to allow both levels, not only the first.
+    ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }, { kind: 'min', level: 2, source: 'floor' }], [], [2], null],
+    // Where the chain supplies no summary, the pin is held raw, so a floor
+    // that excludes raw makes it strict.
+    ['c', 2, [{ kind: 'max', level: 2, source: 'cap' }], [0], null, 0],
+    ['c', 2, [{ kind: 'min', level: 1, source: 'floor' }], [], [1, 2], null],
+    // A pinned level that isn't a non-negative integer is never held:
+    // buildLeaf empties the leaf, and its conflict names no level.
+    ['a', 1.5, [], [], [], null],
+    ['a', -1, [], [], [], null],
+    ['a', Number.NaN, [], [], [], null],
   ];
-  for (const [pinLevel, constraint, allowed, missing, heldAt] of cases) {
-    a.pinLevel = pinLevel;
-    const forest = new CanonicalSummaryForest(inputsOf(chronicle), { constraints: new Map([['a', [constraint]]]) });
-    const label = `pinned at L${pinLevel} beside ${JSON.stringify(constraint)}`;
-    assert.deepEqual(forest.leaf('a')?.allowedLevels, allowed, label);
+  for (const [id, pinLevel, constraints, allowed, missing, heldAt] of cases) {
+    a.pinLevel = undefined;
+    c.pinLevel = undefined;
+    (id === 'a' ? a : c).pinLevel = pinLevel;
+    const forest = new CanonicalSummaryForest(inputsOf(chronicle), { constraints: new Map([[id, constraints]]) });
+    const label = `${id} pinned at L${pinLevel} beside ${JSON.stringify(constraints)}`;
+    assert.deepEqual(forest.leaf(id)?.allowedLevels, allowed, label);
     assert.deepEqual(forest.constraintConflicts.map((conflict) => conflict.requestedMissingLevels), missing ? [missing] : [], label);
-    assert.deepEqual(heldLevelPin(forest.leaf('a')!), heldAt === null ? null : { level: pinLevel, heldAt }, label);
+    assert.deepEqual(heldLevelPin(forest.leaf(id)!), heldAt === null ? null : { level: pinLevel, heldAt }, label);
   }
 });
 
