@@ -153,6 +153,18 @@ export interface CompileResult {
   provenance?: CompileProvenance;
 
   /**
+   * Thinking blocks this compile left out because the prefix they were minted
+   * under no longer holds, or because nothing says what it was: a summary's
+   * captured carriers, and replies from before the store's first accepted
+   * round. Zero until the store's host accepts a round, and for a target that
+   * doesn't bind thinking (`SelectOptions.bindsThinking: false`). It counts
+   * the blocks the pass removed from what the strategy rendered, so it rises
+   * at a fold and once when the pass engages, and stays above zero only while
+   * something keeps invalidating replies, such as a positional injection.
+   */
+  thinkingStripped?: number;
+
+  /**
    * The stored messages of every raw body in `provenance`, as this compile
    * read them, keyed by the body's head (`RawBodySource.messageId`): the
    * body's members in shard order, head first — one message for an unsharded
@@ -244,6 +256,11 @@ export interface CompileProvenance {
    * the provenance back as you got it.
    */
   journalMark?: JournalMark | null;
+  /**
+   * Set on a dry compile's provenance. A dry compile is never sent, so no
+   * round carries it, and `acceptRound` refuses it.
+   */
+  dryRun?: true;
 }
 
 /**

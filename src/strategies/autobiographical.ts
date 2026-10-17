@@ -74,7 +74,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
-import type { IngressChunkResult } from '../types/strategy.js';
+import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -9798,6 +9798,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _lastCompileEstimate = 0;
   private _storeView: MessageStoreView | null = null;
 
+  /** Thinking the context manager stripped after this strategy's estimate
+   *  isn't sent, so the calibration sample leaves it out. */
+  noteStrippedTokens(tokens: number): void {
+    if (Number.isFinite(tokens) && tokens > 0) this._lastCompileEstimate = Math.max(0, this._lastCompileEstimate - tokens);
+  }
+
+  /** Whether the compile selecting now sends thinking only while the prefix
+   *  it was minted under holds: the live window then renders as under
+   *  `carrierPolicy: 'live-strip'`. The context manager says so before each
+   *  compile's select. */
+  private thinkingBound = false;
+
+  noteThinkingBound(bound: boolean): void {
+    this.thinkingBound = bound;
+  }
+
+  /** The carrier policy the live window renders and prices under: the
+   *  configured one, unless thinking is bound (see `carrierPolicy`). */
+  private liveCarrierPolicy(): CarrierPolicy {
+    return this.thinkingBound || this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+  }
+
   /**
    * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
    * for a request built from the latest compile (fresh + cache_read +
@@ -10804,7 +10826,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected recallPairCost(s: SummaryEntry): number {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
-    const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+    const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._pairCostCache.get(key);
@@ -13475,7 +13497,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected liveWindowAnswerProse(summary: SummaryEntry): ContentBlock[] {
     const prose = this.summaryAnswerProse(summary);
-    if (this.config.carrierPolicy !== 'live-strip') return prose;
+    if (this.liveCarrierPolicy() !== 'live-strip') return prose;
     const stripped = stripThinkingBlocks(prose);
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,

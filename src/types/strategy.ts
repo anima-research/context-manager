@@ -134,6 +134,35 @@ export interface ReadinessState {
  * Strategies control how context is selected, compressed, and maintained.
  */
 export interface ContextStrategy {
+  /**
+   * The compile just returned left out this many estimated tokens of thinking
+   * that this strategy rendered and priced: its prefix changed since the
+   * thinking was minted (see the context manager's thinking binding). A
+   * strategy that calibrates its estimates against real usage should compare
+   * that usage with what was sent. Called after every committing compile that
+   * strips. A dry compile isn't reported, since its select leaves calibration
+   * as the last committing compile left it.
+   */
+  noteStrippedTokens?(tokens: number): void;
+
+  /**
+   * Whether the compile about to select sends a thinking block only while the
+   * prefix it was minted under holds: the context manager's thinking-binding
+   * pass is engaged for its namespace (its host has accepted a round through
+   * one of the namespace's managers on this store), and the
+   * compile's target binds thinking to its prefix (`SelectOptions.bindsThinking`).
+   * Called at each initialization of the strategy (open, `setStrategy`, a
+   * branch switch), with what a compile for the last committing compile's
+   * target would be told then, or for a target that binds before any compile.
+   * Also called before each compile's select. A dry compile is told its own
+   * value, and the strategy is then told the last committing compile's (or
+   * initialization's) again, so a dry compile leaves this as it found it. While it is true, thinking minted
+   * in another request (a summary's captured reasoning carriers) can't be
+   * sent in the live window, so a strategy should stop rendering and pricing
+   * it there.
+   */
+  noteThinkingBound?(bound: boolean): void;
+
   /** Strategy name for identification */
   readonly name: string;
 
@@ -283,6 +312,37 @@ export interface SelectOptions {
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
+  /**
+   * The host's identity for what it sends before the compiled messages: its
+   * system prompt and tool definitions, as a digest or any string that
+   * changes exactly when they do. It seeds the thinking-binding chain, so a
+   * change strips the thinking minted before it. Leave it out and a change
+   * there goes unseen: the provider then refuses, or drops, the thinking the
+   * change invalidated.
+   */
+  prefixIdentity?: string;
+  /**
+   * Whether the model this compile is sent to binds a signed thinking block
+   * to the prefix it was minted under (default true). Where it does, a block
+   * sent under a changed prefix is refused, or dropped under
+   * `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, so the
+   * thinking-binding pass strips it. Set it false for a model that keeps such
+   * a block: the compile then strips nothing, and the strategy renders the
+   * live window as configured. Thinking already released on the branch, by
+   * an earlier compile's strip or by `ContextManager.releaseThinking`, stays
+   * released whatever a compile's target, since the strategy's view of the
+   * branch reads the message without it. Stamping goes on either way, so a
+   * later compile for a model that binds still finds every reply's stamp.
+   *
+   * It records a provider behaviour that is measured, not promised. On
+   * 2026-10-11, on one Anthropic account, Opus 5.5, Haiku 5.5, Sonnet 5.5 and
+   * Fable 5.1 bound thinking to its prefix, and Fable 5 and Sonnet 5 kept it.
+   * A model left at the default is stripped, which is the safe side. If a
+   * model set false starts binding, an account that enforces binding refuses
+   * the first request that sends a block under a changed prefix, and one
+   * that drops loses the block: this setting is the one to check.
+   */
+  bindsThinking?: boolean;
   /** Audited, expiring continuity relaxation for disruptive transitions.
    * Invalid or expired values fail closed to normal continuity weight. */
   kvUnifiedContinuityRelaxation?: {
@@ -885,6 +945,19 @@ export interface AutobiographicalConfig {
    * its own agents without waiting; flipping the default is a fleet-wide
    * change to what every instance reads back and belongs to whoever lives
    * under it.
+   *
+   * ONCE THINKING IS BOUND, THE LIVE WINDOW IS `'live-strip'`. A carrier was
+   * minted in the summarizer's request, under another conversation, so an
+   * account that enforces thinking binding refuses or drops it in the live
+   * window, and the context manager's binding pass never sends thinking it
+   * can't vouch for. For a compile whose thinking is bound
+   * (`noteThinkingBound`: the pass is engaged and the compile's target binds
+   * thinking), this strategy renders and prices the live window as under
+   * `'live-strip'`, whatever this says. `'full'` still governs a compile
+   * whose thinking isn't bound: on a store whose host has never accepted a
+   * round, or for a target that keeps thinking under a changed prefix
+   * (`SelectOptions.bindsThinking: false`). Mint requests are unchanged
+   * either way.
    */
   carrierPolicy?: CarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */
