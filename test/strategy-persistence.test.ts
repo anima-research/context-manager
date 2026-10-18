@@ -1442,8 +1442,9 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
-  it('refuses as infeasible, under kv-unified, a range pinned at a level only a dropped summary supplied, until the pin is released', async (t) => {
-    t.mock.method(console, 'warn', () => {});
+  it('holds, under kv-unified, a range pinned at a level only a dropped summary supplied at the level its surviving summaries supply', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
     t.mock.method(console, 'error', () => {});
     const config = { targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...kvUnified };
     let pinId = '';
@@ -1471,15 +1472,16 @@ describe('AutobiographicalStrategy — persistence', () => {
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
       assert.ok(!strategy.getSummariesView().some((summary) => summary.level === 2), 'the open drops the L2, which names a missing summary');
-      // kv-unified holds a range pinned at a level exactly there, and no
-      // summary supplies level 2 now, whatever the budget.
-      await assert.rejects(manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }), /kv-unified constraints are infeasible/);
-      assert.ok(manager.unpin(pinId), 'the pin is released');
-      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles without the pin');
-      // Pinned at a level the surviving L1s supply, it compiles too.
-      const survivors = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
-      manager.pinAtLevel(survivors.get('L1-0')!.sourceIds[0]!, survivors.get('L1-1')!.sourceIds[1]!, 1, { name: 'at-one' });
-      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles pinned at L1');
+      // No summary supplies level 2 over the pinned range now. kv-unified
+      // holds it at L1, which its surviving summaries supply, until a merge
+      // makes an L2 again; before #193, every compile refused.
+      const texts = textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }));
+      assert.deepEqual(texts.filter((text) => /^L\d-SUMMARY/.test(text)), ['L1-SUMMARY-0', 'L1-SUMMARY-1'], JSON.stringify(texts));
+      assert.ok(!texts.some((text) => /^MSG[0-3] /.test(text)), 'the pinned range renders at L1, not raw: ' + JSON.stringify(texts));
+      assert.ok(
+        warnings.some((warning) => warning.includes(`kv-unified holds pin ${pinId} ("at-two"), pinned at L2, at L1 in 4 message(s)`)),
+        JSON.stringify(warnings),
+      );
     } finally { manager.close(); }
   });
 

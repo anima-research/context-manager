@@ -154,8 +154,13 @@ test('today\'s pins, locks, summary identities and receipt invalidate stale carr
   for (const summary of c.summaries.values()) if (summary.parentId === root.id) delete summary.parentId;
   forest = new CanonicalSummaryForest(inputs, { preserveGapBearingSummaries: true });
   assert.equal(certifyCarriedLayout(inputs, forest, options), null);
-  c.chunks[0].pinLevel = 9;
+  // A level pin and a lock that disagree; a level pin alone would be held at
+  // the deepest level the chain supplies (#193).
+  c.chunks[0].lockedByAgent = true; c.chunks[0].currentResolution = 1; c.chunks[0].pinLevel = 2;
   forest = new CanonicalSummaryForest(inputs, { preserveGapBearingSummaries: true });
-  assert.ok(forest.constraintConflicts.length);
+  assert.deepEqual(
+    forest.constraintConflicts.map((conflict) => [conflict.leafId, conflict.constraints.map((constraint) => constraint.source)]),
+    [['c0', ['lockedByAgent', 'pin-level']]],
+  );
   assert.equal(certifyCarriedLayout(inputs, forest, options), null);
 });
