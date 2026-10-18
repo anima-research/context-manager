@@ -1500,8 +1500,17 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Pin a range of messages so they aren't compressed and render raw at
-   * their original chronological position. Returns the new pin id.
+   * Pin a range of messages. A pin's bound is its `level`, or without one
+   * its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps the
+   * messages out of compression and renders them raw at their original
+   * chronological position. A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * `adaptiveResolution`: there the range is still compressed, since only a
+   * summary can supply its level, and is held at `level`, or no deeper than
+   * `maxLevel`, as `ProtectedRange` describes. Anywhere else the range is
+   * raw. Where bounds are read and pins overlap at a message, the bound
+   * `ProtectedRange` names holds it, which can compress a message a raw pin
+   * covers. Returns the new pin id.
    *
    * Throws if the active strategy doesn't support pins.
    */
@@ -1527,8 +1536,12 @@ export class ContextManager {
 
   /**
    * Mark a single message as a "document" (semantically a body of
-   * information to retain in full). Same effect as a single-message pin
-   * with `kind: 'document'`. Returns the new pin id.
+   * information to keep). Same effect as a single-message pin with
+   * `kind: 'document'`, levels included (see `pinRange`): without a `level`
+   * or `maxLevel` the message is kept raw, while
+   * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
+   * where the selector reads level bounds.
+   * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
     this.requireInitialized('markDocument');

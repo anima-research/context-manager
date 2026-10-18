@@ -133,6 +133,29 @@ const COMPRESSION_MARKER =
 export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
 /**
+ * The Context Manager's turn between a recall answer and the agent's own raw
+ * turn right after it, in a compression or merge prompt (#116 review, R3-1).
+ * A recall answer is the agent's turn, so the agent's next turn would join
+ * it: `collapseConsecutiveMessages` merges consecutive messages of one
+ * participant, and the formatter merges consecutive messages of one role at
+ * the wire. The summarizer would then read that turn as the end of the memory
+ * it had just recalled, and the answer would no longer be the exact body the
+ * recall-curve variants look for. This turn ends the recall, so the raw turn
+ * after it reads as the conversation going on. Only a request with that
+ * adjacency carries it (`separateRecallAnswers`).
+ */
+export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
+
+/** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
+ *  any other message. A recall pair is such a header and the answer after it. */
+function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
+  if (message.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
+  const block = message.content[0];
+  if (block?.type !== 'text') return undefined;
+  return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
+}
+
+/**
  * Retry-only line for tool_use compression rejections. Summarizer requests
  * declare the agent's live tools (the labclaude reasoning_extraction
  * requirement), so a think-first model can answer a mint prompt on-pattern —
@@ -156,10 +179,11 @@ const NO_TOOLS_RETRY_LINE =
 const PLAIN_PROSE_RETRY_LINE =
   '\n\nWrite the memory directly as plain prose — do not wrap it in <thinking> or any other tags; begin immediately with the memory text itself.';
 
-/** Clone a compression request with `line` appended to the final instruction message. */
-function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
-  const messages = request.messages.map((m, i) => {
-    if (i !== request.messages.length - 1) return m;
+/** Messages with `line` appended to the final message's last block, when that
+ *  block is text. */
+function withLineAppended<M extends { content: ContentBlock[] }>(messages: readonly M[], line: string): M[] {
+  return messages.map((m, i) => {
+    if (i !== messages.length - 1) return m;
     const content = m.content.map((block, j) =>
       j === m.content.length - 1 && block.type === 'text'
         ? { ...block, text: block.text + line }
@@ -167,8 +191,15 @@ function withAppendedInstruction(request: NormalizedRequest, line: string): Norm
     );
     return { ...m, content };
   });
-  return { ...request, messages };
 }
+
+/** Clone a compression request with `line` appended to the final instruction message. */
+function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
+  return { ...request, messages: withLineAppended(request.messages, line) };
+}
+
+/** The lines a retry of an L1 compression appends to its instruction. */
+const L1_RETRY_LINES = [NO_TOOLS_RETRY_LINE, PLAIN_PROSE_RETRY_LINE] as const;
 
 const withNoToolsLine = (request: NormalizedRequest): NormalizedRequest =>
   withAppendedInstruction(request, NO_TOOLS_RETRY_LINE);
@@ -2499,8 +2530,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Pin a range of messages so they aren't compressed and render raw at
-   * their original position. Returns the pin id.
+   * Pin a range of messages. A pin's bound is its `level`, or without one
+   * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
+   * bound of 0, keeps the messages out of compression and renders them raw
+   * at their original position. A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * `adaptiveResolution` (`readsPinBounds`): there the range is still
+   * compressed, since only a summary can supply its level, and is held at
+   * `level`, or no deeper than `maxLevel`, as `ProtectedRange` describes.
+   * Anywhere else the range is raw. Where bounds are read and pins overlap at
+   * a message, the bound `ProtectedRange` names holds it
+   * (`resolvedPinBounds`), which can compress a message a raw pin covers.
+   * Returns the pin id.
    */
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('pinRange');
@@ -2520,8 +2561,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Mark a single message as a "document" — semantically a body of
-   * information the agent wants to retain in full. Functionally a
-   * single-message pin with `kind: 'document'`.
+   * information the agent wants to keep. Functionally a single-message pin
+   * with `kind: 'document'`, and `opts` reads as `pinRange`'s: without a
+   * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
+   * it fold no deeper than that level where the selector reads level bounds.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -2926,7 +2969,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * point — observed empirically at ~chunk 118 in a 4000-message import.
    *
    * Per-summary +50 token overhead accounts for the "[CM] Recall memory
-   * <id>." question turn that wraps each recall body. Rough but defensive.
+   * <id>." question turn that wraps each recall body, and the resume turn
+   * after it where the agent's own turn follows (RECALL_RESUME_TEXT). Rough
+   * but defensive.
    *
    * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
    * tags, so the estimate prices that summary's ACTUAL envelope string on top
@@ -3016,13 +3061,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let deepEnd = -1;
     let frontierEnd = -1;
     for (let i = 0; i < messages.length - 1; i++) {
-      const m = messages[i]!;
-      if (m.participant !== 'Context Manager' || m.content.length !== 1) continue;
-      const block = m.content[0];
-      if (block?.type !== 'text') continue;
-      const match = /^\[CM\] Recall memory (.+)\.$/.exec(block.text);
-      if (!match) continue;
-      const level = levelById.get(match[1]!);
+      const id = recallHeaderId(messages[i]!);
+      if (id === undefined) continue;
+      const level = levelById.get(id);
       if (level === undefined) continue;
       if (frontierEnd === -1 && i > 0) headEnd = i - 1;
       frontierEnd = i + 1;
@@ -6726,7 +6767,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // bundles (a tool_result in an assistant message rejects the request);
       // for fresh imports the conhost importer splits at ingest time, but
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-      const split = splitMixedToolMessages(llmMessages);
+      // First each recall answer is kept apart from the agent's own raw turn
+      // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
+      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
 
       // Collapse consecutive same-participant messages for API compliance
       const collapsed = this.collapseConsecutiveMessages(split);
@@ -6771,8 +6814,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // replace some with placeholders. The raw's charge against the recall
     // budget also counts a pinned tool block whose partner isn't in the
     // request, which the request drops; the request's own price, of
-    // built.cleaned, doesn't. So the gate errs toward recall. A request
-    // without pins is always attempted, as before.
+    // built.cleaned, doesn't. So the gate errs toward recall. The request is
+    // priced with the longer of the lines a retry appends to the instruction
+    // (withNoToolsLine, withPlainProseLine), so a retry fits too. The
+    // recall-curve variants and the opt-in tool-prose rung aren't priced
+    // here: each is admitted on its own when the ladder reaches it
+    // (compressionAdmission). A request without pins is always attempted, as
+    // before.
     // Otherwise this compression lays history out as if no pin applied,
     // recalling the summaries the pins override, and says so once it goes
     // ahead. Waiting for the pins to fit would stall every later L1 too,
@@ -6782,7 +6830,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
     if (history.pinnedRawTokens > 0) {
       const contextBudget = this.normalizedCompressionContextBudget();
-      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
+      const requestTokens = history.pinnedRawTokens <= recallBudget
+        ? Math.max(...L1_RETRY_LINES.map((line) => priceRequest(withLineAppended(built.cleaned, line))))
+        : undefined;
       if (requestTokens === undefined || requestTokens > contextBudget) {
         pinsOverBudget = { history, requestTokens, contextBudget };
         history = layoutHistory(new Set());
@@ -7101,7 +7151,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }).map((pin) => pin.name ?? pin.id);
       const limit = requestTokens === undefined
         ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
-        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+        : `would bring the request to ~${requestTokens} tokens, counting the line a retry adds, over compressionContextBudgetTokens (${contextBudget})`;
       console.warn(
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
@@ -8803,8 +8853,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }],
     });
 
-    // Same bundled-tool-cycle defense as compressChunkHierarchical.
-    const split = splitMixedToolMessages(llmMessages);
+    // Same bundled-tool-cycle defense as compressChunkHierarchical, after the
+    // same separation of recall answers from the agent's raw turns: an L2
+    // target, or the raw middle, follows the last ladder answer.
+    const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
@@ -12596,8 +12648,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * recent window AND not kept raw by a pin. Returns messages from
    * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
    * document mark keeps raw (forceRawPinPositions). A pin with a positive
-   * level or cap, under the strategies that honor one, is compressible: it
-   * renders at a level, which only a summary can supply.
+   * level or cap is compressible where bounds are read (kv-stable and
+   * kv-unified, with adaptive resolution: readsPinBounds): it renders at a
+   * level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
@@ -14183,6 +14236,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     lines.push('</earlier_in_conversation>');
     return lines.join('\n');
+  }
+
+  /**
+   * Put the Context Manager's resume turn (RECALL_RESUME_TEXT) right after
+   * each recall answer that the agent's own raw turn follows: in the L1
+   * prompt, an opened chunk or the raw middle that starts with the agent's
+   * turn; in a merge prompt, an L2 target or the raw middle that does. A
+   * recall answer is the message after a `[CM] Recall memory <id>.` header
+   * (recallHeaderId), and it is the agent's, so a next message of the
+   * answer's participant is what the collapse below joins to it, and the
+   * formatter at the wire. The turn goes in when the message right after the
+   * answer is of that participant, or the first one after it that has any
+   * content is: the request drops a message with no content left once its
+   * unpaired tool blocks and empty text are stripped (stripUnpairedToolBlocks,
+   * stripEmptyTextBlocks and the filter after them), which would bring the
+   * two together. Splitting and collapsing don't change which tool blocks are
+   * paired, so they're stripped here as the request will strip them. Any
+   * other sequence comes back with the same messages.
+   */
+  protected separateRecallAnswers(
+    messages: Array<{ participant: string; content: ContentBlock[] }>,
+  ): Array<{ participant: string; content: ContentBlock[] }> {
+    const carried = stripUnpairedToolBlocks(messages);
+    const hasContent = (i: number): boolean => stripEmptyTextBlocks(carried[i]!.content).length > 0;
+    const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
+    messages.forEach((message, i) => {
+      separated.push(message);
+      if (i === 0 || recallHeaderId(messages[i - 1]!) === undefined) return;
+      let withContent = i + 1;
+      while (withContent < messages.length && !hasContent(withContent)) withContent++;
+      if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {
+        separated.push({ participant: 'Context Manager', content: [{ type: 'text', text: RECALL_RESUME_TEXT }] });
+      }
+    });
+    return separated;
   }
 
   /**
