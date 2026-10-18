@@ -208,7 +208,9 @@ function releasePairings(before: readonly ContentBlock[], released: Set<string>)
  * nothing changes, since only whitespace rides along inside that item; an
  * item none of whose parts survive releases the reasoning that led to it.
  *
- * `after` must keep each surviving block by identity, as a filter does.
+ * `after` must keep each surviving block by identity, as a filter does. A
+ * block it holds only as a new copy, such as the per-message cap's cut,
+ * counts as dropped.
  * Returns `after` itself when nothing has to change.
  */
 export function releaseVanishedRawForms(
@@ -220,7 +222,7 @@ export function releaseVanishedRawForms(
   const released = new Set<string>();
   for (const block of before) {
     if (kept.has(block)) continue;
-    const empty = isEmptyTextPart(block);
+    const empty = isEmptyTextBlock(block);
     for (const key of rawFormKeys(block)) if (!empty || !surviving.has(key)) released.add(key);
   }
   if (released.size === 0) return after;
@@ -234,8 +236,15 @@ export function releaseVanishedRawForms(
   return changed ? result : after;
 }
 
-/** A text part with nothing but whitespace: not an opaque carrier, whose raw item is its content. */
-function isEmptyTextPart(block: ContentBlock): boolean {
+/** A text block that holds nothing: text that is empty or only whitespace, as
+ *  the strategy reads an empty summary or text part, carrying no opaque item
+ *  (`isOpaqueCarrier`). A text block carrying no opaque item whose text isn't
+ *  a string holds nothing either, and is read so without throwing. An empty
+ *  opaque carrier is where this differs from compression input's rule, on
+ *  purpose: `stripEmptyTextBlocks` drops one, since no opaque item rides a
+ *  compression request, while under the per-message cap (message-cap.ts) and
+ *  here a carrier holds an item and counts as content. */
+export function isEmptyTextBlock(block: ContentBlock): boolean {
   if (block.type !== 'text' || isOpaqueCarrier(block)) return false;
   const text = (block as { text?: unknown }).text;
   return typeof text !== 'string' || text.trim().length === 0;

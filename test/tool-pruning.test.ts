@@ -108,6 +108,29 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     await manager.close();
   });
 
+  it('text past maxMessageTokens is dropped with one marker where it began', async () => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 100,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    manager.addMessage('user', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'text', text: 'second' },
+      { type: 'text', text: 'third' },
+    ]);
+    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+    const texts = compiled.messages.flatMap(m => m.content).map(b => (b as { text?: string }).text);
+    assert.equal(texts.length, 2, 'the cut block and one marker for the two dropped ones');
+    assert.match(String(texts[0]), /\[truncated — original was 500 tokens\]$/);
+    assert.equal(texts[1], '[content omitted: this message reached its token limit]');
+    await manager.close();
+  });
+
   it('global numeric cap applies to all tools', async () => {
     const strategy = new AutobiographicalStrategy({
       headWindowTokens: 0,

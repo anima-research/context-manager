@@ -10,6 +10,12 @@
  * must not be re-captured to make a red go green: a diff here is the default
  * path moving, which is exactly what the fix promised not to do.
  *
+ * It was re-captured once, on purpose, when the message cap began marking the
+ * text blocks it drops past `maxMessageTokens` with one
+ * "[content omitted: this message reached its token limit]" block. The new
+ * golden differs from the old one only by that block, once in each of the two
+ * combined cases, whose capped answers carry a second text block.
+ *
  *   npm run build && node dist/test/fixtures/recall-envelope-truncation-golden.generate.js
  */
 

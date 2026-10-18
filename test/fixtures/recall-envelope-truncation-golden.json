@@ -157,6 +157,10 @@
           "text": "zz-memory-merged-level covering the first two tu\n\n[truncated — original was 13 tokens]"
         },
         {
+          "type": "text",
+          "text": "[content omitted: this message reached its token limit]"
+        },
+        {
           "type": "thinking",
           "thinking": "zz-carrier-reasoning",
           "signature": "zz-signature"
@@ -189,6 +193,10 @@
         {
           "type": "text",
           "text": "zz-m\n\n[truncated — original was 13 tokens]"
+        },
+        {
+          "type": "text",
+          "text": "[content omitted: this message reached its token limit]"
         },
         {
           "type": "thinking",
