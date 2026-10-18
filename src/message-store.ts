@@ -1096,6 +1096,12 @@ export class MessageStore {
         return 0;
       case 'image':
         return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+      // A generated image goes to the provider as an image (membrane converts
+      // it), so it is priced as an image without a stamp: membrane's
+      // GeneratedImageContent carries no tokenEstimate. Priced at 0, a layout
+      // holding one ran larger than its estimate.
+      case 'generated_image':
+        return 1600;
       case 'document':
       case 'audio':
       case 'video':

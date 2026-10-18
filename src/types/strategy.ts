@@ -621,11 +621,17 @@ export interface RenderStats {
 
   /**
    * Estimator calibration in force for this compile: the multiplier applied
-   * to every token estimate and the pricing epoch it was learned under.
-   * `provisional` is true while the multiplier is a guess rather than a value
-   * learned under this epoch's pricing: one kept from a record without a
-   * stamp, or the 1 a discard restarts from. The first provider sample
-   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * to every token estimate, and the pricing epoch in force. A multiplier
+   * that isn't provisional was learned under that epoch's pricing, or under
+   * an older epoch's and kept, re-stamped, because nothing this store holds
+   * was repriced since; either way it's reported under the epoch in force.
+   * `provisional` is true while the multiplier is a guess, which the first
+   * provider sample the calibration's band accepts replaces outright, rather
+   * than stepping toward it (see
+   * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
+   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * provisional through a later epoch's load, which re-stamps it whatever
+   * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
    * been discarded, on load or when a provisional one above 1 put the first
    * compile over budget. It is kept
@@ -938,7 +944,12 @@ export interface AutobiographicalConfig {
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. 0 = unlimited.
-   *  A hard ceiling for dense bursts that pack many images into the live window. */
+   *  A hard ceiling for dense bursts that pack many images into the live window.
+   *  Every `image` block counts, whatever its source (base64, a `data:` URL,
+   *  a remote URL, or MCP's `data` beside `mimeType`), and so does every
+   *  generated image, top-level or nested in a tool result (see
+   *  inline-images.ts). An image inside an opaque provider item, such as a
+   *  Responses `image_generation_call` replayed from its raw form, doesn't. */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
@@ -957,10 +968,14 @@ export interface AutobiographicalConfig {
 
   /**
    * Byte wall for live images (2026-07-12): keep inline images newest-first
-   * only while their cumulative base64 size stays under this budget — on top
-   * of `maxLiveImages` / `imageStripDepthTokens`. Guarantees the compiled
-   * window fits the API's total request size cap (413 request_too_large), so
-   * membrane's oversize check is a true invariant, never a silent editor.
+   * only while their cumulative inline size (a base64 source, a `data:` URL's
+   * payload, an MCP or generated image's `data`; 0 for a remote URL) stays
+   * under this budget — on top
+   * of `maxLiveImages` / `imageStripDepthTokens`. It keeps the images it
+   * counts from pushing the compiled window past the API's total request size
+   * cap (413 request_too_large), so that membrane's oversize check isn't what
+   * edits them. An image inside an opaque provider item (see `maxLiveImages`)
+   * isn't counted, so it's outside this budget.
    * Default 20MB (of base64; the API cap is 32MB total).
    */
   maxLiveImageBytes?: number;

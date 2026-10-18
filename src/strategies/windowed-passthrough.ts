@@ -17,6 +17,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { releaseEditedRawForms } from '../raw-forms.js';
+import { hasImage, inlineImageBytes, replaceImages } from '../inline-images.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -52,7 +53,8 @@ export interface WindowedPassthroughOptions {
    */
   maxMessageTokens?: number;
   /**
-   * Live-image policy, mirroring `AutobiographicalConfig`: an image is
+   * Live-image policy, mirroring `AutobiographicalConfig`: an image, nested in
+   * a tool result or not (see inline-images.ts), is
    * replaced by the memory strategy's text placeholder once it is beyond the
    * `maxLiveImages` newest images (counted newest-first), deeper than
    * `imageStripDepthTokens` from the newest message, or past
@@ -381,20 +383,20 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // Entries are in timeline order; the policy counts newest-first.
     for (let e = entries.length - 1; e >= 0; e--) {
       const entry = entries[e];
-      if (!entry.content.some((b) => b.type === 'image')) continue;
+      // Every image the entry carries, nested in a tool_result included,
+      // counted and stripped as the autobiographical strategy does (see
+      // inline-images.ts), raw forms of an edited block released.
+      if (!hasImage(entry.content)) continue;
       const tooDeep = depthTokens > 0 && entry.index < stripStart;
-      entry.content = entry.content.map((block) => {
-        if (block.type !== 'image') return block;
-        const bytes = imageBlockBytes(block);
+      entry.content = replaceImages(entry.content, (image) => {
+        const bytes = inlineImageBytes(image);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (tooDeep || overCount || overBytes) {
-          return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
-        }
+        if (tooDeep || overCount || overBytes) return true;
         keptImages++;
         keptImageBytes += bytes;
-        return block;
-      });
+        return false;
+      }, IMAGE_PLACEHOLDER);
     }
   }
 
@@ -436,11 +438,6 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 // ----------------------------------------------------------------------------
 // Helpers (ports of the autobiographical strategy's protected utilities)
 // ----------------------------------------------------------------------------
-
-function imageBlockBytes(block: unknown): number {
-  const src = (block as { source?: { data?: string } }).source;
-  return typeof src?.data === 'string' ? src.data.length : 0;
-}
 
 /** Text-only token estimate at the same chars/4 rate the truncation marker reports. */
 function estimateTextOnlyTokens(content: ContentBlock[]): number {

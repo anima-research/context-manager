@@ -2,10 +2,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { AutobiographicalStrategy } from '../src/index.js';
+import { inlineImageBytes } from '../src/inline-images.js';
 
 class Prepared extends AutobiographicalStrategy {
   prepare(request: NormalizedRequest) { return this.prepareCompressionRequest(request); }
-  static bytes(block: unknown) { return this.compressionImageBytes(block); }
+  static bytes(block: unknown) { return inlineImageBytes(block); }
   private get preparation() {
     return this as unknown as {
       prepareCompressionAhead(r: NormalizedRequest): NormalizedRequest;
