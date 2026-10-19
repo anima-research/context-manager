@@ -87,3 +87,4 @@ Highest risk areas to prioritize:
 - Blob lifecycle with deletes (#13, #14) ✓
 - Index consistency after remove operations (#18, #19) ✓
 - Configurable compression prompts ✓
+
