@@ -275,6 +275,12 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
     ['a', 3, [{ kind: 'min', level: 2, source: 'floor' }], [], [2, 3], null],
     // Every other constraint has to allow both levels, not only the first.
     ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }, { kind: 'min', level: 2, source: 'floor' }], [], [2], null],
+    // A bound that isn't a non-negative integer allows no level (buildLeaf
+    // empties the leaf for it), so the pin isn't held and its conflict names
+    // the pinned level.
+    ['a', 2, [{ kind: 'min', level: -1, source: 'floor' }], [], [2], null],
+    ['a', 2, [{ kind: 'min', level: 0.5, source: 'floor' }], [], [2], null],
+    ['a', 2, [{ kind: 'max', level: 2.5, source: 'cap' }], [], [2], null],
     // Where the chain supplies no summary, the pin is held raw, so a floor
     // that excludes raw makes it strict.
     ['c', 2, [{ kind: 'max', level: 2, source: 'cap' }], [0], null, 0],

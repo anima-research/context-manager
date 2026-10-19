@@ -320,13 +320,17 @@ const PIN_LEVEL_SOURCE = 'pin-level';
  *  labelled. */
 const levelPins = new WeakSet<CanonicalLeafConstraint>();
 
-/** Whether `constraint` allows a leaf at `level`, whatever its chain supplies. */
+/** Whether `constraint` allows a leaf at `level`, whatever its chain supplies.
+ *  One whose level isn't a non-negative integer allows none, since `buildLeaf`
+ *  empties a leaf that carries it. */
 function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolean {
+  if (constraint.kind === 'raw') return level === 0;
+  const bound = constraint.level;
+  if (bound === undefined || !Number.isInteger(bound) || bound < 0) return false;
   switch (constraint.kind) {
-    case 'raw': return level === 0;
-    case 'exact': return constraint.level === level;
-    case 'max': return constraint.level !== undefined && level <= constraint.level;
-    case 'min': return constraint.level !== undefined && level >= constraint.level;
+    case 'exact': return bound === level;
+    case 'max': return level <= bound;
+    case 'min': return level >= bound;
   }
 }
 

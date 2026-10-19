@@ -1833,6 +1833,16 @@ describe('AutobiographicalStrategy — persistence', () => {
         warnings.some((warning) => warning.includes(`kv-unified holds pin ${pinId} ("at-two"), pinned at L2, at L1 in 4 message(s)`)),
         JSON.stringify(warnings),
       );
+      assert.ok(manager.unpin(pinId), 'the pin is released');
+      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles without the pin');
+      assert.ok(
+        warnings.some((warning) => warning.includes(`pin ${pinId} ("at-two"), held below its L2 by kv-unified, was removed.`)),
+        JSON.stringify(warnings),
+      );
+      // Pinned at a level the surviving L1s supply, it compiles too.
+      const survivors = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
+      manager.pinAtLevel(survivors.get('L1-0')!.sourceIds[0]!, survivors.get('L1-1')!.sourceIds[1]!, 1, { name: 'at-one' });
+      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles pinned at L1');
     } finally { manager.close(); }
   });
 
