@@ -16,11 +16,13 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
+  AutobiographicalStrategy,
   ContextManager,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
   filterMessageStoreView,
   mergeMessageStoreViews,
+  OverBudgetError,
 } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
@@ -300,8 +302,18 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
     await manager.close();
 
     const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
-    const manager2 = await ContextManager.open({ path, strategy: strategy2 });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let manager2: ContextManager;
+    try {
+      manager2 = await ContextManager.open({ path, strategy: strategy2, namespace: 'agents/tern' });
+    } finally {
+      console.warn = warn;
+    }
     assert.equal(strategy2.getAnchor(), 0);
+    // The reset is said, naming the strategy's namespace (#239).
+    assert.ok(warned.some((w) => w.startsWith('[windowed-passthrough] persisted anchor 1000000 is past the branch head') && w.endsWith(' ns=agents/tern')), warned.join('\n'));
     assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
     await manager2.close();
   });
@@ -346,7 +358,12 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const path = freshPath();
     const manager = await ContextManager.open({ path, strategy: new WindowedPassthroughStrategy() });
     manager.addMessage('u', text('x'.repeat(2000))); // ~500 tokens
-    await assert.rejects(manager.compile(budget), (err: Error) => err.name === 'OverBudgetError');
+    await assert.rejects(manager.compile(budget), (err: Error) => {
+      assert.ok(err instanceof OverBudgetError);
+      // No compression here: only a newer message that fits, or a larger budget, clears it.
+      assert.deepStrictEqual(err.clearedBy, ['newer-message']);
+      return true;
+    });
     await manager.close();
   });
 
@@ -361,6 +378,138 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     assert.match(t, /\[truncated — original was 500 tokens\]$/);
     assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
     await manager.close();
+  });
+
+  it('a tool result past the message\'s cap keeps its pairing and says the cap ran out', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const blocks = compiled.messages.flatMap((m) => m.content);
+    const result = blocks.find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1', 'the result still answers its call');
+    assert.ok(blocks.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 't1'), 'and the call is still there');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
+
+  it('autobiographical\'s message cap writes the same marker on a tool result past it', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const result = compiled.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
+
+  it('text past the cap is dropped with one marker where it began', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'text', text: 'second' },
+      { type: 'text', text: 'third' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const blocks = compiled.messages[0].content.map((b) => (b as { text: string }).text);
+    assert.equal(blocks.length, 2, 'the cut block and one marker for the two dropped ones');
+    assert.match(blocks[0], /\[truncated — original was 500 tokens\]$/);
+    assert.equal(blocks[1], '[content omitted: this message reached its token limit]');
+    await manager.close();
+  });
+});
+
+describe('the message cap\'s omission marker, in both strategies', () => {
+  // Room for the image the cap keeps, which a capped message's price counts
+  // as it renders (#223), at the store's 1,600 tokens.
+  const budget = { maxTokens: 3000, reserveForResponse: 50 };
+  const strategies = [
+    ['windowed passthrough', () => new WindowedPassthroughStrategy({ maxMessageTokens: 100 })],
+    ['autobiographical', () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 })],
+  ] as const;
+  for (const [name, make] of strategies) {
+    it(`${name}: goes where the first dropped text was, after a tool result and an image the cap keeps`, async () => {
+      const path = freshPath();
+      const manager = await ContextManager.open({ path, strategy: make() });
+      manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      manager.addMessage('u', [
+        { type: 'text', text: 'x'.repeat(2000) },
+        { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
+        { type: 'text', text: 'dropped' },
+      ]);
+      const compiled = await manager.compile(budget);
+      // The compile sends the result in a turn of its own, so read the
+      // message's blocks in order across the turns after the call.
+      const call = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
+      const blocks = compiled.messages.slice(call + 1).flatMap((m) => m.content);
+      assert.deepEqual(blocks.map((b) => b.type), ['text', 'tool_result', 'image', 'text']);
+      assert.match((blocks[0] as { text: string }).text, /\[truncated — original was 500 tokens\]$/);
+      assert.equal((blocks[1] as { content: unknown }).content, '[content omitted: this message reached its token limit before this result]');
+      assert.equal((blocks[3] as { text: string }).text, '[content omitted: this message reached its token limit]');
+      await manager.close();
+    });
+
+    it(`${name}: isn't written for text blocks past the cap that hold nothing, which are left out, since nothing was lost`, async () => {
+      const path = freshPath();
+      const manager = await ContextManager.open({ path, strategy: make() });
+      manager.addMessage('u', [
+        { type: 'text', text: 'x'.repeat(2000) },
+        { type: 'text', text: '' },
+        { type: 'text', text: '  ' },
+      ]);
+      const compiled = await manager.compile(budget);
+      const blocks = compiled.messages.flatMap((m) => m.content);
+      assert.equal(blocks.length, 1, `only the cut block is sent: ${JSON.stringify(blocks)}`);
+      assert.match(String((blocks[0] as { text?: string }).text), /\[truncated — original was 500 tokens\]$/);
+      await manager.close();
+    });
+  }
+});
+
+describe('WindowedPassthroughStrategy: the price of a message the cap leaves whole', () => {
+  it('is its full estimate, as it renders, though its estimate passed the cap', async () => {
+    // Eleven one-character blocks estimate at 11 tokens, rounded up per block, past the 10-token cap,
+    // but their 11 characters fit its 40, so nothing is cut. A tool call, which the cap doesn't read,
+    // makes the message far larger than the budget.
+    const priced = async (maxMessageTokens: number | undefined): Promise<number> => {
+      const manager = await ContextManager.open({ path: freshPath(), strategy: new WindowedPassthroughStrategy(maxMessageTokens === undefined ? {} : { maxMessageTokens }) });
+      manager.addMessage('a', [
+        ...Array.from({ length: 11 }, (): ContentBlock => ({ type: 'text', text: 'x' })),
+        { type: 'tool_use', id: 't1', name: 'zz_note', input: { note: 'y'.repeat(4000) } } as ContentBlock,
+      ]);
+      try {
+        await manager.compile({ maxTokens: 500, reserveForResponse: 0 });
+        assert.fail('premise: the message is over the budget');
+      } catch (error) {
+        assert.ok(error instanceof OverBudgetError, `premise: refused for its size: ${String(error)}`);
+        return (error as OverBudgetError & { actual: number }).actual;
+      } finally {
+        await manager.close();
+      }
+    };
+    const uncapped = await priced(undefined);
+    assert.ok(uncapped > 60, `premise: the full estimate passes cap + 50: ${uncapped}`);
+    assert.equal(await priced(10), uncapped, 'priced at its full estimate, as with no cap, not at min(estimate, cap + 50)');
   });
 });
 
@@ -383,8 +532,8 @@ describe('WindowedPassthroughStrategy: live-image policy', () => {
       m.content.map((b) => (b.type === 'image' ? 'image' : (b as { text: string }).text)),
     );
     assert.deepEqual(shape, [
-      ['i1', '[image dropped from live context]'],
-      ['i2', '[image dropped from live context]'],
+      ['i1', "[image not shown: this context keeps only some images]"],
+      ['i2', "[image not shown: this context keeps only some images]"],
       ['i3', 'image'],
     ]);
     await manager.close();

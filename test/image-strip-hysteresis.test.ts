@@ -21,6 +21,7 @@ const img = (label: string, bytes = 4): ContentBlock[] => [
 // rebuild so a dry call or observer, rather than initialization, reaches a trim.
 class ImageRatioStrategy extends AutobiographicalStrategy {
   enableImageRatio(): void { this.config.imageStripHysteresisRatio = 0.5; }
+  watermarkStateId(): string { return this.imageWatermarkStateId; }
 }
 const strategy = (extra: Record<string, unknown>) => new ImageRatioStrategy({
   headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0, ...extra,
@@ -69,6 +70,92 @@ describe('imageStripHysteresisRatio', () => {
     await m.close();
   });
 
+  it('registers its watermark state at open when the option is on, and a store never opened with it has none', async () => {
+    const on = strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 });
+    let m = await ContextManager.open({ path: STORE, strategy: on });
+    // Registered as the strategy's other slots are, not created by the
+    // first write.
+    assert.ok(m.getStore().listStates().some((state) => state.id === on.watermarkStateId()), 'registered at open, before any write');
+    await m.close();
+    cleanup();
+    const off = strategy({ maxLiveImages: 4 });
+    m = await ContextManager.open({ path: STORE, strategy: off });
+    assert.ok(!m.getStore().listStates().some((state) => state.id === off.watermarkStateId()), 'no slot without the option');
+    await m.close();
+  });
+
+  it('keeps a watermark an earlier version wrote to an unregistered slot, and persists the next one', async () => {
+    // The layout an earlier version leaves: the slot created by its first write, never registered.
+    const off = strategy({ maxLiveImages: 4 });
+    let m = await ContextManager.open({ path: STORE, strategy: off });
+    for (let i = 1; i <= 5; i++) m.addMessage('user', img(`img-${i}`));
+    const second = m.getAllMessages()[1]!.sequence;
+    m.getStore().setStateJson(off.watermarkStateId(), { sequence: second, at: 0 });
+    await m.close();
+    // Opened with the option on, the strategy registers it and reads the value.
+    m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 }) });
+    assert.equal(await stripped(m, 5), '..III', 'the earlier watermark holds at image 2, where a fresh one would strip 1 to 3');
+    m.addMessage('user', img('img-6'));
+    assert.equal(await stripped(m, 6), '..IIII', 'four live images fit');
+    m.addMessage('user', img('img-7'));
+    assert.equal(await stripped(m, 7), '.....II', 'the limit binds again and the watermark advances to image 5');
+    await m.close();
+    m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 }) });
+    m.addMessage('user', img('img-8'));
+    m.addMessage('user', img('img-9'));
+    // Advanced and persisted: the walk stops at image 5. From image 2, or from nothing, image 9 would bind it again.
+    assert.equal(await stripped(m, 9), '.....IIII', 'the advanced watermark was persisted');
+    await m.close();
+  });
+
+  it('says once that a watermark write failed, and keeps the watermark in memory', async (t) => {
+    const s = strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 });
+    const m = await ContextManager.open({ path: STORE, strategy: s });
+    const store = m.getStore();
+    const write = store.setStateJson.bind(store);
+    t.mock.method(store, 'setStateJson', (id: string, value: unknown) => {
+      if (id === s.watermarkStateId()) throw new Error('append failed: fsync: no space left on device');
+      return write(id, value);
+    });
+    const warn = t.mock.method(console, 'warn', () => {});
+    for (let i = 1; i <= 5; i++) m.addMessage('user', img(`img-${i}`));
+    assert.equal(await stripped(m, 5), '...II', 'the first trim holds');
+    m.addMessage('user', img('img-6'));
+    // Held: the walk stops at image 3, so the limit doesn't bind. A dropped watermark would give '....II'.
+    assert.equal(await stripped(m, 6), '...III', 'one more image leaves the watermark where memory holds it');
+    m.addMessage('user', img('img-7'));
+    m.addMessage('user', img('img-8'));
+    assert.equal(await stripped(m, 8), '......II', 'and the next trim advances it from there');
+    const lines = warn.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes(s.watermarkStateId()));
+    assert.equal(lines.length, 1, 'one line for both failed writes');
+    assert.match(lines[0]!, /append failed: fsync: no space left on device/);
+    await m.close();
+  });
+
+  it('loses a watermark whose write failed when the strategy reloads its state, as a branch switch does', async (t) => {
+    const s = strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 });
+    const m = await ContextManager.open({ path: STORE, strategy: s });
+    const store = m.getStore();
+    const write = store.setStateJson.bind(store);
+    t.mock.method(store, 'setStateJson', (id: string, value: unknown) => {
+      if (id === s.watermarkStateId()) throw new Error('append failed');
+      return write(id, value);
+    });
+    t.mock.method(console, 'warn', () => {});
+    for (let i = 1; i <= 5; i++) m.addMessage('user', img(`img-${i}`));
+    assert.equal(await stripped(m, 5), '...II', 'the first trim holds, in memory only');
+    m.addMessage('user', img('img-6'));
+    assert.equal(await stripped(m, 6), '...III', 'held in memory');
+    m.addMessage('user', img('img-7'));
+    assert.equal(await stripped(m, 7), '...IIII', 'still held: four live images fit');
+    const main = m.currentBranch().name;
+    await m.fork('zz-elsewhere');
+    await m.switchBranch(main);
+    // Reloaded from the store, which never got it: the watermark is computed afresh from seven images.
+    assert.equal(await stripped(m, 7), '.....II', 'the watermark held in memory is gone, and the stripped set changes');
+    await m.close();
+  });
+
   it('byte cap works the same way', async () => {
     const m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImageBytes: 400, imageStripHysteresisRatio: 0.5 }) });
     for (let i = 1; i <= 4; i++) m.addMessage('user', img(`img-${i}`, 100));
@@ -81,9 +168,6 @@ describe('imageStripHysteresisRatio', () => {
   });
 
   describe('a dry select leaves the watermark as it found it', () => {
-    // Node 20.0.0's runner doesn't apply the outer beforeEach to tests in a
-    // nested describe, so these clear the store themselves.
-    beforeEach(cleanup);
     // compile() and previewContext() reach the watermark through the adaptive
     // picker's post-strip estimates.
     const adaptive = (extra: Record<string, unknown> = {}) => strategy({

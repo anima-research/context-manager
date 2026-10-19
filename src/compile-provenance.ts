@@ -14,7 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { continuesBody } from './body-runs.js';
+import { bodyBoundsIn } from './body-runs.js';
 import type {
   CompiledMessageSources,
   ContextEntry,
@@ -43,7 +43,11 @@ export interface EntryProvenance {
   sources: CompiledMessageSources[];
   /** Raw message id -> whether its body was complete in this compile. */
   rawComplete: Map<MessageId, boolean>;
-  /** Every stored message's body, as storedBodies read it (see rawBodiesOf). */
+  /**
+   * The body of every stored message the raw entries name, under each of
+   * its members: the body's members in shard order, head first (see
+   * rawBodiesOf).
+   */
   bodies: ReadonlyMap<MessageId, readonly StoredMessage[]>;
 }
 
@@ -58,28 +62,72 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
 }
 
 /**
- * Every stored body, as the messages of one ingestion, read by the rule every
- * reader of a group id shares (body-runs.ts): a message continues the body
- * before it only when it carries the same group id at a higher shard index,
- * so a body is a run of consecutive messages, and the same text ingested
- * twice, back to back or apart, is two bodies. A message outside any group
- * is a body of its own. A body whose shard 0 was removed keeps its other
- * shards, and its head is then the first of them.
- *
- * Returns, for each stored message, its body's members in shard order (one
- * array per body, shared by its members); the head is the first.
- * `stored` must be in sequence order.
+ * The position of the message stored at `sequence`, or -1. `stored` is in
+ * sequence order, as every message view is.
  */
-export function storedBodies(stored: readonly StoredMessage[]): ReadonlyMap<MessageId, readonly StoredMessage[]> {
-  const out = new Map<MessageId, StoredMessage[]>();
-  let body: StoredMessage[] = [];
-  for (let i = 0; i < stored.length; i++) {
-    const msg = stored[i]!;
-    if (i === 0 || !continuesBody(stored[i - 1], msg)) body = [];
-    body.push(msg);
-    out.set(msg.id, body);
+function positionOfSequence(stored: readonly StoredMessage[], sequence: number): number {
+  let lo = 0;
+  let hi = stored.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const at = stored[mid]!.sequence;
+    if (at === sequence) return mid;
+    if (at < sequence) lo = mid + 1;
+    else hi = mid - 1;
   }
-  return out;
+  return -1;
+}
+
+/**
+ * Finds stored messages by id, with their bodies, reading `stored` only
+ * around the messages asked for, so a compile's attribution costs what its
+ * raw entries name, not what is stored.
+ *
+ * A body is one ingestion, read by the rule every reader of a group id
+ * shares (body-runs.ts): a message continues the body before it only when
+ * it carries the same group id at a higher shard index, so a body is a run
+ * of consecutive messages, and the same text ingested twice, back to back or
+ * apart, is two bodies. A message outside any group is a body of its own. A
+ * body whose shard 0 was removed keeps its other shards, and its head is
+ * then the first of them.
+ *
+ * A message is looked for first right after the last body found, since a
+ * run of raw entries names consecutive messages, and otherwise at its
+ * sequence (`sequenceOf`, then a binary search). So a run of consecutive
+ * stored messages costs one lookup, at its start, and a named message that
+ * doesn't follow the last body found costs one of its own, as one named out
+ * of order does, or one after a message the view filter hid: at most one
+ * lookup for each raw source, whatever the length of `stored`. An id that
+ * no message in `stored` has is not found, and neither is one whose lookup
+ * answers with a sequence no message of `stored` has under that id.
+ */
+function storedBodyFinder(
+  stored: readonly StoredMessage[],
+  sequenceOf: (id: MessageId) => number | undefined,
+): { find: (id: MessageId) => StoredMessage | undefined; bodies: ReadonlyMap<MessageId, readonly StoredMessage[]> } {
+  const found = new Map<MessageId, StoredMessage>();
+  const bodies = new Map<MessageId, readonly StoredMessage[]>();
+  let next = 0;
+  const find = (id: MessageId): StoredMessage | undefined => {
+    const known = found.get(id);
+    if (known) return known;
+    let at = stored[next]?.id === id ? next : -1;
+    if (at === -1) {
+      const sequence = sequenceOf(id);
+      if (sequence === undefined) return undefined;
+      at = positionOfSequence(stored, sequence);
+      if (at === -1 || stored[at]!.id !== id) return undefined;
+    }
+    const { from, to } = bodyBoundsIn(stored, at);
+    const body = stored.slice(from, to + 1);
+    for (const member of body) {
+      found.set(member.id, member);
+      bodies.set(member.id, body);
+    }
+    next = to + 1;
+    return stored[at];
+  };
+  return { find, bodies };
 }
 
 /**
@@ -87,16 +135,20 @@ export function storedBodies(stored: readonly StoredMessage[]): ReadonlyMap<Mess
  * compile read, before any view filter (ordered by sequence): a body is
  * judged as stored, so a shard the filter hid from the strategy still
  * belongs to its body, whose head is shard 0 whether or not it was visible.
+ * `sequenceOf` resolves an id among those same messages to its sequence
+ * (undefined when none has it).
  */
-export function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]): EntryProvenance {
-  const byId = new Map<MessageId, StoredMessage>();
-  for (const msg of stored) byId.set(msg.id, msg);
-  const bodyMembers = storedBodies(stored);
+export function attributeEntries(
+  entries: readonly ContextEntry[],
+  stored: readonly StoredMessage[],
+  sequenceOf: (id: MessageId) => number | undefined,
+): EntryProvenance {
+  const lookup = storedBodyFinder(stored, sequenceOf);
 
   // Keyed by the body's head: two ingestions of the same text are two bodies.
   const bodies = new Map<MessageId, BodyState>();
   const bodyOf = (msg: StoredMessage): BodyState => {
-    const members = bodyMembers.get(msg.id) ?? [msg];
+    const members = lookup.bodies.get(msg.id)!;
     const head = members[0]!;
     let state = bodies.get(head.id);
     if (!state) {
@@ -116,7 +168,7 @@ export function attributeEntries(entries: readonly ContextEntry[], stored: reado
       continue;
     }
     const sourceMessages = entrySourceIds(entry)
-      .map((id) => byId.get(id))
+      .map(lookup.find)
       .filter((m): m is StoredMessage => m !== undefined);
     const states: BodyState[] = [];
     for (const msg of sourceMessages) {
@@ -179,7 +231,7 @@ export function attributeEntries(entries: readonly ContextEntry[], stored: reado
     return { kind: 'other' };
   });
 
-  return { sources, rawComplete, bodies: bodyMembers };
+  return { sources, rawComplete, bodies: lookup.bodies };
 }
 
 /**
@@ -240,14 +292,14 @@ export function buildRenderedLayout(opts: {
 
   const members: number[] = [];
   const memberIds: MessageId[] = [];
-  const units: LayoutUnit[] = [];
+  // The layout's units are read-only once returned; here each run grows.
+  const units: Array<Growing<LayoutUnit>> = [];
   for (const msg of opts.view) {
     members.push(msg.sequence);
     memberIds.push(msg.id);
     if (rawTokens.has(msg.id)) {
-      const unit: LayoutUnit = { k: 'r', t: Math.round(rawTokens.get(msg.id)!) };
-      if (opts.rawComplete.get(msg.id) === false) unit.p = 1;
-      units.push(unit);
+      const t = Math.round(rawTokens.get(msg.id)!);
+      units.push(opts.rawComplete.get(msg.id) === false ? { k: 'r', t, p: 1 } : { k: 'r', t });
       continue;
     }
     const last = units[units.length - 1];
@@ -283,6 +335,9 @@ export function buildRenderedLayout(opts: {
     ...(opts.cause ? { cause: opts.cause } : {}),
   };
 }
+
+/** A union's members with their properties writable, for a unit whose run is still growing. */
+type Growing<T> = T extends unknown ? { -readonly [K in keyof T]: T[K] } : never;
 
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);

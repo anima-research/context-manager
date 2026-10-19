@@ -276,10 +276,12 @@ describe('image MIME canonicalization', () => {
     const { store, messages } = openStore();
     const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
     const hash = store.storeBlob(png, 'image/jpeg');
-    messages.append('user', [{
-      type: 'blob_ref',
-      ref: { hash, mediaType: 'image/jpeg', originalType: 'image' },
-    } as unknown as ContentBlock]);
+    // As an older release stored it, past the write, which refuses a blob_ref now.
+    store.appendToStateJsonWithIdentity('messages', {
+      participant: 'user',
+      content: [{ type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } }],
+      timestamp: Date.now(),
+    }, 'id', 'sequence');
 
     const rawBefore = messages.getWindow(0, 1, { resolveBlobs: false });
     const legacyRef = rawBefore.messages[0].content[0] as unknown as {

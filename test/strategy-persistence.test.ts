@@ -18,7 +18,7 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ChunkRecord } from '../src/strategies/autobiographical.js';
-import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
+import type { StrategyContext, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-strategy-persistence';
 
@@ -30,6 +30,11 @@ function cleanup(): void {
 
 function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
+}
+
+/** A summary entry of any shape, for the persistence boundary. */
+function rawSummary(id: string, level: number, sourceIds: unknown, sourceRange: unknown) {
+  return { id, level, content: `text of ${id}`, tokens: 3, sourceLevel: level - 1, sourceIds, sourceRange, created: 1 };
 }
 
 /**
@@ -83,6 +88,11 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.enqueueMerge({ level, sourceIds });
   }
 
+  /** The merge the queue runs, over these sources, now. */
+  async merge(level: SummaryLevel, sourceIds: string[], manager: ContextManager): Promise<void> {
+    await this.executeMerge(level, sourceIds, (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext());
+  }
+
   persistRawSummaries(entries: unknown[]): void {
     this.store?.setStateJson(this.summariesStateId, entries);
   }
@@ -93,6 +103,11 @@ class TestableStrategy extends AutobiographicalStrategy {
 
   readPersistedSummaries(): SummaryEntry[] {
     return (this.store?.getStateJson(this.summariesStateId) as SummaryEntry[] | null) ?? [];
+  }
+
+  /** A summary through the persistence boundary, whatever its shape. */
+  pushRaw(entry: unknown): void {
+    this.pushSummary(entry as SummaryEntry);
   }
 
   persistRawChunks(records: ChunkRecord[]): void {
@@ -166,6 +181,9 @@ class TestableStrategy extends AutobiographicalStrategy {
   }
 
   reloadPersisted(): void { this.loadPersistedState(); }
+
+  /** The reload a live lookup or a waiting compression makes. */
+  reloadKeepingPresentation(): void { this.loadPersistedState({ keepKvUnifiedPresentation: true }); }
 
   // Read-only views for assertions
   getSummariesView(): SummaryEntry[] { return [...this.summaries]; }
@@ -278,6 +296,110 @@ describe('AutobiographicalStrategy — persistence', () => {
     assert.equal(strategy.getSummariesView().length, 0);
 
     manager.close();
+  });
+
+  it('refuses a summary whose sources, or above L1 whose range, readers cannot use, at the persistence boundary', async () => {
+    const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      // #130's shape: an L1 whose sources are null.
+      assert.throws(
+        () => strategy.pushRaw(rawSummary('L1-0', 1, null, { first: 'm1', last: 'm2' })),
+        /refusing to persist summary L1-0 at L1, a bug in the code that built it: its sourceIds is null, where readers need a non-empty list of ids/,
+      );
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-5', 1, [], { first: 'm1', last: 'm2' })), /L1-5 at L1.*its sourceIds is \[\],/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-7', 1, 'm1', { first: 'm1', last: 'm1' })), /L1-7 at L1.*its sourceIds is "m1",/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-6', 2, ['L1-a', null], { first: 'm1', last: 'm2' })), /L2-6 at L2.*its sourceIds is \["L1-a",null\],/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-8', 2, ['L1-a', ''], { first: 'm1', last: 'm2' })), /L2-8 at L2.*its sourceIds is \["L1-a",""\],/);
+      // A sparse list, whose empty slot `every` would skip and the store can't write.
+      const sparse = new Array<string>(2);
+      sparse[1] = 'm1';
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-11', 1, sparse, { first: 'm1', last: 'm1' })), /L1-11 at L1.*its sourceIds is \[null,"m1"\],/);
+      assert.throws(
+        () => strategy.pushRaw(rawSummary('L2-1', 2, ['L1-a', 'L1-b'], { first: 'm1' })),
+        /refusing to persist summary L2-1 at L2, a bug in the code that built it: its sourceRange is \{"first":"m1"\}, where readers need two message ids/,
+      );
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-9', 2, ['L1-a'], { last: 'm2' })), /L2-9 at L2.*its sourceRange is \{"last":"m2"\},/);
+      assert.throws(() => strategy.pushRaw(rawSummary('L2-10', 2, ['L1-a'], null)), /L2-10 at L2.*its sourceRange is null,/);
+      assert.deepEqual(strategy.getSummariesView(), [], 'none of them is held');
+      assert.deepEqual(strategy.readPersistedSummaries(), [], 'or stored');
+      // A summary readers can use is taken, with the range it holds above L1.
+      strategy.pushRaw(rawSummary('L1-3', 1, ['m1', 'm2'], { first: 'm1', last: 'm2' }));
+      strategy.pushRaw(rawSummary('L2-4', 2, ['L1-3'], { first: 'm1', last: 'm2' }));
+      assert.deepEqual(strategy.readPersistedSummaries().map((s) => [s.id, s.sourceRange]), [
+        ['L1-3', { first: 'm1', last: 'm2' }],
+        ['L2-4', { first: 'm1', last: 'm2' }],
+      ]);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('stores an L1 with its range set to its sources\' ends, as the open would make it, and warns', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    const ranges = {
+      'L1-0': { first: 'm1', last: 'm3' },
+      'L1-1': { first: 'm4', last: 'm4' },
+      'L1-2': { first: 'm5', last: 'm6' },
+      'L1-3': { first: 'm7', last: 'm8' },
+    };
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        strategy.pushRaw(rawSummary('L1-0', 1, ['m1', 'm2', 'm3'], { first: 'm1', last: 'm2' }));
+        strategy.pushRaw(rawSummary('L1-1', 1, ['m4'], null));
+        strategy.pushRaw(rawSummary('L1-2', 1, ['m5', 'm6'], { first: 'm5', last: 'm6' }));
+        strategy.pushRaw(rawSummary('L1-3', 1, ['m7', 'm8'], { first: 'm6', last: 'm8' }));
+        const rangesOf = (summaries: SummaryEntry[]) => Object.fromEntries(summaries.map((s) => [s.id, s.sourceRange]));
+        assert.deepEqual(rangesOf(strategy.getSummariesView()), ranges, 'held with its sources\' ends');
+        assert.deepEqual(rangesOf(strategy.readPersistedSummaries()), ranges, 'and stored so');
+        assert.deepEqual(warnings.filter((w) => w.includes('storing summary')), [
+          '[autobiographical] storing summary L1-0 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m1","last":"m2"} ns=default',
+          '[autobiographical] storing summary L1-1 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held null ns=default',
+          '[autobiographical] storing summary L1-3 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m6","last":"m8"} ns=default',
+        ]);
+        manager.sync();
+      } finally {
+        manager.close();
+      }
+    }
+    warnings.length = 0;
+    const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      assert.equal(warnings.find((w) => w.includes('repaired summary state')), undefined, 'an open has nothing to rebuild: ' + warnings.join('\n'));
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('takes what the package\'s own writers push, the L1 stub, an L1 compression and a merge, as they built it', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    const membrane = {
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'memory body' }], usage: { inputTokens: 10, outputTokens: 5 } }),
+    };
+    const strategy = new TestableStrategy({
+      targetChunkTokens: 20, recentWindowTokens: 0, compressionModel: 'test-model', autoTickOnNewMessage: false, mergeThreshold: 2,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as never });
+    try {
+      // A thin chunk, stubbed without a model call, then chunks the model
+      // compresses; the newest closed chunk is held back.
+      for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock('word '.repeat(8)));
+      for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60)));
+      for (let i = 0; i < 100 && !manager.isReady(); i++) await manager.tick();
+      assert.ok(manager.isReady(), 'the queues drained');
+      const summaries = strategy.getSummariesView();
+      assert.ok(summaries.some((s) => s.level === 1 && s.content.startsWith('(A quiet stretch')), 'the stub');
+      assert.ok(summaries.some((s) => s.level === 1 && s.content === 'memory body'), 'an L1 compression');
+      assert.ok(summaries.some((s) => s.level === 2 && s.content === 'memory body'), 'a merge');
+      assert.deepEqual(warnings.filter((w) => w.includes('storing summary')), [], 'no write repaired a range');
+    } finally {
+      manager.close();
+    }
   });
 
   it('removes empty legacy parents and clears their child pointers on load', async () => {
@@ -487,10 +609,18 @@ describe('AutobiographicalStrategy — persistence', () => {
         const kept = strategy.getSummariesView().map((s) => s.content).sort();
         assert.deepEqual(kept, ['B-SUMMARY', 'C-SUMMARY', 'D-SUMMARY', 'E-SUMMARY', 'Q-SUMMARY', 'R-SUMMARY', 'S-SUMMARY'], 'the two summaries naming missing ones are dropped');
         const before = Object.fromEntries(ids.map((id, i) => [id, level(i)]));
+        // `moves` counts the three levels the compile saves, group 0's unlocked
+        // messages, though each is planned from the L1 it renders (#195).
+        assert.equal(manager.previewContext({ maxTokens: 150, reserveForResponse: 0 })?.moves, 3, 'the preview counts the levels a compile would save');
+        // A preview of the same layout at a budget it doesn't fit counts them
+        // too, though no compile at that budget commits it.
+        const tight = manager.previewContext({ maxTokens: 60, reserveForResponse: 0 });
+        assert.deepEqual([tight?.fits, tight?.moves], [false, 3], 'a preview that doesn\'t fit counts its layout\'s levels');
         // Raw, group 0's messages are over this budget; its L1's recall is far under it.
         const dry = await manager.compile({ maxTokens: 150, reserveForResponse: 0 }, undefined, { dryRun: true });
         assert.deepEqual(strategy.readPersistedResolutions(), before, 'a dry compile saves no level');
         const live = await manager.compile({ maxTokens: 150, reserveForResponse: 0 });
+        assert.equal(manager.getRenderStats()?.planVsActual?.moves, 3, 'the compile counts the levels it saved');
         for (const context of [dry, live]) {
           const texts = context.messages.flatMap((message) => message.content).map((block) => (block as { text?: string }).text ?? '');
           // Group 0 renders through B, group 1 through Q, group 2 through D, and
@@ -840,23 +970,28 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
-  it('gives a summary no pointer names the one summary a level up that lists it, no parent when two do, and the one another copy names', async (t) => {
-    t.mock.method(console, 'warn', () => {});
+  it('gives a summary no pointer names the one summary a level up that lists it, no parent when two do, and the one another copy names, and drops the others that list it', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
     let xId = '';
     let wId = '';
     let wParentId = '';
     let uId = '';
     let uParentId = '';
+    const ids: Record<string, string> = {};
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const [x, y, z, w, v, u, s1, s2] = ['x', 'y', 'z', 'w', 'v', 'u', 's1', 's2'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+      const [x, y, z, w, v, u, s1, s2, t1, t2] = ['x', 'y', 'z', 'w', 'v', 'u', 's1', 's2', 't1', 't2'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
       // x and u are each listed by two L2s; only u has a copy whose pointer
       // names one of them. w is listed by one L2, and directly by an L3 above it.
+      // An L3 sits over the L2 that u's pointer doesn't name.
       const first = strategy.seedL2([x!.id, y!.id], 'first');
       const second = strategy.seedL2([x!.id, z!.id], 'second');
       const third = strategy.seedL2([u!.id, s1!.id], 'third');
       const fourth = strategy.seedL2([u!.id, s2!.id], 'fourth');
+      const beside = strategy.seedL2([t1!.id, t2!.id], 'beside third');
+      const top = strategy.seedParent(3, [third.id, beside.id], 'over third');
       uId = u!.id;
       uParentId = fourth.id;
       const wParent = strategy.seedL2([w!.id, v!.id], 'w parent');
@@ -864,6 +999,10 @@ describe('AutobiographicalStrategy — persistence', () => {
       xId = x!.id;
       wId = w!.id;
       wParentId = wParent.id;
+      Object.assign(ids, {
+        y: y!.id, z: z!.id, v: v!.id, s1: s1!.id, s2: s2!.id, t1: t1!.id, t2: t2!.id, first: first.id, second: second.id,
+        third: third.id, skipping: skipping.id, beside: beside.id, top: top.id,
+      });
       const unpointed = (summary: SummaryEntry) => {
         const copy = { ...summary };
         delete (copy as { mergedInto?: string }).mergedInto;
@@ -873,8 +1012,9 @@ describe('AutobiographicalStrategy — persistence', () => {
       strategy.persistRawSummaries([
         unpointed(view.get(x!.id)!), view.get(y!.id)!, view.get(z!.id)!, unpointed(view.get(w!.id)!), view.get(v!.id)!,
         unpointed(view.get(u!.id)!), { ...unpointed(view.get(u!.id)!), content: '', mergedInto: fourth.id },
-        view.get(s1!.id)!, view.get(s2!.id)!,
+        view.get(s1!.id)!, view.get(s2!.id)!, view.get(t1!.id)!, view.get(t2!.id)!,
         view.get(first.id)!, view.get(second.id)!, view.get(third.id)!, view.get(fourth.id)!, view.get(wParent.id)!, view.get(skipping.id)!,
+        view.get(beside.id)!, view.get(top.id)!,
       ]);
       manager.sync();
       manager.close();
@@ -885,9 +1025,163 @@ describe('AutobiographicalStrategy — persistence', () => {
       const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
       assert.ok(stored.has(xId));
       assert.equal(stored.get(xId)!.mergedInto, undefined, 'with two parents listing it, neither is chosen');
+      assert.ok(!stored.has(ids.first!) && !stored.has(ids.second!), 'and both are dropped, so its messages are covered once');
+      assert.equal(stored.get(ids.y!)?.mergedInto, undefined, 'leaving their other sources without a parent');
+      assert.equal(stored.get(ids.z!)?.mergedInto, undefined);
       assert.equal(stored.get(wId)?.mergedInto, wParentId, 'the summary listing it a level up is its parent; the one two levels up is not');
+      assert.ok(!stored.has(ids.skipping!), 'and the one two levels up is dropped');
+      assert.equal(stored.get(wParentId)?.mergedInto, undefined, 'leaving the parent without one');
       assert.equal(stored.get(uId)?.mergedInto, uParentId, 'of two listing it, the one another copy names is its parent');
+      assert.ok(!stored.has(ids.third!), 'and the other is dropped');
+      assert.equal(stored.get(ids.s1!)?.mergedInto, undefined, 'leaving its other source without a parent');
+      assert.equal(stored.get(ids.s2!)?.mergedInto, uParentId);
+      assert.ok(!stored.has(ids.top!), 'the summary above the dropped one goes with it');
+      assert.equal(stored.get(ids.beside!)?.mergedInto, undefined, 'leaving the other summary it listed without a parent');
+      assert.equal(stored.get(ids.t1!)?.mergedInto, ids.beside, 'whose own sources keep it as theirs');
+      assert.equal(stored.get(ids.t2!)?.mergedInto, ids.beside);
+      assert.deepEqual(
+        [...stored.keys()].sort(),
+        [xId, ids.y!, ids.z!, wId, ids.v!, uId, ids.s1!, ids.s2!, ids.t1!, ids.t2!, uParentId, wParentId, ids.beside!].sort(),
+        'and every summary not dropped is kept',
+      );
+      const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
+      assert.deepEqual(
+        line.match(/naming one it isn't the parent of \[([^\]]*)\]/)?.[1]?.split(', ').sort(),
+        [ids.first!, ids.second!, ids.third!, ids.skipping!].sort(),
+        line,
+      );
+      assert.equal(line.match(/naming a missing summary \[([^\]]*)\]/)?.[1], ids.top, line);
     } finally { manager.close(); }
+  });
+
+  it('keeps the merge the pointers name when two instances merged the same run, so hierarchical mode renders it once', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    const config = { targetChunkTokens: 300, recentWindowTokens: 40, compressionModel: 'test-model', autoTickOnNewMessage: false, mergeThreshold: 99 };
+    const membrane = (text: string) => ({
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text }], usage: { inputTokens: 10, outputTokens: 5 } }),
+    });
+    let earlier = '';
+    let later = '';
+    {
+      const first = new TestableStrategy(config);
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: first, membrane: membrane('MERGED EARLIER') as never });
+      const ids = [0, 1, 2, 3].map((i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
+      manager.addMessage('User', textBlock('TAIL'));
+      const groups = [ids.slice(0, 2), ids.slice(2)];
+      const run = groups.map((group, g) => first.seedL1(`L1-TEXT-${g}`, group).id);
+      first.persistRawChunks(groups.map((group, g) => ({ id: `c-${g}`, sourceIds: group, compressed: true, summaryId: run[g]! })));
+      // A second instance on the store loads the run before either merges it;
+      // merges don't coalesce across instances, so both merge it.
+      const second = new TestableStrategy(config);
+      const secondManager = await ContextManager.open({ store: manager.getStore(), strategy: second, membrane: membrane('MERGED LATER') as never });
+      await first.merge(2, run, manager);
+      await second.merge(2, run, secondManager);
+      [earlier, later] = [first, second].map((strategy) => strategy.getSummariesView().find((summary) => summary.level === 2)!.id);
+      assert.deepEqual(first.readPersistedSummaries().filter((s) => s.level === 2).map((s) => s.id), [earlier, later], 'the store holds both merges');
+      manager.sync();
+      secondManager.close();
+      manager.close();
+    }
+    let afterFirstOpen = '';
+    for (const open of [0, 1]) {
+      warnings.length = 0;
+      const strategy = new TestableStrategy(config);
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const persisted = () =>
+        JSON.stringify([strategy.readPersistedSummaries(), strategy.readPersistedChunks(), strategy.readPersistedMergeQueue()]);
+      try {
+        if (open === 1) assert.equal(persisted(), afterFirstOpen, 'a second open changes nothing the repair writes');
+        const dry = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+        const live = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+        for (const context of [dry, live]) {
+          const texts = textsOf(context);
+          assert.equal(texts.filter((text) => text === 'MERGED LATER').length, 1, JSON.stringify(texts));
+          assert.ok(!texts.some((text) => text === 'MERGED EARLIER' || text.startsWith('L1-TEXT') || text.startsWith('MSG')), JSON.stringify(texts));
+        }
+        const stored = strategy.readPersistedSummaries();
+        assert.deepEqual(stored.filter((s) => s.level === 2).map((s) => s.id), [later], 'the merge the run\'s pointers name is kept');
+        assert.deepEqual(stored.filter((s) => s.level === 1).map((s) => s.mergedInto), [later, later]);
+        assert.ok(strategy.readPersistedChunks().every((record) => record.compressed), 'every chunk record keeps its L1');
+        const line = warnings.find((w) => w.includes('repaired summary state'));
+        if (open === 0) assert.match(line ?? '', new RegExp(`naming one it isn't the parent of \\[${earlier}\\]`), warnings.join('\n'));
+        else assert.equal(line, undefined, 'and logs no repair: ' + warnings.join('\n'));
+        afterFirstOpen = persisted();
+      } finally { manager.close(); }
+    }
+  });
+
+  it('drops both of two summaries over one run whose sources name one each, whichever the store holds first', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const ids: Record<string, string> = {};
+    for (const reversed of [false, true]) {
+      cleanup();
+      {
+        const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        const [a, b] = ['a', 'b'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+        const p = strategy.seedL2([a!.id, b!.id], 'p');
+        const q = strategy.seedL2([a!.id, b!.id], 'q');
+        Object.assign(ids, { a: a!.id, b: b!.id });
+        // A crash partway through the later merge's pointer writes leaves
+        // one source naming each merge.
+        const view = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
+        const entries = [{ ...view.get(a!.id)!, mergedInto: q.id }, { ...view.get(b!.id)!, mergedInto: p.id }, view.get(p.id)!, view.get(q.id)!];
+        strategy.persistRawSummaries(reversed ? entries.reverse() : entries);
+        manager.sync();
+        manager.close();
+      }
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        const stored = strategy.readPersistedSummaries();
+        const order = reversed ? 'with the store reversed' : 'in store order';
+        assert.deepEqual(stored.map((s) => s.id).sort(), [ids.a!, ids.b!].sort(), `neither merge is kept, ${order}`);
+        assert.deepEqual(stored.map((s) => s.mergedInto), [undefined, undefined], `and neither source has a parent, ${order}`);
+      } finally { manager.close(); }
+    }
+    // The sources merge again: an open that merges queues them.
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, mergeThreshold: 2, topologyPolicy: 'report' });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      assert.deepEqual(strategy.getMergeQueueView().map((merge) => [merge.level, [...merge.sourceIds].sort()]), [[2, [ids.a!, ids.b!].sort()]]);
+    } finally { manager.close(); }
+  });
+
+  it('drops the other listers of a summary whose chosen parent it drops for listing another, whichever the store holds first', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const ids: Record<string, string> = {};
+    for (const reversed of [false, true]) {
+      cleanup();
+      {
+        const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        const [b, c, d, e] = ['b', 'c', 'd', 'e'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+        const p = strategy.seedL2([c!.id, d!.id], 'p');
+        const q = strategy.seedL2([b!.id, c!.id], 'q');
+        const r = strategy.seedL2([d!.id, e!.id], 'r');
+        Object.assign(ids, { b: b!.id, c: c!.id, d: d!.id, e: e!.id, r: r.id });
+        // c's pointer names p, but p lists d, whose pointer names r.
+        const view = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
+        const entries = [
+          { ...view.get(b!.id)!, mergedInto: q.id }, { ...view.get(c!.id)!, mergedInto: p.id },
+          { ...view.get(d!.id)!, mergedInto: r.id }, { ...view.get(e!.id)!, mergedInto: r.id },
+          view.get(p.id)!, view.get(q.id)!, view.get(r.id)!,
+        ];
+        strategy.persistRawSummaries(reversed ? entries.reverse() : entries);
+        manager.sync();
+        manager.close();
+      }
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        const order = reversed ? 'with the store reversed' : 'in store order';
+        const parents = Object.fromEntries(strategy.readPersistedSummaries().map((s) => [s.id, s.mergedInto ?? null]));
+        // q could have been c's parent once p went, but parents are chosen
+        // before any drop, so q goes too.
+        assert.deepEqual(parents, { [ids.b!]: null, [ids.c!]: null, [ids.d!]: ids.r, [ids.e!]: ids.r, [ids.r!]: null }, order);
+      } finally { manager.close(); }
+    }
   });
 
   it('takes parentId before mergedInto, counts once a summary listing a child twice, and takes no parent at the child\'s level', async (t) => {
@@ -1442,6 +1736,63 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
+  it('keeps a kv-unified submission in flight across a reload that drops the merge it shows, and compiles after it', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'error', () => {});
+    let ids: string[] = [];
+    // The L1s are each too large for the budget, so a compile shows a merge.
+    const l1 = (g: number, mergedInto: string) => ({
+      id: `L1-run-${g}`, level: 1, content: `RUN-${g} ` + 'word '.repeat(100), tokens: 130, sourceLevel: 0, sourceIds: ids.slice(g * 4, g * 4 + 4),
+      sourceRange: { first: ids[g * 4]!, last: ids[g * 4 + 3]! }, created: 0, mergedInto,
+    });
+    const merge = (id: string, content: string) => ({
+      id, level: 2, content, tokens: 3, sourceLevel: 1, sourceIds: ['L1-run-0', 'L1-run-1'],
+      sourceRange: { first: ids[0]!, last: ids[7]! }, created: 0,
+    });
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      ids = Array.from({ length: 8 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
+      manager.addMessage('User', textBlock('TAIL'));
+      strategy.persistRawSummaries([l1(0, 'L2-earlier'), l1(1, 'L2-earlier'), merge('L2-earlier', 'MERGED EARLIER')]);
+      strategy.persistRawChunks([0, 1].map((g) => ({ id: `c-${g}`, sourceIds: ids.slice(g * 4, g * 4 + 4), compressed: true, summaryId: `L1-run-${g}` })));
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...kvUnified });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const budget = { maxTokens: 150, reserveForResponse: 0 };
+    const prefix = { kvUnifiedImmutablePrefixHash: 'immutable-v1' };
+    try {
+      const shown = textsOf(await manager.compile(budget, undefined, prefix));
+      assert.equal(shown.filter((text) => text === 'MERGED EARLIER').length, 1, JSON.stringify(shown));
+      strategy.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+      // Another instance merged the same run after this one, so the run's
+      // pointers name its merge, and this instance then reloads the store.
+      strategy.persistRawSummaries([l1(0, 'L2-later'), l1(1, 'L2-later'), merge('L2-earlier', 'MERGED EARLIER'), merge('L2-later', 'MERGED LATER')]);
+      strategy.reloadKeepingPresentation();
+      const held = new Set(strategy.getSummariesView().map((s) => s.id));
+      assert.ok(!held.has('L2-earlier') && held.has('L2-later'), 'the reload drops the merge the pointers no longer name');
+      const inFlight = strategy as unknown as {
+        kvUnifiedPendingLayout: { units: Array<{ key: string }> } | null;
+        kvUnifiedPendingMarkerUnitIndices: number[];
+      };
+      assert.ok(inFlight.kvUnifiedPendingLayout?.units.some((unit) => unit.key === 'L2-earlier'), 'and keeps the submission in flight, which shows it');
+      strategy.reportKvUnifiedAccepted({
+        submissionId: 's1',
+        wireReceipt: {
+          requestHash: 'wire1',
+          markers: inFlight.kvUnifiedPendingMarkerUnitIndices.map((_, ordinal) => ({ ordinal, prefixHash: `prefix-${ordinal}`, estimatedOffset: ordinal + 1 })),
+        },
+      });
+      for (const dryRun of [true, false]) {
+        const texts = textsOf(await manager.compile(budget, undefined, { ...prefix, dryRun }));
+        assert.equal(texts.filter((text) => text === 'MERGED LATER').length, 1, JSON.stringify(texts));
+        assert.ok(!texts.some((text) => text === 'MERGED EARLIER' || text.startsWith('RUN-') || text.startsWith('MSG')), JSON.stringify(texts));
+      }
+    } finally { manager.close(); }
+  });
+
   it('holds, under kv-unified, a range pinned at a level only a dropped summary supplied at the level its surviving summaries supply', async (t) => {
     const warnings: string[] = [];
     t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
@@ -1556,7 +1907,7 @@ describe('AutobiographicalStrategy — persistence', () => {
         _level: SummaryLevel,
         _sourceIds: string[],
         _ctx: import('../src/types/index.js').StrategyContext,
-      ): Promise<void> {
+      ): Promise<boolean> {
         throw this.executeMergeError;
       }
     }

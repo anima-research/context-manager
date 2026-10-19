@@ -237,6 +237,7 @@ function makeMockMembrane(
 export async function renderAdaptiveFixture(
   options: AutobiographicalOptions = {},
   responseContentForCall: (callCount: number) => ContentBlock[] = adaptiveTextResponseContent,
+  maxTokens = 900,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
     const strategy = new AutobiographicalStrategy({
@@ -261,7 +262,7 @@ export async function renderAdaptiveFixture(
     // Drain compression to a fixed point: eight ticks take this workload
     // past L1 into merged L2s, so the adaptive render carries both levels.
     for (let tick = 0; tick < 8; tick++) await manager.tick();
-    const compiled = await manager.compile({ maxTokens: 900, reserveForResponse: 0 });
+    const compiled = await manager.compile({ maxTokens, reserveForResponse: 0 });
     const summaries = summariesOf(strategy);
     manager.close();
     return { messages: project(compiled.messages), summaries, compressionRequests: mock.requests };

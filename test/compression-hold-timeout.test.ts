@@ -51,6 +51,8 @@ describe('compression hold timeouts', () => {
       await m.tick();
       assert.strictEqual(notified, 1);
       assert.ok(warnings.some((w) => w.includes(a) && w.includes('150ms')), warnings.join('\n'));
+      // The manager's line names its namespace, the default one here (#239).
+      assert.ok(warnings.some((w) => w.includes(a) && w.endsWith(' ns=default')), warnings.join('\n'));
       clock.t = 250;
       await m.compile();
       assert.strictEqual(notified, 2);

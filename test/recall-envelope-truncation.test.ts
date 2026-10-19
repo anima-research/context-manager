@@ -20,8 +20,11 @@
  *     accounting is load bearing), so what a tight cap buys is a few
  *     characters of prose inside intact tags rather than a broken tag.
  *  2. With the envelope off, capped renders are byte-identical to the tree
- *     before the fix, pinned against
- *     `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
+ *     before the fix apart from the omission marker the truncator writes
+ *     where it drops text, and the adaptive renders' choice of what to fold,
+ *     which pricing a capped raw message as it renders (#223) moved, for each
+ *     of which the golden was captured again (see its generator), pinned
+ *     against `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
  *     null golden runs the fixtures UNCAPPED and so cannot see this
  *     restructure; a red here is the fix leaking into the default path.
  */
@@ -35,6 +38,7 @@ import { COMBINED_RECALL_SEPARATOR_TEXT } from '../src/strategies/autobiographic
 import {
   HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
   HIERARCHICAL_FIXTURE_PLAIN_PROSE,
+  renderHierarchicalFixture,
   type RenderedMessage,
 } from './fixtures/recall-envelope-fixture.js';
 import {
@@ -52,6 +56,8 @@ const GOLDEN = JSON.parse(
 ) as Record<string, RenderedMessage[]>;
 
 const TRUNCATION_MARKER = /\[truncated — original was \d+ tokens\]/;
+/** What the cap writes in place of what it leaves out of a message. */
+const OMISSION_MARKER = '[content omitted: this message reached its token limit]';
 const WHOLE_ENVELOPE = /<cm-recall[^>]*>[\s\S]*?<\/cm-recall>/g;
 
 function textOf(message: RenderedMessage): string {
@@ -83,6 +89,19 @@ function assertNoTornEnvelope(text: string, label: string): void {
   );
 }
 
+/**
+ * A combined answer whose cap leaves summaries out ends with one omission
+ * marker after its last envelope. Returns the answer without it, asserting it
+ * is there and is the only one.
+ */
+function withoutTrailingOmission(answer: RenderedMessage, label: string): RenderedMessage {
+  const markers = answer.content.filter((block) => block.type === 'text' && block.text.includes(OMISSION_MARKER));
+  assert.equal(markers.length, 1, `${label}: one omission marker for the summaries the cap left out`);
+  const last = answer.content.at(-1);
+  assert.ok(last?.type === 'text' && last.text === OMISSION_MARKER, `${label}: after the last envelope`);
+  return { ...answer, content: answer.content.slice(0, -1) };
+}
+
 function assertEnvelopeIntact(answer: RenderedMessage, label: string): void {
   const text = textOf(answer);
   assert.match(text, /^<cm-recall[^>]*>\n/, `${label}: answer must open with a complete envelope`);
@@ -97,7 +116,9 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
       const answers = recallAnswers(rendered.messages);
       assert.ok(answers.length > 0, `${name}: the capped render must still emit recall pairs`);
       for (const [index, answer] of answers.entries()) {
-        assertEnvelopeIntact(answer, `${name} answer ${index}`);
+        const label = `${name} answer ${index}`;
+        // Every combined case here cuts the first of the fixture's three summaries.
+        assertEnvelopeIntact(name.includes('Combined') ? withoutTrailingOmission(answer, label) : answer, label);
       }
     });
   }
@@ -136,8 +157,9 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
       assert.ok(answers.length > 0, `${name}: a tight cap must still emit recall pairs`);
       for (const [index, answer] of answers.entries()) {
         const label = `${name} answer ${index}`;
-        assertEnvelopeIntact(answer, label);
-        const text = textOf(answer);
+        const enveloped = name.includes('Combined') ? withoutTrailingOmission(answer, label) : answer;
+        assertEnvelopeIntact(enveloped, label);
+        const text = textOf(enveloped);
         const inside = /^<cm-recall[^>]*>\n([\s\S]*)\n<\/cm-recall>$/.exec(text);
         assert.ok(inside, `${label}: envelope body must be readable`);
         // The documented boundary behaviour: the envelope is not charged
@@ -174,9 +196,9 @@ function separatorCount(answer: RenderedMessage): number {
 /**
  * What the render CHARGED against the cap: the prose it emitted plus the
  * separators between summaries, priced the way the strategy prices them. The
- * envelope's tags and the truncator's own marker are excluded because both are
- * documented soft-cap overshoot — they are appended after the budget is spent,
- * not bought out of it.
+ * envelope's tags, the truncator's own marker and the omission marker for
+ * summaries left out are excluded because all three are documented soft-cap
+ * overshoot — they are appended after the budget is spent, not bought out of it.
  */
 function chargedTokens(answer: RenderedMessage): number {
   let tokens = 0;
@@ -185,7 +207,7 @@ function chargedTokens(answer: RenderedMessage): number {
       tokens += Math.ceil(block.thinking.length / 4);
       continue;
     }
-    if (block.type !== 'text') continue;
+    if (block.type !== 'text' || block.text === OMISSION_MARKER) continue;
     const charged = block.text
       .replace(ENVELOPE_OPENER, '')
       .replace(ENVELOPE_CLOSER, '')
@@ -197,6 +219,8 @@ function chargedTokens(answer: RenderedMessage): number {
 
 function assertSharedBudgetShape(answer: RenderedMessage, testCase: CombinedSharedBudgetCase): void {
   const label = `${testCase.name} (cap ${testCase.maxMessageTokens})`;
+  // No cap here pays for the fixture's third summary, so every case leaves it out.
+  withoutTrailingOmission(answer, label);
   const bodies = envelopeBodies(answer);
   const text = textOf(answer);
   assertNoTornEnvelope(text, label);
@@ -240,6 +264,17 @@ describe('recallEnvelope under maxMessageTokens: the combined turn spends ONE sh
       assertSharedBudgetShape(combinedAnswerOf(rendered.messages, testCase.name), testCase);
     });
   }
+
+  it('writes no omission marker when the cap leaves nothing out', async () => {
+    const rendered = await renderHierarchicalFixture({
+      maxMessageTokens: 100_000,
+      positionedRecallPairs: false,
+      recallEnvelope: 'xml',
+    });
+    const answer = combinedAnswerOf(rendered.messages, 'uncut');
+    assert.equal(envelopeBodies(answer).length, 3, 'all three summaries are admitted');
+    assert.ok(!textOf(answer).includes(OMISSION_MARKER));
+  });
 
   it('never spends more prose and separators than the cap allows', async () => {
     for (const testCase of combinedSharedBudgetCases()) {

@@ -2,9 +2,11 @@
  * Diagnose the kv-stable fold-walk oscillation (`raise:L4-936` on Mythos).
  *
  * Hypothesis under test: the summary forest's UPWARD view (chunk.l1Id →
- * parentId/mergedInto chain — used by ancestorAt in the tree, the picker's
- * FoldingState, and nextOp) disagrees with the DOWNWARD view (root sourceIds
- * recursion — used by applyRaise/applyLower and leafChunkIds unanimity checks).
+ * parentId/mergedInto chain, as the inputs link it) disagrees with the
+ * DOWNWARD view (root sourceIds recursion — used by applyRaise/applyLower and
+ * leafChunkIds unanimity checks). SummaryTree.ancestorAt answers only with a
+ * summary that lists the chunk, so the upward view here walks the links
+ * itself (`linkedAt`).
  * One chunk that is upward-connected to a root but absent from its downward
  * leaf set (or vice versa) makes the walk emit raise/lower ops that can never
  * converge.
@@ -99,6 +101,17 @@ async function main() {
   }
   const tree = new SummaryTree(inputs);
   const chunkById = new Map(inputs.chunks.map((c) => [c.id, c]));
+  // The summary a chunk's links reach at `level` (its L1, then each parent
+  // pointer), whether or not that summary lists the chunk: the upward view.
+  const linkedAt = (chunkId: string, level: number) => {
+    const seen = new Set<string>();
+    let cur = tree.summary(tree.leaf(chunkId)?.l1Id ?? '');
+    while (cur && cur.level < level && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = cur.parentId ? tree.summary(cur.parentId) : null;
+    }
+    return cur && cur.level === level ? cur : null;
+  };
 
   // ---- op trace ----
   const opCounts = new Map<string, number>();
@@ -131,14 +144,14 @@ async function main() {
       cur = cur.parentId ? tree.summary(cur.parentId) : null;
     }
   }
-  // downward: leaf in node's set whose ancestorAt(level) is a DIFFERENT node (or null)
+  // downward: leaf in node's set whose linkedAt(level) is a DIFFERENT node (or null)
   for (const n of tree.allSummaries()) {
     for (const lid of n.leafChunkIds) {
       if (!chunkById.has(lid)) {
         mismatches.push({ chunk: lid, seq: -1, node: n.id, level: n.level, kind: 'dead-leaf-id' });
         continue;
       }
-      const up = tree.ancestorAt(lid, n.level);
+      const up = linkedAt(lid, n.level);
       if (up?.id !== n.id) {
         mismatches.push({ chunk: lid, seq: chunkById.get(lid)!.sequence, node: n.id, level: n.level, kind: up ? 'down-not-up(other)' : 'down-not-up(null)' });
       }
@@ -176,14 +189,14 @@ async function main() {
     // relevant chunks: down-leaves + any chunk upward-linked to this root
     const rel = new Set<string>(n.leafChunkIds);
     for (const c of inputs.chunks) {
-      const up = tree.ancestorAt(c.id, n.level);
+      const up = linkedAt(c.id, n.level);
       if (up?.id === n.id) rel.add(c.id);
     }
     let shown = 0;
     for (const id of rel) {
       const c = chunkById.get(id);
       const down = downSets.get(n.id)!.has(id);
-      const up = c ? tree.ancestorAt(id, n.level)?.id === n.id : false;
+      const up = c ? linkedAt(id, n.level)?.id === n.id : false;
       const flags = c
         ? [c.pinned && 'pin', c.lockedByAgent && 'lock', inputs.headChunkIds.has(id) && 'head', inputs.tailChunkIds.has(id) && 'tail', c.pinLevel !== undefined && `pinL${c.pinLevel}`, c.pinMaxLevel !== undefined && `pinMax${c.pinMaxLevel}`].filter(Boolean).join(',')
         : 'MISSING-FROM-CHUNKS';
@@ -199,7 +212,12 @@ async function main() {
     // lineage of the node itself
     let cur = tree.summary(rootId);
     const chain: string[] = [];
-    while (cur) { chain.push(`${cur.id}(L${cur.level})`); cur = cur.parentId ? tree.summary(cur.parentId) : null; }
+    const chained = new Set<string>();
+    while (cur && !chained.has(cur.id)) {
+      chained.add(cur.id);
+      chain.push(`${cur.id}(L${cur.level})`);
+      cur = cur.parentId ? tree.summary(cur.parentId) : null;
+    }
     console.log(`  node parent chain: ${chain.join(' → ')}`);
   }
   console.log('\nDONE');

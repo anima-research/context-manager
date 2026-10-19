@@ -38,12 +38,12 @@ const PNG_DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ'.repeat(4);
 const image = (): ContentBlock =>
   ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG_DATA } } as ContentBlock);
 
-/** Every image block in a request, including those nested in tool_results. */
-function imageBlocks(request: NormalizedRequest): ContentBlock[] {
+/** Every block of a request that `keep` picks, including those nested in tool_results. */
+function blocksWhere(request: NormalizedRequest, keep: (b: ContentBlock) => boolean): ContentBlock[] {
   const found: ContentBlock[] = [];
   const walk = (blocks: ContentBlock[]): void => {
     for (const b of blocks) {
-      if (b.type === 'image') found.push(b);
+      if (keep(b)) found.push(b);
       const nested = (b as { content?: unknown }).content;
       if (b.type === 'tool_result' && Array.isArray(nested)) walk(nested as ContentBlock[]);
     }
@@ -51,6 +51,12 @@ function imageBlocks(request: NormalizedRequest): ContentBlock[] {
   for (const m of request.messages) walk(m.content as ContentBlock[]);
   return found;
 }
+
+/** Every image block in a request, including those nested in tool_results. */
+const imageBlocks = (request: NormalizedRequest): ContentBlock[] => blocksWhere(request, (b) => b.type === 'image');
+
+/** The text the cap leaves where it took an image out. */
+const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
 function createCapturingMembrane() {
   const calls: NormalizedRequest[] = [];
@@ -137,6 +143,9 @@ describe('compression prompt image cap applies to the WIRE messages', () => {
         `request shipped ${imgs.length} image block(s) under a 1-byte budget`,
       );
     }
+    // Where the cap took an image out, the summarizer reads the placeholder.
+    const placeholders = calls.flatMap((r) => blocksWhere(r, (b) => b.type === 'text' && (b as { text: string }).text === IMAGE_PLACEHOLDER));
+    assert.ok(placeholders.length >= 1, 'the capped images went out as the placeholder text');
   });
 
   it('a roomy budget keeps the images (the cap did not become a blanket strip)', async () => {

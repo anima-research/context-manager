@@ -157,6 +157,10 @@
           "text": "zz-memory-merged-level covering the first two tu\n\n[truncated — original was 13 tokens]"
         },
         {
+          "type": "text",
+          "text": "[content omitted: this message reached its token limit]"
+        },
+        {
           "type": "thinking",
           "thinking": "zz-carrier-reasoning",
           "signature": "zz-signature"
@@ -189,6 +193,10 @@
         {
           "type": "text",
           "text": "zz-m\n\n[truncated — original was 13 tokens]"
+        },
+        {
+          "type": "text",
+          "text": "[content omitted: this message reached its token limit]"
         },
         {
           "type": "thinking",
@@ -245,56 +253,110 @@
       ]
     },
     {
-      "participant": "Context Manager",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "What do you remember from earlier?"
+          "text": "zz-adaptive-turn-8. zzzz zzzz zzzz zzzz zzzz zzz\n\n[truncated — original was 55 tokens]"
         }
       ]
     },
     {
-      "participant": "Claude",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-memory-3 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+          "text": "zz-adaptive-turn-9. zzzz zzzz zzzz zzzz zzzz zzz\n\n[truncated — original was 55 tokens]"
         }
       ]
     },
     {
-      "participant": "Context Manager",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "What do you remember from earlier?"
+          "text": "zz-adaptive-turn-10. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
         }
       ]
     },
     {
-      "participant": "Claude",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-memory-4 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+          "text": "zz-adaptive-turn-11. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
         }
       ]
     },
     {
-      "participant": "Context Manager",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "What do you remember from earlier?"
+          "text": "zz-adaptive-turn-12. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
         }
       ]
     },
     {
-      "participant": "Claude",
+      "participant": "User",
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-memory-5 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+          "text": "zz-adaptive-turn-13. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-14. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-15. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-16. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-17. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-18. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-adaptive-turn-19. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
         }
       ]
     },
@@ -459,60 +521,6 @@
         {
           "type": "text",
           "text": "zz-a\n\n[truncated — original was 14 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 14 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "User",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
         }
       ]
     },

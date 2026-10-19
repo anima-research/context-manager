@@ -74,6 +74,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
         const e = err as OverBudgetError;
         assert.ok(e.actual > e.budget, `actual ${e.actual} should exceed budget ${e.budget}`);
         assert.ok(e.diagnostics.tailTokens > 0, 'diagnostics should include tail tokens');
+        assert.deepEqual(e.clearedBy, ['smaller-recent-window'], 'the newest message alone fits');
         return true;
       }
     );
@@ -118,7 +119,11 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
 
     await assert.rejects(
       () => manager.compile({ maxTokens: 500, reserveForResponse: 100 }),
-      OverBudgetError,
+      (err: unknown) => {
+        assert.ok(err instanceof OverBudgetError, `expected OverBudgetError, got ${String(err)}`);
+        assert.deepEqual(err.clearedBy, [], 'the produce op has no chunk to make it from');
+        return true;
+      },
     );
     manager.close();
   });
@@ -173,6 +178,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
         assert.ok(err instanceof OverBudgetError, `expected OverBudgetError, got ${String(err)}`);
         assert.ok(err.diagnostics.tailTokens > 0, 'recent tail must be reserved in the failing plan');
         assert.ok(err.actual > err.budget, 'reported overage must exceed the budget');
+        assert.deepEqual(err.clearedBy, [], 'the plan has no summaries to produce');
         return true;
       },
     );
@@ -291,6 +297,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
     assert.ok(caught.message.includes('Head/tail reservation exceeded budget'));
     assert.ok(caught.message.includes('fold plan=not computed'));
     assert.ok(caught.message.includes('hard budget'));
+    assert.deepEqual(caught.clearedBy, ['smaller-recent-window'], 'the recent window holds every message, and the newest alone fits');
     manager.close();
   });
 });

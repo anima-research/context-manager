@@ -27,6 +27,10 @@ function storeAt(calibration: number, messages: Array<{ id: string; content: Con
   };
 }
 
+/** The live-image placeholder; its raw price is its length / 4, like any text. */
+const PLACEHOLDER = "[image not shown: this context keeps only some images]";
+const PLACEHOLDER_RAW = Math.ceil(PLACEHOLDER.length / 4);
+
 const image = (): ContentBlock =>
   ({ type: 'image', source: { type: 'base64', data: 'AAAA', mediaType: 'image/png' } }) as ContentBlock;
 
@@ -40,9 +44,9 @@ describe('postStripEstimates × calibration', () => {
       ];
       const pse: number[] = (strategy as any).postStripEstimates(storeAt(calibration, messages));
       assert.ok(pse.every((n) => Number.isFinite(n) && n >= 0), `estimates ${JSON.stringify(pse)}`);
-      // The stripped image-only message costs exactly its calibrated placeholder (9 raw tokens) —
+      // The stripped image-only message costs exactly its calibrated placeholder (PLACEHOLDER_RAW tokens) —
       // not 1600, not free, never negative.
-      assert.strictEqual(pse[0], Math.round(9 * calibration), `stripped estimate ${pse[0]}`);
+      assert.strictEqual(pse[0], Math.round(PLACEHOLDER_RAW * calibration), `stripped estimate ${pse[0]}`);
       // The live image is untouched.
       assert.strictEqual(pse[1], Math.round(1600 * calibration) + Math.round(1 * calibration));
     });

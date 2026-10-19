@@ -44,9 +44,15 @@ import type {
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
+import type { Diagnostics } from '../../diagnostics.js';
 import { planControlledFrontier, type ControlPlan } from '../kv-control.js';
 
 export interface KvStableOptions {
+  /**
+   * Where its planner's `[kv-timing]` and `[kv-diag]` lines go: the
+   * strategy's diagnostics, which name its namespace (#239).
+   */
+  diagnostics?: Diagnostics;
   /** Trust region P on per-turn perturbation, in tokens the provider would
    *  re-read (exact kvCost — see design §13.4). Within it the solver adopts
    *  the relevance-ideal cut; beyond it it amortizes via suffix adoption or
@@ -80,9 +86,9 @@ export class KvStableStrategy implements FoldingSolver {
     return this._lastTarget;
   }
 
-  /** The full control plan behind the target (perturbation, override) — for
-   *  observability at the call site (`[kv-escalation]` logging). Null before
-   *  the first `solve`. */
+  /** The full control plan behind the target (perturbation, override,
+   *  overlap) — for observability at the call site (`[kv-escalation]` and
+   *  `[kv-overlap]` logging). Null before the first `solve`. */
   lastPlan(): ControlPlan | null {
     return this._lastPlan;
   }
@@ -108,7 +114,8 @@ export class KvStableStrategy implements FoldingSolver {
       } else if (c.pinLevel !== undefined) {
         // Pin-at-level-k: fix exactly at k (0 = raw). k=0 is equivalent to a
         // classic raw pin, so route it through the raw zone; k>0 is resolved to
-        // its whole L_k node below (group-consistent — see the loop after).
+        // its whole node below, at k or the next level down where the chunk
+        // has a summary (group-consistent — see the loop after).
         if (c.pinLevel <= 0) rawZone.add(c.id);
         else fixedPins.push({ id: c.id, level: c.pinLevel });
       } else if (c.pinMaxLevel !== undefined) {
@@ -125,23 +132,32 @@ export class KvStableStrategy implements FoldingSolver {
     // its whole covered range, so "cut through the L_k node" (design §7) fixes
     // EVERY leaf under that node at k — not just the addressed chunk. Fixing a
     // single sub-chunk while its siblings render raw is an unrenderable
-    // frontier. Clamp k to the deepest produced level for the chunk; if none
-    // exists, fall back to fixing just the chunk (the controller clamps it
-    // further). Skip leaves already forced raw (head/tail/classic pin).
+    // frontier. Where the chunk has no summary at k (deeper than the tree has
+    // produced, a level a parent more than one level up skips, or one whose
+    // summary doesn't list it, as when its `parentId` names a summary written
+    // again without its branch), k is lowered to the next level down where it
+    // has one (`SummaryTree.renderableLevel`). That summary lists the chunk,
+    // so the pin holds the chunk with the summary's other leaves.
+    // Skip leaves already forced raw (head/tail/classic pin). Where two
+    // pins-at-level overlap a chunk, the finest level either holds it at
+    // wins, whichever pin comes first; a pin lowered to raw holds its chunk
+    // raw.
+    const hold = (leaf: ChunkId, level: number): void => {
+      const prev = fixedLevels.get(leaf);
+      fixedLevels.set(leaf, prev === undefined ? level : Math.min(prev, level));
+    };
     for (const { id, level } of fixedPins) {
-      const eff = Math.min(level, tree.maxLevel(id));
-      if (eff <= 0) { rawZone.add(id); continue; }
-      const node = tree.ancestorAt(id, eff);
-      if (!node) { fixedLevels.set(id, eff); continue; }
+      const eff = tree.renderableLevel(id, level);
+      const node = tree.ancestorAt(id, eff); // null at level 0
+      if (!node) { rawZone.add(id); continue; }
       for (const leaf of node.leafChunkIds) {
         if (rawZone.has(leaf)) continue;
-        // Finest requirement wins if two pins overlap a leaf.
-        const prev = fixedLevels.get(leaf);
-        fixedLevels.set(leaf, prev === undefined ? eff : Math.min(prev, eff));
+        hold(leaf, eff);
       }
     }
 
     const plan = planControlledFrontier(inputs, tree, {
+      diagnostics: this.opts.diagnostics,
       previous: fPrev,
       // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
       // is the quiet dead band; the trust region and overrides do the rest.

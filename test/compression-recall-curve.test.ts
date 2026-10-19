@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
+import { Membrane } from '@animalabs/membrane';
 
-import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, MessageStore, CompressionWithdrawn } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StoredMessage, StrategyContext, SummaryEntry } from '../src/types/index.js';
 
@@ -130,6 +131,39 @@ function quarantineEventsFor(
   return Array.isArray(value) ? value as Array<Record<string, unknown>> : [];
 }
 
+/** Wait for `cond`, failing rather than hanging. */
+async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+/**
+ * Count lookups in the compression in-flight registry that find a call
+ * already in flight: a producer joining it. The registry is module-private,
+ * so this watches Map lookups by its key's shape (five \u0000-joined parts:
+ * namespace, quarantine ledger id, branch, generation and family) that return
+ * a pending result. A state lock's tail (branch and state id, two parts) never
+ * matches. Restore it before anything else runs.
+ */
+function observeInFlightJoins(): { count: () => number; restore: () => void } {
+  const realGet = Map.prototype.get;
+  let joins = 0;
+  Map.prototype.get = function (this: Map<unknown, unknown>, key: unknown) {
+    const value = realGet.call(this, key);
+    if (
+      typeof key === 'string' &&
+      key.split('\u0000').length === 5 &&
+      key.split('\u0000')[1]!.endsWith('autobio:compression-refusal-quarantine-events') &&
+      value instanceof Promise
+    ) joins++;
+    return value;
+  };
+  return { count: () => joins, restore: () => { Map.prototype.get = realGet; } };
+}
+
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {
     this.pushSummary(entry);
@@ -174,6 +208,44 @@ class ProbeStrategy extends AutobiographicalStrategy {
     this.mergeQueue = [];
   }
 
+  setTickWork(chunks: Chunk[], queued: number[], merges: Array<{ level: number; sourceIds: string[] }> = []): void {
+    for (const chunk of chunks) {
+      if (chunk.recordId) continue;
+      chunk.recordId = `tick-${chunk.index}`;
+      this.appendChunkRecord({
+        id: chunk.recordId,
+        sourceIds: chunk.messages.map((m) => m.id),
+        compressed: chunk.compressed,
+      });
+    }
+    this.chunks = chunks;
+    this.compressionQueue = [...queued];
+    this.mergeQueue = merges;
+  }
+
+  compressionQueueView(): number[] {
+    return [...this.compressionQueue];
+  }
+
+  afterCompression(action: (chunk: Chunk) => void | Promise<void>): void {
+    const compress = this.compressChunkHierarchical.bind(this);
+    this.compressChunkHierarchical = async (...args: Parameters<ProbeStrategy['compressChunkHierarchical']>) => {
+      await compress(...args);
+      await action(args[0]);
+    };
+  }
+
+  installLegacyCompressionOverride(): void {
+    const compress = this.compressChunkHierarchical.bind(this);
+    // A pre-existing override may only forward the original two arguments.
+    this.compressChunkHierarchical = (chunk: Chunk, ctx: StrategyContext): Promise<void> => compress(chunk, ctx);
+  }
+
+  /** Queue a chunk at the tail, with no rebuild, as a plan's demand does (handleProducedOps). */
+  queueAtTail(chunkIndex: number): void {
+    this.compressionQueue.push(chunkIndex);
+  }
+
   mergeQueueView(): Array<{ level: number; sourceIds: string[] }> {
     return this.mergeQueue.map((item) => ({ level: item.level, sourceIds: [...item.sourceIds] }));
   }
@@ -201,6 +273,27 @@ class ProbeStrategy extends AutobiographicalStrategy {
 
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     return this.compressChunkHierarchical(chunk, ctx);
+  }
+
+  queueView(): number[] {
+    return [...this.compressionQueue];
+  }
+
+  splitWindowView(): number[] {
+    return [...this.splitCallTimes];
+  }
+
+  setSplitWindow(times: number[]): void {
+    this.splitCallTimes = [...times];
+  }
+
+  clearQueues(): void {
+    this.compressionQueue = [];
+    this.mergeQueue = [];
+  }
+
+  drain(ctx: StrategyContext): void {
+    (this as unknown as { driveSpeculativeDrain(c: StrategyContext): void }).driveSpeculativeDrain(ctx);
   }
 }
 
@@ -314,6 +407,36 @@ async function fixture(
     compressed: false,
   };
   return { manager, strategy, ids, target, parents: [older, newer], children };
+}
+
+/** Real persisted raw chunks, so onNewMessage can rebuild the queue without test-only boundaries. */
+async function queuedRawFixture() {
+  const mock = scriptedMembrane(['refusal', 'end_turn']);
+  const strategy = new ProbeStrategy({
+    compressionModel: MODEL,
+    targetChunkTokens: 50,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    l1HoldbackChunks: 0,
+    minChunkCharsForLLM: 0,
+    mergeThreshold: 99,
+    compressionRefusalCurveFallbacks: 0,
+  });
+  const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: mock.membrane });
+  try {
+    for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(manager);
+    const chunks = strategy.chunksView();
+    assert.equal(chunks.length, 2);
+    assert.deepEqual(strategy.compressionQueueView(), [0, 1]);
+    await strategy.run(chunks[0], ctx);
+    assert.equal(mock.calls.length, 1, 'first raw chunk has a persisted quarantine family');
+    return { mock, strategy, manager, ctx, chunks };
+  } catch (error) {
+    manager.close();
+    throw error;
+  }
 }
 
 function recallIds(request: NormalizedRequest): string[] {
@@ -842,8 +965,8 @@ describe('compression refusal recall curves', () => {
 
     await fx.strategy.run(fx.target, managerContext(fx.manager));
     assert.equal(mock.calls.length, 1, 'canonical usage over budget suppresses provider fallbacks');
-    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
-      .record as Record<string, unknown>;
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!;
+    const record = exhausted.record as Record<string, unknown>;
     assert.equal(record.canonicalProviderInputTokens, 90_000);
     assert.match(String(record.accountingSource), /provider_total_input/);
     const plan = record.plan as Array<Record<string, unknown>>;
@@ -851,6 +974,27 @@ describe('compression refusal recall curves', () => {
     assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
     assert.ok(plan.every((item) => Number(item.boundedInputTokens) > 90_000));
+    // The family's record keeps each variant the plan left unsent, with its planned size, after the canonical's refusal.
+    const outcomes = exhausted.outcomes as Array<Record<string, unknown>>;
+    assert.deepEqual(outcomes.map((outcome) => outcome.outcome), ['refusal', ...plan.map(() => 'admission_rejected')]);
+    assert.deepEqual(
+      outcomes.slice(1).map((outcome) => [outcome.admittedTokens, outcome.budgetTokens]),
+      plan.map((item) => [item.admittedTokens, item.budgetTokens]),
+    );
+    fx.manager.close();
+  });
+
+  it('a recall variant a provider rejects is recorded with its planned size, as a refused one is', async () => {
+    const rejected = Object.assign(new Error('zz invalid request'), { type: 'invalid_request', httpStatus: 400, retryable: false });
+    const mock = flexibleMembrane([{ stop: 'refusal' }, { error: rejected }]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then one recall variant');
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!;
+    const plan = (exhausted.record as { plan: Array<Record<string, unknown>> }).plan;
+    const variant = (exhausted.outcomes as Array<Record<string, unknown>>).find((outcome) => outcome.outcome === 'provider_error')!;
+    assert.equal(variant.errorType, 'invalid_request');
+    assert.deepEqual([variant.admittedTokens, variant.budgetTokens], [plan[0]!.admittedTokens, plan[0]!.budgetTokens]);
     fx.manager.close();
   });
 
@@ -944,43 +1088,134 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('does not double-count provider cache fields that are subsets of total input', async () => {
+  it('a cached non-Anthropic refusal counts its cache reads in the canonical total', async () => {
+    // membrane states usage with the cached span outside inputTokens wherever
+    // it knows the convention: 200,000 fresh plus 150,000 read from cache is a
+    // 350,000-token prompt, on OpenAI as on Anthropic.
     const mock = flexibleMembrane([
       { stop: 'refusal', inputTokens: 200_000, cacheReadTokens: 150_000, provider: 'openai-responses-api' },
-      { stop: 'end_turn', text: 'subset-accounted fallback succeeded', inputTokens: 220_000 },
+      { stop: 'end_turn', text: 'must never be called' },
     ]);
     const fx = await fixture(mock.membrane, {
       compressionContextBudgetTokens: 350_000,
       compressionRefusalCurveFallbacks: 1,
     });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 2, 'OpenAI cached input is not added twice');
-    assert.equal(fx.target.compressed, true);
+    assert.equal(mock.calls.length, 1, 'the cached span counts, so no expansion fits the budget');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 350_000);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     fx.manager.close();
   });
 
-  it('zero or partial non-Anthropic usage falls back to the complete request bound', async () => {
+  it('a full cache hit on a non-Anthropic provider is the provider\'s count of the prompt', async () => {
+    // No fresh input beside 180,000 cached tokens: in membrane's convention a
+    // 180,000-token prompt served whole from cache. It replaces the invariant
+    // UTF-8 floor, which the huge tool catalog puts past the budget.
     const mock = flexibleMembrane([
-      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 5, provider: 'openai-responses-api' },
+      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 180_000, provider: 'openai-responses-api' },
+      { stop: 'end_turn', text: 'provider-counted fallback succeeded', inputTokens: 190_000 },
     ]);
     const fx = await fixture(mock.membrane, {
-      compressionContextBudgetTokens: 60_000,
+      compressionContextBudgetTokens: 350_000,
       compressionRefusalCurveFallbacks: 1,
+      headWindowTokens: 100_000,
     });
     fx.manager.setToolDefinitions([{
-      name: 'large_zero_usage_tool',
-      description: 'schema inventory '.repeat(20_000),
-      inputSchema: { type: 'object', properties: {} },
+      name: 'huge_invariant_tool_catalog',
+      description: 'schema inventory '.repeat(30_000),
+      inputSchema: {
+        type: 'object',
+        properties: { payload: { type: 'string', description: 'large field '.repeat(30_000) } },
+      },
     }]);
+
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 1, 'degenerate usage cannot bypass the deterministic floor');
+    assert.equal(mock.calls.length, 2, 'the cached count admits one fallback');
+    assert.equal(fx.target.compressed, true);
+    const requests = mock.calls.map((call) => Buffer.byteLength(JSON.stringify(call.request), 'utf8'));
+    assert.ok(requests[0]! > 350_000, 'invariant serialized request exceeds the token budget numerically');
+    fx.manager.close();
+  });
+
+  it('a refusal through membrane itself counts a cache-inclusive provider\'s prompt once', async () => {
+    // The sum rests on membrane's normalization, so this crosses it: a real
+    // Membrane around an adapter whose provider reports cache reads inside its
+    // input count, as OpenAI's does. 10,000 prompt tokens, 8,000 of them read
+    // from cache, are 2,000 fresh plus 8,000 cached once membrane has them.
+    const adapter = {
+      name: 'stub-cache-inclusive',
+      usageCacheConvention: 'cache-inclusive' as const,
+      calls: 0,
+      supportsModel: () => true,
+      async complete(request: { model: string }) {
+        adapter.calls++;
+        return {
+          content: [{ type: 'text', text: '' }],
+          stopReason: 'refusal',
+          usage: { inputTokens: 10_000, outputTokens: 0, cacheReadTokens: 8_000 },
+          model: request.model,
+          rawRequest: request,
+          raw: {},
+        };
+      },
+      async stream(): Promise<never> { throw new Error('the strategy does not stream'); },
+    };
+    const fx = await fixture(new Membrane(adapter as never) as never, {
+      compressionContextBudgetTokens: 10_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(adapter.calls, 1, 'no expansion of a 10,000-token prompt fits a 10,000-token budget');
     const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
       .record as Record<string, unknown>;
-    assert.equal(record.canonicalProviderInputTokens, undefined);
-    assert.ok((record.plan as Array<Record<string, unknown>>).every(
-      (item) => item.accountingSource === 'complete_normalized_request_bound',
-    ));
+    assert.equal(record.canonicalProviderInputTokens, 10_000);
     fx.manager.close();
+  });
+
+  it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
+    // Cache counts with no input count beside them are no observation of the
+    // prompt. Through complete(), membrane's Anthropic and Bedrock adapters
+    // pass the provider's input count through, so this shape reaches the
+    // strategy where such a provider sends none, as from a caller outside
+    // membrane.
+    const withoutInputCount = response('refusal');
+    (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
+    (withoutInputCount as unknown as { details: unknown }).details = {
+      usage: { outputTokens: 0, cacheReadTokens: 5 },
+      model: { provider: 'openai-responses-api' },
+    };
+    const cases: Array<[string, AttemptHandler]> = [
+      ['zero total', { stop: 'refusal', inputTokens: 0, provider: 'openai-responses-api' }],
+      ['no input count', { raw: withoutInputCount }],
+    ];
+    for (const [label, handler] of cases) {
+      const mock = flexibleMembrane([handler]);
+      const fx = await fixture(mock.membrane, {
+        compressionContextBudgetTokens: 60_000,
+        compressionRefusalCurveFallbacks: 1,
+      });
+      fx.manager.setToolDefinitions([{
+        name: 'large_zero_usage_tool',
+        description: 'schema inventory '.repeat(20_000),
+        inputSchema: { type: 'object', properties: {} },
+      }]);
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 1, `${label}: degenerate usage cannot bypass the deterministic floor`);
+      const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+        .record as Record<string, unknown>;
+      assert.equal(record.canonicalProviderInputTokens, undefined, label);
+      const plan = record.plan as Array<Record<string, unknown>>;
+      assert.ok(plan.length > 0, `${label}: the plan has entries`);
+      assert.ok(plan.every(
+        (item) => item.accountingSource === 'complete_normalized_request_bound',
+      ), label);
+      fx.manager.close();
+    }
   });
 
   it('usage absence counts complete huge tools, head, raw input, and normalized config', async () => {
@@ -1154,7 +1389,7 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('preserves canonical empty/error behavior; canonical max_tokens is never canonized', async () => {
+  it('an empty canonical answer exhausts after its plain-prose retry, a truncated one is never canonized, and malformed answers, and two transport failures with nothing landing between them, quarantine nothing', async () => {
     {
       // cm #55 (2026-08-06): an empty generation is no longer a silent
       // skip — after the plain-prose retry also comes back empty, the
@@ -1211,6 +1446,461 @@ describe('compression refusal recall curves', () => {
       await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
       await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)));
       assert.equal(mock.calls.length, 2, 'canonical errors remain retryable and are not quarantined');
+      fx.manager.close();
+    }
+  });
+
+  it('tick skips an already-quarantined chunk and compresses the next eligible chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(mock.calls.length, 1, 'the first attempt creates real durable quarantine');
+      fx.strategy.setTickWork([fx.target, next], [0, 1]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 2, 'one tick must reach the eligible chunk behind quarantine');
+      assert.equal(fx.target.compressed, false);
+      assert.equal(next.compressed, true);
+      assert.deepEqual(fx.strategy.compressionQueueView(), []);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('tick reaches a queued merge after an already-quarantined raw chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(mock.calls.length, 1);
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 2, 'the merge must run in the same tick as the no-op skip');
+      assert.deepEqual(fx.strategy.mergeQueueView(), []);
+      assert.equal(fx.target.compressed, false);
+      assert.ok(fx.strategy.summariesView().some((s) => s.level === 3));
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('one tick exhausts an all-quarantined queue without provider calls, warning once per chunk (#55)', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      await fx.strategy.run(next, ctx);
+      assert.equal(mock.calls.length, 2);
+      const warnings: string[] = [];
+      const previous = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        for (let repeat = 0; repeat < 2; repeat++) {
+          fx.strategy.setTickWork([{ ...fx.target }, { ...next }], [0, 1]);
+          await fx.strategy.tick(ctx);
+          assert.deepEqual(fx.strategy.compressionQueueView(), []);
+        }
+      } finally {
+        console.warn = previous;
+      }
+      assert.equal(mock.calls.length, 2, 'quarantine skip must not attempt the provider');
+      assert.equal(warnings.filter((w) => w.includes('compression quarantine skipped')).length, 2);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a newly refused compression still consumes the tick (#55)', async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'a paid attempt must not fall through into a second work item');
+      assert.equal(fx.strategy.mergeQueueView().length, 1);
+      assert.equal(fx.target.compressed, false);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a tick bounds quarantine scanning even if an await replenishes the queue (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      const merges = [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }];
+      fx.strategy.setTickWork([fx.target], [0], merges);
+      let visited = 0;
+      fx.strategy.afterCompression(() => {
+        assert.equal(++visited, 1, 'a re-enqueued skip must not extend this tick indefinitely');
+        fx.strategy.setTickWork([fx.target], [0], merges);
+      });
+      await fx.strategy.tick(ctx);
+      assert.equal(visited, 1);
+      assert.equal(mock.calls.length, 2, 'the bounded scan must still reach a pending merge');
+      assert.deepEqual(fx.strategy.compressionQueueView(), [0], 'replenished work belongs to a later tick');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a legacy two-argument compression override still consumes at most one item per tick (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target], [0], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      fx.strategy.installLegacyCompressionOverride();
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1);
+      assert.equal(fx.strategy.mergeQueueView().length, 1, 'without a skip notification retain the prior scheduling contract');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a branch switch during a quarantine skip stops the old tick before it can merge (#55)', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, hierarchical: true });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target], [0]);
+      fx.strategy.afterCompression(async () => {
+        await fx.manager.fork('after-quarantine-skip');
+        fx.strategy.setTickWork([fx.target], [], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
+      });
+      await fx.strategy.tick(ctx);
+      assert.equal(fx.manager.currentBranch().name, 'after-quarantine-skip');
+      assert.equal(mock.calls.length, 1, 'old branch work must not consume the new branch merge queue');
+      assert.equal(fx.strategy.mergeQueueView().length, 1);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('stale compression indexes do not block the next queued chunk (#55)', async () => {
+    const mock = scriptedMembrane(['end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], [999, 0]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1);
+      assert.equal(fx.target.compressed, true);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it("a scan that yields after a quarantine skip leaves newer pending work alone", async () => {
+    const mock = scriptedMembrane(['refusal']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target], [0]);
+      const lane = fx.strategy as unknown as { pendingCompression: Promise<void> | null };
+      const newer = new Promise<void>(() => {});
+      // As after a branch switch: newer work takes the lane while the scan is in its skip.
+      fx.strategy.afterCompression(() => { lane.pendingCompression = newer; });
+      await fx.strategy.tick(ctx);
+      assert.equal(lane.pendingCompression, newer, "the stale scan's finally leaves the newer work's ownership");
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('an identity first queued during the scan waits for the next tick', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(mock.calls.length, 1);
+      // Only the quarantined chunk is queued when the scan takes its snapshot.
+      fx.strategy.setTickWork([fx.target, next], [0]);
+      let queuedNext = false;
+      fx.strategy.afterCompression(() => {
+        if (queuedNext) return;
+        queuedNext = true;
+        fx.strategy.setTickWork([fx.target, next], [1]);
+      });
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'the identity queued during the scan waits');
+      assert.deepEqual(fx.strategy.compressionQueueView(), [1]);
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 2, 'and runs at the next tick');
+      assert.equal(next.compressed, true);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a queued chunk compressed during the scan\'s yield is passed over', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target, next], [0, 1]);
+      // Another producer compresses the next chunk while the scan yields after its skip.
+      fx.strategy.afterCompression((chunk) => { if (chunk === fx.target) next.compressed = true; });
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'no call for a chunk already compressed');
+      assert.deepEqual(fx.strategy.compressionQueueView(), []);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('the speculative drain goes on past a tick that only consumed a quarantine skip', async () => {
+    const mock = scriptedMembrane(['refusal', 'end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target, next], [0]);
+      let queuedNext = false;
+      fx.strategy.afterCompression(() => {
+        if (queuedNext) return;
+        queuedNext = true;
+        fx.strategy.setTickWork([fx.target, next], [1]);
+      });
+      // The first tick consumes only the skip; the drain must still run the next one.
+      (fx.strategy as unknown as { driveSpeculativeDrain(ctx: StrategyContext): void }).driveSpeculativeDrain(ctx);
+      const deadline = Date.now() + 10_000;
+      while (!next.compressed && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(next.compressed, true, 'the drain reached the next chunk');
+      assert.equal(mock.calls.length, 2);
+      // Let the drain's last hop find the queue empty and stop before the store closes.
+      const lane = fx.strategy as unknown as { pendingCompression: Promise<void> | null };
+      while (lane.pendingCompression !== null && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      for (let i = 0; i < 3; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('quarantine scanning yields to inbound events while keeping pending work owned (#55)', async () => {
+    const events: string[] = [];
+    let calls = 0;
+    const membrane = {
+      complete: async () => {
+        events.push(`provider-${++calls}`);
+        return calls === 1 ? response('refusal') : response('end_turn', 'a successful next memory');
+      },
+    };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    let event: Promise<void> | undefined;
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      const next: Chunk = { ...fx.target, index: 1, messages: ctx.messageStore.getAll().slice(12, 14) };
+      fx.strategy.setTickWork([fx.target, next], []);
+      await fx.strategy.run(fx.target, ctx);
+      fx.strategy.setTickWork([fx.target, next], [0, 1]);
+      let pendingAtEvent = false;
+      let callsAfterReentrantTick = 0;
+      fx.strategy.afterCompression(() => {
+        if (event) return;
+        // Schedule an event after the quarantine check, before the next raw
+        // chunk. A resolved-promise loop would starve it until the tick ends.
+        event = new Promise<void>((resolve, reject) => {
+          setTimeout(() => {
+            events.push('inbound-event');
+            pendingAtEvent = !!fx.strategy.checkReadiness().pendingWork;
+            fx.strategy.tick(ctx).then(() => {
+              callsAfterReentrantTick = calls;
+              resolve();
+            }, reject);
+          }, 0);
+        });
+      });
+      await fx.strategy.tick(ctx);
+      await event;
+      assert.deepEqual(events, ['provider-1', 'inbound-event', 'provider-2']);
+      assert.equal(pendingAtEvent, true, 'the cooperative yield remains owned pending work');
+      assert.equal(callsAfterReentrantTick, 1, 'an inbound tick cannot start competing compression');
+      assert.equal(next.compressed, true);
+    } finally {
+      await event;
+      fx.manager.close();
+    }
+  });
+
+  it('an inbound queue rebuild cannot spend the scan twice on the same quarantined chunk (#55)', async () => {
+    const fx = await queuedRawFixture();
+    const rebuilds: Promise<void>[] = [];
+    const replacedObjects: boolean[] = [];
+    const inspected: string[][] = [];
+    try {
+      fx.strategy.afterCompression((chunk) => {
+        inspected.push(chunk.messages.map((m) => m.id));
+        if (chunk.compressed) return;
+        // This event runs during tick's cooperative yield. The real manager
+        // invokes onNewMessage, replacing chunk objects and restoring [0, 1].
+        rebuilds.push(new Promise<void>((resolve) => setTimeout(() => {
+          fx.manager.addMessage('User', [text('inbound while the quarantined chunk yields')]);
+          replacedObjects.push(fx.strategy.chunksView()[0] !== chunk);
+          resolve();
+        }, 0)));
+      });
+      await fx.strategy.tick(fx.ctx);
+      await Promise.all(rebuilds);
+      assert.equal(fx.mock.calls.length, 2, 'one tick reaches the eligible raw chunk despite the rebuilt head');
+      assert.ok(replacedObjects.length > 0 && replacedObjects.every(Boolean));
+      assert.deepEqual(inspected, fx.chunks.map((c) => c.messages.map((m) => m.id)));
+      assert.ok(fx.strategy.summariesView().some((s) => s.sourceIds.join(':') === fx.chunks[1].messages.map((m) => m.id).join(':')));
+    } finally {
+      await Promise.all(rebuilds);
+      fx.manager.close();
+    }
+  });
+
+  it('a skipped quarantined chunk waits behind fresh work after the next rebuild', async () => {
+    const fx = await queuedRawFixture();
+    try {
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(fx.mock.calls.length, 2, 'the tick skipped the quarantined chunk and compressed the next');
+      // Inbound traffic rebuilds the queue: the quarantined chunk is raw, so
+      // it is queued again, beside the chunks the new messages closed.
+      for (let i = 0; i < 8; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`fresh-${i} ` + 'word '.repeat(30))]);
+      const quarantinedIds = fx.chunks[0].messages.map((m) => m.id).join(':');
+      const chunks = fx.strategy.chunksView();
+      const quarantined = chunks.findIndex((chunk) => chunk.messages.map((m) => m.id).join(':') === quarantinedIds);
+      const queue = fx.strategy.compressionQueueView();
+      assert.ok(quarantined >= 0 && queue.includes(quarantined), 'the quarantined chunk is queued again');
+      assert.ok(queue.some((index) => index !== quarantined && !chunks[index]!.compressed), 'fresh chunks are queued');
+      assert.equal(queue.at(-1), quarantined, 'it waits behind the fresh chunks, so they are built first');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a skipped quarantined chunk that a rebuild queues again during its yield still waits behind fresh work', async () => {
+    const fx = await queuedRawFixture();
+    const quarantinedIds = fx.chunks[0].messages.map((m) => m.id).join(':');
+    const rebuilds: Promise<void>[] = [];
+    try {
+      fx.strategy.afterCompression((chunk) => {
+        if (chunk.compressed || chunk.messages.map((m) => m.id).join(':') !== quarantinedIds) return;
+        // Inbound traffic during the skip's yield: its rebuild queues the
+        // quarantined chunk again, beside the chunks the new messages close,
+        // before tick has given it a failure order.
+        rebuilds.push(new Promise<void>((resolve) => setTimeout(() => {
+          for (let i = 0; i < 8; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`fresh-${i} ` + 'word '.repeat(30))]);
+          resolve();
+        }, 0)));
+      });
+      await fx.strategy.tick(fx.ctx);
+      await Promise.all(rebuilds);
+      assert.equal(rebuilds.length, 1, 'the premise: the rebuild ran during the skip');
+      assert.equal(fx.mock.calls.length, 2, 'the tick skipped the quarantined chunk and compressed the next');
+      const chunks = fx.strategy.chunksView();
+      const quarantined = chunks.findIndex((chunk) => chunk.messages.map((m) => m.id).join(':') === quarantinedIds);
+      const queue = fx.strategy.compressionQueueView();
+      assert.ok(quarantined >= 0 && queue.includes(quarantined), 'the quarantined chunk is queued again');
+      assert.ok(queue.some((index) => index !== quarantined && !chunks[index]!.compressed), 'fresh chunks are queued');
+      assert.equal(queue.at(-1), quarantined, 'it waits behind the fresh chunks, so they are built first');
+    } finally {
+      await Promise.all(rebuilds);
+      fx.manager.close();
+    }
+  });
+
+  it('a rebuilt scan resolves original source identities at their current queue indexes (#55)', async () => {
+    const fx = await queuedRawFixture();
+    const rebuilt = fx.chunks.map((chunk, index) => ({ ...chunk, index: 1 - index })).reverse();
+    try {
+      let visited = 0;
+      fx.strategy.afterCompression((chunk) => {
+        visited++;
+        if (!chunk.compressed) fx.strategy.setTickWork(rebuilt, [1, 0]);
+      });
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(visited, 2);
+      assert.equal(fx.mock.calls.length, 2);
+      assert.equal(rebuilt[0].compressed, true, 'the relocated eligible chunk, not a stale object, is compressed');
+      assert.equal(rebuilt[1].compressed, false);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('a rebuilt queue can withdraw an original candidate without the scan resurrecting it (#55)', async () => {
+    const fx = await queuedRawFixture();
+    try {
+      let inspected = 0;
+      fx.strategy.afterCompression(() => {
+        inspected++;
+        fx.strategy.setTickWork(fx.chunks.map((chunk) => ({ ...chunk })), [0]);
+      });
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(inspected, 1, 'each original source is inspected at most once');
+      assert.equal(fx.mock.calls.length, 1, 'withdrawn eligible work must stay withdrawn');
+      assert.deepEqual(fx.strategy.compressionQueueView(), [0]);
+    } finally {
+      fx.manager.close();
+    }
+  });
+
+  it('an all-stale compression queue clears readiness with no candidate identities (#55)', async () => {
+    const mock = scriptedMembrane(['end_turn']);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    try {
+      const ctx = managerContext(fx.manager);
+      fx.target.index = 0;
+      fx.strategy.setTickWork([fx.target], []);
+      await fx.strategy.run(fx.target, ctx);
+      assert.equal(fx.target.compressed, true);
+      const unqueued: Chunk = {
+        index: 1, startIndex: 12, endIndex: 14,
+        messages: ctx.messageStore.getAll().slice(12, 14),
+        tokens: 100, compressed: false,
+      };
+      fx.strategy.setTickWork([fx.target, unqueued], [999, 0]);
+      assert.equal(fx.strategy.checkReadiness().ready, false, 'raw work plus stale queued entries blocks readiness');
+      await fx.strategy.tick(ctx);
+      assert.equal(mock.calls.length, 1, 'stale cleanup does not call the provider');
+      assert.deepEqual(fx.strategy.compressionQueueView(), []);
+      assert.equal(unqueued.compressed, false, 'unqueued raw work stays raw');
+      assert.equal(fx.strategy.checkReadiness().ready, true, 'removing the stale entries clears readiness');
+    } finally {
       fx.manager.close();
     }
   });
@@ -1310,6 +2000,65 @@ describe('compression refusal recall curves', () => {
     manager.close();
   });
 
+  it('a quarantine record an earlier release wrote with the old count still holds its chunk', async () => {
+    // An earlier release counted this refusal at its fresh input alone, 2,000,
+    // where this one counts 10,000, so its record carries another count and
+    // another key. It wrote accounting version 2, as this release does, and
+    // the family key hashes no count, so the record goes on holding the
+    // chunk's request family.
+    const path = freshPath();
+    const firstMock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 2_000, cacheReadTokens: 8_000, provider: 'openai-responses-api' },
+    ]);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    const exhausted = quarantineEvents(first.manager).find((event) => event.kind === 'exhausted')!;
+    const current = exhausted.record as Record<string, unknown>;
+    assert.equal(current.canonicalProviderInputTokens, 10_000, 'premise: this release counts the cached span');
+    await first.strategy.clearCompressionRefusalQuarantine(String(current.key));
+    const earlier: Record<string, unknown> = {
+      ...structuredClone(current),
+      key: 'earlier-release-key',
+      canonicalProviderInputTokens: 2_000,
+      accountingSource: 'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2',
+      normalizedConfig: { ...(current.normalizedConfig as Record<string, unknown>), accountingVersion: 2 },
+    };
+    first.manager.getStore().appendToStateJsonWithIdentity(
+      'default/autobio:compression-refusal-quarantine-events',
+      { kind: 'exhausted', key: earlier.key, record: earlier, outcomes: [], created: Date.now() },
+      'eventId',
+      'sequence',
+    );
+    first.manager.close();
+
+    const retryMock = scriptedMembrane(['end_turn']);
+    const retried = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy: retried, membrane: retryMock.membrane });
+    const ctx = managerContext(manager);
+    const chunk: Chunk = {
+      index: 999,
+      startIndex: 10,
+      endIndex: 12,
+      messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+      tokens: 100,
+      compressed: false,
+    };
+    await retried.run(chunk, ctx);
+    assert.equal(retryMock.calls.length, 0, 'the earlier record holds the chunk');
+    assert.equal(chunk.compressed, false);
+    manager.close();
+  });
+
   it('a new accounting version is not blocked by the old per-chunk shape cap', async () => {
     const path = freshPath();
     const firstMock = scriptedMembrane(['refusal']);
@@ -1363,6 +2112,123 @@ describe('compression refusal recall curves', () => {
     assert.equal(retryMock.calls.length, 1, 'v2 accounting earns one fresh canonical attempt');
     assert.equal(chunk.compressed, true);
     manager.close();
+  });
+
+  for (const rung of [false, true]) {
+    it(rung
+      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though the store gives back the rung\'s options with their keys in another order'
+      : 'a quarantined chunk run again makes no call with the tool-prose rung off (the control)', async () => {
+      // Every call is refused with a provider count, which the stored record's key carries and the gate's doesn't,
+      // so only the record's family, in the current request regime, can hold the chunk.
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0,
+        ...(rung
+          ? { compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] } }
+          : {}),
+      });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.ok(mock.calls.length >= 1, 'premise: the first run called the model');
+      const exhausted = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
+      assert.equal(exhausted.length, 1, 'premise: the first run quarantined the chunk');
+      assert.equal(
+        (exhausted[0]!.record as { canonicalProviderInputTokens?: number }).canonicalProviderInputTokens, 100,
+        "premise: the stored record's key carries the provider's count",
+      );
+      if (rung) {
+        const stored = (exhausted[0]!.record as { normalizedConfig: { toolProseFallback: object } }).normalizedConfig.toolProseFallback;
+        const built = (fx.strategy as unknown as { toolProseHoistOptions(): object }).toolProseHoistOptions();
+        assert.deepEqual(stored, built, 'premise: the stored options are the ones the strategy builds');
+        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the store gives back their keys in another order');
+      }
+      const logPath = `${freshPath()}-trace.jsonl`;
+      paths.push(logPath);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+      try {
+        for (const run of ['second', 'third']) {
+          fx.target.compressed = false;
+          const before = mock.calls.length;
+          await fx.strategy.run(fx.target, managerContext(fx.manager));
+          assert.equal(mock.calls.length - before, 0, `the ${run} run makes no call`);
+        }
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+      const events = existsSync(logPath)
+        ? readFileSync(logPath, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { event?: string }).event)
+        : [];
+      assert.deepEqual(
+        events.filter((event) => event === 'compression:quarantine-skipped'),
+        ['compression:quarantine-skipped', 'compression:quarantine-skipped'],
+        'the quarantine gate skipped each of those runs',
+      );
+      fx.manager.close();
+    });
+  }
+
+  it("the tool-prose rung's options make one request regime: its shape cap holds the chunk, and options that differ start another", async () => {
+    type RungOptions = { intoTool: string; field?: string; result?: string; minChars?: number; fromTools: string[] };
+    const base: RungOptions = { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] };
+    const rung = (changes: Partial<RungOptions> = {}) => ({ compressionToolProseFallback: { ...base, ...changes } });
+    const path = freshPath();
+    // The first shape, quarantined at the default context budget.
+    const firstMock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0, ...rung() }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    assert.ok(firstMock.calls.length >= 1, 'premise: the first shape is attempted');
+    first.manager.close();
+    let exhausted = 0;
+    // Each context budget is another request shape of the same chunk.
+    const callsFor = async (options: ConstructorParameters<typeof ProbeStrategy>[0]): Promise<number> => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+      const strategy = new ProbeStrategy({
+        compressionModel: MODEL,
+        targetChunkTokens: 100,
+        recentWindowTokens: 0,
+        headWindowTokens: 0,
+        minChunkCharsForLLM: 0,
+        mergeThreshold: 99,
+        compressionRefusalCurveFallbacks: 0,
+        ...options,
+      });
+      const manager = await ContextManager.open({ path, strategy, membrane: mock.membrane });
+      const ctx = managerContext(manager);
+      const chunk: Chunk = {
+        index: 999,
+        startIndex: 10,
+        endIndex: 12,
+        messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+        tokens: 100,
+        compressed: false,
+      };
+      await strategy.run(chunk, ctx);
+      exhausted = quarantineEvents(manager).filter((event) => event.kind === 'exhausted').length;
+      manager.close();
+      return mock.calls.length;
+    };
+    for (const budget of [101_000, 102_000]) {
+      assert.ok(await callsFor({ ...rung(), compressionContextBudgetTokens: budget }) >= 1, `premise: the shape at ${budget} is attempted`);
+    }
+    assert.equal(exhausted, 3, 'premise: each of the three shapes is quarantined');
+    assert.equal(
+      await callsFor({ ...rung(), compressionContextBudgetTokens: 103_000 }), 0,
+      'a fourth shape with the same options is held by the cap of three',
+    );
+    // Options that differ in any one value, or the rung off, are another regime, which the three records don't fill.
+    const others: Array<[string, ConstructorParameters<typeof ProbeStrategy>[0]]> = [
+      ['the rung off', {}],
+      ['another intoTool', rung({ intoTool: 'notes' })],
+      ['another field', rung({ field: 'text' })],
+      ['another result', rung({ result: 'zz noted' })],
+      ['another minChars', rung({ minChars: 50 })],
+      ['another fromTools', rung({ fromTools: ['skip_reply', 'zz_think'] })],
+    ];
+    for (const [name, options] of others) {
+      assert.ok(await callsFor({ ...options, compressionContextBudgetTokens: 103_000 }) >= 1, `with ${name}, the chunk is attempted afresh`);
+    }
   });
 
   it('restart with fallback limit 1→3 invalidates the exhausted plan key', async () => {
@@ -1681,7 +2547,7 @@ describe('compression refusal recall curves', () => {
   it('concurrent producers consult durable summaries and persist only one L1', async () => {
     const mock = scriptedMembrane(['end_turn', 'end_turn']);
     // The process-local branch/family registry coalesces the second producer;
-    // hold the first briefly so the race is real.
+    // hold the first until the second has joined, so the race is real.
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let entered = 0;
@@ -1715,11 +2581,22 @@ describe('compression refusal recall curves', () => {
     ).filter(Boolean) as StoredMessage[];
     const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
 
-    const runs = Promise.all([
-      first.strategy.run(first.target, managerContext(first.manager)),
-      second.run(secondChunk, secondCtx),
-    ]);
-    setTimeout(release, 20);
+    // Release the held call only once the second producer has joined it:
+    // arriving later, it would reload the durable summary instead, and the
+    // test would pass without the in-flight registry.
+    const joins = observeInFlightJoins();
+    let runs: Promise<unknown>;
+    try {
+      runs = Promise.all([
+        first.strategy.run(first.target, managerContext(first.manager)),
+        second.run(secondChunk, secondCtx),
+      ]);
+      await until(() => joins.count() >= 1, 'the second producer to join the in-flight call');
+      assert.equal(entered, 1, 'joined while the first call is held');
+    } finally {
+      joins.restore();
+      release();
+    }
     await runs;
     assert.equal(mock.calls.length, 1, 'same-key in-flight registry permits only one provider call');
     const persisted = first.manager.getStore().getStateJson('default/autobio:summaries');
@@ -1734,6 +2611,132 @@ describe('compression refusal recall curves', () => {
     assert.equal(secondChunk.compressed, true);
     secondManager.close();
     first.manager.close();
+  });
+
+  type LanePause = { statedUntil: number | null; statedBy: string | null; backoffUntil: number; failures: number } | null;
+  const lanePause = (strategy: unknown): LanePause => (strategy as { compressionPause: LanePause }).compressionPause;
+
+  /**
+   * Two instances on one store, the second joining the first's in-flight call,
+   * which fails with `error`. `seed` runs on the second before it joins.
+   */
+  async function coalescedFailure(
+    error: Error,
+    seed?: (strategy: ProbeStrategy, ctx: StrategyContext) => void,
+    options: { secondMembrane?: unknown } = {},
+  ) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const concurrent = {
+      complete: async () => {
+        calls++;
+        await gate;
+        throw error;
+      },
+    } as never;
+    const path = freshPath();
+    const first = await fixture(concurrent, { compressionRefusalCurveFallbacks: 0 }, path);
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({ store: first.manager.getStore(), strategy: second, membrane: (options.secondMembrane ?? concurrent) as never });
+    const secondCtx = managerContext(secondManager);
+    const secondMessages = first.target.messages.map(
+      (message) => secondCtx.messageStore.get(message.id),
+    ).filter(Boolean) as StoredMessage[];
+    const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
+    seed?.(second, secondCtx);
+    const joins = observeInFlightJoins();
+    const before = Date.now();
+    let runs: Promise<PromiseSettledResult<unknown>[]>;
+    try {
+      runs = Promise.allSettled([
+        first.strategy.run(first.target, managerContext(first.manager)),
+        second.run(secondChunk, secondCtx),
+      ]);
+      await until(() => joins.count() >= 1, 'the second producer to join the in-flight call');
+    } finally {
+      joins.restore();
+      release();
+    }
+    const [producer, waiter] = await runs;
+    assert.equal(calls, 1, "one provider call, the producer's");
+    assert.equal(producer!.status, 'rejected');
+    assert.equal(waiter!.status, 'rejected');
+    assert.equal((waiter as PromiseRejectedResult).reason, error, "the waiter rethrows the producer's failure");
+    return {
+      before,
+      pause: lanePause(second),
+      producerPause: lanePause(first.strategy),
+      close: () => {
+        secondManager.close();
+        first.manager.close();
+      },
+    };
+  }
+
+  it("a waiter on another instance's call takes the provider's stated wait from its failure, counting none", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const { before, pause, close } = await coalescedFailure(limited);
+    assert.ok(pause && pause.statedUntil !== null && pause.statedUntil >= before + 120_000,
+      "the waiter's lane holds for the provider's stated wait, so it doesn't send the same request inside it");
+    assert.equal(pause!.failures, 0, 'no failure counted: none of its calls failed');
+    assert.equal(pause!.backoffUntil, 0, 'and no backoff of its own');
+    close();
+  });
+
+  it("a waiter on another membrane takes no pause from the producer's stated wait: the provider stated it for the producer's route", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const elsewhere = { complete: async () => { throw new Error('zz the waiter makes no call of its own'); } };
+    const { pause, producerPause, close } = await coalescedFailure(limited, undefined, { secondMembrane: elsewhere });
+    assert.ok(producerPause && producerPause.statedUntil !== null, "premise: the producer's own lane holds for the stated wait");
+    assert.equal(pause, null, "the waiter's route stated no wait, so its lane takes none");
+    close();
+  });
+
+  it("with no stated wait, the waiter's lane takes no pause from another instance's failure", async () => {
+    const unavailable = Object.assign(new Error('zz overloaded'), { type: 'server', httpStatus: 503, retryable: true });
+    const { pause, close } = await coalescedFailure(unavailable);
+    assert.equal(pause, null, 'nothing to hold for: its own calls failed none, and the provider stated no wait');
+    close();
+  });
+
+  it("a waiter with a backoff of its own keeps it, and its failure count, when it takes another instance's stated wait", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const backoffUntil = Date.now() + 600_000;
+    const { before, pause, close } = await coalescedFailure(limited, (strategy, ctx) => {
+      (strategy as unknown as { compressionPause: unknown }).compressionPause = {
+        backoffUntil, statedUntil: null, statedBy: null, failures: 4, membrane: ctx.membrane, model: MODEL, reason: 'zz its own earlier failure',
+      };
+    });
+    assert.ok(pause && pause.statedUntil !== null && pause.statedUntil >= before + 120_000, 'it takes the stated wait');
+    assert.equal(pause!.backoffUntil, backoffUntil, 'its own backoff stands');
+    assert.equal(pause!.failures, 4, 'and so does its failure count');
+    close();
+  });
+
+  it("a deferral by the producer's provider admission gives the waiter's lane no pause, since no call was made", async () => {
+    const deferral = Object.assign(new Error('zz held; no call was made'), {
+      type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 120_000,
+    });
+    const { pause, producerPause, close } = await coalescedFailure(deferral);
+    assert.equal(producerPause?.statedBy, 'admission', "the premise: the producer's own lane holds the admission's answer");
+    assert.equal(pause, null, "no provider stated a wait: the waiter's next attempt asks the admission itself");
+    close();
+  });
+
+  it("an aborted call gives the waiter's lane no pause, even with a stated wait on its error", async () => {
+    const aborted = Object.assign(new Error('zz aborted'), { name: 'AbortError', retryAfterMs: 60_000 });
+    const { pause, close } = await coalescedFailure(aborted);
+    assert.equal(pause, null, "only a real call's transient failure paces the waiter");
+    close();
   });
 
   it("a waiter on another instance's compression keeps its own kv-unified submission in flight, and still takes up the store (#166)", async () => {
@@ -1940,7 +2943,13 @@ describe('compression refusal recall curves', () => {
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
     ]);
-    setTimeout(release, 20);
+    // Both calls in flight at once before either is released: had the second
+    // joined the first, this would never be reached.
+    try {
+      await until(() => calls.length >= 2, 'both namespaces to call the provider');
+    } finally {
+      release();
+    }
     await runs;
     assert.equal(calls.length, 2, 'namespace state identities cannot coalesce');
     const targetKey = first.target.messages.map((message) => message.id).join(':');
@@ -1956,7 +2965,7 @@ describe('compression refusal recall curves', () => {
     first.manager.close();
   });
 
-  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async () => {
+  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async (t) => {
     const calls: RecordedCall[] = [];
     const membrane = {
       complete: async (request: NormalizedRequest) => {
@@ -1986,6 +2995,14 @@ describe('compression refusal recall curves', () => {
       compressed: false,
     };
 
+    // Each alert's line names the namespace it alerts for (#239).
+    const alerts: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      const line = String(args[0]);
+      if (line.startsWith('{') && line.includes('"compression:quarantine-alert"')) {
+        alerts.push(String((JSON.parse(line) as { namespace?: unknown }).namespace));
+      }
+    });
     await Promise.all([
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
@@ -1996,6 +3013,7 @@ describe('compression refusal recall curves', () => {
       assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
       assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
     }
+    assert.deepEqual(alerts.sort(), ['beta', 'default']);
     assert.equal(first.strategy.quarantineKeysView().length, 1);
     assert.equal(second.quarantineKeysView().length, 1);
     secondManager.close();
@@ -2642,7 +3660,8 @@ describe('prepared recall expansions: what is logged', () => {
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
       assert.equal(sentWithMarker.length, 1, `${location}: one sent request carried the data URL`);
       assert.equal(lines.length, 1, `${location}: one line, for the request that was sent`);
-      assert.equal(lines[0]!.endsWith('[canonical]'), location === 'parent', `${location}: ${lines[0]}`);
+      // The request's label ends the line's fields, before the namespace it was logged for (#239).
+      assert.equal(lines[0]!.endsWith('[canonical] ns=default'), location === 'parent', `${location}: ${lines[0]}`);
       fx.manager.close();
     }
   });
@@ -2668,7 +3687,56 @@ describe('prepared requests are logged when they are sent', () => {
       } finally { console.error = original; }
       assert.equal(mock.calls.length, sent ? 2 : 1);
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical]', '[source-only-final]'] : ['[canonical]']);
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical] ns=default', '[source-only-final] ns=default'] : ['[canonical] ns=default']);
+      fx.manager.close();
+    }
+  });
+
+  it('logs nothing again for the retries an attempt makes from a sent request (R2-5)', async () => {
+    const payload = 'V'.repeat(20000);
+    const toolUse: AttemptHandler = {
+      raw: {
+        stopReason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+        usage: { inputTokens: 100, outputTokens: 50 },
+      },
+    };
+    // Typed as membrane types a 400: an untyped error is transient, which
+    // interrupts the ladder instead of taking the carrier fallback.
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'),
+      { type: 'invalid_request', httpStatus: 400, retryable: false },
+    );
+    const cases: Array<[string, AttemptHandler[], boolean]> = [
+      ['no-tools and tools-less', [toolUse, toolUse, { stop: 'end_turn', text: 'prose after the tools-less retry' }], false],
+      ['carrier-stripped', [{ error: carrierRejection }, { stop: 'end_turn', text: 'prose after the carrier-stripped retry' }], true],
+    ];
+    for (const [name, handlers, carriers] of cases) {
+      const mock = flexibleMembrane(handlers);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+      if (carriers) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+      }
+      fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+        ...m, content: [text('data:image/png;base64,' + payload)],
+      });
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, handlers.length, `${name}: every retry was sent`);
+      assert.ok(mock.calls.every((call) => !JSON.stringify(call.request).includes(payload)), `${name}: each send carries the marker`);
+      assert.equal(fx.target.compressed, true, `${name}: the last retry's answer is the L1`);
+      if (carriers) {
+        assert.ok(logs.some((line) => line.includes('transport rejected reasoning carriers')), 'the carrier fallback ran');
+        assert.ok(JSON.stringify(mock.calls[0]!.request).includes('private-'), 'the first send carried reasoning');
+        assert.ok(!JSON.stringify(mock.calls[1]!.request).includes('private-'), 'the retry was stripped of it');
+      }
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical] ns=default'], `${name}: ${JSON.stringify(lines)}`);
       fx.manager.close();
     }
   });
@@ -2693,6 +3761,351 @@ describe('prepared source-only identity', () => {
     };
     const actualHash = createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex');
     assert.equal(record.normalizedConfig.sourceOnlyFallbackRequestHash, actualHash);
+    fx.manager.close();
+  });
+});
+
+describe('tool-prose hoist admission', () => {
+  after(cleanup);
+
+  const PROSE = {
+    compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] },
+  };
+
+  /** The chunk becomes one skip_reply round whose long reason a hoist moves into journal. */
+  function hoistableChunk(fx: Fixture): void {
+    fx.manager.setToolDefinitions(['journal', 'skip_reply'].map(name => ({
+      name, description: name, inputSchema: { type: 'object' },
+    })));
+    fx.target.messages = fx.target.messages.map((m, i) => ({
+      ...m, participant: i ? 'User' : 'Claude',
+      content: i ? [{ type: 'tool_result', toolUseId: 't', content: '{"skipped":true}' } as ContentBlock]
+        : [{ type: 'tool_use', id: 't', name: 'skip_reply', input: { reason: 'a private note '.repeat(40) } } as ContentBlock],
+    }));
+  }
+
+  /** Whether a request carries a hoisted call: a journal call in its messages (the tools declare journal anyway). */
+  const hoisted = (request: NormalizedRequest) => request.messages.some((m) => m.content.some(
+    (block) => block.type === 'tool_use' && (block as { name: string }).name === 'journal',
+  ));
+
+  function exhaustedOutcomes(fx: Fixture): Array<{ curveLabel: string; outcome: string; admittedTokens?: number; budgetTokens?: number }> {
+    const exhausted = quarantineEvents(fx.manager).find(e => e.kind === 'exhausted') as {
+      outcomes: Array<{ curveLabel: string; outcome: string; admittedTokens?: number; budgetTokens?: number }>;
+    };
+    return exhausted.outcomes;
+  }
+
+  it("admits the canonical's hoist on the canonical's count plus what the hoist adds, and records one over the budget without sending it", async () => {
+    const counted = 50_000;
+    // Room for it: the hoist is sent.
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    assert.ok(!hoisted(open.calls[0]!.request) && hoisted(open.calls[1]!.request), 'the second call is the hoist');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const added = roomy.strategy.inputBound(open.calls[1]!.request) - roomy.strategy.inputBound(open.calls[0]!.request);
+    assert.ok(added >= 256, `the hoist adds two messages and their bytes (${added})`);
+    roomy.manager.close();
+
+    // A budget the canonical fits with one token to spare: what the hoist adds
+    // takes it over, so it's recorded and not sent.
+    const budget = counted + reserve + 1;
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    hoistableChunk(fx);
+    const logPath = `${freshPath()}-trace.jsonl`;
+    paths.push(logPath);
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    try {
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const expected = { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget };
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      expected,
+    );
+    // Its attempt trace records the same, as a rejected variant's does.
+    const traces = readFileSync(logPath, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { event?: string; metadata?: Record<string, unknown> })
+      .filter((entry) => entry.event === 'compression:attempt' && entry.metadata?.curveLabel === 'tool-prose-hoist');
+    assert.equal(traces.length, 1);
+    const trace = traces[0]!.metadata!;
+    assert.deepEqual(
+      { outcome: trace.outcome, admittedTokens: trace.admittedTokens, budgetTokens: trace.budgetTokens, latencyMs: trace.latencyMs, persisted: trace.persisted },
+      { ...expected, latencyMs: 0, persisted: false },
+    );
+    fx.manager.close();
+  });
+
+  it("prices what a hoist adds from the fields both requests send, so a raw replay form the edit releases isn't credited against it", async () => {
+    const counted = 50_000;
+    /** The same chunk, its call and result carrying the raw XML the XML formatter replays in their place. */
+    function withRawXml(fx: Fixture): void {
+      hoistableChunk(fx);
+      const reason = 'a private note '.repeat(40);
+      const xmlCall = `<function_calls>\n<invoke name="skip_reply">\n<parameter name="reason">${reason}</parameter>\n</invoke>\n</function_calls>`;
+      const xmlResult = '<function_results>\n<result>\n<tool_use_id>t</tool_use_id>\n<output>{"skipped":true}</output>\n</result>\n</function_results>';
+      fx.target.messages = fx.target.messages.map((m, i) => ({
+        ...m, content: m.content.map((b) => ({ ...b, rawXml: i ? xmlResult : xmlCall }) as ContentBlock),
+      }));
+    }
+    const stripped = (r: NormalizedRequest) => ({ ...r, messages: r.messages.map((m) => ({ ...m, content: m.content.map((b) => {
+      const c = { ...b } as Record<string, unknown>; delete c.rawXml; delete c.rawItem; return c as unknown as ContentBlock;
+    }) })) }) as NormalizedRequest;
+    // Room for it: the hoist is sent, and its edit released the call's raw form.
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    withRawXml(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    const [base, hoist] = [open.calls[0]!.request, open.calls[1]!.request];
+    const reserve = base.config.maxTokens;
+    assert.ok(roomy.strategy.inputBound(hoist) < roomy.strategy.inputBound(base), "the complete bound falls: the released raw form's copy is gone");
+    const added = roomy.strategy.inputBound(stripped(hoist)) - roomy.strategy.inputBound(stripped(base));
+    assert.ok(added >= 256, `what the fields add (${added})`);
+    roomy.manager.close();
+
+    // A budget the hoist misses by what its fields add, though the complete
+    // bounds' difference would let it through.
+    const budget = counted + reserve + Math.floor(added / 2);
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    withRawXml(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("admits the canonical's hoist on its own bound when the canonical's response carries no usage", async () => {
+    // Room for it: the hoist is sent.
+    const open = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    assert.ok(hoisted(open.calls[1]!.request), 'the second call is the hoist');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[1]!.request);
+    roomy.manager.close();
+
+    // A budget the hoist's own bound misses by one token. Read as a count of
+    // 0, the missing usage would admit it on what it adds alone.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    hoistableChunk(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("admits the canonical's hoist on its own bound when the provider counted only the canonical's carrier-stripped copy", async () => {
+    // Typed as membrane types a 400: an untyped error is transient, which
+    // interrupts the ladder instead of taking the carrier fallback.
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'),
+      { type: 'invalid_request', httpStatus: 400, retryable: false },
+    );
+    const withCarriers = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+    };
+    // The carrier fallback says so on stderr, every time.
+    const quietly = async (run: () => Promise<unknown>) => {
+      const original = console.error;
+      console.error = () => {};
+      try { await run(); } finally { console.error = original; }
+    };
+    const counted = 1_000;
+    // Room for it: the canonical goes as its stripped copy, then the hoist,
+    // built from the canonical with its carriers and first sent with them.
+    const open = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }, { error: carrierRejection }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    withCarriers(roomy);
+    hoistableChunk(roomy);
+    await quietly(() => roomy.strategy.run(roomy.target, managerContext(roomy.manager)));
+    assert.equal(open.calls.length, 4, 'the canonical, its stripped copy, the hoist and its stripped copy');
+    assert.ok(JSON.stringify(open.calls[0]!.request).includes('private-'), 'the canonical carried reasoning');
+    assert.ok(hoisted(open.calls[2]!.request) && JSON.stringify(open.calls[2]!.request).includes('private-'), 'so did the hoist, first');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[2]!.request);
+    assert.ok(roomy.strategy.inputBound(open.calls[0]!.request) > counted + 1, 'the stripped count is below what the canonical sends');
+    roomy.manager.close();
+
+    // A budget the hoist's own bound misses by one token. Priced on the
+    // stripped copy's count, it would fit.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    withCarriers(fx);
+    hoistableChunk(fx);
+    await quietly(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(tight.calls.length, 2, 'only the canonical and its stripped copy are sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("plans the recall-curve variants on their own bound when the provider counted only the canonical's carrier-stripped copy", async () => {
+    // Typed as membrane types a 400: an untyped error is transient, which
+    // interrupts the ladder instead of taking the carrier fallback.
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'),
+      { type: 'invalid_request', httpStatus: 400, retryable: false },
+    );
+    const withCarriers = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+    };
+    const quietly = async (run: () => Promise<unknown>) => {
+      const original = console.error;
+      console.error = () => {};
+      try { await run(); } finally { console.error = original; }
+    };
+    const counted = 1_000;
+    // Room for one variant: the canonical goes as its stripped copy, then the
+    // variant, built from the canonical with its carriers and first sent with them.
+    const open = flexibleMembrane([
+      { error: carrierRejection }, { stop: 'refusal', inputTokens: counted },
+      { error: carrierRejection }, { stop: 'end_turn', text: 'the variant, sent as its stripped copy' },
+    ]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: 1_000_000 });
+    withCarriers(roomy);
+    await quietly(() => roomy.strategy.run(roomy.target, managerContext(roomy.manager)));
+    assert.equal(open.calls.length, 4, 'the canonical, its stripped copy, the variant and its stripped copy');
+    assert.ok(JSON.stringify(open.calls[2]!.request).includes('private-'), 'the variant carried reasoning, first');
+    assert.notEqual(JSON.stringify(open.calls[2]!.request), JSON.stringify(open.calls[0]!.request), 'the third call is a variant');
+    const reserve = open.calls[2]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[2]!.request);
+    assert.ok(roomy.strategy.inputBound(open.calls[0]!.request) > counted + 1, 'the stripped count is below what the canonical sends');
+    roomy.manager.close();
+
+    // A budget the variant's own bound misses by one token. Planned on the
+    // stripped copy's count, it would fit.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: budget });
+    withCarriers(fx);
+    await quietly(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(tight.calls.length, 2, 'only the canonical and its stripped copy are sent');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, undefined);
+    // A rejected variant spends no attempt, so the plan goes on to the next.
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length >= 1);
+    assert.ok(plan.every((item) => item.accountingSource === 'complete_normalized_request_bound' && item.disposition === 'admission_rejected'));
+    assert.deepEqual(
+      { admittedTokens: plan[0]!.admittedTokens, budgetTokens: plan[0]!.budgetTokens },
+      { admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("prices a variant's added recall answers as their route sends them: a redacted_thinking block by its reasoning item alone, whose summary only the item holds", async () => {
+    const counted = 10_000;
+    // Only L2-201's children carry the item, so the variant that swaps
+    // L2-201's pair for theirs adds two of them, and L2-200's adds none.
+    const withItems = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) {
+        if (entry.id !== 'L1-102' && entry.id !== 'L1-103') continue;
+        // Both Responses routes send the item alone in the block's place,
+        // its summary and its encrypted content; the block's own data
+        // doesn't go out beside it.
+        const encrypted = 'E'.repeat(4_000);
+        entry.responseContent = [{
+          type: 'redacted_thinking', data: encrypted,
+          rawItem: { type: 'reasoning', id: `rs_${entry.id}`, summary: [{ type: 'summary_text', text: 'S'.repeat(4_000) }], encrypted_content: encrypted },
+        } as unknown as ContentBlock, { type: 'text', text: entry.content }];
+      }
+      fx.strategy.flushSummaries();
+    };
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'end_turn', text: 'the variant' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: 1_000_000 });
+    withItems(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2, 'the canonical, then the first variant');
+    assert.ok(JSON.stringify(open.calls[1]!.request).includes('S'.repeat(100)), "the first variant is L2-201's, carrying the items");
+    const reserve = open.calls[1]!.request.config.maxTokens;
+    roomy.manager.close();
+
+    // A budget the two items overrun (16,000 and more), though the blocks'
+    // fields alone (8,000 and more) fit.
+    const budget = counted + reserve + 12_000;
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: budget });
+    withItems(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // L2-201's variant is rejected and spends no attempt, so L2-200's goes.
+    assert.equal(tight.calls.length, 2);
+    assert.equal(JSON.stringify(tight.calls[1]!.request).includes('S'.repeat(100)), false, "L2-201's variant isn't sent");
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!.record as Record<string, unknown>;
+    const rejected = (record.plan as Array<Record<string, unknown>>).find((item) => item.curveLabel === 'expand:L2-201')!;
+    assert.equal(rejected.accountingSource, 'canonical_provider_usage_plus_expansion');
+    assert.equal(rejected.disposition, 'admission_rejected');
+    // The items, not the whole blocks, whose data adds 8,000 more.
+    const delta = rejected.expansionDeltaTokens as number;
+    assert.ok(delta >= 16_000 && delta < 24_000, `the two items are priced, not the whole blocks (${delta})`);
+    fx.manager.close();
+  });
+
+  it("admits the source-only hoist on source-only-final's own count, not the canonical's", async () => {
+    const budget = 200_000;
+    // The canonical over the budget, as a model with a larger context accepts it.
+    const canonical = { stop: 'refusal' as const, inputTokens: budget };
+    const open = flexibleMembrane([canonical, { stop: 'refusal', inputTokens: 1_000 }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionContextBudgetTokens: budget, ...PROSE,
+    });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 3, 'the canonical, source-only-final and its hoist');
+    assert.ok(!hoisted(open.calls[1]!.request) && hoisted(open.calls[2]!.request));
+    const outcomes = exhaustedOutcomes(roomy);
+    assert.equal(outcomes.find(o => o.curveLabel === 'tool-prose-hoist')?.outcome, 'admission_rejected', "the canonical's hoist is over the budget");
+    assert.equal(outcomes.find(o => o.curveLabel === 'source-only-tool-prose-hoist')?.outcome, 'refusal', 'the source-only hoist was sent');
+    const reserve = open.calls[1]!.request.config.maxTokens;
+    const added = roomy.strategy.inputBound(open.calls[2]!.request) - roomy.strategy.inputBound(open.calls[1]!.request);
+    roomy.manager.close();
+
+    // Source-only-final's count with one token to spare: its hoist's own
+    // addition takes it over, where the request's bound alone would admit it.
+    const counted = budget - reserve - 1;
+    assert.ok(roomy.strategy.inputBound(open.calls[2]!.request) + reserve <= budget, 'its bound alone fits');
+    const tight = flexibleMembrane([canonical, { stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionContextBudgetTokens: budget, ...PROSE,
+    });
+    hoistableChunk(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 2, 'the canonical and source-only-final');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'source-only-tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget },
+    );
     fx.manager.close();
   });
 });
@@ -2728,5 +4141,633 @@ describe('prepared tool-prose mode rewrite', () => {
     assert.ok(outcome);
     assert.equal(outcome.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex'));
     fx.manager.close();
+  });
+});
+
+describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () => {
+  after(cleanup);
+
+  // agent-framework's shape: a subclass with its own name.
+  class MaintenanceWithdrawnError extends CompressionWithdrawn {
+    constructor() {
+      super('zz maintenance call withdrawn');
+      this.name = 'MaintenanceWithdrawnError';
+    }
+  }
+  // A second copy of this package: no shared class, only the brand.
+  const fromAnotherCopy = (): Error => Object.assign(new Error('zz withdrawn by another copy'), {
+    [Symbol.for('@animalabs/context-manager:compression-withdrawn')]: true,
+  });
+
+  async function quiet<T>(work: () => Promise<T>): Promise<{ logs: string[]; result: PromiseSettledResult<T> }> {
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+    try {
+      const [result] = await Promise.allSettled([work()]);
+      return { logs, result: result! };
+    } finally {
+      console.error = original;
+    }
+  }
+
+  // Date.now reads a clock the test moves, for the work it runs.
+  async function withClock<T>(clock: { now: number }, work: () => Promise<T>): Promise<T> {
+    const real = Date.now;
+    Date.now = () => clock.now;
+    try {
+      return await work();
+    } finally {
+      Date.now = real;
+    }
+  }
+
+  // flexibleMembrane's answers, with a hook that runs as each call arrives, given the call's index.
+  function hookedMembrane(handlers: AttemptHandler[], onCall: (index: number) => void) {
+    const inner = flexibleMembrane(handlers);
+    const complete = (inner.membrane as { complete(request: NormalizedRequest): Promise<unknown> }).complete;
+    return {
+      calls: inner.calls,
+      membrane: {
+        complete: async (request: NormalizedRequest) => {
+          onCall(inner.calls.length);
+          return complete(request);
+        },
+      } as never,
+    };
+  }
+
+  const splitOptions = { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionSplitFallback: true };
+  const partSummary = { stop: 'end_turn' as const, text: 'zz a part summarized ' + 'detail '.repeat(20) };
+
+  it('is rethrown unchanged by each rung of the ladder, recording no outcome and quarantining nothing', async () => {
+    const shapes = [() => new CompressionWithdrawn(), () => new MaintenanceWithdrawnError(), fromAnotherCopy];
+    // The canonical call, the first and second recall fallbacks, and source-only after them.
+    for (const at of [0, 1, 2, 3]) {
+      for (const shape of shapes) {
+        const withdrawn = shape();
+        const handlers = [{ stop: 'refusal' as const }, { stop: 'end_turn' as const, text: '' }, { stop: 'end_turn' as const, text: '' }];
+        const mock = flexibleMembrane([...handlers.slice(0, at), { error: withdrawn }]);
+        const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2, compressionSourceOnlyFallback: true });
+        const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+        assert.equal(result.status, 'rejected', `at ${at}`);
+        assert.equal((result as PromiseRejectedResult).reason, withdrawn, `at ${at}: rethrown unchanged`);
+        assert.equal(mock.calls.length, at + 1, `at ${at}: nothing after the withdrawal`);
+        assert.equal(fx.target.compressed, false);
+        assert.deepEqual(quarantineEvents(fx.manager), [], `at ${at}: nothing recorded`);
+        assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')), `at ${at}: not logged as a failure`);
+        fx.manager.close();
+      }
+    }
+  });
+
+  it('is rethrown unchanged by the tool-prose rung, recording no outcome and quarantining nothing', async () => {
+    for (const shape of [() => new CompressionWithdrawn(), () => new MaintenanceWithdrawnError(), fromAnotherCopy]) {
+      const withdrawn = shape();
+      // The canonical call refuses, so the tool-prose rung runs first; its call is withdrawn.
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { error: withdrawn }]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0,
+        compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] },
+      });
+      fx.manager.setToolDefinitions(['journal', 'skip_reply'].map(name => ({
+        name, description: name, inputSchema: { type: 'object' },
+      })));
+      fx.target.messages = fx.target.messages.map((m, i) => ({
+        ...m, participant: i ? 'User' : 'Claude',
+        content: i ? [{ type: 'tool_result', toolUseId: 't', content: '{"skipped":true}' } as ContentBlock]
+          : [{ type: 'tool_use', id: 't', name: 'skip_reply', input: { reason: 'note '.repeat(100) } } as ContentBlock],
+      }));
+      const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+      assert.equal(result.status, 'rejected');
+      assert.equal((result as PromiseRejectedResult).reason, withdrawn, 'rethrown unchanged');
+      assert.equal(mock.calls.length, 2, 'nothing after the withdrawal');
+      const messagesOf = (call: number) => JSON.stringify((mock.calls[call]!.request as { messages: unknown }).messages);
+      assert.ok(!messagesOf(0).includes('"journal"') && messagesOf(1).includes('"journal"'), 'the withdrawn call was the hoisted request');
+      assert.equal(fx.target.compressed, false);
+      assert.deepEqual(quarantineEvents(fx.manager), [], 'nothing recorded');
+      assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')), 'not logged as a failure');
+      fx.manager.close();
+    }
+  });
+
+  it('is rethrown by a split-stitch part, before it counts as an error', async () => {
+    const withdrawn = new MaintenanceWithdrawnError();
+    // The canonical call and source-only refuse, so the split rung runs; its first part is withdrawn.
+    const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error: withdrawn }]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionSplitFallback: true });
+    const { result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.equal(mock.calls.length, 3, 'the split part was the call withdrawn');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    fx.manager.close();
+  });
+
+  it('gives a withdrawn split part\'s own stamp in the split call window back, and keeps the sent part\'s', async () => {
+    const withdrawn = new MaintenanceWithdrawnError();
+    // The canonical call and source-only refuse, so the split rung runs: its first part lands, and its second is withdrawn.
+    // The clock moves a second as each call arrives, so each part's stamp, taken just before its call, is its own.
+    const clock = { now: 1_800_000_000_000 };
+    const sentAt: number[] = [];
+    const mock = hookedMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, partSummary, { error: withdrawn }], () => {
+      sentAt.push(clock.now);
+      clock.now += 1_000;
+    });
+    const fx = await fixture(mock.membrane, splitOptions);
+    const { result } = await withClock(clock, () => quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager))));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.equal(mock.calls.length, 4, 'the premise: one part was sent before the next was withdrawn');
+    assert.notEqual(sentAt[2], sentAt[3], 'the premise: the two parts were sent at different times');
+    assert.deepEqual(fx.strategy.splitWindowView(), [sentAt[2]], 'the window keeps the sent part\'s stamp and gives the withdrawn part\'s back');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    fx.manager.close();
+  });
+
+  it('lets a later split send parts that a withdrawn part\'s stamp would have refused at a low window cap', async () => {
+    const withdrawn = new MaintenanceWithdrawnError();
+    // The first run's split sends one part and has its second withdrawn. The second run resumes at the split, since
+    // the family's progress keeps the canonical's and source-only's refusals, and its split sends two parts. A split
+    // rung starts only when its window has room for a whole attempt, here two calls of the three allowed in ten
+    // minutes, so the second run starts only if the withdrawn part's stamp left the window.
+    const mock = flexibleMembrane([
+      { stop: 'refusal' }, { stop: 'refusal' }, partSummary, { error: withdrawn },
+      partSummary, partSummary,
+    ]);
+    const fx = await fixture(mock.membrane, { ...splitOptions, compressionSplitMaxCallsPer10Min: 3, compressionSplitMaxCallsPerChunk: 2 });
+    const first = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal((first.result as PromiseRejectedResult).reason, withdrawn);
+    assert.equal(mock.calls.length, 4, 'the premise: the first run sent one part before the next was withdrawn');
+    const retry = { ...fx.target, compressed: false };
+    const second = await quiet(() => fx.strategy.run(retry, managerContext(fx.manager)));
+    assert.equal(second.result.status, 'fulfilled');
+    assert.equal(mock.calls.length, 6, 'the later split sent both its parts, and nothing else was asked again');
+    assert.equal(retry.compressed, true, 'and compressed the chunk');
+    assert.equal(fx.strategy.splitWindowView().length, 3, 'the first run\'s sent part and the later split\'s two fill the window');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    fx.manager.close();
+  });
+
+  it('removes no other part\'s stamp when the window dropped the withdrawn part\'s own while its call was out', async () => {
+    const withdrawn = new MaintenanceWithdrawnError();
+    // The canonical call and source-only refuse, so the split rung runs, and its first part is withdrawn. While that
+    // call is out, more than ten minutes pass and another split run starts, as a tick can after a branch reload clears
+    // the pending compression. Only a split run's start prunes the window: that one drops this part's stamp and adds
+    // its own part's.
+    const clock = { now: 1_800_000_000_000 };
+    let fx!: Fixture;
+    let othersStamp = 0;
+    const mock = hookedMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error: withdrawn }], (index) => {
+      if (index !== 2) return;
+      clock.now += 11 * 60_000;
+      othersStamp = clock.now;
+      fx.strategy.setSplitWindow([othersStamp]);
+    });
+    fx = await fixture(mock.membrane, splitOptions);
+    const { result } = await withClock(clock, () => quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager))));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.equal(mock.calls.length, 3, 'the premise: the split\'s first part was the call withdrawn');
+    assert.deepEqual(fx.strategy.splitWindowView(), [othersStamp], 'the refund removes no stamp it did not add');
+    fx.manager.close();
+  });
+
+  it('leaves the family free: a later call compresses the chunk', async () => {
+    const mock = flexibleMembrane([{ stop: 'refusal' }, { error: new CompressionWithdrawn() }, { stop: 'end_turn', text: 'zz summary of the chunk' }]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1 });
+    await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    const retry = { ...fx.target, compressed: false };
+    await fx.strategy.run(retry, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'nothing suppressed the retry');
+    assert.equal(retry.compressed, true, 'the later call compressed the chunk');
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && String(s.content).includes('zz summary of the chunk')), 'its L1 is kept');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    fx.manager.close();
+  });
+
+  it('is rethrown to a waiter coalesced on the same chunk, which records nothing either', async () => {
+    const withdrawn = new MaintenanceWithdrawnError();
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = { complete: async () => { calls++; await gate; throw withdrawn; } };
+    const fx = await fixture(membrane as never);
+    const ctx = managerContext(fx.manager);
+    const { logs, result } = await quiet(async () => {
+      const producer = fx.strategy.run(fx.target, ctx);
+      const waiter = fx.strategy.run(fx.target, ctx);
+      release();
+      return Promise.allSettled([producer, waiter]);
+    });
+    const [producer, waiter] = (result as PromiseFulfilledResult<PromiseSettledResult<void>[]>).value;
+    assert.equal(calls, 1, 'the waiter made no call of its own');
+    assert.equal((producer as PromiseRejectedResult).reason, withdrawn);
+    assert.equal((waiter as PromiseRejectedResult).reason, withdrawn, 'the waiter rethrows the same withdrawal');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')), 'and nobody logs it as a failure');
+    fx.manager.close();
+  });
+
+  it('treats an error that is only named CompressionWithdrawn, without the brand, as a failure', async () => {
+    const named = Object.assign(new Error('zz not really withdrawn'), { name: 'CompressionWithdrawn' });
+    const mock = flexibleMembrane([{ error: named }]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal((result as PromiseRejectedResult).reason, named);
+    assert.ok(logs.some((line) => line.includes('Failed to compress chunk')), 'reported as the failure it is');
+    fx.manager.close();
+  });
+
+  it('names itself and says what it is by default', () => {
+    const withdrawn = new CompressionWithdrawn();
+    assert.equal(withdrawn.name, 'CompressionWithdrawn');
+    assert.equal(withdrawn.message, 'compression call withdrawn by the host');
+    assert.ok(withdrawn instanceof Error);
+  });
+
+  it('says withdrawn, not error, in the opt-in compression log', async () => {
+    const log = `${freshPath()}-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const mock = flexibleMembrane([{ error: new MaintenanceWithdrawnError() }]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+      await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+      fx.manager.close();
+      const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
+      assert.equal(receipts.length, 1, 'one receipt for the call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+      assert.ok(!('error' in receipts[0]!), 'and no error');
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
+  });
+
+  it('says withdrawn in the opt-in compression log when the branch moved while the withdrawn call was out', async () => {
+    const log = `${freshPath()}-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      let move!: () => Promise<void>;
+      const membrane = { complete: async () => { await move(); throw new MaintenanceWithdrawnError(); } } as never;
+      const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+      const main = fx.manager.currentBranch().name;
+      const fork = fx.manager.getStore().createBranchAt('zz-withdrawn-fork', main, fx.manager.getStore().currentSequence()).name;
+      move = () => fx.manager.switchBranch(fork);
+      const { result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+      // The premise: the branch moved during the call, so the result is discarded, not rethrown.
+      assert.equal(fx.manager.currentBranch().name, fork);
+      assert.equal(result.status, 'fulfilled');
+      fx.manager.close();
+      const entries = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+      const receipts = entries.filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
+      assert.equal(receipts.length, 1, 'one receipt for the call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+      assert.ok(!('error' in receipts[0]!), 'and no error');
+      const discards = entries.filter((entry) => entry.event === 'compression:branch-result-discarded');
+      assert.deepEqual(discards.map((entry) => (entry.metadata as Record<string, unknown>).phase), ['canonical_withdrawn'], 'the discard names the withdrawal, not an error');
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
+  });
+
+  // A later rung's call on a moved branch: its withdrawal propagates as it is to the call's catch, which marks the
+  // receipt withdrawn, while an abort there is discarded by the ladder under that rung's own label.
+  for (const kind of ['withdrawal', 'abort'] as const) {
+    it(`logs a later rung's ${kind} on a branch that moved while its call was out ${kind === 'withdrawal' ? 'as withdrawn' : 'under that rung'}`, async () => {
+      const log = `${freshPath()}-calls.jsonl`;
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+      try {
+        let move!: () => Promise<void>;
+        let calls = 0;
+        const membrane = {
+          complete: async () => {
+            calls++;
+            if (calls === 1) return response('refusal');
+            await move();
+            throw kind === 'withdrawal'
+              ? new MaintenanceWithdrawnError()
+              : Object.assign(new Error('zz aborted'), { name: 'AbortError' });
+          },
+        } as never;
+        const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true });
+        const main = fx.manager.currentBranch().name;
+        const fork = fx.manager.getStore().createBranchAt(`zz-${kind}-fork`, main, fx.manager.getStore().currentSequence()).name;
+        move = () => fx.manager.switchBranch(fork);
+        const { result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+        // The premises: the canonical call was refused and the source-only rung's call met the move.
+        assert.equal(calls, 2);
+        assert.equal(fx.manager.currentBranch().name, fork);
+        assert.equal(result.status, 'fulfilled');
+        fx.manager.close();
+        const entries = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+        const receipts = entries.filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
+        assert.equal(receipts.length, 1, 'one receipt for the call');
+        const discards = entries.filter((entry) => entry.event === 'compression:branch-result-discarded');
+        const phases = discards.map((entry) => (entry.metadata as Record<string, unknown>).phase);
+        if (kind === 'withdrawal') {
+          assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+          assert.ok(!('error' in receipts[0]!), 'and no error');
+          assert.deepEqual(phases, ['canonical_withdrawn'], 'the call discards it as a withdrawal');
+        } else {
+          assert.ok(!('withdrawn' in (receipts[0]!.metadata as Record<string, unknown>)), 'an abort is no withdrawal');
+          assert.deepEqual(phases, ['source-only-final:error'], 'the ladder discards it under the rung that met it');
+        }
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        rmSync(log, { force: true });
+      }
+    });
+  }
+
+  it('puts the chunk back at the head of the queue when tick is withdrawn', async () => {
+    const withdrawn = new CompressionWithdrawn();
+    const mock = flexibleMembrane([{ error: withdrawn }]);
+    const fx = await fixture(mock.membrane);
+    // A chunk past the seeded L1s, so no guard drops it before the call.
+    const covered = new Set(fx.ids.slice(0, 8));
+    const chunk = fx.strategy.chunksView().find((c) => c.messages.length > 0 && c.messages.every((m) => !covered.has(m.id)));
+    assert.ok(chunk, 'the fixture has a chunk no L1 covers');
+    fx.strategy.queueOnly(chunk.index);
+    const { logs, result } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.deepEqual(fx.strategy.queueView(), [chunk.index]);
+    assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')));
+    fx.manager.close();
+  });
+
+  it('leaves a withdrawn chunk queued once when a rebuild during the call has queued it again', async () => {
+    // The fixture's seeded L1s would let the dedup guard drop the head chunk without a call, so this
+    // store has none: the queue's own head is attempted.
+    const withdrawn = new CompressionWithdrawn();
+    let manager!: ContextManager;
+    let head = -1;
+    let requeuedDuringCall = false;
+    const strategy = new ProbeStrategy({
+      compressionModel: MODEL, targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
+      autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+    });
+    const membrane = {
+      complete: async () => {
+        // A message arrives while the call is out, and the rebuild it starts queues the pending chunks again.
+        manager.addMessage('User', [text('zz arrives mid-call ' + 'word '.repeat(10))]);
+        requeuedDuringCall = strategy.queueView().includes(head);
+        throw withdrawn;
+      },
+    };
+    manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
+    for (let i = 0; i < 14; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(18))]);
+    head = strategy.queueView()[0]!;
+    assert.ok(head !== undefined, 'a chunk is queued');
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.ok(requeuedDuringCall, 'the rebuild during the call queued the chunk again');
+    const queue = strategy.queueView();
+    assert.equal(queue.filter((index) => index === head).length, 1, `queued once: ${JSON.stringify(queue)}`);
+    manager.close();
+  });
+
+  /** A store with no seeded L1s, so the queue's own head is attempted; complete is the membrane's whole behaviour. */
+  async function ownStore(complete: (manager: ContextManager, strategy: ProbeStrategy) => Promise<never>, config: { adaptiveResolution?: boolean; compressionRefusalCurveFallbacks?: number } = {}) {
+    let manager!: ContextManager;
+    const strategy = new ProbeStrategy({
+      compressionModel: MODEL, targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
+      autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, ...config,
+    });
+    manager = await ContextManager.open({ path: freshPath(), strategy, membrane: { complete: () => complete(manager, strategy) } as never });
+    for (let i = 0; i < 14; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(18))]);
+    return { manager, strategy };
+  }
+
+  it('puts a withdrawn chunk back ahead of the chunks queued behind it', async () => {
+    const withdrawn = new CompressionWithdrawn();
+    const { manager, strategy } = await ownStore(async () => { throw withdrawn; });
+    const before = strategy.queueView();
+    assert.ok(before.length > 1, `several chunks are queued: ${JSON.stringify(before)}`);
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.deepEqual(strategy.queueView(), before, 'the head is back at the head, the rest in their order');
+    manager.close();
+  });
+
+  it('moves a withdrawn chunk back to the head, once, when something queued it again at the tail during the call without a rebuild', async () => {
+    const withdrawn = new CompressionWithdrawn();
+    let head = -1;
+    let during: number[] = [];
+    const { manager, strategy } = await ownStore(async (_m, s) => {
+      // As a plan's demand does (handleProducedOps): at the tail, with no rebuild.
+      s.queueAtTail(head);
+      during = s.queueView();
+      throw withdrawn;
+    });
+    const before = strategy.queueView();
+    head = before[0]!;
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    // The premise: other chunks were queued, and the chunk was queued again behind them.
+    assert.ok(during.length > 1 && during.at(-1) === head && during.indexOf(head) === during.length - 1, `queued again at the tail: ${JSON.stringify(during)}`);
+    assert.deepEqual(strategy.queueView(), before, 'back at the head, once, the rest in their order');
+    manager.close();
+  });
+
+  it('puts a chunk whose call failed for another reason behind the chunks that haven\'t failed', async () => {
+    const failure = new Error('zz provider refused');
+    const { manager, strategy } = await ownStore(async () => { throw failure; }, { compressionRefusalCurveFallbacks: 0 });
+    const head = strategy.queueView()[0]!;
+    assert.ok(strategy.queueView().length >= 2, 'the premise: chunks are queued behind it');
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, failure);
+    assert.equal(strategy.queueView().at(-1), head, `put back behind the others: ${JSON.stringify(strategy.queueView())}`);
+    manager.close();
+  });
+
+  it('leaves a withdrawn chunk out of the queue when a hold placed during the call keeps the rebuild from queuing it', async () => {
+    const withdrawn = new CompressionWithdrawn();
+    let held: string[] = [];
+    let head = -1;
+    const { manager, strategy } = await ownStore(async (m, s) => {
+      // A surgery's hold lands while the call is out; the host withdraws the call, and a message's arrival rebuilds.
+      held = s.chunksView()[head]!.messages.map((message) => message.id);
+      m.holdCompression(held, { timeoutMs: 60_000 });
+      m.addMessage('User', [text('zz arrives mid-call ' + 'word '.repeat(10))]);
+      throw withdrawn;
+    });
+    head = strategy.queueView()[0]!;
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.ok(!strategy.queueView().includes(head), `the held chunk stays out: ${JSON.stringify(strategy.queueView())}`);
+    manager.releaseCompression(held);
+    manager.addMessage('User', [text('zz after the release ' + 'word '.repeat(10))]);
+    assert.ok(strategy.queueView().includes(head), 'the rebuild after the release queues it again');
+    manager.close();
+  });
+
+  it('puts a withdrawn chunk back at the head when a preview ran while the call was out', async () => {
+    const withdrawn = new CompressionWithdrawn();
+    let previewed = false;
+    let rebuildsDuring = 0;
+    let during: number[] = [];
+    let rebuilds = 0;
+    const { manager, strategy } = await ownStore(async (m, s) => {
+      // A host previews its context while the call is out: the preview's dry
+      // run rebuilds the chunk table, then puts the table and the queue back.
+      const before = rebuilds;
+      previewed = m.previewContext({ maxTokens: 100_000, reserveForResponse: 0 } as never) !== null;
+      rebuildsDuring = rebuilds - before;
+      during = s.queueView();
+      throw withdrawn;
+    }, { adaptiveResolution: true });
+    const probe = strategy as unknown as { rebuildChunks(store: unknown): void };
+    const rebuild = probe.rebuildChunks.bind(strategy);
+    probe.rebuildChunks = (store) => { rebuilds++; rebuild(store); };
+    const head = strategy.queueView()[0]!;
+    const { result } = await quiet(() => strategy.tick(managerContext(manager)));
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    // The premise: the preview ran a rebuild during the call, and left the queue as tick had it, without the chunk.
+    assert.ok(previewed, 'the preview ran');
+    assert.ok(rebuildsDuring > 0, 'the preview rebuilt the chunk table');
+    assert.ok(!during.includes(head), `the chunk was out of the queue during the call: ${JSON.stringify(during)}`);
+    assert.equal(strategy.queueView()[0], head, `back at the head: ${JSON.stringify(strategy.queueView())}`);
+    manager.close();
+  });
+
+  it('stops the speculative drain quietly', async () => {
+    const mock = flexibleMembrane([{ error: new MaintenanceWithdrawnError() }]);
+    const fx = await fixture(mock.membrane);
+    const covered = new Set(fx.ids.slice(0, 8));
+    const chunk = fx.strategy.chunksView().find((c) => c.messages.length > 0 && c.messages.every((m) => !covered.has(m.id)))!;
+    fx.strategy.queueOnly(chunk.index);
+    const { logs } = await quiet(async () => {
+      fx.strategy.drain(managerContext(fx.manager));
+      // Until the call is made and the chunk is back (the queue is empty while the call is out),
+      // then one more turn of the event loop, for the drain's own handling of the rejection.
+      const deadline = Date.now() + 10_000;
+      while (!(mock.calls.length === 1 && fx.strategy.queueView().length === 1)) {
+        assert.ok(Date.now() < deadline, 'the drain settles');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    assert.equal(mock.calls.length, 1, 'the drain made the call');
+    assert.ok(!logs.some((line) => line.includes('speculative-drain error')), logs.join('\n'));
+    assert.deepEqual(fx.strategy.queueView(), [chunk.index]);
+    fx.manager.close();
+  });
+
+  it('leaves a withdrawn merge at the head of its queue, with no rejection recorded', async () => {
+    const withdrawn = Object.assign(new MaintenanceWithdrawnError(), { retryable: false, type: 'zz_withdrawn' });
+    const mock = flexibleMembrane([{ error: withdrawn }]);
+    const fx = await fixture(mock.membrane, { hierarchical: true });
+    fx.strategy.clearQueues();
+    // Two L1s no L2 has merged yet, past the fixture's seeded tree.
+    const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+    const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+    fx.strategy.seed(a);
+    fx.strategy.seed(b);
+    fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+    const before = fx.strategy.mergeQueueView();
+    const { logs, result } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 1, 'the merge made its call');
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn);
+    assert.deepEqual(fx.strategy.mergeQueueView(), before);
+    // Even carrying retryable: false and a type, as a non-retryable provider error does, it isn't recorded.
+    assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0);
+    assert.ok(!logs.some((line) => line.includes('Failed to merge summaries')));
+    fx.manager.close();
+  });
+
+  it('builds no run of failures on a merge however often it is withdrawn, even shaped like a retryable server error', async () => {
+    const withdrawn = Object.assign(new MaintenanceWithdrawnError(), { retryable: true, type: 'server' });
+    const mock = flexibleMembrane([{ error: withdrawn }]);
+    const fx = await fixture(mock.membrane, { hierarchical: true });
+    fx.strategy.clearQueues();
+    const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+    const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+    fx.strategy.seed(a);
+    fx.strategy.seed(b);
+    fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+    const before = fx.strategy.mergeQueueView();
+    const limit = AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES;
+    for (let i = 0; i < limit + 8; i++) await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(mock.calls.length, limit + 8, 'each tick made the merge call');
+    assert.deepEqual(fx.strategy.mergeQueueView(), before, 'the merge is still at the head');
+    assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0, 'nothing quarantined');
+    assert.equal((fx.strategy as unknown as { mergeFailureRuns: Map<string, unknown> }).mergeFailureRuns.size, 0, 'no run of failures');
+    fx.manager.close();
+  });
+
+  it('rethrows a merge\'s withdrawal shaped like a carrier rejection, without the stripped retry', async () => {
+    // A 400 invalid_request carries its type, which makes it a request-attributable rejection: the stripped retry's
+    // other precondition.
+    const carrierShape = { httpStatus: 400, type: 'invalid_request', message: 'invalid_request: thinking blocks cannot be modified' };
+    // A merge whose prior recall pairs carry reasoning, since the summaries before its span answer with it: the
+    // stripped retry's precondition.
+    const carrierMerge = async (handlers: AttemptHandler[]) => {
+      const mock = flexibleMembrane(handlers);
+      const fx = await fixture(mock.membrane, { hierarchical: true });
+      fx.strategy.clearQueues();
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+      const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+      const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+      fx.strategy.seed(a);
+      fx.strategy.seed(b);
+      fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+      const before = fx.strategy.mergeQueueView();
+      const { logs, result } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+      return { mock, fx, before, logs, result };
+    };
+    // The premise: without the brand, this shape is a transport rejection of the carriers, which gets the stripped retry.
+    const control = await carrierMerge([
+      { error: Object.assign(new Error(), carrierShape) },
+      { stop: 'end_turn', text: 'zz the merge summarized ' + 'detail '.repeat(20) },
+    ]);
+    assert.equal(control.mock.calls.length, 2, 'the premise: unbranded, this shape gets the stripped retry');
+    assert.ok(control.logs.some((line) => line.includes('transport rejected reasoning carriers')), 'the premise: unbranded, it is taken for a transport rejection');
+    control.fx.manager.close();
+
+    const withdrawn = Object.assign(new MaintenanceWithdrawnError(), carrierShape);
+    const { mock, fx, before, logs, result } = await carrierMerge([{ error: withdrawn }]);
+    assert.ok(JSON.stringify(mock.calls[0]!.request.messages).includes('"thinking"'), 'the premise: the merge request carries reasoning');
+    assert.equal((result as PromiseRejectedResult).reason, withdrawn, 'rethrown unchanged');
+    assert.equal(mock.calls.length, 1, 'no stripped retry');
+    assert.ok(!logs.some((line) => line.includes('transport rejected reasoning carriers')), 'not taken for a transport rejection');
+    assert.deepEqual(fx.strategy.mergeQueueView(), before);
+    fx.manager.close();
+  });
+
+  it('says withdrawn, not error, in a merge receipt in the opt-in compression log', async () => {
+    const log = `${freshPath()}-merge-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const mock = flexibleMembrane([{ error: new MaintenanceWithdrawnError() }]);
+      const fx = await fixture(mock.membrane, { hierarchical: true });
+      fx.strategy.clearQueues();
+      const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+      const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+      fx.strategy.seed(a);
+      fx.strategy.seed(b);
+      fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+      await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+      fx.manager.close();
+      const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => entry.operation === 'merge_l2' && entry.event === undefined);
+      assert.equal(receipts.length, 1, 'one receipt for the merge call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+      assert.ok(!('error' in receipts[0]!), 'and no error');
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
   });
 });

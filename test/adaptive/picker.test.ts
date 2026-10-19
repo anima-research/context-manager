@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Picker } from '../../src/adaptive/picker.js';
+import { namespaceDiagnostics } from '../../src/diagnostics.js';
+import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
+import type { SummaryEntry } from '../../src/types/strategy.js';
 import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.js';
 import { OldestFirstStrategy } from '../../src/adaptive/strategies/oldest-first.js';
 import type { FoldingBudget } from '../../src/adaptive/folding-strategy.js';
@@ -442,3 +445,176 @@ for (const [name, make] of [['flat-profile', () => new FlatProfileStrategy()], [
     assert.equal(result.levelAt(lockedOnly.sequence, lockedOnly.id), 1);
   });
 }
+
+// #194's store: x0 and x1 under N1, y0 and y1 under N2, and both L1s name M as
+// their parent, but M was written again from N1 alone. M isn't y's summary at
+// L2, since it doesn't list y, so neither solver raises M for y. Raising M
+// only ever moved x, and a solver that chose it for y chose it again on every
+// step until it reached its internal bound and threw.
+function unlistedParent(order: 'y first' | 'x first'): PickerInputs {
+  const ids = order === 'y first' ? ['y0', 'y1', 'x0', 'x1'] : ['x0', 'x1', 'y0', 'y1'];
+  return greedyStore(ids.map((id): [string, string] => [id, id.startsWith('x') ? 'N1' : 'N2']), [
+    ['N1', 1, ['x0', 'x1'], 30, 'M'], ['N2', 1, ['y0', 'y1'], 30, 'M'], ['M', 2, ['N1'], 40],
+  ]);
+}
+
+const greedySolvers = [
+  ['flat-profile', () => new FlatProfileStrategy()],
+  ['oldest-first', () => new OldestFirstStrategy()],
+] as const;
+
+for (const [name, make] of greedySolvers) {
+  for (const order of ['y first', 'x first'] as const) {
+    test(`picker (${name}): a summary on a chunk's lineage that doesn't list it isn't raised for it (${order})`, () => {
+      const result = new Picker(make()).run(unlistedParent(order), BUDGET(60, 0));
+      for (const id of ['y0', 'y1']) assert.ok((result.finalResolutions.get(id) ?? 0) <= 1, `${id} renders raw or through N2`);
+    });
+  }
+
+  // On #194's store with y first, N2 names M, which doesn't list it, and no
+  // summary above lists y. So once y is at L1 the step asks for an L2 over
+  // N2's range, as it does at the top of any lineage. The strategy's
+  // production can't make it, since N2 already has a parent; a store the
+  // strategy opens doesn't carry such a link.
+  test(`picker (${name}): where no summary above lists the chunk, a step asks for the next level`, () => {
+    const result = new Picker(make()).run(unlistedParent('y first'), BUDGET(60, 0));
+    assert.deepEqual(result.produced, [{ level: 2, range: { firstChunkId: 'y0', lastChunkId: 'y1' } }]);
+    assert.equal(result.finalResolutions.get('y0'), 1);
+    assert.equal(result.finalResolutions.get('y1'), 1);
+  });
+
+  // A level carried from before M was written again: y at L2, where its
+  // lineage reaches M, which doesn't list it. A greedy step only raises, so y
+  // starts at L1, where N2 lists it, rather than stay at a level it can't
+  // render at.
+  test(`picker (${name}): a chunk carried at a level whose summary doesn't list it starts at the next level down that has one`, () => {
+    const inputs = unlistedParent('x first');
+    for (const c of inputs.chunks) if (c.id.startsWith('y')) c.currentResolution = 2;
+    const result = new Picker(make()).run(inputs, BUDGET(10_000, 0));
+    assert.equal(result.finalResolutions.get('y0'), 1);
+    assert.equal(result.finalResolutions.get('y1'), 1);
+  });
+
+  // y's L1 N2 names T, an L3 that lists N2 directly, so y's lineage skips L2.
+  // Carried at L2, y starts at L1, where N2 lists it, though its lineage goes
+  // on to L3.
+  test(`picker (${name}): a chunk carried at a level its lineage skips starts at the next level down that has a summary`, () => {
+    const inputs = greedyStore([['x0', 'N1'], ['x1', 'N1'], ['y0', 'N2'], ['y1', 'N2']], [
+      ['N1', 1, ['x0', 'x1'], 30, 'M'], ['M', 2, ['N1'], 20, 'T'], ['N2', 1, ['y0', 'y1'], 30, 'T'], ['T', 3, ['M', 'N2'], 10],
+    ]);
+    for (const c of inputs.chunks) if (c.id.startsWith('y')) c.currentResolution = 2;
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(10_000, 0));
+    assert.equal(result.finalResolutions.get('y0'), 1);
+    assert.equal(result.finalResolutions.get('y1'), 1);
+    assert.deepEqual(unrealizable, []);
+  });
+
+  // x's L1 L1-0 names R, an L2 written from L1-1 alone, while T, the L3 above
+  // R, lists L1-0 through its other source Q. x has no summary at L2, and a
+  // merge can't make one for it, since L1-0 already has a parent. So a step
+  // raises x through T, the next summary up that lists it, with w.
+  test(`picker (${name}): past a summary that doesn't list the chunk, a step raises it through the next one up that does`, () => {
+    const inputs = greedyStore([['x', 'L1-0'], ['w', 'L1-1']], [
+      ['L1-0', 1, ['x'], 30, 'R'], ['L1-1', 1, ['w'], 30, 'R'], ['R', 2, ['L1-1'], 20, 'T'],
+      ['Q', 2, ['L1-0'], 20], ['T', 3, ['R', 'Q'], 10],
+    ]);
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(25, 0));
+    assert.equal(result.finalResolutions.get('x'), 3);
+    assert.equal(result.finalResolutions.get('w'), 3);
+    assert.deepEqual(result.produced, []);
+    assert.equal(result.finalTokens, 20);
+    assert.deepEqual(unrealizable, []);
+  });
+
+  // x's L1 N names T, an L3 that lists N directly, so x's lineage skips L2,
+  // and a merge can't make an L2 for x, since N already has a parent. A step
+  // raises x through T, the next summary up, with w.
+  test(`picker (${name}): a step raises a chunk past a level its lineage skips to the next summary up`, () => {
+    const inputs = greedyStore([['x', 'N'], ['w', 'N2']], [
+      ['N', 1, ['x'], 30, 'T'], ['N2', 1, ['w'], 30, 'M'], ['M', 2, ['N2'], 20, 'T'], ['T', 3, ['N', 'M'], 10],
+    ]);
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(25, 0));
+    assert.equal(result.finalResolutions.get('x'), 3);
+    assert.equal(result.finalResolutions.get('w'), 3);
+    assert.deepEqual(result.produced, []);
+    assert.equal(result.finalTokens, 20);
+    assert.deepEqual(unrealizable, []);
+  });
+
+  // N1 lists x0, x1 and y0, while y0's own L1 is N2, which has no parent, and
+  // M, N1's parent, is an L2. Raising N1 and then M for x moves x0 and x1; y0,
+  // whose summary at those levels is N2 and then none, keeps its level. It
+  // used to be raised with them, to L2, where it has no summary, and the
+  // picker reported a level it can't realize. flat-profile then raises y0
+  // through N2; oldest-first, which only ever chooses for the oldest chunk,
+  // leaves it raw.
+  test(`picker (${name}): raising a summary leaves a leaf it lists through another lineage at its level`, () => {
+    const inputs = greedyStore([['x0', 'N1'], ['x1', 'N1'], ['y0', 'N2']], [
+      ['N1', 1, ['x0', 'x1', 'y0'], 30, 'M'], ['N2', 1, ['y0'], 30], ['M', 2, ['N1'], 20],
+    ]);
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(60, 0));
+    assert.equal(result.finalResolutions.get('x0'), 2, 'M was raised for x');
+    assert.equal(result.finalResolutions.get('y0'), name === 'flat-profile' ? 1 : 0);
+    assert.deepEqual(unrealizable, []);
+  });
+}
+
+// A store of chunks (each with its L1) and summaries ([id, level, sources,
+// recall tokens, parent]), with a 10-token tail chunk after them.
+function greedyStore(
+  chunks: Array<[id: string, l1Id: string]>,
+  summaries: Array<[id: string, level: number, sourceIds: string[], tokens: number, parentId?: string]>,
+): PickerInputs {
+  const all: PickerChunk[] = chunks.map(([id, l1Id], sequence) => ({
+    id, sequence, rawTokens: 100, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id,
+  }));
+  all.push({ id: 't0', sequence: all.length, rawTokens: 10, currentResolution: 0, lockedByAgent: false, pinned: false });
+  return {
+    chunks: all,
+    summaries: new Map(summaries.map(([id, level, sourceIds, tokens, parentId]): [string, SummaryEntry] => [id, {
+      id, level, content: id, tokens, sourceLevel: level - 1, sourceIds, created: 0,
+      sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! },
+      ...(parentId ? { parentId } : {}),
+    }])),
+    headTokens: 0, tailTokens: 10, headChunkIds: new Set(), tailChunkIds: new Set(['t0']),
+  };
+}
+
+// Run a picker with console.error caught, and return its
+// [picker-unrealizable] lines, if any.
+function runQuietly(solver: FlatProfileStrategy | OldestFirstStrategy, inputs: PickerInputs, budget: FoldingBudget) {
+  const original = console.error;
+  const lines: string[] = [];
+  console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+  try {
+    const result = new Picker(solver).run(inputs, budget);
+    return { result, unrealizable: lines.filter((l) => l.includes('[picker-unrealizable]')) };
+  } finally {
+    console.error = original;
+  }
+}
+
+// #239: a strategy's picker logs through the strategy's diagnostics, so its lines name the
+// namespace the strategy works for.
+test('picker: its lines name the namespace its owner gives it', () => {
+  const inputs = greedyStore([['x', 'L1-0']], [['L1-0', 1, ['x'], 30]]);
+  const solver = {
+    name: 'stub',
+    // x at a level it has no summary at, and an entry for no chunk at all.
+    solve: () => ({ frontier: new Map([['x', 2], ['t0', 0], ['gone', 1]]), produced: [] }),
+  } as unknown as ConstructorParameters<typeof Picker>[0];
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+  try {
+    new Picker(solver, namespaceDiagnostics(() => 'agents/tern')).run(inputs, BUDGET(10_000, 0));
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines.filter((l) => l.startsWith('[picker-dead-ids]')), [
+    '[picker-dead-ids] solver=stub: dropped 1 frontier entry referencing no live chunk (store surgery residue). ns=agents/tern',
+  ]);
+  const unrealizable = lines.filter((l) => l.startsWith('[picker-unrealizable]'));
+  assert.equal(unrealizable.length, 1, lines.join('\n'));
+  assert.match(unrealizable[0]!, / ns=agents\/tern$/);
+});

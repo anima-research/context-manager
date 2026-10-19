@@ -8,8 +8,9 @@
  *
  * Monotonic within a solve (never lowers). Memory-fading by construction: a
  * given chunk's resolution only ever increases within a solve, and the carried
- * resolutions seed the next one, except that a pinned chunk is seeded raw
- * (greedy-fold.ts).
+ * resolutions seed the next one, except that a pinned chunk is seeded raw and
+ * a chunk carried at a level where it has no summary starts at the next level
+ * down where it has one (greedy-fold.ts).
  *
  * See `docs/adaptive-resolution-design.md` §3.7.
  */
@@ -72,19 +73,22 @@ function flatProfileStep(state: GreedyState, budget: FoldingBudget): GreedyOp | 
   // can shrink the plan, not the first resort.
   let fallbackProduce: GreedyOp | null = null;
   for (const bestLevel of rankedLevels) {
-    // Find the oldest raisable group at this level. A "group" at level k is
-    // the set of chunks sharing an L_{k+1} ancestor. We want to raise that
-    // group all the way to L_{k+1}.
-    //
-    // The oldest group is the one containing the oldest chunk at level k.
+    // Raise the group of the oldest chunk at this level: the chunks sharing
+    // its next summary up, its L_{k+1} ancestor, or, past a level where it
+    // has none (one its lineage skips, or one whose summary doesn't list it),
+    // the next one up where it has one. The group is raised all the way to
+    // that summary. Younger chunks at the level aren't tried.
     const oldestChunk = middle.find((c) => c.currentResolution === bestLevel);
     if (!oldestChunk) continue;
 
     const parentLevel = bestLevel + 1;
-    const parentSummary = oldestChunk.ancestorAt(parentLevel);
+    const parentSummary = state.nextAncestor(oldestChunk);
     if (!parentSummary) {
-      // L_{k+1} not produced for this chunk's group yet — request it, but
-      // only if no other level can raise.
+      // No summary above lists this chunk: request L_{k+1} for its group, but
+      // only if no other level can raise. The strategy makes it only on the
+      // terms GreedyState.nextAncestor names, so for a chunk whose summary
+      // links upward to one that doesn't list it, the request comes back on
+      // the next compile.
       //
       // Range semantics differ by level:
       //  - bestLevel === 0: the caller is asking for an L1 covering this

@@ -62,10 +62,10 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     );
     assert.equal(fsResults.length, 5, 'all 5 fs:read tool_result blocks should still be present (just rewritten)');
 
-    const truncated = fsResults.filter(r => typeof r.content === 'string' && r.content.includes('Result truncated'));
+    const truncated = fsResults.filter(r => typeof r.content === 'string' && r.content === "[result of tool 'fs:read' left out: this context shows only the tool's last 2 results]");
     const intact = fsResults.filter(r => typeof r.content === 'string' && r.content.includes('file '));
 
-    assert.equal(truncated.length, 3, 'first 3 should be truncated (older)');
+    assert.equal(truncated.length, 3, 'first 3 should be left out (older)');
     assert.equal(intact.length, 2, 'last 2 should survive intact');
 
     // The last two intact ones must be tu-3 and tu-4 (most recent).
@@ -81,6 +81,54 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     assert.equal(httpResult.content, 'HTTP body', 'http:get untouched (no limit)');
 
     manager.close();
+  });
+
+  it('a limit of 0 leaves out every result of the tool, and the marker says so', async () => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      toolResultMaxLastN: { 'fs:read': 0 },
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    for (let i = 0; i < 2; i++) {
+      manager.addMessage('Claude', [toolUse(`z-${i}`, 'fs:read', { i })]);
+      manager.addMessage('user', [toolResult(`z-${i}`, `file ${i}`)]);
+    }
+    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+    const results = compiled.messages.flatMap(m => m.content).filter(
+      (b): b is { type: 'tool_result'; toolUseId: string; content: string } => b.type === 'tool_result',
+    );
+    assert.deepEqual(results.map(r => r.content), [
+      "[result of tool 'fs:read' left out: this context shows none of its results]",
+      "[result of tool 'fs:read' left out: this context shows none of its results]",
+    ]);
+    await manager.close();
+  });
+
+  it('text past maxMessageTokens is dropped with one marker where it began', async () => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 100,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    manager.addMessage('user', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'text', text: 'second' },
+      { type: 'text', text: 'third' },
+    ]);
+    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+    const texts = compiled.messages.flatMap(m => m.content).map(b => (b as { text?: string }).text);
+    assert.equal(texts.length, 2, 'the cut block and one marker for the two dropped ones');
+    assert.match(String(texts[0]), /\[truncated — original was 500 tokens\]$/);
+    assert.equal(texts[1], '[content omitted: this message reached its token limit]');
+    await manager.close();
   });
 
   it('global numeric cap applies to all tools', async () => {

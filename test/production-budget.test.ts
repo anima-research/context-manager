@@ -14,15 +14,18 @@
  *  - a throwing shadow pick never breaks the live compile;
  *  - an unreachable target (exhausted shadow with nothing to produce) warns
  *    loudly instead of failing silently at descent time;
- *  - speculative demand does not punch through the L1 holdback window.
+ *  - speculative demand does not punch through the L1 holdback window;
+ *  - `[kv-overlap]` reports the compile's own plan, once, and never the
+ *    shadow pick's, which no compile renders.
  */
 
-import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
+import type { SummaryEntry } from '../src/index.js';
 import type { Picker, PickerInputs } from '../src/adaptive/picker.js';
 import type { ProduceRequest, FoldingBudget } from '../src/adaptive/folding-strategy.js';
 
@@ -42,6 +45,8 @@ function textBlock(text: string): ContentBlock[] {
  *  a failing shadow pick without touching the live one). */
 class SpyStrategy extends AutobiographicalStrategy {
   pickerRunBudgets: number[] = [];
+  /** Each picker run's level for each chunk, in run order. */
+  pickerRunLevels: Array<Map<string, number>> = [];
   producedCalls: Array<{ ops: number; speculative: boolean }> = [];
   failOnBudget?: number;
 
@@ -57,10 +62,17 @@ class SpyStrategy extends AutobiographicalStrategy {
         if (spy.failOnBudget !== undefined && budget.totalBudget === spy.failOnBudget) {
           throw new Error('synthetic shadow-pick failure');
         }
-        return real.run(runInputs, budget);
+        const result = real.run(runInputs, budget);
+        spy.pickerRunLevels.push(new Map(runInputs.chunks.map((c) => [c.id, result.levelAt(c.sequence, c.id)])));
+        return result;
       },
     };
     return wrapper as unknown as Picker;
+  }
+
+  /** A summary written as is, with no model call. */
+  seed(entry: Omit<SummaryEntry, 'created'>): void {
+    this.pushSummary({ ...entry, created: 0 });
   }
 
   protected handleProducedOps(
@@ -267,6 +279,128 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
       'live demand must still punch through the holdback',
     );
     assert.ok(strategy.demandedL1Count() > 0, 'live demand must mark the chunk');
+    manager.close();
+  });
+
+  // N1 lists x and y, while y's own L1 is N2, the first L1 that lists it: a
+  // plan that folds x to L1 renders N1, whose recall covers y while y renders
+  // through its own lineage or raw, so y is in the window twice.
+  const overlapOptions = { foldingStrategy: 'kv-stable', recentWindowTokens: 8, speculativeProduction: false };
+  function seedOverlap(manager: ContextManager, strategy: SpyStrategy): { x: string; y: string } {
+    const x = manager.addMessage('user', textBlock('x ' + 'word '.repeat(100)));
+    const y = manager.addMessage('user', textBlock('y ' + 'word '.repeat(100)));
+    manager.addMessage('user', textBlock('z latest ' + 'word '.repeat(20)));
+    strategy.seed({
+      id: 'N2', level: 1, content: 'summary of y', tokens: 6,
+      sourceLevel: 0, sourceIds: [y], sourceRange: { first: y, last: y },
+    });
+    strategy.seed({
+      id: 'N1', level: 1, content: 'summary of x and y', tokens: 8,
+      sourceLevel: 0, sourceIds: [x, y], sourceRange: { first: x, last: y },
+    });
+    return { x, y };
+  }
+  function catchOverlapLines(t: TestContext): string[] {
+    const lines: string[] = [];
+    const original = console.error.bind(console);
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      if (String(args[0]).includes('[kv-overlap]')) lines.push(String(args[0]));
+      else original(...args);
+    });
+    return lines;
+  }
+
+  it('logs [kv-overlap] for the compile\'s own plan with no production budget set', async (t) => {
+    const lines = catchOverlapLines(t);
+    const strategy = makeStrategy(overlapOptions);
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const { x, y } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 260, reserveForResponse: 0 });
+    assert.deepStrictEqual(strategy.pickerRunBudgets, [260], 'the live pick alone');
+    assert.strictEqual(strategy.pickerRunLevels[0]!.get(x), 1, 'the plan renders N1, through x');
+    assert.strictEqual(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0]!, new RegExp(`sample=${y} ns=default$`));
+    manager.close();
+  });
+
+  // #239: a process can host several strategies, each in its own namespace, and their lines
+  // interleave on stderr; each diagnostic of the compile names the namespace it was logged for,
+  // after its fields, so a grep for its prefix still matches. The planner's [kv-timing] lines,
+  // which KV_TIMING turns on, come through the strategy's solver and name it too.
+  it('names the strategy\'s namespace on the compile\'s [kv-overlap], [plan-vs-actual] and [kv-timing] lines', async (t) => {
+    const logged: string[] = [];
+    const original = console.error.bind(console);
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      const line = String(args[0]);
+      if (/^\[(kv-overlap|plan-vs-actual|kv-timing)\]/.test(line)) logged.push(line);
+      else original(...args);
+    });
+    const timing = process.env.KV_TIMING;
+    process.env.KV_TIMING = '1';
+    t.after(() => {
+      if (timing === undefined) delete process.env.KV_TIMING;
+      else process.env.KV_TIMING = timing;
+    });
+    const strategy = makeStrategy(overlapOptions);
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, namespace: 'agents/tern' });
+    const { y } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 260, reserveForResponse: 0 });
+    const of = (tag: string) => logged.filter((line) => line.startsWith(`[${tag}]`));
+    assert.strictEqual(of('kv-overlap').length, 1, logged.join('\n'));
+    assert.match(of('kv-overlap')[0]!, new RegExp(`sample=${y} ns=agents/tern$`));
+    assert.strictEqual(of('plan-vs-actual').length, 1, logged.join('\n'));
+    // After its fields, solver= and those that follow it.
+    assert.match(of('plan-vs-actual')[0]!, / solver=\S+(?: \w+=\S+)* ns=agents\/tern$/);
+    assert.ok(of('kv-timing').length > 0, logged.join('\n'));
+    for (const line of of('kv-timing')) assert.match(line, / ns=agents\/tern$/);
+    manager.close();
+  });
+
+  it('logs no [kv-overlap] about the shadow pick\'s plan, which no compile renders', async (t) => {
+    const lines = catchOverlapLines(t);
+    const strategy = makeStrategy({ ...overlapOptions, productionBudgetTokens: 250 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const { x } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+    assert.deepStrictEqual(strategy.pickerRunBudgets, [100_000, 250], 'the live pick, then the shadow pick');
+    assert.ok(
+      [...strategy.pickerRunLevels[0]!.values()].every((level) => level === 0),
+      'the live plan renders no summary',
+    );
+    assert.strictEqual(strategy.pickerRunLevels[1]!.get(x), 1, 'the shadow plan renders N1, through x');
+    assert.deepStrictEqual(lines, []);
+    manager.close();
+  });
+
+  it('logs [kv-overlap] once, for the compile\'s own plan, when the shadow pick plans the same summary', async (t) => {
+    const lines = catchOverlapLines(t);
+    const strategy = makeStrategy({ ...overlapOptions, productionBudgetTokens: 200 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const { x, y } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 260, reserveForResponse: 0 });
+    assert.deepStrictEqual(strategy.pickerRunBudgets, [260, 200], 'the live pick, then the shadow pick');
+    assert.strictEqual(strategy.pickerRunLevels[0]!.get(x), 1, 'the live plan renders N1, through x');
+    assert.strictEqual(strategy.pickerRunLevels[1]!.get(x), 1, 'and so does the shadow plan');
+    assert.strictEqual(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0]!, /1 leaf\(s\) with conflicting lineage/);
+    assert.match(lines[0]!, new RegExp(`sample=${y} ns=default$`));
+    manager.close();
+  });
+
+  it('a dry run logs [kv-overlap] for the plan it previews, and makes no shadow pick', async (t) => {
+    const lines = catchOverlapLines(t);
+    const strategy = makeStrategy({ ...overlapOptions, productionBudgetTokens: 200 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const { x } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 260, reserveForResponse: 0 }, undefined, { dryRun: true });
+    assert.deepStrictEqual(strategy.pickerRunBudgets, [260], 'the dry run\'s own pick alone');
+    assert.strictEqual(strategy.pickerRunLevels[0]!.get(x), 1, 'its plan renders N1, through x');
+    assert.strictEqual(lines.length, 1, lines.join('\n'));
     manager.close();
   });
 });

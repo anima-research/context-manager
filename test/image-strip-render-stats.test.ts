@@ -21,7 +21,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-image-strip-render-stats';
-const PLACEHOLDER = 'image dropped from live context';
+const PLACEHOLDER = "image not shown: this context keeps only some images";
 
 function cleanup(): void {
   if (existsSync(TEST_STORE_PATH)) rmSync(TEST_STORE_PATH, { recursive: true, force: true });
@@ -98,7 +98,7 @@ describe('image stripping × render stats', () => {
     }
 
     // And total must be strictly below the pre-strip size — proves the credit bites.
-    const preStrip = expected + stripped * (1600 - Math.ceil('[image dropped from live context]'.length / 4));
+    const preStrip = expected + stripped * (1600 - Math.ceil("[image not shown: this context keeps only some images]".length / 4));
     assert.ok(rs!.total.tokens < preStrip, 'total is the stripped size, not the pre-strip size');
 
     manager.close();

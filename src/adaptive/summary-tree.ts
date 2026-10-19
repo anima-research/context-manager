@@ -7,7 +7,11 @@
  * rendering or resolution state. Pure and deterministic.
  *
  * Structure mirrors the model the picker already uses:
- *  - `chunk.l1Id` + the `SummaryEntry.parentId` chain define the upward path.
+ *  - `chunk.l1Id` + the `SummaryEntry.parentId` chain define the upward path
+ *    (a chunk's lineage), followed while each parent sits above its summary.
+ *    A chunk's summary at a level is the one its lineage reaches there, and
+ *    only where that summary lists the chunk: a parent pointer can name a
+ *    summary written again without the chunk's branch.
  *  - `SummaryEntry.sourceLevel === 0` means `sourceIds` are leaf (message) ids;
  *    otherwise they are child summary ids.
  *  - A folded node's token cost is its recall-pair size
@@ -74,6 +78,13 @@ export class SummaryTree {
   private readonly unresolved: Set<string>;
   /** The chunks this tree was built from, for `derive`. */
   private readonly sourceChunks: readonly PickerChunk[];
+  /** Each summary's leaves as a set, built the first time a chunk's lineage
+   *  reaches it (`ancestorAt`, `maxLevel`). */
+  private readonly leafSets = new Map<SummaryId, ReadonlySet<ChunkId>>();
+  /** Each chunk's answers from `ancestorAt`, by level, kept as they're
+   *  asked. The tree doesn't change once built, and a greedy solve asks the
+   *  same ones on every step. */
+  private readonly ancestorMemo = new Map<ChunkId, (SummaryNode | null)[]>();
 
   constructor(inputs: PickerInputs, previous?: SummaryTree, rebuild?: readonly SummaryEntry[]) {
     this.summaries = inputs.summaries;
@@ -211,33 +222,55 @@ export class SummaryTree {
   }
 
   /**
-   * The L_level ancestor summary of a chunk, or null if not present. Matches
-   * the picker's `accountFrontier` ancestor walk (parentId chain from l1Id).
+   * The chunk's summary at `level`, the one it renders through there: the
+   * L_level summary its lineage (`l1Id`, then each parent above) reaches,
+   * when that summary lists the chunk. Null when the lineage has no summary
+   * there, or has one that doesn't list the chunk, whose recall wouldn't hold
+   * it. Where every summary on the lineage lists the chunk, as the strategy's
+   * load repair leaves a store it opens, this is the walk the picker's
+   * `accountFrontier` and the renderer make.
    */
   ancestorAt(chunkId: ChunkId, level: number): SummaryNode | null {
     if (level <= 0) return null;
+    let known = this.ancestorMemo.get(chunkId);
+    const cached = known?.[level];
+    if (cached !== undefined) return cached;
     const leaf = this.leaves.get(chunkId);
-    if (!leaf || !leaf.l1Id) return null;
-    let cur = this.nodes.get(leaf.l1Id);
-    while (cur && cur.level < level) {
-      if (!cur.parentId) return null;
-      cur = this.nodes.get(cur.parentId);
+    let found: SummaryNode | null = null;
+    if (leaf?.l1Id) {
+      let cur = this.nodes.get(leaf.l1Id);
+      while (cur && cur.level < level) cur = this.parentOf(cur);
+      if (cur && cur.level === level && this.leafSet(cur).has(chunkId)) found = cur;
     }
-    return cur && cur.level === level ? cur : null;
+    if (!known) this.ancestorMemo.set(chunkId, (known = []));
+    known[level] = found;
+    return found;
   }
 
-  /** Highest level k for which a summary covering this chunk exists (0 = none). */
+  /** The highest level at which the chunk has a summary (`ancestorAt`), or 0
+   *  when it has none. */
   maxLevel(chunkId: ChunkId): number {
     const leaf = this.leaves.get(chunkId);
     if (!leaf || !leaf.l1Id) return 0;
-    let cur = this.nodes.get(leaf.l1Id);
     let max = 0;
-    while (cur) {
-      max = cur.level;
-      if (!cur.parentId) break;
-      cur = this.nodes.get(cur.parentId);
+    for (let cur = this.nodes.get(leaf.l1Id); cur; cur = this.parentOf(cur)) {
+      if (this.leafSet(cur).has(chunkId)) max = cur.level;
     }
     return max;
+  }
+
+  /**
+   * The highest level at or below `level` at which the chunk has a summary
+   * (`ancestorAt`), or 0 when there's none. A level held for the chunk, such
+   * as a pin's or a lock's, renders at the level this returns: above the top
+   * of the chunk's lineage, at a level the lineage skips (a parent more than
+   * one level up), or at one whose summary doesn't list the chunk, the chunk
+   * has no summary, and the next level down where it has one comes nearest.
+   */
+  renderableLevel(chunkId: ChunkId, level: number): number {
+    let k = Math.min(level, this.maxLevel(chunkId));
+    while (k > 0 && !this.ancestorAt(chunkId, k)) k--;
+    return Math.max(k, 0);
   }
 
   /**
@@ -264,6 +297,20 @@ export class SummaryTree {
   }
 
   // ---- internals ----
+
+  /** The summary's parent in the tree, when it sits above the summary: a
+   *  lineage climbs, so a walk along it ends. */
+  private parentOf(node: SummaryNode): SummaryNode | undefined {
+    const parent = node.parentId === undefined ? undefined : this.nodes.get(node.parentId);
+    return parent && parent.level > node.level ? parent : undefined;
+  }
+
+  /** A summary's leaves as a set. */
+  private leafSet(node: SummaryNode): ReadonlySet<ChunkId> {
+    let set = this.leafSets.get(node.id);
+    if (!set) { set = new Set(node.leafChunkIds); this.leafSets.set(node.id, set); }
+    return set;
+  }
 
   private buildNode(s: SummaryEntry, collected?: Map<SummaryId, LeafCollection>): SummaryNode {
     const leaves = this.collectLeaves(s, collected);

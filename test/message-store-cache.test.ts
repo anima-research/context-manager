@@ -25,6 +25,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { registerStateIfAbsent } from '../src/state-registration.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-message-store-cache';
@@ -52,7 +53,11 @@ async function openManager(): Promise<ContextManager> {
   // resolutions, …) interleave with message appends — exactly the foreign
   // sequence bumps the revalidation path exists for.
   const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
-  return ContextManager.open({ path: TEST_STORE_PATH, strategy });
+  const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+  // The foreign slot the tests write, registered first, so the tests don't
+  // rely on a chronicle creating a slot on its first write.
+  registerStateIfAbsent(manager.getStore(), { id: 'test/foreign-slot', strategy: 'snapshot' });
+  return manager;
 }
 
 describe('MessageStore — materialized cache write-through & revalidation', () => {

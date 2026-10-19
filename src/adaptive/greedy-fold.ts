@@ -6,14 +6,21 @@
  * solver protocol — the picker never sees intermediate steps. Monotonic by
  * construction: greedy steps only raise (kv-stable is the only solver that
  * plans bidirectionally, and it solves in closed form). The one exception is
- * the seed: a pinned chunk starts at 0, whatever it carried.
+ * the seed: a pinned chunk starts at 0, whatever it carried, and a chunk
+ * carried at a level where it has no summary starts at the next level down
+ * where it has one.
+ *
+ * A chunk's summary at a level is the one `SummaryTree.ancestorAt` gives, so
+ * it lists the chunk. Raising a summary moves the leaves whose summary at its
+ * level it is, the chunk that chose it among them; a leaf the summary lists
+ * whose own lineage has another summary there, or none, keeps its level. A
+ * step raises a chunk through its next summary up
+ * (`GreedyState.nextAncestor`), past a level where it has none.
  *
  * Extracted from the former picker-side `MutableFoldingState` when the op
  * walk was retired (see folding-strategy.ts header).
  */
 
-import type { SummaryEntry } from '../types/strategy.js';
-import { getSummaryParentId } from '../types/strategy.js';
 import type {
   ChunkId,
   SummaryId,
@@ -22,6 +29,7 @@ import type {
   ProduceRequest,
 } from './folding-strategy.js';
 import type { PickerInputs, PickerChunk } from './picker.js';
+import { SummaryTree, type SummaryNode } from './summary-tree.js';
 
 /** Read-only chunk view for greedy step decisions. */
 export interface GreedyChunkView {
@@ -29,7 +37,9 @@ export interface GreedyChunkView {
   sequence: number;
   rawTokens: number;
   currentResolution: number;
-  ancestorAt(level: number): SummaryEntry | null;
+  /** The chunk's summary at `level`, which lists it
+   *  (`SummaryTree.ancestorAt`), or null when it has none there. */
+  ancestorAt(level: number): SummaryNode | null;
 }
 
 /** One greedy decision. */
@@ -42,6 +52,17 @@ export interface GreedyState {
   foldableMiddle(): readonly GreedyChunkView[];
   /** Rendered-token estimate at the current resolutions. */
   tokenCount(): number;
+  /** The chunk's summary at the lowest level above its current one where it
+   *  has one, or null when no summary above lists it. A level its lineage
+   *  skips, or one whose summary doesn't list it, is passed over, since the
+   *  strategy can't produce a summary there: below that level the lineage
+   *  already links upward, and its production (`handleProducedOps`) makes an
+   *  L1 only for a chunk without one, and merges only summaries that link to
+   *  none, two or more at a time. With null, a step asks for the next level,
+   *  which that production makes only on those terms. A method of the state
+   *  rather than of each view, since the engine makes every view again after
+   *  each raise. */
+  nextAncestor(chunk: GreedyChunkView): SummaryNode | null;
 }
 
 /**
@@ -90,8 +111,7 @@ export function runGreedy(
 class GreedyEngine implements GreedyState {
   private readonly chunkOrder: PickerChunk[];
   private readonly chunkById = new Map<ChunkId, PickerChunk>();
-  private readonly summaries: ReadonlyMap<SummaryId, SummaryEntry>;
-  private readonly recallPairTokens: ReadonlyMap<SummaryId, number>;
+  private readonly tree: SummaryTree;
   private readonly headChunkIds: ReadonlySet<ChunkId>;
   private readonly tailChunkIds: ReadonlySet<ChunkId>;
   private readonly headTokens: number;
@@ -102,6 +122,7 @@ class GreedyEngine implements GreedyState {
   private tokenCacheValue = 0;
 
   constructor(inputs: PickerInputs) {
+    this.tree = new SummaryTree(inputs);
     this.chunkOrder = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
     for (const c of this.chunkOrder) {
       this.chunkById.set(c.id, c);
@@ -109,11 +130,12 @@ class GreedyEngine implements GreedyState {
       // accounting already price it, whether or not the agent locked it. Its
       // carried resolution can be a fold from before the pin was added, and
       // the frontier is what renders (and what the strategy stores), so it
-      // starts at 0.
-      this.resolutions.set(c.id, c.pinned ? 0 : c.currentResolution);
+      // starts at 0. A level carried from before the summary tree's links
+      // changed can be one where the chunk has no summary, which a greedy
+      // step, only raising, would never leave: it starts at the next level
+      // down where it has one.
+      this.resolutions.set(c.id, c.pinned ? 0 : this.tree.renderableLevel(c.id, c.currentResolution));
     }
-    this.summaries = inputs.summaries;
-    this.recallPairTokens = inputs.recallPairTokens ?? new Map();
     this.headChunkIds = inputs.headChunkIds;
     this.tailChunkIds = inputs.tailChunkIds;
     this.headTokens = inputs.headTokens;
@@ -132,6 +154,18 @@ class GreedyEngine implements GreedyState {
     return out;
   }
 
+  nextAncestor(chunk: GreedyChunkView): SummaryNode | null {
+    const from = (this.resolutions.get(chunk.id) ?? 0) + 1;
+    const next = this.tree.ancestorAt(chunk.id, from);
+    if (next) return next;
+    const top = this.tree.maxLevel(chunk.id);
+    for (let k = from + 1; k <= top; k++) {
+      const node = this.tree.ancestorAt(chunk.id, k);
+      if (node) return node;
+    }
+    return null;
+  }
+
   tokenCount(): number {
     if (this.tokenCacheValid) return this.tokenCacheValue;
     this.tokenCacheValue = this.computeTokens();
@@ -143,16 +177,18 @@ class GreedyEngine implements GreedyState {
     return new Map(this.resolutions);
   }
 
-  /** Raise every unprotected leaf under groupRoot to the summary's level. */
+  /** Raise every unprotected leaf whose summary at groupRoot's level is
+   *  groupRoot to that level. */
   applyRaise(groupRoot: SummaryId): void {
-    const summary = this.summaries.get(groupRoot);
+    const summary = this.tree.summary(groupRoot);
     if (!summary) throw new Error(`greedy fold: applyRaise: unknown groupRoot ${groupRoot}`);
     const targetLevel = summary.level;
-    for (const id of this.collectLeafIds(summary)) {
+    for (const id of summary.leafChunkIds) {
       const chunk = this.chunkById.get(id);
       if (!chunk) continue;
       if (chunk.pinned || chunk.lockedByAgent) continue;
       if (this.headChunkIds.has(id) || this.tailChunkIds.has(id)) continue;
+      if (this.tree.ancestorAt(id, targetLevel)?.id !== groupRoot) continue;
       const current = this.resolutions.get(id) ?? 0;
       if (current < targetLevel) this.resolutions.set(id, targetLevel);
     }
@@ -169,42 +205,15 @@ class GreedyEngine implements GreedyState {
       get currentResolution() {
         return self.resolutions.get(c.id) ?? 0;
       },
-      ancestorAt(level: number): SummaryEntry | null {
-        return self.ancestorAt(c, level);
+      ancestorAt(level: number): SummaryNode | null {
+        return self.tree.ancestorAt(c.id, level);
       },
     };
   }
 
-  private ancestorAt(chunk: PickerChunk, level: number): SummaryEntry | null {
-    if (level <= 0) return null;
-    if (!chunk.l1Id) return null;
-    let current: SummaryEntry | undefined = this.summaries.get(chunk.l1Id);
-    while (current && current.level < level) {
-      const parentId = getSummaryParentId(current);
-      if (!parentId) return null;
-      current = this.summaries.get(parentId);
-    }
-    if (!current || current.level !== level) return null;
-    return current;
-  }
-
-  private collectLeafIds(summary: SummaryEntry): ChunkId[] {
-    const out: ChunkId[] = [];
-    const visit = (s: SummaryEntry): void => {
-      if (s.sourceLevel === 0) {
-        for (const mid of s.sourceIds) out.push(mid);
-      } else {
-        for (const sid of s.sourceIds) {
-          const child = this.summaries.get(sid);
-          if (child) visit(child);
-        }
-      }
-    };
-    visit(summary);
-    return out;
-  }
-
-  /** Mirrors the picker's applied-frontier accounting (see picker.ts). */
+  /** Mirrors the picker's applied-frontier accounting (see picker.ts) for
+   *  the frontiers this engine plans, where each chunk's level has a summary
+   *  that lists it. */
   private computeTokens(): number {
     let total = this.headTokens + this.tailTokens;
     const renderedSummaries = new Set<SummaryId>();
@@ -215,14 +224,14 @@ class GreedyEngine implements GreedyState {
         total += c.rawTokens;
         continue;
       }
-      const ancestor = this.ancestorAt(c, effectiveResolution);
+      const ancestor = this.tree.ancestorAt(c.id, effectiveResolution);
       if (!ancestor) {
         total += c.rawTokens;
         continue;
       }
       if (renderedSummaries.has(ancestor.id)) continue;
       renderedSummaries.add(ancestor.id);
-      total += this.recallPairTokens.get(ancestor.id) ?? ancestor.tokens;
+      total += ancestor.recallTokens;
     }
     return total;
   }

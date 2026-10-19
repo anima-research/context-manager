@@ -33,6 +33,8 @@ class Seeded extends AutobiographicalStrategy {
 }
 
 const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 0 });
+/** How many of these messages' stored levels differ from `before`. */
+const storedChanges = (s: Seeded, ids: string[], before: number[]) => ids.filter((id, i) => s.stored(id) !== before[i]).length;
 const rendersRaw = (messages: { content: ContentBlock[] }[]) =>
   messages.some((m) => m.content.some((b) => b.type === 'text' && b.text.includes('RAW-0 ')));
 
@@ -53,24 +55,47 @@ describe('a pin added over a folded message, under the greedy solvers', () => {
             m.addMessage(i % 2 === 0 ? 'user' : 'assistant', [{ type: 'text', text: `RAW-${i} ` + 'x'.repeat(800) }]));
           s.seedL1s(ids);
 
+          let before = ids.map((id) => s.stored(id));
           const folded = await m.compile(budget(1900));
+          // `moves` counts exactly the levels the compile stored (#195).
+          assert.equal(m.getRenderStats()?.planVsActual?.moves, storedChanges(s, ids, before));
           assert.equal(rendersRaw(folded.messages), false, 'pressure folds the first message');
           assert.equal(s.carried(ids[0]), 1);
           if (locked) s.lockChunk(ids[0]);
 
           const pin = m.pinRange(ids[0], ids[0]);
+          // A preview of the pinned layout counts what the compile will.
+          assert.equal(m.previewContext(budget(100_000))?.moves, locked ? 0 : 1, 'the preview counts as the compile does');
+          before = ids.map((id) => s.stored(id));
           const pinned = await m.compile(budget(100_000));
           assert.equal(rendersRaw(pinned.messages), true, 'the pinned message renders raw');
           // An unlocked message stores the 0, dropping the fold the pin replaced;
           // the strategy never stores a change to a locked one.
           assert.equal(s.carried(ids[0]), locked ? 1 : 0);
           assert.equal(s.stored(ids[0]), locked ? 1 : 0);
+          // Only a stored change is a move: the unlocked message's, once. A locked
+          // one renders raw on every compile while its level stays, which isn't
+          // a move on any of them (#195).
+          assert.equal(m.getRenderStats()?.planVsActual?.moves, locked ? 0 : 1);
+          assert.equal(m.getRenderStats()?.planVsActual?.moves, storedChanges(s, ids, before));
+          for (let k = 0; k < 2; k++) {
+            m.addMessage('user', [{ type: 'text', text: `MORE-${k} ` + 'y'.repeat(40) }]);
+            before = ids.map((id) => s.stored(id));
+            const again = await m.compile(budget(100_000));
+            assert.equal(rendersRaw(again.messages), true, 'still raw while pinned');
+            assert.equal(m.getRenderStats()?.planVsActual?.moves, 0, 'nothing moves while the pin stands');
+            assert.equal(storedChanges(s, ids, before), 0);
+          }
 
           m.unpin(pin);
+          before = ids.map((id) => s.stored(id));
           const unpinned = await m.compile(budget(100_000));
+          assert.equal(m.getRenderStats()?.planVsActual?.moves, storedChanges(s, ids, before));
           assert.equal(rendersRaw(unpinned.messages), !locked, locked ? 'the lock\'s level returns' : 'the message stays raw without pressure');
           if (!locked) {
+            before = ids.map((id) => s.stored(id));
             const pressed = await m.compile(budget(1900));
+            assert.equal(m.getRenderStats()?.planVsActual?.moves, storedChanges(s, ids, before));
             assert.equal(rendersRaw(pressed.messages), false, 'pressure folds it again');
           }
         } finally {

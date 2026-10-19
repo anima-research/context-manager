@@ -1403,11 +1403,47 @@ describe('ContextManager', () => {
       // System injection works regardless
       assert.strictEqual(result.systemInjections.length, 1);
 
-      // beforeUser has no user message to anchor to — should be skipped
-      // afterUser has no user message — should append at end
-      assert.strictEqual(result.messages.length, 2);
-      assert.strictEqual(result.messages[0].participant, 'Claude');
-      assert.strictEqual(result.messages[1].participant, 'system_context:tools');
+      // No user message to anchor to: both go at the end, where the turn's
+      // user message would come, beforeUser first as around a user message.
+      assert.deepStrictEqual(
+        result.messages.map((m) => m.participant),
+        ['Claude', 'system_context:rag', 'system_context:tools'],
+      );
+      // Each injection's provenance source sits at its message's index.
+      assert.deepStrictEqual(
+        result.provenance!.messages.map((s) => (s.kind === 'injection' ? s.namespace : s.kind)),
+        ['raw', 'rag', 'tools'],
+      );
+      // And each carries its injection's content, which is what the agent receives.
+      assert.deepStrictEqual(
+        result.messages.slice(1).map((m) => m.content),
+        [injections[1].content, injections[2].content],
+      );
+    });
+
+    it('should anchor both injections to a user message that an agent message follows', async () => {
+      cleanup();
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new PassthroughStrategy(),
+      });
+
+      // The only user message comes first, and the agent's reply after it.
+      manager.addMessage('User', [{ type: 'text', text: 'Question' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'Answer' }]);
+
+      const injections: ContextInjection[] = [
+        { namespace: 'rag', position: 'beforeUser', content: [{ type: 'text', text: 'Before user' }] },
+        { namespace: 'tools', position: 'afterUser', content: [{ type: 'text', text: 'After user' }] },
+      ];
+
+      const result = await manager.compile(undefined, injections);
+
+      // Around the user message, not at the end: a user message anchors both.
+      assert.deepStrictEqual(
+        result.messages.map((m) => m.participant),
+        ['system_context:rag', 'User', 'system_context:tools', 'Claude'],
+      );
     });
 
     it('should handle injections with multimodal content', async () => {

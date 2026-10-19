@@ -16,6 +16,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import {
   SummaryTree,
   planControlledFrontier,
+  reportOverlap,
   type PickerInputs,
   type PickerChunk,
 } from '../src/adaptive/index.js';
@@ -155,6 +156,7 @@ async function main() {
     now: newestSeq,
     mergeThreshold: 6,
   });
+  reportOverlap(solved.overlap);
   const dist: Record<number, number> = {};
   for (const lvl of solved.resolutions.values()) dist[lvl] = (dist[lvl] ?? 0) + 1;
 

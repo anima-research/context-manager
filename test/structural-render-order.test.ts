@@ -9,7 +9,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 const text = (body: string): ContentBlock => ({ type: 'text', text: body });
 const use = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'read', input: { payload: 'x'.repeat(200) } });
 const result = (id: string, body = `real result ${id}`): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: body });
-const missingResultText = '[tool result unavailable — omitted during context compression]';
+const missingResultText = "[this call's result isn't shown in this context. If you need its output and the tool only reads, call it again; you'll get what it returns now.]";
 type Message = { participant: string; content: ContentBlock[] };
 const agent = (...content: ContentBlock[]): Message => ({ participant: 'agent', content });
 const user = (...content: ContentBlock[]): Message => ({ participant: 'user', content });
@@ -51,8 +51,8 @@ describe('structural render ordering across adaptive and hierarchical selectors'
       for (const adaptiveResolution of [true, false]) {
         const results = (await render(messages, adaptiveResolution))
           .flatMap(message => message.content).filter(block => block.type === 'tool_result');
-        assert.match(String(results.find(block => block.toolUseId === 'A')?.content), /Result truncated/,
-          'the older genuine result must be truncated even when one result matches the marker');
+        assert.equal(String(results.find(block => block.toolUseId === 'A')?.content), "[result of tool 'read' left out: this context shows only the tool's last result]",
+          'the older genuine result must be left out even when one result matches the marker');
         assert.equal(results.find(block => block.toolUseId === 'B')?.content,
           markerId === 'B' ? missingResultText : 'real result B');
         assert.equal(results.find(block => block.toolUseId === 'MISSING')?.content, missingResultText,
@@ -74,7 +74,7 @@ describe('structural render ordering across adaptive and hierarchical selectors'
       const blocks = adaptive.flatMap(message => message.content);
       const results = blocks.filter(block => block.type === 'tool_result');
       assert.equal(results.find(block => block.toolUseId === 'B')?.content, 'real result B');
-      assert.match(String(results.find(block => block.toolUseId === 'A')?.content), /Result truncated/);
+      assert.equal(String(results.find(block => block.toolUseId === 'A')?.content), "[result of tool 'read' left out: this context shows only the tool's last result]");
       assert.equal(results.filter(block => block.toolUseId === 'B').length, 1, 'repair removes duplicate results before counting');
       if (name === 'missing result stub' || name === 'tail result stub') {
         const id = name === 'tail result stub' ? 'TAIL' : 'MISSING';

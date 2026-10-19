@@ -15,6 +15,7 @@
  *   nothing, and every test below that expects a preimage asks for one.
  */
 
+import { namespaceDiagnostics } from '../src/diagnostics.js';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -23,6 +24,7 @@ import { existsSync, rmSync } from 'node:fs';
 import {
   ContextManager,
   AutobiographicalStrategy,
+  CompressionWithdrawn,
   getMintRequestByHash,
   getMintRequestPreimageBytes,
   MintPreimageMaterializationError,
@@ -330,9 +332,11 @@ function scriptedMintMembrane(script: ScriptedAttemptOutcome[]) {
         const outcome = script[attempts.length] ?? 'accept';
         attempts.push({ request: structuredClone(request), outcome });
         if (outcome === 'carrier_reject') {
+          // As the Anthropic adapter classifies a 400 (membrane 0.5.69+):
+          // typed invalid_request, so the ladder knows it is about the request.
           throw Object.assign(
             new Error('invalid_request: thinking blocks cannot be modified'),
-            { httpStatus: 400 },
+            { httpStatus: 400, type: 'invalid_request', retryable: false },
           );
         }
         return {
@@ -407,6 +411,45 @@ const acceptedRequestCases: Array<{ label: string; script: ScriptedAttemptOutcom
   { label: 'tool_use rejection then the no-tools retry', script: ['tool_use', 'accept'] },
   { label: 'carrier-400 rejection then the stripped retry', script: ['carrier_reject', 'accept'] },
 ];
+
+describe("a host's withdrawal of an L1 call shaped like a carrier rejection (CompressionWithdrawn)", () => {
+  after(cleanup);
+
+  // A 400 invalid_request carries its type, which makes it a request-attributable rejection: the stripped retry's
+  // other precondition.
+  const carrierShape = { httpStatus: 400, type: 'invalid_request', message: 'invalid_request: thinking blocks cannot be modified' };
+  const carriesReasoning = (request: NormalizedRequest): boolean =>
+    request.messages.some((message) => message.content.some((block) => block.type === 'thinking'));
+
+  it('rethrows a withdrawal without the stripped retry that the same shape gets unbranded', async () => {
+    // The premise: without the brand, this shape is a transport rejection of the request's carriers.
+    const controlRequests: NormalizedRequest[] = [];
+    const control = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        controlRequests.push(structuredClone(request));
+        if (controlRequests.length === 1) throw Object.assign(new Error(), carrierShape);
+        return { stopReason: 'end_turn', content: [t('zz-l1-memory-2')], usage: { inputTokens: 100, outputTokens: 20 } };
+      },
+    });
+    await control.strategy.run(control.target, ctx(control.manager));
+    assert.equal(controlRequests.length, 2, 'the premise: unbranded, this shape gets the stripped retry');
+    assert.ok(carriesReasoning(controlRequests[0]!) && !carriesReasoning(controlRequests[1]!), 'the premise: the retry is the request stripped of its reasoning');
+    await control.manager.close();
+
+    const withdrawn = Object.assign(new CompressionWithdrawn(), carrierShape);
+    const requests: NormalizedRequest[] = [];
+    const fx = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        requests.push(structuredClone(request));
+        throw withdrawn;
+      },
+    });
+    await assert.rejects(fx.strategy.run(fx.target, ctx(fx.manager)), (error) => error === withdrawn);
+    assert.ok(carriesReasoning(requests[0]!), 'setup: the request carries reasoning blocks (the carrier path needs them)');
+    assert.equal(requests.length, 1, 'no stripped retry: a withdrawal is never a transport rejection');
+    await fx.manager.close();
+  });
+});
 
 describe('Mint preimages follow the accepted request', () => {
   after(cleanup);
@@ -904,6 +947,25 @@ describe('Preimage persistence never blocks the mint', () => {
     await reopened.manager.close();
   });
 
+  // The strategy reports the failure through its own diagnostics, so the line names the
+  // namespace that minted (#239). This manager has none of its own, so that's `default`.
+  it("storeBlob throws: the failure's line names the minting strategy's namespace", async (tc) => {
+    const mock = acceptingMembrane();
+    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: true });
+    const reports: unknown[][] = [];
+    tc.mock.method(console, 'error', (...args: unknown[]) => { reports.push(args); });
+
+    await fx.strategy.tick({ ...ctx(fx.manager), store: storeRefusing(fx.manager.getStore(), 'storeBlob') });
+
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 2), 'setup: the merge minted');
+    const failures = reports
+      .map((args) => String(args[0]))
+      .filter((line) => line.startsWith('[mint-preimage] failed to persist request preimage '));
+    assert.ok(failures.length > 0, JSON.stringify(reports.map((args) => String(args[0]))));
+    for (const line of failures) assert.match(line, /^\[mint-preimage\] failed to persist request preimage [a-f0-9]{64}: ns=default$/);
+    await fx.manager.close();
+  });
+
   it('the envelope index refusing writes: the media-bearing mint lands anyway', async () => {
     const data = zzImageBase64(53);
     const mock = acceptingMembrane();
@@ -946,6 +1008,13 @@ describe('Mint preimage envelope registration', () => {
     assert.ok(
       reports.some(args => args.includes(failure)),
       `the report carries the registration failure: ${JSON.stringify(reports.map(args => String(args[0])))}`,
+    );
+    // Through the minting strategy's diagnostics, the report names its namespace (#239).
+    reports.length = 0;
+    persistMintRequestPreimage(store, request, requestHash, namespaceDiagnostics(() => 'agents/tern'));
+    assert.ok(
+      reports.some(args => args.includes(failure) && /^\[mint-preimage\] failed to persist request preimage [a-f0-9]{64}: ns=agents\/tern$/.test(String(args[0]))),
+      `the report names its namespace: ${JSON.stringify(reports.map(args => String(args[0])))}`,
     );
     store.close();
   });

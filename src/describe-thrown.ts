@@ -1,3 +1,5 @@
+import type { Diagnostics } from './diagnostics.js';
+
 /**
  * A thrown value as text, for a diagnostic that must not fail in its turn:
  * an Error's message, else the value's String form, else its
@@ -22,12 +24,13 @@ export function describeThrown(value: unknown): string {
  * Log `message` with the thrown value as console.error formats it, keeping
  * an Error's stack, without letting the formatting fail in its turn: Node
  * formats an object through its [util.inspect.custom] hook, which can throw.
- * Then the value is described by describeThrown instead.
+ * Then the value is described by describeThrown instead. `log` is where the
+ * line goes: one namespace's diagnostics name it (#239).
  */
-export function logThrown(message: string, value: unknown): void {
+export function logThrown(message: string, value: unknown, log: Diagnostics = console): void {
   try {
-    console.error(message, value);
+    log.error(message, value);
   } catch {
-    console.error(`${message} ${describeThrown(value)}`);
+    log.error(`${message} ${describeThrown(value)}`);
   }
 }

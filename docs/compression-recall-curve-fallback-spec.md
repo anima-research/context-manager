@@ -40,7 +40,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 
 ## Non-negotiable invariants
 
-1. **Canonical first.** Always issue the current canonical compression request unchanged. Fallback activates only after canonical `stopReason === "refusal"`.
+1. **Canonical first.** Always issue the current canonical compression request unchanged. Fallback activates only after the canonical stage ends without a summary: a refusal or an incomplete answer takes the bounded curve, and a rejection attributable to the request, or a rung decided by its failures (see 10), goes to source-only-final once when that rung is configured, and otherwise exhausts the family.
 2. **Same as-of model.** Do not use a neutral observer or alternate model/provider.
 3. **No semantic omission.** Preserve head, raw middle, target chunk, tool cycles, instruction, and all leaf-history coverage selected by the canonical recall frontier.
 4. **No private-state sanitization.** Do not remove, redact, deduplicate, or placeholder `think`, `skip_reply`, thinking, tool, or other state as part of this feature.
@@ -49,7 +49,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 7. **No future leakage.** The alternate request must retain the same as-of boundary; no tail-after-chunk.
 8. **Coverage proof.** A replacement is valid only if recursively expanded leaf message IDs exactly equal the parent’s leaf coverage.
 9. **Store once.** Only the first successful response may become the chunk’s L1 summary. Refused/aborted diagnostic outputs are never persisted as memory.
-10. **Bounded retries.** Never loop indefinitely on the same chunk/frontier/request state.
+10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures: its first, and each later one after compression landed on the same membrane and model since the one before) is recorded durably and never requested again, and the family exhausts after its bounded curve. Split-stitch is one exception: it is one retry unit, so a transient failure inside it re-runs the whole rung, the pieces it had settled included. A compression hold placed during a call is the other: it discards the call's answer before anything records it, so the chunk is asked for again once the hold is released. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So however long an outage lasts, it adds at most one failure to a run, which decides the rung only where it is the run's eighth, and a restart starts every run again. Meanwhile the same request is retried with pacing.
 
 ## Fallback algorithm
 
@@ -57,9 +57,9 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 
 Build and issue the request exactly as current `compressChunkHierarchical()` does.
 
-If `stopReason !== "refusal"`, preserve existing behavior.
+If the canonical stage answers `end_turn` with persistable text, mint it as before. A refusal or an incomplete answer takes the bounded curve below. A request-attributable rejection, or a rung its failures decided, goes to source-only-final once (see Durable refusal quarantine), and an answer whose text strips to empty gets one plain-prose retry.
 
-If `stopReason === "refusal"`, retain the complete canonical request and canonical selected recall frontier for variant construction.
+On a refusal or an incomplete answer, retain the complete canonical request and canonical selected recall frontier for variant construction.
 
 ### Candidate nodes
 
@@ -106,10 +106,21 @@ tools, instruction, system/provider fields), a per-message formatter-envelope
 allowance, and the output reserve. After canonical refusal reports complete
 provider input usage, v2 admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
-remains the fail-closed path when usage is absent, zero/partial, or from an
-unknown accounting contract. Provider adapters whose cache counters are
-disjoint (Anthropic/Bedrock) include cache-write/read totals; adapters whose
-cache-read count is a subset use their positive total `inputTokens` once.
+remains the fail-closed path when usage is absent, has no input count, or
+totals zero. Through `complete()`, which compression calls, membrane's
+Anthropic and Bedrock adapters pass the provider's input count through, so
+a missing one arrives as missing. Its other adapters report an omitted
+count as zero, so a cache-only report reads as a full cache hit, which a
+response can't tell from an omitted count. The
+provider total is `inputTokens +
+cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.6.0
+and later, in the host's instance) states the counts as disjoint wherever it
+knows the convention, subtracting the cached span from `inputTokens` for
+providers that report it inside, such as OpenAI and Gemini. A usage whose
+convention membrane can't establish keeps its provider's counts: in 0.6.0
+that's openai-compatible's and openai-completions', which never report cache
+reads, and an OpenRouter response with no cache field. So its total is its
+input count.
 Physical request-byte enforcement remains a separate provider/transport
 constraint. A positive complete provider total is authoritative even when it is
 smaller than the deterministic byte bound: canonical refusal proves that exact
@@ -121,8 +132,20 @@ fallback limit of provider attempts. An over-budget variant is recorded and
 skipped without preventing a later eligible variant.
 
 Stop at the first non-refusal response containing persistable nonempty memory
-text. A refused, empty, or provider-error variant is recorded and the bounded
-curve continues. Canonical non-refusal behavior remains unchanged.
+text. A refused, empty, or deterministically rejected variant (a provider error
+attributable to the request: `context_length`, `invalid_request`, `safety`,
+`unsupported`) is recorded and the bounded curve continues. A transient provider
+failure (capacity, transport, credentials, or anything unclassified) is not by
+itself evidence about the variant: the curve stops there, keeps the family's
+durable progress, pauses the compression lane, and a later tick resumes at that
+variant without repeating requests whose outcomes are recorded. Only
+`COMPRESSION_PERSISTENT_FAILURES` of them on one rung decide it, the first and
+each later one after compression landed on the same membrane and model since
+the one before: their outcome,
+`provider_error:persistent-<class>`, is recorded like a rejection. A canonical rejection
+attributable to the request skips the variants and the canonical hoist: it goes
+to source-only-final once when that rung is configured, and otherwise exhausts
+the family.
 
 ### Optional later variants
 
@@ -135,8 +158,41 @@ Do not include these in v1 unless single-node expansion proves insufficient acro
 
 ## Durable refusal quarantine
 
-If canonical refuses and every allowed variant refuses, is rejected by
-admission, throws a provider/validation error, or returns no persistable text:
+A family exhausts when its ladder ends without a summary, in one of three
+ways:
+
+- the canonical stage refuses or answers incompletely, and every later rung
+  the ladder reaches ends without one: the canonical's tool-prose hoist
+  (when the canonical's own first call refused; a refusal of its no-tools
+  or tools-less retry leaves the stage incomplete, and the hoist doesn't
+  run), the recall variants, source-only-final and its hoist (after a
+  refusal), and split-stitch;
+- the canonical stage (the canonical, or its no-tools or tools-less retry)
+  throws a request-attributable provider error (`context_length`,
+  `invalid_request`, `safety`, `unsupported`), or one its failures decided:
+  no hoist, variant or split is tried, since each variant only adds recall
+  to the canonical request. Source-only-final is tried once where it is
+  configured, and the family exhausts if it ends without a summary, or at
+  once where it isn't configured;
+- the answer the ladder accepted strips to empty. The canonical stage's
+  `end_turn` answer, or a later rung's `end_turn` answer with text, ends the
+  ladder, and a thinking wrapper is stripped from its text only after that,
+  so an answer that strips to empty takes this exit whichever rung gave it.
+  After the canonical stage's, a recall variant's or split-stitch's, the
+  canonical's plain-prose retry is asked once, and the family exhausts if it
+  ends without a summary too. After source-only-final's or a tool-prose
+  hoist's, the family exhausts at once.
+
+A rung ends without a summary when it refuses, answers incompletely or with
+no persistable text, throws a request-attributable provider error or one its
+failures decided, or, for a hoist or a variant, is rejected by admission. A
+transient failure ends no rung by itself: it interrupts the ladder, which
+resumes at that rung later, and `COMPRESSION_PERSISTENT_FAILURES` of them on
+one rung, counted as rule 10 says, decide it. An abort, the caller's signal
+or a host's withdrawal, ends no rung and counts no failure: nothing is
+recorded, and the family stays open.
+
+When a family exhausts:
 
 - leave the chunk raw;
 - do not store an empty summary;

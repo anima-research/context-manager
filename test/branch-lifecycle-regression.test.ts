@@ -101,4 +101,78 @@ describe('ContextManager branch lifecycle regressions', () => {
 
     manager.close();
   });
+
+  it('writes no merge quarantine onto a branch the store switched to while tick awaited its chunk klaxon', async () => {
+    // A host can switch the chronicle directly, without ContextManager. If it
+    // does so before a tick it didn't await resumes from the chunk klaxon (in
+    // the same synchronous run, or a promise continuation of the same turn),
+    // the merge klaxon's sweep would run on the old branch's mirrors and
+    // persist that branch's merge quarantine onto the new one; tick checks its
+    // branch after that await.
+    const strategy = new AutobiographicalStrategy({
+      targetChunkTokens: 2000,
+      autoTickOnNewMessage: false,
+      mergeThreshold: 99,
+      hierarchical: true,
+      quarantineAlarmIntervalMs: 1,
+    });
+    const manager = await ContextManager.open({ path: storePath(), strategy });
+    const ids = ['a', 'b', 'c', 'd'].map((text) => manager.addMessage('user', content(`${text} hello world`)));
+    const internals = strategy as unknown as {
+      store: { switchBranch(name: string): unknown; getStateJson(id: string): unknown };
+      mergeQuarantineStateId: string;
+      mergeQuarantine: Map<string, unknown>;
+      pushSummary(entry: unknown): void;
+      persistMergeQuarantine(): void;
+    };
+    const l1 = (id: string, first: number, last: number) => ({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0, created: 1,
+      sourceIds: [ids[first]!, ids[last]!], sourceRange: { first: ids[first]!, last: ids[last]! },
+    });
+    internals.pushSummary(l1('L1-x', 0, 1));
+    internals.pushSummary(l1('L1-y', 2, 3));
+    const quarantine = (key: string, sourceIds: string[]): void => {
+      internals.mergeQuarantine = new Map([[key, { key, level: 2, sourceIds, attempts: 3, lastOutcome: 'refusal', quarantinedAt: 1 }]]);
+      internals.persistMergeQuarantine();
+    };
+    const stored = (): string[] =>
+      ((internals.store.getStateJson(internals.mergeQuarantineStateId) ?? []) as Array<{ key: string }>).map((r) => r.key);
+    const quietly = async (work: () => Promise<unknown>): Promise<unknown> => {
+      const warn = console.warn, error = console.error;
+      console.warn = () => {};
+      console.error = () => {};
+      try { await work(); return undefined; } catch (thrown) { return thrown; } finally {
+        console.warn = warn;
+        console.error = error;
+      }
+    };
+
+    // On main, a record whose sources are gone: the merge sweep clears it and persists.
+    quarantine('gone', ['ghost-1', 'ghost-2']);
+    const main = manager.currentBranch().name;
+    // On the fork, a record over two live L1s: the sweep keeps it.
+    const fork = await manager.fork('fork');
+    const live = (internals as unknown as { summaries: Array<{ id: string; mergedInto?: string }> }).summaries
+      .filter((s) => (s.id === 'L1-x' || s.id === 'L1-y') && !s.mergedInto);
+    assert.equal(live.length, 2, "premise: the fork's reload keeps both L1s, unmerged");
+    quarantine('live', ['L1-x', 'L1-y']);
+    await manager.switchBranch(main);
+    assert.deepEqual([...internals.mergeQuarantine.keys()], ['gone'], 'premise: loaded on main');
+    // No tick has run, so neither klaxon has sounded yet: both are due.
+
+    const tick = manager.tick();
+    internals.store.switchBranch(fork);
+    const thrown = await quietly(() => tick);
+    assert.deepEqual(stored(), ['live'], "the fork keeps its own merge quarantine, not main's");
+    assert.equal(thrown, undefined, 'the tick returns at its branch check, with no error');
+
+    // The switch landed before the merge klaxon: main's record is still there.
+    await manager.switchBranch(main);
+    assert.deepEqual(stored(), ['gone'], 'premise: the tick swept nothing on main before the switch');
+    // The control: on its own branch, the same sweep clears main's record and persists.
+    await quietly(() => manager.tick());
+    assert.deepEqual(stored(), [], 'premise: the sweep runs and persists when its branch is current');
+
+    manager.close();
+  });
 });

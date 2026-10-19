@@ -111,7 +111,7 @@ async function growUntil(store: Awaited<ReturnType<typeof conversation>>, positi
   return assert.fail(`L${level} never covered the pinned messages`);
 }
 
-/** console.warn lines about held level pins while `fn` runs. */
+/** console.warn lines about held level pins while `fn` runs, as the strategy's diagnostics write them, with its namespace. */
 async function holdLines(fn: () => Promise<void>): Promise<string[]> {
   const lines: string[] = [];
   const warn = console.warn;
@@ -187,7 +187,7 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
     });
     assert.equal(lines.length, 2, lines.join('\n'));
     assert.match(lines[0], /^autobio: kv-unified holds pin pin-0 \("recent"\), pinned at L2, at (raw|L1|raw and L1) in [1-4] message\(s\)/);
-    assert.equal(lines[1], 'autobio: kv-unified no longer holds pin pin-0 ("recent") below its L2.');
+    assert.equal(lines[1], 'autobio: kv-unified no longer holds pin pin-0 ("recent") below its L2. ns=default');
     assert.deepEqual(renderedLevels(await store.cm.compile(), store.strategy, store.ids, pinned), Array(4).fill(2));
     store.cm.close();
   });
@@ -204,13 +204,13 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
       for (let round = 0; round < 5; round++) await store.cm.compile();
     });
     assert.deepEqual(held, [
-      'autobio: kv-unified holds pin pin-0 ("probe"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does.',
+      'autobio: kv-unified holds pin pin-0 ("probe"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
     ]);
     const reached = await holdLines(async () => {
       await growUntil(store, pinned, 2);
       await store.cm.compile();
     });
-    assert.deepEqual(reached, ['autobio: kv-unified no longer holds pin pin-0 ("probe") below its L2.']);
+    assert.deepEqual(reached, ['autobio: kv-unified no longer holds pin pin-0 ("probe") below its L2. ns=default']);
 
     // A pin removed while it is held.
     store.cm.pinAtLevel(store.ids[store.ids.length - 12], store.ids[store.ids.length - 9], 3, { name: 'later' });
@@ -222,7 +222,7 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
     });
     assert.equal(removed.length, 2, removed.join('\n'));
     assert.match(removed[0], /^autobio: kv-unified holds pin pin-1 \("later"\), pinned at L3, at /);
-    assert.equal(removed[1], 'autobio: pin pin-1 ("later"), held below its L3 by kv-unified, was removed.');
+    assert.equal(removed[1], 'autobio: pin pin-1 ("later"), held below its L3 by kv-unified, was removed. ns=default');
     store.cm.close();
   });
 
@@ -236,7 +236,7 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
       await assert.rejects(store.cm.compile({ maxTokens: 600, reserveForResponse: 0 }), OverBudgetError);
     });
     assert.deepEqual(lines, [
-      'autobio: kv-unified holds pin pin-0 ("tight"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does.',
+      'autobio: kv-unified holds pin pin-0 ("tight"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
     ]);
     store.cm.close();
   });
@@ -249,7 +249,7 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
     store.cm.pinAtLevel(store.ids[0], store.ids[7], 2, { name: 'fine' });
     const lines = await holdLines(async () => { await store.cm.compile(); });
     assert.deepEqual(lines, [
-      'autobio: kv-unified holds pin pin-1 ("fine"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does.',
+      'autobio: kv-unified holds pin pin-1 ("fine"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
     ]);
     store.cm.close();
   });

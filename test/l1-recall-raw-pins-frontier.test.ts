@@ -15,7 +15,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { NativeFormatter } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { RECALL_RESUME_TEXT } from '../src/strategies/autobiographical.js';
+import { transformZeroRecallCompression } from '../src/surgery/zero-recall-compression.js';
 import type { ProtectedRange } from '../src/types/strategy.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'l1-recall-pins-'));
@@ -39,6 +42,7 @@ type Internals = {
   summaries: Summary[];
   config: Record<string, unknown>;
   estimateTokens(content: unknown[]): number;
+  summaryAnswerContent(summary: Summary): unknown[];
   resetHeadWindow(id: string | null): void;
   getHeadWindowStartIndex(store: unknown): number;
   getHeadWindowEnd(store: unknown): number;
@@ -50,11 +54,21 @@ async function forest(
   afterAdd?: (cm: ContextManager, ids: string[]) => void,
   content: (i: number, text: string) => unknown[] = (_i, text) => [{ type: 'text', text }],
   participant: (i: number) => string = (i) => (i % 2 ? 'Claude' : 'User'),
+  respond: (call: number) => unknown[] = (call) => [{ type: 'text', text: `Summary #${call}: ordinary events.` }],
 ) {
   const requests: any[] = [];
   let calls = 0;
+  // How the summarizer answers the next calls, in order; a memory once it's empty.
+  const script: Array<'refusal' | 'tool_use' | 'thinking-wrapped'> = [];
   const membrane = { complete: async (req: unknown) => { requests.push(JSON.parse(JSON.stringify(req))); calls++;
-    return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${calls}: ordinary events.` }], usage: { inputTokens: 500, outputTokens: 100 } }; } };
+    const scripted = script.shift();
+    if (scripted === 'refusal') {
+      return { stopReason: 'refusal', content: [], usage: { inputTokens: 500, outputTokens: 0 },
+        raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+    }
+    if (scripted === 'tool_use') return { stopReason: 'tool_use', content: [], usage: { inputTokens: 500, outputTokens: 10 } };
+    const content = scripted === 'thinking-wrapped' ? [{ type: 'text', text: '<thinking>a draft</thinking>' }] : respond(calls);
+    return { stopReason: 'end_turn', content, usage: { inputTokens: 500, outputTokens: 100 } }; } };
   const strategy = new AutobiographicalStrategy({ compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, adaptiveResolution: true,
     ...overrides });
@@ -70,8 +84,10 @@ async function forest(
   }
   for (let r = 0; r < 200; r++) { await cm.compile(); await cm.tick(); if (calls > 150) break; }
   const internals = strategy as unknown as Internals;
-  return { cm, strategy, internals, ids, textOf, requests };
+  return { cm, strategy, internals, ids, textOf, requests, script };
 }
+
+const isL1Request = (request: any): boolean => textsOf(request).some((text) => text.includes(MARKER));
 
 function textsOf(request: any): string[] {
   return request.messages.flatMap((m: any) => m.content).filter((b: any) => typeof b.text === 'string').map((b: any) => b.text);
@@ -308,6 +324,173 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
   });
 });
 
+/** The summary id a recall header names, or undefined for any other message. */
+function headerId(message: any): string | undefined {
+  if (message?.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
+  return /^\[CM\] Recall memory (.+)\.$/.exec(message.content[0]?.text ?? '')?.[1];
+}
+
+describe('a recall answer stays apart from the agent\'s own turn after it', () => {
+  // The agent speaks on even turns here, so the L1 holding message 212
+  // opens on the agent's turn, after the summary that ends at 211.
+  const agentOnEven = (i: number) => (i % 2 ? 'User' : 'Claude');
+
+  async function agentFirstChunk(name: string) {
+    const built = await forest(name, {}, undefined, undefined, agentOnEven);
+    assert.equal(l1Holding(built.internals, built.ids[212]).sourceIds[0], built.ids[212], 'setup: message 212 opens its L1');
+    built.cm.pinRange(built.ids[212], built.ids[212], { name: 'agent-first' });
+    return built;
+  }
+
+  /** The recall pair nearest before a raw turn. */
+  function pairBefore(request: any, rawText: string): { raw: number; header: number; id: string } {
+    const raw = request.messages.findIndex((m: any) => m.content.some((b: any) => b.text === rawText));
+    assert.ok(raw > 0, 'setup: the raw turn is in the prompt');
+    let header = raw - 1;
+    while (header >= 0 && headerId(request.messages[header]) === undefined) header--;
+    assert.ok(header >= 0, 'setup: a recall pair comes before it');
+    return { raw, header, id: headerId(request.messages[header])! };
+  }
+
+  it('an opened chunk that starts on the agent\'s turn keeps that turn out of the recall answer before it', async () => {
+    const { cm, internals, ids, textOf, requests } = await agentFirstChunk('agent-first');
+    const request = await nextL1(cm, requests);
+    assert.ok(request, 'the L1 request was sent');
+    const rawText = textOf.get(ids[212])!;
+    const { raw, header, id } = pairBefore(request, rawText);
+    const before = internals.summaries.find((s) => s.id === id)!;
+    const shape = (m: any) => ({ participant: m.participant, content: m.content });
+    assert.deepEqual(request.messages[header + 1].content, internals.summaryAnswerContent(before), 'the recall answer is the memory alone');
+    assert.deepEqual(shape(request.messages[header + 2]), { participant: 'Context Manager', content: [{ type: 'text', text: RECALL_RESUME_TEXT }] },
+      'the Context Manager takes a turn between them');
+    assert.equal(raw, header + 3, 'the raw turn comes right after it');
+    assert.deepEqual(shape(request.messages[raw]), { participant: 'Claude', content: [{ type: 'text', text: rawText }] }, 'the raw turn is a message of its own');
+    assert.equal(request.messages.filter((m: any) => m.content[0]?.text === RECALL_RESUME_TEXT).length, 1, 'no other boundary gets that turn');
+    // The formatter merges consecutive messages of one role at the wire, so
+    // without that turn the memory and the raw turn reach the summarizer as
+    // one turn.
+    const wire = new NativeFormatter().buildMessages(request.messages, { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never)
+      .messages as Array<{ role: string; content: unknown }>;
+    const memoryTurn = wire.find((m) => m.role === 'assistant' && JSON.stringify(m.content).includes(before.content));
+    assert.ok(memoryTurn, 'setup: the memory reaches the wire');
+    assert.ok(!JSON.stringify(memoryTurn!.content).includes('OLD-212 '), 'at the wire the raw turn is not part of the memory\'s turn');
+    cm.close();
+  });
+
+  /** The user's turn 212 carries `between`, which the request drops, so the
+   *  agent's turn 213 would follow the recall answer before it. */
+  async function separatedPast(name: string, between: unknown[]) {
+    const content = (i: number, text: string) => (i === 212 ? between : [{ type: 'text', text }]);
+    const { cm, internals, ids, textOf, requests } = await forest(name, {}, undefined, content);
+    assert.equal(l1Holding(internals, ids[213]).sourceIds[0], ids[212], 'setup: message 212 opens the L1 holding 213');
+    cm.pinRange(ids[213], ids[213], { name: 'after-212' });
+    const request = await nextL1(cm, requests);
+    assert.ok(request, 'the L1 request was sent');
+    const { raw, header, id } = pairBefore(request, textOf.get(ids[213])!);
+    const before = internals.summaries.find((s) => s.id === id)!;
+    assert.deepEqual(request.messages[header + 1].content, internals.summaryAnswerContent(before), 'the recall answer is the memory alone');
+    assert.equal(request.messages[header + 2].content[0]?.text, RECALL_RESUME_TEXT, 'the Context Manager takes a turn between them');
+    assert.equal(raw, header + 3, 'the agent\'s raw turn comes right after it');
+    const wire = new NativeFormatter().buildMessages(request.messages, { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never)
+      .messages as Array<{ role: string; content: unknown }>;
+    const memoryTurn = wire.find((m) => m.role === 'assistant' && JSON.stringify(m.content).includes(before.content));
+    assert.ok(memoryTurn, 'setup: the memory reaches the wire');
+    assert.ok(!JSON.stringify(memoryTurn!.content).includes('OLD-213 '), 'at the wire the raw turn is not part of the memory\'s turn');
+    cm.close();
+  }
+
+  it('and so does one that a message with no content comes between, which the request drops', async () => {
+    await separatedPast('blank-between', [{ type: 'text', text: '   ' }]);
+  });
+
+  it('and so does one that a tool result whose call no message carries comes between with blank text, which the request strips and drops', async () => {
+    await separatedPast('unpaired-between', [{ type: 'tool_result', toolUseId: 'toolu_nowhere', content: 'a result' }, { type: 'text', text: '  ' }]);
+  });
+
+  it('and an agent turn that is thinking alone, which the prompt strips, doesn\'t join the answer before it either', async () => {
+    // The agent's turn 212 is a thinking block alone, which the prompt strips
+    // from raw turns, and the user's turn 213 follows it. Without the
+    // Context Manager's turn the collapse would join the emptied turn, and its
+    // separator, to the recall answer.
+    const thinkingOnly = (i: number, text: string) =>
+      i === 212 ? [{ type: 'thinking', thinking: 'thought alone', signature: 'sig' }] : [{ type: 'text', text }];
+    const { cm, internals, ids, textOf, requests } = await forest('thinking-alone', {}, undefined, thinkingOnly, agentOnEven);
+    assert.equal(l1Holding(internals, ids[213]).sourceIds[0], ids[212], 'setup: message 212 opens the L1 holding 213');
+    cm.pinRange(ids[213], ids[213], { name: 'after-thinking' });
+    const request = await nextL1(cm, requests);
+    assert.ok(request, 'the L1 request was sent');
+    const { header, id } = pairBefore(request, textOf.get(ids[213])!);
+    const before = internals.summaries.find((s) => s.id === id)!;
+    assert.deepEqual(request.messages[header + 1].content, internals.summaryAnswerContent(before), 'the recall answer is the memory alone');
+    cm.close();
+  });
+
+  it('and the zero-recall surgery, taking the recall pairs out, keeps that turn and the Context Manager\'s turn before it', async () => {
+    const { cm, ids, textOf, requests } = await agentFirstChunk('agent-first-surgery');
+    const request = await nextL1(cm, requests);
+    assert.ok(request, 'the L1 request was sent');
+    const { messages, removedRecallIds } = transformZeroRecallCompression(request.messages);
+    assert.ok(removedRecallIds.length > 0, 'setup: the request recalls memories');
+    assert.ok(!messages.some((m) => headerId(m) !== undefined), 'every recall pair is taken out');
+    const raw = messages.findIndex((m) => m.content.some((b: any) => b.text === textOf.get(ids[212])));
+    assert.ok(raw > 0, 'the agent\'s raw turn stays');
+    assert.equal((messages[raw - 1]!.content[0] as { text?: string }).text, RECALL_RESUME_TEXT, 'with the Context Manager\'s turn before it');
+    cm.close();
+  });
+
+  it('so the summary before it keeps its refusal-fallback variant', async () => {
+    const { cm, internals, ids, textOf, requests, script } = await agentFirstChunk('agent-first-variant');
+    script.push('refusal');
+    const canonical = await nextL1(cm, requests);
+    assert.ok(canonical, 'the L1 request was sent');
+    const before = internals.summaries.find((s) => s.id === pairBefore(canonical, textOf.get(ids[212])!).id)!;
+    assert.ok(before.level >= 2, `setup: the summary before it is an L${before.level}, which a variant can expand`);
+    const variant = requests.filter(isL1Request)[1];
+    assert.ok(variant, 'a variant followed the refusal');
+    const texts = textsOf(variant);
+    assert.ok(!texts.includes(`[CM] Recall memory ${before.id}.`), `the first variant expands ${before.id}, the newest summary it can`);
+    for (const child of before.sourceIds) assert.ok(texts.includes(`[CM] Recall memory ${child}.`), `its child ${child} is recalled in its place`);
+    cm.close();
+  });
+
+  it('in a merge prompt, an L2 target that starts on the agent\'s turn stays out of the last ladder answer', async () => {
+    const { cm, requests } = await forest('agent-first-merge', {}, undefined, undefined, agentOnEven);
+    const merges = requests.filter((request) => !isL1Request(request));
+    let separated = 0;
+    for (const merge of merges) {
+      merge.messages.forEach((m: any, i: number) => {
+        const id = headerId(m);
+        if (id === undefined) return;
+        const answer = merge.messages[i + 1];
+        assert.ok(!answer.content.some((b: any) => typeof b.text === 'string' && b.text.startsWith('OLD-')), `no raw turn joins ${id}'s answer`);
+        if (merge.messages[i + 2]?.content[0]?.text !== RECALL_RESUME_TEXT) return;
+        separated++;
+        assert.equal(merge.messages[i + 3]?.participant, 'Claude', 'the agent\'s raw turn follows the Context Manager\'s');
+      });
+    }
+    assert.ok(separated > 0, `setup: an L2 target opened on the agent's turn after a ladder answer (${merges.length} merges)`);
+    cm.close();
+  });
+
+  it('a recall answer before another speaker\'s turn, or two raw turns of one speaker, get no resume turn (control)', async () => {
+    // The agent speaks on odd turns, and on turn 40 too, so each L2 merge
+    // target opens on the user's turn and turns 39 to 41 are all the agent's.
+    const { cm, ids, textOf, requests } = await forest('user-first', {}, undefined, undefined, (i) => (i % 2 || i === 40 ? 'Claude' : 'User'));
+    let userAfterAnswer = 0;
+    for (const request of requests) {
+      request.messages.forEach((m: any, i: number) => {
+        if (headerId(m) !== undefined && request.messages[i + 2]?.participant === 'User') userAfterAnswer++;
+      });
+      assert.ok(!request.messages.some((m: any) => m.content[0]?.text === RECALL_RESUME_TEXT), 'no request carries a resume turn');
+    }
+    assert.ok(userAfterAnswer > 0, 'setup: a recall answer comes right before a user turn');
+    const sameSpeaker = requests.some((request) => request.messages.some((m: any) =>
+      m.content.some((b: any) => b.text === textOf.get(ids[39])) && m.content.some((b: any) => b.text === textOf.get(ids[40]))));
+    assert.ok(sameSpeaker, 'setup: the agent\'s turns 39 and 40 reach a prompt, one message as before');
+    cm.close();
+  });
+});
+
 describe('a pin holds whatever the linkage, and empty summaries keep their old coverage', () => {
   it('a pinned message in an L1 its parent does not list opens that L1', async () => {
     const { cm, internals, textOf, requests } = await forest('bad-linkage-pinned');
@@ -335,6 +518,130 @@ describe('a pin holds whatever the linkage, and empty summaries keep their old c
     }
     for (const id of l1!.sourceIds) assert.ok(!texts.includes(textOf.get(id)!), `the empty L1's message ${id} isn't replayed raw`);
     cm.close();
+  });
+});
+
+describe('raw pins are priced as the request sends them, serialized media replaced', () => {
+  // A tool round whose result carries a serialized data URL, as a tool's JSON
+  // output does: message 4 calls the tool, message 5 holds its result. A text
+  // block that long would be sharded on ingress; a tool result isn't.
+  const withDataUrl = (n: number, prose = '') => (i: number, text: string) =>
+    i === 4 ? [{ type: 'text', text }, { type: 'tool_use', id: 'media-5', name: 'fetch', input: {} }]
+    : i === 5 ? [{ type: 'tool_result', toolUseId: 'media-5', content: `${text} ${prose}data:image/png;base64,${'A'.repeat(n)}` }]
+    : [{ type: 'text', text }];
+  const toolRound = (i: number) => (i === 4 ? 'Claude' : i === 5 ? 'User' : i % 2 ? 'Claude' : 'User');
+  // History with tool blocks waits for the host's tool definitions.
+  const withTools = (cm: ContextManager, ids: string[]) => {
+    if (ids.length === 1) cm.setToolDefinitions([{ name: 'fetch', description: 'fetch a url', inputSchema: { type: 'object' as const } }]);
+  };
+  const markerFor = (n: number) => `[embedded image/png data URL omitted from compression prompt: ${n} serialized payload characters]`;
+  /** The store's price of the payload alone, as a tool result's content. */
+  const payloadPrice = (cm: ContextManager, n: number): number =>
+    (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore
+      .estimateTokens({ content: [{ type: 'tool_result', toolUseId: 'x', content: 'A'.repeat(n) }] });
+
+  it('a pinned tool result carrying a data URL is spent from the recall budget as its marker', async () => {
+    const { cm, internals, ids, requests } = await forest('media-recall-budget', {}, withTools, withDataUrl(20_000), toolRound);
+    // Half the payload's price: room for the pinned chunk as it is sent, and
+    // not for its payload.
+    internals.config.compressionRecallBudgetTokens = Math.floor(payloadPrice(cm, 20_000) / 2);
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin is honored: ${JSON.stringify(warnings)}`);
+    const sent = JSON.stringify(request);
+    assert.ok(sent.includes(markerFor(20_000)) && !sent.includes('A'.repeat(4096)), 'the pinned result is raw, its payload replaced');
+    cm.close();
+  });
+
+  it('the same pin is spent from the recall budget: with no room for it, the summaries it overrides are recalled', async () => {
+    const { cm, internals, ids, requests } = await forest('media-recall-none', {}, withTools, withDataUrl(20_000), toolRound);
+    internals.config.compressionRecallBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin costs something: ${JSON.stringify(warnings)}`);
+    cm.close();
+  });
+
+  it('a request whose pinned raw carries a data URL is priced against compressionContextBudgetTokens as sent', async () => {
+    const { cm, internals, ids, requests } = await forest('media-context-budget', {}, withTools, withDataUrl(150_000), toolRound);
+    // The recall budget has room for the payload itself, and the limit is
+    // under any request, so the warning gives the request's price as the gate
+    // reckons it.
+    internals.config.compressionRecallBudgetTokens = 10_000_000;
+    internals.config.compressionContextBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+    const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+    assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+    const payload = payloadPrice(cm, 150_000);
+    assert.ok(Number(priced) < payload, `the request is priced without the payload it never sends: ${JSON.stringify({ priced, payload })}`);
+    cm.close();
+  });
+
+  it('the gate counts the pinned content it sends: more prose beside the payload raises its price by that prose', async () => {
+    const pricedWith = async (name: string, prose: string): Promise<number> => {
+      const { cm, internals, ids, requests } = await forest(name, {}, withTools, withDataUrl(150_000, prose), toolRound);
+      internals.config.compressionRecallBudgetTokens = 10_000_000;
+      internals.config.compressionContextBudgetTokens = 1;
+      cm.pinRange(ids[5], ids[5], { name: 'media' });
+      const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+      const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+      assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+      cm.close();
+      return Number(priced);
+    };
+    const prose = 'note '.repeat(4000);
+    const without = await pricedWith('media-prose-without', '');
+    const withProse = await pricedWith('media-prose-with', prose);
+    const { cm } = await forest('media-prose-price', {}, withTools, withDataUrl(10), toolRound);
+    const prosePrice = (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore
+      .estimateTokens({ content: [{ type: 'text', text: prose }] });
+    cm.close();
+    assert.ok(withProse - without >= prosePrice * 0.9, `the pinned prose is priced: ${JSON.stringify({ without, withProse, prosePrice })}`);
+  });
+});
+
+describe("the pins gate prices thinking as the request sends it", () => {
+  const STORE = (cm: ContextManager) => (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+  const signed = (chars: number) => ({ type: 'thinking', thinking: 'weighed it', signature: 'S'.repeat(chars) });
+
+  it("a pinned message's own signed thinking isn't sent, so it isn't spent from the recall budget", async () => {
+    // Message 5 carries a signature far past the budget; the request strips
+    // raw thinking as it inserts the message.
+    const withThinking = (i: number, text: string) => i === 5 ? [signed(80_000), { type: 'text', text }] : [{ type: 'text', text }];
+    const { cm, internals, ids, textOf, requests } = await forest('pin-own-thinking', {}, undefined, withThinking);
+    const opened = l1Holding(internals, ids[5]);
+    const pinnedTokens = opened.sourceIds.reduce((sum, id) => sum + internals.estimateTokens([{ type: 'text', text: textOf.get(id)! }]), 0);
+    assert.ok(STORE(cm).estimateTokens({ content: [signed(80_000)] }) > pinnedTokens + 100, 'setup: the signature alone is past the budget');
+    internals.config.compressionRecallBudgetTokens = pinnedTokens + 10;
+    cm.pinRange(ids[5], ids[5], { name: 'thinking' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin is honored: ${JSON.stringify(warnings)}`);
+    assert.ok(!JSON.stringify(request).includes('S'.repeat(1000)), 'the raw message is sent without its thinking');
+    cm.close();
+  });
+
+  it("a recall answer's signed reasoning is sent, and the gate prices it in full", async () => {
+    // Every summary carries signed reasoning, which a recall answer replays.
+    const pricedWith = async (name: string, chars: number) => {
+      const respond = (call: number) => [signed(chars), { type: 'text', text: `Summary #${call}: ordinary events.` }];
+      const { cm, internals, ids, requests } = await forest(name, {}, undefined, undefined, undefined, respond);
+      internals.config.compressionRecallBudgetTokens = 10_000_000;
+      internals.config.compressionContextBudgetTokens = 1;
+      cm.pinRange(ids[5], ids[5], { name: 'pin' });
+      const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+      const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+      assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+      const delta = STORE(cm).estimateTokens({ content: [signed(chars)] }) - STORE(cm).estimateTokens({ content: [signed(100)] });
+      cm.close();
+      return { priced: Number(priced), delta };
+    };
+    const short = await pricedWith('carrier-short', 100);
+    const long = await pricedWith('carrier-long', 20_100);
+    assert.ok(long.delta > 1000, 'setup: the longer signature costs more');
+    assert.ok(long.priced - short.priced >= long.delta, `at least one recall answer's signature is priced: ${JSON.stringify({ short, long })}`);
   });
 });
 
@@ -439,43 +746,60 @@ describe('the raw pins add is spent from the recall budget', () => {
     cm.close();
   });
 
-  it('pins are kept up to compressionContextBudgetTokens, priced as the request is sent', async () => {
+  it('pins are kept up to compressionContextBudgetTokens, priced as the request is sent with the longer retry line', async () => {
     // The pinned chunk carries an image and two turns of one speaker, which
-    // the request collapses into one with a separator, and the host serves a
-    // system prompt and tools, so every term of the price is in play.
+    // the request collapses into one with a separator; a second opened chunk
+    // starts on the agent's turn after a recall pair, so the Context Manager
+    // takes a turn between them; and the host serves a system prompt and
+    // tools. So every term of the price is in play. A retry appends a line to
+    // the instruction, so a retry of the admitted request must fit too.
     const image = { type: 'image', source: { type: 'base64', data: 'A'.repeat(64), mediaType: 'image/png' } };
     const tools = [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
-    const run = async (name: string, budget: number) => {
-      const { cm, internals, ids, textOf, requests } = await forest(name, {}, undefined,
-        (i, text) => (i === 5 ? [image, { type: 'text', text }] : [{ type: 'text', text }]),
-        (i) => (i % 2 === 0 || i === 5 ? 'User' : 'Claude'));
+    const speaker = (i: number) => (i % 2 === 0 || i === 5 ? 'User' : 'Claude');
+    const run = async (name: string, budget: number, retried = false) => {
+      const { cm, internals, ids, textOf, requests, script } = await forest(name, {}, undefined,
+        (i, text) => (i === 5 ? [image, { type: 'text', text }] : [{ type: 'text', text }]), speaker);
       cm.setSystemPrompt('You are the agent whose memory this is.');
       cm.setToolDefinitions(tools as never);
       internals.config.compressionContextBudgetTokens = budget;
       cm.pinRange(ids[5], ids[5], { name: 'at-the-limit' });
+      const agentFirst = internals.summaries.find((s) => s.level === 1 && ids.indexOf(s.sourceIds[0]) >= 30 && speaker(ids.indexOf(s.sourceIds[0])) === 'Claude');
+      assert.ok(agentFirst, 'setup: an L1 opens on the agent\'s turn');
+      cm.pinRange(agentFirst!.sourceIds[0], agentFirst!.sourceIds[0], { name: 'agent-first' });
       const root = rootHolding(internals, ids[5]);
+      // A tool call brings the no-tools retry; its memory, wrapped whole in
+      // <thinking>, brings the plain-prose retry.
+      if (retried) script.push('tool_use', 'thinking-wrapped');
       const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
       assert.ok(request, 'the compression ran');
       assert.ok(request.system && request.tools?.length, 'setup: the request carries the system prompt and tools');
       const view = (cm as unknown as { strategyMessageView(): { estimateTokens(m: unknown): number } }).strategyMessageView();
       const priceOf = (content: unknown[]) => view.estimateTokens({ content });
-      const price = request.config.maxTokens +
-        priceOf([{ type: 'text', text: request.system }]) +
-        priceOf([{ type: 'text', text: JSON.stringify(request.tools) }]) +
-        request.messages.reduce((sum: number, m: { content: unknown[] }) => sum + priceOf(m.content), 0);
+      const price = (sent: any) => sent.config.maxTokens +
+        priceOf([{ type: 'text', text: sent.system }]) +
+        priceOf([{ type: 'text', text: JSON.stringify(sent.tools) }]) +
+        sent.messages.reduce((sum: number, m: { content: unknown[] }) => sum + priceOf(m.content), 0);
+      const instruction = (sent: any): string => sent.messages.at(-1).content.at(-1).text;
+      const retries = requests.filter((sent) => sent !== request && isL1Request(sent) &&
+        instruction(sent) !== instruction(request) && instruction(sent).startsWith(instruction(request)));
       const texts = textsOf(request);
       const raw = texts.includes(textOf.get(ids[5])!);
       const recalled = texts.includes(`[CM] Recall memory ${root.id}.`);
+      const resumeTurns = texts.filter((text) => text === RECALL_RESUME_TEXT).length;
       cm.close();
-      return { price, raw, recalled, warnings };
+      return { price: price(request), retryPrices: retries.map(price), raw, recalled, resumeTurns, warnings };
     };
-    const roomy = await run('context-roomy', 10_000_000);
+    const roomy = await run('context-roomy', 10_000_000, true);
     assert.ok(roomy.raw, 'setup: with room, the pinned message is raw');
-    const exact = await run('context-exact', roomy.price);
-    assert.ok(exact.raw && exact.price === roomy.price, `a request of exactly the budget (${roomy.price}) keeps the pins`);
-    const over = await run('context-over', roomy.price - 1);
-    assert.ok(!over.raw && over.recalled, 'one token less, the summary the pin overrides is recalled instead');
-    assert.ok(over.warnings.some((w) => w.includes(`~${roomy.price} tokens`)), 'the warning gives the price of the request it would have sent');
+    assert.equal(roomy.resumeTurns, 1, 'setup: the request carries the Context Manager\'s turn before the agent-first chunk');
+    assert.equal(roomy.retryPrices.length, 2, 'setup: both retries were sent');
+    const longest = Math.max(...roomy.retryPrices);
+    assert.ok(longest > roomy.price, `setup: a retry (${longest}) is longer than the request it retries (${roomy.price})`);
+    const exact = await run('context-exact', longest);
+    assert.ok(exact.raw && exact.price === roomy.price, `a request whose longer retry is exactly the budget (${longest}) keeps the pins`);
+    const over = await run('context-over', longest - 1);
+    assert.ok(!over.raw && over.recalled, `one token less, the summary the pin overrides is recalled, though the request without a retry line (${roomy.price}) would fit`);
+    assert.ok(over.warnings.some((w) => w.includes(`~${longest} tokens, counting the line a retry adds`)), 'the warning gives the price it was held to');
   });
 
   it('pinned raw is priced as the store prices it, images included, without adaptive selection too', async () => {

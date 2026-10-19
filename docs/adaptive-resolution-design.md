@@ -265,10 +265,11 @@ selectNextFold(state, budget):
   // Pick the most-populous level. Tiebreak: lower level (so we fold
   // older fragmented detail before consolidating coarser regions).
   k = argmax(visibleCounts)
-  // Within that level, pick the oldest group eligible to raise.
+  // Within that level, pick the oldest group eligible to raise: the oldest
+  // chunk's next summary up, past a level where it has none.
   groupRoot = oldestRaisableGroupAtLevel(state, k)
   if !groupRoot:
-    // Try to produce the next level.
+    // No summary above lists it: try to produce the next level.
     return { kind: 'produce', level: k+1, range: oldestGroupRange(state, k) }
   return { kind: 'raise', groupRoot: groupRoot }
 ```
@@ -287,11 +288,13 @@ raiseGroup(groupRoot):
   for chunk in chunksUnder(groupRoot):
     if chunk.lockedByAgent:
       continue   // skip locked chunks; group fold becomes partial
+    if ancestorAt(chunk, groupRoot.level) != groupRoot:
+      continue   // a leaf it lists through another lineage keeps its level
     chunk.currentResolution = max(chunk.currentResolution, groupRoot.level)
     chunk.resolutionChangedAt = now()
 ```
 
-`chunksUnder(groupRoot)` walks the summary tree down from `groupRoot` to all leaf chunks under it. The `max` matters: a chunk already at a higher resolution isn't lowered when an intermediate group containing it is folded later.
+`chunksUnder(groupRoot)` walks the summary tree down from `groupRoot` to all leaf chunks under it. A leaf whose own summary at that level (`SummaryTree.ancestorAt`) is another one, or none, keeps its level, as kv-control's group fold decides. The `max` matters: a chunk already at a higher resolution isn't lowered when an intermediate group containing it is folded later.
 
 **Locked chunks block group-fold partially.** If chunk C is `lockedByAgent: true` and the picker raises C's level-k ancestor group, every chunk in the group *except* C flips to level k. C stays at its current resolution. The rendered output then has a hole inside what was a contiguous group — strategy must handle this in its eligibility check (only consider a group raisable if at least one chunk inside is unlocked, ideally most).
 
@@ -300,9 +303,16 @@ raiseGroup(groupRoot):
 > foldable group is excluded from the fold rather than vetoing it — boundary-cut
 > tolerance, §13.6. Group atomicity means "every participating leaf".
 
-**Producing missing summaries.** If `raiseGroup(groupRoot)` requires
-L_{k+1} and no L_{k+1} exists yet, the strategy emits a `produce` op
-instead of a `raise`. The picker collects produce ops in
+**Producing missing summaries.** If no summary above the chunk lists it,
+the strategy emits a `produce` op for L_{k+1} instead of a `raise`. A level
+the chunk's lineage skips, or one whose summary doesn't list it, is passed
+over to the next summary up that lists it rather than produced: below it the
+lineage already links upward, and the handler below makes an L1 only for a
+chunk without one, and merges only summaries that link to none, two or more
+at a time. For the same reason, a produce op for a chunk whose summary links
+upward to one that doesn't list it makes nothing, and the next compile asks
+again. A store the strategy opens has no such link, since its load repair
+replaces or clears it. The picker collects produce ops in
 `PickerResult.produced` and stops (one produce op per `run()` call). The
 caller — `AutobiographicalStrategy.selectAdaptive` — routes each op via
 `handleProducedOps`:
@@ -389,8 +399,9 @@ L_k summaries for `k > 1` come from two complementary paths in V1:
   default-on under `adaptiveResolution`): when a new L_k lands, if N
   siblings now share a (would-be) L_{k+1} parent, the pre-producer
   enqueues the L_{k+1} merge immediately. Walks all levels recursively so
-  the chain climbs as far as the source counts justify. Bounded by
-  `maxSpeculativeL1s` to keep cost-sensitive deployments honest.
+  the chain climbs as far as the source counts justify. Past
+  `maxSpeculativeL1s` unmerged L1s, L1 production ahead of it waits while
+  an L1 merge is queued, to keep cost-sensitive deployments honest.
 - **Reactive on `produce` op** (§3.8): if the picker requests an L_n the
   pre-producer hasn't reached yet (either because the deployment opted
   out, or because the speculation cap held it back), `handleProducedOps`
@@ -457,7 +468,11 @@ Given:
             budgetMet, exhausted, moves, deadFrontierIds, unrealizable }.
 
 [selectAdaptive — strategy side, after picker.run]
-5. Commit finalResolutions to strategy state; persist if changed.
+5. Stage each unlocked middle chunk's level where it differs from the level
+   it has saved. A dry run stages them too, to count them. Commit and
+   persist the staged changes only once every later stage has succeeded,
+   and never in a dry run, so neither a refused compile nor a dry run saves
+   a level.
 6. If produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the hard budget × (1 +
@@ -468,9 +483,13 @@ Given:
    shards via the rendering algorithm in §3.6.1.
 ```
 
-`moves` is the number of chunks whose resolution changed vs the carried
-state (it replaced the op walk's `iterations` in `PlanVsActual` and the
-preview surfaces when the walk was retired — see §3.5 history note).
+`moves` is the number of chunks whose resolution changed from the level
+they started the solve at. It replaced the op walk's `iterations` in
+`PlanVsActual` and the preview surfaces when the walk was retired (see §3.5
+history note). Those surfaces now report instead the changes step 5 stages,
+which are the saved levels a compile commits. They leave out locked chunks,
+which keep their saved level even while a pin renders them at another
+(#195).
 
 Token counting: each chunk's `rawTokens` is computed at picker-input
 construction time (delegated to `MessageStoreView.estimateTokens`); each
@@ -751,7 +770,13 @@ and re-introducing one via the objective notation would repeat it.
   not obtained by minimizing this function.
 - `perturbation(F, F_prev)` — exact, not modeled: rendered tokens from the
   earliest position where `F`'s layout diverges from `F_prev`'s to the end
-  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read.
+  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read
+  for the plan's own choices. `F_prev` here is the carried frontier: the
+  persisted one with this compile's protections applied first (the raw zone
+  raw, pins at their level and locks at theirs, each lowered to a level where
+  the leaf has a summary of its own lineage that lists it, and a tightened
+  pin-max-level, a lock's included) and projected to a valid cut (§13.6). A change every plan must make is in it already, so no plan's
+  perturbation counts it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
   turn may take; it never determines *which* chunks may move.
@@ -847,7 +872,8 @@ locked chunks. Salience never overrides a pin.
 *(rev 5.1 amendment — boundary-cut tolerance, `de3d293`.)* A hard protection
 protects its **leaf**, no longer its whole group: a protected leaf inside a
 foldable group is *excluded from the fold* rather than vetoing it, and renders
-raw beside the group's recall (the renderer's "ownership wins" semantics).
+at the level it's held at (raw for the flat zone, head, tail and a classic
+pin) beside the group's recall (the renderer's "ownership wins" semantics).
 Without this, a head/tail boundary cutting two messages into a 742-leaf L3
 group made the entire group permanently unfoldable and OverBudget-wedged the
 agent with its own L3 sitting unused. Details and the related unanimity
@@ -954,9 +980,10 @@ stores; all are load-bearing and none appeared in the original rev 5.0 text.
 **Boundary-cut tolerance** (`de3d293`). A hard-protected leaf (−1 sentinel:
 raw zone / pins / locked) inside a foldable group is *excluded from the fold*
 rather than vetoing it, and is exempt from group unanimity in the validity
-projection. The renderer already draws protected messages raw beside their
-chunk's recall ("ownership wins"), so a boundary cutting through a group must
-not make the group permanently unfoldable. Trigger: calibration drift moved
+projection. The renderer already draws a protected message at the level it's
+held at (raw for the raw zone and a classic pin) beside its group's recall
+("ownership wins"), so a boundary cutting through a group must not make the
+group permanently unfoldable. Trigger: calibration drift moved
 the token-derived head boundary two messages into an L3's first chunk — the
 2-leaf overlap vetoed the whole 742-leaf group in every phase, and the agent
 OverBudget-wedged with its own L3 unused. Consequence for §3.8: group
@@ -970,12 +997,61 @@ monotone-lowers the whole group around it — observed: one disagreeing leaf
 un-folded a 200-leaf group, 615 leaves cascaded (+24k tokens), and the solve
 returned an over-W frontier while a produced L4/L5 layer sat unused (opus4).
 Now leaves whose lineage disagrees are skipped by folds and exempted from
-unanimity: they render raw beside the covering recall. **This is a degraded
-mode, not a feature** — every exempted leaf means messages are semantically
+unanimity: they keep their own level, raw or through their own lineage,
+beside the covering recall. **This is a degraded mode, not a feature** —
+every exempted leaf means messages are semantically
 *double-represented* in the window (rendered raw or via their own chain while
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
-until the store gets nesting repair.
+until the store gets nesting repair. It reads the frontier the plan emits: a
+rendered summary that lists a leaf whose own summary at that level
+(`SummaryTree.ancestorAt`) is another one, or that has none there. So a plan
+reports the leaves of a fold it carries as it reports those of one it makes. The
+planner only finds these leaves, as the
+plan's `overlap`, and the compile logs them for its own plan, beside
+`[kv-escalation]`. So the shadow production pick, which a compile that isn't
+a dry run makes when `productionBudgetTokens` is set below its budget, plans
+the same way and doesn't warn: no compile renders its plan. A leaf that a
+lock or a pin holds beside a
+summary of its own lineage that lists it renders in both recalls without a
+warning: a protection put it there, not the topology. A fold's eligibility
+and its moves, phase C's un-folds and the validity projection all decide
+which leaves a node renders by that same lineage rule, per node, so no pass
+depends on which folds ran in this compile.
+
+The validity projection decides the exemption by lineage: a leaf that a group
+lists, but whose own lineage at the group's level is another summary or none,
+never vetoes the group. Nor does a leaf folded above the group's level: it
+renders through a coarser summary of its own lineage, and that summary's
+unanimity decides whether it stays there. Where it stays and the group
+renders, the leaf is in both recalls. On a nested tree that can't last for a
+leaf no protection holds, since the coarser summary owns the group's leaves
+and those below its level veto it, unless every one of them is
+hard-protected, since those never veto. A held leaf stays where the base
+put it: a pin-at-level holds a whole node's leaves at one level, but a lock
+holds one chunk, so a lock above its group stays there with the group's
+recall beside it, boundary-cut tolerance extended to a lock. On a non-nested
+tree an unheld leaf can stay too, overlap like the rest of this section's.
+Only a listed leaf of the group's own lineage rendered in more detail than
+the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
+never does. A leaf also stays at its level only where it has a summary there:
+the summary its own lineage reaches at that level, when that summary lists
+it (`SummaryTree.ancestorAt`). A level carried from before the tree's links
+changed can point through a summary that no longer covers the leaf. The
+projection lowers such a leaf, and the base lowers a locked or pinned leaf's
+level to the next one down where it has a summary
+(`SummaryTree.renderableLevel`), since the projection holds those: past a
+summary that doesn't list it, a level its lineage skips, or the top of its
+lineage. Every projection applies
+the rule alike, the ideal cut's, the carried frontier's and each
+suffix-adoption candidate's, so a frontier the planner emitted projects to
+itself on unchanged inputs. Before this rule,
+only the ideal cut's projection exempted these leaves, through the solve's
+own exempt set, and the carried frontier's and suffix candidates'
+projections didn't. The next compile's carried frontier then un-folded the
+group around them, so on unchanged inputs the window re-laid while the plan
+reported a perturbation of 0, or reported a fold and a perturbation for a
+frontier it hadn't changed.
 
 **Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
 levels; on a non-nested tree its repairs *add* tokens after the phases stopped
@@ -1009,8 +1085,12 @@ unit identity (siblings share one recall unit). Phase C therefore records
 may hold members below the fold level, and a hardcoded from/to drifts the
 ledger off the render — after which every later accept decision runs on
 corrupt arithmetic (observed: phase C walked an L3 fold all the way back to
-carried while its ledger believed it sat on target). Anyone editing the
-phases is editing against this invariant.
+carried while its ledger believed it sat on target). Each un-fold phase C
+tries prices each leaf it moves where the projection will put it, so the
+accept weighs it there: one level down, or deeper while the summary of the
+leaf's own lineage there is missing, doesn't list it, or is vetoed by a leaf
+below it, down to raw. A revert moves each leaf back from that level. Anyone
+editing the phases is editing against these invariants.
 
 **Memoization contracts** (`1c4c436`, `7f2d5e1`). Three memos are
 correctness-relevant, not just performance: group *eligibility* is memoized

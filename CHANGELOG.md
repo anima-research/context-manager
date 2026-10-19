@@ -12,6 +12,510 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.16.0 — 2026-10-19
+
+### Breaking
+
+- **TypeScript callers that write to a compile's provenance:** its `layout`
+  (`RenderedLayout`, `LayoutUnit`), its `branch` and every other `BranchRef`,
+  its `journalMark`, and its `compileId`, `namespace` and `strategy` are
+  read-only. Code that assigns to them, changes their arrays, or passes one of
+  their arrays where a mutable array is expected stops compiling. Acceptance
+  reads and records what they say, and the mark steers its search for an
+  earlier acceptance, so such a write before accepting changed what it
+  recorded. Copy before changing. Unchanged: the per-message sources in
+  `messages` stay writable, and reading these parts compiles as before.
+
+- **Strategy authors:** `AutobiographicalStrategy`'s protected
+  `summaryAnswerContentCapped` and `combinedRecallAnswerContent` are removed.
+  Since 0.15.0, compiles render the live window's recall answers through
+  `renderSummaryAnswer` and `renderCombinedRecallAnswer`, so neither has
+  changed what a compile sends. A subclass that calls either, or overrides
+  one with the `override` keyword, stops compiling. A plain override still
+  compiles and still does nothing, so remove it. A call becomes
+  `renderSummaryAnswer(summary, maxTokens).content` or
+  `renderCombinedRecallAnswer(summaries, maxTokens).content`. To change what
+  a live-window recall answer says, override `liveWindowAnswerProse`, which
+  both render methods and the budget's pricing read; overriding only a
+  render method changes what is sent but not what is priced. The render
+  methods, which return the layout's references with the content, are where
+  to change how the cap cuts an answer. The recall pairs in merge and
+  compression requests render through `summaryAnswerContent`, as before.
+  Unchanged: what compiles render.
+
+- **Host operators:** take `@animalabs/membrane` 0.6.0 or later in your own range with this release. context-manager now requires `^0.6.0`, where it required `^0.5.69`, and it counts a compression attempt's prompt through `ctx.membrane`, the host's own instance, which that range doesn't bind: npm installs context-manager's own 0.6.0 nested beside a host's older membrane without complaint. 0.6.0 is the first release that states Gemini's cached input apart from its fresh input (antra-tess/membrane#109), and it also adds Gemini's tool-use prompt tokens, which Google's own tools such as code execution add to a prompt, to the input count (antra-tess/membrane#125). A host whose own membrane is older passes Gemini's counts raw, with the cached span inside the input count. Below 0.5.81 it passes OpenAI's raw too, and OpenRouter's on routes that report OpenAI's `cached_tokens`. This release counts that span twice there: a compression fallback that fits can be `admission_rejected`, and its chunk can go to quarantine.
+  - **Migration:** raise the host's own `@animalabs/membrane` range to `^0.6.0`.
+  - **Unchanged:** context-manager's API, its options and what it stores, and how it counts Anthropic's and Bedrock's input, which it already summed with their cache counts.
+
+- **Hosts that write content they didn't build,** such as a channel's
+  messages: `addMessage`, `editMessage`, `MessageStore.append` and `edit`,
+  `ContextLog.append`, `edit` and `replaceAll`, and `blockAsStored` for its
+  one block, now refuse content that doesn't match `ContentBlock` where its
+  readers read it, and store nothing of it. Before, such content was stored,
+  and a reader written against `ContentBlock` could throw on it from then
+  on, except inline media the store couldn't keep, whose write threw. What's
+  refused: content that isn't an array; a block that isn't an object, is an
+  array, or has no string `type`; a text or thinking block whose `text` or
+  `thinking` isn't a string; a `tool_result` whose content is neither a
+  string nor an array of such blocks, at any depth; an image, document,
+  audio or video block whose `source` isn't an object, such as MCP's form of
+  an image or audio, which carries `data` and `mimeType` on the block (a
+  write takes it as `source: { type: 'base64', data, mediaType }`, as
+  agent-framework converts it); inline media the store can't keep as a blob,
+  where its own write threw an error naming neither the block nor the field:
+  a document, audio or video block, or an image other than a URL one, in the
+  content itself, not inside a `tool_result`, whose `source.data` the
+  store's read of base64 can't take, which only data that isn't a string can
+  be, or that has no media type, neither a declared `source.mediaType` nor,
+  for an image, a png, jpeg, gif or webp signature in its data (data outside
+  membrane's string type, such as a `Buffer`, is read for this as the store
+  reads it, a copy the store's write then makes again); a generated image
+  whose `data` or `mimeType` isn't a string; a `tool_use` whose `input` is
+  given, isn't an object and has no JSON form, such as a `bigint`, unless
+  the block already carries a string `unparseableInput`, which is kept; and
+  a `blob_ref`, which only the store writes. A host that copies messages
+  from one store to another copies them as read with blobs resolved, the
+  default: a read with `resolveBlobs: false` gives `blob_ref`s. The refusal
+  is a `MalformedContentError`. Its message names each place by its path,
+  such as `Message refused: content[1] is a string, not a content block.`,
+  and its `places` lists them. `malformedContentPlaces(content)` lists the
+  same places without throwing, for content as JSON gives it nested no
+  deeper than the call stack allows, so a host can check content before it
+  writes or queues it, and drop a write this refuses rather than requeue it.
+  `addMessage` refuses such a message before anything else happens: no
+  compression hold expires or is placed, and the strategy's ingress chunking
+  never reads it. A shard of a strategy's chunking that doesn't match is
+  refused before any shard is stored, with an error naming the shard, though
+  by then expired holds have been released, as at any add; and
+  `ContextLog.replaceAll` refuses an entry holding such content before it
+  clears the log.
+
+- **Anyone running context-manager on Node 20 or 21, or on Node 22 before 22.12:** context-manager now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, and CI tests at Node 22.12.0 exactly, at 24 and at the newest Node, where it tested the newest 20.x and 24. Node 20 reached end of life on 2026-04-30. npm warns when it installs context-manager on an older Node, and refuses only with `engine-strict` set. Nothing in context-manager's code changes with this; older Node versions are simply no longer tested.
+  - **Migration:** run Node 22.12 or later.
+  - **Unchanged:** context-manager's API, what it stores, and what it compiles.
+
+### Added
+
+- `[fold-diff]` observability for adaptive compiles: when a compile that
+  changed at least one saved level commits, the strategy logs once which
+  chunks moved between which levels, grouped into contiguous source-order
+  runs, and where its request's entries first differ from those of the last
+  request the strategy returned, with the tokens from there to the end, which
+  no cached prefix can cover — e.g.
+  `[fold-diff] moves=18 (deepened=18 raised=0) divergence@20k suffix=32k runs=1: L0→L1×18[636..656]`.
+  A compile that commits no saved-level change prints nothing, whatever else
+  changed in its request, and neither does a dry run or a plan refused before
+  the commit. The same record is attached to
+  `RenderStats.planVsActual.foldDiff`, with at most eight runs and
+  `runsTotal` counting them all, and describes only the compile it is
+  attached to.
+- The runs compare the carried frontier with the new one, both at the levels
+  chunks render at under this compile's pins and summaries: a pinned chunk
+  counts as raw whatever it carries, and locked chunks are skipped as the
+  commit loop skips them. So the runs describe what the commit changes, and a
+  pin added or removed, a summary lost or a lock released since the previous
+  request changes the request without a run; the divergence shows where. A
+  compile that only saves a lower level for a chunk whose summary is gone
+  logs a line with no move. A move can leave the request unchanged, when the
+  summary it moves to already renders for its siblings and the one it leaves
+  still renders for theirs.
+- The divergence is measured: it is where this request's entries first
+  differ in their bytes from the previous request's, the comparison that
+  places the stable-prefix cache marker, which now also runs under
+  kv-unified. A pin, an appended message or a message edited in place since
+  the previous request shows where it lands; after a branch switch, the
+  previous request is the other branch's. Its offsets count the entries'
+  tokens only: the system prompt and tools come before them and are neither
+  compared nor counted. Nor are the injections `compile()` adds after the
+  comparison: one placed before the last user message moves with it, so
+  where nothing earlier differs, the request first differs at the injection,
+  a message before the divergence the line reports. The strategy's first
+  compile after the process starts has nothing to compare with, and its line
+  says so.
+
+- `OverBudgetError.clearedBy` names what clears an over-budget refusal at run time besides a larger budget, which clears any of them: `'compression'` while compression work that would shrink the context is running or queued for the drain to take, which a compression hold or the speculative cap can stop (for the adaptive picker, only while its plan still has summaries to produce), `'newer-message'` when the newest message alone is over (windowed passthrough) and a newer one that fits would move past it, and `'smaller-recent-window'` when the raw recent window is what's over and the head fits beside the newest turn as the compile must keep it raw: the newest message (for one split into shards, its newest shard), or, when the newest message's body holds a `tool_result`, that whole body and the call before it, or everything from a compression hold that starts earlier. It doesn't name compression for a chunk that needs a model call while the compression quarantine holds it (tick skips it, though a request of a new shape gets a fresh attempt), for a chunk tick defers until the host declares its tools, for a queued chunk or merge, or the work in flight, none of whose messages the compile can fold (each lies in the raw head or recent window, or a pin keeps it raw; a merge's messages are the leaves of its sources), whose summary would free no room though tick still takes it, for work in flight that a compression hold placed since reaches, whose landing discards what the call returns, for a chunk in flight whose summary has landed before its call ends, which the compile already folds through, or, without a compression model, for a merge or a chunk only a model call settles. With a model, the count walks the queued merges in `tick`'s order, a merge in flight still among them at the head, past one that folds nothing, which `tick` runs before it takes the next once that call lands or drops it, as far as one a compression hold blocks, where `tick` stops. A call that fails, is refused or is withdrawn leaves its merge at the head, so the count can name work behind it that `tick` reaches only after that. A merge counts even when `tick` will drop it as stale without a model call, because a source isn't loaded or is already merged into another summary, or its sources fail the merge's topology check (`tick` then quarantines it), until `tick` reaches it and drops it, while a source in memory covers a message the compile can fold; one with no source in memory names nothing. When there's no compression model or the quarantine can't be read, it doesn't name compression for anything queued behind a chunk only a model call settles: tick throws at such a chunk, and a host's tick loop ends there. Where tick would instead defer that chunk until the host declares its tools and go on, the count stops there too, since reading tool blocks as stored it can't always tell. It's empty when nothing else is known to clear the refusal. A dry run's `PreviewResult.clearedBy` carries the list for a layout that doesn't fit, the plan's own when the plan is over the budget; it names compression only for work queued when the dry run takes the list, not for what its plan's own ops would queue. A host can now tell whether compression work that can make room is under way without reading the message, though whether that work is enough to fit isn't checked. The list's type is exported as `OverBudgetClearedBy`; the messages are unchanged.
+
+### Changed
+
+- A `tool_use` whose `input` isn't an object, as membrane 0.5.87's adapters
+  can give it, is now stored with `input: {}`, and `unparseableInput`, where
+  membrane keeps arguments whose JSON didn't parse, keeps the value as JSON.
+  One with no `input` at all is stored with `{}` and no marker, and a string
+  marker the block already carries is kept. A block that shares a raw replay
+  form (`rawXml`, `rawItem`) with a mended one gives the form up, as after
+  any edit, so a write stores what a read of the same content gives. Before,
+  such a block was stored as given. Reads mend it the same way in a store
+  written before. They also mend a signed thinking block whose `thinking`
+  isn't a string, which keeps its signature with `thinking: ''`, as membrane
+  gives a signature-only block; media in MCP's form, with its `data` and
+  `mimeType` on the block and no `source`, which reads with them as its
+  base64 source, as agent-framework converts MCP's media; and a
+  `tool_result` whose content is a lone block or a number, which reads as an
+  array of that block, when the read keeps the block, or as the number's
+  text.
+
+- A message cut at `maxMessageTokens` now says that content was left out. The first text block past the cap that holds anything, text or an opaque item such as a Responses carrier, becomes one `[content omitted: this message reached its token limit]` block, in the autobiographical and windowed-passthrough strategies alike, where those blocks used to be dropped without a trace, so a message read as ending at the cut. A text block that holds nothing, empty or only whitespace, is left out across the cap as it already was past it, with no marker, where one crossing the cap used to be cut and given a truncation suffix; the cap ends there, as at a cut. A message whose every block is such a text block now carries the omission block alone when the cap leaves one of them out, where its whitespace was cut and given the suffix. Leaving one out no longer makes the summary it belongs to partial in the combined recall answer's layout, unless it gives up an item that a kept reasoning part pairs with: that part then goes out without its raw form, as after a cut, and the summary is listed partial. A summary the cap took something from that held anything, of which only text blocks that hold nothing reached the answer, is no longer listed in the combined recall answer's layout, with `recallEnvelope: 'xml'` or without, where it was listed partial: it shows the resident none of its history. A tool result whose content is a string already carried its own marker past the cap; an empty one now stays as it is, since it loses nothing. In the legacy combined recall answer (`positionedRecallPairs: false`), the marker goes where the first dropped block that held anything was, as in any message; with `recallEnvelope: 'xml'`, which spends the cap summary by summary, it goes once after the last answer when the cap leaves out a summary that holds anything, unless that answer's own cut already wrote it inside its envelope. That answer ends where the cap ended, even where the blocks the cap left out spent none of it, and a summary isn't admitted where the cap reaches it and leaves nothing of it that holds anything. An answer the cap admits no summary to is the omission block alone. A message the cap cuts nothing from, though its estimate passed the cap, comes back as it was and is no longer treated as cut: the xml combined answer lists such a summary as shown whole, where it listed it as partial. In the windowed-passthrough strategy, a message the cap looks at but cuts nothing from is now priced at its full estimate, as it renders, where it was priced at `min(estimate, cap + 50)`. The two differ only when such a message's estimate passes `cap + 50`, as one with a large tool call can, and the window's total then rises by the difference. The combined recall answer is priced as rendered, so a capped one now costs the marker's tokens more. The first compile after upgrading changes the bytes of these messages, and misses the prompt cache from the first of them on: one the cap drops a block that holds anything from, which gains the marker; one with a text block that holds nothing across the cap, or whose blocks all hold nothing, once the cap leaves one of them out; one with an empty string tool result past the cap; one in which the cap leaves out a part of a Responses item that holds nothing while a part it keeps carries the same item, which now keeps its raw form; and a combined recall answer that admits a summary differently, as above. Any other message from which the cap leaves out only text blocks that hold nothing, past the cap, comes out as it did. In the windowed-passthrough strategy, the new price can also move the window's start, which changes the prompt from there on too.
+
+- The markers context-manager writes into a compiled context now say what happened, and the stub for a missing tool result says what the agent can do. The first compile after upgrading renders the new text wherever a marker appears, so a provider's prompt cache misses from the first such marker on, once. In the adaptive selector, a stripped image is priced at its placeholder's length, 14 tokens where it cost 9, so that compile can also fit slightly different entries. The other markers' lengths enter no budget, so a result left out under `toolResultMaxLastN` still counts at its original size. The exception is a message `maxMessageTokens` cuts, whose cut is priced as it renders, its notices included.
+  - An image the context doesn't carry reads "[image not shown: this context keeps only some images]", in both strategies and in the compression prompt's image cap. It names no particular limit, since the count, byte and depth limits, the hysteresis watermark and the compression request's byte cap all write it.
+  - A tool call whose result isn't in the rendered context gets "[this call's result isn't shown in this context. If you need its output and the tool only reads, call it again; you'll get what it returns now.]".
+  - A result replaced under `toolResultMaxLastN` reads "[result of tool '<name>' left out: this context shows only the tool's last result]" for a limit of 1, "… the tool's last N results" for a larger one, or "… this context shows none of its results" for a limit of 0. It said "Result truncated", though the whole result is replaced, and counted later results that were replaced too.
+  - A tool result past a message's `maxMessageTokens` reads "[content omitted: this message reached its token limit before this result]", where it blamed the context budget.
+
+- In 0.15.0, under `foldingStrategy: 'kv-stable'` (connectome-host's default) and `'kv-unified'`, with `adaptiveResolution`, a pin or document whose `level`, or without a `level` whose `maxLevel`, is above 0 stopped keeping its messages out of compression; 0.15.0's notes list it under Fixed. Those messages are compressed, since only a summary can supply that level, and the selector holds them at `level`, or no deeper than `maxLevel`, so `markDocument(id, { maxLevel })` lets a document fold, but no deeper than that level. Under kv-unified, a pinned level on a message between the head window and the recent window that no summary supplies yet fails every compile until one does, as 0.15.0's notes say. The comments of `pinRange`, `markDocument`, `PinnableStrategy` and `ProtectedRange` now say so, and that where pins overlap at a message, the bound `ProtectedRange` names holds it, which can compress a message a raw pin covers.
+
+### Fixed
+
+- `acceptRound` refuses a compile whose branch its store doesn't know, live or
+  recorded in the manager's namespace, as it already refused one of another
+  namespace. Another store's compile in the same namespace used to land as a
+  receipt for a branch that store never had, announced to its listeners. A
+  compile of a branch deleted before any of its compiles was accepted is
+  refused the same way; a deleted branch with readable records still takes
+  one.
+- `listFoldReceipts` stops where a receipt's link leaves its namespace or
+  branch, and its `note` says so, instead of listing the other branch's
+  receipts as this one's. An acceptance no longer announces another branch's
+  receipt that such a link names.
+- `acceptRound` refuses a layout whose members aren't in ascending order,
+  whose units' counts aren't positive whole numbers adding up to its members,
+  or that doesn't have one id for each member, as a layout changed after
+  `compile()` returned it can be, instead of writing
+  a record that later fails to rebuild and starts its branch again from a
+  baseline. A change that keeps that shape can't be told from the layout
+  `compile()` returned, and is recorded as written.
+- The fold journal keeps its own copy of each layout and branch it accepts,
+  and a compile's `journalMark` and the branch `listFoldReceipts` returns are
+  copies. So changing a compile's provenance after accepting it no longer
+  changes the layout the journal diffs the next acceptance against, the
+  branch it lists receipts under, or where it looks for an earlier
+  acceptance.
+
+- A compression attempt's provider input count adds cache writes and cache reads to `inputTokens` for every provider, not only for Anthropic and Bedrock (#182). membrane states those three counts as disjoint wherever it knows the convention, so on the other providers that report cache reads, OpenAI's adapters, OpenRouter and, from membrane 0.6.0, Gemini, the count left out the cached span. A refused or incomplete compression's fallback plan then took a baseline too small, and could send an expanded fallback that doesn't fit the compression budget instead of recording it as `admission_rejected`. A successful attempt's `renderedTokens` under-reported its prompt by the same span.
+  - **Host operators:** on those providers, a fallback that doesn't fit is now `admission_rejected` and not sent, as on Anthropic and Bedrock, so a chunk can go to quarantine where before the fallback was sent. `renderedTokens` includes the cached span. A full cache hit, no fresh input beside a positive cache read, now counts as the provider's count of the prompt there too, where before the complete request bound stood in for it. A provider's omitted prompt total beside cache reads counts the same way, since membrane's adapters other than Anthropic's and Bedrock's report an omitted count as zero.
+  - Quarantine records written before this release go on holding their chunks, and the upgrade releases none. On OpenAI's adapters or OpenRouter, or on Gemini through membrane 0.6.0, the old count may have planned a held chunk's fallbacks wrongly, so the chunk may compress now. Clearing each of that chunk's records with `clearCompressionRefusalQuarantine(key)`, by the `quarantine_key` each of its `compression:quarantine-alert` events names beside the chunk's `chunk_hash`, gives it a fresh attempt under the corrected count. Called with no key, it clears every chunk's records.
+
+- A store holding content that doesn't match `ContentBlock` where its
+  readers read it no longer wedges its agent. Such content is content that
+  isn't an array; a block that isn't an object, is an array, or has no
+  string `type`; a text block whose `text`, or a thinking block whose
+  `thinking`, isn't a string; a `tool_use` whose `input` isn't an object; a
+  `tool_result` whose content is neither a string nor an array of such
+  blocks, at any depth; an image, document, audio or video block whose
+  `source` isn't an object; a generated image whose `data` or `mimeType`
+  isn't a string; or a `blob_ref` whose `ref` has no string `hash`, or whose
+  `originalType` isn't image, document, audio or video. Readers written
+  against `ContentBlock` throw on it. A store holding a block that isn't an
+  object, or a `blob_ref` without its `ref` or with any other
+  `originalType`, threw on every compile under the passthrough and windowed
+  strategies, after a reopen too. Under the autobiographical strategy,
+  opening such a store threw, and so did opening one holding a text or
+  thinking block without its `text` or `thinking`. Membrane 0.5.87 throws
+  while building a request that carries an image block without a `source` at
+  the top level, or inside a `tool_result` in xml tool mode. In native tool
+  mode, it replaces such an image inside a `tool_result` with a note that
+  its media type "undefined" isn't accepted, so the model loses it. Its
+  native formatter throws on audio without a `source` at the top level too.
+  Reads (`MessageStore`'s messages and `ContextLog`'s entries) now leave
+  such content out, or mend it so that it matches, before anything reads it,
+  blob resolution included, and log one line per message or context entry
+  naming each place, once per `MessageStore` or `ContextLog`. An entry that
+  comes to have another's index gets a line of its own unless the same
+  places are wrong in it. A `tool_use` is mended as a write now mends it. A
+  `tool_result` keeps its block with the blocks of its content that match,
+  or with an empty array in place of content that is neither a string, an
+  array, a lone block nor a number, so the pair they make survives. A
+  message whose content isn't an array, or all of whose blocks are left out,
+  reads with empty content. The store keeps the content as written, and
+  `editMessage` can replace it. In the message's content, and in each
+  `tool_result`'s content within it, a block that shares a raw replay form
+  (`rawXml`, `rawItem`) with a block a read changes or leaves out gives that
+  form up, as after any edit.
+
+- kv-stable: a pin-at-level at a level its chunk's lineage skips, where a
+  summary's parent is more than one level up, now holds the chunk at the next
+  level down where it has a summary. It was kept there and rendered raw, and
+  the picker reported its level as one it can't realize. A context that holds
+  such a pin compiles differently once after the upgrade, which rewrites its
+  prompt cache from where the compiled context first changes (#194).
+- flat-profile and oldest-first: a chunk's summary at a level is now one that
+  lists it, as for kv-stable. Where a summary's parent pointer named a summary
+  written again without its branch, they could choose that summary for the
+  chunk, raise the summary's own leaves and leave the chunk where it was, and
+  choose it again on every step until the solve threw "greedy fold solver
+  exceeded internal bound". Raising a summary now moves the leaves whose own
+  summary at its level it is, as kv-stable's folds decide: a leaf it lists
+  through another lineage keeps its level, where it used to be raised too,
+  even to a level where its own lineage has no summary. On a store whose
+  summary tree isn't nested this changes their plans, and oldest-first, which
+  chooses a summary only for the oldest chunk, can meet its target less often.
+  A chunk carried at a level whose summary doesn't list it now starts at the
+  next level down where it has one. And a step raises a chunk past a level
+  where it has no summary, one its lineage skips or one whose summary doesn't
+  list it, through the next summary up that lists it. Past a level its
+  lineage skips, it used to ask for a summary at that level, which the
+  strategy can't produce for a chunk whose lineage already links past it, and
+  stop there, short of its target, on every compile (#194).
+
+- `moves`, in the `[plan-vs-actual]` line, `planVsActual` and a preview's
+  result, now counts the chunks whose saved fold level the compile changes,
+  which are the levels it commits (#195). A dry run counts the levels it
+  would commit, and a preview counts the levels its layout changes, whether
+  or not the layout fits. It was the picker's count, of chunks whose solved
+  level differs from the level they were planned from, and the two differ in
+  two cases. A classic pin renders a locked chunk at another level while the
+  commit keeps the locked one, so that chunk counted as a move on every
+  compile for as long as the pin stood. A chunk whose saved level's summary
+  is gone is planned from the level its summaries still reach, so the
+  compile that saves that level didn't count it. A `moves=` histogram loses
+  the first and gains the second. `PickerResult.moves` is unchanged.
+
+- A split-stitch compression's `details.usage.discardedAttempts` now carries the cache counts its discarded calls (refused, incomplete or empty) reported, `cacheCreationTokens` and `cacheReadTokens`, beside their input and output counts (#199). It counted only input and output, so on providers that cache, the discarded spend's cached span was missing. The counts appear once some discarded call has reported cache counts, as the stitched usage's appear once some successful leaf has. The `attempted` totals in the split-stitch log events and in the stitched entry's split metadata gain the same two sums over every completed call, once some call has reported them.
+
+- A `beforeUser` injection passed to `compile()` now reaches the agent when
+  no compiled message has the participant `user`, in any letter case, as
+  when messages are stored under their authors' names: it goes at the end,
+  ahead of any `afterUser` injection, which already fell back to the end
+  there. Before, it was dropped without a log line or a trace. Its provenance
+  source and its tokens in the rendered layout come with it (#220).
+
+- kv-stable: a compile no longer logs `[kv-overlap]` about the shadow
+  production pick's plan, which no compile renders. A compile that isn't a dry
+  run makes that pick when `productionBudgetTokens` is set below its budget,
+  and the pick planned the same way and logged a warning about its own plan.
+  So a compile whose own plan rendered no such summary could warn, and one
+  whose plan did could warn twice (#222).
+
+- A message `maxMessageTokens` cuts is now priced, in both strategies, at its
+  uncapped price plus the store's estimate of what the cut changed, so the
+  cut is priced as it renders (#223). It was priced at no more than the cap
+  plus 50 tokens. But the cap cuts only text and string tool results, so a
+  capped message's images, tool calls and thinking went out whole beyond that
+  price. And the cap keeps four characters a token, which the store prices at
+  its own rates: a string tool result cut at a 10,000-token cap estimates at
+  about 17,400 tokens, and prose at about 13,800. At small caps the price
+  falls instead: a message of text alone cut at a cap of 1 estimates at about
+  15 tokens, where it was priced at 51. In the autobiographical strategy, a
+  message the cap leaves whole is priced as it is with no cap, where it was
+  priced at no more than the cap plus 50. In the adaptive selection's middle,
+  a body sharded at ingress is priced uncut where the plan keeps it raw,
+  since the middle sends its text uncut, where a cap smaller than a shard had
+  the plan count it cut, so emission could overrun the plan by what the cut
+  left out and refuse. A compile's render
+  stats count each message at its new price. A `maxMessageTokens` that isn't
+  a positive number, such as NaN, is no cap in the windowed strategy too,
+  which cut away a message's text and left the cap's notices in its place.
+  - Where `maxMessageTokens` is set, a compile fits fewer raw messages in its
+    budget wherever a capped message sends more than the cap plus 50. A
+    prose block cut at connectome-host's cap of 10,000 does at calibration
+    multipliers above about 0.73, and a string tool result cut there does at
+    any the clamp allows. At any cap a message's images, tool calls or
+    thinking can take it past.
+    The autobiographical strategy then folds or evicts sooner, and can refuse
+    with `OverBudgetError` where it sent a window over its budget. The
+    windowed strategy re-anchors sooner, and refuses a newest message that
+    renders past the budget, where it sent it. At small caps, a capped
+    message that keeps little beside its cut text is priced lower, so a
+    compile fits more of them.
+  - The estimator's calibration starts pricing epoch 3. A multiplier learned
+    where capped messages were under-priced made up for that price, so kept,
+    it would run high, and a compile it put over the hard budget would stay
+    refused. So the first compile discards the multiplier in a store holding
+    a message whose estimate the cut's test puts past the cap, or one the old
+    price could have limited, with an `[estimator-calibration]` warning and
+    `calibration.reset` in the render stats, and the first provider sample
+    sets it again. A store with no cap, or nothing near it, keeps its
+    multiplier, where its view reports the multiplier it estimates at, as
+    `MessageStore`'s does. One that doesn't is read at 0.6, so its store can
+    be counted for a message well under the cap.
+  - The hierarchical selection, which runs when `adaptiveResolution` is off
+    (the default), prices raw messages before the image strip. So a capped
+    message whose image the strip replaces is now priced with that image
+    whole, as an uncapped message there already is, where it was priced at
+    no more than the cap plus 50. Such a window can be refused where its
+    rendered size fits the budget.
+  - A window this moves misses the prompt cache on its first request after the
+    upgrade, and, in a store whose calibration restarts, can miss it again
+    once the first provider sample sets the multiplier.
+
+- Past `maxSpeculativeL1s`, compressing chunks into L1s now waits only while
+  an L1 merge is queued to bring the count of unmerged L1s back down (#240).
+  With none queued, it goes on. Compression used to stop for good, with
+  chunks still queued and nothing able to start it again, wherever no such
+  merge could come: with the cap below `mergeThreshold - 1`; with unmerged L1s
+  that can't merge filling the cap, as after a merge goes to the merge
+  quarantine; or with `hierarchical` false, where no merge runs. A host whose
+  compression had stopped this way compresses its queued chunks after the
+  upgrade, as it would have when they formed.
+- The option's documentation said the cap counted queued chunks too and held
+  back only the auto-tick. It counts produced, unmerged L1s, and its hold
+  applies in `tick` itself, background or manual.
+
+- `compile()` no longer groups every stored message into bodies to attribute
+  its raw entries. Provenance now finds each body a raw entry names, through a
+  store lookup when it doesn't follow the last body found, and reads the
+  stored messages only around it. The rendered layout still walks the
+  strategy's view, since it records every message of the view. Sources, their
+  completeness and `rawBodies` are unchanged.
+
+- Reads leave out a stored `blob_ref` of a document, audio or video whose
+  reference has no string `mediaType`, and log the line naming it, such as
+  `content[2].ref.mediaType is undefined, not a string`, as they do one whose
+  `originalType` isn't image, document, audio or video. Before, it read back
+  as media without a string media type, which the store's write can't keep,
+  so a host copying messages as read with blobs resolved couldn't store that
+  message. The store's own writes don't make such a reference: it keeps media
+  as a blob only at the top of a message's or context entry's content, where
+  every write path refuses media it can't give a type. An image's reference
+  still reads back with the type its bytes' signature names, whatever its
+  `mediaType` holds, and with that `mediaType` when its bytes carry no png,
+  jpeg, gif or webp signature.
+
+- kv-stable: on a store whose summary tree isn't nested (where
+  `[kv-overlap]` warns), the next compile no longer un-folds a summary around
+  a leaf that the summary lists but whose own lineage doesn't run through it,
+  or around a leaf of its own folded above it. The validity projection now
+  decides both from the tree, for the carried frontier and each
+  suffix-adoption candidate as for the ideal cut: a leaf vetoes a summary
+  only when it renders below the summary's level and the summary is its own
+  lineage there. Before, a plan that held re-laid the window from that
+  summary on, on unchanged inputs, and reported a perturbation of 0; a plan
+  that adopted the same frontier again reported a fold and a perturbation it
+  hadn't made; and suffix adoption could never take such a summary. On such
+  a store a plan can now also keep a summary folded where it used to render
+  that summary's leaves raw, since the solve's own exemption covered only
+  the leaves its folds had met. LariTesserae's #130 named the re-layout.
+- kv-stable: a compile no longer leaves a leaf at a level whose own-lineage
+  summary doesn't list it, on any store. A level carried from before a
+  summary was written again without one of its sources, a lock or a pin
+  could point there, and so could a fresh plan's passes on a store whose tree
+  isn't nested. The leaf's recall didn't hold it, and where no other recall
+  did, the turn was refused with `UncoveredDropError`. The projection now
+  lowers such a leaf, and the base lowers a locked or pinned leaf's level the
+  same way, so a lock or a pin can now render below the level it holds when
+  the summary there doesn't list the leaf. For a pin-at-level
+  (`pinAtLevel`, `ProtectedRange.level`), kv-stable now lowers the level the
+  same way before it holds the pin's summary there, so a summary it holds for
+  the pin lists the pinned chunk, and the chunk is held with that summary's
+  other leaves. It used to hold the leaves of the summary that doesn't list
+  the chunk, which nothing pins, and leave the pinned chunk unheld, so it
+  rendered raw when there was room.
+- kv-stable: where two pins-at-level overlap a chunk, it is now held at the
+  finer of the levels the two pins hold it at, whichever pin kv-stable reads
+  second; a pin whose chunk has no summary at or below its level holds the
+  chunk raw. A pin at a level where the chunk's lineage had no summary used
+  to set that level for the chunk, replacing a finer pin's level when
+  kv-stable read it second, and the chunk rendered raw, with the picker
+  reporting a level it can't realize.
+- kv-stable: on a store whose summary tree isn't nested, the solve's
+  un-fold pass now moves the leaves a summary renders, decided by each
+  leaf's own lineage as the projection decides. It used to leave out any
+  leaf that some fold in the same compile had met under another lineage,
+  and could then settle on a plan above `foldAt`, the same on every
+  compile. A fold decides the same way: a listed leaf of another lineage,
+  which the fold doesn't move, no longer vetoes it with its pin-max-level or
+  its fold-depth cap.
+- kv-stable: the solve's un-fold pass now weighs each leaf it moves where the
+  projection will put it: one level down, or deeper, past a level where the
+  leaf's lineage has no summary and past a summary that a leaf below it
+  vetoes, down to the next level whose summary of the leaf's own lineage lists
+  it and isn't vetoed, or to raw. It weighed every leaf one level down. Where
+  a summary in the leaf's lineage names a parent more than one level up, so
+  its lineage has no summary there, it counted the leaf as raw and could
+  decline an un-fold that would have brought the plan closer to its target.
+  Where a leaf below vetoed the summary there, the plan it took wasn't the one
+  the projection rendered, and a compile could end exhausted where a plan fit.
+- kv-stable: `[kv-overlap]` now reads the frontier the plan emits. It warns
+  for every compile whose plan renders a summary that lists a leaf of another
+  lineage, and only then. It used to report the folds the compile made, so a
+  plan that kept the carried folds could render the overlap without a
+  warning, and a plan that didn't render it could still warn. A lock or a pin
+  can still hold a leaf beside a summary of its own lineage that lists it,
+  which renders the leaf in both recalls without a warning.
+- kv-stable: a locked chunk with a pin-max-level is lowered to the cap at
+  plan start, as the cap promises. It used to keep its carried level above
+  the cap. A chunk under another range's pin-at-level keeps that level, as
+  before, since kv-stable fixes the pin's whole node there.
+- kv-stable: an unlocked chunk's level carried far above the summary tree's
+  top is now lowered in one compile to a level its summaries render. A plan
+  that held it could emit a level with no summary, which renders raw, and
+  the next compile then rendered the summary while reporting a perturbation
+  of 0.
+
+- A host can withdraw a compression or merge call it doesn't want made, such as one arriving while it holds the store or stops, by throwing `CompressionWithdrawn`, newly exported, or an error extending it, from the membrane it hands the strategy. Every rung of the L1 compression ladder (the tool-prose hoist, the recall fallbacks, source-only and split-stitch parts) and the merge path rethrow it unchanged and record no outcome, so a withdrawal never counts toward a quarantine. Before, each rung recorded it as a `provider_error`, and a ladder whose remaining rungs failed that way quarantined the chunk. `tick` puts a withdrawn chunk back at the head of its queue, unless a rebuild while the call was out decided the queue afresh, and a withdrawn merge stays at the head of its own. An L1 call whose branch moved while it was out discards the withdrawal, as it discards any error. A withdrawal isn't reported on the console as a failure, the opt-in compression log marks its receipt `withdrawn`, and it stops the speculative drain quietly. The strategy recognises it by a brand that subclasses and other copies of this package carry, not by its name.
+
+- In hierarchical mode, two kept summaries that list one summary no longer both render. Two instances on one store can merge the same run, since compression coalesces across instances and merges don't, and the store then holds two summaries over the same sources: each rendered, covering the same messages twice. Opening a store now drops every summary that lists one it isn't the parent of, with the summaries above it, as it drops a summary that names a missing one. A summary's parent is chosen as before, so of two merges of one run, the one all the run's pointers name is kept, and a source only the other listed merges again. When the run's pointers are split between the two, as a crash partway through the later merge's pointer writes leaves them, both are dropped and the run merges again. A summary that two list while its pointers name neither has no parent, so both are dropped and it merges again. The repair is persisted, so a second open changes nothing, and the open's log line names the summaries it dropped this way under "naming one it isn't the parent of".
+
+- `pushSummary` refuses a summary whose `sourceIds` isn't a non-empty list of ids, or, above L1, whose `sourceRange` isn't two message ids. The error names the summary and the value it holds, and nothing is held or stored. Before, such a summary was stored as written, and only a later open dropped or rebuilt it, with nothing to say where it came from; the summary with null `sourceIds` found in a real store (#130) has no known writer. An L1 whose range doesn't run from its first source to its last is now stored with that range, as the open would rebuild it, with a warning that names the summary and the range it held. This package's compressions and merges write readable sources, and an L1's range from its first source to its last, so only a summary built some other way, such as by a subclass calling `pushSummary`, meets the error or the warning.
+
+- The stable-prefix cache marker is placed against the last request the
+  strategy returned: a compile refused after it placed its markers no longer
+  becomes the request the next compile compares with.
+
+- The image-strip watermark (`imageStripHysteresisRatio`) registers its state slot when the strategy opens with the option on. Before, the slot was never registered, and its first write created it. A store whose slot was created that way keeps its watermark. A watermark write that fails is now logged once per strategy instance, naming the slot and the error, where before it was swallowed. The watermark still holds in memory until the strategy next loads its state (`initialize`), as a restart, a branch switch or fork, or `setStrategy` does.
+
+- An L1 prompt shows pinned history raw only when the request fits `compressionContextBudgetTokens` with the longer of the lines that the no-tools and plain-prose retries add to its instruction, so either retry of an admitted request fits too. The request used to be priced without that line, so a pinned request admitted within a few dozen tokens of the budget could go over it on a retry. The over-budget warning and the `compression:pinned-raw-over-budget` event's `requestTokens` give the price with the line, and the warning says so: "counting the line a retry adds".
+
+- With `witnessedBeforeSequence` set, a quiet stretch before the pin (a chunk of text only, with too little text to summarize, stored as a mechanical stub without a model call) is now stamped `witnessed`, as an L1 summary of the same chunk is. A merge of inherited summaries that included one used to take the live merge instruction, where `getMergeInstruction`, and the retry after a refusal, give a merge of all-witnessed sources the witnessed one; its result, and every merge above it, went unstamped. Such merges now take the witnessed merge instruction. The stamp is written when a stub is made, so summaries already stored keep what they were written with: a merge made after the upgrade over a quiet stretch stored before it still takes the live instruction. Deployments without `witnessedBeforeSequence` are unchanged.
+
+- An L1 compression prompt or a merge prompt no longer joins the agent's own raw turn to the recall answer just before it. The prompt collapsed the two into one message with a `---` separator, and the formatter merges consecutive messages of one role at the wire in any case, so the summarizer read the raw turn as the end of the memory it had just recalled. That happened wherever the agent's raw turn followed a recall pair, directly or past messages with no content, which a request leaves out: in the L1 prompt, at an opened chunk that starts on the agent's turn and at the raw middle; in a merge prompt, at an L2 target or the raw middle. A Context Manager turn, `[CM] The conversation resumes.`, now comes between them. The answer is the memory alone again, so a summary just before such a chunk keeps its refusal-fallback variant, which matches the answer exactly. The one-shot zero-recall surgery (`scripts/one-shot-zero-recall-surgery.ts`), which takes the recall pairs out of a compression request, is unchanged, but it dropped that raw turn along with the answer it was joined to. Given a request built now, it keeps the turn, and the Context Manager's turn before it. A prompt without that adjacency is unchanged.
+
+- Compression's data-URL matcher bounds what comes before a payload, so a string that almost matches no longer throws. In 0.15.0 the media type and its parameters had no bound, and a text holding `data:` and a run of nine million characters with no slash, or one parameter value that long, overflowed V8's regex stack and threw a `RangeError` from the compression request's preparation. Now the type's two names and each parameter name take at most 127 characters, as RFC 6838 bounds them, and there are at most 16 parameters with values of at most 1,024 characters, bounds of the matcher's own. A data URL past them isn't matched, and its payload stays in the prompt, so any compression request holding one can be refused for context length.
+- A replaced payload ends where its encoding does, except after a full-width last line. 0.15.0 took any escape inside a payload as part of it, so the text after a payload could be replaced with it: in the review's cases, a path, a URL or a few words. Now a payload wrapped at 60, 64 or 76 characters with escaped line breaks (`\n` and the like), as Ruby's `Base64.encode64`, PEM and MIME wrap it, is matched across them, and an escaped base64 character such as `\/` counts as one character of its line. Any other escape ends the payload, as do an escaped break after a line of another width and any raw line break, so the text after it stays. A payload whose last line is 60, 64 or 76 characters long can't be told from one that goes on, so it takes the base64 characters after its break with it. A payload wrapped at another width, which 0.15.0 replaced along with the text after it, now ends at its first break: with that first line under the 4096 floor nothing is replaced and the payload stays in the prompt, and otherwise only that line is. The floor counts the characters the payload takes in the text, escapes and breaks included.
+- The marker names the media type only when the decoded type reads as one, since a `\u` escape can spell any character into it. Otherwise the payload is still replaced, and the marker leaves the type out.
+- The split rung weighs each part's share of the summary target by what the part sends, priced as the store prices it: its text, its tool results and tool calls, and its images, with its thinking left out and its serialized media priced as their markers. So a part holding a data URL no longer takes nearly the whole target from its siblings, and a part holding a long tool result or images no longer falls to the 100-token floor. Each image counts at the store's estimate, though a request's inline image cap can replace some with placeholders, and a tool block whose partner is outside the chunk counts, though the request drops it, so such a part is weighed above what it sends.
+- An L1 request with raw pins priced the pinned raw, and the whole request, with their serialized media's payloads, against the recall budget and `compressionContextBudgetTokens`. So a pin whose raw carried a data URL, or one beside a chunk that did, could be dropped for recall even when the request as sent fit. Both are now priced as sent, with the media replaced: the pinned raw without its thinking, which the request strips from raw messages, and the request with the signed reasoning its recall answers carry, which it sends. Images are priced at the store's estimate, above what is sent where the request's inline image cap replaces some, and the pinned raw's charge against the recall budget also counts a tool block whose partner the request drops, so the gate errs toward recall.
+- A sharded body's size, which decides whether a chunk of it is compressed as reading and is quoted in the reading instruction, for an L1 and for a merge, is now priced as sent too, with serialized media as its markers and thinking left out. Pricing each shard scans its text, and a body's size is read for every chunk of it, so within one strategy context a shard's price is kept until one of its blocks changes. So is the transition summary's head, which kept 8,000 characters of its messages' text with their payloads in it and now keeps their markers in their place; the payloads its markers replace in the text it carries are logged with the transition request, as a compression request logs its own.
+- The tool-prose hoists (`compressionToolProseFallback`) are admitted against `compressionContextBudgetTokens` as a recall-curve variant is, where 0.15.0 sent them unpriced: the provider's count of the request each one rewrites (the canonical, or the source-only fallback for its own hoist), plus what the hoist adds, read from both requests with each block priced as its route sends it, plus the output reserve. The whole bound counts a block's raw replay forms (`rawXml`, `rawItem`) beside its fields, and the hoist's edit releases its call's, so a difference of the two whole bounds credited a released `rawXml`, which no route sends, against what the hoist adds. A recall-curve variant's delta is read the same way. A `redacted_thinking` block carrying a reasoning item is priced as that item alone, as both Responses routes send it (on the API route, membrane sends compression requests through its `openai-responses` formatter whatever formatter they name), and every other block by its fields. Two places where a route sends more than that are known, so what a rung adds there is priced low: such a reasoning block on Anthropic, which sends it whole and would meet one only where a compression model moved there from a Responses route replays its earlier answers (whether Anthropic accepts the block at all is unchecked), and a block whose `rawItem` outweighs its fields on the Responses API route, which sends the item, by the item's own overhead (unmeasured). Where that request has no count, or the provider counted only the copy stripped of reasoning that a transport rejection made it go as, the hoist is admitted on its own bound, and so is a recall-curve variant whose canonical went as that copy. A hoist over the budget is recorded as `admission_rejected` in the attempt's outcomes and traces, with its admitted tokens and the budget, and isn't sent. Each argument a hoist moves adds two messages, which the bound prices at 128 tokens each before their bytes, so near the budget a hoist can be skipped where it would have fit.
+- 0.15.0's entry says what preparation replaced in a request is logged when the request is sent. It's logged when the request is first sent: the retries an L1 attempt makes from a sent request (the no-tools, tools-less and carrier-stripped ones) log nothing again, and a merge retried after a `tool_use` rejection is built from its sources again on a later tick, so what preparation replaced in it is logged again.
+- **Upgrading a store from before 0.15.0:** a merge that serialized media pushed past the provider's context limit before 0.15.0 stays quarantined, since a merge quarantine record is keyed by the merge's sources alone. Records with `lastErrorType: 'context_length'` made before 0.15.0 may be such merges: `getMergeQuarantineStatus()` lists every quarantine record with its `lastErrorType`, and `clearMergeQuarantine(key)` clears one, after which the merge is retried with its serialized media replaced where the matcher reads it. A merge whose media this release leaves in the prompt, a data URL past the bounds or a payload wrapped at another width, can be refused on context length and quarantined again; another compression request holding such media can be refused the same way. A compression request whose payload this release ends or replaces differently from 0.15.0 changes its bytes, so it misses the prompt cache once after the upgrade. So does an L1 or merge of a sharded body whose size, quoted in its reading instruction, the new pricing changes, a split part, whose target, quoted in its instruction, now follows what the part sends rather than its text's length, a request whose pinned raw the pins gate now admits differently, and a transition summary request whose head held serialized media, which its markers now replace.
+
+- In the adaptive selection's middle, a run of a sharded body's raw shards,
+  which goes out joined into one text block, is now counted as the shards it
+  joins, each by the store's estimate of it, as the plan already counted them
+  and as the head and recent windows already did. It was counted as the
+  joined block, which the store's default estimator prices at the rate its
+  first 2,000 characters set, so where the shards' densities differed, the
+  middle's count left the plan's. A run whose first 2,000 characters were
+  denser than the rest of it was counted over the plan, so a compile whose
+  plan fit could refuse with `OverBudgetError` ("Emission overran the plan"),
+  and refused again on every compile until the budget or the store changed:
+  with an 80,000-character body that opens with 12,000 characters of JSON raw
+  in the middle, a compile planned at 28,670 tokens was counted at 34,786. A
+  run whose first characters were the lighter was counted under the plan: the
+  same characters the other way round, planned at 28,670, were counted at
+  27,590. A compile that went out before sends the same bytes; one refused
+  this way now goes out.
+  - The render stats, which the calibration sample compares with provider
+    usage, count such a run at its new price. A store whose recent samples
+    had such a body raw in the middle learned its multiplier against the old
+    count, and over its next samples the multiplier moves to where the plan's
+    own prices put it, as it already did whenever such a body left the
+    middle. Until then, a multiplier learned against a count over the plan's
+    runs low: when one such body is the whole window, the plan prices that
+    store's requests up to about a fifth under what they cost, and a compile
+    refused at a budget between the plan and the old count can now go out
+    costing up to about a quarter more than its budget. One learned against a
+    count under the plan's runs high, so the plan folds more than it needs to,
+    as it did before. No calibration epoch starts, since no plan price
+    changes: the first compile after the upgrade plans as the last one before
+    it did.
+
+- With `compressionToolProseFallback` set, the compression quarantine holds a
+  quarantined chunk by its family and by the per-chunk shape cap, as it does
+  with the rung off. The gate compared a hash of the rung's options in
+  each stored record with a hash of the current ones, and the store gives
+  those options back with their keys in another order, so no stored record
+  was ever in the current request regime, and only an exact key match held
+  the chunk. Where the provider had counted the chunk's request, the key
+  never matched either, and every pass that reached the chunk called the
+  model for it again, without recording a new exhaustion. Each new shape of
+  the request, such as one at a moved recall frontier, was attempted with no
+  cap. The options are now compared whatever the order of their keys. With
+  the rung on, the cap now holds a chunk after three refused shapes until the
+  quarantine is cleared, a switch of compression model included, as with the
+  rung off.
+
 ## 0.15.0 — 2026-10-16
 
 ### Added

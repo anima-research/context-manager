@@ -1,6 +1,7 @@
-// Runs as npm's `version` lifecycle hook (see package.json): at that point
-// package.json already carries the new version, and files staged here are
-// included in the release commit that `npm version` then creates and tags.
+// Runs as the `version` lifecycle hook (see package.json) of a version
+// command such as `npm version`: at that point package.json already carries
+// the new version, and files staged here are included in the release commit
+// the version command then creates and tags.
 //
 // Folds the pending fragments in changelog.d/ (one file per change,
 // `<slug>.<breaking|added|changed|fixed>.md`) together with anything filed
@@ -8,6 +9,12 @@
 // `## X.Y.Z — YYYY-MM-DD` section, deletes the consumed fragments, and
 // leaves a fresh empty `## Unreleased` above it. Refuses to release when
 // there is nothing to release, or when the input's shape is ambiguous.
+//
+// Run any other way, it would release into the version package.json already
+// holds and delete the fragments it folded (#198), so it refuses unless its
+// environment looks like a version command's `version` hook (see
+// checkInvocation). That guards against running it by mistake, not on
+// purpose: any process can set those variables. `--help` says what it does.
 import {
   existsSync,
   readdirSync,
@@ -163,7 +170,11 @@ function main() {
 
   const escaped = version.replace(/[.]/g, "\\.");
   if (new RegExp(`^## ${escaped}([^0-9]|$)`, "m").test(text)) {
-    fail(`a '## ${version}' section already exists.`);
+    fail(
+      `refused, and this script changed nothing: a '## ${version}' section already exists, so the pending ` +
+        `entries can't be released as ${version}. A version bump made before it ran stays in package.json. ` +
+        "Release them under a new version: npm version <patch|minor|major>.",
+    );
   }
 
   const afterHeader = text.slice(header.index + header[0].length);
@@ -197,8 +208,58 @@ function main() {
   );
 }
 
+const USAGE = `Usage: npm version <patch|minor|major>
+
+scripts/release-changelog.mjs is the \`version\` hook in package.json. When a
+version command such as npm version runs it, package.json already holds the
+new version, and it folds the fragments in ${FRAGMENT_DIR}/ and the entries
+under '## Unreleased' into a new '## X.Y.Z — YYYY-MM-DD' section of
+${CHANGELOG}, deletes the fragments it folded, and leaves an empty
+'## Unreleased' above the new section. The version command then makes its
+release commit and tag, as it's configured to.
+
+It takes no arguments but --help or -h. It refuses to run unless its
+environment looks like a version command's \`version\` hook, as npm version,
+bun pm version and yarn version give it, since run any other way it would
+release into the version package.json already holds. (yarn run version looks
+the same, and the release's refusal of a version that already has a section
+is what stops it.)`;
+
+// Whether the environment looks like a version command's `version` hook. The
+// check can't see a bump, only these two variables: npm_lifecycle_event says
+// which script runs ("preversion" runs before the bump), and npm_command which
+// npm command ("run" for `npm run version`, which bumps nothing; bun's and
+// pnpm's `run` set "run-script", npx "exec"). Version commands that aren't
+// npm's, such as `bun pm version` and `yarn version`, set no npm_command, so
+// its absence is accepted too. Two runs are judged wrongly: `yarn run version`
+// sets none either and bumps nothing, so it gets past this check and only the
+// release's own refusals (a version that already has a section, nothing to
+// release) stop it; and one that sets no npm_command itself, launched by npx
+// or from an npm script, inherits that runner's ("exec", "run"), so it is
+// refused after its bump. npm version sets its own, from an npm script too.
+function checkInvocation(args, env) {
+  if (args.includes("--help") || args.includes("-h")) return "help";
+  if (args.length > 0) {
+    fail(
+      `refused, and nothing was changed: unknown argument '${args[0]}', and it takes none but --help or -h. ` +
+        "`node scripts/release-changelog.mjs --help` says what it does.",
+    );
+  }
+  if (env.npm_lifecycle_event !== "version" || (env.npm_command !== undefined && env.npm_command !== "version")) {
+    const seen = (name) => (env[name] === undefined ? `${name} is unset` : `${name} is '${env[name]}'`);
+    fail(
+      "refused, and this script changed nothing: it runs only as the version hook of a version " +
+        "command such as `npm version <patch|minor|major>`, after the new version is in package.json " +
+        `(here ${seen("npm_command")} and ${seen("npm_lifecycle_event")}). A version bump made ` +
+        "before it ran stays in package.json. `node scripts/release-changelog.mjs --help` says what it does.",
+    );
+  }
+  return "release";
+}
+
 try {
-  main();
+  if (checkInvocation(process.argv.slice(2), process.env) === "help") console.log(USAGE);
+  else main();
 } catch (e) {
   if (!(e instanceof ReleaseError)) throw e;
   console.error(`release-changelog: ${e.message}`);

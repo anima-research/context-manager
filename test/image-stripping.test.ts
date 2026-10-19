@@ -7,7 +7,7 @@
  *       from the newest message are stripped even though the surrounding text
  *       stays verbatim (so text horizon >> image horizon).
  *
- * Stripped images are replaced by "[image dropped from live context]".
+ * Stripped images are replaced by "[image not shown: this context keeps only some images]".
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -38,7 +38,7 @@ function imageState(messages: { content: ContentBlock[] }[], label: string): 'im
   );
   if (!entry) return 'missing';
   if (entry.content.some((b) => b.type === 'image')) return 'image';
-  if (entry.content.some((b) => b.type === 'text' && b.text.includes('image dropped from live context')))
+  if (entry.content.some((b) => b.type === 'text' && b.text.includes("image not shown: this context keeps only some images")))
     return 'stripped';
   return 'missing';
 }

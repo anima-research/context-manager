@@ -766,6 +766,20 @@ describe('compile provenance', () => {
     cm.close();
   });
 
+  it("counts a beforeUser injection placed at the end of messages with no user message in the layout's tokens", async () => {
+    const { cm } = await open();
+    cm.addMessage('assistant', [{ type: 'text', text: 'a0 thinking aloud' }]);
+    const note: ContentBlock[] = [{ type: 'text', text: '[body] online, battery 62%' }];
+    const bare = (await cm.compile(BUDGET)).provenance!.layout!;
+    const result = await cm.compile(BUDGET, [{ namespace: 'body', position: 'beforeUser', content: note }]);
+    assert.deepEqual(result.messages.map((m) => m.participant), ['assistant', 'system_context:body']);
+    const store = (cm as unknown as { messageStore: { estimateBaseTokens(content: ContentBlock[]): number } }).messageStore;
+    const noteTokens = store.estimateBaseTokens(note);
+    assert.ok(noteTokens > 0);
+    assert.equal(result.provenance!.layout!.totalTokens, bare.totalTokens + noteTokens);
+    cm.close();
+  });
+
   it('estimates layout tokens before calibration, so identical content costs the same at any calibration', async () => {
     const { cm } = await open();
     // Five blocks of two base tokens each: a calibrated estimate rounds each
@@ -1023,10 +1037,20 @@ describe('fold journal size', () => {
   });
 
   it('a delta rebuilds the next layout exactly, for random edits of members and units', () => {
+    // mulberry32. A linear congruential step computed in a double loses its
+    // low bits past 2^53, and `seed % n` then repeats a few values.
     let seed = 12345;
-    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+    const rand = (n: number) => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
+    };
+    const distinct = new Set<string>();
+    const kinds = [0, 0, 0];
     const unit = (): LayoutUnit => {
       const k = rand(3);
+      kinds[k] = (kinds[k] ?? 0) + 1;
       if (k === 0) return { k: 'r', t: rand(4) };
       if (k === 1) return { k: 's', n: 1 + rand(4), sm: [[`s${rand(3)}`, 1, 'm', 0, rand(5)]] };
       return { k: 'o', n: 1 + rand(4) };
@@ -1038,17 +1062,30 @@ describe('fold journal size', () => {
       return { members, units };
     };
     let asserted = 0;
+    let spliced = 0;
     for (let round = 0; round < 2000; round++) {
       const prevUnits = Array.from({ length: rand(8) + 1 }, unit);
-      const nextUnits = rand(2) === 0 ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
+      const splice = rand(2) === 0;
+      if (splice) spliced++;
+      const nextUnits = splice ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
       const pool = Array.from({ length: 60 }, () => rand(200));
       const unique = [...new Set(pool)];
       const prev = layout(prevUnits, unique.filter(() => rand(4) > 0));
       const next = layout(nextUnits, unique.filter(() => rand(4) > 0));
       assert.deepEqual(applyLayoutDelta(prev, layoutDelta(prev, next)), next, `round ${round}`);
       asserted++;
+      distinct.add(JSON.stringify([prev, next]));
     }
     assert.equal(asserted, 2000, 'every pair of layouts has a delta');
+    assert.ok(distinct.size >= 1900, `${distinct.size} distinct pairs of layouts in 2000 rounds`);
+    // Each unit kind, and each way of building the next layout, has to come up
+    // a fair share of the time: distinct pairs alone would pass a generator
+    // that never drew one of them, since the member pools keep pairs apart.
+    const drawn = kinds[0]! + kinds[1]! + kinds[2]!;
+    for (const [i, kind] of ['r', 's', 'o'].entries()) {
+      assert.ok(kinds[i]! * 4 >= drawn, `${kinds[i]} of ${drawn} units are '${kind}'`);
+    }
+    assert.ok(spliced >= 800 && spliced <= 1200, `${spliced} of 2000 next layouts edit the previous one`);
 
     // A chain rebuilt in one pass equals the same deltas applied one at a time,
     // across chains that remove and re-add the same sequences.
@@ -1327,6 +1364,216 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('refuses a compile of another store in the same namespace, and writes nothing', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    const otherPath = `${STORE}-other`;
+    rmSync(otherPath, { recursive: true, force: true });
+    const other = await ContextManager.open({ path: otherPath, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    try {
+      add(other, 3);
+      assert.throws(() => other.acceptRound({ provenance }), /has no live branch with that id and creation time, and this namespace has no readable record of one, so accepting it here again is refused the same way/);
+      assert.equal(layoutRecords(other.getStore()).length, 0);
+      assert.deepEqual(other.listFoldReceipts().receipts, []);
+      assert.equal((await acceptCompile(other))?.kind, 'baseline', 'its own compiles are accepted as before');
+    } finally {
+      other.close();
+      rmSync(otherPath, { recursive: true, force: true });
+    }
+    cm.close();
+  });
+
+  it('accepts a late compile of a deleted branch it has records of, and refuses one of a branch deleted before any', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const main = cm.currentBranchRef();
+    await cm.fork('kept');
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, 'omit');
+    const onKept = (await cm.compile(BUDGET)).provenance!;
+    await cm.switchBranch(main.name);
+    await cm.fork('gone');
+    const onGone = (await cm.compile(BUDGET)).provenance!;
+    await cm.switchBranch(main.name);
+    cm.getStore().deleteBranch('kept');
+    cm.getStore().deleteBranch('gone');
+    // After a reopen, only the records can say the deleted branch existed.
+    cm.close();
+    ({ cm } = await open(strategy));
+    assert.equal(cm.acceptRound({ provenance: onKept })?.kind, 'change', 'a deleted branch with records stays known');
+    const before = layoutRecords(cm.getStore()).length;
+    assert.throws(() => cm.acceptRound({ provenance: onGone }), /has no live branch with that id and creation time, and this namespace has no readable record of one/);
+    assert.equal(layoutRecords(cm.getStore()).length, before);
+    cm.close();
+  });
+
+  it('a receipt link that leaves its namespace or branch ends the walk, says so, and is never announced', async () => {
+    // What main's newest records link to, in turn: side's receipt (another
+    // branch), another namespace's receipt on main itself, and a record of
+    // another namespace that holds no receipt.
+    const kinds = ['branch', 'namespace', 'namespace, no receipt'] as const;
+    const lastRecord = (store: JsStore): string => store.getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    for (const kind of kinds) {
+      cleanup();
+      let { cm, strategy } = await open();
+      const ids = add(cm, 3);
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      const main = cm.currentBranchRef();
+      const store = cm.getStore();
+      let target: string;
+      if (kind === 'branch') {
+        await cm.fork('side');
+        assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+        target = lastRecord(store);
+        await cm.switchBranch(main.name);
+      } else {
+        const other = await ContextManager.open({ store, strategy: new ScriptedStrategy(), namespace: 'agents/other' });
+        const otherReceipt = await acceptCompile(other);
+        assert.equal(otherReceipt?.kind, 'baseline');
+        target = otherReceipt!.id;
+        other.close();
+        if (kind === 'namespace, no receipt') {
+          const { receipt: _otherReceipt, ...otherBare } = JSON.parse(store.getRecord(target)!.payload.toString('utf8'));
+          store.appendJson('context-manager/accepted-layout', { ...otherBare, compileId: 'other-bare' });
+          target = lastRecord(store);
+        }
+      }
+      strategy.plan.set(ids[0]!, 'omit');
+      const change = await acceptCompile(cm);
+      assert.equal(change?.kind, 'change');
+      const record = JSON.parse(store.getRecord(change!.id)!.payload.toString('utf8'));
+
+      // Main's newest receipt, copied with its link moved onto the target. A
+      // journal that never heard of it announces it, and nothing of the target's.
+      store.appendJson('context-manager/accepted-layout', { ...record, compileId: 'foreign-link', pr: target });
+      const forged = lastRecord(store);
+      cm.close();
+      ({ cm } = await open(strategy));
+      let heard: string[] = [];
+      cm.onFoldReceipt((r) => heard.push(r.id));
+      assert.equal(await acceptCompile(cm), null, kind);
+      assert.deepEqual(heard, [forged], `${kind}: main's own newest receipt is announced, and the target isn't`);
+      const listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts.map((r) => r.id), [forged], `${kind}: the target isn't spliced into main's receipts`);
+      assert.match(listed.note ?? '', new RegExp(`Receipts before ${forged} aren't listed: its link names record ${target}, which belongs to another namespace or branch`), kind);
+
+      // A newest record with no receipt whose link names the target: main
+      // lists nothing, and an acceptance announces nothing of the target's,
+      // though it announces main's own next receipt.
+      const { receipt: _receipt, ...bare } = record;
+      cm.getStore().appendJson('context-manager/accepted-layout', { ...bare, compileId: 'foreign-link-bare', pr: target });
+      cm.close();
+      ({ cm } = await open(strategy));
+      heard = [];
+      cm.onFoldReceipt((r) => heard.push(r.id));
+      assert.equal(await acceptCompile(cm), null, kind);
+      assert.deepEqual(heard, [], `${kind}: the target isn't announced on main`);
+      const empty = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(empty.receipts, [], kind);
+      assert.match(empty.note ?? '', new RegExp(`^No receipts are listed: record ${target}, where the branch's receipts start, belongs to another namespace or branch\\.`), kind);
+      strategy.plan.set(ids[1]!, 'omit');
+      const later = await acceptCompile(cm);
+      assert.equal(later?.kind, 'change', kind);
+      assert.deepEqual(heard, [later!.id], `${kind}: main's own receipt is announced`);
+      if (kind === 'branch') {
+        assert.deepEqual(cm.listFoldReceipts({ branch: 'side' }).receipts.map((r) => r.id), [target], 'side keeps its own');
+      }
+      cm.close();
+    }
+  });
+
+  it('refuses a layout whose shape changed after compile returned it, and writes nothing', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const refused = /its members aren't in ascending order, its units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id for each member, so accepting it again is refused the same way/;
+    // Each change on its own compile. The id count catches the first three;
+    // only the members-and-units check catches the last three.
+    const changes: Array<[string, (layout: { members: number[]; memberIds: string[]; units: LayoutUnit[] }) => void]> = [
+      ['a member added', (l) => l.members.push(Number.MAX_SAFE_INTEGER)],
+      ['an id dropped', (l) => l.memberIds.pop()],
+      ['an id added', (l) => l.memberIds.push('extra')],
+      ['members out of order', (l) => l.members.reverse()],
+      ['a unit added', (l) => l.units.push({ k: 'o', n: 1 })],
+      ['a unit of no members', (l) => l.units.push({ k: 'o', n: 0 })],
+    ];
+    for (const [what, change] of changes) {
+      const provenance = (await cm.compile(BUDGET)).provenance!;
+      change(provenance.layout as unknown as { members: number[]; memberIds: string[]; units: LayoutUnit[] });
+      assert.throws(() => cm.acceptRound({ provenance }), refused, what);
+    }
+    assert.equal(layoutRecords(cm.getStore()).length, 0);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline', 'a compile as returned is accepted');
+    // The types say so too: none of this compiles without a cast, while the
+    // per-message sources stay the caller's to change.
+    const readOnly = (p: CompileProvenance) => {
+      // @ts-expect-error the layout is read-only
+      p.layout!.members.push(1);
+      // @ts-expect-error the layout is read-only
+      p.layout!.memberIds.push('x');
+      // @ts-expect-error the layout is read-only
+      p.layout!.units[0]!.k = 'o';
+      // @ts-expect-error the branch is read-only
+      p.branch.created = 0;
+      // @ts-expect-error the mark is read-only
+      p.journalMark!.recordId = 'x';
+      // @ts-expect-error the compile's identity is read-only
+      p.compileId = 'x';
+      p.messages.push({ kind: 'other' });
+    };
+    void readOnly;
+    cm.close();
+  });
+
+  it('keeps its own copy of what it accepted, so a change to the provenance afterwards changes nothing it records', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    strategy.plan.set(ids[0]!, { summary: 'L1-0', level: 1 });
+    const accepted = (await cm.compile(BUDGET)).provenance!;
+    const receipt = cm.acceptRound({ provenance: accepted });
+    assert.equal(receipt?.kind, 'baseline');
+    assert.notEqual(receipt!.source.branch, accepted.branch, 'the receipt names the branch by its own copy');
+    // Writes into each part of the accepted layout, through casts: the
+    // summary unit's reference, the raw unit after it in place, and the
+    // summary's member, given its raw neighbour's sequence, which in a shared
+    // array would move the summary's form onto that message.
+    const layout = accepted.layout as unknown as { members: number[]; units: Array<Record<string, unknown>> };
+    const summary = layout.units[0] as { k: string; sm: Array<[string, number, string, 0 | 1, number]> };
+    assert.equal(summary.k, 's');
+    summary.sm[0]![0] = 'L1-9';
+    assert.equal(layout.units[1]!.k, 'r');
+    Object.assign(layout.units[1]!, { p: 1 });
+    layout.members[0] = layout.members[1]!;
+    assert.equal(await acceptCompile(cm), null, 'the next compile, unchanged, is unchanged against what was accepted');
+    const mark = (await cm.compile(BUDGET)).provenance!.journalMark!;
+    (mark as { recordId: string }).recordId = 'elsewhere';
+    assert.notEqual((await cm.compile(BUDGET)).provenance!.journalMark?.recordId, 'elsewhere', "the journal's own mark is unchanged");
+    cm.close();
+  });
+
+  it('keeps its own branch reference, so renaming a compile\'s branch or a listed one leaves receipts under the branch\'s name', async () => {
+    const { cm } = await open();
+    add(cm, 2);
+    const main = cm.currentBranchRef();
+    await cm.fork('side');
+    const accepted = (await cm.compile(BUDGET)).provenance!;
+    const receipt = cm.acceptRound({ provenance: accepted });
+    assert.equal(receipt?.kind, 'baseline');
+    (accepted.branch as { name: string }).name = 'renamed';
+    await cm.switchBranch(main.name);
+    cm.getStore().deleteBranch('side');
+    // A deleted branch is found by the name its records give it.
+    const listed = cm.listFoldReceipts({ branch: 'side' });
+    assert.deepEqual(listed.receipts.map((r) => r.id), [receipt!.id], "the deleted branch's receipts stay under its name");
+    assert.equal(cm.listFoldReceipts({ branch: 'renamed' }).branch, null);
+    (listed.branch as { name: string }).name = 'renamed';
+    assert.deepEqual(cm.listFoldReceipts({ branch: 'side' }).receipts.map((r) => r.id), [receipt!.id], 'the listed branch was a copy');
+    const byRef = cm.listFoldReceipts({ branch: receipt!.source.branch });
+    (byRef.branch as { name: string }).name = 'renamed';
+    assert.deepEqual(cm.listFoldReceipts({ branch: 'side' }).receipts.map((r) => r.id), [receipt!.id], 'so was the one found by reference');
+    cm.close();
+  });
+
   it('a branch whose newest record cannot be read gets a baseline, never a diff against an older layout', async () => {
     let { cm, strategy } = await open();
     const ids = add(cm, 3);
@@ -1351,7 +1598,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         const receipt = await acceptCompile(cm);
         assert.equal(receipt?.kind, 'baseline', `${what}: a baseline`);
-        assert.ok(errors.some((e) => e.includes('is unreadable')), `${what}: and it is reported`);
+        // As this journal's branch's, naming its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('is unreadable') && e.endsWith(' ns=agents/tester')), `${what}: and it is reported: ${errors.join('\n')}`);
         errors.length = 0;
       }
     } finally {
@@ -1419,7 +1667,8 @@ describe('fold journal durability and index', () => {
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
       assert.equal((await acceptCompile(cm))?.kind, 'baseline');
-      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null")), `reported: ${errors.join('\n')}`);
+      // About this journal's branch, so it names the journal's namespace (#239).
+      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null") && e.endsWith(' ns=agents/tester')), `reported: ${errors.join('\n')}`);
     } finally {
       console.error = error;
       cm.close();
@@ -1473,7 +1722,8 @@ describe('fold journal durability and index', () => {
     }
     assert.equal(receipt?.kind, 'baseline', 'the acceptance stands');
     assert.equal(layoutRecords(cm.getStore()).length, 1);
-    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object]')), `reported: ${written.join('')}`);
+    // Its line names the journal's namespace (#239).
+    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object] ns=agents/tester')), `reported: ${written.join('')}`);
     cm.close();
   });
 
@@ -1597,6 +1847,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         assert.equal((await acceptCompile(cm))?.kind, 'baseline', `${what}: a baseline`);
         assert.ok(errors.some((e) => /unreadable|treating the branch as unrecorded/.test(e)), `${what}: reported`);
+        // The fallback that treats this journal's branch as unrecorded names its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('unrecorded') && e.endsWith(' ns=agents/tester')), `${what}: ${errors.join('\n')}`);
         errors.length = 0;
         // Another round compares with the baseline just written, and the
         // record that couldn't be read lends the branch no receipts.

@@ -18,12 +18,21 @@ jobs:
       # Both platforms: a package-lock.json regenerated over an existing
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
-      # catches the lock the other's platform produced. Tests run on ubuntu.
-      # Node: the engines floor and current LTS — stdio flushing semantics
-      # around process exit differ between versions and platforms.
+      # catches the lock the other's platform produced.
+      # Node: the engines floor, pinned exactly so npm ci's prepare build and
+      # the suite run on it; the newest Node the range admits; and, between
+      # them, every maintained major line (24), since each major ships its own
+      # built-in fetch (Undici). The middle legs change when a line between
+      # the ends reaches end of life, and when a new major becomes the newest
+      # and the line it replaces falls between the ends. stdio
+      # flushing around process exit differs between versions and platforms.
+      # macOS runs the two ends only.
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: [20, 24]
+        node: ['22.12.0', 24, latest]
+        exclude:
+          - os: macos-latest
+            node: 24
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

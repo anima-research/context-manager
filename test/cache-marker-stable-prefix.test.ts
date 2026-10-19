@@ -19,8 +19,8 @@ import { AutobiographicalStrategy } from '../src/strategies/autobiographical.js'
 import type { ContextEntry } from '../src/types/context.js';
 
 class Exposed extends AutobiographicalStrategy {
-  place(entries: ContextEntry[], head: Set<string>, tail: Set<string>): void {
-    this.placeCacheMarkers(entries, head, tail);
+  place(entries: ContextEntry[], head: Set<string>, tail: Set<string>): number | null {
+    return this.placeCacheMarkers(entries, head, tail);
   }
 }
 
@@ -104,6 +104,30 @@ test('total rewrite: no stable-prefix marker, no crash', () => {
   for (let i = 0; i < b.es.length; i++) b.es[i] = entry(`x${i}`, `new-${i}`);
   s.place(b.es, new Set(), new Set());
   assert.deepEqual(marksOf(b.es), [b.es.length - 1]); // end only
+});
+
+test('returns where the entries first differ from the previous compile’s: null at first, an entry edited in place, the first appended one, the count when none differs', () => {
+  const s = new Exposed({});
+  const a = fixture();
+  assert.equal(s.place(a.es, a.head, a.tail), null, 'no earlier compile');
+  const edited = () => {
+    const f = fixture();
+    f.es[5] = entry('m3', 'fold-3, edited in place'); // same message, new bytes
+    return f;
+  };
+  const b = edited();
+  assert.equal(s.place(b.es, b.head, b.tail), 5);
+  const c = edited();
+  assert.equal(s.place(c.es, c.head, c.tail), c.es.length, 'nothing differs');
+  // Appended entries weren't in the previous request, so the first of them is
+  // where this one first differs, not the new count.
+  const d = edited();
+  d.es.push(entry('t3', 'raw-3'), entry('t4', 'raw-4'));
+  assert.equal(s.place(d.es, d.head, d.tail), c.es.length, 'the first appended entry');
+  // Entries only removed from the end: this request is a prefix of the last.
+  const e = edited();
+  e.es.splice(-2);
+  assert.equal(s.place(e.es, e.head, e.tail), e.es.length, 'a prefix of the previous request');
 });
 
 test('never more than 3 message-level markers', () => {

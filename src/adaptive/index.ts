@@ -131,6 +131,7 @@ export {
 export {
   replayControlled,
   planControlledFrontier,
+  reportOverlap,
   foldDepthCap,
   PRICE,
   MAX_FOLD_LEVEL,
@@ -147,6 +148,7 @@ export {
   OverBudgetError,
   UncoveredDropError,
   accountFrontier,
+  type OverBudgetClearedBy,
   type OverBudgetDiagnostics,
   type PickerInputs,
   type PickerResult,

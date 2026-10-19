@@ -33,6 +33,8 @@ export type CappedRenderPath = 'hierarchical' | 'adaptive';
 export interface CappedRenderCase {
   path: CappedRenderPath;
   options: AutobiographicalOptions;
+  /** The adaptive render's compile budget, where it isn't the fixture's 900. */
+  maxTokens?: number;
 }
 
 export const CAPPED_RENDER_CASES = {
@@ -59,6 +61,10 @@ export const CAPPED_RENDER_CASES = {
   adaptiveTightCap: {
     path: 'adaptive',
     options: { maxMessageTokens: 1 },
+    // A raw message capped at 1 token renders a few characters and the cut's
+    // suffix, and is priced as it renders (#223), so the fixture's 30 fit 900
+    // tokens raw. A smaller budget makes the render fold, as the case needs.
+    maxTokens: 300,
   },
 } as const satisfies Record<string, CappedRenderCase>;
 
@@ -82,7 +88,7 @@ export async function renderCappedCase(
     : { ...testCase.options, recallEnvelope: mode };
   return testCase.path === 'hierarchical'
     ? renderHierarchicalFixture(options)
-    : renderAdaptiveFixture(options);
+    : renderAdaptiveFixture(options, undefined, testCase.maxTokens);
 }
 
 /** Reaches the production token estimator the combined path spends through. */

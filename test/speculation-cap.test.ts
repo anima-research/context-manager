@@ -8,9 +8,10 @@
  *
  * Post-fix:
  *  - `maxSpeculativeL1s` caps the count of *produced, unmerged* L1 summaries.
- *    When at cap, `onNewMessage` defers auto-tick L1 production — chunks still
- *    queue, but compression doesn't fire until merges bring the unmerged count
- *    back under the cap (or an explicit tick() / compile()).
+ *    Past the cap, while an L1→L2 merge is queued, tick takes no chunk, from
+ *    the auto-tick drain or an explicit tick(): chunks still queue, and the
+ *    merge brings the unmerged count back down. With no L1 merge queued, the
+ *    cap holds nothing (#240).
  *  - The cap does NOT count the pending compression backlog and does NOT gate
  *    merges: merges consolidate L1s into L_{k+1} and REDUCE the unmerged count,
  *    so gating them would deadlock (too many unmerged L1s blocks the merges that
@@ -110,7 +111,7 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
     manager.close();
   });
 
-  it('with maxSpeculativeL1s, auto-tick is deferred when at cap', async () => {
+  it('with maxSpeculativeL1s past the cap and no merge queued, auto-tick still fires (#240)', async () => {
     const strategy = new TickCountingStrategy({
       headWindowTokens: 0,
       recentWindowTokens: 5,
@@ -123,10 +124,12 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       path: TEST_STORE_PATH,
       strategy,
     });
-    // Seed AFTER open so initialize() doesn't wipe the seeds.
+    // Seed AFTER open so initialize() doesn't wipe the seeds. Their sources
+    // resolve to no message, so no merge can ever take them.
     strategy.seedL1('summary 1');
     strategy.seedL1('summary 2');
     strategy.seedL1('summary 3');
+    assert.equal((strategy as any).isAtSpeculativeCap(), true, 'premise: three unmerged L1s are past a cap of 2');
 
     const ticksBefore = strategy.tickCalls;
     for (let i = 0; i < 5; i++) {
@@ -136,10 +139,9 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
     await new Promise(r => setTimeout(r, 30));
 
     assert.ok(strategy.hasQueuedChunk(), 'sanity: chunk formed');
-    assert.equal(
-      strategy.tickCalls,
-      ticksBefore,
-      'auto-tick must NOT fire when unmerged L1s already exceed maxSpeculativeL1s',
+    assert.ok(
+      strategy.tickCalls > ticksBefore,
+      'with no merge queued the cap holds nothing, so auto-tick fires (it used to stop here for good)',
     );
     manager.close();
   });
@@ -233,12 +235,13 @@ describe('AutobiographicalStrategy — speculation cap does not deadlock (regres
 
     // Isolate the drain/cap gating from executeMerge's message-store coupling:
     // simulate a successful merge by marking the sources merged.
-    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<boolean> {
       this.mergeRuns++;
       for (const id of sourceIds) {
         const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
         if (s) (s as any).mergedInto = 'L2-test';
       }
+      return true;
     }
   }
 
@@ -296,6 +299,216 @@ describe('AutobiographicalStrategy — speculation cap does not deadlock (regres
 
     manager.close();
   });
+
+  it('past the cap, tick takes no chunk while an L1 merge is queued, and takes one once the merge has run', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      targetChunkTokens: 20,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      compressionModel: 'mock',
+      maxSpeculativeL1s: 2,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    const ids = [0, 1, 2].map((i) => strategy.seedL1(`s${i}`).id); // 3 unmerged > cap 2
+    strategy.queueMerge(ids);
+    for (let i = 0; i < 5; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+    manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
+    const queued = strategy.compQ.length;
+    assert.ok(queued >= 1, 'premise: a chunk is queued');
+    assert.equal(strategy.atCap(), true, 'premise: past the cap');
+
+    await manager.tick();
+    assert.equal(strategy.mergeRuns, 1, 'the merge runs');
+    assert.equal(strategy.compQ.length, queued, 'tick took no chunk while the merge was queued');
+    await manager.tick();
+    assert.equal(strategy.compQ.length, queued - 1, 'with the cap relieved, the next tick takes a chunk');
+    manager.close();
+  });
+
+  it('past the cap, a queued merge above L1 holds no L1 production, since it brings no L1 count down', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      targetChunkTokens: 20,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      compressionModel: 'mock',
+      maxSpeculativeL1s: 2,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    [0, 1, 2].forEach((i) => strategy.seedL1(`s${i}`)); // 3 unmerged > cap 2, none of them mergeable
+    (strategy as any).enqueueMerge({ level: 3, sourceIds: ['L2-a', 'L2-b'] }); // an L2→L3 merge only
+    for (let i = 0; i < 5; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+    manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
+    const queued = strategy.compQ.length;
+    assert.ok(queued >= 1, 'premise: a chunk is queued');
+    assert.equal(strategy.atCap(), true, 'premise: past the cap');
+
+    await manager.tick();
+    assert.equal(strategy.compQ.length, queued - 1, 'tick takes a chunk: no queued merge can relieve the L1 cap');
+    assert.equal(strategy.mergeRuns, 0, 'L1 compression comes first, as below the cap');
+    manager.close();
+  });
+
+  it('under the cap, tick takes a chunk before a queued L1 merge, which holds nothing there', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      targetChunkTokens: 20,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      compressionModel: 'mock',
+      maxSpeculativeL1s: 5,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    const ids = [0, 1].map((i) => strategy.seedL1(`s${i}`).id); // 2 unmerged, under a cap of 5
+    strategy.queueMerge(ids);
+    for (let i = 0; i < 5; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+    manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
+    const queued = strategy.compQ.length;
+    assert.ok(queued >= 1, 'premise: a chunk is queued');
+    assert.equal(strategy.atCap(), false, 'premise: under the cap');
+
+    await manager.tick();
+    assert.equal(strategy.compQ.length, queued - 1, 'tick takes a chunk');
+    assert.equal(strategy.mergeRuns, 0, 'and leaves the merge for later, as without a cap');
+    manager.close();
+  });
+
+  it('past the cap, an L1 merge queued behind a merge above L1 still holds L1 production', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
+    const strategy = new DrainStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      targetChunkTokens: 20,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      compressionModel: 'mock',
+      maxSpeculativeL1s: 2,
+      hierarchical: true,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    const ids = [0, 1, 2].map((i) => strategy.seedL1(`s${i}`).id); // 3 unmerged > cap 2
+    (strategy as any).enqueueMerge({ level: 3, sourceIds: ['L2-a', 'L2-b'] }); // the head
+    strategy.queueMerge(ids); // the L1 merge, behind it
+    for (let i = 0; i < 5; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+    manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
+    const queued = strategy.compQ.length;
+    assert.ok(queued >= 1, 'premise: a chunk is queued');
+    assert.equal(strategy.atCap(), true, 'premise: past the cap');
+
+    await manager.tick();
+    assert.equal(strategy.mergeRuns, 1, 'tick runs the head merge');
+    assert.equal(strategy.compQ.length, queued, 'and takes no chunk, since the L1 merge behind it is queued');
+    await manager.tick();
+    assert.equal(strategy.mergeRuns, 2, 'then the L1 merge');
+    await manager.tick();
+    assert.equal(strategy.compQ.length, queued - 1, 'with the cap relieved, the next tick takes a chunk');
+    manager.close();
+  });
+});
+
+/**
+ * Regression (#240): past the cap, production waits only for a queued L1
+ * merge that will bring the count back down. Where none can come, the cap
+ * used to stop compression for good: no tick, message or compile moved it.
+ * Each case below ticked to a halt with chunks still queued.
+ */
+describe('AutobiographicalStrategy — the speculation cap holds nothing where no L1 merge is queued (#240)', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  type Lane = {
+    summaries: SummaryEntry[];
+    chunks: Array<{ compressed: boolean }>;
+    compressionQueue: number[];
+    mergeQueue: unknown[];
+    pendingCompression: Promise<void> | null;
+    isAtSpeculativeCap(): boolean;
+    pushSummary(entry: SummaryEntry): void;
+  };
+  const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock]' }] }) };
+  const open = async (config: Record<string, unknown>, stranded: number) => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 5,
+      targetChunkTokens: 20,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      compressionModel: 'mock',
+      mergeThreshold: 6,
+      ...config,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    const lane = strategy as unknown as Lane;
+    // Their sources resolve to no message, so no merge can ever take them.
+    for (let i = 0; i < stranded; i++) {
+      lane.pushSummary({
+        id: `L1-stranded-${i}`, level: 1, content: 'stranded', tokens: 2, sourceLevel: 0,
+        sourceIds: [`gone-${i}`], sourceRange: { first: `gone-${i}`, last: `gone-${i}` }, created: Date.now(),
+      });
+    }
+    return { manager, lane };
+  };
+  const l2s = (lane: Lane) => lane.summaries.filter((s) => s.level === 2).length;
+
+  const cases = [
+    { name: 'a cap below mergeThreshold - 1', config: { maxSpeculativeL1s: 2 }, stranded: 0 },
+    { name: 'unmerged L1s that can never merge filling the cap', config: { maxSpeculativeL1s: 5 }, stranded: 2 },
+    { name: 'a cap with merges off (hierarchical: false)', config: { maxSpeculativeL1s: 5, hierarchical: false }, stranded: 0 },
+  ];
+  // Both merge checks: checkMergeThreshold, and the recursive one adaptive hosts run.
+  for (const speculativeProduction of [false, true]) {
+    for (const c of cases) {
+      it(`compresses every chunk with ${c.name}${speculativeProduction ? ', under speculativeProduction' : ''}`, async () => {
+        const { manager, lane } = await open({ ...c.config, speculativeProduction }, c.stranded);
+        for (let i = 0; i < 40; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+        // Tick on while a merge tick will run is queued too, so the merge the last L1 queues runs.
+        const mergesRun = c.config.hierarchical !== false;
+        let pastCap = false;
+        for (let t = 0; t < 60 && (lane.compressionQueue.length > 0 || (mergesRun && lane.mergeQueue.length > 0)); t++) {
+          await manager.tick();
+          pastCap ||= lane.isAtSpeculativeCap();
+        }
+        assert.ok(pastCap, 'premise: the lane went past the cap');
+        assert.ok(lane.chunks.length >= 6, `premise: enough chunks to pass the cap (${lane.chunks.length})`);
+        assert.equal(lane.compressionQueue.length, 0, 'no chunk is left queued');
+        assert.equal(lane.chunks.filter((chunk) => !chunk.compressed).length, 0, 'every chunk is compressed');
+        if (c.config.hierarchical === false) {
+          assert.equal(l2s(lane), 0, 'no merge runs with merges off');
+        } else {
+          assert.ok(l2s(lane) >= 1, 'the newest run reached the threshold and merged');
+        }
+        manager.close();
+      });
+    }
+  }
+
+  it('compresses every chunk past the cap through the auto-tick drain, with no merge queued', async () => {
+    const { manager, lane } = await open({ maxSpeculativeL1s: 5, autoTickOnNewMessage: true }, 2);
+    for (let i = 0; i < 40; i++) manager.addMessage('user', textBlock(`m-${i} hello world`));
+    // The drain ticks on its own, a macrotask hop between ticks: wait for it to settle.
+    for (let i = 0; i < 400 && (lane.compressionQueue.length > 0 || lane.mergeQueue.length > 0 || lane.pendingCompression); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // One more hop, so the drain's last look at its empty queues runs before the store closes.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(lane.chunks.length >= 6, `premise: enough chunks to pass the cap (${lane.chunks.length})`);
+    // An L2 needs six new L1s in the newest run, which puts eight unmerged L1s past the cap of 5.
+    assert.ok(l2s(lane) >= 1, 'premise: the drain went past the cap and merged');
+    assert.equal(lane.compressionQueue.length, 0, 'no chunk is left queued');
+    assert.equal(lane.chunks.filter((chunk) => !chunk.compressed).length, 0, 'every chunk is compressed');
+    manager.close();
+  });
 });
 
 /**
@@ -332,7 +545,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
 
     // Each merge consolidates its sources AND (for the first few) enqueues a
     // follow-on merge — so the queue length nets out unchanged that tick.
-    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<boolean> {
       this.mergeRuns++;
       for (const id of sourceIds) {
         const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
@@ -345,6 +558,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
           .slice(0, 6).map((s: SummaryEntry) => s.id);
         if (fresh.length >= 2) this.qMerge(fresh);
       }
+      return true;
     }
   }
 
@@ -364,7 +578,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
     // One trigger, as a single onNewMessage would do.
     (strategy as any).driveSpeculativeDrain((manager as any).createStrategyContext());
 
-    // Let the microtask recursion + async ticks settle.
+    // Let the timer recursion + async ticks settle.
     for (let i = 0; i < 100 && strategy.mergeQ.length > 0; i++) {
       await new Promise(r => setTimeout(r, 10));
     }

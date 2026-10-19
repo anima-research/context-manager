@@ -1,6 +1,6 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, getMintRequestPreimageBytes } from '../src/index.js';
@@ -24,20 +24,37 @@ function texts(req: NormalizedRequest): string[] {
   return req.messages.flatMap((m) => m.content.filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text').map((b) => b.text));
 }
 
-/** Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever. */
-function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same' }) {
+/**
+ * Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever.
+ * `refusedDetails` gives each refusal details.usage: with both cache counts (5 written, 11 read),
+ * with cache reads alone, or with input and output and no cache counts.
+ */
+function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; rejectOn?: string; leafDetails?: boolean | 'first-only' | 'same'; refusedDetails?: boolean | 'reads-only' | 'no-cache' }) {
   let leaf = 0;
   const calls: NormalizedRequest[] = [];
+  /** How many target messages each refused request carried, so a test can tell the split's own refusals. */
+  const refusedTargets: number[] = [];
+  const refusedCache = opts.refusedDetails === 'reads-only' ? { cacheReadTokens: 11 }
+    : opts.refusedDetails === 'no-cache' ? {}
+    : { cacheCreationTokens: 5, cacheReadTokens: 11 };
   return {
     calls,
+    refusedTargets,
+    leaves: () => leaf,
     membrane: {
       complete: async (request: NormalizedRequest) => {
         calls.push(structuredClone(request));
         const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
         if (opts.throwOn !== undefined && targets.length === 1 && targets[0]!.startsWith(opts.throwOn)) throw new Error('transport-down');
+        // A deterministic rejection of the piece, which abandons the rung (an untyped error interrupts it).
+        if (opts.rejectOn !== undefined && targets.length === 1 && targets[0]!.startsWith(opts.rejectOn)) {
+          throw Object.assign(new Error('zz piece rejected'), { type: 'invalid_request', httpStatus: 400, retryable: false });
+        }
         const refuse = targets.length >= opts.refuseAt || (opts.alwaysRefuse !== undefined && targets.some((t) => t.startsWith(opts.alwaysRefuse!)));
         if (refuse) {
+          refusedTargets.push(targets.length);
           return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 },
+            ...(opts.refusedDetails ? { details: { usage: { inputTokens: 100, outputTokens: 0, ...refusedCache } } } : {}),
             raw: { response: { stop_details: { category: 'bio' } } } };
         }
         const which = targets.map((t) => t.split(' ')[0]).join('+');
@@ -53,7 +70,7 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
 class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   details() { return (this as unknown as { lastSplitDetails?: { usage: Record<string, unknown>; model: { actual: string; provider: string }; cache: { tokensCreated: number; tokensRead: number; hitRatio: number } } }).lastSplitDetails; }
-  attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } }).lastSplitAttempted; }
+  attempted() { return (this as unknown as { lastSplitAttempted?: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number; complete: boolean } }).lastSplitAttempted; }
   entries(): SummaryEntry[] { return (this as unknown as { summaries: SummaryEntry[] }).summaries; }
 }
 function managerContext(manager: ContextManager): StrategyContext {
@@ -187,10 +204,15 @@ describe('split-stitch L1 fallback', () => {
     }
   });
 
-  it('a provider error on a sub-request aborts the rung: nothing installed, no further sub-calls', async () => {
-    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+  it('a transient error on a sub-request interrupts the rung: nothing installed, no further sub-calls, family not exhausted', async () => {
+    const opts: { refuseAt: number; throwOn?: string } = { refuseAt: 2, throwOn: 'raw-1' };
+    const { calls, membrane } = cumulativeMembrane(opts);
     const fx = await build(membrane, { split: true, placeholder: true });
-    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // An untyped transport error says nothing about the request: the rung
+    // is one atomic retry unit, so it propagates and the rung
+    // runs again later instead of exhausting the family.
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted by a transport error');
     assert.equal(fx.strategy.entries().length, 0, 'nothing installed after a transport error');
     const subs = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
     const idx = subs.findIndex((c) => texts(c).some((t) => t.startsWith('raw-1 ')) && texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
@@ -200,9 +222,179 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(att.calls, subs.length, 'attempted.calls counts the thrown sub-call too');
     assert.equal(att.errors, 1);
     assert.equal(att.complete, false);
+
+    // The transport recovers: a later run re-runs the whole rung, from its
+    // first piece, and pays nothing again for the rungs before it.
+    delete opts.throwOn;
+    const whole = (c: NormalizedRequest) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 4;
+    const wholeBefore = calls.filter(whole).length;
+    const before = calls.length;
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.filter(whole).length, wholeBefore, 'the refused whole-chunk rungs are reused from progress, not sent again');
+    const rerun = calls.slice(before);
+    assert.ok(texts(rerun[0]!).some((t) => t.startsWith('raw-0 ')), 'the rung re-runs from its first piece');
+    assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
+    assert.equal(fx.strategy.attempted()!.complete, true, 'the re-run is recorded as complete');
   });
 
-  it('per-window call cap aborts the rung and installs nothing', async () => {
+  it('a piece that fails after a branch switch counts nothing: the next failure on the new branch starts a run of one', async () => {
+    const inner = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+    let gate: Promise<void> | null = null;
+    let held = false;
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (gate && targets.length === 1 && targets[0]!.startsWith('raw-1')) {
+          const wait = gate;
+          gate = null;
+          held = true;
+          await wait;
+        }
+        return (inner.membrane as unknown as { complete(r: NormalizedRequest): Promise<unknown> }).complete(request);
+      },
+    };
+    const fx = await build(membrane, { split: true, placeholder: true });
+    const lane = fx.strategy as unknown as {
+      noteCompressionLanded(membrane: object, model: string | undefined): void;
+      compressionFailureRuns: Map<string, { run: { failures: number } }>;
+    };
+    const runs = () => [...lane.compressionFailureRuns.values()].map((entry) => entry.run.failures);
+    const store = fx.manager.getStore();
+    const fork = store.createBranchAt('zz-fork', fx.manager.currentBranch().name, store.currentSequence()).name;
+    // Other work has landed, so a counted failure would extend a run.
+    lane.noteCompressionLanded(membrane, 'same-model');
+    let release!: () => void;
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const abandoned = fx.strategy.run(fx.target, managerContext(fx.manager));
+    while (!held) await new Promise((resolve) => setTimeout(resolve, 1));
+    await fx.manager.switchBranch(fork);
+    release();
+    // The ladder abandons work that crossed a branch switch, quietly.
+    await abandoned.catch(() => undefined);
+    assert.deepEqual(runs(), [], 'the piece failed after the switch, so it counted nothing');
+    // On the new branch, with another landing first, the chunk's next failure is its first.
+    lane.noteCompressionLanded(membrane, 'same-model');
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    assert.deepEqual(runs(), [1], 'a run of one');
+    fx.manager.close();
+  });
+
+  it('a deterministic rejection of a sub-request aborts the rung: nothing installed, family exhausted', async () => {
+    const calls: NormalizedRequest[] = [];
+    const base = cumulativeMembrane({ refuseAt: 2 }).membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length === 1 && targets[0]!.startsWith('raw-1')) {
+          throw Object.assign(new Error('400 too long'), { type: 'context_length', retryable: false });
+        }
+        return base.complete(request);
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, placeholder: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.strategy.entries().length, 0, 'nothing installed after a rejected piece');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the ladder ended deterministically');
+    assert.equal(fx.strategy.attempted()!.complete, false);
+    const subs = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
+    const rejected = subs.findIndex((c) => {
+      const targets = texts(c).filter((t) => /^raw-\d+ /.test(t));
+      return targets.length === 1 && targets[0]!.startsWith('raw-1');
+    });
+    assert.ok(rejected >= 0, 'the rejected piece was sent');
+    assert.equal(subs.length, rejected + 1, 'nothing after it: no retry of raw-1, no later piece');
+  });
+
+  it("the window cap is a local throttle: a rung that would contend with earlier calls waits for room, recording nothing and exhausting nothing, then runs whole", async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2, n: 2 });
+    const window = fx.strategy as unknown as { splitCallTimes: number[] };
+    const calledAt = Date.now() - 1_000;
+    window.splitCallTimes = [calledAt]; // another chunk's split call, a second ago
+    const before = Date.now();
+    const wait = await fx.strategy.run(fx.target, managerContext(fx.manager)).then(() => null, (error: unknown) => error as Error & { waitMs?: number });
+    const after = Date.now();
+    assert.match(wait?.message ?? '', /split-stitch waits for its call window/);
+    assert.ok(wait!.waitMs! >= calledAt + 600_000 - after && wait!.waitMs! <= calledAt + 600_000 - before,
+      `until that call ages out of the 10-minute window (${wait!.waitMs} ms)`);
+    const pieces = () => calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
+    assert.equal(pieces().length, 0, 'no piece is sent while the window lacks room for a whole attempt');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted');
+    assert.equal(fx.strategy.entries().length, 0);
+    window.splitCallTimes = []; // the window ages out
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(pieces().length, 2, 'the rung runs whole');
+    assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
+  });
+
+  it("a piece's call that the caller's provider admission defers takes no window slot and counts as no call", async () => {
+    const deferred = Object.assign(new Error('Provider wait: same-model is held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+        throw deferred;
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, n: 2 });
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /Provider wait/);
+    assert.deepEqual((fx.strategy as unknown as { splitCallTimes: number[] }).splitCallTimes, [], 'no slot taken');
+    assert.equal(fx.strategy.attempted()!.calls, 0, 'and no call counted');
+  });
+
+  it("a piece whose answer is classified as a provider error ends the rung with that error's type", async () => {
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+        return { content: [text('a piece')], stopReason: 'zz-unknown-stop', usage: { inputTokens: 100, outputTokens: 20 }, raw: { response: {} } };
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, n: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    // The bare type, as every other rung's rejection records it.
+    assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'malformed_response']);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().spans[0]?.latestOutcome, 'provider_error:malformed_response', 'the span names the type once');
+  });
+
+  it('a rung its failures decided is recorded as the decision, so the span counts it as no answer', async () => {
+    const { membrane } = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+    const fx = await build(membrane, { split: true, placeholder: true });
+    const lane = fx.strategy as unknown as { noteCompressionLanded(membrane: object, model: string | undefined): void };
+    // The first failure starts the rung's run; each of the next seven follows a landing.
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    for (let i = 0; i < 6; i++) {
+      lane.noteCompressionLanded(membrane, 'same-model');
+      await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    }
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'the premise: seven failures decide nothing');
+    lane.noteCompressionLanded(membrane, 'same-model');
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const outcomes = [...projection.values()][0]?.outcomes ?? [];
+    const split = outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    assert.equal(split?.outcome, 'provider_error', 'the eighth decides the rung, and the family exhausts');
+    assert.match(split?.errorType ?? '', /^persistent-/, 'recorded as the decision, persistent-<class>');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.spans[0]!.answeredAttempts, outcomes.length - 1, 'every answer counts but the decision');
+    assert.equal(status.spans[0]!.latestOutcome, `provider_error:${split!.errorType}`, 'and the line names the decision once');
+    fx.manager.close();
+  });
+
+  it('a window of 0 ends the rung before any piece is sent, as a cap trip', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, windowCap: 0, n: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1).length, 0, 'no piece is sent');
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    assert.deepEqual([split?.outcome, split?.errorType], ['refusal', 'window-call-cap']);
+  });
+
+  it('an attempt that alone needs more calls than the window allows ends the rung: under these caps it cannot finish', async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2 });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
@@ -295,6 +487,113 @@ describe('split-stitch L1 fallback', () => {
     assert.ok(d.cache.hitRatio > 0 && d.cache.hitRatio < 1, 'aggregate hit ratio computed from summed counts');
     const disc = d.usage.discardedAttempts as { attempts: number };
     assert.ok(disc.attempts >= 1, 'refused leaves counted as discarded attempts');
+  });
+
+  /** The split's own refusals: refused requests over part of the four-message chunk, not all of it. */
+  const splitRefusals = (stub: { refusedTargets: number[] }) => stub.refusedTargets.filter((k) => k < 4).length;
+  const cacheOf = (o: { cacheCreationTokens?: number; cacheReadTokens?: number } | undefined) => ({ cacheCreationTokens: o?.cacheCreationTokens, cacheReadTokens: o?.cacheReadTokens });
+
+  it('discarded attempts carry the cache counts the discarded calls reported', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const refused = splitRefusals(stub);
+    assert.ok(refused >= 1, 'the split refused some of its own requests');
+    assert.equal(fx.strategy.attempted()!.refused, refused);
+    const d = fx.strategy.details()!;
+    // The stitched usage is the four successful leaves' (4×7 written, 4×3 read),
+    // and what the split's refused requests reported (5 written, 11 read each)
+    // is the discarded spend's.
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: 28, cacheReadTokens: 12 });
+    assert.deepEqual(cacheOf(d.usage.discardedAttempts as object), { cacheCreationTokens: refused * 5, cacheReadTokens: refused * 11 });
+  });
+
+  it('discarded attempts carry the refused calls\' cache counts when no successful leaf reported any', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const refused = splitRefusals(stub);
+    const d = fx.strategy.details()!;
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: undefined, cacheReadTokens: undefined }, 'no successful leaf reported cache counts');
+    assert.deepEqual(cacheOf(d.usage.discardedAttempts as object), { cacheCreationTokens: refused * 5, cacheReadTokens: refused * 11 });
+  });
+
+  it('discarded attempts carry no cache counts when only the successful leaves reported them', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, leafDetails: true });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const d = fx.strategy.details()!;
+    assert.deepEqual(cacheOf(d.usage), { cacheCreationTokens: 28, cacheReadTokens: 12 });
+    const disc = d.usage.discardedAttempts as { attempts: number };
+    assert.ok(disc.attempts >= 1);
+    assert.equal('cacheCreationTokens' in disc, false, 'no discarded call reported any, so no zero stands in for one');
+    assert.equal('cacheReadTokens' in disc, false);
+  });
+
+  it('a discarded call that reports only cache reads counts them', async () => {
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: 'reads-only' });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // The pair appears together, as on the stitched usage.
+    assert.deepEqual(cacheOf(fx.strategy.details()!.usage.discardedAttempts as object), { cacheCreationTokens: 0, cacheReadTokens: splitRefusals(stub) * 11 });
+  });
+
+  it('no cache counts appear anywhere when no call reported any', async () => {
+    // The refusals carry details.usage, with input and output and no cache counts.
+    const stub = cumulativeMembrane({ refuseAt: 2, refusedDetails: 'no-cache' });
+    const fx = await build(stub.membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const d = fx.strategy.details()!;
+    const disc = d.usage.discardedAttempts as { attempts: number };
+    assert.ok(disc.attempts >= 1);
+    const places: Array<[string, object]> = [
+      ['discardedAttempts', disc],
+      ['the stitched usage', d.usage],
+      ['attempted', fx.strategy.attempted()!],
+      ['the split metadata', (fx.strategy.entries()[0]!.stitched as { attempted: object }).attempted],
+    ];
+    for (const [where, value] of places) {
+      assert.equal('cacheCreationTokens' in value, false, `${where} has no cacheCreationTokens`);
+      assert.equal('cacheReadTokens' in value, false, `${where} has no cacheReadTokens`);
+    }
+  });
+
+  it('the split metadata and both split-stitch log events carry the attempted cache sums', async () => {
+    const logPath = `${freshPath()}-trace.jsonl`;
+    paths.push(logPath);
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    try {
+      const landed = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true });
+      const fx = await build(landed.membrane, { split: true });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      // A run abandoned at its last single message, after the others folded.
+      const abandoned = cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true, rejectOn: 'raw-3' });
+      const fy = await build(abandoned.membrane, { split: true });
+      await fy.strategy.run(fy.target, managerContext(fy.manager));
+
+      // Every completed call: the successful leaves' 7 written and 3 read, the refusals' 5 and 11.
+      const sums = (stub: ReturnType<typeof cumulativeMembrane>) => ({
+        cacheCreationTokens: stub.leaves() * 7 + splitRefusals(stub) * 5,
+        cacheReadTokens: stub.leaves() * 3 + splitRefusals(stub) * 11,
+      });
+      const events = readFileSync(logPath, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; metadata?: { reason?: string; piecesDiscarded?: number; attempted?: { cacheCreationTokens?: number; cacheReadTokens?: number } } });
+      const landedEvent = events.find((e) => e.event === 'compression:split-stitch');
+      const abandonedEvent = events.find((e) => e.event === 'compression:split-stitch-abandoned');
+      assert.ok(landedEvent && abandonedEvent, 'both runs logged their split-stitch event');
+      assert.ok(splitRefusals(abandoned) >= 1 && abandoned.leaves() >= 1, 'the abandoned run completed calls of both kinds first');
+      // The premise: raw-3's rejection, its last call, abandoned it, after other pieces folded.
+      assert.equal(abandonedEvent.metadata?.reason, 'provider-error:invalid_request', "abandoned by the piece's rejection");
+      assert.ok((abandonedEvent.metadata?.piecesDiscarded ?? 0) >= 1, 'after other pieces folded');
+      assert.ok(JSON.stringify(abandoned.calls.at(-1)).includes('raw-3'), 'the last call was the piece holding raw-3');
+      assert.deepEqual(cacheOf(landedEvent.metadata?.attempted), sums(landed));
+      assert.deepEqual(cacheOf((fx.strategy.entries()[0]!.stitched as { attempted: object }).attempted), sums(landed));
+      assert.deepEqual(cacheOf(abandonedEvent.metadata?.attempted), sums(abandoned));
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
   });
 
   it('model identity is unanimous only when every successful leaf reported it; present/missing mix is "mixed"', async () => {
