@@ -693,9 +693,10 @@ export class ContextManager {
    * - "afterUser": inserted after the last user message
    *
    * The `injections` parameter is DEPRECATED (see {@link ContextInjection}
-   * and anima-research/agent-framework#171): injected blocks are not stored
-   * and are re-placed on every compile, so they move with each activation
-   * and break prompt-cache prefixes. New callers should pass `undefined`.
+   * and anima-research/agent-framework#171): injected blocks are not stored,
+   * and `beforeUser` and `afterUser` blocks are re-placed on every compile,
+   * so they move with each activation and break prompt-cache prefixes. New
+   * callers should pass `undefined`.
    *
    * May block if strategy has pending work.
    */

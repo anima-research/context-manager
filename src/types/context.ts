@@ -83,20 +83,26 @@ export interface PendingWork {
  *
  * @deprecated Context injection is deprecated
  * (anima-research/agent-framework#171). Injections are never stored: each
- * `compile()` splices them in fresh, re-anchored to the latest
- * user-participant message, so the rendered prefix changes at every
- * activation and prompt caches stop hitting past that point (head-only
- * hits on OpenAI Responses/Codex). After a mid-activation recompile the
- * anchor can also fall between a tool call and its result. Prefer content
- * that is stored once at its own position — system prompt for durable
- * instructions, ordinary messages for changing state. Still accepted by
- * `compile()` for now.
+ * `compile()` splices `beforeUser` and `afterUser` injections in fresh,
+ * re-anchored to the latest user-participant message, so the rendered
+ * prefix changes at every activation and prompt caches stop hitting past
+ * that point (head-only hits on OpenAI Responses/Codex). After a
+ * mid-activation recompile a `beforeUser` injection can also land between a
+ * tool call and its result. `system` injections are not spliced: they come
+ * back in `CompileResult.systemInjections` for the caller's system prompt.
+ * Prefer content that is stored once at its own position — system prompt
+ * for durable instructions, ordinary messages for changing state. Still
+ * accepted by `compile()` for now.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
   namespace: string;
 
-  /** Where to inject in the message array */
+  /**
+   * Where to inject: `beforeUser` and `afterUser` go into the message array,
+   * placed as `compile()` describes, and `system` comes back in
+   * `CompileResult.systemInjections` instead.
+   */
   position: 'system' | 'beforeUser' | 'afterUser';
 
   /** Content blocks to inject (multimodal) */
