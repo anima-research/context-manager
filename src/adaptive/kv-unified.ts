@@ -349,20 +349,6 @@ const PIN_LEVEL_SOURCE = 'pin-level';
  *  labelled. */
 const levelPins = new WeakSet<CanonicalLeafConstraint>();
 
-/** Whether `constraint` allows a leaf at `level`, whatever its chain supplies.
- *  One whose level isn't a non-negative integer allows none, since `buildLeaf`
- *  empties a leaf that carries it. */
-function admitsLevel(constraint: CanonicalLeafConstraint, level: number): boolean {
-  if (constraint.kind === 'raw') return level === 0;
-  const bound = constraint.level;
-  if (bound === undefined || !Number.isInteger(bound) || bound < 0) return false;
-  switch (constraint.kind) {
-    case 'exact': return bound === level;
-    case 'max': return level <= bound;
-    case 'min': return level >= bound;
-  }
-}
-
 /**
  * The hold a leaf's level pin is under (design F4b): the pinned level, and the
  * level the leaf is held at, the deepest level its ownership chain supplies
@@ -388,7 +374,7 @@ function levelPinHold(
   if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
   let heldAt = 0;
   for (const candidate of availableLevels) if (candidate < level && candidate > heldAt) heldAt = candidate;
-  const allowsHold = (other: CanonicalLeafConstraint) => admitsLevel(other, level) && admitsLevel(other, heldAt);
+  const allowsHold = (other: CanonicalLeafConstraint) => constraintAdmits(other, level) && constraintAdmits(other, heldAt);
   return constraints.every((other) => other === pin || allowsHold(other)) ? { level, heldAt } : null;
 }
 
@@ -2069,8 +2055,9 @@ export class CanonicalSummaryForest {
   }
 }
 
-/** Whether a leaf constraint admits `level`, as buildLeaf reads it: a
- *  constraint whose own level isn't a non-negative integer admits nothing. */
+/** Whether a leaf constraint admits `level`, as buildLeaf reads it, whatever
+ *  the leaf's chain supplies: a constraint whose own level isn't a
+ *  non-negative integer admits nothing. */
 function constraintAdmits(constraint: CanonicalLeafConstraint, level: number): boolean {
   if (constraint.kind === 'raw') return level === 0;
   const bound = constraint.level;
