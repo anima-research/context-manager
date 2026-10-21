@@ -4,6 +4,7 @@ import type {
   StrategyContext,
   ReadinessState,
   MessageStoreView,
+  MessageId,
   ContextLogView,
   TokenBudget,
   ContextEntry,
@@ -281,13 +282,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // the cap with nothing cut. The image strip's depth (applyImageStripping)
     // is still measured by the store's estimate of each stored message,
     // before the cap, as the autobiographical strategy measures its own.
-    const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
       const msg = messages[i];
       const estimate = store.estimateTokens(msg);
-      if (cap <= 0) return estimate;
-      const content = truncateContent(msg.content, cap);
+      const content = this.cappedContent(msg);
       if (content === msg.content) return estimate;
       shaped.set(i, content);
       return estimate + cappedPriceExtra(store, msg, content);
@@ -366,6 +365,55 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.applyImageStripping(entries, messages, store);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
+  }
+
+  /** A stored message's content as select sends it under the per-message
+   *  cap: the content itself when no cap is set or nothing needs cutting. */
+  private cappedContent(msg: StoredMessage): ContentBlock[] {
+    const cap = this.maxMessageTokens ?? 0;
+    return cap <= 0 ? msg.content : truncateContent(msg.content, cap);
+  }
+
+  /**
+   * See `ContextStrategy.renderAsNewest`. The steps select takes for the
+   * messages it sends, over the view's suffix from the batch's oldest
+   * message to its newest: each cut as select cuts it (cappedContent), then
+   * applyImageStripping, whose depth is measured from the view's newest
+   * message, as select's is. A message before the anchor, which select
+   * leaves out, comes back as null. Like select, it first reloads the
+   * branch the store has moved to. A re-anchor the next compile's budget
+   * forces isn't foreseen: it moves the anchor only past a window bigger
+   * than the budget allows. A body sharded under the autobiographical
+   * strategy comes back shard by shard, since select sends each as its own
+   * message.
+   */
+  renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
+    this.syncToBranch();
+    const messages = store.getAll();
+    const at = new Map(messages.map((m, i) => [m.id, i] as const));
+    const shown = (i: number): boolean => messages[i]!.sequence >= this.anchor;
+    let from = messages.length;
+    for (const id of ids) {
+      const i = at.get(id);
+      if (i !== undefined && shown(i)) from = Math.min(from, i);
+    }
+    // Timeline order with each message's position as its index, as select's
+    // entries have, which the image pass reads for depth and newest-first.
+    const entries: ContextEntry[] = [];
+    for (let i = from; i < messages.length; i++) {
+      const msg = messages[i]!;
+      entries.push({
+        index: i,
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content: this.cappedContent(msg),
+      });
+    }
+    this.applyImageStripping(entries, messages, store);
+    const rendered = new Map<MessageId, ContentBlock[]>();
+    for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
+    return ids.map((id) => rendered.get(id) ?? null);
   }
 
   /** 'window' when the last committed select moved the window's start. */

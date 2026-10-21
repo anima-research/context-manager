@@ -4,11 +4,12 @@
  * One process can host several managers on one store, each with its own
  * namespace (agent-framework gives each agent `agents/<name>`), and their
  * lines interleave on stderr. A line about one namespace's work ends its
- * first line with ` ns=<namespace>`, after its own fields, so a grep for its
- * prefix still matches and a reader can keep one namespace's lines. A line
- * about what no one namespace owns, such as the store's own records or a
- * message slot the managers share, is logged as it is, through `console`,
- * which is a Diagnostics too.
+ * message's first line with ` ns=<namespace>`, after its own fields, so a
+ * grep for its prefix still matches and a reader can keep one namespace's
+ * lines. Values logged after the message, such as an error, print after the
+ * suffix, as console prints them. A line about what no one namespace owns,
+ * such as the store's own records or a message slot the managers share, is
+ * logged as it is, through `console`, which is a Diagnostics too.
  *
  * As with console, a message followed by arguments is a format string, so a
  * value put into it that may hold a '%' is doubled first.

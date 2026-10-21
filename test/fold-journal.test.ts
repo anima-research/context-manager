@@ -141,6 +141,93 @@ describe('fold journal', () => {
   beforeEach(cleanup);
   afterEach(cleanup);
 
+  it("a close() from a receipt listener lets the acceptance that announced to it commit its own receipt, and the owned store closes when it returns", async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const baseline = await acceptCompile(cm);
+    assert.ok(baseline);
+    cm.close();
+    // Reopened, the journal hasn't announced the branch's newest receipt, so
+    // the next acceptance announces it before it commits its own.
+    ({ cm, strategy } = await open(strategy));
+    const closing = cm;
+    const heard: string[] = [];
+    let storeOpenAtClose: boolean | undefined;
+    closing.onFoldReceipt((receipt) => {
+      heard.push(receipt.id);
+      if (heard.length === 1) {
+        closing.close();
+        storeOpenAtClose = !closing.getStore().isClosed();
+      }
+    });
+    strategy.plan.set(ids[1]!, 'omit');
+    const result = await closing.compile(BUDGET);
+    const change = closing.acceptRound({ provenance: result.provenance! });
+    assert.equal(change?.kind, 'change', 'the acceptance committed its receipt');
+    assert.equal(heard[0], baseline.id, "the branch's earlier receipt was announced first");
+    assert.equal(storeOpenAtClose, true, 'the owned store stayed open while the acceptance ran');
+    assert.ok(closing.getStore().isClosed(), 'and closed when it returned');
+    ({ cm } = await open(strategy));
+    assert.deepEqual(cm.listFoldReceipts({ limit: 10 }).receipts.map((r) => r.id), [change!.id, baseline.id], 'both receipts are durable');
+    cm.close();
+  });
+
+  it('a close() during a write nested in an acceptance closes the owned store only when the acceptance returns', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    assert.ok(await acceptCompile(cm));
+    cm.close();
+    ({ cm, strategy } = await open(strategy));
+    const closing = cm;
+    // The receipt listener adds a message, and a message listener closes the
+    // manager during that add: a write inside the acceptance's write.
+    let nesting = false;
+    let nested: string | undefined;
+    let storeOpenAfterNested: boolean | undefined;
+    closing.onMessage((event) => {
+      if (nesting && event.type === 'add') closing.close();
+    });
+    closing.onFoldReceipt(() => {
+      if (nested !== undefined) return;
+      nesting = true;
+      nested = closing.addMessage('User', [{ type: 'text', text: 'nested' }]);
+      nesting = false;
+      storeOpenAfterNested = !closing.getStore().isClosed();
+    });
+    strategy.plan.set(ids[1]!, 'omit');
+    const result = await closing.compile(BUDGET);
+    const change = closing.acceptRound({ provenance: result.provenance! });
+    assert.equal(change?.kind, 'change', 'the acceptance committed its receipt');
+    assert.equal(storeOpenAfterNested, true, 'the owned store stayed open when the nested add returned');
+    assert.ok(closing.getStore().isClosed(), 'and closed when the acceptance returned');
+    ({ cm } = await open(strategy));
+    assert.ok(cm.getMessage(nested!), 'the nested add is stored');
+    assert.equal(cm.listFoldReceipts({ limit: 10 }).receipts[0]?.id, change!.id, "the acceptance's receipt is durable");
+    cm.close();
+  });
+
+  it('a close() from a receipt listener still closes the owned store when the acceptance then fails', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    assert.ok(await acceptCompile(cm));
+    cm.close();
+    ({ cm, strategy } = await open(strategy));
+    const closing = cm;
+    const store = closing.getStore() as unknown as { appendJson: (...args: unknown[]) => unknown };
+    closing.onFoldReceipt(() => {
+      if (closing.isClosed()) return;
+      closing.close();
+      // The acceptance's own receipt then fails to write.
+      store.appendJson = () => {
+        throw new Error('the receipt write failed');
+      };
+    });
+    strategy.plan.set(ids[1]!, 'omit');
+    const result = await closing.compile(BUDGET);
+    assert.throws(() => closing.acceptRound({ provenance: result.provenance! }), /the receipt write failed/);
+    assert.ok(closing.getStore().isClosed(), 'the owned store closed when the failed acceptance returned');
+  });
+
   it('writes a baseline on the first accepted round, saying history before it is unknown', async () => {
     const { cm } = await open();
     const ids = add(cm, 3);

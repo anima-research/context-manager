@@ -94,7 +94,7 @@ describe('the manager\'s diagnostics', () => {
         const store = JsStore.openOrCreate({ path: ${JSON.stringify(dir)} + '/' + name });
         MessageStore.register(store, namespace);
         // Each store's cache starts cold, a miss. The sibling's cache is stale once the other
-        // store appends, so its own append's write-through fails.
+        // store appends, so its own append's write-through is deferred to its next read.
         const own = new MessageStore(store, { namespace });
         const sibling = new MessageStore(store, { namespace });
         own.append('User', [{ type: 'text', text: 'one' }]);
@@ -114,12 +114,12 @@ describe('the manager\'s diagnostics', () => {
     assert.equal(result.status, 0, result.stderr);
     const cacheLines = result.stderr.split('\n').filter((line) =>
       line.startsWith('[cm-cache] getAllInternal MISS') ||
-      line.startsWith('[cm-cache] append write-through FAILED (cache was stale before the append)'));
+      line.startsWith("[cm-cache] append write-through deferred (cache wasn't current before the append)"));
     const linesOf = (slot: string) => cacheLines.filter((line) => line.includes(` stateId=${slot} `));
     const isolated = linesOf('agents/tern/messages');
     const shared = linesOf('messages');
     for (const lines of [isolated, shared]) {
-      assert.ok(lines.some((line) => line.includes(' MISS ')) && lines.some((line) => line.includes(' FAILED ')), result.stderr);
+      assert.ok(lines.some((line) => line.includes(' MISS ')) && lines.some((line) => line.includes(' deferred ')), result.stderr);
     }
     assert.ok(isolated.every((line) => line.endsWith(' ns=agents/tern')), isolated.join('\n'));
     assert.ok(shared.every((line) => !line.includes(' ns=')), shared.join('\n'));

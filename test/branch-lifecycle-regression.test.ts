@@ -147,8 +147,6 @@ describe('ContextManager branch lifecycle regressions', () => {
       }
     };
 
-    // On main, a record whose sources are gone: the merge sweep clears it and persists.
-    quarantine('gone', ['ghost-1', 'ghost-2']);
     const main = manager.currentBranch().name;
     // On the fork, a record over two live L1s: the sweep keeps it.
     const fork = await manager.fork('fork');
@@ -157,7 +155,11 @@ describe('ContextManager branch lifecycle regressions', () => {
     assert.equal(live.length, 2, "premise: the fork's reload keeps both L1s, unmerged");
     quarantine('live', ['L1-x', 'L1-y']);
     await manager.switchBranch(main);
-    assert.deepEqual([...internals.mergeQuarantine.keys()], ['gone'], 'premise: loaded on main');
+    // On main, a record whose sources are gone, written after the load, as a
+    // record can go stale while the store is open (the open's own sweep clears
+    // one stale at load): the merge sweep clears it and persists.
+    quarantine('gone', ['ghost-1', 'ghost-2']);
+    assert.deepEqual([...internals.mergeQuarantine.keys()], ['gone'], 'premise: on main');
     // No tick has run, so neither klaxon has sounded yet: both are due.
 
     const tick = manager.tick();
@@ -167,9 +169,11 @@ describe('ContextManager branch lifecycle regressions', () => {
     assert.equal(thrown, undefined, 'the tick returns at its branch check, with no error');
 
     // The switch landed before the merge klaxon: main's record is still there.
-    await manager.switchBranch(main);
+    internals.store.switchBranch(main);
     assert.deepEqual(stored(), ['gone'], 'premise: the tick swept nothing on main before the switch');
-    // The control: on its own branch, the same sweep clears main's record and persists.
+    // The control: on its own branch, the same sweep clears such a record and persists.
+    await manager.switchBranch(main);
+    quarantine('gone', ['ghost-1', 'ghost-2']);
     await quietly(() => manager.tick());
     assert.deepEqual(stored(), [], 'premise: the sweep runs and persists when its branch is current');
 

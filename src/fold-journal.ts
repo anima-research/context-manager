@@ -276,12 +276,16 @@ interface LatestLayout extends StoredLayout {
 
 const storeIdentityCache = new WeakMap<JsStore, string>();
 
-/** The store's id, minted once (as a typed record) on first use. */
-export function storeIdentity(store: JsStore): string {
-  const cached = storeIdentityCache.get(store);
+/** The store's id if this process has read or minted it, or null: the store isn't read. */
+export function cachedStoreIdentity(store: JsStore): string | null {
+  return storeIdentityCache.get(store) ?? null;
+}
+
+/** The store's id if it has one, read as storeIdentity reads it, or null: never minted here. */
+export function existingStoreIdentity(store: JsStore): string | null {
+  const cached = cachedStoreIdentity(store);
   if (cached) return cached;
-  const ids = store.getRecordIdsByType(STORE_IDENTITY_RECORD);
-  for (const id of ids) {
+  for (const id of store.getRecordIdsByType(STORE_IDENTITY_RECORD)) {
     const parsed = readRecord<{ storeId?: unknown }>(store, id);
     if (parsed && typeof parsed.storeId === 'string' && parsed.storeId) {
       // It may be the record of a mint whose sync failed, durable or not:
@@ -291,6 +295,14 @@ export function storeIdentity(store: JsStore): string {
       return parsed.storeId;
     }
   }
+  return null;
+}
+
+/** The store's id, minted once (as a typed record) on first use. */
+export function storeIdentity(store: JsStore): string {
+  const existing = existingStoreIdentity(store);
+  if (existing) return existing;
+  const ids = store.getRecordIdsByType(STORE_IDENTITY_RECORD);
   const storeId = randomUUID();
   if (ids.length > 0) {
     // Refusing would fail every acceptance on this store for good; a new id

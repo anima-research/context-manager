@@ -9,6 +9,7 @@
  */
 
 import { getSummaryParentId } from '../types/strategy.js';
+import type { SummaryEntry } from '../types/strategy.js';
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerChunk, PickerInputs } from './picker.js';
 
@@ -225,6 +226,34 @@ interface MutableSummary {
   leafIds: ChunkId[];
   /** Positions of `leafIds`, parallel to it. */
   leafPositions: number[];
+}
+
+/**
+ * Ownership follows a lineage only where each summary lists the one below it.
+ * A chunk renders through a summary only where that summary covers it
+ * (`SummaryTree.ancestorAt` reads the summary's leaves through what it lists,
+ * #234), and a parent pointer can name a summary written again without this
+ * branch. So a chunk whose L1 doesn't list it is ownerless, and a summary
+ * whose parent doesn't list it is a root. The forest then owns a chunk at a
+ * level only where `ancestorAt` renders it there. It can own fewer: where a
+ * pointer on the chunk's chain names a summary that doesn't list the one
+ * below, while the summary at a level above still covers the chunk through
+ * others it lists. A pointer to a missing summary, or to one at a level the
+ * link can't name, is kept, so the walk reports it.
+ */
+function listedL1Id(chunk: PickerChunk, summaries: ReadonlyMap<SummaryId, SummaryEntry>): SummaryId | undefined {
+  const l1Id = chunk.l1Id;
+  if (l1Id === undefined) return undefined;
+  const l1 = summaries.get(l1Id);
+  return l1 === undefined || l1.level !== 1 || l1.sourceIds.includes(chunk.id) ? l1Id : undefined;
+}
+
+/** `entry`'s parent where that parent lists it (see `listedL1Id`). */
+function listedParentId(entry: SummaryEntry, summaries: ReadonlyMap<SummaryId, SummaryEntry>): SummaryId | undefined {
+  const parentId = getSummaryParentId(entry);
+  if (parentId === undefined) return undefined;
+  const parent = summaries.get(parentId);
+  return parent === undefined || parent.level <= entry.level || parent.sourceIds.includes(entry.id) ? parentId : undefined;
 }
 
 /** Levels and representation hashes along one ownership chain, shared by
@@ -505,14 +534,15 @@ export class CanonicalSummaryForest {
     const cleanChainByL1 = new Map<SummaryId, SummaryId[]>();
     for (let at = 0; at < chunks.length; at++) {
       const chunk = chunks[at];
-      if (chunk.l1Id !== undefined) {
-        const known = cleanChainByL1.get(chunk.l1Id);
+      const l1Id = listedL1Id(chunk, inputs.summaries);
+      if (l1Id !== undefined) {
+        const known = cleanChainByL1.get(l1Id);
         if (known) { chainOf[at] = known; continue; }
       }
       const issuesBefore = issues.length;
       const chain: SummaryId[] = [];
       const seen = new Set<SummaryId>();
-      let currentId = chunk.l1Id;
+      let currentId = l1Id;
       let previousLevel = 0;
       while (currentId !== undefined) {
         if (seen.has(currentId)) {
@@ -565,10 +595,10 @@ export class CanonicalSummaryForest {
         }
         chain.push(entry.id);
         previousLevel = entry.level;
-        currentId = getSummaryParentId(entry);
+        currentId = listedParentId(entry, inputs.summaries);
       }
       chainOf[at] = chain;
-      if (chunk.l1Id !== undefined && issues.length === issuesBefore) cleanChainByL1.set(chunk.l1Id, chain);
+      if (l1Id !== undefined && issues.length === issuesBefore) cleanChainByL1.set(l1Id, chain);
     }
 
     if (issues.length > 0) throw new CanonicalForestError(issues);
@@ -606,7 +636,7 @@ export class CanonicalSummaryForest {
                 id,
                 level: entry.level,
                 recallTokens: inputs.recallPairTokens?.get(id) ?? entry.tokens,
-                parentId: getSummaryParentId(entry),
+                parentId: listedParentId(entry, inputs.summaries),
                 childSummaryIds: new Set(),
                 directLeafIds: [],
                 leafIds: [],
@@ -773,7 +803,7 @@ export class CanonicalSummaryForest {
         if (!Number.isFinite(recallTokens) || recallTokens < 0) return null;
         chain.push(entry.id);
         previousLevel = entry.level;
-        currentId = getSummaryParentId(entry);
+        currentId = listedParentId(entry, inputs.summaries);
       }
       const placed = oldMap.get(l1Id);
       let result = chain;
@@ -798,7 +828,8 @@ export class CanonicalSummaryForest {
     const noChain: readonly SummaryId[] = [];
     for (let i = 0; i < n; i++) {
       const chunk = chunks[i];
-      const chain = chunk.l1Id === undefined ? noChain : walk(chunk.l1Id);
+      const l1Id = listedL1Id(chunk, inputs.summaries);
+      const chain = l1Id === undefined ? noChain : walk(l1Id);
       if (chain === null) return null;
       chainOf[i] = chain;
       const before = i < oldLeaves.length ? oldLeaves[i].summaryIds : null;
@@ -812,9 +843,9 @@ export class CanonicalSummaryForest {
         for (const id of chain) changedSummaryIds.add(id);
         // A leaf newly owned by this L1 (it was ownerless or appended); a
         // re-parented L1 keeps its previous leaves, added below.
-        if (chunk.l1Id !== undefined && (before === null || before.length === 0)) {
-          let positions = positionsOfL1.get(chunk.l1Id);
-          if (!positions) positionsOfL1.set(chunk.l1Id, positions = []);
+        if (l1Id !== undefined && (before === null || before.length === 0)) {
+          let positions = positionsOfL1.get(l1Id);
+          if (!positions) positionsOfL1.set(l1Id, positions = []);
           positions.push(i);
         }
       }
@@ -876,7 +907,7 @@ export class CanonicalSummaryForest {
         id,
         level: entry.level,
         recallTokens: inputs.recallPairTokens?.get(id) ?? entry.tokens,
-        parentId: getSummaryParentId(entry),
+        parentId: listedParentId(entry, inputs.summaries),
         childSummaryIds: children
           ? [...children].sort((a, b) => firstPositionOf(a) - firstPositionOf(b) || a.localeCompare(b))
           : [],
@@ -1025,11 +1056,12 @@ export class CanonicalSummaryForest {
   /**
    * Build the forest for `inputs` from `previous` when ownership did not
    * change: every previous leaf is still there in the same order with the
-   * same L1 link, only ownerless leaves were appended, summaries and recall
+   * same L1 listing it, only ownerless leaves were appended, summaries and recall
    * costs are identical, and the options match. Summary nodes, treeified and
    * gap-bearing sets are shared. Leaves whose own fields or head/tail
    * membership changed are rebuilt; the rest are shared. Returns null when a
-   * full build is needed, which the caller does with the constructor.
+   * full build is needed, which the caller does with the constructor, and
+   * always for a forest that treeified a summary.
    */
   static derive(
     previous: CanonicalSummaryForest,
@@ -1046,6 +1078,13 @@ export class CanonicalSummaryForest {
       !Number.isFinite(inputs.headTokens) || inputs.headTokens < 0 ||
       !Number.isFinite(inputs.tailTokens) || inputs.tailTokens < 0
     ) return null;
+    // Treeification takes summaries a full build walks off their leaves'
+    // chains, and so off summaryMap, the record the checks below compare
+    // against. A listing change, an edit in place or a removal around them can
+    // then change what a full build makes without any check here seeing it,
+    // so a treeified forest is rebuilt in full. A forest that isn't treeified
+    // places every summary a chain reaches.
+    if (previous.treeifiedSummaryIds.length > 0) return null;
     const pi = previous.sourceInputs;
     // Summaries are compared with the previous forest's own record of them:
     // the strategy updates a child's parent link on the entry object itself
@@ -1058,7 +1097,7 @@ export class CanonicalSummaryForest {
       const recall = inputs.recallPairTokens?.get(id) ?? entry.tokens;
       if (placed) {
         if (placed.level !== entry.level || placed.recallTokens !== recall) return null;
-        if (getSummaryParentId(entry) !== placed.parentId) ownershipChanged = true;
+        if (listedParentId(entry, inputs.summaries) !== placed.parentId) ownershipChanged = true;
         continue;
       }
       const old = pi.summaries.get(id);
@@ -1080,7 +1119,7 @@ export class CanonicalSummaryForest {
       const leaf = oldLeaves[i], b = chunks[i];
       if (leaf.id !== b.id || leaf.sequence !== b.sequence) return null;
       const l1Id = leaf.summaryIds.length > 0 ? leaf.summaryIds[0] : undefined;
-      if (l1Id !== b.l1Id) {
+      if (l1Id !== listedL1Id(b, inputs.summaries)) {
         // A leaf may become owned; any other change of ownership is a full build.
         if (l1Id !== undefined) return null;
         ownershipChanged = true;
@@ -1094,7 +1133,7 @@ export class CanonicalSummaryForest {
       if (!Number.isFinite(chunk.rawTokens) || chunk.rawTokens < 0) return null;
       if (appendedIds!.has(chunk.id)) return null;
       appendedIds!.add(chunk.id);
-      if (chunk.l1Id !== undefined) ownershipChanged = true;
+      if (listedL1Id(chunk, inputs.summaries) !== undefined) ownershipChanged = true;
       lastSequence = chunk.sequence;
     }
     if (ownershipChanged) return CanonicalSummaryForest.extend(previous, inputs, options, chunks);
@@ -2006,6 +2045,13 @@ export class CanonicalSummaryForest {
       floorTokens === null || !Number.isFinite(maxTokens)
         ? 0
         : Math.max(0, floorTokens - maxTokens);
+    // Producing the missing levels clears the refusal only where every
+    // conflicting leaf, given the levels it requests, has a level all its
+    // constraints admit. A lock against a pin at another level, or a raw pin
+    // against an exact constraint at a missing level, conflicts still.
+    const producingClears = missingLevels.length > 0 && this.constraintConflicts.every((conflict) =>
+      [...conflict.availableLevels, ...conflict.requestedMissingLevels].some((level) =>
+        conflict.constraints.every((constraint) => constraintAdmits(constraint, level))));
     return {
       reason,
       floorTokens,
@@ -2014,11 +2060,24 @@ export class CanonicalSummaryForest {
       missingLevels,
       requiredAdditionalTokens,
       suggestion:
-        reason === 'constraint-conflict'
-          ? 'Release or reconcile the listed constraints, or produce the missing levels.'
-          : `Raise W by at least ${requiredAdditionalTokens} tokens, or release a binding protection.`,
+        reason !== 'constraint-conflict'
+          ? `Raise W by at least ${requiredAdditionalTokens} tokens, or release a binding protection.`
+          : producingClears
+            ? 'Release or reconcile the listed constraints, or produce the missing levels.'
+            : 'Release or reconcile the listed constraints.',
     };
   }
+}
+
+/** Whether a leaf constraint admits `level`, as buildLeaf reads it: a
+ *  constraint whose own level isn't a non-negative integer admits nothing. */
+function constraintAdmits(constraint: CanonicalLeafConstraint, level: number): boolean {
+  if (constraint.kind === 'raw') return level === 0;
+  const bound = constraint.level;
+  if (bound === undefined || !Number.isInteger(bound) || bound < 0) return false;
+  if (constraint.kind === 'exact') return level === bound;
+  if (constraint.kind === 'max') return level <= bound;
+  return level >= bound;
 }
 
 function mergeCuts(a: PartialCut, b: PartialCut): PartialCut {

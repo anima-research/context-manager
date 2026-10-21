@@ -57,6 +57,8 @@ async function main(): Promise<void> {
     } else {
       console.log(`${storePath}${namespace ? ` (${namespace})` : ''}: ${manager.getMessageCount()} messages, ${seen}, ` +
         `${violations.length} topology violation(s), compression debt ${debt.state}`);
+      // What the report couldn't read, what that means and what to do, a line each.
+      if (debt.error !== undefined) for (const line of debt.error.split('\n')) console.log(`  ${line}`);
       for (const v of violations) {
         console.log(`  L${v.level} ${v.id}: ${v.leafCount} leaves ${v.span.first}..${v.span.last}, ` +
           `${v.holes} hole(s) e.g. ${v.holeSample.join(',')}` +

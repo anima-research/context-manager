@@ -12,6 +12,361 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.17.1 — 2026-10-19
+
+### Fixed
+
+- A compile's provenance no longer reads a stored message to learn where it
+  sits. Attribution looks up the sequence of each raw run's first message,
+  and since 0.16.0 that lookup was `get(id)`, which deserializes the whole
+  message through chronicle to report one field: on a long-lived store with a
+  few hundred raw runs per compile, that was about 100 ms of every compile.
+  `MessageStoreView` gains an optional `sequenceOf(id)`, which `MessageStore`
+  answers from its id index and the listing the compile has just read, and
+  merged views pass through; a view without it is still asked through `get`
+  (#273).
+
+## 0.17.0 — 2026-10-19
+
+### Added
+
+- The `[plan-vs-actual]` line, logged by every adaptive compile that returns, dry runs and previews included, now carries `messages=<n>` after `solver=`, the messages in the strategy's view of the branch the compile read (after the view filter, auxiliary slots included), and then `compileMs=<n>`, the time in the base `AutobiographicalStrategy.select()` up to the line in whole milliseconds. Under `foldingStrategy: 'kv-unified'` it also carries `solveMs=<n>`, the forest build, solve and latent-demand ranking of the compile's final pick inside it (not the `productionBudgetTokens` shadow pick). A dry run or preview, which skips work a live compile does, adds ` dryRun=true`, so a journal comparison can leave them out. `compileMs` excludes a subclass's own `select()` override and the `ContextManager` work around the call. It includes a `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out, and after a provisional-calibration retry the refused first attempt. `RenderStats.planVsActual` carries all four as optional `messages`, `compileMs`, `solveMs` and `dryRun`, so a host can read them without parsing logs. Everything before the new fields is unchanged.
+
+- kv-unified solves every forest with a subtree-memoized engine
+  (`engine: 'subtree'`, the `auto` default; `engine: 'dag'` asks for the
+  packed DAG engine; `auto` runs a solve the subtree engine cannot fit under
+  the label ceiling once more on the packed engine). What a summary subtree contributes to a label is a
+  set of deltas pruned on the same grid as before, computed once per
+  summary and kept in the solve's reuse holder (by summary id, across full
+  forest builds) while nothing under it changed: its leaves' weights,
+  constraints, zone and receipt entries, its own and its descendants'
+  structure and recall costs, and the solve's policy, grid and wall. With ages read in bands, a compile re-solves only the
+  subtrees an append, a band crossing, a new summary or a move touched and
+  combines the rest, so the solve's cost follows what changed instead of
+  the store's size (#45). Without a grid the composition is exact Pareto
+  algebra and matches the object engine's nondominated terminal set; on a
+  grid it is the same kind of bucketed approximation with the same error
+  bound, placed from each subtree's origin, so the retained candidates can
+  differ within that bound. `KvUnifiedTimings.subtree` reports the delta
+  sets a solve computed and reused.
+
+- `mergeHoldSummaryIds`: operator merge holds. Listed summaries are never offered as merge sources by any scheduler, so while a summary that hasn't merged is held (e.g. awaiting review), no summary above it forms; like quarantined sources, held summaries split the frontier into runs, so later history still merges around them. They count as unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every held summary toward its level's `mergeThreshold`. The run of same-level summaries just before a held one can't grow past it, so it merges as a run between two summaries does, which can be at two, below `mergeThreshold`. Lifting a hold doesn't undo the merges formed around the held summary: it can then merge only with an unmerged summary of its level beside it, and one with none beside it stays at its level. Holds are deliberate, so they don't change `getCompressionDebt().state`, but they're listed in `mergeHeldIds`. Hosts must pass the option through (connectome-host companion PR).
+
+- `witnessedIdentityReminder` is a separate identity reminder for wholly
+  inherited targets: L1 chunks entirely before `witnessedBeforeSequence`,
+  and merges whose every source is witnessed. Every other target keeps
+  `identityReminder`, including a chunk that spans the pin, each piece the
+  split rung folds such a chunk into, and a merge of inherited and lived
+  sources. Such a mixed request shows inherited and lived material
+  together under the live instruction and reminder, with no label saying
+  which is which, so after a rename the new live reminder reaches the
+  inherited material in it. The protection is opt-in. With only
+  `identityReminder` set, the library appends it, current name included,
+  to wholly inherited targets too, so an inherited-history migration
+  should set `witnessedIdentityReminder`. The offline drain script passes
+  it from the recipe. Unset, requests are unchanged.
+
+### Changed
+
+- Stderr diagnostics about one namespace now name it, as
+  ` ns=<namespace>` at the end of their message's first line, after their
+  fields, so the lines of several managers in one process, such as
+  agent-framework's agents on one store, can be told apart (#239).
+  Arguments after a message, such as an error, print after it as before.
+  A grep for a line's prefix still matches. A reader that took a line's
+  end as its last field, such as `[kv-overlap]`'s `sample=`, now finds
+  ` ns=` there.
+  - The strategy's lines, `[plan-vs-actual]`, `[kv-overlap]`,
+    `[kv-unified]` and `[kv-escalation]` among them, the manager's, and
+    the planner's, picker's, fold journal's, mint preimage's and windowed
+    strategy's lines that run for one namespace name the manager's,
+    `default` when it has none. A strategy no manager has initialized
+    names none.
+  - A message slot's lines, its cadence retune at open and `[cm-cache]`
+    lines among them, and a context log's name the namespace the slot or
+    log belongs to, such as an isolated or an auxiliary slot's. The
+    shared message slot's, and those of a context log with no namespace,
+    name none, as do lines about the store as a whole, such as the fold
+    journal's index warnings.
+- The JSON diagnostics `config:effective` and
+  `compression:quarantine-alert`, each `[debugLogContext]` entry, and each
+  entry of the compression log (`CONTEXT_MANAGER_COMPRESSION_LOG`) gain a
+  `namespace` field.
+- `persistMintRequestPreimage` takes an optional fourth argument, a
+  `Diagnostics`, now exported as a type, which its lines go through.
+  `AutobiographicalStrategy` has a new protected `diag`, the strategy's
+  diagnostics, which a subclass can log through to name its namespace. A
+  subclass's own member named `diag` now conflicts with it.
+
+- Cache-marker placement on the adaptive compile, for every strategy but
+  `kv-unified`: the first message-level breakpoint now sits at the end of
+  the **deep band**, the leading run of recall pairs after the head
+  rendered at the deepest level the compile emitted, instead of at the
+  last head message. The level is the deepest over the whole middle, so a
+  shallower leading run in front of a deeper summary leaves no band, and
+  the head marker stays. Nothing that arrives rewrites the band: a new
+  max-level summary lands after it, and a merge one level up is the rare
+  exception. A deeper summary landing after it ends the band without
+  changing a byte of it, and that turn marks the furthest entry the
+  previous request marked that is still unchanged: the old band end, or a
+  later mark. The solver can also re-cut the band's youngest group to a
+  shallower level. Measured on a long-lived resident (2026-10-06), the
+  head marker cached 244 tokens of bootstrap messages while 14 complete L3
+  pairs (~73k tokens) sat unmarked behind it, and 24 of 51 large rewrites
+  in a week re-read exactly the system+tools prefix. The band comes after
+  the head, so the first slot's prefix contains the head and is never
+  shorter than before. When the first slot moves, with a band before or
+  after, the measured-stable-prefix marker goes to the furthest entry the
+  previous request marked that is still in the unchanged prefix, unless
+  the first slot already marks it, so the turn still reads what that
+  request wrote: for example the head when a fold forms the band right
+  after it, the band's old end when the group after the band deepens to
+  its level or the band goes, or a later marker of the previous request
+  when the change comes after it. Otherwise the measured-stable-prefix and
+  end markers are unchanged, and the 3-marker first claim still holds.
+  Repair stubs right after a head that ends in an unanswered tool call
+  don't cost the band, until the call's genuine result is placed there
+  instead. When neither a compile nor the one before it has a band,
+  placement is byte-identical to before.
+  **Trade on membrane's native formatter:** native marks the system block
+  only when zero message markers arrive, so the head marker was the one
+  marker covering tools+system+head there, and every turn read at least
+  that from cache. With the band marker, a turn whose band changes inside
+  it reads from cache on native only what an earlier request marked within
+  what survived, usually *nothing* (before, it read tools+system+head). On
+  the XML formatter membrane marks the system block itself on these
+  requests, so a band change still reads tools+system.
+  `kv-unified` keeps its 33/66/100 thirds.
+
+- kv-unified reads ages in geometric bands: a strategy built from a recipe
+  prices a leaf's fidelity age, continuity recency and stability at the
+  lower edge of the band they fall in, 4 bands per doubling (a band is a
+  factor of about 1.19 wide), so a leaf's weight changes only when it
+  crosses a band edge instead of on every append. Exact ages moved every
+  leaf's weight on every compile, which is what kept a solve from reusing
+  any score from the compile before (#45). With banding on, continuity
+  recency is at its floor from eight half-lives out, and stability is 1 for
+  the first half of a half-life after a move and then read at whole
+  doublings, whatever the band count. `policy.ageBandSteps: 0` in the
+  recipe's `kvUnified` block restores exact ages; the solver-level policy
+  treats an absent value as exact, so direct solver callers are unchanged.
+
+- kv-unified latent demand measures the producible merges jointly by
+  default: one what-if solve with every candidate present at its
+  conservative recall cost, demanding the merges the pool's best cut in the
+  frame it shares with the live solve uses, when that cut beats the live
+  one by more than `adoptEpsilon`. A compile with a
+  merge backlog paid two full solves per candidate (up to 16 candidates,
+  the multi-second compiles of #131); it now pays one extra solve, and the
+  gain gating a demand is the set's, measured once, instead of per-candidate
+  differences at the approximation's noise floor. `latentDemandMode:
+  'individual'` in the recipe's `kvUnified` block restores the per-candidate
+  ranking; the solver-level `latentDemand.mode` treats an absent value as
+  `individual`. A merge in the strategy's merge quarantine is not a
+  candidate in either mode (`latentDemand.blocked`): its request would be
+  refused at the queue, and a joint cut that used it would hide the merge
+  it would otherwise demand.
+
+- The compression-quarantine alarm and `getCompressionQuarantineStatus()` name each quarantined span once. A span can hold one quarantine record per request shape it exhausted, up to three, so the alarm's count of records overstated how many spans were stuck, and its keys didn't say which messages. The status gains `spans`, the longest waiting first: each span's first and last message ids, `closedAgeMs`, its age since its chunk closed (from its messages' timestamps, not its records, so a chunk re-cut into new records still shows how long its messages have stayed raw), `quarantinedAt`, when its earliest record was made, its records, the requests a provider answered for them (the canonical request, its no-tools and tools-less retries, and each fallback after them; a recall variant planned over the context budget, recorded as `admission_rejected` and never sent, isn't counted, and neither is a rung its failures decided, `provider_error:persistent-<class>`, which no provider gave as an answer), and the newest record's last outcome (such as `refusal`, `provider_error:invalid_request` or `provider_error:persistent-server:503`, null when that record holds none). To count each answer, a family's quarantine record now keeps every outcome the family recorded, its canonical stage's and a carrier rejection's among them, however its ladder ended, where it kept one outcome for the whole canonical stage; a record written before this keeps its one, so its canonical stage counts once. The alarm line starts with the number of spans, gives the number of records beside it, and lists each span with those figures. Its two clocks are labelled: "closed 2.3 h ago" is the time since its chunk closed, which can be longer than the time since it was first quarantined, and "refusing since 2026-10-15T10:21Z" is when its earliest record was made. `count` and `keys` are unchanged.
+
+### Fixed
+
+- A `MessageStore` no longer re-materializes its whole message slot at its
+  next read after another `MessageStore` on the same store appends to it
+  (#251). A sibling's append moved the write version the instances share,
+  and every read took that as a reason to reload the slot. Where only
+  appends happened since its cache was built, a read now fetches the
+  appended records by point lookup and adds them, and the instance's own
+  append after a sibling's keeps its cache for that read instead of
+  dropping it. A sibling's edit or removal, or a branch switch, still costs
+  a reload. On chronicle 0.4.0, a point lookup of any record but the newest
+  after a write rebuilds chronicle's per-item cache, so a read after one
+  append costs a point lookup, and a read after several still pays that
+  rebuild. Like the cache's revalidation before it, this relies on the slot
+  being written only through `MessageStore`: a write outside it, beside a
+  sibling's edit or removal, can now leave a reader's listing stale, and an
+  edit or removal through that listing can reach another record.
+
+- A kv-unified compile no longer fails when a label search exceeds
+  `labelCeiling` (#252): the ceiling bounds a search, not the turn.
+  Where the live solve exceeds it, on the engine a recipe names or after
+  the subtree engine's retry on the packed one, the compile takes the
+  minimum-token cut, which the solve's feasibility check computes before
+  any search, and demands no merge. An autobiographical strategy's first
+  solve that exceeds it, in any pick, warns, naming the ceiling, the
+  labels the search stopped at and the engine. A latent-demand search
+  that exceeds it measures nothing, and the demand goes on with what the
+  searches that fit showed: a conservative what-if's candidate isn't
+  demanded, as one with no feasible cut isn't; a certified what-if whose
+  re-solve without the certificate is stopped stands at its certified
+  gain; an expected-cost solve that's stopped leaves the conservative
+  gain to order its request; and a joint forest that's stopped has its
+  candidates ranked one at a time. A stopped what-if or joint search
+  isn't run again while the inputs that decide its label count hold.
+  Where the base solve without the certificate, which a merge that
+  passes the gate against the certified base is decided against, exceeds
+  it, no merge is demanded that compile, and the joint ranking no longer
+  takes that for its own forest's failure. A compile where the ceiling
+  stopped something carries `ceiling=` on `[plan-vs-actual]` and in its
+  stats (`live`, `joint`, `gate`, `whatIfs:N`), and
+  `KvUnifiedStrategy`'s `lastTimings.ceiling` reports it;
+  `onCeilingFallback` tells a host of a live fallback.
+  `ParetoKvUnifiedPolicySolver` itself still throws
+  `SparseLabelCeilingError`. A compile whose searches stay within the
+  ceiling is unchanged.
+
+- kv-unified's forest owns a leaf through a summary only where each summary on the leaf's chain lists the one below it, so it owns a leaf at a level only where the renderer's layout renders it there (#234): a summary whose parent doesn't list it is a root, and a chunk whose L1 doesn't list it is ownerless. Where a parent pointer named a summary written again without that branch, every kv-unified engine planned the branch's leaves at that summary, while the rendered layout showed them raw (#253). Such a branch's leaves are now offered no level above the one their listed chain reaches. A pin or lock at a level above it makes the solve refuse, as it refuses any pin at a level a chunk's chain doesn't supply. A parent that stops listing a child inside its span leaves the parent's leaves non-contiguous, which the forest refuses, unless `treeifyNonContiguousSummaries` or `preserveGapBearingSummaries` is set, as the store's own reopen refuses such a store. With `treeifyNonContiguousSummaries` set, kv-unified now builds the forest in full on every compile whose last forest treeified a summary, instead of deriving it from that forest, since a listing change, an edit in place or a removal around a summary treeification cuts could pass a derive unseen; on a large store that is CPU on each such compile.
+
+- The kv-unified solver's packed and object DAG engines report an
+  `approximationScoreErrorBound` that covers the cuts their grid prunes
+  (#254). A pruned partial cut's error was charged to the representative
+  cheapest to stand in for it, which could have more tokens than the cut and
+  be pruned at the wall later, taking that error with it, where the cut's own
+  continuation would have fit. The bound could then read 0 beside a cut 37%
+  worse than the exact solver's. A cut is now charged only to a
+  representative with no more tokens than its own, as the subtree engine
+  already does. The cut each engine selects is unchanged.
+
+- A kv-unified solve that scores every terminal label exactly no longer dies
+  with `RangeError: Maximum call stack size exceeded` below its label ceiling
+  when it leaves more terminal labels than a call takes as spread arguments
+  (about 125,000 on Node 22 and 24). Such a solve has
+  `terminalEvaluation: 'full'`, `storage: 'objects'` or `engine: 'leaf'`, or is
+  `ExactKvUnifiedPolicySolver.solve` with `candidateSource: 'labels'`. A solve
+  with `storage: 'objects'` also no longer dies when one prune group keeps more
+  labels than that. The exact scorer takes its floors in a loop, and the
+  object-storage engine's prune appends each group's labels one by one (#255).
+  The strategy built from a `kvUnified` recipe adds none of these, and the
+  recipe's type declares none of them.
+
+- kv-unified's infeasibility certificate suggests producing the missing levels
+  only where producing them would clear every conflict it lists, and otherwise
+  reads "Release or reconcile the listed constraints." A lock against a pin at
+  another level, for example, no longer tells the operator to produce levels
+  (#256).
+
+- A store with a summary whose child covers more messages than a call takes as
+  spread arguments (about 125,000 on Node 22 and 24) now opens: the topology
+  audit that runs at load threw `RangeError` on it. `planTopologyRepair()` no
+  longer throws on such a store either, and compression's recall curve now
+  collects its leaves the same way.
+  `getCompressionDebt()` reports a store with more summaries, or more pending
+  merge groups, than that limit, where the `RangeError` inside it used to come
+  back as its empty report: state `healthy`, with no last mint (#258).
+
+- The compression-quarantine alarm no longer announces "ALL CLEAR — quarantine empty, debt paid", or calls its handler with a count of 0, while the quarantine its alarm last sounded on may still hold debt. It did when the quarantine couldn't be read, and when the strategy had moved to another branch whose quarantine was empty. A status whose read failed now has `unreadable: true`, with `count`, `keys` and `spans` empty, and the alarm logs the read's error at most once an interval and stays as it was until a read succeeds. The alarm now speaks of the quarantine the strategy is reading: an episode follows the namespace and branch its alarm last sounded on, stays up while the strategy reads another one whose quarantine is empty, saying so at the alarm's interval with no handler call, and ends with the all-clear when the strategy reads its own quarantine empty.
+- A quarantine ledger entry whose record isn't an object with a string `key` and `chunkSourceHash`, whose record carries another entry's key, or whose generation isn't a non-empty string, is left out of the quarantine, and a warning names its key, where it has one, once per load. It no longer holds its chunk back, so a chunk no other entry holds is tried again, and a refusal records it afresh. A record-less entry made the quarantine check before each L1 summary request throw, and made a clear of every record throw. No clear reaches a left-out entry: it stays in the ledger, read past, until a checkpoint rewrites the ledger, which needs 256 events in it. `count`, `keys` and `getCompressionDebt()`'s `compressionQuarantineCount` no longer include it, and an outcome list is read as the outcomes in it. A ledger or legacy snapshot whose value isn't a list is read as holding nothing, as a ledger that isn't a list already was, and the legacy snapshot isn't read beside a ledger like that; a stored null reads as no value. A checkpoint, whatever its key, replaces the entries before it with its list, and one that holds no list replaces them with nothing. A warning names each value or checkpoint that holds no list once per load. No version writes any of these, so they take a ledger edited by hand or damaged.
+
+- Maintenance ticks skip quarantined chunks to reach eligible compression or merges. Each tick visits its initially queued source identities at most once, using current queue entries after rebuilds. The scan yields between quarantine checks so inbound events can run. Attempted work still consumes the tick. A chunk a tick skipped is ordered behind the chunks and merges that haven't failed, as a failed chunk is, so after the rebuild that every inbound message makes, tick builds their requests before it builds the skipped chunk's again. The strategy warns once per skipped source identity on each branch it loads. Quarantine-family matching is unchanged; the retry policy's changes are in the transient-ladder entry.
+
+- Transient provider failures no longer spend the L1 compression ladder or exhaust a request family by their kind. By its kind alone, a failure is evidence about the request only when it is a deterministic rejection (`context_length`, `invalid_request`, `safety`, `unsupported`); any other failure is evidence only by the company it keeps, below. Capacity, transport, credential and unclassified failures used to be recorded as a rung's `provider_error` while the ladder carried on, so an outage could quarantine a viable family. Now such a failure stops the ladder at that rung and keeps what the ladder had learned, and a later tick resumes there.
+  - Durable family progress (branch-scoped state `autobio:compression-family-progress`, separate from the quarantine ledger): every deterministic answer a request has given is written and synced before the next rung's call, so neither a restart nor a resumed tick pays again for the canonical or for a rung whose outcome is known. It is one record shared by every strategy on the store and namespace: each read is fresh and each write is a read-merge-write of its own family, so a sibling strategy sees another's progress and no write drops another's families. It is dropped when the chunk mints or its span is covered otherwise (an existing L1 adopted, a sibling's coalesced result, or the dedup guard finding every message already summarized), when the family exhausts into quarantine, and when an operator clears that quarantine. A sweep from the maintenance tick, every 10 minutes at most and independent of the quarantine alarm, also drops progress whose chunk record is compressed, progress whose chunk record is missing when every message of its span is covered by an L1 or one is gone from the store, and progress nothing has advanced for 30 days (with no chunk records at all, only age decides). A ladder never writes back a family whose progress was dropped while it ran (minted, cleared or swept), nor quarantines it: the opt-in compression log says `compression:family-dropped`, and the next attempt pays afresh. In one process only a family's own ladder writes its progress, and a second ladder on the same family, namespace and branch joins the first. A drop before a ladder first sees its family's progress isn't seen: where sibling strategies with different families share a store, one's mint of a span can leave the other's ladder to write progress, or an exhausted record, for a span that's covered. The record's one-shot alert goes out with it, and the record stands until the quarantine alarm's paid-off sweep finds the span's chunk compressed or gone, or an operator clears it. A family that another process has already quarantined under the same key keeps that record: the ladder writes nothing and forgets its progress. Across processes nothing else coordinates. A recorded deterministic answer belongs to its request (its bytes, the model included) and is reused on any route and in any later process, which is what keeps it paid once. After a known route change, an answer that only the old backend would give (an `unsupported` from a missing feature, a stricter `safety` filter, a proxy's size limit read as `invalid_request`) still stands for its family, and the family can exhaust where the new route would have answered its canonical; `clearCompressionRefusalQuarantine()` asks it again from its canonical, with its recorded answers dropped. A family whose ladder is still in progress keeps its answers, and may mint from a lesser rung than the new route would have answered.
+  - The plain-prose retry (after an answer whose whole text was a `<thinking>` wrapper) is a rung of the same ladder: the empty answer is recorded against the rung that gave it (the canonical, or its no-tools or tools-less retry), a rejection of the retry is its outcome, and a transient failure resumes at the retry.
+  - The degraded text-only retry after a transport rejects a request's reasoning carriers is entered only for a failure classified as a request-attributable rejection (a transient failure that merely mentions thinking interrupts the ladder instead), and the rejection is recorded under its own identity, so a resumed ladder goes straight to the stripped request instead of sending the rejected one again. Merges apply the same classification before their degraded retry.
+  - A request-attributable rejection of the canonical (including its no-tools or tools-less retries) skips the recall variants and the canonical hoist. Each variant reuses the rejected request and only expands recall. The rejection goes to source-only-final once, when configured, and otherwise exhausts the family.
+  - A failure that is not a rejection says nothing about the request by its kind, but it is evidence by the company it keeps on its own route. A subject's first failure starts a run, and each later one counts against it (an L1 chunk's rung, or a merge) only when some other compression has landed in the same domain since the subject's last failure there: the membrane instance the call went through and the model it named, as this process knows them. Another model's or another route's landings say nothing about this one. A landing is a compression the provider answered and whose result is written (an L1 pushed and its chunk record marked, or a merged summary written); a thin-chunk stub, an adopted L1, a span found covered and a merge entry skipped with no call are none. Failures of any class count. An L1 run is keyed by the chunk's rung, not by the bytes it sent, because every L1 that lands changes a pending chunk's request (its recall frontier grows), so the run goes on across that. The rung is named by the chunk's sources, their ids and their content, and by its label: a source edited in place starts a new run, and a late failure of the old content leaves the new content's run alone. Each content of a chunk has one run, whichever of its request families the ladder sends, and an answer or a decision ends it. The 8th failure in a run, the first and seven more each after a landing, decides the rung like a rejection: the ladder tries source-only-final once, when configured, and otherwise the family is exhausted and quarantined like any other. It stays quarantined until its chunk compresses, the paid-off sweep clears it, an operator does, or its ledger entry is found unusable. So an outage, in which nothing lands, adds at most one failure to each subject's run however long it lasts, and decides a rung only where that failure is a run's eighth, while a subject that keeps failing as other work lands on its route is decided. If each call failed independently 30% of the time, a given eight attempts would all fail 0.007% of the time (0.3⁸); a decision also needs a landing between each pair, so it is rarer still. For operators: a run is this process's evidence, kept in memory, so a restart starts every count again, and a span still failing after a restart holds no merges around it until it fails again. A process that restarts before it collects eight counts keeps retrying a request that fails on its own while other work lands, paced, with no decision. Routing below membrane (a proxy that picks a backend per call) is invisible here. And strategies that fail one subject through different routes in turn start each other's run again, since a failure in another domain starts a new one, so they don't decide it. Split-stitch is one atomic retry unit: a transient failure inside it re-runs the whole rung later, paying again for the pieces it had settled, within its per-attempt call caps. Its window cap (`compressionSplitMaxCallsPer10Min`) is a local throttle, not an answer: a rung starts only when the window has room for a whole attempt. Otherwise its chunk waits, with nothing recorded and nothing counted, while the tick goes on to the work behind it, and the first tick after the window has room takes it up (the strategy schedules no tick of its own). A piece's call that the caller's provider admission defers takes no place in the window. An attempt that alone needs more calls than the window allows still ends the rung, as the per-attempt cap does.
+- Compression is paced across ticks after a transient failure, in L1 or a merge, on the membrane and compression model it failed on. No compression call is made there and no further queue item is consumed until both the provider's stated `retryAfterMs` and a local backoff of 5 s doubling to 10 minutes have passed. A chunk a failing tick was trying goes behind the chunks that haven't failed, so they run once the pause ends, and a failing merge goes behind the other queued merges. The order lives in the process and every rebuild applies it, so an inbound message doesn't put a failed chunk back at the head, and a failed chunk gives its turn to a queued merge that hasn't failed since, so a lone failing chunk doesn't keep merges, and the landings they bring, from running. A chunk is put back by its source identity, only while it is still uncompressed; a rebuild during the call re-decides its eligibility, and work that rebuild withdrew stays withdrawn. After a deferral by the caller's provider admission, an abort or a host's withdrawal (`CompressionWithdrawn`), which say nothing, the chunk keeps its place: at the head, or among the failed if it failed before, and a withdrawal pauses nothing. A merge spanning a chunk that was put back after a failure waits for it: a run of summaries before a hole that a pending retry will fill isn't consolidated early as a stranded interior run (a run whose chunk a rebuild re-cut holds nothing). Past the speculative cap (`maxSpeculativeL1s`) such a run waits as below it, since compressing chunks into L1s waits there only while an L1 merge is queued, so the retry still comes, once the count is back under the cap or no L1 merge is left queued.
+  - A subject that fails while nothing else lands in its domain has nothing to compare against, so it is counted no further than its first failure and backs off indefinitely. While the lane is paused, `checkReadiness()` names what failed last and its failure class beside the pause, and `getCompressionDebt()` turns `degraded` once the oldest closed chunk has waited over an hour.
+  - A stated wait is a non-negative `retryAfterMs` (NaN, or any value that isn't a non-negative number, states none) and is never shortened. One that cannot be held as an instant (Infinity, or past the last instant a Date can hold) is an explicit hold until a restart, a model change, or a release.
+  - Any provider answer to one of the lane's calls resets its route's pause, the pause of the membrane instance and model it went through, a merge's answer included (a refusal is an answer), whatever the branch: the pause is the route's. Another route's answer leaves it.
+  - The pause is in process and scoped to the membrane instance and to the model the failed call was dispatched with: another model ignores and clears it. A restart-stable provider deadline belongs to the caller's provider admission. Discarded or stale-branch work installs nothing. `checkReadiness()` names a pause only while it binds the configured model.
+  - `releaseCompressionPause(model?)` releases the provider's stated wait (agent-framework calls it when an operator releases a provider wait). The lane's own backoff stays, so the lane resumes once that has passed too, and the failure count stays (a release is not an answer from the provider).
+  - A refusal by the caller's provider admission (`providerAdmission: 'deferred'`: agent-framework holding a model, no call made) counts no failure and adds no backoff; any genuine backoff already in force is left as it was. The admission stays the authority: its answer is cached until the deadline it gave or for at most 30 s (`COMPRESSION_ADMISSION_RECHECK_MS`), whichever is sooner, and the lane then asks it again. Asking makes no provider call. The cached answer expires within 30 s, and the next otherwise-eligible tick asks the admission again (a genuine backoff, or the maintenance cadence, can postpone that tick), so a condition that clears with no release reaching this instance (a recovered journal, a release made in another process) is observed without one; `releaseCompressionPause` still resumes at once. A deferral never shortens a wait a provider stated after a real call.
+  - A strategy that joined another instance's call for the same request (a coalesced wait), and gets back that call's transient failure, takes the wait the provider stated after that call, so it doesn't send the same request inside that wait. None of its own calls failed, so it counts no failure and adds no backoff, and with no stated wait it pauses nothing. A deferral by the caller's provider admission, which made no call, pauses nothing either: the joining strategy's next attempt asks the admission itself.
+  - One warning per pause, a `compression:lane-paused` log event, and `checkReadiness()` names the pause while it lasts. A hold by the caller's provider admission warns, and logs `compression:lane-held-by-admission`, once per hold and again when its deadline changes, though the lane asks the admission again every 30 s at most.
+- The merge lane routes only request-attributable rejections through its bounded attempt policy. A non-retryable failure that says nothing about the request (an expired key, a spent quota) now pauses the lane instead of spending attempts toward quarantine. Any other failure counts under the same evidence rule as L1's: the 8th failure in a run (the first, and seven more each after a landing in its domain) is a bounded-policy attempt, which pauses nothing (as in L1, the deciding failure is the request's own), so the policy's smaller retry is asked at the next tick. A rejection is recognized by its type whatever value is thrown, and any answer ends the entry's run. A merge whose answer a compression hold placed during the call keeps out is no failure: it stays queued for the release, pausing nothing and counting nothing. A queued merge that is skipped with no call (a source missing or already parented, or a crossed merge refused) is dropped from the queue as before, but it is neither an answer that ends the pause nor a landing. For subclasses: the protected `executeMerge` now resolves `true` when it wrote the merged parent and `false` when it skipped, and an override must resolve `true` for a merge it wrote. The merge entry's persisted server-error streak is gone, so the merge lane no longer counts 12 consecutive server errors in an outage, and a merge's run, like an L1 chunk's, is kept in memory.
+- Compression failure logs (`Failed to compress chunk`, `Failed to merge summaries`, the speculative-drain error) print a bounded string instead of the error object, and the L1 and merge `CONTEXT_MANAGER_COMPRESSION_LOG` records bound their `error` field to 2,000 characters. A provider error's `rawRequest` is the whole request that failed, and printing the object wrote it out in full.
+
+- A store closed under the speculative drain no longer ends the host's process. The drain runs each next tick from a timer that no caller awaits, so when the store closed while that tick waited, as a host's stop() closes one, the tick's `Store has been closed` was an uncaught exception, which exits the process under Bun and Node. A tick that comes due on a closed store now doesn't run, and the drain ends quietly, as on a withdrawal. Whatever else a tick throws there, such as an override of `shouldCompressPreflight()` that throws, is logged as a `speculative-drain error`, as the drain's other errors are.
+
+- A quarantined merge no longer freezes the whole summary pyramid. Merge candidate selection always offered the oldest contiguous run; when that exact group was quarantined, `enqueueMerge` silently declined it on every pass and no later group was ever considered (observed: one refused L2 merge left 322 newer L1s unmerged for 16 days, with zero merge calls). While a quarantined merge's group could still be retried as it stands, its sources are now left out of the merge candidates, so they split the frontier like a hole: the summaries on each side merge as usual, a run that ends at the hole can merge at two, as one between two summaries can, and no summary above crosses it. A record holds nothing once its group can't be retried as it stands (a source gone or parented, or the group no longer a valid merge), nor for a topology refusal, and its sources then merge in valid groups. A topology refusal's own group, offered once it is a valid merge again, queues and its record goes. `clearMergeQuarantine` queues a held group again, unless one of its sources is still held or already queued. A group cleared after merges formed around it merges into one summary, which stays below its neighbours' level when nothing beside it was left unmerged. A store whose merging had stopped this way merges its backlog after the upgrade. The merge-quarantine klaxon's line now counts the records that hold their sources.
+- Merge eligibility is enforced in one place for every scheduler: `enqueueMerge` refuses any group containing a held source (previously only an exact quarantined set). The adaptive produce path (`enqueueMergeForRange`, which the greedy solvers and kv-unified's latent demand use) also leaves such sources out and takes the longest run beside them; before this it re-requested the exact quarantined group on every pick, so the freeze above still occurred on stores using it. A queued merge holding such a source, as a queue from an older version can, is skipped when it reaches the head, and its other summaries are offered again.
+- Stale merge-quarantine records (sources merged or repaired while the store was closed) are swept at load, not only when the alarm fires.
+- `getCompressionDebt()` reports `mergeQuarantineKeys` and `mergeHeldIds`.
+
+- With `foldingStrategy: 'kv-unified'`, `reportKvUnifiedAccepted` or
+  `reportKvUnifiedFailed` for a submission that is no longer in flight,
+  already settled or superseded by a later one, no longer clears the
+  in-flight submission's pending compile. The receipt chain already takes
+  such a callback as a duplicate that changes nothing, but the strategy
+  cleared its pending state whatever the id, so the in-flight submission's
+  acceptance kept no cache reference and the next compile's solver weighed
+  no cache costs, with nothing logged. By our reading no current host sends
+  such a callback while another submission is in flight: agent-framework
+  settles each submission in the order its receipts arrive, and fails a
+  previous activation's open ones before the next activation compiles.
+
+- With `foldingStrategy: 'kv-unified'`, each cache marker now goes where a
+  message ends a unit of the solved layout, and is recorded at that boundary,
+  so the cache reference an accepted presentation keeps says where each
+  marker sits. The layout renders the head window as one unit, and two kinds
+  of marker didn't fit it:
+  - **A marker on a head message other than the head window's last** was
+    recorded at the head window's end. Two or more of them were recorded at
+    that one boundary, so the request carried more markers than the compile
+    recorded, and the accepted presentation kept no cache reference: the next
+    compile's solver weighed no cache costs. That could happen on every
+    compile while the head window held several messages and nothing was yet
+    in the middle. A marker now goes in the head window only on its last
+    message.
+  - **A body whose shards span the head and the recent window,** with nothing
+    between them, goes out as one message, and its marker was recorded at the
+    head window's end, short of where it sits by the body's shards in the
+    recent window. It's now recorded where its last shard ends.
+  - A request whose marker count differs from its compile's, which drops the
+    reference, is now logged once per strategy (`[kv-unified] … cache markers
+    where its compile marked …`), where before nothing said so. A request
+    with no markers, as with prompt caching off, isn't logged.
+
+- With `foldingStrategy: 'kv-unified'`, the solver no longer counts as cached
+  a prefix whose bytes changed after the request that cached it while its
+  messages kept their place in the solved layout. A message changes in place
+  when `ContextManager.editMessage` rewrites it; when its image is stripped,
+  once newer images reach `maxLiveImages` or leave it no room in
+  `maxLiveImageBytes`, or once the conversation from it on runs past
+  `imageStripDepthTokens` (all on by default); when its tool result is
+  replaced, once newer results of the same tool reach `toolResultMaxLastN`;
+  when a late result moves up over the stub pairing repair had put after its
+  call; or when a different `maxMessageTokens` cuts it. A recall pair changes
+  in place under a different `maxMessageTokens`, `recallEnvelope`,
+  `carrierPolicy`, `summaryContextLabel` or `summaryParticipant`. The provider
+  serves nothing past such a change, but every cache marker after it was still
+  credited, so the solver priced no churn for a rewrite the provider charges.
+  An accepted request's cache reference now records, for each marker, a hash
+  of the entries up to it as the strategy emitted them. Before each solve, a
+  marker whose prefix no longer renders that way is left out of the reference
+  the solver weighs, and so is a marker on the head window's end once the head
+  window no longer ends at its message. The check renders the presentation the
+  reference kept, so a candidate that renders raw a message the reference had
+  folded, holding an image or a tool result newer than an earlier raw one, can
+  change that earlier one and still be credited. `beforeUser` and `afterUser`
+  injections, which `compile` adds after the strategy's selection, are outside
+  the record. A reference written before this release has no record, and its
+  markers are credited as before until the next request is accepted. Two new
+  warnings, each logged at most once per strategy instance, mean the check
+  itself has gone wrong: `[kv-unified] the cache check couldn't render recall
+  …`, after which the markers past that recall pair aren't credited, and
+  `[kv-unified] the cache check rebuilt the prefix through …`, when a compile
+  that kept the accepted presentation sent something other than the check
+  rebuilt.
+
+- `mergeMessageStoreViews` builds the merged listing once per combination of
+  source listings and serves it from a memo while every source returns the
+  same array, instead of concatenating and sorting every slot on each
+  `getAll`, `getFrom` and `getTail`. A manager with `auxiliaryMessageViews`
+  paid that O(n log n) merge on every read of a compile (two for the
+  windowed strategy, ten-odd for the autobiographical one), and the strategy's
+  listing-keyed memos (post-strip estimates, the chunk index) never hit over
+  a merged view because each read returned a new array (#45).
+- An `AutobiographicalStrategy` instance set again while its merge's call was
+  still out, as by `setStrategy()` with the same instance or by a new manager
+  opened with it after `close()`, no longer writes two summaries over the same
+  sources. When the earlier call settled, it cleared the mark of the new
+  generation's merge, so the next tick started a second merge of the same
+  sources while that one was still out. Both wrote, and `compile()` returned
+  both summaries. A tick now clears only its own mark, so nothing starts beside
+  the new generation's merge (#138).
+
 ## 0.16.0 — 2026-10-19
 
 ### Breaking

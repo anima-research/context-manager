@@ -38,7 +38,12 @@ async function assertFenced(manager: ContextManager, id: string) {
   const sequence = store.currentSequence();
   const messages = manager.getAllMessages();
   const branches = manager.listBranches().map(branch => branch.name);
-  assert.throws(() => manager.addMessage('user', text('wrong branch')), fenced);
+  // The refusal's whole text once, advice included: every operation's
+  // refusal is the same one.
+  assert.throws(() => manager.addMessage('user', text('wrong branch')), {
+    message: `ContextManager.addMessage requires successful strategy initialization (selected branch ${store.currentBranch().name}). ` +
+      'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+  });
   assert.throws(() => manager.editMessage(id, text('wrong edit')), fenced);
   assert.throws(() => manager.removeMessage(id), fenced);
   assert.throws(() => manager.removeMessages(id, id), fenced);
@@ -187,7 +192,7 @@ describe('ContextManager initialization fence', () => {
         else store.switchBranch('target');
         const sequence = store.currentSequence();
         summaryGate.resolve();
-        await assert.rejects(transition, /Branch or strategy changed during ContextManager.resetHeadWindow/);
+        await assert.rejects(transition, { message: 'Branch or strategy changed during ContextManager.resetHeadWindow; retry on the intended branch.' });
         assert.equal(store.currentSequence(), sequence);
         assert.equal(manager.getMessageCount(), 1);
         assert.equal(strategy.resetCalls, 0);
@@ -311,7 +316,7 @@ describe('ContextManager initialization fence', () => {
       await manager.setStrategy(new PassthroughStrategy());
       const sequence = store.currentSequence();
       summaryGate.resolve();
-      await assert.rejects(transition, /Branch or strategy changed during ContextManager.resetHeadWindow/);
+      await assert.rejects(transition, { message: 'Branch or strategy changed during ContextManager.resetHeadWindow; retry on the intended branch.' });
       assert.equal(store.currentSequence(), sequence);
       assert.equal(manager.getMessageCount(), 1);
       assert.equal(strategy.resetCalls, 0);
@@ -331,7 +336,7 @@ describe('ContextManager initialization fence', () => {
       store.switchBranch('reused');
       const sequence = store.currentSequence();
       summaryGate.resolve();
-      await assert.rejects(transition, /Branch or strategy changed during ContextManager.resetHeadWindow/);
+      await assert.rejects(transition, { message: 'Branch or strategy changed during ContextManager.resetHeadWindow; retry on the intended branch.' });
       assert.equal(store.currentSequence(), sequence);
       assert.equal(strategy.resetCalls, 0);
     });

@@ -209,7 +209,12 @@ When a family exhausts:
   - recall frontier changes;
   - target chunk changes;
   - model/config changes;
-  - operator explicitly clears/retries the record.
+  - operator explicitly clears/retries the record;
+  - its ledger entry can't be used: a record that isn't an object with a
+    string key and chunk hash, or that carries another entry's key, or a
+    generation that isn't a non-empty string. No version writes one, so only
+    a ledger edited by hand or damaged holds one; the projection leaves it
+    out and names it by its key, where it has one.
 - emit one ops alert for the exhausted key, not one per maintenance tick.
 
 State IDs:
@@ -250,8 +255,8 @@ read/replace whole-array snapshot. A checkpoint retains the newest 1,024 active
 exhausted families; older families expire and may make a new canonical-first
 attempt. Between checkpoints at most 128 two-event exhaustion/pending-alert
 groups can accumulate, so both active state and event history have a finite
-bound. Within that window, a family remains until its key changes or an
-exact-generation operator clear.
+bound. Within that window, a family remains until its key changes, an
+exact-generation operator clear, or its ledger entry is found unusable.
 
 ## Observability
 

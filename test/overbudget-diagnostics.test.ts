@@ -185,9 +185,9 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   onQuarantineSkipProbe: (() => void) | undefined;
 
   protected override compressChunkHierarchical(...args: Parameters<AutobiographicalStrategy['compressChunkHierarchical']>): Promise<void> {
-    const [chunk, ctx, onSkip, onRequestStopped] = args;
+    const [chunk, ctx, onSkip, onRequestStopped, onJoinedWorkDiscarded] = args;
     const probe = this.onQuarantineSkipProbe;
-    return super.compressChunkHierarchical(chunk, ctx, probe ? () => { onSkip?.(); probe(); } : onSkip, onRequestStopped);
+    return super.compressChunkHierarchical(chunk, ctx, probe ? () => { onSkip?.(); probe(); } : onSkip, onRequestStopped, onJoinedWorkDiscarded);
   }
 
   /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */

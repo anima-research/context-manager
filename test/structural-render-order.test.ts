@@ -65,7 +65,7 @@ describe('structural render ordering across adaptive and hierarchical selectors'
     ['missing result stub', [...paired, agent(use('MISSING')), user(text('continue without that result'))]],
     ['tail result stub', [agent(use('A')), user(result('A')), agent(use('B')), user(result('B'), use('TAIL'))]],
     ['duplicate result removed by pairing', [...paired, user(result('B')), agent(text('done'))]],
-    ['displaced result relocated before pruning', [agent(use('A')), agent(use('B')), user(result('B')), user(result('A')), agent(text('done'))]],
+    ['displaced result counted in its call\'s place', [agent(use('A')), agent(use('B')), user(result('B')), user(result('A')), agent(text('done'))]],
   ] satisfies Array<[string, Message[]]>) {
     it(`${name}: both selectors retain the newest real result`, async () => {
       const adaptive = await render(messages, true);
@@ -75,7 +75,7 @@ describe('structural render ordering across adaptive and hierarchical selectors'
       const results = blocks.filter(block => block.type === 'tool_result');
       assert.equal(results.find(block => block.toolUseId === 'B')?.content, 'real result B');
       assert.equal(String(results.find(block => block.toolUseId === 'A')?.content), "[result of tool 'read' left out: this context shows only the tool's last result]");
-      assert.equal(results.filter(block => block.toolUseId === 'B').length, 1, 'repair removes duplicate results before counting');
+      assert.equal(results.filter(block => block.toolUseId === 'B').length, 1, 'a duplicate result takes no slot and is sent once');
       if (name === 'missing result stub' || name === 'tail result stub') {
         const id = name === 'tail result stub' ? 'TAIL' : 'MISSING';
         const stub = results.find(block => block.toolUseId === id);

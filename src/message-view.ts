@@ -74,14 +74,31 @@ export function filterMessageStoreView(
   };
 }
 
+/** Merged listings keyed by the chain of source listings they were merged
+ * from (primary first, then each auxiliary, compared by identity). Every
+ * link is a WeakMap, so a combination lives only while all of its source
+ * arrays do: a store that keeps appending while another stays put leaves
+ * no trail of obsolete merges behind the unchanged listing. */
+interface MergedListingNode {
+  merged?: StoredMessage[];
+  next: WeakMap<readonly StoredMessage[], MergedListingNode>;
+}
+const mergedListings: MergedListingNode = { next: new WeakMap() };
+
 /**
  * Merge one primary view with any number of auxiliary views into a single
  * timeline ordered by `sequence`.
  *
- * Cost: every `getAll` / `getFrom` / `getTail` re-concatenates and re-sorts
- * (O(n log n) per read). Only managers configured with auxiliary views pay
- * it, and their strategies read once per select; do not hang a hot path
- * (per-message bookkeeping, tight loops) off a merged view.
+ * Cost: the merged listing is built once per combination of source
+ * listings and served from a memo while every source returns the same
+ * array. The sources are the stores' own cached listings (MessageStore
+ * memoizes getAll on branch and write version), so a compile's reads
+ * (two getAll/getFrom/getTail calls for the windowed strategy, ten-odd for
+ * the autobiographical one), across the fresh view objects the host
+ * builds for each strategy call, share one O(n log n) merge; the next
+ * append misses on the changed source and merges again. The memo also
+ * keeps the listing's identity stable, which the strategy's per-listing
+ * memos (post-strip estimates, the chunk index) key on.
  *
  * Token estimation and calibration delegate to the primary view (estimators
  * are store-level and identical across slots of one chronicle store).
@@ -95,8 +112,21 @@ export function mergeMessageStoreViews(
   if (auxiliary.length === 0) return primary;
 
   const all = () => {
-    const merged = primary.getAll().concat(...auxiliary.map((v) => v.getAll()));
+    const source = primary.getAll();
+    const sources = auxiliary.map((v) => v.getAll());
+    let node = mergedListings;
+    for (const listing of [source, ...sources]) {
+      let next = node.next.get(listing);
+      if (!next) {
+        next = { next: new WeakMap() };
+        node.next.set(listing, next);
+      }
+      node = next;
+    }
+    if (node.merged) return node.merged;
+    const merged = source.concat(...sources);
     merged.sort((a, b) => a.sequence - b.sequence);
+    node.merged = merged;
     return merged;
   };
   return {
@@ -109,6 +139,13 @@ export function mergeMessageStoreViews(
         if (msg) return msg;
       }
       return null;
+    },
+    sequenceOf: (id: MessageId) => {
+      for (const view of [primary, ...auxiliary]) {
+        const sequence = view.sequenceOf ? view.sequenceOf(id) : view.get(id)?.sequence;
+        if (sequence !== undefined) return sequence;
+      }
+      return undefined;
     },
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {

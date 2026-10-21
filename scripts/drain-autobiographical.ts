@@ -85,8 +85,10 @@ const passthroughKeys = [
   'compressionSplitMaxCallsPerChunk',
   'compressionSplitMaxCallsPer10Min',
   'compressionRecallBudgetTokens',
+  'mergeHoldSummaryIds',
   'summaryTargetTokens',
   'identityReminder',
+  'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
 ] as const;
@@ -129,10 +131,14 @@ const compact = () => {
     mergeQueue: progress.mergeQueueLength,
     pending: progress.pending,
     summaries: progress.summaryCounts,
-    quarantines: debt.compressionQuarantineCount + debt.mergeQuarantineCount,
+    // null when the debt report couldn't count one of them (see debtError)
+    quarantines: debt.compressionQuarantineCount === null || debt.mergeQuarantineCount === null
+      ? null
+      : debt.compressionQuarantineCount + debt.mergeQuarantineCount,
     pendingChunks: debt.pendingChunks,
     frontier: debt.unmergedFrontier,
     tools: tools.length,
+    ...(debt.error !== undefined ? { debtError: debt.error } : {}),
   };
 };
 
@@ -142,6 +148,9 @@ let final = compact();
 try {
   for (let step = 1; step <= maxSteps; step++) {
     const before = compact();
+    // A store whose debt it can't read is one it can't tell is drained, so
+    // stop here rather than spend provider calls on it.
+    if (before.debtError !== undefined) break;
     if (
       !before.pending &&
       before.l1Queue === 0 &&
@@ -159,7 +168,9 @@ try {
   manager.close();
 }
 console.log(JSON.stringify({ event: 'finish', completed, ...final }));
-if (!completed || final.quarantines > 0) process.exit(1);
+// A last report with an error fails, and so does one whose quarantines it
+// couldn't count (null).
+if (!completed || final.quarantines !== 0 || final.debtError !== undefined) process.exit(1);
 
 function latestToolsFromAnthropicLog(path: string): ToolDefinition[] {
   const fd = openSync(path, 'r');

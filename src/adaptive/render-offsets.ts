@@ -35,9 +35,13 @@ export type Frontier = ReadonlyMap<ChunkId, number>;
 export interface RenderedUnit {
   kind: 'head' | 'raw' | 'recall' | 'tail';
   /**
-   * Stable identity for prefix comparison. Two units are byte-identical iff
-   * they share (kind, key): 'head'/'tail' for the fixed blocks, the chunk id
-   * for a raw shard, the summary id for a recall pair.
+   * Stable identity for prefix comparison: 'head'/'tail' for the fixed
+   * blocks, the chunk id for a raw shard, the summary id for a recall pair.
+   * Two units that share (kind, key) are the same part of the conversation,
+   * but what they render can still change in place under the key (an edit,
+   * an image stripped, a tool result replaced or moved, a cut, a recall's
+   * envelope), which kv-unified's accepted cache reference records and checks
+   * (CacheRenderRecord).
    */
   key: string;
   tokens: number;

@@ -73,6 +73,9 @@ test('kv-unified canonical forest rejects ownership cycles', () => {
   const l1 = chronicle.produceL1(['a']);
   const l2 = chronicle.produceUpper(2, [l1.id]);
   l2.parentId = l1.id;
+  // Ownership climbs only to a parent that lists the summary, so the cycle
+  // needs the L1 to list its L2 as well.
+  l1.sourceIds = [...l1.sourceIds, l2.id];
 
   assert.throws(
     () => new CanonicalSummaryForest(inputsOf(chronicle)),
@@ -306,6 +309,55 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
   }
 });
 
+test('kv-unified suggests producing the missing levels only where that clears every conflict', () => {
+  const release = 'Release or reconcile the listed constraints.';
+  const produce = 'Release or reconcile the listed constraints, or produce the missing levels.';
+  type Chunk = ReturnType<MockChronicle['addChunk']>;
+  const cases: Array<{ name: string; a?: (chunk: Chunk) => void; b?: (chunk: Chunk) => void;
+    constraints?: Record<string, CanonicalLeafConstraint[]>; missing: number[]; suggestion: string }> = [
+    { name: 'a lock against a pin at a level that exists', a: (c) => { c.lockedByAgent = true; c.currentResolution = 0; c.pinLevel = 1; }, missing: [], suggestion: release },
+    { name: 'a pin at a level that is no integer', a: (c) => { c.pinLevel = 1.5; }, missing: [], suggestion: release },
+    { name: 'a raw pin against a pin at a level that exists', a: (c) => { c.pinned = true; c.pinLevel = 1; }, missing: [], suggestion: release },
+    { name: 'an exact constraint at a missing level', constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: produce },
+    { name: 'a floor above every level supplied', constraints: { a: [{ kind: 'min', level: 2, source: 'caller' }] }, missing: [2], suggestion: produce },
+    { name: 'a lock against a pin at a missing level', a: (c) => { c.lockedByAgent = true; c.currentResolution = 0; c.pinLevel = 2; }, missing: [2], suggestion: release },
+    { name: 'a raw pin against an exact constraint at a missing level', a: (c) => { c.pinned = true; },
+      constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a missing level beside a lock against a pin', b: (c) => { c.lockedByAgent = true; c.currentResolution = 0; c.pinLevel = 1; },
+      constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a cap below an exact constraint at a missing level',
+      constraints: { a: [{ kind: 'max', level: 1, source: 'caller' }, { kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a cap at an exact constraint\'s missing level',
+      constraints: { a: [{ kind: 'max', level: 2, source: 'caller' }, { kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: produce },
+    { name: 'a floor above a cap', constraints: { a: [{ kind: 'min', level: 2, source: 'caller' }, { kind: 'max', level: 1, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a floor below an exact constraint, with two levels missing',
+      constraints: { a: [{ kind: 'min', level: 2, source: 'caller' }, { kind: 'exact', level: 3, source: 'caller' }] }, missing: [2, 3], suggestion: produce },
+    { name: 'a missing level beside a floor that is no integer',
+      constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }], b: [{ kind: 'min', level: 0.5, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a missing level beside a negative floor',
+      constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }], b: [{ kind: 'min', level: -1, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'a lock against a pin beside a missing level', a: (c) => { c.lockedByAgent = true; c.currentResolution = 0; c.pinLevel = 1; },
+      constraints: { b: [{ kind: 'exact', level: 2, source: 'caller' }] }, missing: [2], suggestion: release },
+    { name: 'missing levels on two leaves that producing clears',
+      constraints: { a: [{ kind: 'exact', level: 2, source: 'caller' }], b: [{ kind: 'min', level: 2, source: 'caller' }] }, missing: [2], suggestion: produce },
+  ];
+  for (const kase of cases) {
+    const chronicle = new MockChronicle({ recallPairTokens: 50 });
+    const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+    const b = chronicle.addChunk({ id: 'b', rawTokens: 100 });
+    chronicle.produceL1(['a', 'b']);
+    kase.a?.(a);
+    kase.b?.(b);
+    const constraints = new Map(Object.entries(kase.constraints ?? {}));
+    const result = new CanonicalSummaryForest(inputsOf(chronicle), { constraints }).minimumTokens(1_000);
+    assert.equal(result.feasible, false, kase.name);
+    if (result.feasible) continue;
+    assert.equal(result.certificate.reason, 'constraint-conflict', kase.name);
+    assert.deepEqual(result.certificate.missingLevels, kase.missing, kase.name);
+    assert.equal(result.certificate.suggestion, kase.suggestion, kase.name);
+  }
+});
+
 test('kv-unified exact feasibility prices a protected raw hole beside its recall', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 50 });
   const protectedChunk = chronicle.addChunk({ id: 'a', rawTokens: 100, pinned: true });
@@ -352,6 +404,7 @@ test('kv-unified reports the exact over-budget floor and required increase', () 
   assert.equal(result.floorTokens, 150);
   assert.equal(result.certificate.reason, 'over-budget');
   assert.equal(result.certificate.requiredAdditionalTokens, 30);
+  assert.equal(result.certificate.suggestion, 'Raise W by at least 30 tokens, or release a binding protection.');
   assert.ok(result.frontier);
 });
 

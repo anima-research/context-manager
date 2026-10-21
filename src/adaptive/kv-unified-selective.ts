@@ -1,7 +1,7 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { ExactCutEnumerationStats } from './kv-unified.js';
 import {
-  comparePolicyCandidates, normalizeContinuityMultiplier, normalizePolicy, policyScore,
+  comparePolicyCandidates, frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore,
   type ExactPolicyCandidate, type ExactPolicySolveOptions, type ExactPolicySolveResult, type UnscoredCandidate, withBestScoreUnder } from './kv-unified-policy.js';
 
 export interface MetricInterval { readonly lower: number; readonly upper: number }
@@ -126,27 +126,46 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
   const selected = carried && carried.score <= best.score + epsilon ? carried : best;
   // Same interval pruning as the winner search, but against caller-supplied
   // floors. Only candidates whose lower bound can still win are refined.
-  const bestScoreUnder = (kf: number, cf: number): number => {
+  const bestUnder = (kf: number, cf: number): ExactPolicyCandidate => {
     const exactScore = (c: UnscoredCandidate) =>
       policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
+    let best = -1;
+    let bestScore = Infinity;
+    // A tie in the caller's frame breaks as the selection breaks one: fewer
+    // rendered tokens, then the frontier signature. (The pool-frame score
+    // the candidates carry is not a tie-breaker here: it can order two
+    // caller-frame ties the other way.)
+    const beats = (i: number, j: number): boolean => {
+      const a = refine(i), b = refine(j);
+      return a.renderedTokens < b.renderedTokens || (a.renderedTokens === b.renderedTokens &&
+        frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds)) < 0);
+    };
+    const consider = (i: number): void => {
+      const value = exactScore(refine(i));
+      if (value < bestScore || (value === bestScore && best >= 0 && beats(i, best))) {
+        best = i; bestScore = value;
+      }
+    };
     if (fullyEvaluate) {
-      let best = Infinity;
-      for (let i = 0; i < source.length; i++) best = Math.min(best, exactScore(refine(i)));
-      return best;
+      for (let i = 0; i < source.length; i++) consider(i);
+    } else {
+      const low = new Float64Array(source.length);
+      let upperBound = Infinity;
+      for (let i = 0; i < source.length; i++) {
+        const c = source[i];
+        low[i] = policyScore(c.fidelity.lower, c.budgetPenalty, c.cacheChurn, c.continuity.lower, kf, cf, policy, multiplier);
+        upperBound = Math.min(upperBound, policyScore(c.fidelity.upper, c.budgetPenalty, c.cacheChurn, c.continuity.upper, kf, cf, policy, multiplier));
+      }
+      for (let i = 0; i < source.length; i++) if (low[i] <= upperBound) consider(i);
     }
-    const low = new Float64Array(source.length);
-    let upperBound = Infinity;
-    for (let i = 0; i < source.length; i++) {
-      const c = source[i];
-      low[i] = policyScore(c.fidelity.lower, c.budgetPenalty, c.cacheChurn, c.continuity.lower, kf, cf, policy, multiplier);
-      upperBound = Math.min(upperBound, policyScore(c.fidelity.upper, c.budgetPenalty, c.cacheChurn, c.continuity.upper, kf, cf, policy, multiplier));
-    }
-    let best = Infinity;
-    for (let i = 0; i < source.length; i++) {
-      if (low[i] > upperBound) continue;
-      best = Math.min(best, exactScore(refine(i)));
-    }
-    return best;
+    if (best < 0) throw new Error('kv-unified score intervals failed to retain a winner');
+    // The candidate scored in the caller's frame; its own fields keep the
+    // pool's floors, as every candidate of this pool does.
+    return score(best);
+  };
+  const bestScoreUnder = (kf: number, cf: number): number => {
+    const c = bestUnder(kf, cf);
+    return policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
   };
   return withBestScoreUnder({
     feasible: true, selected, cacheFloor, continuityFloor, cacheRelevant, enumeration: stats,
@@ -154,5 +173,5 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
       return candidates ??= source.map((_candidate, index) => score(index))
         .sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     },
-  }, bestScoreUnder);
+  }, bestScoreUnder, bestUnder);
 }

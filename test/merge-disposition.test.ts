@@ -277,12 +277,12 @@ describe('Merge terminal-disposition gate', () => {
     re.strategy.qMerge(2, fx.sourceIds);
     assert.equal(re.strategy.mergeQueueView().length, 0);
 
-    // Operator clears → retry becomes possible → end_turn response persists.
+    // Operator clears → the clear queues the held group again → end_turn response persists.
     re.strategy.clearMergeQuarantine();
     assert.equal(re.strategy.getMergeQuarantineStatus().count, 0);
     assert.equal(storedMergeQuarantine(re.manager).length, 0, 'clear is durable');
-    re.strategy.qMerge(2, fx.sourceIds);
-    assert.equal(re.strategy.mergeQueueView().length, 1);
+    assert.deepEqual(re.strategy.mergeQueueView().map((m) => m.sourceIds), [fx.sourceIds], 'the clear queues the held group again');
+    assert.equal(re.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'with a fresh attempt budget');
     await re.strategy.tick(ctx(re.manager));
     const parent = re.strategy.summariesView().find((s) => s.level === 2);
     assert.equal(parent?.content, 'Post-clear consolidation.');

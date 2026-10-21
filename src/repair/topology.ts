@@ -160,7 +160,8 @@ function view(summaries: RepairSummary[], records: RepairRecord[], storeOrder: M
     if (s.level === 1) out = liveL1.has(s.id) ? [...s.sourceIds] : [];
     else {
       out = [];
-      for (const childId of s.sourceIds) { const c = byId.get(childId); if (c && c.id !== s.id) out.push(...leaves(c)); }
+      // One by one: a large child's leaves overflow a spread's argument limit.
+      for (const childId of s.sourceIds) { const c = byId.get(childId); if (c && c.id !== s.id) for (const leaf of leaves(c)) out.push(leaf); }
     }
     cache.set(s.id, out);
     return out;
@@ -338,7 +339,7 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     const crossed = crossedOf(v, alive());
     if (crossed.length === 0) break;
     plan.iterations = Math.max(plan.iterations, iteration);
-    const level = Math.min(...crossed.map((c) => c.level));
+    const level = crossed.reduce((min, c) => Math.min(min, c.level), Infinity);
     for (const c of crossed.filter((x) => x.level === level)) {
       v = view(summaries, records, storeOrder);
       const s = v.byId.get(c.id);

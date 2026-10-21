@@ -4,6 +4,7 @@ import { tailUnits } from './render-offsets.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import { PackedDagSolver } from './kv-unified-packed.js';
+import { SubtreeMemoSolver, type SubtreeSolveStats } from './kv-unified-subtree.js';
 import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
@@ -105,7 +106,9 @@ export type ParetoSolveOptions = ExactPolicySolveOptions & {
   tokenBucketSize?: number;
   continuityBucketSize?: number;
   fidelityBucketSize?: number;
-  engine?: 'auto' | 'leaf' | 'dag';
+  /** `auto` (absent) and `subtree` run the subtree-memoized engine, `dag`
+   * the packed DAG engine; `leaf` is the exact reference path. */
+  engine?: 'auto' | 'leaf' | 'dag' | 'subtree';
   /** Opt-in prototype: prove the hysteresis selection before propagating labels. */
   hysteresisCertificate?: boolean;
   /** Diagnostic reference path; the normal DAG path uses packed storage. */
@@ -129,6 +132,9 @@ export class ParetoKvUnifiedPolicySolver {
   private bufferGapEmissions = false;
   /** Wall time of the last certificate attempt, succeeded or not. */
   lastCertificateMs = 0;
+  /** Set when the last solve ran the subtree-memoized engine; null when
+   * another engine (or the certificate) decided. */
+  lastSubtreeStats: SubtreeSolveStats | null = null;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
@@ -154,6 +160,7 @@ export class ParetoKvUnifiedPolicySolver {
     // presentation map edited in between, must not be served the old read.
     options = { ...options };
     this.summaryMetricCache = new WeakMap();
+    this.lastSubtreeStats = null;
     const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
@@ -166,8 +173,26 @@ export class ParetoKvUnifiedPolicySolver {
       if (options.storage !== 'objects') {
         const feasibility = this.forest.minimumTokens(options.maxTokens);
         if (!feasibility.feasible) return { feasible: false, feasibility };
-        return new PackedDagSolver(this.inputs, this.forest, options, gapBearingOwnership || internalHoles,
-          (error) => this.approximationBound(options, normalizePolicy(options.policy), error), feasibility).solve();
+        const buffered = gapBearingOwnership || internalHoles;
+        const bound = (error: ApproximationEnvelope) => this.approximationBound(options, normalizePolicy(options.policy), error);
+        if (options.engine !== 'dag') {
+          const subtree = new SubtreeMemoSolver(this.inputs, this.forest, options, buffered, bound, feasibility);
+          try {
+            const result = subtree.solve();
+            this.lastSubtreeStats = subtree.lastStats;
+            return result;
+          } catch (error) {
+            // A subtree's sets are pruned against the wall from the subtree's
+            // own origin, so a forest whose prefix fills most of the wall can
+            // need more labels than the ceiling where the packed engine,
+            // pruning from the absolute prefix, needs few. Asked for no engine
+            // in particular, the solve runs once more on the packed engine.
+            if (!(error instanceof SparseLabelCeilingError) || options.engine === 'subtree') throw error;
+            subtree.dropDeparted();
+            this.lastSubtreeStats = { ...subtree.stats, ceilingFallback: true };
+          }
+        }
+        return new PackedDagSolver(this.inputs, this.forest, options, buffered, bound, feasibility).solve();
       }
       this.bufferGapEmissions = gapBearingOwnership || internalHoles;
       try {
@@ -461,7 +486,9 @@ export class ParetoKvUnifiedPolicySolver {
             ));
         const covered = coverApproximationPool(pool, representatives, cacheRelevant);
         labelsDominated += pool.length - covered.length;
-        result.push(...covered);
+        // Appended one by one: a group can hold more labels than a call takes
+        // as spread arguments (about 125,000), below the label ceiling (#255).
+        for (const label of covered) result.push(label);
       }
       labelsCreated += result.length;
       maxLabelsPerState = Math.max(maxLabelsPerState, result.length);
@@ -1013,7 +1040,17 @@ const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
  * component envelopes are one-sided: how much worse the representative may
  * be than an exact path it stands in for.  Subsequent actions add the same
  * component costs at the same structural/cache state, so the envelope carries
- * forward unchanged until another prune. */
+ * forward unchanged until another prune.
+ *
+ * A path is attached only to a representative with no more rendered tokens
+ * than its own. A later action adds the same tokens to both, so a
+ * representative the wall prunes takes with it only paths the wall would
+ * have pruned too, and the error it carries for them is never owed. Attached
+ * to a representative with more tokens, a path whose own continuation fits
+ * could lose its error when that representative crosses the wall, and the
+ * bound read from the surviving labels would miss its cut (#254). The
+ * fewest-tokens representative always qualifies, so every path is attached.
+ * The packed and subtree engines apply the same rule. */
 function coverApproximationPool(
   pool: readonly ParetoLabel[],
   representatives: readonly ParetoLabel[],
@@ -1028,6 +1065,7 @@ function coverApproximationPool(
     let chosenCost = Number.POSITIVE_INFINITY;
     for (let i = 0; i < covered.length; i++) {
       const candidate = covered[i];
+      if (candidate.renderedTokens > source.renderedTokens) continue;
       const cost =
         Math.abs(candidate.renderedTokens - source.renderedTokens) +
         Math.max(0, candidate.continuityLoss - source.continuityLoss) +

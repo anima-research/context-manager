@@ -22,10 +22,20 @@
  * the withdrawal, as it discards any error, so nothing is rethrown or put
  * back.
  *
- * The strategy recognises a withdrawal by a brand the constructor sets,
- * `Symbol.for('@animalabs/context-manager:compression-withdrawn')`, not by
- * `name` or `instanceof`, so a subclass can carry a name of its own, and two
- * copies of this package agree.
+ * The same membrane can end a call already out. The strategy passes each call
+ * a signal of its own, which it aborts when it lets go of the call's work; a
+ * host that combines its own signal with that one (`AbortSignal.any`) and
+ * aborts it has withdrawn the call too. Membrane then rejects the call with a
+ * cancellation, an error of type `abort` or one named `AbortError`, which the
+ * strategy takes as it takes this withdrawal and rethrows as it is. So a
+ * deadline a host means to count as the call's failure is membrane's
+ * `progressTimeoutMs`, which ends a call as a timeout, rather than a signal of
+ * its own.
+ *
+ * The strategy recognises a `CompressionWithdrawn` by a brand the
+ * constructor sets, `Symbol.for('@animalabs/context-manager:compression-withdrawn')`,
+ * not by `name` or `instanceof`, so a subclass can carry a name of its own,
+ * and two copies of this package agree.
  */
 const WITHDRAWN = Symbol.for('@animalabs/context-manager:compression-withdrawn');
 

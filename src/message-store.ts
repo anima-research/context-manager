@@ -119,7 +119,14 @@ interface NativeIndexEqOpts {
  */
 const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
 
-/** Its `[cm-cache]` line goes through `log`, the bumping store's diagnostics (#239). */
+/**
+ * Its `[cm-cache]` line goes through `log`, the bumping store's diagnostics (#239).
+ *
+ * An append moves the version by one and adds one record; every other
+ * mutation moves it and adds no record. getAllInternal reads "only appends
+ * since" from that: a slot grown by exactly the versions moved. That holds
+ * only while the slot is written through MessageStore alone.
+ */
 function bumpWriteVersion(store: object, stateId: string, log: Diagnostics): number {
   let m = sharedWriteVersions.get(store);
   if (!m) {
@@ -393,11 +400,12 @@ export class MessageStore {
    * Memo of the fully-materialized internal state (2026-07-18, sonn5 OOM /
    * CPU-churn class, companion to the BlobManager resolve cache).
    *
-   * `getAllInternal()` is a full chronicle `getStateJson` — serde
-   * serialize + JS parse of the ENTIRE message state. Compile calls it
-   * ~6× per pass (postStripEstimates, getRecentWindowStart,
-   * getHeadWindowEnd, getCompressibleMessages, selectAdaptive,
-   * rebuildChunks), and compression catch-up repeats those passes
+   * A miss in `getAllInternal()` is a full chronicle `getStateJson` — serde
+   * serialize + JS parse of the ENTIRE message state — unless only appends
+   * happened since the cache was built, which it reads by point lookup
+   * (#251). Compile calls it ~6× per pass (postStripEstimates,
+   * getRecentWindowStart, getHeadWindowEnd, getCompressibleMessages,
+   * selectAdaptive, rebuildChunks), and compression catch-up repeats those passes
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
@@ -532,10 +540,17 @@ export class MessageStore {
       // sees a version mismatch and full-rebuilds on EVERY append — the
       // quadratic ingest this write-through exists to prevent.
       this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+    } else if (!cacheWasCurrent && this.allCache) {
+      // The cache wasn't current: a sibling wrote since it was built, or it
+      // was built on another branch. It's kept: the next read extends it with
+      // what was appended, this write included, where only appends happened
+      // on its branch, and rebuilds it otherwise (getAllInternal), so a
+      // sibling's append costs no reload here either.
+      cacheDiag(`append write-through deferred (cache wasn't current before the append) stateId=${this.stateId} — cache kept for the next read to extend or rebuild`, this.log);
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
           this.log,
         );
       }
@@ -766,6 +781,19 @@ export class MessageStore {
     }
 
     return this.internalToStored(internal, messageId, index);
+  }
+
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it. While the
+   * materialized cache is current (a compile has just listed the slot), it
+   * answers from there instead of reading the item through chronicle, which
+   * get() does even to report one field (#273).
+   */
+  sequenceOf(messageId: MessageId): number | undefined {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return undefined;
+    const internal = this.cacheIsCurrent() ? this.allCache!.internals[index] : this.getInternal(index);
+    return internal?.sequence;
   }
 
   /**
@@ -1135,6 +1163,7 @@ export class MessageStore {
     return {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
+      sequenceOf: (id) => this.sequenceOf(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
@@ -1806,6 +1835,29 @@ export class MessageStore {
         missReason = `revalidate-fail count (cached ${this.allCache.internals.length} live ${count}${canPointLookup ? '' : ', no point lookup'})`;
       }
     }
+    // Only appends since the cache was built, through any MessageStore on
+    // this store: the slot grew by exactly the write versions moved
+    // (bumpWriteVersion). The appended records are then read by point lookup
+    // and added, rather than the slot re-materialized for a sibling's append
+    // (#251). The cached records aren't looked up to confirm them: on
+    // chronicle 0.4.0, a point lookup of any record but the newest after a
+    // write rebuilds chronicle's per-item cache, which a read after one
+    // append then avoids. Like the count-and-tail check above, this relies
+    // on the slot being written only through MessageStore. A write outside
+    // it moves no version, so where it adds a record beside a sibling's edit
+    // or removal, the length comes out as the versions predict: the cache is
+    // extended stale, and an edit or removal through its index can reach
+    // another record.
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion !== writeVersion) {
+      const appended = this.appendedSince(this.allCache.internals, writeVersion - this.allCache.writeVersion);
+      if (appended) {
+        for (const record of appended) this.allCache.internals.push(record);
+        this.allCache.writeVersion = writeVersion;
+        this.allCache.sequence = sequence;
+        return this.allCache.internals;
+      }
+      missReason = `${missReason}, not appends only (cached ${this.allCache.internals.length} + ${writeVersion - this.allCache.writeVersion} versions, live ${this.length()})`;
+    }
     const _t = CACHE_DIAG ? Date.now() : 0;
     const state = this.store.getStateJson(this.stateId);
     const internals =
@@ -1813,6 +1865,26 @@ export class MessageStore {
     this.allCache = { branchId, sequence, internals, writeVersion };
     cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`, this.log);
     return internals;
+  }
+
+  /**
+   * The `added` records appended to the slot after `cached`, an earlier
+   * materialization of it, by point lookup; null where they can't be read
+   * that way: a slot whose length isn't `cached`'s plus `added`, a record
+   * that won't read, or a chronicle without point lookup, where getInternal
+   * falls back to getAllInternal itself.
+   */
+  private appendedSince(cached: readonly StoredMessageInternal[], added: number): StoredMessageInternal[] | null {
+    if (typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson !== 'function') return null;
+    const count = this.length();
+    if (count !== cached.length + added) return null;
+    const appended: StoredMessageInternal[] = [];
+    for (let i = cached.length; i < count; i++) {
+      const record = this.getInternal(i);
+      if (!record) return null;
+      appended.push(record);
+    }
+    return appended;
   }
 
   private getSliceInternal(offset: number, limit: number): StoredMessageInternal[] {

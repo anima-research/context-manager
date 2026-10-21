@@ -103,4 +103,19 @@ describe('the speculative drain\'s timer lets no error out', () => {
     assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke ns=default']);
     assert.equal(held.length, 1, 'the drain scheduled nothing more');
   });
+
+  it('a throw with line breaks is logged on one line', async (t) => {
+    class BreakingPreflight extends AutobiographicalStrategy {
+      private preflights = 0;
+      protected override shouldCompressPreflight(): boolean {
+        this.preflights++;
+        if (this.preflights > 1) throw new Error('preflight broke\n  on its second line');
+        return true;
+      }
+    }
+    const strategy = new BreakingPreflight(options);
+    const { held, logged } = await drainWithNextTickHeld(t, strategy);
+    assert.doesNotThrow(() => held[0]!());
+    assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke on its second line ns=default']);
+  });
 });

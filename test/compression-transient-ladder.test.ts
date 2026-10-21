@@ -1467,6 +1467,48 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
+  it('a run waits only for a retry pending before the first summary it cannot grow past, a held summary of the merge quarantine included', async () => {
+    // The layout above: summaries over messages 0-3 and 8-9, and a pending chunk over 4-7.
+    async function layout(spans: Array<[string, number, number]>, holdIds: string[]) {
+      const fx = await queued(scripted([OK('unused')]).membrane);
+      for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+      const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+      const hole = fx.strategy.chunksView().find((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]);
+      assert.ok(hole && hole.messages.at(-1)!.id === ids[7], 'premise: a pending chunk over messages 4-7');
+      const unmerged = spans.map(([id, first, last]): SummaryEntry => ({
+        id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+        sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+      }));
+      for (const entry of unmerged) fx.strategy.seed(entry);
+      // A merge of the held pair, refused at the provider until its attempts ran out.
+      (fx.strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set('held-pair', {
+        key: 'held-pair', level: 2, sourceIds: holdIds, attempts: 3, lastOutcome: 'refusal', quarantinedAt: 1,
+      });
+      const retry = () => {
+        const run = { key: 'zz-request', domain: 'zz', failures: 1, atLanded: 0 };
+        (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: typeof run; chunkKey: string }> }).compressionFailureRuns
+          .set('zz-subject', { run, chunkKey: hole!.messages.map((m) => m.id).join(':') });
+      };
+      const pick = () => fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id) ?? null;
+      const held = [...(fx.strategy as unknown as { mergeHeldSourceIds(): Set<string> }).mergeHeldSourceIds()].sort();
+      assert.deepEqual(held, [...holdIds].sort(), 'premise: the record holds the pair');
+      return { fx, retry, pick };
+    }
+
+    // A held pair after the hole: the run before can't grow past it, but the retry lands before it.
+    const trailing = await layout([['L1-a', 0, 1], ['L1-b', 2, 3], ['L1-c', 8, 8], ['L1-d', 9, 9]], ['L1-c', 'L1-d']);
+    assert.deepEqual(trailing.pick(), ['L1-a', 'L1-b'], 'with no retry pending, the run before the held pair merges at two');
+    trailing.retry();
+    assert.equal(trailing.pick(), null, 'with a retry pending before the held pair, the run waits for it');
+    trailing.fx.manager.close();
+
+    // A held pair before the hole: the run before it can't grow past it, so a retry beyond doesn't hold it.
+    const interior = await layout([['L1-a', 0, 0], ['L1-b', 1, 1], ['L1-q', 2, 2], ['L1-r', 3, 3], ['L1-c', 8, 8], ['L1-d', 9, 9]], ['L1-q', 'L1-r']);
+    interior.retry();
+    assert.deepEqual(interior.pick(), ['L1-a', 'L1-b'], 'a retry past the held pair holds nothing before it');
+    interior.fx.manager.close();
+  });
+
   it('past the speculative cap, the run before a hole a retry will fill still waits, and with no L1 merge queued the cap holds no L1 production', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);

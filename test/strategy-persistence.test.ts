@@ -1072,8 +1072,12 @@ describe('AutobiographicalStrategy — persistence', () => {
       const run = groups.map((group, g) => first.seedL1(`L1-TEXT-${g}`, group).id);
       first.persistRawChunks(groups.map((group, g) => ({ id: `c-${g}`, sourceIds: group, compressed: true, summaryId: run[g]! })));
       // A second instance on the store loads the run before either merges it;
-      // merges don't coalesce across instances, so both merge it.
+      // merges don't coalesce across instances, so both merge it. A merge now
+      // finds another instance's in the store and writes nothing, so this one
+      // skips the parent checks, as merges did before them: stores they wrote
+      // can hold both merges, which the open repairs.
       const second = new TestableStrategy(config);
+      (second as unknown as { parentedMergeSources: () => string[] }).parentedMergeSources = () => [];
       const secondManager = await ContextManager.open({ store: manager.getStore(), strategy: second, membrane: membrane('MERGED LATER') as never });
       await first.merge(2, run, manager);
       await second.merge(2, run, secondManager);

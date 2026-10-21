@@ -113,7 +113,7 @@ test('packed/full and packed/selective agree with object storage, including ever
     const reference = solver.solve({ ...options, storage: 'objects' });
     assert.ok(reference.feasible);
     for (const terminalEvaluation of ['full', 'selective'] as const) {
-      const packed = solver.solve({ ...options, terminalEvaluation });
+      const packed = solver.solve({ ...options, terminalEvaluation, engine: 'dag' });
       assert.ok(packed.feasible);
       assert.deepEqual(packed.selected, reference.selected, `selected run ${run}/${terminalEvaluation}`);
       assert.equal(packed.cacheFloor, reference.cacheFloor);

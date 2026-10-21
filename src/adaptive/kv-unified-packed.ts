@@ -215,11 +215,14 @@ export class PackedDagSolver {
       }
       // Read every original envelope before writing any representative. The
       // max reductions are order-independent; ties still use F/K/T/E order.
+      // A source is charged only to a representative with no more tokens
+      // than its own, as in the object engine's coverApproximationPool.
       for (let pos = b.head[group]; pos >= 0; pos = b.next[pos]) {
         const source = incoming[pos];
         let chosen = 0, best = Infinity;
         for (let i = 0; i < kept.length; i++) {
           const target = kept[i];
+          if (s.data[(target) * LABEL_STRIDE + LabelField.Tokens] > s.data[(source) * LABEL_STRIDE + LabelField.Tokens]) continue;
           const cost = Math.abs(s.data[(target) * LABEL_STRIDE + LabelField.Tokens] - s.data[(source) * LABEL_STRIDE + LabelField.Tokens]) +
             Math.max(0, s.data[(target) * LABEL_STRIDE + LabelField.Continuity] - s.data[(source) * LABEL_STRIDE + LabelField.Continuity]) +
             Math.max(0, s.data[(target) * LABEL_STRIDE + LabelField.Fidelity] - s.data[(source) * LABEL_STRIDE + LabelField.Fidelity]) +
@@ -482,6 +485,6 @@ export class PackedDagSolver {
       enumeration: result.enumeration, propagation,
       get candidates() { return result.candidates; },
     };
-    return result.bestScoreUnder ? withBestScoreUnder(out, result.bestScoreUnder) : out;
+    return result.bestScoreUnder ? withBestScoreUnder(out, result.bestScoreUnder, result.bestUnder) : out;
   }
 }

@@ -226,6 +226,33 @@ describe('planTopologyRepair', () => {
     assert.equal(plan.remaining.length, 0);
   });
 
+  test('the planner finds a crossed summary whose child covers more messages than a call takes as spread arguments (#258)', () => {
+    // A call takes about 125,000 spread arguments on node 22 and 24. The
+    // planner collects each summary's messages from its children's, so an L3
+    // over an L2 of 199,990 messages took them in one spread, which threw. A
+    // failure of this premise means the runtime takes more spread arguments,
+    // as with a larger stack (`node --stack-size`) or a newer V8, not that the
+    // planner changed: raise the count until a spread throws again.
+    const count = 200_000;
+    assert.throws(() => Math.max(...new Array<number>(count).fill(0)), RangeError,
+      'premise: this runtime takes fewer spread arguments than the L2 has messages');
+    // The second-last L1 is left out of the L2, so the L2 and the L3 over it
+    // are crossed by a 10-message hole.
+    const hole = count / 10 - 2;
+    const summaries: RepairSummary[] = [];
+    const records: RepairRecord[] = [];
+    for (let k = 0; k < count / 10; k++) {
+      summaries.push(l1(`a${k}`, 10 * k, 10 * k + 9, k === hole ? undefined : 'L2'));
+      records.push(rec(`c-${k}`, 10 * k, 10 * k + 9, `a${k}`));
+    }
+    summaries.push(up('L2', 2, summaries.filter((_, k) => k !== hole).map((s) => s.id), 0, count - 1, 'L3'));
+    summaries.push(up('L3', 3, ['L2'], 0, count - 1));
+    // Finding them is where the collector runs; no repair iteration is needed
+    // for that, and each would rebuild the planner's view of the whole store.
+    const plan = planTopologyRepair({ summaries, records, messages: msgs(count) }, { maxIterations: 0 });
+    assert.deepEqual(plan.before.map((c) => [c.id, c.leafCount, c.holes]), [['L2', count - 10, 10], ['L3', count - 10, 10]]);
+  });
+
   test('a clean store plans nothing', () => {
     const summaries = [l1('L1-0', 0, 9, 'L2'), l1('L1-1', 10, 19, 'L2'), up('L2', 2, ['L1-0', 'L1-1'], 0, 19)];
     const records = [rec('c-0', 0, 9, 'L1-0'), rec('c-1', 10, 19, 'L1-1')];

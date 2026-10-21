@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
-import { Membrane } from '@animalabs/membrane';
+import { Membrane, TimeoutAbortError, abortError } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore, CompressionWithdrawn } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
@@ -4147,7 +4147,8 @@ describe('prepared tool-prose mode rewrite', () => {
 describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () => {
   after(cleanup);
 
-  // agent-framework's shape: a subclass with its own name.
+  // A subclass with a name of its own, as agent-framework's MaintenanceWithdrawnError
+  // would be once it extends CompressionWithdrawn.
   class MaintenanceWithdrawnError extends CompressionWithdrawn {
     constructor() {
       super('zz maintenance call withdrawn');
@@ -4201,7 +4202,8 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
   const partSummary = { stop: 'end_turn' as const, text: 'zz a part summarized ' + 'detail '.repeat(20) };
 
   it('is rethrown unchanged by each rung of the ladder, recording no outcome and quarantining nothing', async () => {
-    const shapes = [() => new CompressionWithdrawn(), () => new MaintenanceWithdrawnError(), fromAnotherCopy];
+    // A withdrawal that also carries a cancellation's type is still the host's own, and goes through as itself.
+    const shapes = [() => new CompressionWithdrawn(), () => new MaintenanceWithdrawnError(), fromAnotherCopy, () => Object.assign(new MaintenanceWithdrawnError(), { type: 'abort' })];
     // The canonical call, the first and second recall fallbacks, and source-only after them.
     for (const at of [0, 1, 2, 3]) {
       for (const shape of shapes) {
@@ -4769,5 +4771,200 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
       else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
       rmSync(log, { force: true });
     }
+  });
+
+  // A host's cancellation of a call already out, by a signal it combined with
+  // the one the strategy passes: membrane rejects the call with a
+  // cancellation, typed `abort` or named `AbortError` (#241).
+  // Membrane's own, an AbortError, and membrane's from another copy of the package, which is no instance of this copy's MembraneError.
+  const cancellations = [
+    () => abortError(),
+    () => new DOMException('The operation was aborted.', 'AbortError'),
+    () => Object.assign(new Error('Request was aborted'), { name: 'MembraneError', type: 'abort', retryable: false }),
+  ];
+
+  it("takes a host's cancellation of a call as its withdrawal at each rung: rethrown as itself, recording no outcome", async () => {
+    // The canonical call, the first and second recall fallbacks, and source-only after them.
+    for (const at of [0, 1, 2, 3]) {
+      for (const shape of cancellations) {
+        const cancelled = shape();
+        const handlers = [{ stop: 'refusal' as const }, { stop: 'end_turn' as const, text: '' }, { stop: 'end_turn' as const, text: '' }];
+        const mock = flexibleMembrane([...handlers.slice(0, at), { error: cancelled }]);
+        const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2, compressionSourceOnlyFallback: true });
+        const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+        assert.equal(result.status, 'rejected', `at ${at}`);
+        assert.equal((result as PromiseRejectedResult).reason, cancelled, `at ${at}: rethrown as itself`);
+        assert.equal(mock.calls.length, at + 1, `at ${at}: nothing after the cancellation`);
+        assert.equal(fx.target.compressed, false);
+        assert.deepEqual(quarantineEvents(fx.manager), [], `at ${at}: nothing recorded`);
+        assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')), `at ${at}: not logged as a failure`);
+        fx.manager.close();
+      }
+    }
+  });
+
+  it("takes a host's cancellation of a split-stitch part as its withdrawal: rethrown as itself, counted as neither a call nor an error", async () => {
+    // The canonical call and source-only refuse, so the split rung runs; its first part is cancelled.
+    const cancelled = abortError();
+    const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error: cancelled }]);
+    const fx = await fixture(mock.membrane, splitOptions);
+    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, cancelled, 'rethrown as itself');
+    assert.equal(mock.calls.length, 3, 'the split part was the call cancelled');
+    const split = fx.strategy as unknown as { lastSplitAttempted?: { calls: number; errors: number }; splitCallTimes: number[] };
+    assert.deepEqual(
+      { calls: split.lastSplitAttempted?.calls, errors: split.lastSplitAttempted?.errors },
+      { calls: 0, errors: 0 },
+      'the part counts as neither a call nor an error',
+    );
+    assert.deepEqual(split.splitCallTimes, [], 'its slot in the call window went back');
+    assert.deepEqual(quarantineEvents(fx.manager), []);
+    assert.ok(!logs.some((line) => line.includes('split-stitch abandoned')), 'the split was not abandoned on it');
+    fx.manager.close();
+  });
+
+  it("puts the chunk back at the head of the queue when the host cancels tick's call", async () => {
+    const cancelled = abortError();
+    const mock = flexibleMembrane([{ error: cancelled }]);
+    const fx = await fixture(mock.membrane);
+    // A chunk past the seeded L1s, so no guard drops it before the call.
+    const covered = new Set(fx.ids.slice(0, 8));
+    const chunk = fx.strategy.chunksView().find((c) => c.messages.length > 0 && c.messages.every((m) => !covered.has(m.id)));
+    assert.ok(chunk, 'the fixture has a chunk no L1 covers');
+    fx.strategy.queueOnly(chunk.index);
+    const { logs, result } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, cancelled, 'rethrown as itself');
+    assert.deepEqual(fx.strategy.queueView(), [chunk.index]);
+    assert.ok(!logs.some((line) => line.includes('Failed to compress chunk')));
+    fx.manager.close();
+  });
+
+  it("stops the speculative drain quietly when the host cancels its call", async () => {
+    const mock = flexibleMembrane([{ error: abortError() }]);
+    const fx = await fixture(mock.membrane);
+    const covered = new Set(fx.ids.slice(0, 8));
+    const chunk = fx.strategy.chunksView().find((c) => c.messages.length > 0 && c.messages.every((m) => !covered.has(m.id)))!;
+    fx.strategy.queueOnly(chunk.index);
+    const { logs } = await quiet(async () => {
+      fx.strategy.drain(managerContext(fx.manager));
+      // As for a withdrawal: until the call is made and the chunk is back, then one more turn of the
+      // event loop, for the drain's own handling of the rejection.
+      const deadline = Date.now() + 60_000;
+      while (!(mock.calls.length === 1 && fx.strategy.queueView().length === 1)) {
+        assert.ok(Date.now() < deadline, 'the drain settles');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    assert.equal(mock.calls.length, 1, 'the drain made the call');
+    assert.ok(!logs.some((line) => line.includes('speculative-drain error')), logs.join('\n'));
+    assert.deepEqual(fx.strategy.queueView(), [chunk.index]);
+    fx.manager.close();
+  });
+
+  it("leaves a merge whose call the host cancels at the head of its queue, with no rejection recorded", async () => {
+    // Membrane's cancellation carries retryable: false and a type, as the
+    // provider errors a merge records do.
+    const cancelled = abortError();
+    const mock = flexibleMembrane([{ error: cancelled }]);
+    const fx = await fixture(mock.membrane, { hierarchical: true });
+    fx.strategy.clearQueues();
+    // Two L1s no L2 has merged yet, past the fixture's seeded tree.
+    const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+    const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+    fx.strategy.seed(a);
+    fx.strategy.seed(b);
+    fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+    const before = fx.strategy.mergeQueueView();
+    const { logs, result } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 1, 'the merge made its call');
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, cancelled, 'rethrown as itself');
+    assert.deepEqual(fx.strategy.mergeQueueView(), before);
+    assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0);
+    assert.ok(!logs.some((line) => line.includes('Failed to merge summaries')));
+    fx.manager.close();
+  });
+
+  it("says withdrawn, not error, in a compression's receipt when the host cancels its call", async () => {
+    const log = `${freshPath()}-cancel-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const mock = flexibleMembrane([{ error: abortError() }]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+      await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+      fx.manager.close();
+      const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
+      assert.equal(receipts.length, 1, 'one receipt for the call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true, 'it says withdrawn');
+      assert.ok(!('error' in receipts[0]!), 'and no error');
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
+  });
+
+  it("says withdrawn, not error, in a merge receipt when the host cancels the merge's call, and logs no failure", async () => {
+    const log = `${freshPath()}-merge-cancel-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const mock = flexibleMembrane([{ error: abortError() }]);
+      const fx = await fixture(mock.membrane, { hierarchical: true });
+      fx.strategy.clearQueues();
+      const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+      const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+      fx.strategy.seed(a);
+      fx.strategy.seed(b);
+      fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+      const { logs } = await quiet(() => fx.strategy.tick(managerContext(fx.manager)));
+      fx.manager.close();
+      assert.equal(mock.calls.length, 1, 'the merge made its call');
+      const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => entry.operation === 'merge_l2' && entry.event === undefined);
+      assert.equal(receipts.length, 1, 'one receipt for the merge call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true, 'it says withdrawn');
+      assert.ok(!('error' in receipts[0]!), 'and no error');
+      assert.ok(!logs.some((line) => line.includes('Failed to merge summaries')), 'no failure is logged');
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
+  });
+
+  it("counts a TimeoutAbortError as the call's failure, not as a cancellation", async () => {
+    const timedOut = new TimeoutAbortError('zz no provider progress');
+    const mock = flexibleMembrane([{ error: timedOut }]);
+    const fx = await fixture(mock.membrane);
+    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(result.status, 'rejected');
+    assert.equal((result as PromiseRejectedResult).reason, timedOut, 'rethrown as itself');
+    assert.ok(logs.some((line) => line.includes('Failed to compress chunk')), 'logged as a failure');
+    fx.manager.close();
+  });
+
+  it('ends a compression at a split part whose call is rejected after the strategy was let go of, abandoning no split', async () => {
+    let fx: Awaited<ReturnType<typeof fixture>> | undefined;
+    // A rejection, on which a split part abandons its split; a transient
+    // failure the split's interrupt() would rethrow anyway.
+    const failure = Object.assign(new Error('zz invalid request'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    // The canonical call and source-only refuse, so the split rung runs; the
+    // strategy is let go of as its first part's call arrives, which is then
+    // rejected.
+    const mock = hookedMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error: failure }], (index) => {
+      if (index === 2) fx!.strategy.detach();
+    });
+    fx = await fixture(mock.membrane, splitOptions);
+    const { logs, result } = await quiet(() => fx!.strategy.run(fx!.target, managerContext(fx!.manager)));
+    assert.equal(result.status, 'fulfilled', 'the compression ended quietly');
+    assert.equal(mock.calls.length, 3, "the split part's call was the last");
+    assert.ok(!logs.some((line) => line.includes('split-stitch abandoned')), 'no split was abandoned on it');
+    fx.manager.close();
   });
 });

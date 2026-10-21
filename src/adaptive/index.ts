@@ -75,6 +75,7 @@ export {
   type PresentedLeaf,
   type AcceptedPresentationReference,
   type ProviderCacheReference,
+  type CacheRenderRecord,
   type KvUnifiedWelfarePolicy,
   type ExactPolicySolveOptions,
   type ExactPolicyCandidate,

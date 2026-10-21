@@ -55,6 +55,10 @@ oracle-only and bucketed-R the production mode (§4.3-4.4); **C is per-leaf
 additive against a fixed reference ⇒ no continuation state** (§3.2, §4.3);
 K fitted on data, C set by welfare judgment (§13 0a); receipt state hash-
 chained (§5); stale `J` / branch-3 / T3-slack references cleaned.
+Revised 2026-10-18: a strategy built from a recipe reads the three age
+measures (fidelity age, continuity recency, stability) at the lower edge of
+a geometric band, `policy.ageBandSteps` bands per doubling (default 4; 0 is
+exact), so a leaf's weight moves only at band edges (§3.1, §3.2; #45).
 Successor proposal to the rev 5.0/5.1 single-path solve
 (`adaptive-resolution-design.md` §13); implements and generalizes the §12.4
 refinement ("budget-driven slope"). Nothing here is deployed. Validation
@@ -320,6 +324,10 @@ flat-band semantics. `B` never makes `R > W` admissible.
     Fidelity(x) = Σ_leaves i  w_i · u(ℓ_i)
     w_i = salience_i · age_i^(−α) · rawTokens_i
     u(ℓ) = (L_max − ℓ)          [linear v1; concave variants are a later knob]
+
+`age_i` is read at the lower edge of its geometric band when
+`policy.ageBandSteps > 0` (the recipe default is 4 bands per doubling), so
+`w_i` is constant between band edges; `ageBandSteps: 0` reads the exact age.
 
 The resolution-vs-age curve **emerges** from marginal-utility-per-token
 ordering under W. α is the single shape knob, decoupled from merge fanout.
@@ -998,7 +1006,13 @@ Demand therefore has an explicit **latent-candidate layer**:
    occupancy band, welfare policy, and approximation configuration, evaluated with **the same bounded Pareto
    solver used for cut selection** (not a separate "exact" solve). v1
    marginal values are individual (one candidate at a time), not conditional
-   on a production set — a documented approximation. Each evaluation reports:
+   on a production set — a documented approximation. Since 2026-10 the
+   recipe default is the *joint* measurement (`latentDemandMode`, #229):
+   one what-if solve holds every candidate at its conservative cost, and
+   the merges demanded are the ones the pool's best cut, scored in the
+   frame it shares with the live solve, uses, when that cut beats the live
+   one by more than `adoptEpsilon`; `'individual'` restores the
+   per-candidate rule below. Each evaluation reports:
    exact vs approximate mode; bucket parameters; the estimated recall-cost
    distribution; the improvement at the point estimate; and a **conservative
    improvement used for ranking** — v1 rule: cost at an upper quantile
