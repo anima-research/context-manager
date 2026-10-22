@@ -13,6 +13,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { CompileResult, SummaryEntry } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { legacyIngress } from './_harness/legacy-ingress.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'tool-pruning-price-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -46,19 +47,7 @@ class SeedableStrategy extends AutobiographicalStrategy {
  *  the first shard after its text, with no seam declared. */
 class LegacyIngressStrategy extends SeedableStrategy {
   override chunkIngressMessage(participant: string, content: ContentBlock[]) {
-    const decision = super.chunkIngressMessage(participant, content);
-    if (!decision) return decision;
-    const others = content.filter((block) => block.type !== 'text');
-    return {
-      bodyGroupId: decision.bodyGroupId,
-      shards: decision.shards.map((shard, k) => ({
-        shardIndex: shard.shardIndex,
-        content: [
-          { type: 'text', text: shard.content.map((block) => (block.type === 'text' ? block.text : '')).join('') } as ContentBlock,
-          ...(k === 0 ? others : []),
-        ],
-      })),
-    };
+    return legacyIngress(super.chunkIngressMessage(participant, content), content);
   }
 }
 const viewOf = (cm: ContextManager) => (cm as unknown as { strategyMessageView(): MessageStoreView }).strategyMessageView();

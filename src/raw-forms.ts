@@ -310,7 +310,8 @@ export function releaseSharedRawFormsOnMove(
  * part replayed alone would otherwise carry blocks another part holds. So a
  * raw form that a cut block carried, or whose carriers land in more than one
  * part, is given up by every block that carries it, with the reasoning
- * pairing it belongs to. An opaque carrier keeps its raw item, which is its
+ * pairing it belongs to, and so is a reasoning pairing whose members land in
+ * more than one part. An opaque carrier keeps its raw item, which is its
  * whole content.
  *
  * Returns `parts` itself when nothing has to change, and otherwise new
@@ -337,6 +338,13 @@ export function releaseRawFormsAcrossParts(
     }
   }
   for (const [key, where] of landed) if (where.size > 1) released.add(key);
+  // A reasoning pairing is replayed as one: a pairing whose members land on
+  // different parts is true of no part alone.
+  for (const pairing of pairingsOf(before)) {
+    const where = new Set<number>();
+    for (const key of pairing) for (const k of landed.get(key) ?? []) where.add(k);
+    if (where.size > 1) for (const key of pairing) released.add(key);
+  }
   if (released.size === 0) return parts;
   releasePairings(before, released);
   let changed = false;

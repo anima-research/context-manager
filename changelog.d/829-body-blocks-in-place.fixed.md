@@ -22,11 +22,14 @@
   with other blocks, or across the middle and a window, misses the prompt
   cache from that body on, on its first request after the upgrade, and so
   does one whose recent window starts at a tool result whose call is such a
-  body (next item).
+  body, or whose edge falls on a later shard of a split tool-result message
+  (next item).
 - The recent window's start, the head and tail reservation's floor and the
-  compression hold's boundary, where a tool result's call is a sharded body,
-  start at the call's first shard that holds a `tool_use` or thinking. The
-  recent window started at a split call's last shard, leaving its `tool_use`
-  out of the raw tail when the call was stored before blocks were kept in
-  place. Tool-result pruning counts a sharded reply's calls as one turn,
-  wherever they sit in it.
+  compression hold's boundary keep a tool result with its call wherever the
+  message at the boundary holds the result, on any of its shards, starting
+  at the call's first shard that holds a `tool_use` or thinking. The recent
+  window started at a split result message's later shard, leaving the result
+  and its call out of the raw tail, and at a split call's last shard,
+  leaving its `tool_use` out when the call was stored before blocks were
+  kept in place. Tool-result pruning counts a sharded reply's calls as one
+  turn, wherever they sit in it.

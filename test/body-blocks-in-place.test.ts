@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import { legacyIngress } from './_harness/legacy-ingress.js';
 
 const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as unknown as ContentBlock;
 const prose = (tag: string, chars: number) => `${tag} sentence of the body, plain words. `.repeat(Math.ceil(chars / 40)).slice(0, chars);
@@ -69,19 +70,7 @@ const canonical = (v: unknown): string => JSON.stringify(v, (_k, x) =>
  *  the first shard after its text, with no seam declared. */
 class LegacyIngress extends AutobiographicalStrategy {
   override chunkIngressMessage(participant: string, content: ContentBlock[]) {
-    const decision = super.chunkIngressMessage(participant, content);
-    if (!decision) return decision;
-    const others = content.filter((block) => block.type !== 'text');
-    return {
-      bodyGroupId: decision.bodyGroupId,
-      shards: decision.shards.map((shard, k) => ({
-        shardIndex: shard.shardIndex,
-        content: [
-          text(shard.content.map((block) => (block.type === 'text' ? block.text : '')).join('')),
-          ...(k === 0 ? others : []),
-        ],
-      })),
-    };
+    return legacyIngress(super.chunkIngressMessage(participant, content), content);
   }
 }
 
@@ -125,11 +114,19 @@ describe('a sharded body goes out as it was given, wherever its shards render', 
           // Messages written after the body: the rest of the shape, then four turns.
           const after = shape.writes.length - 1 - shape.body + 4;
           if (place === 'raw in the adaptive middle') assert.ok(stats.middleRaw.tokens > 0, 'premise: the middle sends raw history');
-          if (place === 'across the middle and the recent window') {
-            assert.ok(stats.middleRaw.tokens > 0, 'premise: the middle sends some of the body raw');
-            assert.ok(stats.tail.messages > after, `premise: the recent window holds some of its shards too (${stats.tail.messages} messages)`);
-          }
           const given = shape.writes[shape.body]![1];
+          if (place === 'across the middle and the recent window') {
+            if (given.some((b) => b.type === 'tool_result')) {
+              // A window's edge inside a message that holds a tool result moves
+              // back to its call, so the whole message and its call are raw in
+              // the recent window.
+              assert.ok(stats.tail.messages >= after + bodyIds.length + 1,
+                `the recent window holds the whole message and its call (${stats.tail.messages} messages)`);
+            } else {
+              assert.ok(stats.middleRaw.tokens > 0, 'premise: the middle sends some of the body raw');
+              assert.ok(stats.tail.messages > after, `premise: the recent window holds some of its shards too (${stats.tail.messages} messages)`);
+            }
+          }
           const at = compiled.messages.findIndex((m) => canonical(m.content) === canonical(given));
           assert.ok(at >= 0, 'a message sends the body, exactly as given');
           // Nothing of the body anywhere else: its tagged text, its images, its tool blocks.
@@ -262,12 +259,17 @@ describe("a reply's calls on different shards", () => {
   });
 });
 
-describe('the recent window at a result that sits after text, on a later shard of its message', () => {
-  it('starts at the call before the result\'s message, not at that message\'s start', async () => {
-    class Exposed extends AutobiographicalStrategy {
-      recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
-      estimates(store: unknown) { return this.postStripEstimates(store as never); }
-    }
+describe('a result that sits after text, on a later shard of its message', () => {
+  class Exposed extends AutobiographicalStrategy {
+    recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
+    hold(store: unknown) { return this.holdBoundary(store as never); }
+    estimates(store: unknown) { return this.postStripEstimates(store as never); }
+  }
+  /** A call, then a result message `[long text, tool_result]` and a reply. */
+  async function withLateResult(
+    hold: boolean,
+    body: (strategy: Exposed, store: unknown, at: { callAt: number; from: number; to: number; resultAt: number }, view: unknown) => void,
+  ) {
     const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-late-result-'));
     const strategy = new Exposed({ adaptiveResolution: true, autoTickOnNewMessage: false, headWindowTokens: 0, recentWindowTokens: 1 });
     const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
@@ -276,20 +278,38 @@ describe('the recent window at a result that sits after text, on a later shard o
       manager.addMessage('User', [text('please check the weather')]);
       const callAt = manager.getAllMessages().length;
       manager.addMessage('Claude', [call('call-1')]);
-      const before = manager.getAllMessages().length;
-      manager.addMessage('User', [text(prose('NOTE', 40_000)), result('call-1', 'Sunny.')]);
+      const from = manager.getAllMessages().length;
+      manager.addMessage('User', [text(prose('NOTE', 40_000)), result('call-1', 'Sunny.')], undefined, undefined, hold ? { holdCompression: true } : undefined);
+      const to = manager.getAllMessages().length - 1;
       manager.addMessage('Claude', [text('It is sunny.')]);
       const stored = manager.getAllMessages();
       const resultAt = stored.findIndex((m) => m.content.some((b) => b.type === 'tool_result'));
-      assert.ok(resultAt > before, 'premise: the result sits on a later shard of its message');
-      const store = (manager as unknown as { messageStore: unknown }).messageStore;
-      const config = (strategy as unknown as { config: Record<string, number> }).config;
-      config.recentWindowTokens = strategy.estimates(store).slice(resultAt).reduce((a, b) => a + b, 0);
-      assert.equal(strategy.recentStart(store), callAt, 'the window starts at the call');
+      assert.ok(to - from >= 2 && resultAt === to, `premise: the message is three or more shards, its result on the last (${from}..${to}, result at ${resultAt})`);
+      body(strategy, (manager as unknown as { messageStore: unknown }).messageStore, { callAt, from, to, resultAt },
+        (manager as unknown as { strategyMessageView(): unknown }).strategyMessageView());
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  it("the recent window, its edge on any of the message's shards, starts at the call", async () => {
+    await withLateResult(false, (strategy, store, { callAt, from, to }) => {
+      const config = (strategy as unknown as { config: Record<string, number> }).config;
+      const pse = strategy.estimates(store);
+      for (let edge = from; edge <= to; edge++) {
+        config.recentWindowTokens = pse.slice(edge).reduce((a, b) => a + b, 0);
+        assert.equal(strategy.recentStart(store), callAt, `an edge on message ${edge}`);
+      }
+    });
+  });
+
+  it('a compression hold on the message starts at the call', async () => {
+    // The strategy's view of the store, which carries the holds.
+    await withLateResult(true, (strategy, _store, { callAt, from }, view) => {
+      assert.ok(strategy.hold(view) <= from, 'premise: the message is held');
+      assert.equal(strategy.hold(view), callAt);
+    });
   });
 });
 

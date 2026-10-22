@@ -474,6 +474,30 @@ describe('chunkIngressMessage keeps each block in place', () => {
     assert.equal(shards[1]!.continuesBlock, false, 'premise: the seam falls between the two parts');
   });
 
+  it('a reasoning pairing whose members land whole on different shards is given up by both', () => {
+    // A reasoning item, plain text with no raw form, then the function call
+    // the reasoning led to: the reasoning lands on the first shard, the call
+    // on the last, each whole.
+    const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_9' } } as unknown as ContentBlock;
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_9' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [reasoning, { type: 'text', text: 'a plain long text. '.repeat(400) }, call];
+    const shards = shardsOf(given);
+    assert.equal(shards[0]!.content[0]!.type, 'thinking', 'premise: the reasoning is on the first shard');
+    assert.equal(shards.at(-1)!.content.at(-1)!.type, 'tool_use', 'premise: the call is on the last shard');
+    assert.equal((shards[0]!.content[0] as { rawItem?: unknown }).rawItem, undefined, 'the reasoning gives up its item');
+    assert.equal((shards.at(-1)!.content.at(-1) as { rawItem?: unknown }).rawItem, undefined, 'and so does the call it led to');
+  });
+
+  it('a reasoning pairing whose members land whole on one shard keeps both items', () => {
+    // Plain text first, then a reasoning item and the function call it led
+    // to, both at the message's end, so both land on its last shard.
+    const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_8' } } as unknown as ContentBlock;
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_8' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [{ type: 'text', text: 'a plain long text. '.repeat(400) }, reasoning, call];
+    const last = shardsOf(given).at(-1)!.content;
+    assert.deepEqual(last.slice(-2), [reasoning, call], 'both keep their items, unchanged, on the last shard');
+  });
+
   it('a raw form whose blocks land whole on one shard is kept', () => {
     const item = { type: 'message', id: 'msg_2' };
     const given: ContentBlock[] = [
@@ -527,8 +551,6 @@ describe('continuesBlock is stored and checked', () => {
 
   for (const [what, declare] of [
     ['declares continuesBlock on some shards after the first and not others', (k: number) => (k === 1 ? { continuesBlock: true } : {})],
-    ['declares continuesBlock on its first shard', (k: number) => ({ continuesBlock: k === 0 })],
-    ['declares continuesBlock false on its first shard and on every later one', () => ({ continuesBlock: false })],
   ] as const) {
     it(`a chunking that ${what} is refused before any shard is written`, async () => {
       class Mixed extends AutobiographicalStrategy {
@@ -548,6 +570,34 @@ describe('continuesBlock is stored and checked', () => {
       });
       assert.throws(() => manager.addMessage('User', [{ type: 'text', text: 'paragraph. '.repeat(2000) }]), /continuesBlock/);
       assert.equal(manager.getAllMessages().length, 0, 'no shard was written');
+      manager.close();
+    });
+  }
+
+  for (const first of [false, true]) {
+    it(`a chunking that also declares continuesBlock ${first} on its first shard is accepted, and joins back as given`, async () => {
+      class FirstDeclared extends AutobiographicalStrategy {
+        override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+          const decision = super.chunkIngressMessage(participant, content);
+          if (!decision) return decision;
+          return { ...decision, shards: decision.shards.map((shard, k) => (k === 0 ? { ...shard, continuesBlock: first } : shard)) };
+        }
+      }
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new FirstDeclared({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 }),
+        membrane: makeMockMembrane() as any,
+      });
+      // The boundary case: the first seam falls between the two blocks, the later ones inside the second.
+      const given: ContentBlock[] = [
+        { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
+        { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
+      ];
+      manager.addMessage('User', given);
+      const stored = manager.getAllMessages();
+      assert.ok(stored.length > 2, 'premise: the message is sharded');
+      assert.equal(stored[0]!.continuesBlock, first, 'premise: the first shard keeps its declaration');
+      assert.deepEqual(joinBodyContent(stored), given);
       manager.close();
     });
   }

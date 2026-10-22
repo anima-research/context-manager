@@ -29,8 +29,9 @@
     every adjacent pair of text blocks across a body's shards, so it shows
     two given text blocks as one. Its change is `joinBodyContent(shards)`.
   - **Refused:** an override of `chunkIngressMessage` whose shards declare
-    `continuesBlock` on some shards after the first and not others, or on
-    the first, is refused before any shard is written.
+    `continuesBlock` on some shards after the first and not others is
+    refused before any shard is written. A first shard's declaration is
+    stored as given, and no join uses it.
   - **Unchanged:** bodies stored before keep their shards as they are. The
     seams fall where they did, so each shard holds the same text as before,
     and a body keeps its `bodyGroupId`. `concatBodyGroups` still renders a

@@ -484,11 +484,12 @@ export interface IngressChunkResult {
   /**
    * The shards in source order. Each becomes a separate StoredMessage.
    * Joining the shards' content (`joinBodyContent`) must reproduce the
-   * original message's blocks, apart from their raw replay forms and a text
-   * block a seam cut. A cut block comes back as one plain text block, without
-   * the fields (such as cache_control or a raw replay form) that were the
-   * whole block's, and a raw form whose blocks don't all sit unchanged on one
-   * shard is given up, with its reasoning pairing (raw-forms.ts).
+   * original message's blocks, apart from a text block a seam cut and a raw
+   * replay form no one shard holds whole. A cut block comes back as one
+   * plain text block, without the fields (such as cache_control or a raw
+   * replay form) that were the whole block's, and a raw form whose blocks
+   * don't all sit unchanged on one shard is given up, with its reasoning
+   * pairing (raw-forms.ts); every other block keeps its raw form.
    */
   shards: Array<{
     content: ContentBlock[];

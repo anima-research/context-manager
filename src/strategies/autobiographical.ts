@@ -12899,11 +12899,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // structural repair refuses a compile to leave out. For a body split
       // into shards at ingress, its newest shard is all that must stay raw,
       // since the earlier shards can close into chunks and fold, unless the
-      // body holds a tool_result: a result leads its message, so it's on the
-      // body's first shard (chunkIngressMessage keeps each block in place,
-      // and a body stored before then holds all its other blocks there), and
-      // a result whose call isn't raw just before it is blanked as an orphan
-      // (enforceToolPairing), without a refusal. So when the newest body
+      // body holds a tool_result, on any of its shards (chunkIngressMessage
+      // keeps each block in place, so a result after a long text is on a
+      // later shard, and a body stored before then holds all its other
+      // blocks on its first), and a result whose call isn't raw just before
+      // it is blanked as an orphan (enforceToolPairing), without a refusal.
+      // So when the newest body
       // holds a tool_result, the turn is the whole body and the call before
       // it, from the call's first shard that holds a tool_use or a thinking
       // block (callStart), as holdBoundary counts it. A hold inside the head
@@ -12913,7 +12914,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let floorTokens = 0;
       if (messages.length > 0) {
         const newestBody = bodyStart((k) => messages[k], messages.length - 1);
-        const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
+        const newestTurn = this.bodyHoldsToolResult(messages, newestBody)
           ? this.callStart(messages, newestBody)
           : messages.length - 1;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
@@ -17910,6 +17911,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected holdBoundaryScans = 0;
 
   /**
+   * Whether the message holding position `at` holds a tool_result on any of
+   * its shards: a sharded message keeps each block where it sat
+   * (chunkIngressMessage), so a result after a long text is on a later shard.
+   */
+  protected bodyHoldsToolResult(messages: readonly StoredMessage[], at: number): boolean {
+    const { from, to } = bodyBoundsIn(messages, at);
+    for (let k = from; k <= to; k++) if (this.hasToolResult(messages[k]!)) return true;
+    return false;
+  }
+
+  /**
    * Where the call a result at `resultAt` answers starts to matter: the
    * first shard of the body before the result's body that holds a
    * tool_use or a thinking block (thinking or redacted_thinking), or
@@ -17940,10 +17952,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Index where the hold region begins: the earliest held message, stepped
-   * back, when it holds a tool_result, onto the call it answers, from the
-   * call's first shard that holds a tool_use or a thinking block
-   * (callStart). `store.length()` when nothing is held — and then without
-   * scanning the timeline.
+   * back, when its message holds a tool_result on any of its shards, onto
+   * the call it answers, from the call's first shard that holds a tool_use
+   * or a thinking block (callStart). `store.length()` when nothing is held —
+   * and then without scanning the timeline.
    */
   protected holdBoundary(store: MessageStoreView): number {
     const isHeld = store.isCompressionHeld;
@@ -17955,7 +17967,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < messages.length; i++) {
       if (isHeld.call(store, messages[i].id)) {
         let b = i;
-        if (b > 0 && this.hasToolResult(messages[b])) b = this.callStart(messages, b);
+        if (b > 0 && this.bodyHoldsToolResult(messages, b)) b = this.callStart(messages, b);
         return b;
       }
     }
@@ -18027,10 +18039,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tokens += pse[i];
       if (tokens > this.config.recentWindowTokens) {
         let boundary = i + 1;
-        // Don't split a tool_use/tool_result pair: if the message at the boundary
-        // is a tool_result, include the call before it, from its first shard
-        // that holds a tool_use or a thinking block (callStart).
-        if (boundary > 0 && boundary < messages.length && this.hasToolResult(messages[boundary])) {
+        // Don't split a tool_use/tool_result pair: if the message at the
+        // boundary holds a tool_result, on any of its shards, include the call
+        // before it, from its first shard that holds a tool_use or a thinking
+        // block (callStart).
+        if (boundary > 0 && boundary < messages.length && this.bodyHoldsToolResult(messages, boundary)) {
           boundary = this.callStart(messages, boundary);
         }
         return boundary;

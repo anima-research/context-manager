@@ -8,6 +8,7 @@ import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/ind
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import type { ContentBlock, Membrane } from '@animalabs/membrane';
+import { legacyIngress } from './_harness/legacy-ingress.js';
 
 class DiagnosticStrategy extends AutobiographicalStrategy {
   // A host that compresses names its model; a test of one that doesn't passes `compressionModel: undefined`.
@@ -786,19 +787,7 @@ describe('OverBudgetError.clearedBy', () => {
    *  on the first shard after its text, with no seam declared. */
   class LegacyIngress extends AutobiographicalStrategy {
     override chunkIngressMessage(participant: string, content: ContentBlock[]) {
-      const decision = super.chunkIngressMessage(participant, content);
-      if (!decision) return decision;
-      const others = content.filter((block) => block.type !== 'text');
-      return {
-        bodyGroupId: decision.bodyGroupId,
-        shards: decision.shards.map((shard, k) => ({
-          shardIndex: shard.shardIndex,
-          content: [
-            { type: 'text', text: shard.content.map((block) => (block.type === 'text' ? block.text : '')).join('') } as ContentBlock,
-            ...(k === 0 ? others : []),
-          ],
-        })),
-      };
+      return legacyIngress(super.chunkIngressMessage(participant, content), content);
     }
   }
 
@@ -876,6 +865,63 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  for (const [resultWords, expected, when] of [
+    [200, [], 'names nothing when only its last shard, which holds the tool_result, would fit'],
+    [30, ['smaller-recent-window'], 'names a smaller window when its body and the call fit'],
+  ] as const) {
+    it(`counts a result after a long text, on a later shard, with its whole body and its call (${when})`, async () => {
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true,
+        targetChunkTokens: 10,
+        headWindowTokens: 0,
+        recentWindowTokens: 100_000,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        manager.addMessage('agent', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+        const before = manager.getAllMessages().length;
+        manager.addMessage('user', [
+          { type: 'text', text: 'result ' + 'word '.repeat(resultWords) },
+          { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+        ]);
+        const shards = manager.getAllMessages().slice(before);
+        assert.ok(shards.length > 1, `the result is stored as shards (got ${shards.length})`);
+        assert.ok(!shards[0]!.content.some((block) => block.type === 'tool_result'), 'its first shard holds no tool_result');
+        assert.ok(shards.at(-1)!.content.some((block) => block.type === 'tool_result'), 'its last shard holds the tool_result');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+        assert.deepEqual(error.clearedBy, expected);
+      });
+    });
+  }
+
+  it("counts a result message that is the store's first message with its whole body (names nothing when only its last shard would fit)", async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 10,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [
+        { type: 'text', text: 'result ' + 'word '.repeat(200) },
+        { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+      ]);
+      const shards = manager.getAllMessages();
+      assert.ok(shards.length > 1 && shards.every((m) => m.bodyGroupId === shards[0]!.bodyGroupId), 'premise: the store is one message, stored as shards');
+      assert.ok(shards.at(-1)!.content.some((block) => block.type === 'tool_result'), 'premise: its last shard holds the tool_result');
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, []);
+    });
+  });
 
   it('clears the head/tail refusal at the smaller window it names (the next refusal can be the picker\'s)', async () => {
     const strategy = recentOnly(100_000);

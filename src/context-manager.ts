@@ -588,13 +588,14 @@ export class ContextManager {
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         // A body declares where its seams split a text block on every shard
         // after the first or on none (joinBodyContent reads one that declares
-        // none as stored before blocks were kept in place), and its first
-        // shard has no seam before it.
-        const declared = ordered.slice(1).filter((s) => s.continuesBlock !== undefined).length;
-        if (ordered[0]!.continuesBlock !== undefined || (declared !== 0 && declared !== ordered.length - 1)) {
+        // none as stored before blocks were kept in place). A first shard has
+        // no seam before it, and no join uses its declaration: a body's first
+        // shard is always the first part of a join (joinBodyContent).
+        const undeclared = ordered.slice(1).filter((s) => s.continuesBlock === undefined).map((s) => s.shardIndex);
+        if (undeclared.length !== 0 && undeclared.length !== ordered.length - 1) {
           throw new Error(
-            `chunkIngressMessage declared continuesBlock on shards ${JSON.stringify(ordered.flatMap((s) => (s.continuesBlock !== undefined ? [s.shardIndex] : [])))} ` +
-              `of ${shardCount}; a body declares it on every shard after the first, or on none`,
+            `chunkIngressMessage declared no continuesBlock on shards ${JSON.stringify(undeclared)} of ${shardCount}, ` +
+              `and declared it on the others after the first; a body declares it on every shard after the first, or on none`,
           );
         }
         // A shard that doesn't match is refused before any shard is stored,
