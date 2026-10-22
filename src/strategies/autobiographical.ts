@@ -73,8 +73,8 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
-import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody, joinBodyContent } from '../body-runs.js';
+import { releaseEditedRawForms, releaseRawFormsAcrossParts, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -604,9 +604,10 @@ type ToolPruningDecision = {
   readonly inputCap: number;
 };
 
-/** A tool call the conversation answers: its message's place in the listing,
- *  the place of the result that first answered it, and every result that
- *  answers it, by message and place in its content. */
+/** A tool call the conversation answers: its message's place in the listing
+ *  (a sharded message's first shard's), the place of the result that first
+ *  answered it, and every result that answers it, by message and place in
+ *  its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
 
 /**
@@ -632,7 +633,9 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        opened.push([block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } }]);
+        // A reply's calls are one turn: a sharded reply's sit on its shards
+        // where they were written, so each is placed at its body's first.
+        opened.push([block.id, { toolName: block.name, call: { message: bodyStart((k) => messages[k], at), place: -1, results: [] } }]);
       } else if (block.type === 'tool_result') {
         const first = waiting.get(block.toolUseId)?.shift();
         let call: AnsweredCall | undefined;
@@ -2566,31 +2569,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * incoming message's text content; if its approximate token count
    * exceeds the chunker's threshold, splits it into shards with a stable
    * shared `bodyGroupId`. The framework then stores each shard as its own
-   * StoredMessage, and the render path concatenates them back into one
-   * API message at compile time (preserving KV cache structure).
+   * StoredMessage, and the render path joins them back into one API message
+   * at compile time (`joinBodyContent`, preserving KV cache structure).
    *
-   * Multi-block content: text blocks are concatenated for chunking, then
-   * the resulting shards are emitted as text blocks. Non-text blocks
-   * (images, tool results) are passed through unchanged on the first
-   * shard only — they don't get split.
+   * Multi-block content: the chunker cuts the message's text blocks joined
+   * into one string, so the seams are where they'd be for that text alone.
+   * Each shard then holds its slice of the message's blocks, in order. A text
+   * block keeps its own boundaries, cut where a seam falls inside it, and
+   * every other block (an image, a document, thinking, a tool call or
+   * result) goes on the shard holding its place in the text: the shard whose
+   * text it comes before, or the last shard at the message's end. Every shard
+   * after the first declares whether the seam before it fell inside a text
+   * block (`continuesBlock`), which is where a render joins the two pieces,
+   * so the joined shards are the message as given. The pieces of a cut text
+   * block are plain text, its other fields (such as cache_control) being the
+   * whole block's, and a raw replay form a cut block carried, or one whose
+   * blocks land on more than one shard, is given up (raw-forms.ts), so a
+   * shard never replays what another holds.
    *
    * See `docs/adaptive-resolution-design.md` §3.6.
    */
   chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
     if (!this.config.adaptiveResolution) return null;
 
-    // Separate text and non-text blocks.
-    const textParts: string[] = [];
-    const nonTextBlocks: ContentBlock[] = [];
+    // The text the chunker cuts: the text blocks joined. Each block's place
+    // is the offset in it where the block starts.
+    let combined = '';
+    let textBlocks = 0;
+    const placed: Array<{ block: ContentBlock; at: number }> = [];
     for (const block of content) {
+      placed.push({ block, at: combined.length });
       if (block.type === 'text') {
-        textParts.push(block.text);
-      } else {
-        nonTextBlocks.push(block);
+        combined += block.text;
+        textBlocks++;
       }
     }
-    if (textParts.length === 0) return null;
-    const combined = textParts.join('');
+    if (textBlocks === 0) return null;
 
     // Threshold and shard size derive from the strategy's existing
     // targetChunkTokens setting: a message over 2x targetChunkTokens
@@ -2607,19 +2621,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sharded = chunkMessage(combined, chunkerOpts);
     if (!sharded.wasSharded) return null;
 
-    // Build IngressChunkResult. Non-text blocks (if any) go on shard 0
-    // so the agent doesn't lose attachments. They're outside the chunker's
-    // concern but should still be available on the first shard.
-    const shards = sharded.shards.map((s) => ({
-      content: ([{ type: 'text', text: s.content }] as ContentBlock[]).concat(
-        s.index === 0 ? nonTextBlocks : []
-      ),
-      shardIndex: s.index,
-    }));
+    // Each shard's span of the joined text, in characters, as the chunker
+    // sliced it.
+    const spans: Array<{ from: number; to: number }> = [];
+    let cursor = 0;
+    for (const shard of sharded.shards) {
+      spans.push({ from: cursor, to: cursor + shard.content.length });
+      cursor += shard.content.length;
+    }
+    const last = spans.length - 1;
+    // The shard a block placed at `at` goes on: the one whose text it comes
+    // before, or the last at the end of the text.
+    const shardAt = (at: number): number => {
+      const k = spans.findIndex((span) => at < span.to);
+      return k < 0 ? last : k;
+    };
+    const blocks: ContentBlock[][] = spans.map(() => []);
+    for (const { block, at } of placed) {
+      if (block.type !== 'text' || block.text.length === 0) {
+        blocks[shardAt(at)]!.push(block);
+        continue;
+      }
+      const end = at + block.text.length;
+      for (let k = shardAt(at); k <= last && spans[k]!.from < end; k++) {
+        const from = Math.max(at, spans[k]!.from);
+        const to = Math.min(end, spans[k]!.to);
+        // A piece of a cut block is plain text: the block's other fields,
+        // such as a raw replay form or a caller's cache_control, are true of
+        // the whole block, not of a piece.
+        blocks[k]!.push(from === at && to === end ? block : { type: 'text', text: block.text.slice(from - at, to - at) });
+      }
+    }
+    // A raw form survives only where every block that shares it lands,
+    // unchanged, on one shard (raw-forms.ts).
+    const placedBlocks = releaseRawFormsAcrossParts(content, blocks);
+    // A seam falls inside a text block when one starts before it and ends after.
+    const insideText = (seam: number): boolean =>
+      placed.some(({ block, at }) => block.type === 'text' && at < seam && seam < at + block.text.length);
 
     return {
       bodyGroupId: sharded.bodyGroupId,
-      shards,
+      shards: sharded.shards.map((s, k) => ({
+        content: placedBlocks[k]!,
+        shardIndex: s.index,
+        ...(k > 0 ? { continuesBlock: insideText(spans[k]!.from) } : {}),
+      })),
     };
   }
 
@@ -12853,21 +12899,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // structural repair refuses a compile to leave out. For a body split
       // into shards at ingress, its newest shard is all that must stay raw,
       // since the earlier shards can close into chunks and fold, unless the
-      // body holds a tool_result: ingress puts a
-      // split message's non-text blocks on its first shard
-      // (chunkIngressMessage), and a result whose call isn't raw just before
-      // it is blanked as an orphan (enforceToolPairing), without a refusal.
-      // So when the newest body holds a tool_result, the turn is the whole
-      // body and the whole call before it, from the call's first shard, as
-      // holdBoundary counts it. A hold inside the head leaves every window's
-      // tail starting at the head's end, so a floor counted from the hold
-      // covers at least the tail, and nothing is named, as it should be. So
-      // does a newest turn that starts inside the head.
+      // body holds a tool_result: a result leads its message, so it's on the
+      // body's first shard (chunkIngressMessage keeps each block in place,
+      // and a body stored before then holds all its other blocks there), and
+      // a result whose call isn't raw just before it is blanked as an orphan
+      // (enforceToolPairing), without a refusal. So when the newest body
+      // holds a tool_result, the turn is the whole body and the call before
+      // it, from the call's first shard that holds a tool_use or a thinking
+      // block (callStart), as holdBoundary counts it. A hold inside the head
+      // leaves every window's tail starting at the head's end, so a floor
+      // counted from the hold covers at least the tail, and nothing is named,
+      // as it should be. So does a newest turn that starts inside the head.
       let floorTokens = 0;
       if (messages.length > 0) {
         const newestBody = bodyStart((k) => messages[k], messages.length - 1);
         const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
-          ? bodyStart((k) => messages[k], newestBody - 1)
+          ? this.callStart(messages, newestBody)
           : messages.length - 1;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
@@ -12976,15 +13023,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      // This is the chunk's raw price. The shard path in step 5 sends a run
-      // of a body's raw shards as one entry, their text joined and uncut, so
-      // a shard takes no extra here. It prices that entry as the shards'
-      // text it joins, each by estimateTokens, the store's price, so a shard
-      // of text alone is counted there as here; a shard's other blocks are
-      // priced here, and the shard path leaves them out. A shard the plan
-      // folds is priced as its summary. The head and recent windows cut a
-      // shard as they emit it.
-      const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
+      // This is the chunk's raw price, a shard's as any message's: the shard
+      // path in step 5 sends a run of a body's raw shards as one entry, each
+      // shard cut as any raw message is, and prices the entry as the shards
+      // it joins, each at this price. A shard the plan folds is priced as
+      // its summary.
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
@@ -13374,13 +13418,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 5. Emit middle entries in source order -----
-    const positionOf = this.positionIndex(messages);
     // Walk middle messages. Handle two cases:
     //  - bodyGroupId set: collect the consecutive shards of the same body (one
     //    ingestion; a later ingestion of the same text is another body, see
-    //    body-runs.ts), emit ONE combined entry with concatenated content (raw shards + inline
-    //    summary text for folded shards). This preserves KV — the model sees
-    //    one continuous user message instead of N turns.
+    //    body-runs.ts), and emit each run of its raw shards as ONE entry, its
+    //    shards joined as every raw render joins a body (joinShards), and each
+    //    run of its folded shards as a recall pair. This preserves KV: the model
+    //    sees one continuous message instead of N turns.
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
     const emittedAncestors = new Set<SummaryId>();
 
@@ -13423,8 +13467,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const shards = messages.slice(groupStart, i);
 
         // Walk shards in order, accumulating "runs":
-        //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
-        //    message with their text concatenated.
+        //  - a 'raw' run is consecutive shards at L0; flushed as ONE message
+        //    of their joined blocks.
         //  - a 'summary' run is consecutive shards under the same L_k
         //    ancestor; flushed as a Q+A recall pair (Context Manager
         //    question + summaryParticipant answer), emitted once per
@@ -13433,7 +13477,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         //  - resolution transitions raw ↔ folded
         //  - the L_k ancestor changes
         type Run =
-          | { kind: 'raw'; parts: string[]; ids: string[]; tokens: number }
+          | { kind: 'raw'; parts: Array<{ content: ContentBlock[]; continuesBlock?: boolean; home: MessageId }>; ids: string[]; tokens: number }
           | { kind: 'summary'; ancestor: SummaryEntry };
         let currentRun: Run | null = null;
         const participant = shards[0].participant;
@@ -13441,25 +13485,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const flushRun = (): void => {
           if (!currentRun) return;
           if (currentRun.kind === 'raw') {
-            const text = currentRun.parts.join('');
-            const content: ContentBlock[] = [{ type: 'text', text }];
-            // Deliberately do NOT apply maxMessageTokens here: the picker
-            // is the authority on how much of the doc renders raw vs.
-            // summarized. Truncating the composite would silently lose
-            // doc content that the picker explicitly chose to keep raw.
-            // (`maxMessageTokens` is for per-message caps on chat / tool
-            // results, not for sharded bodyGroup composites.)
+            const content = this.joinShards(currentRun.parts);
+            // The composite isn't cut as a whole, which would cut text the
+            // picker chose to keep raw: each shard is cut at maxMessageTokens
+            // as any raw message is (cappedForSend), as the windows cut it,
+            // so a shard reads the same in every region.
             const tokens = currentRun.tokens;
             if (totalTokens + tokens > prefixBudget) {
               throw emissionOverBudget(totalTokens + tokens);
             }
             entries.push({
               index: entries.length,
-              sourceMessageId: undefined,
-              // Composite provenance: every shard whose text was concatenated
-              // into this entry. Without this the coverage invariant reads the
-              // absorbed shards as missing (the body-group-shard false
-              // positive) — same fix as mergeAdjacentBodyGroupRaw.
+              // Its first shard, as a window's merge names a composite, so a
+              // window's shards of the same body right after it join it
+              // (mergeAdjacentBodyGroupRaw) and the image strip places it.
+              sourceMessageId: currentRun.ids[0],
+              // Composite provenance: every shard joined into this entry.
+              // Without this the coverage invariant reads the absorbed shards
+              // as missing (the body-group-shard false positive), as for
+              // mergeAdjacentBodyGroupRaw.
               sourceMessageIds: [...currentRun.ids],
               cacheLayoutKey: currentRun.ids.at(-1),
               sourceRelation: 'copy',
@@ -13490,35 +13534,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           currentRun = null;
         };
-        // A raw run joins its shards' text into one block and is priced as
-        // the parts it joins, each shard's text by estimateTokens, which is
-        // what the plan counted for a shard of text alone. The store's
-        // default estimator prices a text block at the rate its first 2,000
-        // characters set, so the joined block's own estimate would put the
-        // whole run at that rate, and this entry and the plan would disagree
-        // wherever the shards' densities differ.
-        const addRaw = (shard: StoredMessage): void => {
+        // A raw run sends each shard as any raw message is sent
+        // (cappedForSend), joined, and is priced as the parts it joins, each
+        // shard at the plan's price (postStripEstimates and the cut's extra).
+        // The store's default estimator prices a text block at the rate its
+        // first 2,000 characters set, so the joined block's own estimate
+        // would put the whole run at that rate, and this entry and the plan
+        // would disagree wherever the shards' densities differ.
+        const addRaw = (shard: StoredMessage, position: number): void => {
           if (currentRun?.kind !== 'raw') {
             flushRun();
             currentRun = { kind: 'raw', parts: [], ids: [], tokens: 0 };
           }
           const rawRun = currentRun as Extract<Run, { kind: 'raw' }>;
           rawRun.ids.push(shard.id);
-          const text = this.prunedForSend(store, shard).content
-            .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text');
-          for (const block of text) rawRun.parts.push(block.text);
-          rawRun.tokens += this.estimateTokens(text);
+          const { content, extra } = this.cappedForSend(store, shard, msgCap);
+          rawRun.parts.push({ content, continuesBlock: shard.continuesBlock, home: shard.id });
+          rawRun.tokens += pse[position]! + extra;
         };
 
-        for (const shard of shards) {
-          const resolution = levelAt(positionOf.get(shard.id) ?? -1, shard.id);
+        for (const [k, shard] of shards.entries()) {
+          const position = groupStart + k;
+          const resolution = levelAt(position, shard.id);
           if (resolution === 0) {
-            addRaw(shard);
+            addRaw(shard, position);
           } else {
             const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo);
             if (!ancestor) {
               // Fall back to raw
-              addRaw(shard);
+              addRaw(shard, position);
               continue;
             }
             // If we're already in a summary run for the SAME ancestor, this
@@ -13615,10 +13659,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
     // Both head and tail emission paths emit shards as separate ContextEntries.
-    // The middle path already merges consecutive same-bodyGroup raw shards into
-    // one composite entry, but head/tail don't. This pass closes that gap so
-    // a sharded message renders as ONE API message regardless of which region
-    // it falls into (preserves KV cache through region transitions).
+    // The middle path joins each raw run of a body's shards into one composite
+    // entry, and head/tail don't. This pass joins them, a middle composite to
+    // the window's shards of its body next to it too, so a body's raw shards
+    // render as ONE API message whichever regions they fall into (preserves
+    // KV cache through region transitions).
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store, messages);
 
     this.assertFullCoverage(merged, messages, {
@@ -13637,10 +13682,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural repair may rewrite tool blocks, but it must never erase that
     // turn. A body's shards merge into one entry, so any surviving shard of the
     // newest body proves the newest shard is present: a head or recent-window
-    // merge keeps its first shard's id as sourceMessageId, and a middle-region
-    // composite carries every shard's id in sourceMessageIds (its
-    // sourceMessageId is unset), which is where the newest body lands when its
-    // newest shard alone outgrows the recent window. Only that body's shards
+    // merge keeps its first shard's id as sourceMessageId, as a middle-region
+    // composite does, and either carries every shard's id in sourceMessageIds;
+    // the middle is where the newest body lands when its newest shard alone
+    // outgrows the recent window. Only that body's shards
     // count: an earlier ingestion of the same text shares the group id, and its
     // survival proves nothing about the newest turn.
     const newest = messages[messages.length - 1];
@@ -14954,12 +14999,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (msg.bodyGroupId) {
           const groupStart = i;
           i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k]!, groupStart) + 1;
-          let run: { parts: string[]; ids: string[] } | null = null;
+          // As the middle's emission sends a raw run (selectAdaptive's step 5).
+          let run: { parts: Array<{ content: ContentBlock[]; continuesBlock?: boolean; home: MessageId }>; ids: string[] } | null = null;
           const flush = (): void => {
             if (!run) return;
             entries.push({
-              index: entries.length, sourceMessageIds: run.ids, cacheLayoutKey: run.ids.at(-1),
-              sourceRelation: 'copy', participant: msg.participant, content: [{ type: 'text', text: run.parts.join('') }],
+              index: entries.length, sourceMessageId: run.ids[0], sourceMessageIds: run.ids, cacheLayoutKey: run.ids.at(-1),
+              sourceRelation: 'copy', participant: msg.participant, content: this.joinShards(run.parts),
             });
             run = null;
           };
@@ -14972,7 +15018,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             run ??= { parts: [], ids: [] };
             run.ids.push(shard.id);
-            for (const block of shard.content) if (block.type === 'text') run.parts.push(block.text);
+            run.parts.push({ content: this.cappedForSend(store, shard, window.msgCap).content, continuesBlock: shard.continuesBlock, home: shard.id });
             afterRaw(shard.id);
           }
           flush();
@@ -15037,16 +15083,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Walk an entries array; for every run of consecutive entries that
    *  (a) have sourceRelation: 'copy' (raw, not a synthesized recall pair)
    *  (b) have sourceMessageId pointing to messages in the same bodyGroup
-   * merge them into one composite entry whose body is the byte-faithful
-   * concatenation of their text content. Other entries pass through.
+   * merge them into one composite entry whose content is their body's
+   * blocks, joined as every raw render of a body joins it (joinShards,
+   * joinBodyContent). An entry can itself join a run of the body's shards:
+   * the adaptive middle sends a raw run of a body as one entry, which a
+   * window's shards next to it join. Other entries pass through.
    *
    * The merge prices nothing: the head and recent windows priced each shard
-   * as they emitted it, as the plan priced it, so the budget and the render
-   * stats count a composite as the parts it joins, where the store's default
-   * estimator would price the joined text at its first 2,000 characters'
-   * rate. What re-estimates entries from their content after this, to place
-   * kv-unified's cache markers, report the fold diff or record the rendered
-   * layout, reads the joined text.
+   * as they emitted it, as the plan priced it, and so did the middle its
+   * run, so the budget and the render stats count a composite as the parts
+   * it joins, where the store's default estimator would price the joined
+   * text at its first 2,000 characters' rate. What re-estimates entries from
+   * their content after this, to place kv-unified's cache markers, report the
+   * fold diff or record the rendered layout, reads the joined text.
    *
    * `messages` is the caller's `store.getAll()` listing; overrides should
    * forward it, since a filtered view re-lists the whole history per call.
@@ -15067,27 +15116,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Read the metadata off the full listing (the caller's, so a filtered
     // view is not listed twice) instead of one `store.get()` per raw entry:
     // each get re-fetched the record from chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
-    // store (2026-09-21 profile), for two scalar fields. Only sharded
+    // store (2026-09-21 profile), for a few scalar fields. Only sharded
     // messages carry a bodyGroupId, so the index stays small.
-    const shardMeta = new Map<string, { groupId?: string; shardIndex?: number }>();
+    const shardMeta = new Map<string, StoredMessage>();
     for (const m of messages) {
-      if (m.bodyGroupId) shardMeta.set(m.id, { groupId: m.bodyGroupId, shardIndex: m.shardIndex });
+      if (m.bodyGroupId) shardMeta.set(m.id, m);
     }
-    const metaOf = (sourceMessageId?: string): { groupId?: string; shardIndex?: number } | undefined =>
-      sourceMessageId ? shardMeta.get(sourceMessageId) : undefined;
-    const groupOf = (sourceMessageId?: string): string | undefined =>
-      metaOf(sourceMessageId)?.groupId;
-    const shardOf = (entry: ContextEntry) => {
-      const meta = metaOf(entry.sourceMessageId);
-      return meta ? { bodyGroupId: meta.groupId, shardIndex: meta.shardIndex } : undefined;
+    // An entry's first and last shard: its own, or for an entry that joins a
+    // run of a body's shards, the run's ends.
+    const firstShard = (entry: ContextEntry): StoredMessage | undefined =>
+      entry.sourceRelation === 'copy' && entry.sourceMessageId ? shardMeta.get(entry.sourceMessageId) : undefined;
+    const lastShard = (entry: ContextEntry): StoredMessage | undefined => {
+      const last = entry.sourceMessageIds?.at(-1);
+      return last !== undefined ? (entry.sourceRelation === 'copy' ? shardMeta.get(last) : undefined) : firstShard(entry);
     };
 
     const out: ContextEntry[] = [];
     let i = 0;
     while (i < entries.length) {
       const entry = entries[i];
-      const groupId = entry.sourceRelation === 'copy' ? groupOf(entry.sourceMessageId) : undefined;
-      if (!groupId) {
+      if (!firstShard(entry)) {
         out.push({ ...entry, index: out.length });
         i++;
         continue;
@@ -15095,8 +15143,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Collect the run of consecutive raw entries of the same body. Another
       // ingestion of the same text shares the group id but restarts its
       // shard indices, and a window can start mid-body: the run ends where an
-      // index doesn't rise (see body-runs.ts).
-      const end = bodyEnd(entries.length, (k) => (entries[k]!.sourceRelation === 'copy' ? shardOf(entries[k]!) : undefined), i);
+      // index doesn't rise (see body-runs.ts), read from each entry's last
+      // shard to the next one's first.
+      let end = i;
+      while (end + 1 < entries.length && continuesBody(lastShard(entries[end]!), firstShard(entries[end + 1]!))) end++;
       const run: ContextEntry[] = entries.slice(i, end + 1);
       const j = end + 1;
       if (run.length === 1) {
@@ -15106,36 +15156,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Head and tail emission keep store order, so the run's shards are
       // already in rising shard order (body-runs.ts).
-      // Build merged text content. Every shard's non-text blocks are kept,
-      // ahead of the text: chunkIngressMessage puts a body's on its first
-      // shard, so they are that shard's.
-      const mergedTextParts: string[] = [];
-      const nonTextBlocks: ContentBlock[] = [];
-      for (const r of run) {
-        for (const block of r.content) {
-          if (block.type === 'text') mergedTextParts.push(block.text);
-          else nonTextBlocks.push(block);
-        }
-      }
-      const mergedContent: ContentBlock[] = [
-        ...nonTextBlocks,
-        { type: 'text', text: mergedTextParts.join('') },
-      ];
       out.push({
         index: out.length,
         sourceMessageId: run[0].sourceMessageId,
         // Keep every shard's id: this composite represents all of them, and
         // the coverage invariant reads provenance, not just the first source.
-        sourceMessageIds: run
-          .map(e => e.sourceMessageId)
-          .filter((id): id is string => !!id),
+        sourceMessageIds: run.flatMap((e) => e.sourceMessageIds ?? (e.sourceMessageId ? [e.sourceMessageId] : [])),
         sourceRelation: 'copy',
         participant: run[0].participant,
-        content: mergedContent,
+        content: this.joinShards(run.map((e) => ({
+          content: e.content,
+          continuesBlock: firstShard(e)!.continuesBlock,
+          home: e.sourceMessageId!,
+        }))),
       });
       i = j;
     }
     return out;
+  }
+
+  /**
+   * A body's blocks from consecutive parts of it (joinBodyContent), each
+   * other block recorded as its part's (`home`, its shard), unless one is
+   * recorded already, as a run's blocks are when the merge joins it again:
+   * the image strip judges a block's images by the message that holds it
+   * (applyImageStripping), and a body's blocks can be on any of its shards.
+   */
+  private joinShards(parts: ReadonlyArray<{ content: ContentBlock[]; continuesBlock?: boolean; home: MessageId }>): ContentBlock[] {
+    for (const part of parts) {
+      for (const block of part.content) {
+        if (block.type !== 'text' && !this._blockHome.has(block)) this._blockHome.set(block, part.home);
+      }
+    }
+    return joinBodyContent(parts);
   }
 
   /** Get (lazily constructing) the configured picker instance. */
@@ -17091,9 +17144,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the lower one's verdict.
    *  Each image's verdict then follows from the store alone, whichever
    *  messages the layout folds or the repair moves. `selectAdaptive` asks: every budgeting site in it prices a
-   *  message by those estimates, with what a cut changes added, apart from
-   *  the middle region's text-only entry of a sharded body, priced by its
-   *  text. So does the kv-unified cache check's rebuild of what it sends
+   *  message by those estimates, with what a cut changes added. So does the
+   *  kv-unified cache check's rebuild of what it sends
    *  (kvUnifiedKeepEntries). `renderAsNewest` needn't: it sends every
    *  message from its first to the newest, so no newer message goes unsent.
    *  `selectHierarchical` doesn't: its emission prices
@@ -17116,6 +17168,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const messages = store.getAll();
     const posById = this.positionIndex(messages);
+    // A block's images are its own message's: the entry's (at `pos`), or,
+    // where pairing repair moved a result into the entry or the entry joins a
+    // body's shards, the message the block came from (_blockHome).
+    const homeOf = (block: ContentBlock, pos: number): number => {
+      const from = this._blockHome.get(block);
+      return from === undefined ? pos : posById.get(from) ?? -1;
+    };
     // Image-bearing entries, newest-first by source position. Entries with no
     // resolvable source position sort last (pos -1).
     const ordered = entries
@@ -17143,10 +17202,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const keeps: boolean[] = [];
         for (const block of entries[idx].content) {
           const group = imageGroup(block);
-          // A tool result's images are its own message's: this entry's, or,
-          // where pairing repair moved it here, the one it was moved from.
-          const from = this._movedFrom.get(block);
-          const home = from === undefined ? pos : posById.get(from) ?? -1;
+          const home = homeOf(block, pos);
           for (const image of imagesIn([block])) keeps.push(verdictOf(image, home, group));
         }
         // replaceImages asks about each image once, in imagesIn's order.
@@ -17158,12 +17214,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Counting what the entries send: an entry with no resolvable position is
-    // stripped wherever a depth limit is set. A merged body's images all sit
-    // at its first shard's position, in block order: chunkIngressMessage puts
-    // every non-text block of a body on its first shard, and
-    // mergeAdjacentBodyGroupRaw keeps them ahead of the text, so they are that
-    // shard's images. (A chunker that spread images over shards would need a
-    // position per image.)
+    // stripped wherever a depth limit is set. An image is judged at its own
+    // message's position: the entry's, or, for a block that came from
+    // another message (_blockHome: a joined body's other shards, a result
+    // pairing repair moved), that message's.
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
 
     // The region each source position fell in when select() bucketed it. The
@@ -17191,15 +17245,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptImageBytes += blockBytes;
       return true;
     };
+    // Every image the entries carry, nested in a tool_result included, each
+    // at its own message's position, decided newest message first, as
+    // postStripEstimates counts them: a joined body's images
+    // on a later shard come before those on an earlier one, and a result
+    // pairing repair moved is counted at the message it came from. Each is
+    // decided as an occurrence, by its entry and its place among the entry's
+    // images in the order replaceImages meets them, so an image object that
+    // sits twice gets a verdict at each place.
+    const images: Array<{ idx: number; nth: number; at: number; image: ContentBlock }> = [];
+    for (const { idx, pos } of ordered) {
+      let nth = 0;
+      for (const block of entries[idx]!.content) {
+        const home = homeOf(block, pos);
+        for (const image of imagesIn([block])) images.push({ idx, nth: nth++, at: home, image });
+      }
+    }
+    // Stable, so images of one message keep the order the walk met them in:
+    // their order in the message, apart from a result pairing repair moved
+    // into another entry, whose images are met with that entry.
+    images.sort((a, b) => b.at - a.at);
+    const kept = new Map<number, boolean[]>();
+    for (const { idx, nth, at, image } of images) {
+      let verdicts = kept.get(idx);
+      if (!verdicts) kept.set(idx, (verdicts = []));
+      verdicts[nth] = keeps(image, at);
+    }
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const bucket = bucketAt(pos);
-      // Every image the entry carries, nested in a tool_result included, in
-      // the order postStripEstimates and imageStripReplay count them. A block
-      // is copied only when an image in it goes, and the raw forms an edited
-      // block carried are released, so a replay can't bring the image back.
-      entry.content = replaceImages(entry.content, (image) => {
-        if (keeps(image, pos)) return false;
+      const verdicts = kept.get(idx) ?? [];
+      let nth = 0;
+      // A block is copied only when an image in it goes, and the raw forms an
+      // edited block carried are released, so a replay can't bring the image
+      // back.
+      entry.content = replaceImages(entry.content, () => {
+        if (verdicts[nth++] ?? false) return false;
         // Stats-neutral: the bucket stays as its path tallied it (see the
         // doc above). selectAdaptive tallies at post-strip prices, so
         // reclaiming here would double-decrement there. The strip pass only
@@ -17234,10 +17315,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * answer is how many, by message id (a message with none stripped is
    * absent). Undefined when the option is off or no limit is set.
    * postStripEstimates gives those images their verdicts, which
-   * applyImageStripping applies on every path while the option is on. The adaptive middle's and kv-unified's raw body entries
-   * carry their shards' text alone, so the images of those shards aren't
-   * sent, though the rule counts them toward the limits, and the budget
-   * prices them.
+   * applyImageStripping applies on every path while the option is on,
+   * judging each image at the shard that holds it in a joined body.
    */
   protected imageStripReplay(store: MessageStoreView): ReadonlyMap<MessageId, number> | undefined {
     const ratio = this.imageHysteresisRatio();
@@ -17332,12 +17411,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * verdict each gets is kept for the strip, which applies it
    * (applyImageStripping's asEstimated). A cut that leaves an image out, as an
    * override of `truncateContent` can, takes it off at its full price through
-   * the cut's extra, which every site that prices what's sent adds. Two sites
-   * don't: the recent window's size (getUnheldRecentWindowStart), since no
-   * window's size is measured after the cap (see cappedForSend), and the
-   * middle region's text-only entry of a sharded body, which sends its
-   * shards uncut. The strip depth is still
-   * measured over the stored messages, as getImageStripStart measures it.
+   * the cut's extra, which every site that prices what's sent adds, apart
+   * from the recent window's size (getUnheldRecentWindowStart), since no
+   * window's size is measured after the cap (see cappedForSend). The strip
+   * depth is still measured over the stored messages, as getImageStripStart
+   * measures it.
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
     return this.withToolPruning(store, () => this.postStripEstimatesHeld(store, this._toolPruningInUse!.pruning));
@@ -17832,9 +17910,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected holdBoundaryScans = 0;
 
   /**
+   * Where the call a result at `resultAt` answers starts to matter: the
+   * first shard of the body before the result's body that holds a
+   * tool_use or a thinking block (thinking or redacted_thinking), or
+   * that body's start when none does. A sharded call keeps each tool_use
+   * where it sat (chunkIngressMessage), which for a reply that ends in
+   * its calls is its last shard, so the earlier shards of a call with no
+   * thinking can fold while the shards holding the calls stay raw before
+   * their results. A call that thinks first keeps its thinking on its
+   * first shard and counts from there, so it keeps its thinking with it,
+   * as main's floor and hold counted a sharded call, from its body's
+   * start; so does a body stored before then, which holds the call on
+   * its first shard. The body is read as body-runs.ts reads it, so not
+   * over an earlier ingestion of the same text, which shares the group
+   * id.
+   */
+  protected callStart(messages: readonly StoredMessage[], resultAt: number): number {
+    // The call is the body before the result's own body, wherever in it
+    // `resultAt` falls.
+    const resultBody = bodyStart((k) => messages[k], resultAt);
+    if (resultBody === 0) return 0;
+    const to = resultBody - 1;
+    const from = bodyStart((k) => messages[k], to);
+    for (let k = from; k <= to; k++) {
+      if (messages[k]!.content.some((b) => b.type === 'tool_use' || b.type === 'thinking' || b.type === 'redacted_thinking')) return k;
+    }
+    return from;
+  }
+
+  /**
    * Index where the hold region begins: the earliest held message, stepped
-   * back onto the tool_use a held tool_result answers. `store.length()` when
-   * nothing is held — and then without scanning the timeline.
+   * back, when it holds a tool_result, onto the call it answers, from the
+   * call's first shard that holds a tool_use or a thinking block
+   * (callStart). `store.length()` when nothing is held — and then without
+   * scanning the timeline.
    */
   protected holdBoundary(store: MessageStoreView): number {
     const isHeld = store.isCompressionHeld;
@@ -17846,13 +17955,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < messages.length; i++) {
       if (isHeld.call(store, messages[i].id)) {
         let b = i;
-        if (b > 0 && this.hasToolResult(messages[b])) {
-          b--;
-          // Adaptive-resolution ingress puts a sharded message's tool_use on
-          // its FIRST shard: step back to the start of that body (not over an
-          // earlier ingestion of the same text, which shares the group id).
-          b = bodyStart((k) => messages[k], b);
-        }
+        if (b > 0 && this.hasToolResult(messages[b])) b = this.callStart(messages, b);
         return b;
       }
     }
@@ -17904,7 +18007,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Whether a chunk reaches the hold boundary: any of its messages is held,
-   * follows a held message, or is the tool_use a held tool_result answers.
+   * follows a held message, or is a shard of the call a held tool_result
+   * answers, from where holdBoundary starts it.
    * Only reachable for chunks that closed before the hold was placed; the
    * compression request would otherwise carry the provisional content (as
    * the chunk itself or as its lead-in context).
@@ -17924,9 +18028,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (tokens > this.config.recentWindowTokens) {
         let boundary = i + 1;
         // Don't split a tool_use/tool_result pair: if the message at the boundary
-        // is a tool_result, include the preceding tool_use with it (retreat by 1).
+        // is a tool_result, include the call before it, from its first shard
+        // that holds a tool_use or a thinking block (callStart).
         if (boundary > 0 && boundary < messages.length && this.hasToolResult(messages[boundary])) {
-          boundary--;
+          boundary = this.callStart(messages, boundary);
         }
         return boundary;
       }
@@ -18155,7 +18260,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? releaseEditedRawForms(entry.content, filtered)
+            ? this.releasedKeepingHomes(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -18223,10 +18328,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < entries.length; i++) entries[i].index = i;
   }
 
-  /** The message each tool result pairing repair moved was moved from, by
-   *  the block it placed (relocateOrDropMissingResults), where the entry it
-   *  came from has an id. */
-  private readonly _movedFrom = new WeakMap<ContentBlock, MessageId>();
+  /**
+   * `releaseEditedRawForms(before, kept)`, with each kept block's recorded
+   * home carried to the copy that gives up a raw form, so the image strip
+   * still judges its images at the message that holds them.
+   */
+  private releasedKeepingHomes(before: ContentBlock[], kept: ContentBlock[]): ContentBlock[] {
+    const out = releaseEditedRawForms(before, kept);
+    if (out !== kept) {
+      out.forEach((block, i) => {
+        const home = this._blockHome.get(kept[i]!);
+        if (home !== undefined && block !== kept[i]) this._blockHome.set(block, home);
+      });
+    }
+    return out;
+  }
+
+  /** The stored message a block an entry holds came from, where that isn't
+   *  the entry's own source: a tool result pairing repair moved, from the
+   *  entry it came from (relocateOrDropMissingResults), where that entry has
+   *  an id; and a block of a body's shard, joined into one entry with the
+   *  body's other shards (joinShards). The image strip reads it. */
+  private readonly _blockHome = new WeakMap<ContentBlock, MessageId>();
 
   /**
    * For each `missing` tool_use id (a use in the preceding entry with no
@@ -18265,7 +18388,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // <function_results> holding several) is true of neither side once
         // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? releaseEditedRawForms(source, rest)
+          ? this.releasedKeepingHomes(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
@@ -18273,7 +18396,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const moved = releaseSharedRawFormsOnMove(real, source);
         // Where it came from, for the image strip (applyImageStripping's
         // asEstimated).
-        if (src.sourceMessageId !== undefined) this._movedFrom.set(moved, src.sourceMessageId);
+        // A block joined from another of the body's shards keeps that shard.
+        const home = this._blockHome.get(real) ?? src.sourceMessageId;
+        if (home !== undefined) this._blockHome.set(moved, home);
         return moved;
       }
       return this.createToolResultStub(id);
@@ -19036,8 +19161,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * renders: the plan's chunks, the head and tail reservations, the
    * refusal's floor, the emission checks, the recent window's eviction walk
    * and the render stats.
-   * The adaptive middle's shard path sends a body's raw shards' text uncut,
-   * so their chunks' raw prices take no extra.
    * A site that emits the message sends `content`. None of the windows' sizes
    * is measured after the cap. The head window's size and the image strip's
    * depth are measured over the stored messages (getHeadWindowEnd,

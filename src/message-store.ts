@@ -435,15 +435,15 @@ export class MessageStore {
    * adaptive-resolution metadata (bodyGroupId for shards, initial
    * resolution state, etc.) at ingestion time.
    */
-  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'shardCount', 'currentResolution', 'lockedByAgent'] as const;
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'shardCount', 'continuesBlock', 'currentResolution', 'lockedByAgent'] as const;
 
   /**
    * Append a new message to the store.
    *
    * `extra` is an optional bag of adaptive-resolution metadata
-   * (bodyGroupId / shardIndex / shardCount / currentResolution /
-   * lockedByAgent) that callers may set at ingestion. Field semantics match
-   * StoredMessage.
+   * (bodyGroupId / shardIndex / shardCount / continuesBlock /
+   * currentResolution / lockedByAgent) that callers may set at ingestion.
+   * Field semantics match StoredMessage.
    */
   append(
     participant: string,
@@ -454,6 +454,7 @@ export class MessageStore {
       bodyGroupId?: string;
       shardIndex?: number;
       shardCount?: number;
+      continuesBlock?: boolean;
       currentResolution?: number;
       lockedByAgent?: boolean;
     }
@@ -1964,6 +1965,7 @@ export class MessageStore {
     if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
     if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
     if (internal.shardCount !== undefined) stored.shardCount = internal.shardCount;
+    if (internal.continuesBlock !== undefined) stored.continuesBlock = internal.continuesBlock;
     if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
     if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
     return stored;

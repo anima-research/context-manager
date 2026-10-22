@@ -781,9 +781,36 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  for (const [callWords, expected] of [[200, []], [30, ['smaller-recent-window']]] as const) {
-    it(`counts a call split into shards from its first shard, which holds the tool_use, before the newest tool_result (${expected.length ? 'names a smaller window when the whole call and its result fit' : 'names nothing when only its last shard and the result would'})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+  /** Ingress as bodies were stored before each block was kept in place: the
+   *  text joined into one block, cut across the shards, and the other blocks
+   *  on the first shard after its text, with no seam declared. */
+  class LegacyIngress extends AutobiographicalStrategy {
+    override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+      const decision = super.chunkIngressMessage(participant, content);
+      if (!decision) return decision;
+      const others = content.filter((block) => block.type !== 'text');
+      return {
+        bodyGroupId: decision.bodyGroupId,
+        shards: decision.shards.map((shard, k) => ({
+          shardIndex: shard.shardIndex,
+          content: [
+            { type: 'text', text: shard.content.map((block) => (block.type === 'text' ? block.text : '')).join('') } as ContentBlock,
+            ...(k === 0 ? others : []),
+          ],
+        })),
+      };
+    }
+  }
+
+  for (const [legacy, callWords, expected, when] of [
+    [false, 200, ['smaller-recent-window'], 'names a smaller window when that shard and the result fit, however long the call'],
+    [false, 30, ['smaller-recent-window'], 'names a smaller window when the whole call and its result fit'],
+    [true, 200, [], 'a body stored before then holds it on its first shard: names nothing when only its last shard and the result would'],
+    [true, 30, ['smaller-recent-window'], 'a body stored before then holds it on its first shard: names a smaller window when the whole call and its result fit'],
+  ] as const) {
+    it(`counts a call split into shards from the shard holding its tool_use, before the newest tool_result (${when})`, async () => {
+      const Strategy = legacy ? LegacyIngress : AutobiographicalStrategy;
+      const strategy = new Strategy({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,
@@ -800,8 +827,10 @@ describe('OverBudgetError.clearedBy', () => {
         const stored = manager.getAllMessages();
         const shards = stored.slice(before, -1);
         assert.ok(shards.length > 1, `the call is stored as shards (got ${shards.length})`);
-        assert.ok(shards[0]!.content.some((block) => block.type === 'tool_use'), 'its first shard holds the tool_use');
-        assert.ok(!shards.at(-1)!.content.some((block) => block.type === 'tool_use'), 'its last shard holds none');
+        const holding = shards.map((shard) => shard.content.some((block) => block.type === 'tool_use'));
+        assert.deepEqual(holding.indexOf(true), legacy ? 0 : shards.length - 1,
+          legacy ? 'its first shard holds the tool_use' : 'its last shard holds the tool_use, where it sat');
+        assert.equal(holding.filter(Boolean).length, 1, 'no other shard holds one');
         const error = await refusal(manager);
         assert.match(error.message, /^Head\/tail reservation exceeded budget/);
         assert.deepEqual(error.clearedBy, expected);
@@ -809,13 +838,15 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const [resultWords, callWords, expected, when] of [
-    [200, 0, [], 'names nothing when only its last shard would fit'],
-    [30, 0, ['smaller-recent-window'], 'names a smaller window when they fit'],
-    [30, 60, [], 'names nothing when its body alone would fit but not with its call'],
+  for (const [resultWords, callWords, legacy, expected, when] of [
+    [200, 0, false, [], 'names nothing when only its last shard would fit'],
+    [30, 0, false, ['smaller-recent-window'], 'names a smaller window when they fit'],
+    [30, 60, false, ['smaller-recent-window'], "names a smaller window when its body fits with its sharded call's last shard, which holds the tool_use"],
+    [30, 60, true, [], 'a call stored before then holds its tool_use on its first shard: names nothing when its body alone would fit but not with its whole call'],
   ] as const) {
     it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${when})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+      const Strategy = legacy ? LegacyIngress : AutobiographicalStrategy;
+      const strategy = new Strategy({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,

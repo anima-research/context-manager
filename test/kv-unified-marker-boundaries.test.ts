@@ -94,6 +94,12 @@ const CASES: Record<string, Case> = {
     regions: [7, 0, 2],
     marked: [0, 2],
   },
+  'a body first, its raw shards across the middle and the recent window: the body is marked, as one message': {
+    messages: [BODY],
+    config: { headWindowTokens: 0, recentWindowTokens: 20_000 },
+    regions: [0, 1, 7],
+    marked: [0, 2],
+  },
   'everything in the recent window: only the last message is marked': {
     messages: [BODY],
     config: { headWindowTokens: 0, recentWindowTokens: 40_000 },

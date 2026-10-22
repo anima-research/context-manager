@@ -206,6 +206,10 @@ Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is 
 - A stable `bodyGroupId` shared with its sibling shards.
 - A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.
 - The same `participant` as the original message.
+- Its slice of the message's blocks, in order. The chunker cuts the message's text blocks joined into one string; each text block keeps its own boundaries, cut where a seam falls inside it, and every other block (an image, a document, thinking, a tool call or result) goes on the shard holding its place in the text: the shard whose text it comes before, or the last shard at the message's end. So a reply ending in a tool call keeps the call on its last shard, next to its result.
+- On every shard after the first, `continuesBlock`: whether the seam before it fell inside a text block. A render joins the two pieces only there, so joined shards are the message as given (`joinBodyContent`), apart from a cut text block, which comes back as plain text: its other fields, such as cache_control, are the whole block's. A raw replay form a cut block carried, or one whose blocks land on more than one shard, is given up at ingress, so a shard never replays what another shard holds.
+
+A body stored before blocks were kept in place has its text joined into one block, cut across its shards, and every other block on its first shard after its text, with no `continuesBlock`. Where those blocks sat wasn't kept, so it renders as it always did from the windows: its other blocks first, then its text as one block, in every region.
 
 The chunker (`src/adaptive/chunker.ts`) additionally computes a per-shard
 `sourceHash` and `{ startByte, endByte }` range, but those live in the
@@ -218,7 +222,7 @@ the same shard boundaries.
 **Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, blank-line paragraph breaks), token-bucket fallback (default `chunkSize` = 4096 tokens, no overlap), last-resort hard split at the largest UTF-8-safe position when no structural seam exists. Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
 
 **Rendering** (revised — see §3.6.1 for the implemented model):
-- **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message whose body is the byte-faithful concatenation of those shards. The role is the group's role. KV cache preserved across the run.
+- **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message of those shards' blocks, joined by `joinBodyContent`: for a whole body, the message as given. Each shard is sent as any raw message is, cut at `maxMessageTokens`, so a run renders the same in every region, and a run whose shards fall in two regions (the middle and a window) is still one message. The role is the group's role. KV cache preserved across the run.
 - **Folded run** (consecutive shards under the same L_k ancestor) → emitted as a standard Q+A recall pair (one Context Manager question + one summaryParticipant answer carrying the summary text). The same format used for chat summaries elsewhere — consistent agent experience.
 
 A bodyGroup with mixed resolutions therefore renders as multiple alternating entries: raw composite User message → recall pair → raw composite User message → recall pair → … The KV cache breaks at the fold boundaries (where the byte sequence changes anyway), but raw runs between folds stay cache-stable.
@@ -231,7 +235,7 @@ This was a deliberate departure from rev 2 of this doc, which proposed one compo
 ### 3.6.1 BodyGroup rendering algorithm
 
 Within a single bodyGroup, walk shards in source order accumulating "runs":
-- `raw` run = consecutive shards at L0; flushed as one User message with concatenated text.
+- `raw` run = consecutive shards at L0; flushed as one message of their joined blocks.
 - `summary` run = consecutive shards under the same L_k ancestor; flushed as a Q+A pair (deduped: same ancestor never emits twice).
 
 A run breaks (and the previous run flushes) when:

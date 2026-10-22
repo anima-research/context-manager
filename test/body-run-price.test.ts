@@ -5,7 +5,8 @@
  * block, in the adaptive middle through the shard path and in the head and
  * recent windows through their merge, and the strategy counts that block as
  * the parts it joins: in the plan, in the emission and eviction checks, and
- * in the render stats, which the calibration sample reads. The store's own
+ * in the render stats, which the calibration sample reads. (A body with other
+ * blocks sends them where they sat, and they count with their shards.) The store's own
  * estimate of the joined block would put all of it at the rate its first
  * 2,000 characters set, so where the shards' densities differ it comes to
  * another count: over the parts here when the first shard is the denser, and
@@ -143,25 +144,24 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
     }
   });
 
-  it("raw in the adaptive middle, with an image on the first shard: the run is counted as the text it sends", async () => {
-    // Ingress puts a split body's other blocks on its first shard, and the
-    // middle's shard path sends only its shards' text. The plan prices the
-    // image with the shard, so here it plans more than the run sends. With
-    // no depth strip: at the default 30,000 tokens the first shard is the
-    // message that crosses the depth, so the estimate, as the strip, would
-    // price its image as the placeholder.
-    const o = await open([{ type: 'text', text: DENSE + PROSE }, IMAGE], { ...WINDOWS['raw in the adaptive middle'].config, imageStripDepthTokens: 0 });
+  it("raw in the adaptive middle, with an image at the body's end: the run sends it where it sat, and is counted as every part", async () => {
+    // Ingress keeps the image in its place, at the end of the last shard, and
+    // the middle's shard path sends every block of a raw shard, so it sends
+    // what the plan priced. With no depth strip: at the default 30,000 tokens
+    // the last shard is the message that crosses the depth, so the estimate,
+    // as the strip, would price its image as the placeholder.
+    const given: ContentBlock[] = [{ type: 'text', text: DENSE + PROSE }, IMAGE];
+    const o = await open(given, { ...WINDOWS['raw in the adaptive middle'].config, imageStripDepthTokens: 0 });
     try {
       const compiled = await o.manager.compile(BIG);
       const stats = o.manager.getRenderStats()!;
-      assert.ok(compiled.messages.every((m) => m.content.every((block) => block.type === 'text')),
-        'premise: the middle sends no image');
+      WINDOWS['raw in the adaptive middle'].premise(stats);
+      assert.deepEqual(compiled.messages[0]!.content, given, 'the body goes out as given, its image after its text');
       const textParts = o.parts((block) => block.type === 'text');
       assert.ok(o.parts() > textParts, 'premise: the image has a price');
       const { planned, actual } = stats.planVsActual!;
-      assert.equal(planned, o.parts(), `the plan counts the image with its shard: planned ${planned}, every part ${o.parts()}`);
-      assert.deepEqual([actual, stats.total.tokens], [textParts, textParts],
-        `emitted ${actual}, render stats ${stats.total.tokens}, the text parts ${textParts}`);
+      assert.deepEqual([planned, actual, stats.total.tokens], [o.parts(), o.parts(), o.parts()],
+        `planned ${planned}, emitted ${actual}, render stats ${stats.total.tokens}, every part ${o.parts()}`);
     } finally {
       await o.close();
     }
@@ -203,10 +203,10 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
     }
   });
 
-  it("raw in the adaptive middle, with an emitter that counts more than the plan: the run's own check refuses the compile", async () => {
-    // estimateTokens prices what the middle sends and, with no summaries yet,
-    // nothing the plan counts, so doubling it puts the run over a plan that
-    // fits its budget, and only the emission check stands between them.
+  it("raw in the adaptive middle, with an emitter that counts more: the run is counted as the plan priced its shards", async () => {
+    // estimateTokens prices nothing the plan counts, with no summaries yet,
+    // and the middle's run takes each shard's price from the plan, as the
+    // windows do, so doubling it changes neither the run's count nor what fits.
     class DoubleCountingEmitter extends AutobiographicalStrategy {
       protected override estimateTokens(content: ContentBlock[]): number {
         return 2 * super.estimateTokens(content);
@@ -215,7 +215,8 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
     const o = await open([{ type: 'text', text: PROSE + DENSE }], WINDOWS['raw in the adaptive middle'].config, DoubleCountingEmitter);
     try {
       const parts = o.parts();
-      await assert.rejects(o.manager.compile({ maxTokens: parts, reserveForResponse: 0 }), /Emission overran the plan/);
+      assert.equal(await o.attempt(parts), parts, `a budget of ${parts} sends it all, counted as its parts`);
+      WINDOWS['raw in the adaptive middle'].premise(o.manager.getRenderStats()!);
     } finally {
       await o.close();
     }

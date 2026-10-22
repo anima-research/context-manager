@@ -15,7 +15,9 @@ import { bodyEnd } from '../body-runs.js';
 
 /**
  * Join each body's consecutive shards into one composite message whose body
- * is the byte-faithful concatenation of the shards' text content. A body is
+ * is the byte-faithful concatenation of the shards' text content: a render of
+ * the body as text alone. To join a body's blocks, as the strategy's raw
+ * renders send it, use joinBodyContent (body-runs.ts). A body is
  * one ingestion: a later ingestion of the same text carries the same
  * bodyGroupId and is a body of its own (see body-runs.ts). Messages with a
  * null/undefined bodyGroupId pass through unchanged.
@@ -27,8 +29,9 @@ import { bodyEnd } from '../body-runs.js';
  *
  * Properties:
  *  - **Byte-faithful** when all shards in a group are at L0 and getRecallText
- *    is not called: the concatenated body equals the original message body
- *    byte-for-byte. Verified by tests in test/adaptive/render.test.ts.
+ *    is not called: the concatenated text equals the original message's text
+ *    byte-for-byte. Verified by tests in test/adaptive/render.test.ts. Its
+ *    other blocks come back as placeholders (extractTextContent).
  *  - **One API message per body**, regardless of shard count. No turn
  *    markers between shards.
  *  - **Store order**: `messages` is read in store order, where a body's
@@ -84,10 +87,10 @@ export function concatBodyGroups(
 }
 
 /**
- * Extract text content from a message's content blocks. For shards we
- * expect (and require) all content to be text — they were produced by
- * the chunker, which only splits strings. If non-text blocks slip through,
- * they're stringified as best-effort.
+ * The text of a shard's blocks, joined. This helper renders a body as text
+ * alone: a body's other blocks (an image, a document, a tool call or result)
+ * carry no text, so each is written as a placeholder naming its type. The
+ * strategy's own render keeps every block (joinBodyContent).
  */
 function extractTextContent(blocks: ContentBlock[]): string {
   const out: string[] = [];
@@ -95,8 +98,6 @@ function extractTextContent(blocks: ContentBlock[]): string {
     if (b.type === 'text') {
       out.push(b.text);
     } else {
-      // Non-text content in a sharded body shouldn't happen, but if it
-      // does, we serialize as a placeholder rather than crashing.
       out.push(`[non-text content: ${b.type}]`);
     }
   }

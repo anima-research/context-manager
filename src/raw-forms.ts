@@ -300,3 +300,55 @@ export function releaseSharedRawFormsOnMove(
   if (item && pairingsOf(source).some((pairing) => pairing.includes(item))) shared.add(item);
   return shared.size === 0 ? moved : withoutRawForms(moved, shared);
 }
+
+/**
+ * Reconcile a message's content after it was split into parts that render
+ * apart, such as the shards ingress stores for a long message. `before` is
+ * the message's content; `parts` hold its blocks, each unchanged block by
+ * identity, and a block cut into pieces as new blocks. A raw form is true of
+ * a part only when every block that shares it is in that part, unchanged: a
+ * part replayed alone would otherwise carry blocks another part holds. So a
+ * raw form that a cut block carried, or whose carriers land in more than one
+ * part, is given up by every block that carries it, with the reasoning
+ * pairing it belongs to. An opaque carrier keeps its raw item, which is its
+ * whole content.
+ *
+ * Returns `parts` itself when nothing has to change, and otherwise new
+ * arrays for the parts that change.
+ */
+export function releaseRawFormsAcrossParts(
+  before: readonly ContentBlock[],
+  parts: ContentBlock[][],
+): ContentBlock[][] {
+  const partOf = new Map<ContentBlock, number>();
+  parts.forEach((part, k) => { for (const block of part) partOf.set(block, k); });
+  const released = new Set<string>();
+  const landed = new Map<string, Set<number>>();
+  for (const block of before) {
+    const k = partOf.get(block);
+    for (const key of rawFormKeys(block)) {
+      if (k === undefined) {
+        released.add(key);
+        continue;
+      }
+      let where = landed.get(key);
+      if (!where) landed.set(key, (where = new Set()));
+      where.add(k);
+    }
+  }
+  for (const [key, where] of landed) if (where.size > 1) released.add(key);
+  if (released.size === 0) return parts;
+  releasePairings(before, released);
+  let changed = false;
+  const result = parts.map((part) => {
+    let partChanged = false;
+    const next = part.map((block) => {
+      const out = withoutRawForms(block, released);
+      if (out !== block) partChanged = true;
+      return out;
+    });
+    if (partChanged) changed = true;
+    return partChanged ? next : part;
+  });
+  return changed ? result : parts;
+}
