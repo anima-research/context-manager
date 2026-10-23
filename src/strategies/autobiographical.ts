@@ -15794,62 +15794,59 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Phase 0: Head window — every message sent raw, each cut at the cap as
     // any raw message is (from headStart, not necessarily 0). While a reset
-    // head fills it is sent last instead, where the tail goes (sentWindows),
-    // by this same walk, so it is still sent whole or refused as the head is.
+    // head fills, it is sent last, where the tail goes (sentWindows), but it
+    // is priced, refused and tallied here as the head is, ahead of the
+    // middle's budget, so the middle is selected as with the head first. Its
+    // entries wait for the tail.
     const { headStart, headEnd, recentStart, filling } = this.sentWindows(store);
-    const emitHead = (from: number, to: number, clearedBy: () => OverBudgetClearedBy[]): void => {
-      const before = totalTokens;
-      for (let i = from; i < to && i < messages.length; i++) {
-        const msg = messages[i];
-        const { content, extra } = this.cappedForSend(store, msg, msgCap);
-        // The pruned form's price with its images whole: this selection's
-        // strip counts only the images it sends (#219), or, with
-        // imageStripHysteresisRatio, applies that option's set, and it prices
-        // no image as the placeholder either way.
-        const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
-        // The head is sent whole by definition: stopping it mid-window drops
-        // messages no summary covers. Refuse honestly beyond grace.
-        if (totalTokens + tokens > graceLimit) {
-          throw this.overBudgetError(budget, {
-            stage: 'Hierarchical emission overran the budget',
-            budget: graceLimit,
-            actual: totalTokens + tokens,
-            // The head is sent whole by definition, and its size is cold
-            // configuration (headWindowTokens isn't a hot setting). Besides a
-            // larger budget, a head-window reset clears it, which starts a new
-            // topic and isn't a lever the list names (OverBudgetClearedBy).
-            // Newer messages can shrink a head that holds images, since the
-            // image strip takes the oldest images first (maxLiveImages,
-            // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
-            // strip enough isn't known, so nothing is named for that either.
-            // A filling head sent last refuses here too, after the middle,
-            // which it reports as such: compression that would fold some of
-            // that middle clears it then, and the levers say so.
-            clearedBy: clearedBy(),
-            diagnostics: {
-              middleCountUnit: 'selection-items',
-              deepestLevelKind: 'attempted',
-              headTokens: totalTokens + tokens - before,
-              tailTokens: 0,
-              middleTokens: before,
-              middleChunkCount: 0,
-              deepestLevel: 0,
-            },
-          });
-        }
-
-        entries.push({
-          index: entries.length,
-          sourceMessageId: msg.id,
-          sourceRelation: 'copy',
-          participant: msg.participant,
-          content,
+    const headWalkEnd = filling ? messages.length : headEnd;
+    const fillingHead: ContextEntry[] = [];
+    for (let i = headStart; i < headWalkEnd && i < messages.length; i++) {
+      const msg = messages[i];
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      // The pruned form's price with its images whole: this selection's
+      // strip counts only the images it sends (#219), or, with
+      // imageStripHysteresisRatio, applies that option's set, and it prices
+      // no image as the placeholder either way.
+      const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
+      // The head is sent whole by definition: stopping it mid-window drops
+      // messages no summary covers. Refuse honestly beyond grace.
+      if (totalTokens + tokens > graceLimit) {
+        throw this.overBudgetError(budget, {
+          stage: 'Hierarchical emission overran the budget',
+          budget: graceLimit,
+          actual: totalTokens + tokens,
+          // The head is sent whole by definition, and its size is cold
+          // configuration (headWindowTokens isn't a hot setting). Besides a
+          // larger budget, a head-window reset clears it, which starts a new
+          // topic and isn't a lever the list names (OverBudgetClearedBy).
+          // Newer messages can shrink a head that holds images, since the
+          // image strip takes the oldest images first (maxLiveImages,
+          // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
+          // strip enough isn't known, so nothing is named for that either.
+          clearedBy: [],
+          diagnostics: {
+            middleCountUnit: 'selection-items',
+            deepestLevelKind: 'attempted',
+            headTokens: totalTokens + tokens,
+            tailTokens: 0,
+            middleTokens: 0,
+            middleChunkCount: 0,
+            deepestLevel: 0,
+          },
         });
-        totalTokens += tokens;
-        this.rsRaw('head', tokens);
       }
-    };
-    emitHead(headStart, headEnd, () => []);
+
+      (filling ? fillingHead : entries).push({
+        index: entries.length,
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content,
+      });
+      totalTokens += tokens;
+      this.rsRaw('head', tokens);
+    }
     // Mark the last head entry as a cache boundary (even if budget truncated the window)
     if (entries.length > 0) {
       entries[entries.length - 1].cacheMarker = true;
@@ -15866,15 +15863,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // raw messages from after a combined pair into it, and the head never
     // folds.
     let summariesById: Map<string, SummaryEntry> | undefined;
-    // Compression clears a refusal when queued work would fold one of these
-    // messages, raw or under one of these summaries, as compressionWorkQueued
-    // counts it.
-    const middleCompression = (summaries: readonly SummaryEntry[], raw: readonly StoredMessage[]): OverBudgetClearedBy[] => {
-      summariesById ??= new Map(this.summaries.map((s) => [s.id, s]));
-      const prefix = new Set<MessageId>(raw.map((m) => m.id));
-      for (const s of summaries) this.expandSummaryToLeafMessageIds(s, summariesById, prefix);
-      return this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [];
-    };
     const middleRefusal = (refused: {
       actual: number;
       unit: 'selection-items' | 'raw-messages';
@@ -15883,11 +15871,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       summaries: readonly SummaryEntry[];
       raw: readonly StoredMessage[];
     }): OverBudgetError => {
+      summariesById ??= new Map(this.summaries.map((s) => [s.id, s]));
+      const prefix = new Set<MessageId>(refused.raw.map((m) => m.id));
+      for (const s of refused.summaries) this.expandSummaryToLeafMessageIds(s, summariesById, prefix);
       return this.overBudgetError(budget, {
         stage: 'Hierarchical emission overran the budget',
         budget: graceLimit,
         actual: refused.actual,
-        clearedBy: middleCompression(refused.summaries, refused.raw),
+        clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [],
         diagnostics: {
           middleCountUnit: refused.unit,
           deepestLevelKind: 'attempted',
@@ -16363,9 +16354,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Tail eviction is loss (no summary covers the recent window) — give it
     // the grace window before it records drops and the invariant refuses.
     if (filling) {
-      // A filling reset head goes here, last: the head window's whole walk.
-      // The whole middle came before it, so folding any of it makes room.
-      emitHead(headStart, messages.length, () => middleCompression(selectedSummaries, middleRaw.map((entry) => entry.msg)));
+      // The filling head, priced in Phase 0, goes here, last. The history
+      // before it is then the stable prefix, so its end is the cache
+      // boundary, as the head's end is once the head goes first.
+      if (entries.length > 0) entries[entries.length - 1].cacheMarker = true;
+      for (const entry of fillingHead) entries.push({ ...entry, index: entries.length });
     } else {
       const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, graceLimit, totalTokens);
       this.rsRaw('tail', tailStats.tokens, tailStats.messages);
@@ -18160,8 +18153,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (sentWindows), so a body the head ended inside would be sent in two
    * parts with that history between them. The ratchet guard
    * (anchorHeadToCoverage) then reads the boundary as it does without a
-   * reset. At headStart 0 nothing comes between the head and its
-   * continuation, so the head still ends where its tokens run out there.
+   * reset, and can extend it to where chunk coverage resumes; that is a
+   * body's start unless an earlier version ended a head inside a body whose
+   * rest it then chunked. At headStart 0 nothing comes between the head and
+   * its continuation, so the head still ends where its tokens run out there.
    */
   private resetHeadWindowEnd(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
     const at = (k: number): StoredMessage | undefined => messages[k];
@@ -18173,11 +18168,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (let k = from; k < to; k++) tokens += store.estimateTokens(messages[k]);
       if (tokens > this.config.headWindowTokens) {
         let boundary = from;
-        const previous = bodyStart(at, boundary - 1);
+        // A start inside a body (a strategy reset to a later shard) is
+        // where its body's walk back stops.
+        const previous = Math.max(startIdx, bodyStart(at, boundary - 1));
         for (let k = previous; k < boundary; k++) {
           if (this.hasToolUse(messages[k])) { boundary = previous; break; }
         }
-        return this.anchorHeadToCoverage(store, messages, boundary, tokens);
+        // The guard counts from the boundary's own message on, as without a
+        // reset: what it's given runs through that message.
+        let through = 0;
+        for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
+        return this.anchorHeadToCoverage(store, messages, boundary, through);
       }
       from = to;
     }
@@ -18191,10 +18192,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * and the head window reaching the store's end), the compile sends store
    * order instead: the history before the head, then the head window last,
    * as the tail. So the newest message is the last one sent, and the history
-   * keeps its place at the front of the request, and its cached prefix,
-   * through the fill. This returns an empty head at headStart then, and a
+   * keeps its place at the front of the request through the fill, where its
+   * prefix can stay cached. This returns an empty head at headStart then, and a
    * recent window that starts no later. Once a body no longer fits the head
-   * window, the head goes first again. Only the order moves: the head
+   * window, the head goes first again. Each compile decides it from the head
+   * window's end as it prices it then. Only the order moves: the head
    * window's messages stay out of compression either way
    * (getCompressibleMessages reads the head window itself).
    */
@@ -19361,9 +19363,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Those messages are the recent window's, and the head window's too when
    * no message comes between the two: a compile places the middle's
    * messages, and the history before a head window that was reset, after
-   * the head. The hierarchical select can also place summaries there, which
-   * are text and change no image decision. A message before them comes back
-   * as null.
+   * the head. A reset head that is still filling is sent last itself, after
+   * that history, so its messages are among them (sentWindows). The
+   * hierarchical select can also place summaries there, which are text and
+   * change no image decision. A message before them comes back as null.
    *
    * It takes a compile's steps before its windows as a dry select takes
    * them: it rebuilds the chunks, then, under adaptive resolution, loads the

@@ -901,13 +901,15 @@ describe('the head window', () => {
     }
   });
 
-  it('a reset whose head still fills keeps the accepted markers past the old head', async () => {
-    const { dir, strategy, manager } = await open({ headWindowTokens: 1_700, recentWindowTokens: 300 });
+  it("a reset whose head still fills keeps the accepted markers past the old head in the cache check, and the solve credits the fill's own from the next compile", async () => {
+    // The head holds the first two messages, so the accepted layout opens with its unit.
+    const { dir, strategy, manager } = await open({ headWindowTokens: 4_500, recentWindowTokens: 300 });
     try {
       add(manager, [...MIDDLE, ['u', [text(plain(4))]], ['a', [text(plain(5))]], ...CLOSE]);
       const one = await compile(manager);
       accept(strategy, one);
       const ref = reference(strategy)!;
+      assert.equal(ref.layout.units[0]?.kind, 'head', 'premise: the accepted layout opens with the head');
       await manager.resetHeadWindow('a new topic');
       add(manager, SMALL);
       const two = await compile(manager);
@@ -916,7 +918,18 @@ describe('the head window', () => {
       // there now; every marker after it is still on the wire's prefix.
       const past = ref.markers.filter((m) => ref.layout.units[m.unitIndex - 1]?.kind !== 'head').length;
       assert.ok(past > 0, 'premise: the accepted request had markers past its head');
-      assert.equal(solveMarkers(strategy), past, 'each marker past the old head is credited');
+      assert.equal(solveMarkers(strategy), past, 'each marker past the old head reaches the solve');
+      // The accepted layout opens with the old head's unit, which this
+      // compile sends as history, so the solve's walk from the front credits
+      // none of them here, as on a reset before this change.
+      const atReset = solved(strategy)!;
+      assert.ok(atReset.selected && atReset.cacheRelevant && atReset.selected.cacheChurn > 0, 'the reset compile is priced uncached');
+      accept(strategy, two);
+      add(manager, [['a', [text('ok3')]], ['u', [text('next3')]]]);
+      await compile(manager);
+      const next = solved(strategy)!;
+      assert.ok(next.selected && next.cacheRelevant && next.selected.cacheChurn < atReset.selected.cacheChurn / 10,
+        `the next fill compile is credited the history: churn ${next.selected?.cacheChurn} after ${atReset.selected.cacheChurn}`);
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
