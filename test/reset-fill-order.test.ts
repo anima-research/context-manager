@@ -130,15 +130,18 @@ describe('what a compile sends after a head-window reset', () => {
           assert.ok(textOf(out[H.length + 1]!).endsWith('word3999'), 'the long message is sent whole, in one entry');
         }));
 
-      it('keeps store order and sends a held message raw when a hold sits inside a filling head', () =>
+      it('keeps store order with a compression hold inside a filling head', () =>
         withStore(make, async (m) => {
           await history(m);
           await m.resetHeadWindow('A new topic.');
           const held = m.addMessage('user', words('after1', 5));
           m.addMessage('assistant', words('after2', 5));
           m.holdCompression([held], { timeoutMs: 60_000 });
-          assert.deepStrictEqual(await sent(m), [...H, 'TT', 'after1', 'after2']);
-          m.releaseCompression([held]);
+          try {
+            assert.deepStrictEqual(await sent(m), [...H, 'TT', 'after1', 'after2']);
+          } finally {
+            m.releaseCompression([held]);
+          }
         }));
 
       it('keeps a tool call with its result when the result does not fit the head', () =>
@@ -201,6 +204,20 @@ describe('what a compile sends after a head-window reset', () => {
       assert.ok(error instanceof OverBudgetError, `refused as over budget, not as a dropped message: ${String(error)}`);
       assert.deepStrictEqual(error.clearedBy, [], 'no compression is queued');
       assert.strictEqual(error.diagnostics.headTokens, stats.head.tokens, 'the refusal counts the filling head as the head');
+    }));
+
+  it('refuses a filling head the budget alone can\'t hold as a head refusal, before the history, under the hierarchical select', () =>
+    withStore(SELECTS.hierarchical!, async (m) => {
+      await history(m);
+      await m.resetHeadWindow('A new topic.');
+      for (let i = 0; i < 3; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`new${i}`, 400));
+      await m.compile(BUDGET);
+      const head = m.getRenderStats()!.head.tokens;
+      const error = await m.compile({ maxTokens: Math.floor(head / 2), reserveForResponse: 0 }).then(() => null, (e: unknown) => e);
+      assert.ok(error instanceof OverBudgetError, `refused: ${String(error)}`);
+      assert.deepStrictEqual(error.clearedBy, [], 'only a larger budget clears a head');
+      assert.ok(error.diagnostics.headTokens > 0 && error.diagnostics.middleTokens === 0 && error.diagnostics.headTokens <= head,
+        `the head's walk refused before the history: head=${error.diagnostics.headTokens} middle=${error.diagnostics.middleTokens}`);
     }));
 
   it('names compression when folding the history would make room beside a filling head', () =>

@@ -16367,7 +16367,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
-    // Strip stale images (this path places no cache markers). Its emission
+    // Strip stale images (this path's one cache marker, set above on the
+    // head's last entry or, while a reset head fills, the history's, stays on
+    // that entry whatever the strip changes). Its emission
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
     // full price. So it priced no image as the placeholder, and the strip
@@ -18153,9 +18155,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (sentWindows), so a body the head ended inside would be sent in two
    * parts with that history between them. The ratchet guard
    * (anchorHeadToCoverage) then reads the boundary as it does without a
-   * reset, and can extend it to where chunk coverage resumes; that is a
-   * body's start unless an earlier version ended a head inside a body whose
-   * rest it then chunked. At headStart 0 nothing comes between the head and
+   * reset, and can extend it to the first message chunk coverage owns after
+   * it, which isn't always a body's start (a chunk can begin after a pinned
+   * or already owned shard). At headStart 0 nothing comes between the head and
    * its continuation, so the head still ends where its tokens run out there.
    */
   private resetHeadWindowEnd(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
@@ -18174,8 +18176,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (let k = previous; k < boundary; k++) {
           if (this.hasToolUse(messages[k])) { boundary = previous; break; }
         }
-        // The guard counts from the boundary's own message on, as without a
-        // reset: what it's given runs through that message.
+        // The guard counts on from the boundary's own message, so what it's
+        // given runs through that message. (Without a reset it's given one
+        // message more when the walk back for a tool call moves the boundary.)
         let through = 0;
         for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
         return this.anchorHeadToCoverage(store, messages, boundary, through);

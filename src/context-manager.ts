@@ -1781,9 +1781,9 @@ export class ContextManager {
    * Reset the head window to start from a new position.
    * Old head window messages become compressible.
    *
-   * With a head window (`headWindowTokens` above 0), the new head starts at
-   * the transition message, whole whatever its size, and then holds whole
-   * messages while they fit. While every message since the transition fits,
+   * With a head window (`headWindowTokens` above 0) and history before the
+   * reset, the new head starts at the transition message, whole whatever its
+   * size, and then holds whole messages while they fit. While every message since the transition fits,
    * as each compile prices them, that compile sends what happened in order:
    * the history before the reset, then the transition and each message
    * since, so the newest is the last one sent. Once one doesn't, it sends

@@ -926,7 +926,8 @@ describe('the head window', () => {
       assert.ok(atReset.selected && atReset.cacheRelevant && atReset.selected.cacheChurn > 0, 'the reset compile is priced uncached');
       accept(strategy, two);
       add(manager, [['a', [text('ok3')]], ['u', [text('next3')]]]);
-      await compile(manager);
+      const three = await compile(manager);
+      assert.equal(firstChange(two, three), two.length, 'premise: the next fill compile sends the last one as it was, and adds to it');
       const next = solved(strategy)!;
       assert.ok(next.selected && next.cacheRelevant && next.selected.cacheChurn < atReset.selected.cacheChurn / 10,
         `the next fill compile is credited the history: churn ${next.selected?.cacheChurn} after ${atReset.selected.cacheChurn}`);
