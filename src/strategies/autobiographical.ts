@@ -18156,13 +18156,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * parts with that history between them. The ratchet guard
    * (anchorHeadToCoverage) then reads the boundary as it does without a
    * reset, and can extend it to the first message chunk coverage owns after
-   * it. That is a body's start unless the body's first messages are kept out
-   * of chunks: by a raw pin, where the head stops at the body's start, since
-   * no chunk can take those; or unpinned, kept out while the body's rest
-   * was chunked by an earlier version's head that ended inside the body or
-   * by a pin since removed, where the extension stands, so those messages
-   * aren't chunked out of order (#122), and the body stays in two parts
-   * until the next reset. At headStart 0 nothing comes between the
+   * it. The extension leaves out the run of whole bodies at its end that pins
+   * keep raw, since no chunk can take a pinned-raw message: so a body whose
+   * never-chunked first messages pins keep raw isn't split, and a pinned tool
+   * call isn't kept in the head away from its result. It never ends right
+   * after a body holding a tool call, which would keep the call from its
+   * result; there the extension stands. Messages kept out of chunks without a
+   * pin (an earlier version's head that ended inside a body whose rest it
+   * chunked, or a pin since removed) stay in the extension, so they aren't
+   * chunked out of order (#122), and such a body stays in two parts while the
+   * head's end is inside it. At headStart 0 nothing comes between the
    * head and its continuation, so the head still ends where its tokens run
    * out there.
    */
@@ -18188,19 +18191,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         let through = 0;
         for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
         const end = this.anchorHeadToCoverage(store, messages, boundary, through);
-        // An extension that ends inside a body splits it around the history.
-        // When every message it adds of that body is kept raw by a pin, no
-        // chunk can take those (getCompressibleMessages), so leaving them out
-        // of the head mints no out-of-order L1 (#122), and the head stops at
-        // the body's start. An unpinned run there (left by an earlier
-        // version's head or a pin since removed) keeps the extension.
-        const split = bodyStart(at, end);
-        if (split >= boundary && split < end) {
-          const raw = this.forceRawPinPositions(messages);
-          for (let k = split; k < end; k++) if (!raw.has(k)) return end;
-          return split;
+        if (end === boundary) return end;
+        // The extension keeps never-chunked messages in the head so they
+        // aren't chunked after the coverage that follows them (#122). A pin
+        // that keeps a message raw keeps it out of every chunk
+        // (getCompressibleMessages), so the run of whole bodies at the
+        // extension's end that pins keep raw is left out of it: otherwise it
+        // could end the head inside a body, sending the body in two parts
+        // with the history between, or keep a pinned tool call in the head
+        // while its result follows the history. The head doesn't end right
+        // after a body holding a tool call, as the walk back above keeps it
+        // from doing. Messages kept out of chunks without a pin (left by an
+        // earlier version's head, or by a pin since removed) stay in it.
+        const raw = this.forceRawPinPositions(messages);
+        let kept = end;
+        for (let k = end - 1; k >= boundary && raw.has(k); k--) {
+          if (bodyStart(at, k) !== k) continue;
+          let afterCall = false;
+          if (k > boundary) {
+            for (let j = bodyStart(at, k - 1); j < k; j++) if (this.hasToolUse(messages[j])) { afterCall = true; break; }
+          }
+          if (!afterCall) kept = k;
         }
-        return end;
+        return kept;
       }
       from = to;
     }

@@ -920,10 +920,12 @@ describe('the head window', () => {
       assert.ok(past > 0, 'premise: the accepted request had markers past its head');
       assert.equal(solveMarkers(strategy), past, 'each marker past the old head reaches the solve');
       // The accepted layout opens with the old head's unit, which this
-      // compile sends as history, so the solve's walk from the front credits
-      // none of them here, as on a reset before this change.
+      // compile sends as history, so by reading the solve's walk from the
+      // front (kv-unified-terminal's emit) credits none of them here, as on a
+      // reset before this change. The test checks that this compile pays
+      // churn and the next fill compile a tenth of it or less.
       const atReset = solved(strategy)!;
-      assert.ok(atReset.selected && atReset.cacheRelevant && atReset.selected.cacheChurn > 0, 'the reset compile is priced uncached');
+      assert.ok(atReset.selected && atReset.cacheRelevant && atReset.selected.cacheChurn > 0, 'the reset compile pays cache churn');
       accept(strategy, two);
       add(manager, [['a', [text('ok3')]], ['u', [text('next3')]]]);
       const three = await compile(manager);
