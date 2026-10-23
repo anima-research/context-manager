@@ -666,6 +666,19 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/**
+ * What a request carried besides the compiled window, as the caller sent it
+ * (see `AutobiographicalStrategy.reportRealInputTokens`). The provider counts
+ * it in the input total and the compile estimate doesn't, so a calibration
+ * sample that leaves it out learns it as a per-token rate.
+ */
+export interface RequestOverhead {
+  /** The system prompt the request sent. */
+  system?: string;
+  /** The tool definitions the request sent. */
+  tools?: ReadonlyArray<ToolDefinition>;
+}
+
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
 export interface CalibrationReset {
   /** The multiplier that was discarded. */

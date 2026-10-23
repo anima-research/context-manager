@@ -29,6 +29,7 @@ import type {
   TimeRangeSummaryEntry,
   RenderStats,
   CalibrationReset,
+  RequestOverhead,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -1854,6 +1855,12 @@ function imageGroup(block: ContentBlock): unknown {
   return block.type === 'tool_result' ? block.toolUseId : TOP_LEVEL_IMAGES;
 }
 
+/** Out-of-band calibration samples in a row it takes to learn from them, and
+ *  how close each one's implied multiplier must be to the one before it to
+ *  continue the run (see reportRealInputTokens). */
+const OUT_OF_BAND_RUN_LENGTH = 3;
+const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
+
 /**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
@@ -2883,6 +2890,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationLoaded = false;
     this._calibrationReset = null;
     this._calibrationProvisional = null;
+    this._outOfBandRun = null;
     this._imageStripReplayMemo = null;
     this._lastKvStable = null;
     this._storeOrder = new Map();
@@ -14194,16 +14202,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
    * for a request built from the latest compile (fresh + cache_read +
-   * cache_creation, minus non-window overhead the caller knows about, e.g.
-   * tool schemas). Maintains an EMA of real/estimated and applies it as the
-   * store's global multiplier, persisted across restarts. The per-class rates
-   * carry the shape; this carries the residual level.
+   * cache_creation, as the provider reports it), and what the request sent
+   * besides the window: its system prompt and tool definitions (#323). Those
+   * are priced as the store prices the window and added to the estimate, so
+   * the sample compares the whole request with the whole request; left out,
+   * the multiplier learns them as a per-token rate, which no value of it can
+   * be (see RequestOverhead). Maintains an EMA of real/estimated and applies
+   * it as the store's global multiplier, persisted across restarts. The
+   * per-class rates carry the shape; this carries the residual level.
    */
-  reportRealInputTokens(realTotal: number): void {
+  reportRealInputTokens(realTotal: number, overhead?: RequestOverhead): void {
     this.requireLoadedBranch('reportRealInputTokens');
     if (!Number.isFinite(realTotal) || realTotal <= 0) return;
-    const est = this._lastCompileEstimate;
-    if (!est || est <= 0) return;
+    const window = this._lastCompileEstimate;
+    if (!window || window <= 0) return;
 
     // ARM-ONCE-PER-COMPILE (2026-07-12 regression fix). A turn makes MANY API
     // calls — tool-use rounds and max_tokens continuations each append to the
@@ -14216,6 +14228,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this._calibrationArmed) return;
     this._calibrationArmed = false;
 
+    // The overhead in the window's units (current calibrated), so the implied
+    // multiplier below is real / raw(window + overhead) and doesn't depend on
+    // the multiplier it's measured at: one sample states it.
+    const overheadTokens = overhead ? this.priceRequestOverhead(overhead) : 0;
+    const est = window + overheadTokens;
+    const counts = `(est=${Math.round(est / 1000)}k` +
+      `${overheadTokens > 0 ? ` incl. ${Math.round(overheadTokens / 1000)}k system+tools` : ''}` +
+      ` real=${Math.round(realTotal / 1000)}k)`;
     const ratio = realTotal / est;
     const current = this._calibration;
     const observed = ratio * current; // back out the multiplier already applied
@@ -14231,23 +14251,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // construction and must be learned from.
     const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
     const observedInBand = observed >= 0.6 && observed <= 1.8;
+    // CONSISTENT RUN (#323). At 1.00 the ratio and the implied multiplier are
+    // the same number, so a store whose true ratio is past the band (every
+    // epoch discard restarts there) rejects every sample and never learns.
+    // A single wild sample is still noise, but a run of them that agree with
+    // each other is a ruler that's off, not a request we didn't compile: the
+    // third in a row is learned, outright, which lands it on the clamp edge.
+    // Only for samples whose caller declared what it sent besides the window:
+    // undeclared, a consistent ratio past the band is what tool schemas and a
+    // system prompt look like, and learning it would fold the window to the
+    // clamp without making the request any closer to the budget.
+    let fromRun = false;
     if (!ratioInBand && !observedInBand) {
-      this.diag.error(
-        `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
-          `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
-          `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}`,
-      );
-      return;
+      const run = this._outOfBandRun;
+      this._outOfBandRun = !overhead ? null
+        : run && Math.abs(observed / run.observed - 1) <= OUT_OF_BAND_RUN_AGREEMENT
+          ? { observed, count: run.count + 1 }
+          : { observed, count: 1 };
+      const count = this._outOfBandRun?.count ?? 0;
+      if (count < OUT_OF_BAND_RUN_LENGTH) {
+        this.diag.error(
+          `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ${counts} — ` +
+            `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}` +
+            (overhead
+              ? ` (${count} of ${OUT_OF_BAND_RUN_LENGTH} consistent samples to learn from)`
+              : `; if every sample reads about the same, the caller may be leaving out the system prompt ` +
+                `and tools it sends (reportRealInputTokens' second argument)`),
+        );
+        return;
+      }
+      this._outOfBandRun = null;
+      fromRun = true;
+    } else {
+      this._outOfBandRun = null;
     }
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const ema = this._calibrationEma ?? current;
     // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
     // sample is the first evidence under this release's pricing, so it replaces
-    // the guess outright; the EMA steps from here on.
+    // the guess outright; the EMA steps from here on. A consistent run replaces
+    // it outright too: an EMA step from 1.00 toward a ratio past the band
+    // would leave the next sample just as far out of band.
     const provisional = this._calibrationProvisional;
     this._calibrationProvisional = null;
-    const next = provisional ? observed : ema + alpha * (observed - ema);
+    const next = provisional || fromRun ? observed : ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
     this._calibrationEma = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
@@ -14264,7 +14312,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (provisional) {
         this.diag.error(
           `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
-            `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
+            `${current.toFixed(2)} ${counts}; stamped`,
         );
         this.persistCalibration();
       }
@@ -14272,12 +14320,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     this.diag.error(
       `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
-        `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}` +
+        `${fromRun ? ` (${OUT_OF_BAND_RUN_LENGTH} consistent out-of-band samples: learned at the clamp)` : provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
+        counts,
     );
     this._calibration = clamped;
     this.applyCalibration();
     this.persistCalibration();
+  }
+
+  /** The store's price of what a request sent besides the window: its system
+   *  prompt and its tool definitions as sent, priced as a compression request
+   *  prices its own (priceRequest in the compression path), at the current
+   *  multiplier, so it adds to the window estimate in the same units. */
+  private priceRequestOverhead(overhead: RequestOverhead): number {
+    const store = this._storeView;
+    if (!store) return 0;
+    const content: ContentBlock[] = [];
+    if (overhead.system) content.push({ type: 'text', text: overhead.system });
+    if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
+    return content.length > 0 ? store.estimateTokens({ content } as unknown as StoredMessage) : 0;
   }
 
   /** Write the multiplier in force under the current pricing stamp, with the
@@ -14434,6 +14496,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _calibration = 1;
   /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
   private _calibrationEma: number | null = null;
+  /** The out-of-band samples rejected in a row that agree with each other,
+   *  and the last one's implied multiplier (see reportRealInputTokens). In
+   *  memory only: a restart counts afresh. */
+  private _outOfBandRun: { observed: number; count: number } | null = null;
   private _calibrationLoaded = false;
   /** Set when an older-epoch multiplier was discarded; persisted with the record. */
   private _calibrationReset: CalibrationReset | null = null;

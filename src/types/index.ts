@@ -80,6 +80,7 @@ export type {
   SummaryOverviewStrategy,
   RenderStats,
   CalibrationReset,
+  RequestOverhead,
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
 } from './strategy.js';
