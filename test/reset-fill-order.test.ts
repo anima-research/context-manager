@@ -710,3 +710,36 @@ describe('what a compile sends after a head-window reset', () => {
     });
   }
 });
+
+describe('a past reset head, as compression requests read it (headAsOf)', () => {
+  it('ends by whole bodies, as the live reset head does: a long first message after an earlier transition is left out whole', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reset-fill-past-head-'));
+    const strategy = new AutobiographicalStrategy({ ...base, hierarchical: false, adaptiveResolution: true, targetChunkTokens: 1500 } as never);
+    let n = 0;
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `[S${++n}] ` + 'recalled '.repeat(30) }],
+      usage: { input_tokens: 100, output_tokens: 40 } }) };
+    const m = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: membrane as never });
+    try {
+      await history(m);
+      await m.resetHeadWindow('Topic A.');
+      const long = m.addMessage('user', words('Along', 6000));
+      for (let i = 0; i < 20; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`a${i}`, 200));
+      await m.resetHeadWindow('Topic B.');
+      for (let i = 0; i < 40; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`b${i}`, 200));
+      for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+      const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
+      const all = (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
+      const first = all.findIndex((x) => x.id === long);
+      const shards = all.filter((x) => x.bodyGroupId !== undefined && x.bodyGroupId === all[first]!.bodyGroupId).length;
+      assert.ok(shards > 2, 'premise: the long message is stored as shards, more than the head window holds');
+      const s = strategy as unknown as { headAsOf(v: never, pos: number): { start: number; end: number }; getHeadWindowStartIndex(v: never): number };
+      const pos = first + shards + 5;
+      assert.ok(pos < s.getHeadWindowStartIndex(view), "premise: the position is in topic A's history, before the live head");
+      assert.deepStrictEqual(s.headAsOf(view, pos), { start: first - 1, end: first },
+        "topic A's head is its transition alone: the long message after it doesn't fit, so it's left out whole");
+    } finally {
+      await m.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
