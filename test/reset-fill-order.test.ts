@@ -10,6 +10,9 @@
  * - After a reset the head holds whole bodies: the transition's body always,
  *   then whole bodies while they fit. A body that doesn't fit is sent whole
  *   after the history, and a tool call stays with its result.
+ * - The ratchet guard's extension leaves out pinned bodies at its end, and
+ *   keeps a body's never-chunked first part that no pin holds, so that part
+ *   isn't chunked out of order.
  * - Without a reset (headStart 0) the head still ends where its tokens run out.
  */
 import { describe, it } from 'node:test';
@@ -414,6 +417,55 @@ describe('what a compile sends after a head-window reset', () => {
             "premise: B's first two shards stay out of chunks, and coverage starts at its third");
           assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first + 2,
             "the head keeps both shards: leaving out the pinned second would end it inside B all the same, and the unpinned first needs the head");
+        }));
+
+      it('leaves two pinned bodies out of the head together', () =>
+        open(async (m, strategy) => {
+          await history(m);
+          await m.resetHeadWindow('A new topic.');
+          m.addMessage('user', words('after1', 20));
+          const d = m.addMessage('assistant', words('Dbody', 1800));
+          const id = m.addMessage('assistant', words('Bbody', 6000));
+          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
+          const all = () => (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
+          const first = all().findIndex((x) => x.id === id);
+          const dAt = all().findIndex((x) => x.id === d);
+          m.pinRange(d, all()[first - 1]!.id);
+          m.pinRange(id, id);
+          const est = view as unknown as { estimateTokens(x: unknown): number };
+          const headStart = (strategy as unknown as { getHeadWindowStartIndex(v: never): number }).getHeadWindowStartIndex(view);
+          (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
+            all().slice(headStart, first).reduce((t, x) => t + est.estimateTokens(x), 0) - 1;
+          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+          await m.compile(BUDGET);
+          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
+          assert.ok(!owned.includes(d) && !owned.includes(id) && owned.includes(all()[first + 1]!.id),
+            "premise: D and B's first shard stay out of chunks, and coverage starts at B's second");
+          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), dAt,
+            'the head ends before D: both pinned bodies are left out');
+        }));
+
+      it('keeps a parallel call\'s pinned result with its call', () =>
+        open(async (m, strategy) => {
+          await history(m);
+          await m.resetHeadWindow('A new topic.');
+          m.addMessage('assistant', [...words('calling', 5), { type: 'tool_use', id: 'p1', name: 'search', input: {} },
+            { type: 'tool_use', id: 'p2', name: 'search', input: {} }]);
+          m.addMessage('user', [{ type: 'tool_result', toolUseId: 'p1', content: 'First.' }]);
+          const second = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'p2', content: 'Second.' }, ...words('Rbody', 6000)]);
+          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
+          const all = () => (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
+          const at = all().findIndex((x) => x.id === second);
+          assert.ok(all()[at + 1]?.bodyGroupId === all()[at]!.bodyGroupId, 'premise: the second result is stored as shards');
+          m.pinRange(second, second);
+          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+          await m.compile(BUDGET);
+          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
+          assert.ok(!owned.includes(second) && owned.includes(all()[at + 1]!.id), "premise: the second result's first shard stays out of chunks, its rest chunked");
+          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), at + 1,
+            "the head keeps the second result's first shard with the call it answers");
         }));
 
       it('leaves a run of pinned shards out of the head, and keeps an unpinned body before it', () =>

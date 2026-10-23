@@ -1060,8 +1060,9 @@ export interface AutobiographicalConfig {
    *  Messages within this window are never chunked or compressed — they survive
    *  as raw copies so initial instructions retain full granularity. After a
    *  head-window reset past the first message, a head window above 0 starts
-   *  at the transition and holds whole messages (ContextManager.resetHeadWindow
-   *  says what a compile sends). */
+   *  at the transition and holds whole messages, except where the ratchet
+   *  guard keeps a message's never-chunked first part
+   *  (ContextManager.resetHeadWindow says what a compile sends). */
   headWindowTokens: number;
   /** Always break at message boundaries */
   chunkOnMessageBoundary: boolean;

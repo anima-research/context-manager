@@ -18159,9 +18159,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * it. The extension leaves out the run of whole bodies at its end that pins
    * keep raw, since no chunk can take a pinned-raw message: so a body whose
    * never-chunked first messages pins keep raw isn't split, and a pinned tool
-   * call isn't kept in the head away from its result. It never ends right
-   * after a body holding a tool call, which would keep the call from its
-   * result; there the extension stands. Messages kept out of chunks without a
+   * call isn't kept in the head away from its result. It leaves out only a
+   * run in which every tool result answers a call in the run, so no call in
+   * the head loses its result; otherwise the extension stands. (The guard
+   * itself, as without a reset, can end the head right after a never-chunked
+   * call whose result is chunked.) Messages kept out of chunks without a
    * pin (an earlier version's head that ended inside a body whose rest it
    * chunked, or a pin since removed) stay in the extension, so they aren't
    * chunked out of order (#122), and such a body stays in two parts while the
@@ -18199,19 +18201,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // extension's end that pins keep raw is left out of it: otherwise it
         // could end the head inside a body, sending the body in two parts
         // with the history between, or keep a pinned tool call in the head
-        // while its result follows the history. The head doesn't end right
-        // after a body holding a tool call, as the walk back above keeps it
-        // from doing. Messages kept out of chunks without a pin (left by an
-        // earlier version's head, or by a pin since removed) stay in it.
+        // while its result follows the history. A run is left out only whole
+        // bodies at a time, and only where every tool result in it answers a
+        // call in it, so no call stays in the head without its result.
+        // Messages kept out of chunks without a pin (left by an earlier
+        // version's head, or by a pin since removed) stay in it.
         const raw = this.forceRawPinPositions(messages);
+        const calls = new Set<string>();
+        const unanswered = new Set<string>();
         let kept = end;
         for (let k = end - 1; k >= boundary && raw.has(k); k--) {
-          if (bodyStart(at, k) !== k) continue;
-          let afterCall = false;
-          if (k > boundary) {
-            for (let j = bodyStart(at, k - 1); j < k; j++) if (this.hasToolUse(messages[j])) { afterCall = true; break; }
+          for (const block of messages[k].content) {
+            if (block.type === 'tool_result' && !calls.has(block.toolUseId)) unanswered.add(block.toolUseId);
           }
-          if (!afterCall) kept = k;
+          for (const block of messages[k].content) {
+            if (block.type === 'tool_use') { calls.add(block.id); unanswered.delete(block.id); }
+          }
+          if (bodyStart(at, k) === k && unanswered.size === 0) kept = k;
         }
         return kept;
       }
