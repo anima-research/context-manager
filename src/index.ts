@@ -1,6 +1,6 @@
 // Main class
-export { ContextManager, InitializationSupersededError } from './context-manager.js';
-export type { ContextManagerConfig } from './context-manager.js';
+export { ContextManager, ContextDerivationUnsupportedError, InitializationSupersededError } from './context-manager.js';
+export type { ContextManagerConfig, DeriveContextOptions, ContextDerivation, ReopenDerivedOptions } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)
 export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-channel.js';
@@ -90,6 +90,10 @@ export type {
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   HotConfigurableStrategy,
+  RenderingFrontierStrategy,
+  DerivationManifest,
+  DerivationManifestOptions,
+  DerivationManifestStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
   LoadRepairReport,
@@ -138,4 +142,6 @@ export {
   isResettableStrategy,
   isSummaryOverviewStrategy,
   isHotConfigurableStrategy,
+  isRenderingFrontierStrategy,
+  isDerivationManifestStrategy,
 } from './types/index.js';

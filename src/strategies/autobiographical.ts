@@ -33,6 +33,8 @@ import type {
   HotContextSettingsStatus,
   SelectOptions,
   PreviewResult,
+  DerivationManifest,
+  DerivationManifestOptions,
   RenderedSummaryInfo,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
@@ -1817,6 +1819,23 @@ function defaultsForKeysLeftNullish(
 }
 
 /**
+ * What {@link AutobiographicalStrategy.exportRenderingFrontier} hands a
+ * fresh instance over a derived context: the frontier state a restart
+ * would lose. Opaque to callers.
+ */
+export interface AutobiographicalRenderingFrontier {
+  strategy: 'autobiographical';
+  /** Previous compile's per-entry cache identities (marker placement). */
+  prevCacheKeys?: string[];
+  /** The live tail size, which hot settings may have moved off the config value. */
+  recentWindowTokens?: number;
+  runtimeTransitionPaceTokens?: number;
+  preparedWindowTokens?: number;
+  lastFrontierTokens?: number;
+  transitionBlocked?: HotContextSettingsStatus['blocked'];
+}
+
+/**
  * A block as a compression request's route sends it (sentBoundTokens), as
  * membrane 0.5.86 sends it:
  *   - Anthropic: the native formatter rebuilds each block from its fields,
@@ -2498,6 +2517,101 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.lastFrontierTokens <= this.preparedWindowTokens),
       ...(this.transitionBlocked ? { blocked: this.transitionBlocked } : {}),
     };
+  }
+
+  // --------------------------------------------------------------------------
+  // Inherited-state manifest (DerivationManifestStrategy)
+  // --------------------------------------------------------------------------
+
+  /**
+   * What a derived context starts from: the memory tree and everything that
+   * describes how it is presented — summaries, chunk records, the id
+   * counter, pins, resolutions, locks, calibration, the kv-unified receipt
+   * and the merge quarantine (dispositions about specific merges). Left
+   * empty on the child's branch: the merge queue, which `initialize`
+   * rebuilds from the inherited summaries, and — unless `refusals` is
+   * asked for — the compression-refusal ledger, which records this
+   * instance's own refusals and alerts. Ids the configuration never
+   * registered are ignored by the store.
+   */
+  derivationManifest(namespace: string, options: DerivationManifestOptions = {}): DerivationManifest {
+    const ns = namespace;
+    return {
+      stateIds: [
+        ...(options.refusals
+          ? [`${ns}/autobio:compression-refusal-quarantine-events`, `${ns}/autobio:compression-refusal-quarantine`]
+          : []),
+        `${ns}/autobio:summaries`,
+        `${ns}/autobio:chunks`,
+        `${ns}/autobio:counter`,
+        `${ns}/autobio:pins`,
+        `${ns}/autobio:resolutions`,
+        `${ns}/autobio:locks`,
+        `${ns}/autobio:calibration`,
+        `${ns}/autobio:merge-quarantine`,
+        `${ns}/kvunified:presentation-receipt`,
+      ],
+      statePrefixes: [],
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Rendering frontier hand-over (RenderingFrontierStrategy)
+  // --------------------------------------------------------------------------
+
+  /**
+   * The in-memory remainder of the rendering frontier. Everything else a
+   * derived context needs — summaries, resolutions, locks, pins, the
+   * kv-unified receipt — is persisted and arrives through the store.
+   */
+  exportRenderingFrontier(): AutobiographicalRenderingFrontier {
+    this.requireLoadedBranch('exportRenderingFrontier');
+    return {
+      strategy: 'autobiographical',
+      // Strings are immutable; the array is copied so the two instances'
+      // later compiles never share it.
+      ...(this._prevCacheKeys ? { prevCacheKeys: [...this._prevCacheKeys] } : {}),
+      recentWindowTokens: this.config.recentWindowTokens,
+      ...(this.runtimeTransitionPaceTokens !== undefined
+        ? { runtimeTransitionPaceTokens: this.runtimeTransitionPaceTokens }
+        : {}),
+      ...(this.preparedWindowTokens !== undefined ? { preparedWindowTokens: this.preparedWindowTokens } : {}),
+      ...(this.lastFrontierTokens !== undefined ? { lastFrontierTokens: this.lastFrontierTokens } : {}),
+      ...(this.transitionBlocked ? { transitionBlocked: this.transitionBlocked } : {}),
+    };
+  }
+
+  adoptRenderingFrontier(frontier: unknown): void {
+    this.requireLoadedBranch('adoptRenderingFrontier');
+    const f = frontier as Partial<AutobiographicalRenderingFrontier> | null | undefined;
+    if (!f || f.strategy !== 'autobiographical') return;
+    this._prevCacheKeys = Array.isArray(f.prevCacheKeys) ? [...f.prevCacheKeys] : undefined;
+    if (typeof f.recentWindowTokens === 'number') this.config.recentWindowTokens = f.recentWindowTokens;
+    this.runtimeTransitionPaceTokens = f.runtimeTransitionPaceTokens;
+    this.preparedWindowTokens = f.preparedWindowTokens;
+    this.lastFrontierTokens = f.lastFrontierTokens;
+    this.transitionBlocked = f.transitionBlocked;
+  }
+
+  discardRenderingFrontier(): void {
+    this.requireLoadedBranch('discardRenderingFrontier');
+    this._prevCacheKeys = undefined;
+    this.preparedWindowTokens = undefined;
+    this.lastFrontierTokens = undefined;
+    this.transitionBlocked = undefined;
+    if (this.config.adaptiveResolution) {
+      this.resolutions.clear();
+      this.persistResolutions();
+    }
+    if (this.config.foldingStrategy === 'kv-unified' && this.store) {
+      this.requireBranchMutation('discardRenderingFrontier');
+      this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
+      this.kvUnifiedDraft = null;
+      this.kvUnifiedPendingLayout = null;
+      this.kvUnifiedPendingMarkerUnitIndices = [];
+      this.kvUnifiedPendingImmutablePrefixHash = null;
+      this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
+    }
   }
 
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {

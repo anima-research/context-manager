@@ -11,6 +11,7 @@ import type {
   StoredMessage,
   SelectOptions,
   Sequence,
+  DerivationManifest,
 } from '../types/index.js';
 import { registerStateIfAbsent } from '../state-registration.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
@@ -521,6 +522,32 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       let k = 0;
       entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
     }
+  }
+
+  /** A derived context inherits the anchor; nothing else is persisted. */
+  derivationManifest(namespace: string): DerivationManifest {
+    return { stateIds: [this.anchorStateIdOverride ?? `${namespace}/windowed:anchor`], statePrefixes: [] };
+  }
+
+  // --------------------------------------------------------------------------
+  // Rendering frontier hand-over (RenderingFrontierStrategy)
+  // --------------------------------------------------------------------------
+
+  /** The anchor is persisted and inherited through the store; only the
+   *  previous compile's cache identities live in memory. */
+  exportRenderingFrontier(): unknown {
+    return { strategy: 'windowed-passthrough', prevCacheKeys: this.prevCacheKeys ? [...this.prevCacheKeys] : null };
+  }
+
+  adoptRenderingFrontier(frontier: unknown): void {
+    const f = frontier as { strategy?: string; prevCacheKeys?: string[] | null } | null | undefined;
+    if (!f || f.strategy !== 'windowed-passthrough') return;
+    this.prevCacheKeys = Array.isArray(f.prevCacheKeys) ? [...f.prevCacheKeys] : null;
+  }
+
+  /** A fresh solve re-marks from a cold start; the anchor is a position, not a solve. */
+  discardRenderingFrontier(): void {
+    this.prevCacheKeys = null;
   }
 
   // --------------------------------------------------------------------------

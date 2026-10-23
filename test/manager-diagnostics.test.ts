@@ -114,12 +114,15 @@ describe('the manager\'s diagnostics', () => {
     assert.equal(result.status, 0, result.stderr);
     const cacheLines = result.stderr.split('\n').filter((line) =>
       line.startsWith('[cm-cache] getAllInternal MISS') ||
-      line.startsWith("[cm-cache] append write-through deferred (cache wasn't current before the append)"));
+      // On a branch whose freshness token is slotRevision, the write-through on
+      // a stale cache is done at the append (extended) or given up (dropped),
+      // never deferred; main's wording is kept acceptable for a merge-back.
+      /^\[cm-cache\] append write-through (deferred|extended|dropped) \(cache wasn't current before the append\)/.test(line));
     const linesOf = (slot: string) => cacheLines.filter((line) => line.includes(` stateId=${slot} `));
     const isolated = linesOf('agents/tern/messages');
     const shared = linesOf('messages');
     for (const lines of [isolated, shared]) {
-      assert.ok(lines.some((line) => line.includes(' MISS ')) && lines.some((line) => line.includes(' deferred ')), result.stderr);
+      assert.ok(lines.some((line) => line.includes(' MISS ')) && lines.some((line) => / (deferred|extended|dropped) /.test(line)), result.stderr);
     }
     assert.ok(isolated.every((line) => line.endsWith(' ns=agents/tern')), isolated.join('\n'));
     assert.ok(shared.every((line) => !line.includes(' ns=')), shared.join('\n'));

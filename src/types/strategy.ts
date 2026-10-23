@@ -477,6 +477,82 @@ export function isHotConfigurableStrategy(s: ContextStrategy): s is HotConfigura
 }
 
 /**
+ * Strategy that can hand over the part of its rendering frontier that lives
+ * only in memory.
+ *
+ * A derived context (see `ContextManager.derive`) inherits everything a
+ * strategy PERSISTS — summaries, resolutions, pins, receipts — through the
+ * store. What it would lose is what a restart also loses: the previous
+ * compile's cache identities, an in-flight budget transition, a hot-tuned
+ * tail. Without those the child's first compile is correct but places its
+ * cache markers as a cold start does, and the provider prefix the parent
+ * just paid for is not reused. These hooks carry that remainder across.
+ *
+ * The frontier value is opaque to callers and only meaningful between two
+ * instances of the same strategy class with compatible configuration; an
+ * instance must ignore a frontier it does not recognise.
+ */
+export interface RenderingFrontierStrategy extends ContextStrategy {
+  /** Snapshot the in-memory frontier. Must not alias mutable strategy state. */
+  exportRenderingFrontier(): unknown;
+  /** Take over a frontier exported by another instance. Called after initialize. */
+  adoptRenderingFrontier(frontier: unknown): void;
+  /**
+   * Forget the inherited frontier, persisted part included, so the next
+   * compile solves from scratch — a deliberate fresh solve, e.g. at another
+   * budget. The presentation changes and the provider cache misses.
+   */
+  discardRenderingFrontier(): void;
+}
+
+/** Which Chronicle states a derived context inherits from its parent. */
+export interface DerivationManifest {
+  /** Exact state ids. Ids that name no registered state are ignored. */
+  stateIds: string[];
+  /** Plain string prefixes of state ids. */
+  statePrefixes: string[];
+}
+
+/**
+ * Strategy that names which of its persisted states a derived context
+ * inherits (see `ContextManager.derive`). Without this, every state under
+ * the strategy's namespace prefix is inherited, which carries work queues
+ * and failure ledgers along with the memory they describe. A strategy that
+ * implements it lists what the child should start from and leaves the
+ * rest empty on the child's branch — a queue to be rebuilt from inherited
+ * state, a ledger of the parent's own refusals.
+ */
+/** Per-derivation choices a manifest may honour. */
+export interface DerivationManifestOptions {
+  /**
+   * Also inherit the parent's refusal ledger — what it declined to compress
+   * and why. Off by default: a task fork is free of its parent's refusals.
+   * A fork that stands in for the parent's attention wants them, so it is
+   * not asked the thing the parent said no to without knowing. Inherited
+   * entries are the parent's; the child's own refusals append after them
+   * on its branch, and nothing reaches the parent.
+   */
+  refusals?: boolean;
+}
+
+export interface DerivationManifestStrategy extends ContextStrategy {
+  derivationManifest(namespace: string, options?: DerivationManifestOptions): DerivationManifest;
+}
+
+export function isDerivationManifestStrategy(s: ContextStrategy): s is DerivationManifestStrategy {
+  return typeof (s as Partial<DerivationManifestStrategy>).derivationManifest === 'function';
+}
+
+export function isRenderingFrontierStrategy(s: ContextStrategy): s is RenderingFrontierStrategy {
+  const candidate = s as Partial<RenderingFrontierStrategy>;
+  return (
+    typeof candidate.exportRenderingFrontier === 'function' &&
+    typeof candidate.adoptRenderingFrontier === 'function' &&
+    typeof candidate.discardRenderingFrontier === 'function'
+  );
+}
+
+/**
  * Result of a strategy's ingestion-time chunking decision.
  */
 export interface IngressChunkResult {
