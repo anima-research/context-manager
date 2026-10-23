@@ -18156,9 +18156,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * parts with that history between them. The ratchet guard
    * (anchorHeadToCoverage) then reads the boundary as it does without a
    * reset, and can extend it to the first message chunk coverage owns after
-   * it, which isn't always a body's start (a chunk can begin after a pinned
-   * or already owned shard). At headStart 0 nothing comes between the head and
-   * its continuation, so the head still ends where its tokens run out there.
+   * it. That is a body's start unless the body's first messages are kept out
+   * of chunks: by a raw pin, where the head stops at the body's start, since
+   * no chunk can take those; or unpinned, kept out while the body's rest
+   * was chunked by an earlier version's head that ended inside the body or
+   * by a pin since removed, where the extension stands, so those messages
+   * aren't chunked out of order (#122), and the body stays in two parts
+   * until the next reset. At headStart 0 nothing comes between the
+   * head and its continuation, so the head still ends where its tokens run
+   * out there.
    */
   private resetHeadWindowEnd(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
     const at = (k: number): StoredMessage | undefined => messages[k];
@@ -18181,7 +18187,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // message more when the walk back for a tool call moves the boundary.)
         let through = 0;
         for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
-        return this.anchorHeadToCoverage(store, messages, boundary, through);
+        const end = this.anchorHeadToCoverage(store, messages, boundary, through);
+        // An extension that ends inside a body splits it around the history.
+        // When every message it adds of that body is kept raw by a pin, no
+        // chunk can take those (getCompressibleMessages), so leaving them out
+        // of the head mints no out-of-order L1 (#122), and the head stops at
+        // the body's start. An unpinned run there (left by an earlier
+        // version's head or a pin since removed) keeps the extension.
+        const split = bodyStart(at, end);
+        if (split >= boundary && split < end) {
+          const raw = this.forceRawPinPositions(messages);
+          for (let k = split; k < end; k++) if (!raw.has(k)) return end;
+          return split;
+        }
+        return end;
       }
       from = to;
     }

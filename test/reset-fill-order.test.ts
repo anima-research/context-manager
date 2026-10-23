@@ -282,6 +282,75 @@ describe('what a compile sends after a head-window reset', () => {
       assert.deepStrictEqual([error.diagnostics.headTokens, error.diagnostics.tailTokens], [stats.head.tokens, 0], `the plan's refusal counts it as the head: ${error.message}`);
     }));
 
+  for (const name of ['adaptive', 'kv-unified'] as const) {
+    describe(`a long body after a reset whose first shard a host pins while it's recent (${name})`, () => {
+      /** After a reset: a short message, then B, stored as shards, whose first shard (the id addMessage returns) is
+       *  pinned while the recent window holds B; then traffic that pushes B out, so compression chunks B's rest. */
+      async function pinnedBody(m: ContextManager): Promise<{ pin: string; first: number; shards: number[]; view: never }> {
+        await history(m);
+        await m.resetHeadWindow('A new topic.');
+        m.addMessage('user', words('after1', 20));
+        const id = m.addMessage('assistant', words('Bbody', 6000));
+        const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
+        const all = (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
+        const first = all.findIndex((x) => x.id === id);
+        const shards = all.flatMap((x, i) => (x.bodyGroupId && x.bodyGroupId === all[first]!.bodyGroupId ? [i] : []));
+        assert.ok(shards.length > 2 && shards[0] === first, 'premise: B is stored as shards, and addMessage returns the first');
+        const pin = m.pinRange(id, id);
+        for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+        for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+        await m.compile(BUDGET);
+        const owned = (m as unknown as { strategy: { chunks: Array<{ messages: Array<{ id: string }> }> } }).strategy.chunks
+          .flatMap((c) => c.messages.map((x) => x.id));
+        const now = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
+        assert.ok(!owned.includes(now[shards[0]!]!.id) && owned.includes(now[shards[1]!]!.id),
+          "premise: B's first shard stays out of chunks, and coverage after the head starts at its second");
+        return { pin, first, shards, view };
+      }
+      const make = () => new AutobiographicalStrategy({ ...base, recentWindowTokens: 30_000, hierarchical: false, adaptiveResolution: true,
+        targetChunkTokens: 1500, ...(name === 'kv-unified' ? { foldingStrategy: 'kv-unified', kvUnified: { ...KVU, policy: { ...KVU.policy } } } : {}),
+        compressionModel: 'test-model' } as never);
+      const stub = () => {
+        let n = 0;
+        return { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `[S${++n}] ` + 'recalled '.repeat(30) }],
+          usage: { input_tokens: 100, output_tokens: 40 } }) } as never;
+      };
+      const open = async (body: (m: ContextManager, strategy: AutobiographicalStrategy) => Promise<void>) => {
+        const dir = mkdtempSync(join(tmpdir(), 'reset-fill-pin-'));
+        const strategy = make();
+        const m = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: stub() });
+        try { await body(m, strategy); } finally { await m.close(); rmSync(dir, { recursive: true, force: true }); }
+      };
+
+      it('ends the head at the body\'s start and sends the body whole after the history', () =>
+        open(async (m, strategy) => {
+          const { first, view } = await pinnedBody(m);
+          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first,
+            'the head stops at B\'s start rather than take its pinned first shard');
+          const out = (await m.compile(BUDGET)).messages as unknown as Sent[];
+          assert.deepStrictEqual(out.slice(0, 2 + H.length).map(label), ['TT', 'after1', ...H]);
+          const at = out.findIndex((x) => textOf(x).startsWith('Bbody word0 '));
+          assert.strictEqual(at, 2 + H.length, 'B starts right after the history');
+          // The compile joins a body's shards sent one after another into one message.
+          assert.ok(textOf(out[at]!).endsWith(' word5999'), 'B is sent whole, as one message');
+          assert.strictEqual(label(out[at + 1]!), 'event0', 'and the rest follows it');
+        }));
+
+      it('keeps the extension over an unpinned first shard, so it is never chunked after B\'s rest', () =>
+        open(async (m, strategy) => {
+          const { pin, shards, view } = await pinnedBody(m);
+          m.unpin(pin);
+          const s = strategy as unknown as { getHeadWindowEnd(v: never): number };
+          assert.strictEqual(s.getHeadWindowEnd(view), shards[1], 'the head keeps the unpinned first shard, up to where coverage starts');
+          for (let i = 120; i < 140; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+          const all = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
+          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
+          assert.ok(!owned.includes(all[shards[0]!]!.id), 'no chunk takes it after the chunks of B\'s rest');
+        }));
+    });
+  }
+
   for (const [name, sharded] of [['hierarchical', false], ['adaptive, with a sharded body in the head', true]] as const) {
     it(`keeps a reset head where coverage begins when calibration rises (${name})`, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'reset-fill-ratchet-'));
