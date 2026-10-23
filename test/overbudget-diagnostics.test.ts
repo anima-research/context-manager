@@ -1747,7 +1747,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  it('before the host declares its tools, counts no queued chunk that starts inside the head window when the head carries a tool cycle after the chunk\'s start, which tick\'s head carries raw', async () => {
+  it('before the host declares its tools, counts no queued chunk that lies inside the head window, and tick asks the model for the first: its request carries the head only up to the chunk, not the tool cycle after it (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1775,19 +1775,22 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       assert.ok(!queued[0].some((id) => cycle.includes(id)), 'the first queued chunk is text ahead of the cycle');
       strategy.setHeadWindowTokens(100_000);
-      assert.equal(strategy.countsCompressionWork(), false, 'tick defers every queued chunk until the tools come');
-      // The premise: tick's head carries the cycle raw, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
+      assert.equal(strategy.countsCompressionWork(), false, 'chunks inside the head fold nothing, so none counts');
+      // The head a request gives is cut at its chunk's start (headAsOf), so the cycle after the first chunk isn't in
+      // its request: tick asks the model rather than deferring, and the counting membrane throws. Before #317 the
+      // head went whole, messages after the chunk included.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
   // The chunks the test above widens the head over lie wholly inside it, so they fold nothing and don't count
-  // whatever the tools say. A chunk that lies before a reset head start folds, and the head after it, which
-  // tick's request carries raw, is what holds it back: a tool message in the head lies past the chunk's start.
-  it('before the host declares its tools, counts no queued chunk that lies before a reset head start when the head carries a tool cycle, which tick\'s request carries raw though it lies after the chunk', async () => {
+  // whatever the tools say. A chunk that lies before a reset head start folds. Tick's request for it gives the
+  // head that history followed, the opening here, and not the reset head after it (#317), so a tool cycle in the
+  // reset head doesn't hold it back.
+  it('before the host declares its tools, names compression for a queued chunk that lies before a reset head start when that head carries a tool cycle, which lies after the chunk and tick\'s request leaves out (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1819,14 +1822,13 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(chunkAt.every((i) => i >= 0 && i < headStart), 'the premise: the first queued chunk lies before the head window\'s start, so it folds');
       assert.ok(!queued[0]!.some((id) => cycle.includes(id)), 'the premise: and holds no tool block of its own');
       assert.ok(cycleAt.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window, past the chunk\'s start');
-      assert.deepEqual(error.clearedBy, [], 'tick defers every queued chunk until the tools come');
-      // The premise: tick's request carries the head raw, cycle included, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
-      manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      assert.deepEqual(error.clearedBy, ['compression'], 'the chunk folds and tick will take it without the tools');
+      // The premise: tick's request gives the opening as its head, without the cycle, so tick asks the model, and the
+      // counting membrane throws.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
@@ -1877,7 +1879,7 @@ describe('OverBudgetError.clearedBy', () => {
   }
 
   for (const pinned of [false, true]) {
-    it(`names ${pinned ? 'nothing' : 'compression'} before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned, which tick\'s request then carries raw' : 'which tick\'s request leaves out'}`, async () => {
+    it(`names nothing before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned' : 'unpinned'}: tick's request carries the cycle raw in the opening, the head of that history (#317)`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         targetChunkTokens: 40,
@@ -1904,17 +1906,10 @@ describe('OverBudgetError.clearedBy', () => {
         assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
         const queued = strategy.queuedChunkIds();
         assert.ok(queued.some((ids) => !ids.some((id) => cycle.includes(id))), 'text chunks are queued');
-        if (!pinned) {
-          assert.deepEqual(error.clearedBy, ['compression']);
-          // The premise: tick's request leaves the cycle out, so tick asks the model, and the counting membrane throws.
-          await assert.rejects(async () => {
-            for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-          }, /no model in this test/);
-          assert.equal(calls.n, 1, 'tick asked the model');
-          return;
-        }
         assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
-        // The premise: tick's request carries the pinned cycle raw, so tick defers every queued chunk, with no model call.
+        // The premise: tick's request for a chunk before the reset gives the opening as its head, cycle included, raw
+        // (pinned or not), so tick defers every queued chunk, with no model call. Before #317 an unpinned cycle there
+        // was left out, since the head was the reset one.
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');

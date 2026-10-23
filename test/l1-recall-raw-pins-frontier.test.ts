@@ -225,7 +225,7 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
     cm.close();
   });
 
-  it('a pin after the chunk being compressed opens nothing: its summary is recalled, as on main', async () => {
+  it('a pin after the chunk being compressed opens nothing, and its summary, which comes after the chunk, is not recalled (#317)', async () => {
     // A message the chunker skipped while it was pinned raw, then unpinned, is
     // compressed out of order, after the history that follows it.
     let skippedPin = '';
@@ -247,7 +247,9 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
     const request = requests.find(compressing);
     assert.ok(request, 'setup: the skipped message was compressed');
     const texts = textsOf(request);
-    assert.ok(texts.includes(`[CM] Recall memory ${root.id}.`), 'the summary holding the later pin is recalled');
+    const rootFirst = ids.indexOf((root as unknown as { sourceRange: { first: string } }).sourceRange.first);
+    assert.ok(rootFirst > 30, `setup: the summary holding the later pin starts after the chunk (at ${rootFirst})`);
+    assert.ok(!texts.includes(`[CM] Recall memory ${root.id}.`), 'the summary holding the later pin, after the chunk, is not recalled: the request holds only what came before');
     assert.ok(!texts.includes(textOf.get(ids[100])!), 'the later pin adds no raw');
     cm.close();
   });

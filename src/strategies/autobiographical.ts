@@ -354,9 +354,9 @@ function nextFailureStreak(
  * An L1 run's subject: the chunk's rung, by the chunk's sources (see
  * chunkRunSubject) and the rung's curve label, the stripped retry after a
  * carrier rejection being its own. Not the request's bytes: a pending
- * chunk's request carries the whole unmerged frontier as recall pairs, so
- * every other L1 that lands changes it, and those landings are the evidence
- * a run needs.
+ * chunk's request carries the unmerged frontier summaries that start before
+ * it as recall pairs, so an L1 that lands for history before it changes it,
+ * and those landings are the evidence a run needs.
  */
 function chunkRunKey(runSubject: string, curveLabel: string, stripped: boolean): string {
   return sha256Json({ runSubject, curveLabel, stripped });
@@ -4016,12 +4016,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Consecutive compression/merge requests share a long, append-mostly
    * prefix — head window + prior recall pairs (~60% of input on synthetic
    * workloads, ~93% on mature stores) — that previously went to the API
-   * with zero `cache_control` and was re-read cold on every call. Markers
+   * with zero `cache_control` and was re-read cold on every call. They share
+   * the head window only while they summarize one topic's history: after a
+   * head-window reset, requests for different topics' history each carry
+   * that topic's head (headAsOf). Markers
    * land at the three boundaries whose survival probability ranks highest
    * (measured optimum; `analysis/2026-08-20-cm37-cache-partition-experiments.md`
    * in the workspace root):
    *
-   *   1. end of head window        — survives everything short of identity edits
+   *   1. end of head window        — survives everything short of identity edits,
+   *                                  among requests for one topic's history
    *   2. last level>=2 recall pair — survives appends AND L1→L2 merges (a
    *      merge replaces the run at this boundary and extends it)
    *   3. last recall pair          — the append frontier
@@ -4085,7 +4089,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     // A capped ladder front-evicts on every mint, so the pair seams shift and
     // writing them is waste. The head seam does not: tools, system prompt and
-    // head window precede the ladder and are the same request after request,
+    // head window precede the ladder and are the same request after request
+    // for one topic's history (headAsOf gives each topic its own head),
     // unless image shedding (one byte budget, spent newest-first) replaces a
     // head image for one payload and not for the next.
     let placed = false;
@@ -9110,9 +9115,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      ("Antra came to me to explore the transformation story
     //      again…"), compounding across merges into runaway false
     //      memories (the "68 initiations" incident). Chronological
-    //      order is also the KV-stable order — the head never changes.
-    //      (executeMerge always had head-first; this site was the odd
-    //      one out.)
+    //      order is also the KV-stable order: chunks of one topic after its
+    //      head share that head, so their requests share its prefix. The
+    //      head is the head as of the chunk (headAsOf): after a head-window
+    //      reset, the head that history followed, the opening or its own
+    //      topic's, never the later topic's. (executeMerge always had
+    //      head-first; this site was the odd one out.)
     //   2. Prior summaries — narrativized as CM-asks / agent-recalls
     //      pairs, in source order. The unmerged frontier of the
     //      summary forest: any summary that has not yet been merged
@@ -9130,10 +9138,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
     const allMessages = ctx.messageStore.getAll();
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
+    // default IDs happen to be decimal text, where lexical order corrupts the
+    // timeline at the first width transition (`"103" < "15"`). Use the store's
+    // canonical order instead so recall pairs remain chronological for every ID
+    // representation and newly-created summaries extend rather than splice the
+    // provider-cache prefix.
+    const messageOrder = new Map<MessageId, number>(
+      allMessages.map((message, index) => [message.id, index]),
+    );
+    const chunkFirstId = chunk.messages[0]?.id;
+    // The chunk's start is its first message still in the store: a host can
+    // remove a stored message (agent-framework's Discord module does, on a
+    // delete) while the chunk holding it waits in the queue. -1 only when
+    // none of its messages is left (startInStore).
+    const chunkStartIdx = this.startInStore(chunk.messages.map((m) => m.id), messageOrder);
+    // The head as of the chunk (headAsOf): after a head-window reset, history
+    // from before it is given the head it followed, not the new topic's, which
+    // came after it. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, chunkStartIdx);
 
     // ---- Prior recall set (the unmerged frontier) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -9146,15 +9169,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
-    // default IDs happen to be decimal text, where lexical order corrupts the
-    // timeline at the first width transition (`"103" < "15"`). Use the store's
-    // canonical order instead so recall pairs remain chronological for every ID
-    // representation and newly-created summaries extend rather than splice the
-    // provider-cache prefix.
-    const messageOrder = new Map<MessageId, number>(
-      allMessages.map((message, index) => [message.id, index]),
-    );
     // Pins in the canonical L1 prompt. The live view shows a message that a
     // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
     // frontier summary that can't be shown as a recall pair (it covers such a
@@ -9192,20 +9206,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // stay declared (reasoning_extraction guard). L1 only; merge/transition
     // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const chunkFirstId = chunk.messages[0]?.id;
-    const chunkStartIdx = chunkFirstId ? allMessages.findIndex((m) => m.id === chunkFirstId) : -1;
 
     // History before the chunk, laid out for the messages that pins keep raw.
     const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
       // The recall frontier, the chunks pins open and the leaf coverage, as
       // compressionWorkQueued's count reads them too (recallCoverage).
       const { frontier, openedMessageIds, coveredMessageIds: priorSummaryMessageIds } = this.recallCoverage(forceRawMessageIds);
+      // Recall pairs only for history before the chunk: a summary whose
+      // source range starts before the chunk's first message, as a merge's
+      // prior recall set takes only what starts before its range (1a). A
+      // chunk compressed after later history already has summaries (the old
+      // head's chunk, which a head-window reset makes compressible after the
+      // chunks behind it; a pinned or quarantined chunk let go late) was
+      // given their recall pairs too, ahead of it: what came after it
+      // (#317). It now sees fewer pairs: only those that start before it.
+      // Coverage is the whole frontier's still, so a later summary's
+      // messages stay out of the raw middle (one-to-one). A summary that
+      // starts before the chunk and reaches past it (a sparse sweep
+      // artifact, issue #42) is still recalled, since the messages it covers
+      // before the chunk have no other form here; so its later part, what it
+      // says of history after the chunk, still reaches this request, and only
+      // where a summary straddles the chunk. A summary written before this
+      // rule may also carry what came after its own history, from the head or
+      // recall pairs it was written with; that stays in its text. Where a
+      // summary starts is summaryStartInStore's rule, the one
+      // a merge's prior recall set uses: a summary whose first message a host
+      // removed starts at its first message still there, and one with none
+      // left isn't recalled. A chunk with no message left (chunkStartIdx -1)
+      // recalls none.
+      const summariesById = new Map<string, SummaryEntry>();
+      for (const s of this.summaries) summariesById.set(s.id, s);
+      const startOf = new Map<string, number>();
+      for (const s of frontier) startOf.set(s.id, this.summaryStartInStore(s, messageOrder, summariesById));
       const priorSummaries = frontier
-        .sort((a, b) => {
-          const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
-        });
+        .filter((s) => { const at = startOf.get(s.id)!; return at >= 0 && at < chunkStartIdx; })
+        .sort((a, b) => startOf.get(a.id)! - startOf.get(b.id)! || a.sourceRange.first.localeCompare(b.sourceRange.first));
 
       // Raw messages before the chunk outside the head window, by position.
       // From the head window's end on, any message no summary represents yet
@@ -9249,7 +9284,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           rawMiddle.push({ position: i, message: m });
         }
       }
-      return { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
+      return { priorSummaries, startOf, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
     };
 
     // When the chunk is a portion of a substantially larger sharded message
@@ -9275,7 +9310,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pins count only before the chunk being compressed: this prompt is the
     // history the chunk follows. A summary after it (a chunk compressed out of
-    // order, after a head-window reset or an unpin) is recalled as on main.
+    // order, after a head-window reset or an unpin) isn't recalled at all
+    // (layoutHistory), and its messages stay covered.
     const forceRawMessageIds = new Set<MessageId>();
     for (const i of this.forceRawPinPositions(allMessages)) {
       if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
@@ -9285,7 +9321,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The canonical request's messages for one layout of history, sections 1
     // to 6, shaped as they are sent. Admitting the pins prices this list.
     const assemble = (
-      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      { startOf, priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
       keptSummaries: readonly SummaryEntry[],
     ) => {
       const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
@@ -9304,7 +9340,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the chunk." For doc-heavy chronicles, "everything before" would
       // be hundreds of thousands of tokens; the recall pairs below
       // represent that intermediate content. The head is just the
-      // permanent prefix that the original instance always saw.
+      // prefix the original instance saw ahead of this history: the head
+      // window as of the chunk (headAsOf), which after a head-window reset
+      // is the opening, or the transition and opening of the chunk's topic.
       //
       // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
       // are the persistent authority over how a message is represented.
@@ -9329,13 +9367,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
 
       // One sequence by source position after the head window, which always
-      // comes first, so the summarizer never reads an older raw turn as coming
-      // after a later memory. Where the raw middle follows every recall pair,
-      // as it does when chunking runs contiguously, this is the order the
-      // prompt always had: recall pairs, then raw.
+      // comes first, so the summarizer never reads an older raw turn, or an
+      // older memory, as coming after a later memory. A recall pair sits at
+      // its summary's start as the recall filter read it (layoutHistory's
+      // startOf, summaryStartInStore): a summary whose first message a host
+      // removed sits at its first message still in the store, not last.
+      // Where the raw middle follows every recall pair, as it does when
+      // chunking runs contiguously, this is the order the prompt always had:
+      // recall pairs, then raw.
       const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
         ...keptSummaries.map((summary) => ({
-          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          position: startOf.get(summary.id) ?? Number.MAX_SAFE_INTEGER,
           summary,
         })),
         ...rawMiddle,
@@ -11794,7 +11836,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //
     // No tail-after-merge: same as-of principle as L1 compression. The
     // consolidation is being formed at the moment the last source was
-    // ready, so nothing after that is visible.
+    // ready, so nothing after that is visible, except what a recalled
+    // summary's own text carries: one written before this as-of rule may
+    // say what came after its history.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
     // Build lookup maps
@@ -11820,9 +11864,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     for (const src of sources) collectLeaves(src);
 
-    // Find the start of the merge range in the message store.
-    const mergeFirstMsgId = sources[0].sourceRange.first;
-    const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
+    // The merge range's start in the store: its first leaf still there
+    // (startInStore), as a summary's start is read (summaryStartInStore). -1
+    // only when none is: nothing in the store says when that history
+    // happened, so the merge gets no head (headAsOf) and recalls no summary
+    // (1a), as a compression chunk in that state does.
+    const positionOf = this.positionIndex(allMessages);
+    const mergeStartIdx = this.startInStore(sourceLeafIds, positionOf);
 
     // ---- 1a. PRIOR RECALL SET (chronologically before merge range) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -11836,20 +11884,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (`!mergedInto`) lets a merged L1 drop out in favour of its L2/L3
     // parent — the same rule used everywhere else and now in
     // `compressChunkHierarchical`. The cap below is the defense-in-depth.
+    const priorStart = new Map<string, number>();
     const priorSummariesAll = this.summaries
       // Skip empty-content summaries (see compressChunkHierarchical): an empty
       // text block in the merge recall header 400s and stalls compression.
       .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
       .filter((s) => {
         for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
-        const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
-        return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
+        // Where it starts (summaryStartInStore): a summary whose first message
+        // a host removed starts at its first message still in the store, so
+        // it's recalled and its other messages, which its coverage holds out
+        // of the raw middle, keep a form here. One with none left isn't.
+        const firstIdx = this.summaryStartInStore(s, positionOf, summariesById);
+        priorStart.set(s.id, firstIdx);
+        return firstIdx >= 0 && firstIdx < mergeStartIdx;
       })
-      .sort((a, b) => {
-        const ai = allMessages.findIndex((m) => m.id === a.sourceRange.first);
-        const bi = allMessages.findIndex((m) => m.id === b.sourceRange.first);
-        return ai - bi;
-      });
+      .sort((a, b) => priorStart.get(a.id)! - priorStart.get(b.id)!);
 
     // Leaf coverage of every live summary — the rendering authority
     // (one-to-one invariant; see compressChunkHierarchical). Uses the
@@ -11872,9 +11922,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
     //
-    // The head window is the foundational identity anchor — the actual
-    // opening of the chronicle. It establishes who is speaking to whom.
-    // Without it, when the merge target's content is heavily first-person
+    // The head window is the foundational identity anchor — the opening
+    // the merged history followed (headAsOf: the chronicle's opening, or
+    // after a head-window reset the opening of its topic). It establishes
+    // who is speaking to whom. Without it, when the merge target's content
+    // is heavily first-person
     // from someone other than the agent, the agent loses its first-person
     // grounding and drifts into the content author's voice.
     //
@@ -11882,10 +11934,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // wins over the token-derived head boundary. A head-range message
     // covered by a live summary renders via its recall pair; one inside
     // the merge tree renders in the TARGET expansion. Never raw here too.
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // The head as of the merge's first message (headAsOf), as for an L1: a
+    // merge over history from before a head-window reset is given the head
+    // that history followed. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, mergeStartIdx);
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -12804,48 +12856,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the chunk's own messages, and, unless compressionSourceOnly, each message
    * the request carries raw ahead of the chunk, by the coverage tick's request
    * reads with the pins before the chunk (recallCoverage). From the lower of
-   * the head window's start and headEnd (headEnd clipped at a hold as tick
-   * clips it, and 0 with the head window off, headWindowTokens <= 0), that's
-   * every message the coverage leaves uncovered, up to the chunk or to
-   * headEnd, whichever is later. Before it, only what pins keep raw: the
+   * the start and end of the head that request gives (headAsOf, the head as
+   * of the chunk, its end clipped at a hold as tick clips it, and 0 with the
+   * head window off, headWindowTokens <= 0), that's every message the coverage
+   * leaves uncovered, up to the chunk or to that head's end, whichever is
+   * later. Before it, only what pins keep raw: the
    * messages of an L1 a pin opens, and a pinned message. Tick lays its
    * history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
    * tool blocks first. So this can say yes where tick's request has none,
    * never the reverse. The test it returns takes one chunk. Chunks with the
-   * same pins before them read the same coverage, so each coverage is read
-   * once, for the first message its request carries raw with a tool block,
-   * and a chunk's answer is whether that message comes before the later of
-   * the chunk's start and headEnd.
+   * same pins before them, and the same head start, read the same coverage
+   * from the same place, so each is read once, for the first message its
+   * request carries raw with a tool block, and a chunk's answer is whether
+   * that message comes before the later of the chunk's start and its head's
+   * end.
    */
   private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
     const all = store.getAll();
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const headEnd = Math.min(this.getHeadWindowEnd(store), this.holdBoundary(store));
-    const from = Math.min(this.getHeadWindowStartIndex(store), headEnd);
     const position = new Map(all.map((message, i) => [message.id, i]));
     const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
-    // For each count of pins before a chunk, the index of the first message
-    // that request carries raw with a tool block, or all.length for none.
-    const firstToolBlock = new Map<number, number>();
+    // Built at the first head read, so a count that reads none (source-only,
+    // or each chunk holding a tool block itself) scans no holds.
+    let heads: ((pos: number) => { start: number; end: number }) | undefined;
+    // For each count of pins before a chunk and the start its head's raw
+    // reading takes, the index of the first message that request carries raw
+    // with a tool block, or all.length for none.
+    const firstToolBlock = new Map<string, number>();
     return (chunk) => {
       if (chunk.messages.some((m) => hasToolBlocks(m.content))) return true;
       if (sourceOnly) return false;
-      const start = position.get(chunk.messages[0]?.id ?? '') ?? -1;
+      // The chunk's start as tick's request takes it (startInStore).
+      const start = this.startInStore(chunk.messages.map((m) => m.id), position);
+      heads ??= this.headsAsOf(store);
+      const head = heads(start);
+      const headEnd = head.end;
+      const from = Math.min(head.start, headEnd);
       const pinned = pins.filter((i) => i < start);
-      let first = firstToolBlock.get(pinned.length);
+      const key = `${pinned.length}:${from}`;
+      let first = firstToolBlock.get(key);
       if (first === undefined) {
         const pinnedIds = new Set(pinned.map((i) => all[i].id));
         const seen = this.recallCoverage(pinnedIds);
         // Before `from`, the request carries only what pins keep raw: an L1 a
-        // pin opens, and a pinned message (which lies before headEnd, since
-        // from is at most headEnd).
+        // pin opens, and a pinned message. (Either lies before headEnd there,
+        // since from is at most headEnd.)
         const carried = (message: StoredMessage, i: number): boolean =>
           !seen.coveredMessageIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
         const found = all.findIndex((message, i) => carried(message, i) && hasToolBlocks(message.content));
         first = found === -1 ? all.length : found;
-        firstToolBlock.set(pinned.length, first);
+        firstToolBlock.set(key, first);
       }
       return first < Math.max(headEnd, start);
     };
@@ -18104,6 +18166,137 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Where history starts in the store: the position of the first of `ids`
+   * still there (store order), or -1 when none is. A host can remove stored
+   * messages (agent-framework's Discord module does, on a delete or a history
+   * sync) while a summary over them, or a queued chunk holding them, lives
+   * on; -1 means nothing in the store says when that history happened.
+   */
+  protected startInStore(ids: Iterable<MessageId>, position: ReadonlyMap<MessageId, number>): number {
+    let start = -1;
+    for (const id of ids) {
+      const at = position.get(id);
+      if (at !== undefined && (start < 0 || at < start)) start = at;
+    }
+    return start;
+  }
+
+  /**
+   * Where a summary starts in the store: its first leaf message still there
+   * (expandSummaryToLeafMessageIds, startInStore), whether or not that is
+   * sourceRange.first; -1 when none is. The one rule for both recall sets, a
+   * compression request's and a merge's (1a), and for where a recall pair
+   * sits among them: a summary starting before the history being summarized
+   * is recalled, at its start. A summary with no message left isn't: its
+   * place is unknown, and its coverage holds no message out of the request.
+   */
+  protected summaryStartInStore(
+    summary: SummaryEntry,
+    position: ReadonlyMap<MessageId, number>,
+    summariesById: ReadonlyMap<string, SummaryEntry>,
+  ): number {
+    const leaves = new Set<MessageId>();
+    this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+    return this.startInStore(leaves, position);
+  }
+
+  /**
+   * The head window a compression or merge request gives as context for the
+   * history it summarizes from `pos` on: the head in force when the message at
+   * `pos` was the newest, cut at `pos` and at the compression holds
+   * (holdBoundary). From the live head's start on, that is the live head,
+   * cut at `pos`, so a chunk inside the live head window (one a widened
+   * window grew over) no longer gets the head's messages after its start.
+   * A `pos` that's unknown (-1: none of the history's messages is left in
+   * the store, startInStore) gets no head: nothing in the store says when
+   * that history happened, and the live head may have come after it. Before
+   * the live head's start, it is the head starting at the latest topic
+   * transition message at or before `pos` (isTopicTransitionMessage, the test
+   * that restores the live head's start at a restart), or at the opening when
+   * there is none, ending by the walk the live head takes from its start
+   * (headWindowEndFrom). So history from before a head-window reset gets the
+   * head it followed: the opening, or the transition and opening of the topic
+   * it was in. There, a chunk that starts at a transition, or at the
+   * store's first message (the opening's own chunk, which a reset releases),
+   * gets none: nothing came before it.
+   *
+   * After a reset, these requests gave the new topic's opening ahead of the
+   * older history they summarize (#317), where section 1 of
+   * compressChunkHierarchical places the chronicle's opening "exactly where
+   * the original instance saw it" and keeps later events out.
+   *
+   * Three things it is, by choice:
+   * - Before the live head's start, where a head starts comes from the store
+   *   alone, as a restart reads it. A strategy-level resetHeadWindow to a
+   *   message that isn't a transition isn't in the store: history before that
+   *   message gets the latest transition before it, or the opening, as after a
+   *   restart. History from that message on gets the live head, which a
+   *   restart moves to the last transition in the store. So a restart gives
+   *   the same heads while the live head starts at the last transition in the
+   *   store.
+   * - A past head is priced with today's headWindowTokens and calibration, as
+   *   the live head is, and the ratchet guard (anchorHeadToCoverage) extends
+   *   it by today's chunk ownership, not by those in force when it was the
+   *   head.
+   * - Before the live head's start, any Context Manager message whose text
+   *   starts with "[Topic Transition]" starts a head, as the restart reads
+   *   one, whether or not resetHeadWindow wrote it.
+   */
+  protected headAsOf(store: MessageStoreView, pos: number): { start: number; end: number } {
+    return this.headsAsOf(store)(pos);
+  }
+
+  /**
+   * headAsOf for many positions in one store state, such as each queued chunk
+   * a count of queued work reads (requestCarriesToolBlocks): the live head's
+   * start, the holds and the live head's end are read once, the transitions
+   * before the live head's start once when a position before it is asked
+   * for, and each past head's end once per start. Tick's requests (through
+   * headAsOf) and the count both read heads here, so a subclass that changes
+   * heads overrides this.
+   */
+  protected headsAsOf(store: MessageStoreView): (pos: number) => { start: number; end: number } {
+    const liveStart = this.getHeadWindowStartIndex(store);
+    const hold = this.holdBoundary(store);
+    let liveEnd: number | undefined;
+    let messages: StoredMessage[] | undefined;
+    let transitions: number[] | undefined;
+    const pastEnds = new Map<number, number>();
+    return (pos) => {
+      if (pos < 0) return { start: liveStart, end: liveStart };
+      if (pos >= liveStart) {
+        liveEnd ??= this.getHeadWindowEnd(store);
+        return { start: liveStart, end: Math.min(liveEnd, hold, pos) };
+      }
+      messages ??= store.getAll();
+      if (!transitions) {
+        const found: number[] = [];
+        for (let i = 1; i < liveStart && i < messages.length; i++) {
+          if (this.isTopicTransitionMessage(messages[i])) found.push(i);
+        }
+        transitions = found;
+      }
+      // The latest transition at or before pos, or the opening.
+      let start = 0;
+      for (let lo = 0, hi = transitions.length - 1; lo <= hi;) {
+        const mid = (lo + hi) >> 1;
+        if (transitions[mid]! <= pos) {
+          start = transitions[mid]!;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      let end = pastEnds.get(start);
+      if (end === undefined) {
+        end = this.headWindowEndFrom(store, messages, start);
+        pastEnds.set(start, end);
+      }
+      return { start, end: Math.min(end, hold, pos) };
+    };
+  }
+
+  /**
    * Index of the first message AFTER the head window.
    * Messages [headStart, headEnd) are sent raw, never summarized.
    *
@@ -18119,10 +18312,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * material (issue #122). See anchorHeadToCoverage.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
-    if (this.config.headWindowTokens <= 0) return 0;
+    return this.headWindowEndFrom(store, store.getAll(), this.getHeadWindowStartIndex(store));
+  }
 
-    const messages = store.getAll();
-    const startIdx = this.getHeadWindowStartIndex(store);
+  /**
+   * Where a head window starting at `startIdx` ends, by the walk the live head
+   * window takes (getHeadWindowEnd): the live head's start, or a past head's
+   * (headAsOf). A head that starts past 0, at a head-window reset's
+   * transition, ends by resetHeadWindowEnd: whole bodies, the transition
+   * always whole.
+   */
+  protected headWindowEndFrom(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
+    if (this.config.headWindowTokens <= 0) return 0;
     if (startIdx > 0) return this.resetHeadWindowEnd(store, messages, startIdx);
     let tokens = 0;
 
