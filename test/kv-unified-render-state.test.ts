@@ -885,7 +885,8 @@ describe('the head window', () => {
       accept(strategy, one);
       const ref = reference(strategy)!;
       await manager.resetHeadWindow('a new topic');
-      add(manager, SMALL);
+      // A message past the reset head ends its fill, so the head goes first.
+      add(manager, [...SMALL, ['u', [text(plain(6))]]]);
       const two = await compile(manager);
       assert.equal(firstChange(one, two), 0, 'premise: the reset changed what is sent from its first message');
       assert.ok(ref.markers.length > 0, 'premise: the accepted request kept markers');
@@ -894,6 +895,28 @@ describe('the head window', () => {
       assert.equal(solveMarkers(strategy), 0, 'no marker is credited');
       const solve = solved(strategy)!;
       assert.ok(solve.selected && solve.cacheRelevant && solve.selected.cacheChurn > 0, 'the solve prices the rewrite');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a reset whose head still fills keeps the accepted markers past the old head', async () => {
+    const { dir, strategy, manager } = await open({ headWindowTokens: 1_700, recentWindowTokens: 300 });
+    try {
+      add(manager, [...MIDDLE, ['u', [text(plain(4))]], ['a', [text(plain(5))]], ...CLOSE]);
+      const one = await compile(manager);
+      accept(strategy, one);
+      const ref = reference(strategy)!;
+      await manager.resetHeadWindow('a new topic');
+      add(manager, SMALL);
+      const two = await compile(manager);
+      assert.equal(firstChange(one, two), one.length, 'premise: the filling head is sent after the history, which is sent as it was');
+      // The old head's own marker stands for a head's end, and no head ends
+      // there now; every marker after it is still on the wire's prefix.
+      const past = ref.markers.filter((m) => ref.layout.units[m.unitIndex - 1]?.kind !== 'head').length;
+      assert.ok(past > 0, 'premise: the accepted request had markers past its head');
+      assert.equal(solveMarkers(strategy), past, 'each marker past the old head is credited');
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });

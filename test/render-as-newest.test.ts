@@ -350,16 +350,17 @@ describe('renderAsNewest', () => {
     });
   });
 
-  it("autobiographical: after the head window's start is reset, messages it holds come back as null, since the history before it follows them", async () => {
+  it("autobiographical: while a reset head fills, messages it holds render as the next compile sends them, since it sends them last", async () => {
     const strategy = memory({ headWindowTokens: 1_000_000, recentWindowTokens: 100 });
     await withManager(strategy, async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'before the reset' }]);
       const a = manager.addMessage('user', [{ type: 'text', text: 'a' }]);
       strategy.resetHeadWindow(a);
       const b = manager.addMessage('user', [{ type: 'text', text: 'b' }]);
-      assert.deepEqual(manager.renderAsNewest([a, b]), [null, null]);
+      const [forA, forB] = manager.renderAsNewest([a, b])!;
       const compiled = await manager.compile(BUDGET);
-      assert.deepEqual(compiled.messages.slice(-3).map((m) => textOf(m.content)), ['a', 'b', 'before the reset'], 'the compile sends the history after the head');
+      assert.deepEqual(compiled.messages.slice(-3).map((m) => textOf(m.content)), ['before the reset', 'a', 'b'], 'the compile sends the history first, then the filling head');
+      assert.deepEqual([sent(forA!), sent(forB!)], compiled.messages.slice(-2).map((m) => sent(m.content)));
     });
   });
 
