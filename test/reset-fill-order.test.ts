@@ -12,8 +12,10 @@
  *   between a call and its result. A body that doesn't fit is sent whole
  *   after the history, unless the ratchet guard below keeps part of it.
  * - The ratchet guard's extension leaves out the pinned run at its end, from a
- *   body's start, back to the last message holding a tool result; a pinned
- *   call left out goes after the history ahead of its result, if any. It
+ *   body's start, back to the last message holding a tool result: a pinned
+ *   message it could take whole, a pinned call, or the never-chunked first
+ *   part of a message marked after its rest was chunked. A pinned call left
+ *   out goes after the history ahead of its result, if any. It
  *   keeps a body's never-chunked first part that no pin holds, so that part
  *   isn't chunked out of order, and the pinned messages from the last one
  *   holding a tool result back, as without a reset (where the head can then
@@ -352,8 +354,8 @@ describe('what a compile sends after a head-window reset', () => {
     describe(`a pinned run at a reset head's end that compression never took (${name})`, () => {
       // A pin or a document mark covers a message stored in parts whole, for compression as for the selects, so a
       // message pinned while it's recent is never chunked, and the ratchet guard can take it into the head whole. A
-      // message whose later parts were chunked before it was marked (a mark from before whole-message pins, or an
-      // earlier version's head that ended inside it) keeps those chunks, and is built below as such a store left it.
+      // message whose later parts were chunked before it was marked (by a mark from before whole-message pins, or one
+      // made after a head that ended inside it) keeps those chunks, and is built below by the second route.
       const make = () => new AutobiographicalStrategy({ ...base, recentWindowTokens: 30_000, hierarchical: false, adaptiveResolution: true,
         targetChunkTokens: 1500, ...(name === 'kv-unified' ? { foldingStrategy: 'kv-unified', kvUnified: { ...KVU, policy: { ...KVU.policy } } } : {}),
         compressionModel: 'test-model' } as never);
@@ -409,8 +411,9 @@ describe('what a compile sends after a head-window reset', () => {
         return { first: parts[0]!, parts, view };
       }
 
-      /** A store an earlier version left: the head ended inside B, after its first part, so compression chunked
-       *  B's rest, and B is marked only then if at all; then a reset to the message before B, as `/newtopic` makes. */
+      /** A head without a reset that ended inside B, after its first part, so compression chunked B's rest; then B
+       *  marked, or not, and a strategy reset to the message before B. A mark from before whole-message pins leaves
+       *  the same chunks. */
       async function chunkedRest(m: ContextManager, strategy: AutobiographicalStrategy, mark: boolean): Promise<{ first: number; parts: number[]; view: View }> {
         m.addMessage('user', words('hist0', 200));
         const after1 = m.addMessage('user', words('after1', 20));

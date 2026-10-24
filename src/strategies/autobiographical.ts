@@ -18470,18 +18470,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (anchorHeadToCoverage) then reads the boundary as it does without a
    * reset, and can extend it to the first message chunk coverage owns after
    * it. The extension leaves out the run at its end, from a body's start,
-   * that pins keep raw and that holds no tool result, since no chunk can take
-   * a pinned-raw message: so a body whose never-chunked first messages pins
-   * keep raw isn't split. Nothing left out answers a call in the head, and a
-   * pinned call left out goes after the history ahead of its result, if it
-   * has one, as without a reset. Pinned messages from the last one that
-   * holds a tool result back stay in the extension, as without a reset: a
-   * call and the pinned first part of its result stay in the head together,
-   * and that message stays in two parts where the extension ends inside it.
+   * that pins keep raw and that holds no tool result. The chunker takes no
+   * message while a pin keeps it raw, so the guard can reach over such a
+   * run: a pinned call whose result is chunked, a pinned message it could
+   * take whole, or the never-chunked first parts of a message marked after
+   * its later parts were chunked (by a mark from before pins covered whole
+   * messages, or one made after a head that ended inside the message).
+   * Left out, the run goes after the history: a pinned call ahead of its
+   * result, if it has one, as without a reset, and a marked message's first
+   * parts with the rest of it rather than in the head with the history
+   * between. Nothing left out answers a call in the head. Pinned messages
+   * from the last one that holds a tool result back stay in the extension,
+   * as without a reset: a call stays in the head with its pinned result, and
+   * such a result whose later parts were chunked before its pin stays in two
+   * parts where the extension ends inside it.
    * (The guard itself, as without a reset, can also end the head right after
-   * a never-chunked call whose result is chunked.) Messages kept out of
-   * chunks without a pin (an earlier version's head that ended inside a body
-   * whose rest it chunked, or a pin since removed) stay in the extension, so
+   * a never-chunked unpinned call whose result is chunked.) Messages kept out of
+   * chunks without a pin (left by a head that ended inside a body whose rest
+   * was then chunked, or by a pin since removed) stay in the extension, so
    * they aren't chunked out of order (#122), and such a body stays in two
    * parts while the head's end is inside it. The walk back for a tool call
    * reads the whole body before the boundary, every shard of it (without a
@@ -18516,17 +18522,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (end === boundary) return end;
         // The extension keeps never-chunked messages in the head so they
         // aren't chunked after the coverage that follows them (#122). A pin
-        // that keeps a message raw keeps it out of every chunk
-        // (getCompressibleMessages), so the run at the extension's end that
-        // pins keep raw, from a body's start, is left out of it: otherwise it
-        // could end the head inside a body, sending the body in two parts
-        // with the history between. The run left out holds no tool result,
-        // so no call in the head loses one to it, and a call it leaves out
-        // goes after the history ahead of its result, if any, as without a
-        // reset. Messages kept out of chunks without a pin (left by an
-        // earlier version's head, or by a pin since removed) stay in it, and
-        // so do the pinned messages from the last one holding a tool result
-        // back, as without this.
+        // that keeps a message raw keeps it out of every chunk made while the
+        // pin stands (getCompressibleMessages), so the run at the extension's
+        // end that pins keep raw, from a body's start, is left out of it:
+        // otherwise a pinned call could stay in the head apart from its
+        // chunked result, and the first parts of a message marked after its
+        // rest was chunked could end the head inside it, sending it in two
+        // parts with the history between. The run left out holds no tool
+        // result, so no call in the head loses one to it, and a call it leaves
+        // out goes after the history ahead of its result, if any, as without a
+        // reset. Messages kept out of chunks without a pin (left by a head
+        // that ended inside their message, or by a pin since removed) stay in
+        // it, and so do the pinned messages from the last one holding a tool
+        // result back, as without this.
         const raw = this.forceRawPinPositions(messages);
         let kept = end;
         for (let k = end - 1; k >= boundary && raw.has(k) && !this.hasToolResult(messages[k]); k--) {
