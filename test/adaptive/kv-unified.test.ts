@@ -6,6 +6,7 @@ import {
   CanonicalSummaryForest,
   ExactEnumerationLimitError,
   SparseLabelCeilingError,
+  heldLevelPin,
   type CanonicalLeafConstraint,
 } from '../../src/adaptive/kv-unified.js';
 import { accountFrontier, type PickerInputs } from '../../src/adaptive/picker.js';
@@ -181,6 +182,146 @@ test('kv-unified intersects locks and pins instead of choosing precedence', () =
     result.certificate.bindingLeaves[0].constraints.map((constraint) => constraint.source),
     ['lockedByAgent', 'pin-level'],
   );
+});
+
+test('kv-unified holds a level pin at the deepest level its chain supplies until the pinned one exists (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  const c = chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  const d = chronicle.addChunk({ id: 'd', rawTokens: 100 });
+  const ab = chronicle.produceL1(['a', 'b']);
+  const cOnly = chronicle.produceL1(['c']);
+  a.pinLevel = 2;
+  c.pinLevel = 2;
+  d.pinLevel = 2;
+
+  // Held: a and c at their L1, d (no summary) raw; nothing conflicts.
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(forest.constraintConflicts, []);
+  assert.deepEqual(forest.leaf('a')?.allowedLevels, [1]);
+  assert.deepEqual(forest.leaf('c')?.allowedLevels, [1]);
+  assert.deepEqual(forest.leaf('d')?.allowedLevels, [0]);
+  assert.deepEqual(heldLevelPin(forest.leaf('a')!), { level: 2, heldAt: 1 });
+  assert.deepEqual(heldLevelPin(forest.leaf('d')!), { level: 2, heldAt: 0 });
+  assert.equal(heldLevelPin(forest.leaf('b')!), null, 'no pin, no hold');
+  assert.ok(forest.minimumTokens(1_000).feasible);
+
+  // The L2 arrives. The next compile derives the forest, and the extension
+  // rebuilds the leaves whose chain changed: the pin is at its level.
+  const l2 = chronicle.produceUpper(2, [ab.id, cOnly.id]);
+  const merged = CanonicalSummaryForest.derive(forest, inputsOf(chronicle));
+  assert.ok(merged, 'setup: a merge extends the previous forest');
+  assert.deepEqual(merged.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(merged.leaf('c')?.allowedLevels, [2]);
+  assert.equal(heldLevelPin(merged.leaf('a')!), null);
+  assert.deepEqual(heldLevelPin(merged.leaf('d')!), { level: 2, heldAt: 0 });
+
+  // A level a summary no longer supplies is held again.
+  chronicle.summaries.delete(l2.id);
+  chronicle.recallPairTokens.delete(l2.id);
+  delete ab.parentId;
+  delete cOnly.parentId;
+  const dropped = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(dropped.leaf('a')?.allowedLevels, [1]);
+  assert.deepEqual(dropped.constraintConflicts, []);
+
+  // A lock stays strict, judged against the pinned level whether or not it
+  // exists: locked at its carried L0, or at the L1 the pin would be held at,
+  // the pin isn't held, the leaf has no level, and the conflict names the
+  // missing L2.
+  a.lockedByAgent = true;
+  for (const carried of [0, 1]) {
+    a.currentResolution = carried;
+    const locked = new CanonicalSummaryForest(inputsOf(chronicle));
+    assert.deepEqual(locked.leaf('a')?.allowedLevels, [], `locked at L${carried}`);
+    assert.equal(heldLevelPin(locked.leaf('a')!), null, `locked at L${carried}: a contradicted pin isn't held`);
+    assert.deepEqual(
+      locked.constraintConflicts.map((conflict) => [
+        conflict.leafId,
+        conflict.constraints.map((constraint) => constraint.source),
+        conflict.requestedMissingLevels,
+      ]),
+      [['a', ['lockedByAgent', 'pin-level'], [2]]],
+      `locked at L${carried}`,
+    );
+  }
+  // Locked at the pinned level once it exists, the two agree.
+  chronicle.produceUpper(2, [ab.id, cOnly.id]);
+  a.currentResolution = 2;
+  const agreeing = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(agreeing.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(agreeing.constraintConflicts, []);
+});
+
+test('kv-unified holds a level pin only while every other constraint on its leaf allows both the pinned level and the level held at (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  chronicle.produceL1(['a', 'b']);
+  const c = chronicle.addChunk({ id: 'c', rawTokens: 100 });
+  // Each row: the leaf ('a', whose chain supplies L1, or 'c', whose chain
+  // supplies no summary), its pinned level, the other constraints on it, then
+  // the leaf's allowed levels, the missing levels its conflict names (null: no
+  // conflict) and the level it's held at (null: not held).
+  const cases: Array<[string, number | undefined, CanonicalLeafConstraint[], number[], number[] | null, number | null]> = [
+    ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }], [1], null, 1],
+    ['a', 2, [{ kind: 'max', level: 2, source: 'cap' }], [1], null, 1],
+    ['a', 2, [{ kind: 'min', level: 1, source: 'floor' }], [1], null, 1],
+    ['a', 2, [{ kind: 'raw', source: 'raw' }], [], [2], null],
+    ['a', 2, [{ kind: 'max', level: 1, source: 'cap' }], [], [2], null],
+    ['a', 2, [{ kind: 'exact', level: 1, source: 'exact' }], [], [2], null],
+    ['a', 2, [{ kind: 'min', level: 3, source: 'floor' }], [], [2, 3], null],
+    // These floors allow the pinned level but not the L1 it would be held
+    // at, so the pin isn't held and its conflict names the pinned level.
+    ['a', 2, [{ kind: 'min', level: 2, source: 'floor' }], [], [2], null],
+    ['a', 3, [{ kind: 'min', level: 2, source: 'floor' }], [], [2, 3], null],
+    // Every other constraint has to allow both levels, not only the first.
+    ['a', 2, [{ kind: 'max', level: 3, source: 'cap' }, { kind: 'min', level: 2, source: 'floor' }], [], [2], null],
+    // A bound that isn't a non-negative integer allows no level (buildLeaf
+    // empties the leaf for it), so the pin isn't held and its conflict names
+    // the pinned level.
+    ['a', 2, [{ kind: 'min', level: -1, source: 'floor' }], [], [2], null],
+    ['a', 2, [{ kind: 'min', level: 0.5, source: 'floor' }], [], [2], null],
+    ['a', 2, [{ kind: 'max', level: 2.5, source: 'cap' }], [], [2], null],
+    // Where the chain supplies no summary, the pin is held raw, so a floor
+    // that excludes raw makes it strict.
+    ['c', 2, [{ kind: 'max', level: 2, source: 'cap' }], [0], null, 0],
+    ['c', 2, [{ kind: 'min', level: 1, source: 'floor' }], [], [1, 2], null],
+    // A pinned level that isn't a non-negative integer is never held:
+    // buildLeaf empties the leaf, and its conflict names no level.
+    ['a', 1.5, [], [], [], null],
+    ['a', -1, [], [], [], null],
+    ['a', Number.NaN, [], [], [], null],
+    // A caller's exact constraint that carries the pin's label isn't a level
+    // pin: only the one made from the chunk's pinLevel is held.
+    ['a', undefined, [{ kind: 'exact', level: 2, source: 'pin-level' }], [], [2], null],
+  ];
+  for (const [id, pinLevel, constraints, allowed, missing, heldAt] of cases) {
+    a.pinLevel = undefined;
+    c.pinLevel = undefined;
+    (id === 'a' ? a : c).pinLevel = pinLevel;
+    const forest = new CanonicalSummaryForest(inputsOf(chronicle), { constraints: new Map([[id, constraints]]) });
+    const label = `${id} ${pinLevel === undefined ? 'unpinned' : `pinned at L${pinLevel}`} beside ${JSON.stringify(constraints)}`;
+    assert.deepEqual(forest.leaf(id)?.allowedLevels, allowed, label);
+    assert.deepEqual(forest.constraintConflicts.map((conflict) => conflict.requestedMissingLevels), missing ? [missing] : [], label);
+    assert.deepEqual(heldLevelPin(forest.leaf(id)!), heldAt === null ? null : { level: pinLevel, heldAt }, label);
+  }
+});
+
+test('kv-unified holds a level pin at the deepest level below it, not at a level above it that the chain supplies (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['a', 'b']);
+  const l2 = chronicle.produceUpper(2, [l1.id]);
+  // A lineage that skips a level: the summary over the L2 is an L4.
+  (chronicle.produceUpper(3, [l2.id]) as { level: number }).level = 4;
+  a.pinLevel = 3;
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(forest.leaf('a')?.availableLevels, [0, 1, 2, 4], 'setup: the chain supplies L1, L2 and L4, and no L3');
+  assert.deepEqual(forest.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(heldLevelPin(forest.leaf('a')!), { level: 3, heldAt: 2 });
 });
 
 test('kv-unified suggests producing the missing levels only where that clears every conflict', () => {

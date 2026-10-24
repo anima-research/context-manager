@@ -1914,7 +1914,10 @@ export class ContextManager {
    * deepest it has, and one whose own-lineage summary at `level` doesn't list
    * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
-   * resolution; under any other selector the range is raw, in the live view
+   * resolution (under kv-unified, a message no summary supplies that level
+   * over yet is held at the deepest level below it that one does; see
+   * `ProtectedRange.level`); under
+   * any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`). Returns the new pin id.
    */

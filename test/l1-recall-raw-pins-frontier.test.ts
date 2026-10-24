@@ -913,13 +913,7 @@ describe('a pin resolves once, for compression and every selector', () => {
       const cm = await ContextManager.open({ path: join(dir, `picker-${name}`), strategy });
       const ids = Array.from({ length: 40 }, (_, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `M-${i}` }]));
       for (const { at, ...bound } of pins) cm.pinRange(ids[at], ids[at], bound);
-      try {
-        await cm.compile();
-      } catch (error) {
-        // kv-unified refuses a level no summary supplies yet; the chunks were
-        // read before it solved.
-        if (!(name === 'kv-unified' && /constraints are infeasible/.test(String(error)))) throw error;
-      }
+      await cm.compile();
       assert.ok(captured, 'setup: the picker was built');
       for (let at = 1; at <= 10; at++) {
         const chunk: ChunkPins | undefined = captured!.find((c) => c.id === ids[at]);

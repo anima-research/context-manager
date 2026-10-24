@@ -59,6 +59,7 @@ import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
 import { KvUnifiedStrategy, ceilingMark, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
+import { heldLevelPin, type CanonicalSummaryForest } from '../adaptive/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
@@ -2854,6 +2855,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     delete this.kvUnifiedReuse.certificate;
     delete this.kvUnifiedReuse.subtree;
     delete this.kvUnifiedReuse.whatIf;
+    this.heldLevelPins.clear();
   }
 
   /**
@@ -3564,9 +3566,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * below `level` renders at the deepest it has, and one whose own-lineage
    * summary at `level` doesn't list it renders where one does, or raw
    * (`ProtectedRange.level`). Honored by `foldingStrategy: 'kv-stable'`
-   * and `'kv-unified'` with adaptive resolution; under any other selector the
-   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
-   * L1 compression prompt where its budgets allow (see
+   * and `'kv-unified'` with adaptive resolution (under kv-unified, a message
+   * no summary supplies that level over yet is held at the deepest level
+   * below it that one does; see `ProtectedRange.level`); under any other
+   * selector the range is raw (`resolvedPinBounds`), in the live view and
+   * in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`).
    * Equivalent to `pinRange(first, last, { level })`.
    */
@@ -13395,6 +13399,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // order when the chunks were already sorted, which the strategy's
       // position-sequenced chunks are; then the leaf is a positional read.
       const forestCurrent = forest?.builtFrom(pickerInputs) === true;
+      if (forestCurrent && !dryRun) this.reportHeldLevelPins(forest!, messages);
       const forestChunks = forestCurrent ? forest!.orderedChunks() : null;
       let dense = forestChunks !== null && forestChunks.length === pickerInputs.chunks.length;
       for (let k = 0; dense && k < forestChunks!.length; k++) dense = forestChunks![k].sequence === k;
@@ -15601,6 +15606,79 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private kvUnifiedCeilingWarned = false;
   /** Structures kv-unified may derive from across compiles (validated on use). */
   private readonly kvUnifiedReuse: KvUnifiedReuse = {};
+  /** Level pins kv-unified holds below their level, by pin id, as last
+   *  reported (`reportHeldLevelPins`). */
+  private readonly heldLevelPins = new Map<string, { label: string; level: number }>();
+
+  /**
+   * Say when kv-unified holds a level pin below its level (`heldLevelPin`),
+   * from what each compile finds on the loaded branch (a dry run reports
+   * nothing, since a preview isn't the live state):
+   * one line when a compile first finds the pin held, naming it, its level,
+   * the levels its messages are held at and how many are held then, and one
+   * when a later compile finds none of its messages held for it (its level
+   * arrived over them, another pin's bound took them, they left the folded
+   * middle, or the store no longer holds an end the pin names) or the pin
+   * gone. A pin covers what `pinPositions` says, as it
+   * does for the forest: under adaptive resolution, a message stored in parts
+   * whole when its ids name one of its parts, less a part locked outside the
+   * span they name. A message counts once however many of its parts are held.
+   * A part counts toward a pin only when that pin's level is the one its
+   * bound took (`resolvedPinBounds`). The record starts over with each open
+   * and branch switch (`clearBranchMirrors`), so a pin still held then is
+   * reported again. It reports what the solve found,
+   * before the frontier is presented: a compile the solver refuses reports
+   * nothing, since its error names the cause, and one refused after the
+   * solve, such as over budget, has already reported the holds its solve made.
+   */
+  private reportHeldLevelPins(forest: CanonicalSummaryForest, messages: StoredMessage[]): void {
+    const held = new Map<MessageId, { level: number; heldAt: number }>();
+    if (this.pins.some((pin) => pin.level !== undefined && pin.level > 0)) {
+      for (const leaf of forest.orderedLeaves()) {
+        const hold = heldLevelPin(leaf);
+        if (hold) held.set(leaf.id, hold);
+      }
+    }
+    const now = new Map<string, { label: string; level: number; heldAt: Set<number>; count: number }>();
+    if (held.size > 0) {
+      const positionOf = this.positionIndex(messages);
+      for (const pin of this.pins) {
+        if (pin.level === undefined || pin.level <= 0) continue;
+        const covered = this.pinPositions(pin, positionOf, messages);
+        if (covered === undefined) continue;
+        const heldAt = new Set<number>();
+        // Held messages, each by its first position: a message's parts are one.
+        const bodies = new Set<number>();
+        for (const i of covered) {
+          const hold = held.get(messages[i].id);
+          if (!hold || hold.level !== pin.level) continue;
+          heldAt.add(hold.heldAt);
+          bodies.add(bodyBoundsIn(messages, i).from);
+        }
+        const label = pin.name ? `${pin.id} ("${pin.name}")` : pin.id;
+        if (bodies.size > 0) now.set(pin.id, { label, level: pin.level, heldAt, count: bodies.size });
+      }
+    }
+    const levelName = (level: number): string => (level === 0 ? 'raw' : `L${level}`);
+    for (const [id, pin] of now) {
+      if (this.heldLevelPins.has(id)) continue;
+      this.heldLevelPins.set(id, { label: pin.label, level: pin.level });
+      this.diag.warn(
+        `autobio: kv-unified holds pin ${pin.label}, pinned at L${pin.level}, at ` +
+          `${[...pin.heldAt].sort((a, b) => a - b).map(levelName).join(' and ')} in ${pin.count} message(s): ` +
+          `no summary supplies L${pin.level} over them yet. They move to L${pin.level} once one does.`,
+      );
+    }
+    for (const [id, pin] of this.heldLevelPins) {
+      if (now.has(id)) continue;
+      this.heldLevelPins.delete(id);
+      this.diag.warn(
+        this.pins.some((p) => p.id === id)
+          ? `autobio: kv-unified no longer holds pin ${pin.label} below its L${pin.level}.`
+          : `autobio: pin ${pin.label}, held below its L${pin.level} by kv-unified, was removed.`,
+      );
+    }
+  }
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
