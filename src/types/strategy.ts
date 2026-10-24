@@ -160,15 +160,16 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
-   * What the next compile sends for each of `ids`, messages just stored and
-   * so among the newest of the window, in the order given. Each comes back
+   * What the next compile renders for each of `ids`, messages just stored
+   * and so among the newest of the window, in the order given, before the
+   * manager leaves out any thinking under `SelectOptions.thinkingBinding`. Each comes back
    * cut by the per-message cap, and as one message where the compile joins a
    * body's shards into one; the strategy makes every image decision it makes
    * there: its count, depth and byte limits, counted newest-first over the
    * view from the oldest of these messages to its newest, as a compile
    * counts them. It's for a caller that appends messages it has just stored
    * to a compiled request without recompiling, such as a turn's mid-turn
-   * injections, so that what it appends is what the next compile sends. A
+   * injections, so that what it appends is what the next compile renders. A
    * later compile can still strip an image of theirs as newer ones arrive.
    *
    * `store` is the view a compile reads. An id comes back as null when the
@@ -311,6 +312,49 @@ export interface ContextStrategy {
    * (for example 'budget-fit' or 'window'). Reading clears it.
    */
   takeSelectionCause?(): string | undefined;
+
+  /**
+   * The context manager left these thinking blocks of stored messages out of
+   * the request the last committing select priced, after the select (see
+   * `SelectOptions.thinkingBinding`). A strategy that calibrates its
+   * estimates against the provider's count of that request takes their
+   * price off what it expects the count to be. Not called for a dry compile.
+   */
+  noteThinkingLeftOut?(blocks: readonly ContentBlock[]): void;
+}
+
+/**
+ * Whether the model a compile is for binds each signed thinking block to the
+ * request it was minted in, so that a block sent after anything before it
+ * changed is refused, or, with the provider's drop control on, set aside.
+ * See `SelectOptions.thinkingBinding`.
+ */
+export interface ThinkingBinding {
+  /** The model binds thinking. Absent or false: the compile is as it would be
+   *  without the option, and neither reads nor writes the branch's record. */
+  binds?: boolean;
+  /** The request carries the provider's drop control, so a stale block is
+   *  set aside rather than refused. Absent means false. */
+  dropBlock?: boolean;
+  /** The participant whose messages are the model's own replies, such as
+   *  the agent's name. Required with `binds`: another participant's reply
+   *  never keeps its thinking. */
+  participant?: string;
+}
+
+/**
+ * Digests of what a request carries before its messages, as the host sends
+ * it, each opaque to the context manager and compared only for equality:
+ * the system text (system-position injections included), the tools in the
+ * order sent, the model, and the rest the provider sees ahead of the
+ * messages (such as the tool choice, the thinking config and the output
+ * limit). See `SelectOptions.identity`.
+ */
+export interface RequestIdentity {
+  system: string;
+  tools: string;
+  model: string;
+  request: string;
 }
 
 /** What a rendered summary covers, for layout reporting. */
@@ -360,6 +404,84 @@ export interface SelectOptions {
    * found after that rebuild.
    */
   dryRun?: boolean;
+  /**
+   * The model this compile is for binds signed thinking (`binds`), so the
+   * compile leaves out every thinking block whose request has changed since
+   * it was minted, and reports it in `CompileResult.thinkingStrip`. With
+   * `binds`, `participant` and `identity` are required, and a compile
+   * without them is refused before anything is selected. Without `binds`,
+   * the compile is as it would be without the option: it neither reads nor
+   * writes the branch's record. A record an earlier binding compile left is
+   * compared at the next binding compile like any other, so a message keeps
+   * its thinking only while everything up to it matches what that compile
+   * sent, a prefix the provider took with that thinking, and nothing past
+   * the record's end keeps it, unless a host noted it after that compile.
+   * A record the store can't read or write is logged, and never fails a
+   * compile or a note. One it can't read is read as none, so a committing
+   * compile starts a record in its place, as for a record this version
+   * doesn't read. When it can't write a compile's record, the record before
+   * it, if any, stands, and that compile's stream can't note onto it.
+   *
+   * The manager keeps a record per branch of what the branch last sent: the
+   * messages its last committing compile with `binds` sent (cache
+   * breakpoints aside, injections included), then the rows a host noted
+   * after them
+   * (`ContextManager.noteRequestSent`): what its stream's requests went on
+   * to carry and, once the stream ended, its last reply. With them it keeps
+   * the stored bodies the compile sent without their thinking, the
+   * compile's `identity`, and the branch's sequence where the record began.
+   * A compile compares what it renders with the record in order. From the
+   * first message that differs, or from the first message when an
+   * `identity` digest changed, every message goes without its thinking, and
+   * so does every message past the record's end: only the host knows which
+   * stored reply answered which request. A reply whose stored body went
+   * without its thinking goes without it again, since what came after it
+   * was minted without it. A message whose participant isn't
+   * `participant`, or that has no stored body (a summary's recall answer,
+   * an injection), never keeps thinking: nothing it carries was minted in
+   * this agent's requests. A manager's record serves one participant, so
+   * compile each namespace for one.
+   *
+   * A reply stored at or before the sequence where the branch's record began
+   * (`CompileResult.thinkingRecordedAfter`), which no record vouches for,
+   * keeps its thinking only with `dropBlock`, for the provider to judge. So
+   * a branch with no record, its own or (on a branch made since) the one it
+   * inherits as of its branch point, leaves out every reply's thinking
+   * without `dropBlock`; with `dropBlock` it leaves the stored replies'
+   * thinking as it is. Either way it starts the record. Each committing
+   * compile with `binds` writes the record; a dry compile reports what it
+   * would leave out and writes no record. The record survives a restart.
+   *
+   * So once a branch has a record, a reply keeps its thinking at the compile
+   * after it's stored only if the host has noted it: each later round of a
+   * stream as the host sends it, and the stream's last reply once it's
+   * stored. A host that passes `thinkingBinding` and notes nothing loses
+   * each reply's thinking at the compile after it's stored, and is never
+   * refused for it. A note names the compile its stream was built from, so
+   * a committing compile with `binds` while a stream is open makes that
+   * stream's later notes vouch for nothing, and its replies go without
+   * their thinking: while one of a branch's requests is streaming, compile
+   * for its branch with `binds` only with `dryRun`, which writes no
+   * record. A preview prices a
+   * summary's carriers by the option it's given (`previewContext`'s
+   * `thinkingBinding`), as a compile does.
+   *
+   * The comparison is of compile output. A host that turns compile output
+   * into a request (sanitizing it, adding rows) must do so the same way at
+   * every request, and must note a row only where the next request will
+   * carry it as the stream sent or got it: context-manager can't see what
+   * happens to a message after it leaves the compile.
+   */
+  thinkingBinding?: ThinkingBinding;
+  /**
+   * Digests of what this compile's request carries before its messages, for
+   * a compile with `thinkingBinding.binds`, which requires them: when one
+   * differs from the branch's record, the compile leaves out every thinking
+   * block. `system` is the system text as sent, with the content of this
+   * compile's `'system'`-position injections, which the compile returns as
+   * `CompileResult.systemInjections`.
+   */
+  identity?: RequestIdentity;
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
@@ -1228,6 +1350,11 @@ export interface AutobiographicalConfig {
    *    byte-identical to the pre-knob render on both surfaces.
    *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
    *    and merge requests still recall them verbatim.
+   *
+   * A select for a model that binds thinking (`SelectOptions.thinkingBinding`)
+   * renders and prices the live window as under `'live-strip'` whatever this
+   * says: a carrier was minted in its summarizer's request, so such a model
+   * never takes it there. Mint and merge requests are unchanged.
    *
    * TWO SURFACES, ONE STORE. A captured carrier is the ARCHIVIST'S cognition:
    * the thinking of writing the memory, not the thinking of living the span it

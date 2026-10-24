@@ -80,6 +80,7 @@ export type {
   JournalMark,
   RenderedLayout,
   LayoutUnit,
+  ThinkingStrip,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -109,6 +110,8 @@ export type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   RenderedSummaryInfo,
+  ThinkingBinding,
+  RequestIdentity,
 } from './types/index.js';
 
 // Accepted rounds and fold receipts

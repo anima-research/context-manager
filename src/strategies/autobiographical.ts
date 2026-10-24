@@ -34,6 +34,7 @@ import type {
   SelectOptions,
   PreviewResult,
   RenderedSummaryInfo,
+  ThinkingBinding,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -77,12 +78,14 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody, joinBodyContent } from '../body-runs.js';
+import { canonicalJson } from '../canonical-json.js';
+import { withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseRawFormsAcrossParts, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
-import type { IngressChunkResult } from '../types/strategy.js';
+import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { storedJson } from '../stored-json.js';
 
@@ -1437,21 +1440,6 @@ function sha256Json(value: unknown): string {
 }
 
 /**
- * JSON with each object's keys in one order whatever order they were set in
- * (sorted, though integer-like keys come first, ascending, as in any object),
- * and each array's items in their own order, so two values that differ only
- * in the order their keys were set give the same text. An object the store
- * keeps comes back with its keys sorted, while one built here keeps the order
- * it was built in.
- */
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(value, (_key, inner: unknown) => {
-    if (inner === null || typeof inner !== 'object' || Array.isArray(inner)) return inner;
-    return Object.fromEntries(Object.keys(inner).sort().map((key) => [key, (inner as Record<string, unknown>)[key]]));
-  });
-}
-
-/**
  * Sources as readers iterate them: a non-empty list of ids. Every index is
  * read, since `every` skips an empty slot of a sparse array, which the store
  * can't write.
@@ -1651,16 +1639,10 @@ export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
  *
- * A stripped Responses reasoning item releases the raw item it was paired
- * with, so the follower isn't replayed with an id whose reasoning is gone
- * (see raw-forms.ts).
+ * The blocks are left out as `withoutThinking` leaves them, raw forms
+ * included (thinking-binding.ts).
  */
-function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return releaseEditedRawForms(
-    content,
-    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
-  );
-}
+const stripThinkingBlocks = withoutThinking;
 
 /**
  * Capture the summarizer's verbatim response blocks for storage on the
@@ -2381,7 +2363,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean },
+    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
   ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
@@ -2416,7 +2398,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       let rendered: ContextEntry[] | undefined;
       try {
-        const out = this.select(store, log, budget, { dryRun: true });
+        const out = this.select(store, log, budget, { dryRun: true, thinkingBinding: opts?.thinkingBinding });
         // Only retained on request: these are full rendered entries and can be
         // megabytes on a large store.
         if (opts?.render) rendered = out;
@@ -7977,12 +7959,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the next compile's stable prefix and fold diff are measured against
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
+      this.thinkingBound = opts?.thinkingBinding?.binds === true;
       try {
         return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
         this._prevCacheKeys = prevCacheKeys;
         throw err;
       } finally {
+        this.thinkingBound = false;
         if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       }
     }
@@ -8014,6 +7998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // one that re-queued its chunk (requeuePendingChunk).
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
+    this.thinkingBound = opts?.thinkingBinding?.binds === true;
     try {
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
@@ -8022,6 +8007,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._dryRunSelect = false;
       if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
+      this.thinkingBound = false;
     }
   }
 
@@ -14068,6 +14054,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _lastCompileEstimate = 0;
   private _storeView: MessageStoreView | null = null;
 
+  /** Thinking the context manager left out after this strategy's committing
+   *  select priced it isn't sent, so the calibration sample's estimate leaves
+   *  out what this strategy priced it at: each block at the store's estimate.
+   *  The select priced each raw message's thinking blocks at just that: the
+   *  image strip and the cap that also enter a message's price never change
+   *  a thinking block's. */
+  noteThinkingLeftOut(blocks: readonly ContentBlock[]): void {
+    if (blocks.length === 0) return;
+    const tokens = this.estimateTokens([...blocks]);
+    if (Number.isFinite(tokens) && tokens > 0) this._lastCompileEstimate = Math.max(0, this._lastCompileEstimate - tokens);
+  }
+
+  /** Whether the select in progress is for a model that binds thinking
+   *  (`SelectOptions.thinkingBinding`): set from the select's own option for
+   *  the run of its select path, and false outside it. A summary's carriers
+   *  were minted in its summarizer's request, so such a model never takes
+   *  them in the live window, and the live window renders and prices them as
+   *  under `carrierPolicy: 'live-strip'`. */
+  private thinkingBound = false;
+
+  /** The carrier policy the live window renders and prices under: the
+   *  configured one, or `'live-strip'` while thinking is bound. */
+  private liveCarrierPolicy(): CarrierPolicy {
+    return this.thinkingBound || this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+  }
+
   /**
    * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
    * for a request built from the latest compile (fresh + cache_read +
@@ -15731,7 +15743,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Memoized price of a summary's recall answer as the LIVE WINDOW renders
    *  it (carriers included under `carrierPolicy: 'full'`, omitted under
-   *  `'live-strip'`, because this price feeds the fold planner for that same
+   *  `'live-strip'` or while thinking is bound, as liveCarrierPolicy says,
+   *  because this price feeds the fold planner for that same
    *  emission): `estimate` is the estimate of that content, and `cost` is
    *  what it's priced at, the estimate floored at the provider's measurement
    *  where that measurement counts what's sent. Keyed by the summary identity
@@ -15743,7 +15756,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
-    const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+    const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._answerCostCache.get(key);
@@ -19228,7 +19241,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The answer body for the LIVE WINDOW — the surface the agent whose memory
-   * this is reads back — under `carrierPolicy`.
+   * this is reads back — under `carrierPolicy`, or under `'live-strip'`
+   * while thinking is bound (liveCarrierPolicy).
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
@@ -19237,8 +19251,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * here would break the signature that the mint surface depends on — hence
    * omission, never rewriting. Every surviving block is passed through by
    * reference, except a Responses item a stripped reasoning item led to: every
-   * block that shares it is copied without its raw item, and so without its id
-   * (see raw-forms.ts).
+   * block that shares it, other than an opaque carrier, is copied without its
+   * raw item, and so without its id (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -19248,7 +19262,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected liveWindowAnswerProse(summary: SummaryEntry): ContentBlock[] {
     const prose = this.summaryAnswerProse(summary);
-    if (this.config.carrierPolicy !== 'live-strip') return prose;
+    if (this.liveCarrierPolicy() !== 'live-strip') return prose;
     const stripped = stripThinkingBlocks(prose);
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,
