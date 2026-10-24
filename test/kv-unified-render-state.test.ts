@@ -505,6 +505,43 @@ describe('with history folded', () => {
     });
   }
 
+  it("an image in a folded chunk takes its live slot in the rebuild as in the emission, which strips an older raw one for it", async () => {
+    // The head window holds the first turn's image, and a later turn that the
+    // solve folds holds a newer one. With one live image, the adaptive
+    // selection counts the folded image as its estimates do, so the head's
+    // is sent as the placeholder; the check's rebuild must strip it too, or
+    // it hashes the head as it wasn't sent and the self-check says so.
+    // 1,800 tokens hold the first turn and its image, and not the second turn.
+    const { dir, strategy, manager } = await open({ ...FOLDED, headWindowTokens: 1_800, maxLiveImages: 1 }, undefined, membrane);
+    try {
+      for (let k = 0; k < 40; k++) {
+        const [p, content] = turn(k);
+        manager.addMessage(p, k === 0 || k === 10 ? [image(), ...content] : content);
+      }
+      await compile(manager);
+      for (let i = 0; i < 16; i++) await manager.tick();
+      const one = (await manager.compile(at(2_000), undefined, HASH)).messages as Wire[];
+      assert.ok(!has(one, (b) => (b as { type: string }).type === 'image'), "premise: the tenth turn's image is folded, so no image is sent");
+      assert.ok(one[0]!.content.some((b) => textOf(b).includes('image not shown')), "premise: the head's image is the placeholder");
+      accept(strategy, one);
+      const ref = reference(strategy)!;
+      assert.ok(ref.layout.units.some((unit) => unit.kind === 'recall'), 'premise: the reference holds recall units');
+      const hooks = strategy as unknown as { kvUnifiedSelfCheck(...args: unknown[]): unknown };
+      const check = hooks.kvUnifiedSelfCheck.bind(strategy);
+      let compared = 0;
+      hooks.kvUnifiedSelfCheck = (...args) => { compared++; return check(...args); };
+      add(manager, [turn(40), turn(41)]);
+      const two = (await manager.compile(at(2_000), undefined, HASH)).messages as Wire[];
+      assert.equal(compared, 1, 'premise: the next compile keeps the presentation and compares its rebuild');
+      assert.equal(firstChange(one, two), one.length, 'premise: nothing the accepted request sent changes');
+      assert.deepEqual(taken(SELF_CHECK), [], "the rebuild strips the head's image as the emission did");
+      assert.equal(solveMarkers(strategy), ref.markers.length, 'every marker survives the check');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a recall answer under another summary participant is not credited', async () => {
     const first = await folded({}, false);
     let { strategy, manager } = first;

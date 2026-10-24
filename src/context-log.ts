@@ -11,6 +11,7 @@ import type {
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces, wellFormedContent } from './well-formed-content.js';
+import { storedJson } from './stored-json.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -144,7 +145,7 @@ export class ContextLog {
       content: storedContent,
     };
 
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    this.store.editStateItem(this.stateId, index, storedJson(updated));
   }
 
   /**
@@ -335,6 +336,8 @@ export class ContextLog {
         return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
       case 'image':
         return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+      case 'generated_image': // as MessageStore prices it: an image without a stamp
+        return 1600;
       case 'document':
       case 'audio':
       case 'video':

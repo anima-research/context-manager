@@ -13,6 +13,8 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    # A test job that hangs is stopped here, rather than at GitHub's six hours.
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -33,8 +35,11 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test
-        run: npm test
+      # Each test file runs in a process of its own instead of through
+      # node --test, whose parent can hang for good on Node 22:
+      # scripts/test-each-file.sh says why.
+      - name: Test (each file in its own process)
+        run: bash scripts/test-each-file.sh
 
   publish:
     name: Publish to npm

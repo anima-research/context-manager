@@ -32,6 +32,8 @@ import type {
   SummaryEntry,
   TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
+  RequestIdentity,
+  ThinkingBinding,
   SelectOptions,
   PreviewResult,
   HotContextSettingsStatus,
@@ -58,6 +60,11 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import {
+  UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
+  type BindOutcome, type BindingRecord,
+} from './thinking-binding.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
@@ -430,6 +437,7 @@ export class ContextManager {
     // so strategies always have something to scope state IDs by, even when
     // the caller didn't supply a namespace.
     const strategyNamespace = config.namespace ?? 'default';
+    registerBindingState(store, strategyNamespace);
     const messageStore = new MessageStore(store, {
       estimator: config.tokenEstimator,
       namespace: messageNamespace,
@@ -1146,6 +1154,10 @@ export class ContextManager {
    * - "afterUser": inserted after the last user message, or at the end when
    *   the messages hold none
    *
+   * With `opts.thinkingBinding.binds`, it then leaves out the thinking a
+   * model that binds thinking can no longer take, injections placed (see
+   * `SelectOptions.thinkingBinding`).
+   *
    * May block if strategy has pending work.
    */
   async compile(
@@ -1154,6 +1166,9 @@ export class ContextManager {
     opts?: SelectOptions
   ): Promise<CompileResult> {
     this.requireInitialized('compile');
+    // Before anything is selected or committed: a compile refused here leaves
+    // nothing behind.
+    if (opts?.thinkingBinding?.binds === true) refuseUnboundBinding(opts);
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -1186,6 +1201,8 @@ export class ContextManager {
       opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
+    // Read now, before anything else selects: these are this select's own.
+    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
@@ -1232,10 +1249,43 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
-      result.rawBodies = rawBodiesOf(attribution);
-      const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
+      const rawBodies = rawBodiesOf(attribution);
+      const compileId = randomUUID();
+      const binding = opts?.thinkingBinding?.binds === true
+        ? this.bindThinkingIn(result, messageSources, opts, compileId)
+        : null;
+      result.rawBodies = rawBodies;
+      if (renderStats) result.renderStats = renderStats;
+      // A body sent without its thinking isn't carried whole, and the layout
+      // prices what was sent: thinking only where a stored body kept it.
+      let layoutEntries = entries;
+      let layoutInjected = injected;
+      let rawComplete = attribution.rawComplete;
+      if (binding) {
+        const without = new Set(binding.record.without);
+        if (without.size > 0) {
+          markThinkingLeftOut(messageSources, without);
+          // Keyed by each stored member of a body, as attribution keys it.
+          const complete = new Map(rawComplete);
+          for (const id of without) {
+            for (const member of rawBodies.get(id) ?? []) if (complete.has(member.id)) complete.set(member.id, false);
+          }
+          rawComplete = complete;
+        }
+        // Each entry keeps the thinking the compile sent of it: an entry the
+        // compile splits (a bundled tool cycle) is bound part by part, so one
+        // part can keep what another leaves out. The record's `without` is
+        // per body, so from the next compile such a body goes without whole.
+        const sent = thinkingSent(result.messages);
+        layoutEntries = entries.map((entry) => {
+          const content = thinkingAsSent(entry.content, sent);
+          return content === entry.content ? entry : { ...entry, content };
+        });
+        layoutInjected = injected.map((content) => (content.some(isThinkingBlock) ? withoutThinking(content) : content));
+      }
+      const layout = this.renderedLayoutFor(viewMessages, layoutEntries, rawComplete, layoutInjected, selectionCause);
       result.provenance = {
-        compileId: randomUUID(),
+        compileId,
         namespace: this.strategyNamespace,
         branch,
         messages: messageSources,
@@ -1245,6 +1295,34 @@ export class ContextManager {
         ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
+      // Last, once nothing of the compile can still fail: what a committing
+      // compile leaves behind for the next one.
+      if (opts?.dryRun !== true) {
+        if (binding) {
+          // Nothing here fails the compile: a record it can't write leaves
+          // the one before, if any, which this compile's stream can't note
+          // onto, so what it sends past that record goes without its
+          // thinking. The strategy's note only adjusts its calibration, so a
+          // strategy that throws there is logged and the compile stands too.
+          this.writeBindingRecordFor(
+            binding.record,
+            'this compile\'s stream can\'t note onto the record before it, if any, so its replies go without their thinking until a compile with binds writes the record',
+          );
+          if (binding.leftOut.length > 0) {
+            try {
+              this.strategy.noteThinkingLeftOut?.(binding.leftOut);
+            } catch (err) {
+              this.diag.error('[context-manager] the strategy failed to take note of thinking left out:', describeThrown(err));
+            }
+          }
+        }
+        // A compile without binds neither reads nor writes the record. One an
+        // earlier binding compile left is compared at the next binding compile
+        // like any other: a message keeps its thinking only while everything
+        // up to it matches what that compile sent and its stream noted, a
+        // prefix the provider took with that thinking, and nothing past the
+        // record's end keeps it.
+      }
       return result;
     };
 
@@ -1315,6 +1393,36 @@ export class ContextManager {
     }
 
     return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * Leave out of `result.messages` the thinking the branch's record says a
+   * binding model can no longer take, and report it (see
+   * `SelectOptions.thinkingBinding`). Returns what a committing compile then
+   * leaves behind: the record, and the stored thinking it left out.
+   */
+  private bindThinkingIn(
+    result: CompileResult,
+    sources: readonly CompiledMessageSources[],
+    opts: SelectOptions,
+    compileId: string,
+  ): BindOutcome {
+    const record = this.readBindingRecordFor('this compile goes on as if the branch had no record, and if it commits, its record takes that one\'s place');
+    const outcome = bindThinking({
+      messages: result.messages,
+      sources,
+      record,
+      dropBlock: opts.thinkingBinding?.dropBlock === true,
+      // Checked at the compile's start (refuseUnboundBinding).
+      identity: opts.identity!,
+      participant: opts.thinkingBinding!.participant!,
+      sequence: this.store.currentSequence(),
+      compileId,
+    });
+    result.messages = outcome.messages;
+    if (outcome.strip) result.thinkingStrip = outcome.strip;
+    result.thinkingRecordedAfter = outcome.record.recordedAfter;
+    return outcome;
   }
 
   /**
@@ -1553,7 +1661,8 @@ export class ContextManager {
   /**
    * What the next compile sends for each of `ids`, messages this manager has
    * just stored, rendered as the newest of the window (see
-   * `ContextStrategy.renderAsNewest`). Give each message by the id
+   * `ContextStrategy.renderAsNewest`), before any thinking the thinking
+   * binding leaves out (`SelectOptions.thinkingBinding`). Give each message by the id
    * `addMessage` returned. For a body stored as shards that's its first
    * shard's, which stands for the whole body where the compile joins its
    * shards; where the compile sends each shard on its own, an id gives back
@@ -1583,6 +1692,141 @@ export class ContextManager {
     return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
   }
 
+  /**
+   * Note what a stream built from this branch's last committing compile with
+   * `binds` sent
+   * after the compiled messages (see `SelectOptions.thinkingBinding`): as it
+   * sends each later round, every row its request carried so far, and once
+   * the stream has ended, those rows and its last reply. Call it on the
+   * branch that compile was on, with `compileId`, that compile's
+   * `provenance.compileId`. Each row, in order, is the id `addMessage`
+   * returned for a stored message, which stands for the whole body, or
+   * `{ unstored: true }`. `identity` is the head the stream was sent with.
+   * The branch's record then holds these rows, so at the next compile they
+   * keep their thinking while nothing up to them differs. Past the record's
+   * end nothing keeps its thinking: a reply keeps its thinking at the next
+   * compile only once a note holds it.
+   *
+   * Note only what the host can vouch it sent, or for the last reply, got
+   * back: a stored row whose copy, as `renderAsNewest` renders it and the
+   * host's request then carries it, differs from what was sent or returned
+   * is `{ unstored: true }`, and so is a row the store doesn't hold that the
+   * next request won't carry where this one did. A request-only row the
+   * host puts back in the same place at every later request needs no row,
+   * since no compile holds it. A note sent with another head than the
+   * record's leaves the record vouching for nothing until a compile writes
+   * it again: the stream's earlier thinking was minted under the
+   * old head. A host that notes nothing keeps no reply's thinking past the
+   * compile after it was stored, and is never refused for it.
+   *
+   * Each stored row is digested as `renderAsNewest` renders it and as the
+   * compile turns that into messages: a tool result under another
+   * participant goes as the user's, and a bundled tool cycle as each of its
+   * parts (`splitMixedToolMessages`). So one it renders as null, or that the
+   * next compile renders otherwise, matches nothing there, and what follows
+   * goes without its thinking; a note that renders rows this way releases
+   * compression holds that have timed out, as `renderAsNewest` does.
+   * Without `renderAsNewest`, a row is its stored content, and a body stored
+   * as shards matches nothing, and so does an id the store doesn't hold, as
+   * after a removal.
+   *
+   * Returns false and writes nothing when `compileId` isn't the compile that
+   * wrote the branch's record, as for a stream whose note arrives after
+   * another committing compile with `binds`: its replies were minted under a
+   * prefix the record no longer holds, and go without their thinking. A
+   * compile without `binds` leaves the record, so a note after one still
+   * writes. It returns false too when the branch has no record, and, logging
+   * it, when the record is one this version can't read, or the store can't
+   * read or write it; a note it can't write is lost, and the record stands
+   * as the last one written.
+   * A dry compile writes no record, so it leaves a stream's notes as they
+   * were. Throws, writing nothing, for a row that isn't an id or the marker,
+   * a `compileId` that isn't a string, or a digest that isn't a string.
+   */
+  noteRequestSent(rows: ReadonlyArray<MessageId | { unstored: true }>, identity: RequestIdentity, compileId: string): boolean {
+    this.requireInitialized('noteRequestSent');
+    if (!Array.isArray(rows)) throw new TypeError(`noteRequestSent: \`rows\` must be an array, got ${typeof rows}`);
+    rows.forEach((row: unknown, i) => {
+      if (typeof row === 'string') return;
+      if (typeof row === 'object' && row !== null && (row as { unstored?: unknown }).unstored === true) return;
+      throw new TypeError(`noteRequestSent: row ${i} must be a message id or { unstored: true }, got ${JSON.stringify(row) ?? typeof row}`);
+    });
+    refuseUnreadableIdentity(identity);
+    if (typeof compileId !== 'string') {
+      throw new TypeError(
+        `noteRequestSent: \`compileId\` must be a string, the provenance.compileId of the compile the stream was built from; got ${typeof compileId}`,
+      );
+    }
+    const record = this.readBindingRecordFor('this note writes nothing, and the branch\'s next committing compile with binds replaces the record');
+    // A note is for the stream of the compile that wrote the record; after
+    // another committing compile with binds its replies were minted under a
+    // prefix the record no longer holds.
+    if (record === null || record.compileId !== compileId) return false;
+    const view = this.mergedMessageView();
+    // An id the store doesn't hold, as after a removal, is nothing the next
+    // compile sends: it vouches for nothing, as the marker does.
+    const ids = rows.filter((row): row is MessageId => typeof row === 'string' && view.get(row) !== null);
+    const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
+    let next = 0;
+    const continued: string[] = [];
+    for (const row of rows) {
+      const stored = typeof row === 'string' ? view.get(row) : null;
+      if (stored === null) {
+        continued.push(UNVOUCHED);
+        continue;
+      }
+      // With no renderAsNewest, a row is its stored content, which for a body
+      // stored as shards is only its first shard's.
+      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? stored.content : null) : rendered[next];
+      next++;
+      if (content === null || content === undefined) {
+        continued.push(UNVOUCHED);
+        continue;
+      }
+      // As the compile turns it into messages: a tool result under another
+      // participant goes as the user's, and a bundled tool cycle as each of
+      // its parts.
+      for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
+    }
+    return this.writeBindingRecordFor(
+      continueRecord(record, continued, identity),
+      'this note is lost: the record stands as the last one written, so the rows this note adds go without their thinking unless a later note of the stream writes',
+    );
+  }
+
+  /**
+   * The branch's binding record. One this version doesn't read, or that the
+   * store can't give, is logged, with what follows from it, and read as
+   * none; a committing compile with `binds` then writes its own in its place.
+   */
+  private readBindingRecordFor(consequence: string): BindingRecord | null {
+    let read: ReturnType<typeof readBindingRecord>;
+    try {
+      read = readBindingRecord(this.store, this.strategyNamespace);
+    } catch (err) {
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} couldn't be read (${describeThrown(err)}); ${consequence}`);
+      return null;
+    }
+    if (read.malformed) {
+      this.diag.warn(
+        `[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} isn't ` +
+        `one this version reads; ${consequence}`,
+      );
+    }
+    return read.record;
+  }
+
+  /** Write the branch's binding record; a write that throws is logged, with what follows from it, and false. */
+  private writeBindingRecordFor(record: BindingRecord, consequence: string): boolean {
+    try {
+      writeBindingRecord(this.store, this.strategyNamespace, record);
+      return true;
+    } catch (err) {
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} couldn't be written (${describeThrown(err)}); ${consequence}`);
+      return false;
+    }
+  }
+
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
     this.requireInitialized('getHotContextSettings');
@@ -1603,11 +1847,14 @@ export class ContextManager {
    * Non-committing preview of the layout at a hypothetical budget and/or
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
    * Returns null when the active strategy has no fold plan to preview.
+   * `opts.thinkingBinding` previews a compile with that option: a binding
+   * one prices a summary's carriers as such a compile renders them (see
+   * `SelectOptions.thinkingBinding`); without it, as configured.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean },
+    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -1616,7 +1863,7 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean },
+        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
       ) => PreviewResult;
     };
     if (typeof s.previewContext !== 'function') return null;
@@ -1637,7 +1884,11 @@ export class ContextManager {
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps the
    * messages out of compression and renders them raw at their original
-   * chronological position. A bound above 0 is read only under
+   * chronological position, a message stored in parts whole, as
+   * `ProtectedRange` describes. A compile whose budget can't hold them beside
+   * the rest refuses with `OverBudgetError`; where the adaptive plan's middle
+   * is over the budget, its message and `diagnostics.rawPins` name each pin
+   * keeping raw tokens in that middle. A bound above 0 is read only under
    * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution`: there the range is still compressed, since only a
    * summary can supply its level, and is held at `level`, or no deeper than
@@ -1681,7 +1932,13 @@ export class ContextManager {
    * `kind: 'document'`, levels included (see `pinRange`): without a `level`
    * or `maxLevel` the message is kept raw, while
    * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
-   * where the selector reads level bounds.
+   * where the selector reads level bounds. Under adaptive resolution, a mark
+   * on any part of a message stored in parts covers the whole message, less
+   * a part locked with `lockChunk` outside the span the mark's id names, as
+   * `pinRange` does.
+   * Under `kv-stable`, a mark with `level` (not `maxLevel`) holds whole each
+   * summary it reaches, so a locked part that shares a summary with a part
+   * the mark covers renders at the level the mark holds that summary at.
    * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
@@ -1760,9 +2017,13 @@ export class ContextManager {
   }
 
   /**
-   * Per-render stats from the active strategy: head/tail message + token
+   * Per-render stats of the last live compile: head/tail message + token
    * counts, plus per-level summary counts and total tokens. Returns null
-   * if the strategy doesn't implement `getRenderStats`.
+   * if the strategy doesn't implement `getRenderStats`, and before a live
+   * compile has run since the strategy loaded its branch (opening the store,
+   * `setStrategy()`, a branch switch). A dry run or preview leaves it as it
+   * was; a compile's own stats, a dry one's included, are its result's
+   * `renderStats`.
    *
    * Designed for TUIs / dashboards that want to display "how much of the
    * agent's context is folded vs raw" at a glance.
@@ -2029,10 +2290,26 @@ export class ContextManager {
     // strategy: a close() from a listener lets the write it interrupted
     // finish, and that write's remaining shards are stored unheard.
     if (this.strategy.onNewMessage && !this.closed) {
-      // Fire and forget - don't block on strategy processing
-      this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
-        this.diag.error('Strategy onNewMessage failed:', err);
-      });
+      // Fire and forget: the write doesn't wait for the strategy, and the
+      // strategy's failure isn't the write's (#288). The hook runs here,
+      // inside the append, so its synchronous part comes before addMessage
+      // returns, after a holdCompression hold is placed. A hook that isn't
+      // async can throw before it returns, and the throw is logged the same
+      // way as a rejection. It can also return no promise, which isn't a
+      // failure. Either way the message stays stored, as do a sharded body's
+      // remaining shards, and the strategy isn't offered it again. Only the
+      // strategy's call is caught: the manager's own work around it, the
+      // context it hands the strategy among it, still fails the write, as
+      // onMessage's note says. The log is logThrown's, which survives a
+      // thrown value that can't be formatted.
+      const failed = (err: unknown) =>
+        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
+      const ctx = this.createStrategyContext();
+      try {
+        Promise.resolve(this.strategy.onNewMessage(message, ctx)).catch(failed);
+      } catch (err) {
+        failed(err);
+      }
     }
   }
 
@@ -2204,15 +2481,23 @@ export class ContextManager {
   }
 }
 
-/** What a store event was about, for a log line: its message (and body group), or its span. */
+/**
+ * What a store event was about, for a log line's message: its message (and
+ * body group), or its span. The message is a format string, since a thrown
+ * value follows it, so a '%' in an id, such as a body group a host's strategy
+ * chose, is doubled to print as itself.
+ */
 function describeStoreEvent(event: MessageStoreEvent): string {
-  switch (event.type) {
-    case 'add':
-      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
-    case 'edit':
-    case 'remove':
-      return `message ${event.messageId}`;
-    case 'removeRange':
-      return `messages ${event.fromId} to ${event.toId}`;
-  }
+  const text = ((): string => {
+    switch (event.type) {
+      case 'add':
+        return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+      case 'edit':
+      case 'remove':
+        return `message ${event.messageId}`;
+      case 'removeRange':
+        return `messages ${event.fromId} to ${event.toId}`;
+    }
+  })();
+  return text.replaceAll('%', '%%');
 }

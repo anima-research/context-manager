@@ -318,6 +318,174 @@ describe("an override of truncateContent is the cut a raw message is priced and 
     });
   }
 
+  it('autobiographical, adaptive selection: an override that drops an image the strip replaces prices the message as the cut it sends', async () => {
+    // The older message's image would be past the one live image. The
+    // override's cut sends neither its text nor its image, so the estimate,
+    // which counts the images the cut sends, gives it no slot and no saving.
+    const strategy = new MarkedCut({ maxMessageTokens: 100, overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, attempt, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'r'.repeat(2000) }, IMAGE]],
+      ['a', [{ type: 'text', text: 'short' }, IMAGE]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      const sent = rendered(compiled);
+      assertStatsMatch(manager, sent, true);
+      assert.equal(await attempt(sent), sent, `a budget of ${sent} sends all of it`);
+    } finally {
+      await close();
+    }
+  });
+
+  it("autobiographical, adaptive selection: a preview that overrides only maxMessageTokens prices that cap's cut, not the live compile's", async () => {
+    // The live compile has no cap, so the older image goes out as the
+    // placeholder. The preview's cap leaves it out, so its estimate must count
+    // the images that cut sends, not reuse the live compile's.
+    class DropsMarkedWhenCapped extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        const marked = content.some((block) => block.type === 'text' && block.text === 'drop images');
+        return maxTokens > 0 && marked ? content.filter((block) => block.type !== 'image') : content;
+      }
+    }
+    const strategy = new DropsMarkedWhenCapped({ overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'drop images' }, IMAGE]],
+      ['a', [{ type: 'text', text: 'newer' }, IMAGE]],
+    ]);
+    try {
+      await manager.compile(BIG);
+      const preview = manager.previewContext(BIG, { maxMessageTokens: 100 }, { render: true })!;
+      assert.ok(preview.entries, 'premise: the preview renders');
+      const images = preview.entries.flatMap((entry) => entry.content).filter((block) => block.type === 'image').length;
+      assert.equal(images, 1, "premise: the preview's cut leaves out the older image");
+      const sent = rendered({ messages: preview.entries });
+      assert.equal(preview.finalTokens, sent, `preview ${preview.finalTokens}, rendered ${sent}`);
+    } finally {
+      await close();
+    }
+  });
+
+  it('autobiographical, adaptive selection: an image the estimate gave no verdict, from an override that answers each call afresh, goes out as the placeholder', async () => {
+    // Outside truncateContent's contract: each call renames the older
+    // message's image, so the image the window sends isn't one the estimate
+    // judged. It's replaced, which errs under the budget: the estimate priced
+    // the image it judged as the placeholder, past the one live image.
+    let calls = 0;
+    class RenamesEachCall extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        if (maxTokens <= 0 || !content.some((block) => block.type === 'text' && block.text === 'renamed')) return content;
+        calls++;
+        return content.map((block) => block.type === 'image'
+          ? { ...block, source: { type: 'base64', mediaType: 'image/png', data: `R${calls}` } } as ContentBlock
+          : block);
+      }
+    }
+    const strategy = new RenamesEachCall({ maxMessageTokens: 100, overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'renamed' }, IMAGE]],
+      ['a', [{ type: 'text', text: 'newer' }, IMAGE]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      const images = compiled.messages.flatMap((m) => m.content).filter((block) => block.type === 'image').length;
+      assert.equal(images, 1, 'premise: only the newer image goes out live');
+      assert.ok(calls >= 2, `premise: the cut was asked more than once (${calls})`);
+      assertStatsMatch(manager, rendered(compiled), true);
+    } finally {
+      await close();
+    }
+  });
+
+  it('autobiographical, adaptive selection: an image whose verdict was given to another image, from an override that reorders its images after the first call, never goes out over the plan', async () => {
+    // Outside truncateContent's contract: every call after the first, which
+    // the estimate makes, swaps the message's two images, so each sent image
+    // meets the verdict the estimate gave the other. The estimate kept the
+    // first live and priced the second as the placeholder; neither verdict
+    // is the other image's, so both go out as the placeholder, under the
+    // plan, rather than the second going out live on the first's verdict.
+    // The blob store prices both images alike, so the live count, not the
+    // budget check, is what tells the two outcomes apart.
+    let calls = 0;
+    class SwapsEachCall extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        if (maxTokens <= 0) return content;
+        calls++;
+        const images = content.filter((block) => block.type === 'image');
+        const order = calls === 1 ? images : [...images].reverse();
+        return [...content.filter((block) => block.type !== 'image'), ...order];
+      }
+    }
+    const first = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'FIRST' } } as ContentBlock;
+    const second = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'SECOND' } } as ContentBlock;
+    const strategy = new SwapsEachCall({ maxMessageTokens: 100, overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'two images' }, first, second]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      assert.ok(calls >= 2, `premise: the cut was asked more than once (${calls})`);
+      const live = compiled.messages.flatMap((m) => m.content).filter((block) => block.type === 'image').length;
+      assert.equal(live, 0, 'premise: the window sent the images in the other order, and neither went out live');
+      const sent = rendered(compiled);
+      const total = manager.getRenderStats()!.total.tokens;
+      assert.ok(sent <= total, `sent ${sent}, past the render stats' ${total}`);
+    } finally {
+      await close();
+    }
+  });
+
+  it('autobiographical, adaptive selection: an override that leaves out the live one of two images prices the one it sends as live', async () => {
+    // With one live image, the first of the two takes the slot. The cut sends
+    // only the second, which then takes it: the strip and the estimate both
+    // decide over what the cut sends.
+    class KeepsLastImage extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        const first = content.findIndex((block) => block.type === 'image');
+        return maxTokens > 0 && first >= 0 ? content.filter((_, k) => k !== first) : content;
+      }
+    }
+    const second = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'BBBB' } } as ContentBlock;
+    const strategy = new KeepsLastImage({ maxMessageTokens: 100, overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, attempt, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'two images' }, IMAGE, second]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      const images = compiled.messages.flatMap((m) => m.content).filter((block) => block.type === 'image').length;
+      assert.equal(images, 1, 'premise: the cut sends the second image, and the strip keeps it live');
+      const sent = rendered(compiled);
+      assertStatsMatch(manager, sent, true);
+      assert.equal(await attempt(sent - 1), 'refused', `a budget of ${sent - 1} is refused`);
+    } finally {
+      await close();
+    }
+  });
+
+  it('autobiographical, adaptive selection: an override that leaves out one of two images alike prices the message as the cut it sends', async () => {
+    // Two generated images with the same data, in one message: the first takes
+    // the one live slot and the second is priced as the placeholder. The cut
+    // leaves out the second, so the one it sends goes out live.
+    class DropsLastImage extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        const last = content.map((block) => block.type).lastIndexOf('generated_image' as never);
+        return maxTokens > 0 && last >= 0 ? content.filter((_, k) => k !== last) : content;
+      }
+    }
+    const generated = { type: 'generated_image', data: 'C'.repeat(64), mimeType: 'image/png' } as unknown as ContentBlock;
+    const strategy = new DropsLastImage({ maxMessageTokens: 100, overBudgetGraceRatio: 0, adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'two alike' }, generated, { ...generated } as ContentBlock]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      const images = compiled.messages.flatMap((m) => m.content).filter((block) => (block as { type: string }).type === 'generated_image').length;
+      assert.equal(images, 1, 'premise: the cut sends one of the two, and the strip keeps it live');
+      assertStatsMatch(manager, rendered(compiled), true);
+    } finally {
+      await close();
+    }
+  });
+
   // An override that rewrites a message and passes the rewrite on to this
   // class's cut, with the estimate it was given: the cut decides from the
   // rewrite's estimate, not the stored message's, whether the rewrite adds a
@@ -502,6 +670,27 @@ describe('a capped message in a plan whose level has no summary is priced as it 
 });
 
 describe('a capped message whose image the strip replaces is priced with that image counted once', () => {
+  it('autobiographical, adaptive selection: an image the cut sends as a copy, releasing a raw form it shared with the cut text, is priced once', async () => {
+    // The cut releases the cut text's raw form, and so copies the image that
+    // shares it. The estimate priced that image as the placeholder, and the
+    // copy goes out as one.
+    const raw = { type: 'message', id: 'm-old', role: 'user', content: [] };
+    const url = { type: 'image', source: { type: 'url', url: 'https://example.invalid/a.png' }, rawItem: raw } as ContentBlock;
+    const strategy = autobiographical(100, { adaptiveResolution: true, maxLiveImages: 1 });
+    const { manager, rendered, close } = await open(strategy, [
+      ['u', [{ type: 'text', text: 'p'.repeat(2000), rawItem: raw } as ContentBlock, url]],
+      ['a', [{ type: 'text', text: 'q'.repeat(2000) }, IMAGE]],
+    ]);
+    try {
+      const compiled = await manager.compile(BIG);
+      const images = compiled.messages.flatMap((m) => m.content).filter((block) => block.type === 'image').length;
+      assert.equal(images, 1, 'premise: the strip replaces the older image of the two');
+      assertStatsMatch(manager, rendered(compiled), true);
+    } finally {
+      await close();
+    }
+  });
+
   it('autobiographical, adaptive selection, keeping one live image', async () => {
     const strategy = autobiographical(100, { adaptiveResolution: true, maxLiveImages: 1 });
     const { manager, rendered, close } = await open(strategy, [
@@ -514,10 +703,9 @@ describe('a capped message whose image the strip replaces is priced with that im
       assert.equal(images, 1, 'premise: the strip replaces the older image of the two');
       const sent = rendered(compiled);
       const stats = manager.getRenderStats()!;
-      // The image's placeholder is a few tokens apart between the post-strip
-      // estimate, which prices it at four characters a token, and the store.
-      // An image counted twice, or not at all, would be about 1,600 off.
-      assert.ok(Math.abs(stats.total.tokens - sent) <= 20, `render stats ${stats.total.tokens}, sent ${sent}`);
+      // The post-strip estimate takes the stripped image's placeholder at the
+      // store's price for its text, so the two agree exactly.
+      assert.equal(stats.total.tokens, sent, `render stats ${stats.total.tokens}, sent ${sent}`);
       assert.equal(stats.planVsActual!.planned, stats.planVsActual!.actual,
         `planned ${stats.planVsActual!.planned}, emitted ${stats.planVsActual!.actual}`);
     } finally {

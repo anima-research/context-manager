@@ -2,9 +2,11 @@
  * Regression: image stripping must run BEFORE the render-stats snapshot is
  * committed and BEFORE cache markers are placed, so that
  *
- *   (a) RenderStats.total reflects the POST-strip context — the real bytes the
- *       agent receives — not the pre-strip size that still counts full image
- *       weight (≈1600 tok) for images replaced by a short text placeholder.
+ *   (a) under adaptive resolution, RenderStats.total reflects the POST-strip
+ *       context — the real bytes the agent receives — not the pre-strip size
+ *       that still counts full image weight (≈1600 tok) for images replaced by
+ *       a short text placeholder. (The hierarchical selection counts a
+ *       stripped image at its full price: see RenderStats.total.)
  *       Pre-fix, getRenderStats() over-reported by ~1592 tok per stripped image
  *       (and image stripping is on by default: maxLiveImages = 6).
  *

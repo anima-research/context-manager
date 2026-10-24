@@ -66,7 +66,7 @@ async function calibrationWarnings<T>(fn: () => Promise<T>): Promise<{ result: T
 /** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
 const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
 
-async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
+async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
@@ -81,6 +81,12 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
       ...(i % 2 && opts.signedThinking ? [SIGNED_THINKING as never] : []),
       // As agent-framework stamps it from usage (src/thinking-token-stamp.ts).
       ...(i % 2 && opts.stampedThinking ? [{ ...SIGNED_THINKING, tokenEstimate: 900 } as never] : []),
+      // Priced at 0 before pricing epoch 5, and as an image since.
+      ...(i % 2 && opts.generatedImage ? [{ type: 'generated_image', data: 'C'.repeat(64), mimeType: 'image/png' } as never] : []),
+      // A tool's generated image, nested in its result.
+      ...(i === 3 && opts.nestedGeneratedImage
+        ? [{ type: 'tool_result', toolUseId: 't-gen', content: [{ type: 'generated_image', data: 'C'.repeat(64), mimeType: 'image/png' }] } as never]
+        : []),
       { type: 'text', text: `turn ${i} ${'lorem ipsum '.repeat(120)}` },
     ]);
   }
@@ -284,6 +290,117 @@ describe('estimator calibration band', () => {
     signedReopened.cm.close();
   });
 
+  it('an epoch-3 multiplier is discarded in a store holding a generated image, and kept in one without', async () => {
+    // Epoch 5 priced generated images as images, where they had cost 0: the
+    // residual learned under epoch 3, which 0.17.1 stamps, absorbed those
+    // images' real tokens. Epoch 4 repriced nothing these stores hold.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const generated = await openManager('epoch5-generated', { generatedImage: true });
+    await generated.cm.compile(BUDGET);
+    generated.internals.store!.setStateJson(generated.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
+    generated.cm.close();
+    const generatedReopened = await openManager('epoch5-generated', { generatedImage: true });
+    await generatedReopened.cm.compile(BUDGET);
+    const cal = generatedReopened.cm.getRenderStats()!.calibration!;
+    assert.equal(cal.multiplier, 1, 'restarts from 1');
+    assert.equal(cal.reset?.discardedMultiplier, 1.4);
+    assert.equal(cal.reset?.fromEpoch, 3);
+    generatedReopened.cm.close();
+
+    const plain = await openManager('epoch5-plain');
+    await plain.cm.compile(BUDGET);
+    plain.internals.store!.setStateJson(plain.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
+    plain.cm.close();
+    const plainReopened = await openManager('epoch5-plain');
+    await plainReopened.cm.compile(BUDGET);
+    assert.equal(plainReopened.internals._calibration, 1.4, 'nothing this store holds was repriced');
+    const saved = plainReopened.internals.store!.getStateJson(plainReopened.internals.calibrationStateId) as { pricing?: number };
+    assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
+    plainReopened.cm.close();
+  });
+
+  it('a generated image nested in a tool result reprices the store too', async () => {
+    const nested = await openManager('epoch5-nested', { nestedGeneratedImage: true });
+    await nested.cm.compile(BUDGET);
+    nested.internals.store!.setStateJson(nested.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
+    nested.cm.close();
+    const reopened = await openManager('epoch5-nested', { nestedGeneratedImage: true });
+    await reopened.cm.compile(BUDGET);
+    const cal = reopened.cm.getRenderStats()!.calibration!;
+    assert.equal(cal.multiplier, 1, 'restarts from 1');
+    assert.equal(cal.reset?.discardedMultiplier, 1.4);
+    reopened.cm.close();
+  });
+
+  it('a record with no stamp is discarded in a store whose only repriced content is a generated image', async () => {
+    const first = await openManager('unstamped-generated', { generatedImage: true });
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.3, at: 1 });
+    first.cm.close();
+    const reopened = await openManager('unstamped-generated', { generatedImage: true });
+    await reopened.cm.compile(BUDGET);
+    const cal = reopened.cm.getRenderStats()!.calibration!;
+    assert.deepEqual([cal.multiplier, cal.provisional, cal.reset?.discardedMultiplier, cal.reset?.fromEpoch], [1, true, 1.3, null]);
+    reopened.cm.close();
+  });
+
+  it("a previous epoch's provisional 1 stays provisional when it's kept and re-stamped", async () => {
+    // A discard under epoch 3 persisted its restart as provisional; no
+    // sample confirmed it before the upgrade, in a store epochs 4 and 5
+    // didn't reprice.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const reset = { discardedMultiplier: 0.6, fromEpoch: 1, at: 5 };
+    const first = await openManager('provisional-kept');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 3, reset, provisional: true });
+    first.cm.close();
+    const reopened = await openManager('provisional-kept');
+    await reopened.cm.compile(BUDGET);
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset });
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { pricing?: number; provisional?: boolean };
+    assert.deepEqual([saved.pricing, saved.provisional], [epoch, true], 're-stamped, still provisional');
+    reopened.cm.close();
+  });
+
+  it("a previous epoch's provisional 1 is kept in a store epoch 5 repriced, not discarded again over its reset", async () => {
+    // As 0.17.1 persists a discard under epoch 3: the restart's 1, flagged
+    // provisional, beside the reset that records what it replaced. The store
+    // holds a generated image, which epoch 5 repriced, but a 1 no sample has
+    // confirmed holds nothing learned under epoch 3's pricing.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const reset = { discardedMultiplier: 1.45, fromEpoch: 1, at: 5 };
+    const first = await openManager('provisional-generated', { generatedImage: true });
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 3, reset, provisional: true });
+    first.cm.close();
+    const reopened = await openManager('provisional-generated', { generatedImage: true });
+    const { lines } = await calibrationWarnings(() => reopened.cm.compile(BUDGET));
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset });
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { pricing?: number; provisional?: boolean; reset?: unknown };
+    assert.deepEqual([saved.pricing, saved.provisional, saved.reset], [epoch, true, reset], 're-stamped, still provisional, its reset kept');
+    assert.deepEqual(lines, [
+      `[estimator-calibration] kept the provisional multiplier 1.00 from pricing epoch 3 (current ${epoch}): ` +
+        `a restart that no provider sample has confirmed holds nothing learned under that epoch's pricing, so ` +
+        `this store's content repriced since doesn't discard it; re-stamped, still provisional ns=default`,
+    ]);
+    reopened.cm.close();
+  });
+
+  it('an epoch-1 multiplier is discarded in a store whose only content repriced since is a generated image', async () => {
+    // The reprice check walks every epoch after the record's: epochs 2 to 4
+    // repriced nothing this store holds, and epoch 5 repriced its generated
+    // images.
+    const first = await openManager('epoch1-generated', { generatedImage: true });
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 1 });
+    first.cm.close();
+    const reopened = await openManager('epoch1-generated', { generatedImage: true });
+    await reopened.cm.compile(BUDGET);
+    const cal = reopened.cm.getRenderStats()!.calibration!;
+    assert.deepEqual([cal.multiplier, cal.provisional, cal.reset?.discardedMultiplier, cal.reset?.fromEpoch], [1, true, 1.4, 1]);
+    reopened.cm.close();
+  });
+
   it('a store with no calibration history reports its multiplier and no reset', async () => {
     const { cm } = await openManager('no-history');
     await cm.compile(BUDGET);
@@ -471,9 +588,17 @@ describe('estimator calibration band', () => {
     assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), unstamped);
     assert.equal(reopened.internals._calibration, 1, 'put back: nothing loaded yet');
     assert.equal(reopened.internals._calibrationProvisional, null);
+    // A dry compile's result carries the retry's stats, priced by the dropped
+    // multiplier, not the refused attempt's.
+    const dryCompile = await reopened.cm.compile(tight, undefined, { dryRun: true });
+    assert.equal(dryCompile.renderStats!.calibration!.multiplier, 1, "the dry result's stats are the retry's");
+    assert.equal(dryCompile.renderStats!.total.messages, dryCompile.messages.length);
+    assert.equal(reopened.internals._calibration, 1, 'put back after the dry compile too');
     // The real compile: refused at 1.45, dropped, resolved at 1; the drop is
     // logged and persisted, and visible as the reset.
-    const { lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
+    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
+    assert.equal(live.renderStats, reopened.cm.getRenderStats(), "the live result's stats are the retry's, the getter's");
+    assert.equal(live.renderStats!.total.messages, live.messages.length);
     assert.equal(reopened.internals._calibration, 1);
     const cal = reopened.cm.getRenderStats()!.calibration!;
     assert.deepEqual([cal.multiplier, cal.provisional, cal.reset?.discardedMultiplier, cal.reset?.fromEpoch], [1, true, 1.45, null]);

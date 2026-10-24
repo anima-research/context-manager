@@ -491,8 +491,6 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           self._storeOrder = new Map();
           self._storeOrderSource = [];
           self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
-          self._imageWatermark = 99;
-          self._postStripMemo = { zz: true };
           if (this.throwAfter) throw new Error('zz-after-writing');
         }
         return out;
@@ -513,7 +511,6 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
       'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
       'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_calibrationLoaded',
       '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_storeOrderSource', '_cachedHeadStartIndex',
-      '_imageWatermark', '_postStripMemo',
     ];
     const storeCalibration = () =>
       (manager as unknown as { messageStore: { getTokenCalibration(): number } }).messageStore.getTokenCalibration();

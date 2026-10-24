@@ -1,5 +1,6 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import type { MessageId, StoredContentBlock, StoredMessage } from './message.js';
+import type { MessageId, Sequence, StoredContentBlock, StoredMessage } from './message.js';
+import type { RenderStats, RequestIdentity } from './strategy.js';
 
 /**
  * Describes how a context entry relates to its source message.
@@ -171,6 +172,71 @@ export interface CompileResult {
    * read-only. It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+
+  /**
+   * This compile's render stats, as its select tallied them while emitting
+   * entries: the same accounting `getRenderStats()` gives a live compile.
+   * They describe the selection rather than the exact request: injections
+   * merged in afterwards aren't counted, an entry that mixes tool calls and
+   * results counts once though the compile splits it into several messages,
+   * and the select's last structural passes, which can trim an orphaned tool
+   * call or add a stub tool result, aren't counted either. A live compile's
+   * are the object `ContextManager.getRenderStats()` then returns, so treat
+   * them as read-only. A dry compile's
+   * (`dryRun`) are its own, which `getRenderStats()` never returns, so a host
+   * can show the composition of the request a dry compile built without
+   * sending it. Absent when the strategy records none.
+   */
+  renderStats?: RenderStats;
+
+  /**
+   * Set on a compile with `thinkingBinding.binds` that newly leaves out a
+   * stored reply's thinking: what, and why (see
+   * `SelectOptions.thinkingBinding`).
+   */
+  thinkingStrip?: ThinkingStrip;
+
+  /**
+   * On every compile with `thinkingBinding.binds`: the branch's sequence
+   * (`JsStore.currentSequence`) when its binding record began, at or above
+   * every message stored before then. A branch that inherits its parent's
+   * record keeps its value, which is at most the branch point; a dry compile
+   * with no record reports what the first record would hold. A reply at or
+   * below it was stored before the context manager recorded what the branch
+   * sent, so the provider may refuse or set aside its thinking without any
+   * strip having missed. Sequences are branch-global across slots, so a
+   * stored message's `sequence` compares with it directly.
+   */
+  thinkingRecordedAfter?: Sequence;
+}
+
+/** What a compile with `thinkingBinding.binds` newly leaves out. */
+export interface ThinkingStrip {
+  /**
+   * The stored bodies (`RawBodySource.messageId`) of the participant's
+   * replies whose thinking this compile leaves out and the compile that
+   * wrote the branch's record didn't, whether or not its request went out:
+   * that compile sent them with their thinking, they were stored since, or
+   * it didn't send them as stored replies at all. A record is written by a
+   * committing compile with `binds`, so a compile without it is passed
+   * over.
+   * So a reply can be reported again: one whose thinking went, that a later
+   * compile didn't send, and that renders again. A host that tells each
+   * loss once keeps its own set of what it has told.
+   */
+  newly: MessageId[];
+  /**
+   * `'head'`: an `identity` digest changed, and every message goes without
+   * its thinking. `'first'`: a reply stored before the branch's record
+   * began, which only the drop control lets keep its thinking, goes without
+   * it, as every reply does at a branch's first compile without the control.
+   * `'messages'`: a compiled message differs from the record, and every
+   * message from it on goes without. When a compile has more than one,
+   * `'head'` is given before `'first'`, and `'first'` before `'messages'`.
+   */
+  cause: 'messages' | 'head' | 'first';
+  /** With `'head'`: which digests changed. */
+  changed?: Array<keyof RequestIdentity>;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */

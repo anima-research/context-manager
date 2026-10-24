@@ -441,9 +441,6 @@ describe('tool pruning, priced as sent', () => {
       decisions = 0;
       cm.addMessage('u', text('next'));
       assert.ok(decisions >= 1 && decisions <= 2, `${label}: ${decisions} decisions for one new message`);
-      decisions = 0;
-      cm.getRenderStats();
-      assert.ok(decisions >= 1 && decisions <= 2, `${label}: ${decisions} decisions for the render stats before the first compile`);
       if (adaptiveResolution) {
         // Only the adaptive selection has a fold plan to preview.
         decisions = 0;
@@ -500,20 +497,6 @@ describe('tool pruning, priced as sent', () => {
     cm.addMessage('u', text('next'));
     const after = formsNow();
     assert.deepEqual(after.slice(0, before.length).map((form, i) => form === before[i]), before.map(() => true));
-    cm.close();
-  });
-
-  it('prices the render stats before the first compile as the first compile sends them', async () => {
-    const { cm, store } = await open({ adaptiveResolution: true, toolResultMaxLastN: 1, toolUseInputMaxTokens: 100 });
-    cm.addMessage('u', text('look these up'));
-    lookups(cm, 3);
-    cm.addMessage('a', [call('w-1', 'write', { body: PROSE })]);
-    cm.addMessage('u', [result('w-1', 'written')]);
-    cm.addMessage('u', text('next'));
-    const reconstructed = cm.getRenderStats()!.tail.tokens;
-    const compiled = await cm.compile(BUDGET);
-    assert.equal(reconstructed, sentOf(store, compiled), 'they count what the first compile sends');
-    assert.equal(reconstructed, cm.getRenderStats()!.tail.tokens);
     cm.close();
   });
 

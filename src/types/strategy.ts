@@ -160,15 +160,16 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
-   * What the next compile sends for each of `ids`, messages just stored and
-   * so among the newest of the window, in the order given. Each comes back
+   * What the next compile renders for each of `ids`, messages just stored
+   * and so among the newest of the window, in the order given, before the
+   * manager leaves out any thinking under `SelectOptions.thinkingBinding`. Each comes back
    * cut by the per-message cap, and as one message where the compile joins a
    * body's shards into one; the strategy makes every image decision it makes
    * there: its count, depth and byte limits, counted newest-first over the
    * view from the oldest of these messages to its newest, as a compile
    * counts them. It's for a caller that appends messages it has just stored
    * to a compiled request without recompiling, such as a turn's mid-turn
-   * injections, so that what it appends is what the next compile sends. A
+   * injections, so that what it appends is what the next compile renders. A
    * later compile can still strip an image of theirs as newer ones arrive.
    *
    * `store` is the view a compile reads. An id comes back as null when the
@@ -228,7 +229,13 @@ export interface ContextStrategy {
 
   /**
    * React to new messages.
-   * Called after a message is added to the store.
+   * Called after a message is added to the store, inside the write that
+   * stored it, so its synchronous part runs before addMessage returns; the
+   * manager doesn't wait for the promise. A rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the message,
+   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * strategy isn't offered it again. A hook that returns no promise, as one
+   * written in JavaScript can, isn't a failure, and nothing is logged.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
@@ -305,6 +312,49 @@ export interface ContextStrategy {
    * (for example 'budget-fit' or 'window'). Reading clears it.
    */
   takeSelectionCause?(): string | undefined;
+
+  /**
+   * The context manager left these thinking blocks of stored messages out of
+   * the request the last committing select priced, after the select (see
+   * `SelectOptions.thinkingBinding`). A strategy that calibrates its
+   * estimates against the provider's count of that request takes their
+   * price off what it expects the count to be. Not called for a dry compile.
+   */
+  noteThinkingLeftOut?(blocks: readonly ContentBlock[]): void;
+}
+
+/**
+ * Whether the model a compile is for binds each signed thinking block to the
+ * request it was minted in, so that a block sent after anything before it
+ * changed is refused, or, with the provider's drop control on, set aside.
+ * See `SelectOptions.thinkingBinding`.
+ */
+export interface ThinkingBinding {
+  /** The model binds thinking. Absent or false: the compile is as it would be
+   *  without the option, and neither reads nor writes the branch's record. */
+  binds?: boolean;
+  /** The request carries the provider's drop control, so a stale block is
+   *  set aside rather than refused. Absent means false. */
+  dropBlock?: boolean;
+  /** The participant whose messages are the model's own replies, such as
+   *  the agent's name. Required with `binds`: another participant's reply
+   *  never keeps its thinking. */
+  participant?: string;
+}
+
+/**
+ * Digests of what a request carries before its messages, as the host sends
+ * it, each opaque to the context manager and compared only for equality:
+ * the system text (system-position injections included), the tools in the
+ * order sent, the model, and the rest the provider sees ahead of the
+ * messages (such as the tool choice, the thinking config and the output
+ * limit). See `SelectOptions.identity`.
+ */
+export interface RequestIdentity {
+  system: string;
+  tools: string;
+  model: string;
+  request: string;
 }
 
 /** What a rendered summary covers, for layout reporting. */
@@ -350,10 +400,88 @@ export interface SelectOptions {
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
    * included, and that release is the one thing a dry compile can leave.
-   * The release's committing rebuild includes any image-watermark advance;
-   * the dry select then restores the state it found after that rebuild.
+   * The release's rebuild commits; the dry select then restores the state it
+   * found after that rebuild.
    */
   dryRun?: boolean;
+  /**
+   * The model this compile is for binds signed thinking (`binds`), so the
+   * compile leaves out every thinking block whose request has changed since
+   * it was minted, and reports it in `CompileResult.thinkingStrip`. With
+   * `binds`, `participant` and `identity` are required, and a compile
+   * without them is refused before anything is selected. Without `binds`,
+   * the compile is as it would be without the option: it neither reads nor
+   * writes the branch's record. A record an earlier binding compile left is
+   * compared at the next binding compile like any other, so a message keeps
+   * its thinking only while everything up to it matches what that compile
+   * sent, a prefix the provider took with that thinking, and nothing past
+   * the record's end keeps it, unless a host noted it after that compile.
+   * A record the store can't read or write is logged, and never fails a
+   * compile or a note. One it can't read is read as none, so a committing
+   * compile starts a record in its place, as for a record this version
+   * doesn't read. When it can't write a compile's record, the record before
+   * it, if any, stands, and that compile's stream can't note onto it.
+   *
+   * The manager keeps a record per branch of what the branch last sent: the
+   * messages its last committing compile with `binds` sent (cache
+   * breakpoints aside, injections included), then the rows a host noted
+   * after them
+   * (`ContextManager.noteRequestSent`): what its stream's requests went on
+   * to carry and, once the stream ended, its last reply. With them it keeps
+   * the stored bodies the compile sent without their thinking, the
+   * compile's `identity`, and the branch's sequence where the record began.
+   * A compile compares what it renders with the record in order. From the
+   * first message that differs, or from the first message when an
+   * `identity` digest changed, every message goes without its thinking, and
+   * so does every message past the record's end: only the host knows which
+   * stored reply answered which request. A reply whose stored body went
+   * without its thinking goes without it again, since what came after it
+   * was minted without it. A message whose participant isn't
+   * `participant`, or that has no stored body (a summary's recall answer,
+   * an injection), never keeps thinking: nothing it carries was minted in
+   * this agent's requests. A manager's record serves one participant, so
+   * compile each namespace for one.
+   *
+   * A reply stored at or before the sequence where the branch's record began
+   * (`CompileResult.thinkingRecordedAfter`), which no record vouches for,
+   * keeps its thinking only with `dropBlock`, for the provider to judge. So
+   * a branch with no record, its own or (on a branch made since) the one it
+   * inherits as of its branch point, leaves out every reply's thinking
+   * without `dropBlock`; with `dropBlock` it leaves the stored replies'
+   * thinking as it is. Either way it starts the record. Each committing
+   * compile with `binds` writes the record; a dry compile reports what it
+   * would leave out and writes no record. The record survives a restart.
+   *
+   * So once a branch has a record, a reply keeps its thinking at the compile
+   * after it's stored only if the host has noted it: each later round of a
+   * stream as the host sends it, and the stream's last reply once it's
+   * stored. A host that passes `thinkingBinding` and notes nothing loses
+   * each reply's thinking at the compile after it's stored, and is never
+   * refused for it. A note names the compile its stream was built from, so
+   * a committing compile with `binds` while a stream is open makes that
+   * stream's later notes vouch for nothing, and its replies go without
+   * their thinking: while one of a branch's requests is streaming, compile
+   * for its branch with `binds` only with `dryRun`, which writes no
+   * record. A preview prices a
+   * summary's carriers by the option it's given (`previewContext`'s
+   * `thinkingBinding`), as a compile does.
+   *
+   * The comparison is of compile output. A host that turns compile output
+   * into a request (sanitizing it, adding rows) must do so the same way at
+   * every request, and must note a row only where the next request will
+   * carry it as the stream sent or got it: context-manager can't see what
+   * happens to a message after it leaves the compile.
+   */
+  thinkingBinding?: ThinkingBinding;
+  /**
+   * Digests of what this compile's request carries before its messages, for
+   * a compile with `thinkingBinding.binds`, which requires them: when one
+   * differs from the branch's record, the compile leaves out every thinking
+   * block. `system` is the system text as sent, with the content of this
+   * compile's `'system'`-position injections, which the compile returns as
+   * `CompileResult.systemInjections`.
+   */
+  identity?: RequestIdentity;
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
@@ -416,7 +544,8 @@ export interface PreviewResult {
   /**
    * Segment breakdown (head / middle / tail / summaries-by-level) for the
    * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
-   * `getRenderStats()`, which continues to describe the live context.
+   * `getRenderStats()`, which describes the last live compile, or is null
+   * before one.
    */
   stats?: RenderStats;
 }
@@ -639,7 +768,7 @@ export interface SummaryOverviewStrategy extends ContextStrategy {
    * List summaries whose source message span overlaps `[fromMs, toMs]`
    * (both ends inclusive; either bound may be omitted for an open range).
    * Requires a `MessageStoreView` to resolve each summary's source message
-   * IDs to timestamps — same reason `getRenderStats` takes one.
+   * IDs to timestamps.
    */
   listSummariesInRange(
     store: MessageStoreView,
@@ -671,11 +800,14 @@ export interface CalibrationReset {
 }
 
 /**
- * Per-render observability stats from a strategy. Counts and token sums for
- * head / tail / summaries / pending work, suitable for TUIs and dashboards
- * that want to display "how much of the context is folded vs raw" at a
- * glance. Token sums use the strategy's own estimates so they line up with
- * the numbers `select()` uses for budget math.
+ * Per-render observability stats from a strategy, recorded by a compile as it
+ * emits each entry: any compile's from its `CompileResult.renderStats`, the
+ * last live compile's from `getRenderStats()`, a preview's from
+ * `previewContext(..., { render: true })`. Counts and token sums for head / tail / summaries /
+ * pending work, suitable for TUIs and dashboards that want to display "how
+ * much of the context is folded vs raw" at a glance. Token sums use the
+ * strategy's own estimates so they line up with the numbers `select()` uses
+ * for budget math.
  */
 export interface RenderStats {
   head: { messages: number; tokens: number };
@@ -695,18 +827,26 @@ export interface RenderStats {
   };
   pending: { chunks: number; merges: number };
   /**
-   * Sum across all buckets — the actual rendered context size. A summary is a
-   * Q/A pair, so it counts as 2 messages here.
+   * Sum across all buckets — the rendered context's size as the selection
+   * priced it: the adaptive selection prices each message after the image
+   * strip, and the hierarchical one counts an image the strip replaces at its
+   * full price. A summary is a Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
 
   /**
    * Estimator calibration in force for this compile: the multiplier applied
-   * to every token estimate and the pricing epoch it was learned under.
-   * `provisional` is true while the multiplier is a guess rather than a value
-   * learned under this epoch's pricing: one kept from a record without a
-   * stamp, or the 1 a discard restarts from. The first provider sample
-   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * to every token estimate, and the pricing epoch in force. A multiplier
+   * that isn't provisional was learned under that epoch's pricing, or under
+   * an older epoch's and kept, re-stamped, because nothing this store holds
+   * was repriced since; either way it's reported under the epoch in force.
+   * `provisional` is true while the multiplier is a guess, which the first
+   * provider sample the calibration's band accepts replaces outright, rather
+   * than stepping toward it (see
+   * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
+   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * provisional through a later epoch's load, which re-stamps it whatever
+   * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
    * been discarded, on load or when a provisional one above 1 put the first
    * compile over budget. It is kept
@@ -777,10 +917,10 @@ export interface RenderStats {
     ceiling?: string;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
-     *  live compile. A caller reads a dry pass's stats only from
-     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
-     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
-     *  live compile. */
+     *  live compile. A caller reads a dry pass's stats from its compile's
+     *  `CompileResult.renderStats`, or from `previewContext(..., { render:
+     *  true })`'s `stats`; a dry pass leaves `getRenderStats()` describing the
+     *  last live compile, or null before one. */
     dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
@@ -796,7 +936,15 @@ export interface RenderStats {
  * implement it simply have `ContextManager.getRenderStats()` return `null`.
  */
 export interface RenderStatsCapableStrategy extends ContextStrategy {
-  getRenderStats(store: MessageStoreView): RenderStats;
+  /** The stats of the last live compile, or null before one has run since
+   *  the strategy loaded its branch. */
+  getRenderStats(store: MessageStoreView): RenderStats | null;
+  /** The stats the strategy's most recent `select()` on its branch
+   *  recorded, live or dry, or null when it recorded none.
+   *  `ContextManager.compile` reads them right after its select for
+   *  `CompileResult.renderStats`; a strategy without this method gives
+   *  compiles none. */
+  getLastSelectStats?(): RenderStats | null;
 }
 
 /** Type guard for strategies that produce render stats. */
@@ -827,6 +975,71 @@ export interface CompressionQuarantineStatus {
    * its all-clear nor calls its handler until a read succeeds.
    */
   unreadable?: true;
+}
+
+/** Why a load's repair dropped a summary that held text (LoadRepairReport). */
+export type LoadRepairDropReason =
+  /**
+   * At L1, no copy or chunk record holds its sources as a list of ids;
+   * above L1, no one copy holds both its sources and its range.
+   */
+  | 'unreadable'
+  /** It names a summary the repaired state doesn't hold. */
+  | 'names-missing'
+  /** It names a summary at its own level or above. */
+  | 'names-not-below'
+  /** It names a summary it isn't the parent of. */
+  | 'names-non-child';
+
+/** One summary holding text that a load's repair dropped. */
+export interface LoadRepairDroppedSummary {
+  /** Its id as stored, as text. */
+  id: string;
+  /** Its `level` as stored; null where that isn't a number. */
+  level: number | null;
+  /** Its `tokens` as stored; null where that isn't a number. */
+  tokens: number | null;
+  reason: LoadRepairDropReason;
+  /**
+   * The messages it covered, by the range the repair held for it (the copy
+   * it chose for the summary's text, or another copy it rebuilt the summary
+   * from): the range's end ids, each with that message's stored time (ISO).
+   * A time is null where the strategy's message view doesn't give it: the
+   * store doesn't hold the message, the host's view filter leaves it out, or
+   * its time can't be read. The range is null where it isn't two message
+   * ids. An 'unreadable' drop can still have one, where what couldn't be read
+   * was its sources.
+   */
+  sourceRange: { first: string; last: string; firstAt: string | null; lastAt: string | null } | null;
+}
+
+/**
+ * What a load's repair of the summary state dropped, when it dropped a
+ * summary holding text (AutobiographicalStrategy.setLoadRepairHandler). It
+ * holds no summary text: the text dropped is read back from the store's
+ * history with `getStateJsonAt(stateId, sequenceBefore)` while `branch` is
+ * the store's current branch, since Chronicle reads a state at a sequence
+ * on the current branch only.
+ */
+export interface LoadRepairReport {
+  /** The namespace whose summary state was repaired. */
+  namespace: string;
+  /**
+   * The Chronicle branch the repair wrote on, by name. The read back at
+   * `sequenceBefore` gives the old summaries only with this branch current:
+   * on another, it gives that branch's state at that sequence.
+   */
+  branch: string;
+  /** The state the repair rewrote. */
+  stateId: string;
+  /** The branch's sequence just before the repair's write: the state there is the summaries as they were. */
+  sequenceBefore: number;
+  /** Each summary holding text that the repair dropped, in stored order. */
+  dropped: LoadRepairDroppedSummary[];
+  /** The sum of `dropped`'s tokens that are numbers. */
+  droppedTokens: number;
+  /** Empty summaries the same repair dropped, which held no text. */
+  emptyDropped: number;
 }
 
 /** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
@@ -1130,6 +1343,11 @@ export interface AutobiographicalConfig {
    *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
    *    and merge requests still recall them verbatim.
    *
+   * A select for a model that binds thinking (`SelectOptions.thinkingBinding`)
+   * renders and prices the live window as under `'live-strip'` whatever this
+   * says: a carrier was minted in its summarizer's request, so such a model
+   * never takes it there. Mint and merge requests are unchanged.
+   *
    * TWO SURFACES, ONE STORE. A captured carrier is the ARCHIVIST'S cognition:
    * the thinking of writing the memory, not the thinking of living the span it
    * describes. It is replayed on two surfaces that want different things from
@@ -1207,7 +1425,12 @@ export interface AutobiographicalConfig {
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. 0 = unlimited.
-   *  A hard ceiling for dense bursts that pack many images into the live window. */
+   *  A hard ceiling for dense bursts that pack many images into the live window.
+   *  Every `image` block counts, whatever its source (base64, a `data:` URL
+   *  or a remote URL), and so does every generated image, top-level or
+   *  nested in a tool result (see inline-images.ts). An image inside an
+   *  opaque provider item, such as a Responses `image_generation_call`
+   *  replayed from its raw form, doesn't. */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
@@ -1230,10 +1453,14 @@ export interface AutobiographicalConfig {
 
   /**
    * Byte wall for live images (2026-07-12): keep inline images newest-first
-   * only while their cumulative base64 size stays under this budget — on top
-   * of `maxLiveImages` / `imageStripDepthTokens`. Guarantees the compiled
-   * window fits the API's total request size cap (413 request_too_large), so
-   * membrane's oversize check is a true invariant, never a silent editor.
+   * only while their cumulative inline size (a base64 source, a `data:` URL's
+   * payload, a generated image's `data`; 0 for a remote URL) stays
+   * under this budget — on top
+   * of `maxLiveImages` / `imageStripDepthTokens`. It keeps the images it
+   * counts from pushing the compiled window past the API's total request size
+   * cap (413 request_too_large), so that membrane's oversize check isn't what
+   * edits them. An image inside an opaque provider item (see `maxLiveImages`)
+   * isn't counted, so it's outside this budget.
    * Default 20MB (of base64; the API cap is 32MB total).
    */
   maxLiveImageBytes?: number;
@@ -1244,10 +1471,31 @@ export interface AutobiographicalConfig {
    * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
    * image strips the oldest live one, a change mid-history that invalidates
    * the prompt cache from that message on, on every image. With a ratio in
-   * (0, 1), a binding limit instead trims down to ratio × each limit and
-   * records a watermark (a message sequence, persisted): every image at or
-   * before it stays stripped, so the stripped set changes once per trim, not
-   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   * (0, 1), a binding limit instead trims down to ratio × each limit, so the
+   * stripped set changes once per trim, not once per image. E.g. 0.7. Costs
+   * up to (1 - ratio) of the image budget right after a trim, and a little
+   * more where ratio × a limit falls between whole images: a count target
+   * rounds down (`maxLiveImages: 4` at 0.7 keeps 2), and the byte and depth
+   * targets are met by stripping whole images.
+   *
+   * The set is computed from the stored messages, keeping no state of its
+   * own: they're replayed oldest first, and whenever a limit binds, the
+   * oldest live images are stripped one at a time until every limit fits
+   * ratio × itself. Within a message they go first to last, so the option
+   * keeps a message's last images, where the limits without it keep the first
+   * that fit: switching the option on can change which of a message's images
+   * stay, not only how many. A target that rounds to 0 is 0, but the newest image
+   * stays while it fits the full limits, so `maxLiveImages: 1` gets no
+   * headroom, and so do the other images of its message while only depth is
+   * over its target, since stripping them can't lower the depth they're at.
+   * A compile, a preview, a reopen and a fork at the same point give the
+   * same set, switching the option on later gives the set it would have
+   * had from the start, and a fold moves nothing. An edit or a removal of any
+   * message, text-only included, replays a different history, so it can
+   * strip or bring back images on either side of it; many of them are newer
+   * than the change, where the prompt is rewritten anyway. Depth is counted
+   * at the store's calibrated estimates, as the limits are counted without
+   * the option, so a calibration change can move the set as it moves theirs.
    */
   imageStripHysteresisRatio?: number;
 
@@ -1355,7 +1603,11 @@ export interface AutobiographicalConfig {
    * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
-   * stored one trails the ids the store holds.
+   * stored one trails the ids the store holds. It leaves out of the merge
+   * quarantine, names and writes it back without every entry that isn't a
+   * record with a string key and a `sourceIds` list whose ids are all
+   * non-empty strings (an empty list is kept), and replaces a stored merge
+   * quarantine that isn't a list with an empty one.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
@@ -1673,8 +1925,15 @@ export interface AutobiographicalConfig {
    * the result exceeds the model's context window — the philosophy is
    * "surface the overage rather than silently lose content."
    *
-   * Default: true (legacy budget-aware truncation: stops emitting recall
-   * pairs and recent messages when the running total exceeds maxTokens).
+   * Default: true. Selection targets the input budget (`budget.maxTokens`
+   * less `reserveForResponse`): it takes no summary past it, except one
+   * coverage completion must include so that no message goes unrepresented.
+   * Emission drops nothing to fit: past the grace window
+   * (`overBudgetGraceRatio`), the hierarchical path's head, its recall pairs
+   * (each positioned pair, or the combined pair under
+   * `positionedRecallPairs: false`) and its raw middle messages refuse the
+   * compile with `OverBudgetError`, and a recent-window eviction that would
+   * drop history no summary covers refuses it with `UncoveredDropError`.
    *
    * Recommended setting for long-lived agents on large-context models
    * (e.g. opus-4-7 with 1M context): false. The window is generous enough
@@ -1951,6 +2210,16 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * compression. Where the selector reads level bounds, a bound above 0 sets
  * how far the span folds instead, and where pins overlap at a message, one
  * bound holds it (see `level`), so a raw pin there might not keep it raw.
+ *
+ * A message stored in parts (a long message that ingress splits under
+ * `adaptiveResolution`) counts as one: under adaptive resolution, a pin
+ * whose first or last id names one of its parts covers it from its first
+ * part to its last, less a part locked with `lockChunk` outside the span
+ * its ids name, where the lock holds. The selects, compression and the
+ * summarizer's prompt all read it so. A compile whose budget can't hold the
+ * raw pins beside the rest refuses; where the adaptive plan's middle is over
+ * the budget, the refusal names each pin keeping raw tokens in that middle
+ * (`OverBudgetDiagnostics.rawPins`).
  *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of

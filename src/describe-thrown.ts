@@ -25,12 +25,14 @@ export function describeThrown(value: unknown): string {
  * an Error's stack, without letting the formatting fail in its turn: Node
  * formats an object through its [util.inspect.custom] hook, which can throw.
  * Then the value is described by describeThrown instead. `log` is where the
- * line goes: one namespace's diagnostics name it (#239).
+ * line goes: one namespace's diagnostics name it (#239). `message` is a
+ * format string on both paths, since a value follows it on both, so a '%'
+ * put into it is doubled first, as diagnostics.ts says.
  */
 export function logThrown(message: string, value: unknown, log: Diagnostics = console): void {
   try {
     log.error(message, value);
   } catch {
-    log.error(`${message} ${describeThrown(value)}`);
+    log.error(`${message} %s`, describeThrown(value));
   }
 }

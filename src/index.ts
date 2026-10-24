@@ -43,7 +43,7 @@ export type { OverBudgetClearedBy } from './adaptive/picker.js';
 export { CompressionWithdrawn } from './compression-withdrawn.js';
 export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
 export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';
-export type { OverBudgetDiagnostics } from './adaptive/picker.js';
+export type { OverBudgetDiagnostics, OverBudgetRawPin } from './adaptive/picker.js';
 
 // Types
 export type {
@@ -80,6 +80,7 @@ export type {
   JournalMark,
   RenderedLayout,
   LayoutUnit,
+  ThinkingStrip,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -92,6 +93,9 @@ export type {
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,
@@ -106,6 +110,8 @@ export type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   RenderedSummaryInfo,
+  ThinkingBinding,
+  RequestIdentity,
 } from './types/index.js';
 
 // Accepted rounds and fold receipts

@@ -373,6 +373,14 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 > pressure, but any such eviction that would silently lose content instead
 > **refuses the turn** (`UncoveredDropError`) — pressure never ships silent
 > loss. The philosophy stands: surface the overage, let the host decide.
+>
+> *(Raw pins)* The refusal of a plan whose middle is over the budget names
+> each pin that keeps raw tokens there (`OverBudgetDiagnostics.rawPins`), with
+> the tokens it keeps. Under adaptive resolution a pin on part of a message
+> stored in parts covers the whole message, so a mark on a long message can
+> be what doesn't fit: whoever manages the pins can unpin it, which lets
+> compression fold it, or whoever sets the budget can raise it, where the
+> model's window allows.
 
 ### 3.11 Recent-window slide
 

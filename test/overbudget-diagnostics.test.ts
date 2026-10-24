@@ -103,6 +103,50 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     });
   }
 
+  /**
+   * An L1 with a reasoning carrier, as a compression that captured its response writes one: its `tokens` is the
+   * provider's measurement, far above what its blocks estimate, so a `carrierPolicy: 'full'` render is priced at it.
+   */
+  seedCarrierL1(id: string, sourceIds: string[], tokens: number, text = 'a short memory', responseContent?: ContentBlock[]): void {
+    this.pushSummary({
+      id, level: 1, sourceLevel: 0, sourceIds,
+      sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+      content: text, tokens, created: 0,
+      responseContent: responseContent ?? [
+        { type: 'thinking', thinking: 'brief', signature: 'zz-sig' },
+        { type: 'text', text },
+      ],
+    } as SummaryEntry);
+  }
+
+  /** An L2 with a reasoning carrier over L1s in memory, as a merge that captured its response writes one. */
+  seedCarrierL2(id: string, l1Ids: string[], tokens: number): void {
+    const sources = l1Ids.map((l1) => this.summaries.find((summary) => summary.id === l1));
+    assert.ok(sources.every((source) => source !== undefined), 'the L1s are in memory');
+    this.pushSummary({
+      id, level: 2, sourceLevel: 1, sourceIds: l1Ids,
+      sourceRange: { first: sources[0]!.sourceRange.first, last: sources[sources.length - 1]!.sourceRange.last },
+      content: 'a merged memory', tokens, created: 0,
+      responseContent: [
+        { type: 'thinking', thinking: 'brief', signature: 'zz-sig-2' },
+        { type: 'text', text: 'a merged memory' },
+      ],
+    } as SummaryEntry);
+  }
+
+  /**
+   * An L1 whose recorded `tokens` (4) is far below what its content prices at, as a count taken before its render
+   * changed is: selection, which counts `tokens`, takes it at any budget, and emission, which prices what it sends,
+   * meets its full size.
+   */
+  seedUndercountedL1(id: string, sourceIds: string[]): void {
+    this.pushSummary({
+      id, level: 1, sourceLevel: 0, sourceIds,
+      sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+      content: 'summary '.repeat(100), tokens: 4, created: 0,
+    });
+  }
+
   /** An L1 shorter than any message here, so a plan that folds anything through it gets smaller. */
   seedShortL1(id: string, sourceIds: string[]): void {
     this.pushSummary({
@@ -176,8 +220,13 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   /** The store view the last count read. */
   private countedView: Parameters<AutobiographicalStrategy['compressionWorkQueued']>[0] | undefined;
 
+  /** The refused prefix the last count was narrowed to (compressionWorkQueued's `within`), if any. Read from the
+   *  arguments as passed, so this file also builds against code whose count takes no prefix. */
+  countedWithin: ReadonlySet<string> | undefined;
+
   protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
     this.countedView = args[0];
+    this.countedWithin = (args as unknown[])[2] as ReadonlySet<string> | undefined;
     return super.compressionWorkQueued(...args);
   }
 
@@ -188,6 +237,16 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     const [chunk, ctx, onSkip, onRequestStopped, onJoinedWorkDiscarded] = args;
     const probe = this.onQuarantineSkipProbe;
     return super.compressChunkHierarchical(chunk, ctx, probe ? () => { onSkip?.(); probe(); } : onSkip, onRequestStopped, onJoinedWorkDiscarded);
+  }
+
+  /** Whether the last count's prefix holds every message the selection can fold (getCompressibleMessages), raw or
+   *  under a summary the selection sends. */
+  prefixHoldsWholeMiddle(): boolean {
+    assert.ok(this.countedView, 'a refusal has counted');
+    const within = this.countedWithin;
+    // A count with no prefix reads every message, as on code whose count takes none.
+    if (!within) return true;
+    return this.getCompressibleMessages(this.countedView).every((m) => within.has(m.id));
   }
 
   /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
@@ -393,14 +452,60 @@ async function withManager(
   }
 }
 
-async function refusal(manager: ContextManager, opts?: { dryRun?: boolean }): Promise<OverBudgetError> {
+async function refusal(
+  manager: ContextManager,
+  opts?: { dryRun?: boolean },
+  budget = { maxTokens: 100, reserveForResponse: 20 },
+): Promise<OverBudgetError> {
   try {
-    await manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, opts);
+    await manager.compile(budget, undefined, opts);
     assert.fail('compile should refuse');
   } catch (error) {
     assert.ok(error instanceof OverBudgetError);
     return error;
   }
+}
+
+/** A budget whose grace window (300) holds the seeded combined recall pair (288) but not the raw message after it, so the raw-message fallback is what refuses. */
+const PAIR_FITS = { maxTokens: 260, reserveForResponse: 20 };
+
+/**
+ * A hierarchical refusal whose prefix holds the whole middle. A refusal names compression only for work that folds a
+ * message its refused prefix holds (compressionWorkQueued's `within`), so one whose prefix holds every message the
+ * selection can fold reads the walk over every queued work, as a test of the walk's rules needs. It's taken at the
+ * budget where the compile stops refusing before the recent window, found by dry runs, which change nothing, and it
+ * checks that its prefix holds the whole middle.
+ */
+async function refusalOfWholeMiddle(manager: ContextManager): Promise<OverBudgetError> {
+  // Whether the compile refuses before the recent window: past the middle, a refusal is the recent window's eviction.
+  const refuses = async (maxTokens: number): Promise<boolean> => {
+    try {
+      await manager.compile({ maxTokens, reserveForResponse: 20 }, undefined, { dryRun: true });
+      return false;
+    } catch (error) {
+      if (error instanceof OverBudgetError) return true;
+      if (error instanceof Error && error.name === 'UncoveredDropError') return false;
+      throw error;
+    }
+  };
+  let low = 100;
+  assert.ok(await refuses(low), 'the compile refuses at the usual budget');
+  let high = low * 2;
+  while (await refuses(high)) {
+    low = high;
+    high *= 2;
+    assert.ok(high <= 1_000_000, 'the compile stops refusing before a million tokens');
+  }
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (await refuses(middle)) low = middle;
+    else high = middle;
+  }
+  const error = await refusal(manager, undefined, { maxTokens: low, reserveForResponse: 20 });
+  assert.match(error.message, /^Hierarchical emission overran the budget/, 'a refusal in the hierarchical middle');
+  const strategy = (manager as unknown as { strategy: DiagnosticStrategy }).strategy;
+  assert.ok(strategy.prefixHoldsWholeMiddle(), 'the refusal\'s prefix holds every message the selection can fold');
+  return error;
 }
 
 function checkBudget(error: OverBudgetError): void {
@@ -482,7 +587,7 @@ describe('OverBudgetError diagnostics', () => {
         const ids = Array.from({ length: 2 }, (_, i) =>
           manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
-        const error = await refusal(manager);
+        const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.equal(error.diagnostics.middleChunkCount, 1);
         assert.deepEqual(error.clearedBy, [], 'no closed chunk waits for compression');
         assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'attempted');
@@ -1379,7 +1484,7 @@ describe('OverBudgetError.clearedBy', () => {
         const last = queued.at(-1)!;
         strategy.seedStoredL1('L1-stored-last', last);
         if (cause === 'unreadable quarantine') strategy.breakQuarantineRead();
-        assert.deepEqual((await refusal(manager)).clearedBy, []);
+        assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile queued the same chunks, in the same order');
         // The premise: the host's loop ends at the first chunk, and tick never reaches the last.
         const summaries = strategy.summaryIds().length;
@@ -1403,7 +1508,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       assert.ok(queued[0]!.includes(callId), 'the first queued chunk holds the call');
       strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
       // The premise: tick doesn't defer the first chunk for the host's tools; it throws for want of a model.
       const summaries = strategy.summaryIds().length;
       await assert.rejects(hostTicks(manager, strategy), /compressionModel is NOT configured/);
@@ -1424,7 +1529,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.seedL1('L1-b', [queued.at(-1)![0]!]);
       strategy.queueMergeOf(['L1-a', 'L1-b']);
       strategy.breakQuarantineRead();
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
       // The premise: the host's loop ends at a chunk before tick reaches the merge.
       const summaries = strategy.summaryIds().length;
       await assert.rejects(hostTicks(manager, strategy), /the quarantine ledger cannot be read/);
@@ -1439,7 +1544,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await drive(manager);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       // The premise: tick skips the quarantined chunks without a model call or a throw, and adopts the last one's L1.
       const before = calls.n;
       const summaries = strategy.summaryIds().length;
@@ -1461,7 +1566,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       // The premise: tick defers the others without a model call or a throw, and adopts the last one's L1.
       const summaries = strategy.summaryIds().length;
       await hostTicks(manager, strategy);
@@ -1579,7 +1684,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  it('before the host declares its tools, counts no queued chunk that starts inside the head window when the head carries a tool cycle after the chunk\'s start, which tick\'s head carries raw', async () => {
+  it('before the host declares its tools, counts no queued chunk that lies inside the head window, and tick asks the model for the first: its request carries the head only up to the chunk, not the tool cycle after it (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1607,19 +1712,22 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       assert.ok(!queued[0].some((id) => cycle.includes(id)), 'the first queued chunk is text ahead of the cycle');
       strategy.setHeadWindowTokens(100_000);
-      assert.equal(strategy.countsCompressionWork(), false, 'tick defers every queued chunk until the tools come');
-      // The premise: tick's head carries the cycle raw, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
+      assert.equal(strategy.countsCompressionWork(), false, 'chunks inside the head fold nothing, so none counts');
+      // The head a request gives is cut at its chunk's start (headAsOf), so the cycle after the first chunk isn't in
+      // its request: tick asks the model rather than deferring, and the counting membrane throws. Before #317 the
+      // head went whole, messages after the chunk included.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
   // The chunks the test above widens the head over lie wholly inside it, so they fold nothing and don't count
-  // whatever the tools say. A chunk that lies before a reset head start folds, and the head after it, which
-  // tick's request carries raw, is what holds it back: a tool message in the head lies past the chunk's start.
-  it('before the host declares its tools, counts no queued chunk that lies before a reset head start when the head carries a tool cycle, which tick\'s request carries raw though it lies after the chunk', async () => {
+  // whatever the tools say. A chunk that lies before a reset head start folds. Tick's request for it gives the
+  // head that history followed, the opening here, and not the reset head after it (#317), so a tool cycle in the
+  // reset head doesn't hold it back.
+  it('before the host declares its tools, names compression for a queued chunk that lies before a reset head start when that head carries a tool cycle, which lies after the chunk and tick\'s request leaves out (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1651,14 +1759,13 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(chunkAt.every((i) => i >= 0 && i < headStart), 'the premise: the first queued chunk lies before the head window\'s start, so it folds');
       assert.ok(!queued[0]!.some((id) => cycle.includes(id)), 'the premise: and holds no tool block of its own');
       assert.ok(cycleAt.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window, past the chunk\'s start');
-      assert.deepEqual(error.clearedBy, [], 'tick defers every queued chunk until the tools come');
-      // The premise: tick's request carries the head raw, cycle included, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
-      manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      assert.deepEqual(error.clearedBy, ['compression'], 'the chunk folds and tick will take it without the tools');
+      // The premise: tick's request gives the opening as its head, without the cycle, so tick asks the model, and the
+      // counting membrane throws.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
@@ -1689,13 +1796,13 @@ describe('OverBudgetError.clearedBy', () => {
         for (let i = 0; i < 12; i++) texts.push(manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
         if (place === 'reset head') strategy.resetHeadWindow(texts[6]!);
         strategy.seedL1('L1-cycle', cycle);
-        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'the premise: covered, the cycle holds no chunk back');
+        assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression'], 'the premise: covered, the cycle holds no chunk back');
         const { indices, headStart, headEnd } = strategy.placement(cycle);
         if (place === 'head window') assert.ok(indices.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window');
         else assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
         // A pin on the call opens the L1 for every chunk after it, so tick's request carries the cycle raw.
         manager.pinRange(cycle[0]!, cycle[0]!, { name: 'zz-pin' });
-        const error = await refusal(manager);
+        const error = await refusalOfWholeMiddle(manager);
         assert.ok(strategy.queuedChunkIds().length > 0, 'text chunks are queued');
         assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
         // The premise: tick defers every queued chunk, with no model call.
@@ -1703,13 +1810,13 @@ describe('OverBudgetError.clearedBy', () => {
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');
         manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
-        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+        assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
       }, { membrane: countingMembrane(calls) });
     });
   }
 
   for (const pinned of [false, true]) {
-    it(`names ${pinned ? 'nothing' : 'compression'} before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned, which tick\'s request then carries raw' : 'which tick\'s request leaves out'}`, async () => {
+    it(`names nothing before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned' : 'unpinned'}: tick's request carries the cycle raw in the opening, the head of that history (#317)`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         targetChunkTokens: 40,
@@ -1736,17 +1843,10 @@ describe('OverBudgetError.clearedBy', () => {
         assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
         const queued = strategy.queuedChunkIds();
         assert.ok(queued.some((ids) => !ids.some((id) => cycle.includes(id))), 'text chunks are queued');
-        if (!pinned) {
-          assert.deepEqual(error.clearedBy, ['compression']);
-          // The premise: tick's request leaves the cycle out, so tick asks the model, and the counting membrane throws.
-          await assert.rejects(async () => {
-            for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-          }, /no model in this test/);
-          assert.equal(calls.n, 1, 'tick asked the model');
-          return;
-        }
         assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
-        // The premise: tick's request carries the pinned cycle raw, so tick defers every queued chunk, with no model call.
+        // The premise: tick's request for a chunk before the reset gives the opening as its head, cycle included, raw
+        // (pinned or not), so tick defers every queued chunk, with no model call. Before #317 an unpinned cycle there
+        // was left out, since the head was the reset one.
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');
@@ -1814,7 +1914,7 @@ describe('OverBudgetError.clearedBy', () => {
       ];
       strategy.resetHeadWindow(head);
       manager.holdCompression([held], { timeoutMs: 60_000 });
-      const error = await refusal(manager);
+      const error = await refusalOfWholeMiddle(manager);
       const { indices, headStart, headEnd, holdStart } = strategy.placement([early[0]!, held, ...cycle]);
       const [chunkAt, heldAt, ...cycleAt] = indices as [number, number, number, number];
       assert.ok(chunkAt < headStart, 'the premise: the chunk lies before the head window\'s start');
@@ -2257,7 +2357,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.holdBlocksMerges = true;
       // The first queued chunk holds both sources; the others hold neither.
       assert.ok(queued.slice(1).some((chunk) => !chunk.includes(ids[0]!) && !chunk.includes(ids[1]!)), 'a queued chunk the L1s leave alone');
-      const error = await refusal(manager);
+      const error = await refusalOfWholeMiddle(manager);
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
@@ -2283,7 +2383,7 @@ describe('OverBudgetError.clearedBy', () => {
           if (work === 'running') strategy.startCompressing();
           // A merge whose source in memory covers a message the compile can fold.
           else strategy.queueMergeOf(['L1-diagnostic']);
-          const error = await refusal(manager);
+          const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
           assert.match(error.message, positionedRecallPairs
             ? /selected middle representations=1, attempted representation level=L1/
             : /middle raw messages=1, attempted representation level=L0/);
@@ -2347,8 +2447,10 @@ describe('OverBudgetError.clearedBy', () => {
         // A merge whose source in memory covers a message the compile can fold, so only the hold stops it.
         strategy.queueMergeOf(['L1-diagnostic']);
         assert.equal(strategy.checkReadiness().ready, false, 'the merge is queued');
-        const error = await refusal(manager);
+        const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages',
+          'the pair, or with the combined pair fitting, the raw message after it, refuses');
         assert.deepEqual(error.clearedBy, [], 'tick stops at a blocked merge until the hold is released');
       });
     });
@@ -2570,7 +2672,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       pinChunks(manager, queued.slice(0, 1));
       queued.slice(1).forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
       assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile queued the same chunks, in the same order');
       // The premise: tick takes the pinned chunk first, and the host's loop ends there.
       await assert.rejects(hostTicks(manager, strategy), /compressionModel is NOT configured/);
@@ -2673,7 +2775,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
       pinChunks(manager, queued.slice(0, 1));
-      const error = await refusal(manager);
+      const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
@@ -2687,7 +2789,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
       pinChunks(manager, queued.slice(0, 1));
-      const error = await refusal(manager);
+      const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
@@ -2700,7 +2802,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
       pinChunks(manager, queued.slice(0, 1));
-      const error = await refusal(manager);
+      const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, ['compression']);
     });
@@ -2726,7 +2828,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.queueMergeOf(['L1-a', 'L1-b']);
       strategy.queueMergeOf(['L1-c', 'L1-d']);
       manager.pinRange(ids[0]!, ids[1]!, { name: 'zz-pin' });
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
     });
   });
 
@@ -2742,7 +2844,7 @@ describe('OverBudgetError.clearedBy', () => {
       await Promise.race([model.called, ticking]);
       // tick takes only the head merge, which the pin leaves folding nothing.
       assert.equal(model.calls.n, 1, 'premise: tick asked the model for the head merge, and waits');
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       model.release();
       await ticking;
     }, { membrane: model.membrane });
@@ -2762,7 +2864,7 @@ describe('OverBudgetError.clearedBy', () => {
       // tick takes only the head merge, which the pin leaves folding nothing.
       assert.equal(model.calls.n, 1, 'premise: tick asked the model for the head merge, and waits');
       manager.holdCompression([ids[3]!], { timeoutMs: 60_000 });
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
       const { indices, holdStart } = strategy.placement(ids);
       assert.ok(indices[1]! < holdStart && indices[3]! >= holdStart, 'premise: the hold reaches the merge in flight and not the merge behind it');
       model.release();
@@ -2810,13 +2912,13 @@ describe('OverBudgetError.clearedBy', () => {
       assert.equal(strategy.chunkInFlight(), undefined, 'premise: the work in flight is the merge');
       strategy.atCap = false;
       strategy.breakQuarantineRead();
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       model.release();
       await ticking;
       // The control: with nothing in flight, the same fixture names nothing, since the walk stops at the
       // first queued chunk, which needs a model call, ahead of the merge still queued.
       assert.equal(strategy.queuedMergeCount(), 1, 'premise: the merge stays queued, its call rejected by the test');
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
     }, { membrane: model.membrane });
   });
 
@@ -2957,7 +3059,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.queueMergeOf(['L1-c', 'L1-d']);
       strategy.queueMergeOf(['L1-a', 'L1-b']);
       manager.holdCompression([ids[3]!], { timeoutMs: 60_000 });
-      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, []);
       manager.releaseCompression([ids[3]!]);
     });
   });
@@ -2974,7 +3076,7 @@ describe('OverBudgetError.clearedBy', () => {
       await Promise.race([model.called, ticking]);
       assert.equal(model.calls.n, 1, 'premise: tick asked the model for the first chunk, and waits');
       assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: the chunk in flight is the one the pin keeps raw');
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       model.release();
       assert.match(String(await ticking), /released by the test/);
     }, { membrane: model.membrane });
@@ -2993,4 +3095,336 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+});
+
+describe('OverBudgetError in the hierarchical middle', () => {
+  const middleStrategy = (config: ConstructorParameters<typeof AutobiographicalStrategy>[0] = {}) => new DiagnosticStrategy({
+    adaptiveResolution: false,
+    hierarchical: true,
+    targetChunkTokens: 100_000,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+    ...config,
+  });
+  const say = (manager: ContextManager, i: number): string =>
+    manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+  /** The input budget whose grace window (0.25) holds `tokens` and nothing more than a token or so past it. */
+  const holding = (tokens: number) => ({ maxTokens: Math.ceil(tokens / 1.25) + 20, reserveForResponse: 20 });
+  const unit = (error: OverBudgetError) => Reflect.get(error.diagnostics, 'middleCountUnit');
+
+  // Under positionedRecallPairs: false the combined recall pair went out unguarded: past the grace window, what refused
+  // was whatever came after it, or nothing did.
+  for (const after of ['nothing', 'a raw message', 'the recent window'] as const) {
+    it(`refuses at the combined recall pair past the grace window, as at a positioned pair, with ${after} after it`, async () => {
+      const refusals: OverBudgetError[] = [];
+      for (const positionedRecallPairs of [true, false]) {
+        const strategy = middleStrategy({ positionedRecallPairs, ...(after === 'the recent window' ? { recentWindowTokens: 50 } : {}) });
+        await withManager(strategy, async (manager) => {
+          const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+          // One message raw after the pair, or in the recent window, or none. The L1's 200 tokens are past the
+          // 80-token input budget, so selection passes it over, and coverage completion includes it.
+          strategy.seedPyramid(after === 'nothing' ? ids : after === 'a raw message' ? ids.slice(0, 1) : ids.slice(0, 2), 1);
+          refusals.push(await refusal(manager));
+        });
+      }
+      const [positioned, combined] = refusals;
+      assert.match(combined!.message, /^Hierarchical emission overran the budget/);
+      assert.equal(unit(combined!), 'selection-items', 'the pair refuses, not what follows it');
+      assert.match(combined!.message, /selected middle representations=1, attempted representation level=L1/);
+      assert.equal(combined!.actual, positioned!.actual, 'priced as the positioned pair is');
+      assert.equal(combined!.budget, positioned!.budget);
+      assert.deepEqual(combined!.clearedBy, [], 'no work is queued');
+    });
+  }
+
+  it('reports the head as head and the rest of the middle as middle, at each of the middle\'s four refusals', async () => {
+    // m0 is the head; an L1 covers m1; m2 has no summary, so it's raw. (An unowned m1 would join the head:
+    // anchorHeadToCoverage extends a head that ends on one to where coverage resumes.)
+    const run = async (positionedRecallPairs: boolean, budget?: { maxTokens: number; reserveForResponse: number }) => {
+      const strategy = middleStrategy({ positionedRecallPairs, headWindowTokens: 60 });
+      let error!: OverBudgetError;
+      let head!: OverBudgetError;
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+        strategy.seedPyramid([ids[1]!], 1);
+        head = await refusal(manager, undefined, { maxTokens: 30, reserveForResponse: 20 });
+        error = await refusal(manager, undefined, budget);
+      });
+      assert.equal(Reflect.get(head.diagnostics, 'middleTokens'), 0, 'the premise: the head alone refuses here');
+      return { error, headTokens: head.actual };
+    };
+    const split = (error: OverBudgetError) => ({
+      head: Reflect.get(error.diagnostics, 'headTokens') as number,
+      middle: Reflect.get(error.diagnostics, 'middleTokens') as number,
+      tail: Reflect.get(error.diagnostics, 'tailTokens') as number,
+    });
+    // Positioned: the pair refuses.
+    const pair = await run(true);
+    assert.equal(unit(pair.error), 'selection-items');
+    assert.match(pair.error.message, /attempted representation level=L1/);
+    assert.ok(pair.headTokens > 0, 'the premise: the head holds m0');
+    assert.deepEqual(split(pair.error), { head: pair.headTokens, middle: pair.error.actual - pair.headTokens, tail: 0 });
+    // Combined: the pair comes first and refuses.
+    const combined = await run(false);
+    assert.equal(unit(combined.error), 'selection-items');
+    assert.deepEqual(split(combined.error), { head: combined.headTokens, middle: combined.error.actual - combined.headTokens, tail: 0 });
+    // Combined, with the pair fitting: the raw m2 after it refuses.
+    const raw = await run(false, holding(combined.error.actual));
+    assert.equal(unit(raw.error), 'raw-messages');
+    assert.deepEqual(split(raw.error), { head: raw.headTokens, middle: raw.error.actual - raw.headTokens, tail: 0 });
+    // Positioned, with the pair fitting: the raw m2 after it refuses.
+    const first = await run(true, holding(pair.error.actual));
+    assert.equal(unit(first.error), 'selection-items');
+    assert.match(first.error.message, /attempted representation level=L0/, 'the raw message refuses');
+    assert.deepEqual(split(first.error), { head: first.headTokens, middle: first.error.actual - first.headTokens, tail: 0 });
+  });
+
+  // Work counts for a refusal in the middle only where it folds a message the refused prefix holds: work after the
+  // refused item can't shrink that prefix.
+  for (const positionedRecallPairs of [true, false]) {
+    it(`names compression ${positionedRecallPairs ? 'at a positioned pair' : 'at the combined pair'} only for work that folds a message before it or in it`, async () => {
+      const strategy = middleStrategy({ positionedRecallPairs, targetChunkTokens: 40 });
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 12 }, (_, i) => say(manager, i));
+        // An L1 over m0 alone, which no chunk matches, so the chunk that holds m0 is covered and isn't work.
+        // Selection takes it, and its pair, first in the middle, refuses.
+        strategy.seedUndercountedL1('L1-first', [ids[0]!]);
+        const first = await refusal(manager);
+        assert.equal(unit(first), 'selection-items');
+        assert.match(first.message, /attempted representation level=L1/, 'the pair over m0 refuses, first in the middle');
+        assert.ok(strategy.queuedChunkIds().some((chunk) => !chunk.includes(ids[0]!)), 'the premise: a chunk after the pair is queued');
+        assert.equal(strategy.countsCompressionWork(), true, 'the premise: that chunk counts as work, over the whole middle');
+        assert.deepEqual(first.clearedBy, [], 'it folds nothing the pair refused with');
+        // A refusal past those messages holds them, so the same work counts.
+        assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
+        // A merge of the pair's own summary can shrink it.
+        strategy.seedUndercountedL1('L1-second', [ids[1]!]);
+        strategy.queueMergeOf(['L1-first', 'L1-second']);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      }, { membrane: true });
+    });
+  }
+
+  it('names nothing at a positioned pair for a merge of summaries after it', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: true });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 4 }, (_, i) => say(manager, i));
+      // The pair over m0 comes first and refuses; m1 is raw; two L1s after it are queued to merge.
+      strategy.seedUndercountedL1('L1-first', [ids[0]!]);
+      strategy.seedUndercountedL1('L1-later', [ids[2]!]);
+      strategy.seedUndercountedL1('L1-last', [ids[3]!]);
+      strategy.queueMergeOf(['L1-later', 'L1-last']);
+      const first = await refusal(manager);
+      assert.match(first.message, /attempted representation level=L1/, 'the pair over m0 refuses, first in the middle');
+      assert.equal(strategy.countsCompressionWork(), true, 'the premise: the merge counts over the whole middle');
+      assert.deepEqual(first.clearedBy, [], 'the merge folds summaries after the refused pair');
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('names nothing at the raw message after the combined pair for work on messages after it', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: false, targetChunkTokens: 40 });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 12 }, (_, i) => say(manager, i));
+      strategy.seedUndercountedL1('L1-first', [ids[0]!]);
+      const pair = await refusal(manager);
+      assert.equal(unit(pair), 'selection-items', 'the premise: the combined pair refuses first');
+      // Past the pair, m1 raw after it refuses; m1's chunk is covered (it holds m0), and the queued one after it is not in the prefix.
+      const raw = await refusal(manager, undefined, holding(pair.actual));
+      assert.equal(unit(raw), 'raw-messages');
+      assert.equal(Reflect.get(raw.diagnostics, 'middleTokens'), raw.actual, 'the pair and m1');
+      assert.equal(strategy.countsCompressionWork(), true, 'the premise: the chunk after counts over the whole middle');
+      assert.deepEqual(raw.clearedBy, []);
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('prices the combined pair at a carrier\'s measured tokens under carrierPolicy full, as a positioned pair is priced, and at its estimate under live-strip', async () => {
+    const outcome = async (positionedRecallPairs: boolean, carrierPolicy: 'full' | 'live-strip') => {
+      const strategy = middleStrategy({ positionedRecallPairs, carrierPolicy });
+      let result: { refused?: OverBudgetError } = {};
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        strategy.seedCarrierL1('L1-carrier', ids, 400);
+        try {
+          await manager.compile({ maxTokens: 220, reserveForResponse: 20 });
+        } catch (error) {
+          assert.ok(error instanceof OverBudgetError, String(error));
+          result = { refused: error };
+        }
+      });
+      return result;
+    };
+    const positioned = await outcome(true, 'full');
+    const combined = await outcome(false, 'full');
+    assert.ok(positioned.refused, 'the premise: a positioned pair is priced at the measured 400');
+    assert.ok(combined.refused, 'the combined pair is priced at it too');
+    assert.equal(combined.refused.actual, positioned.refused.actual);
+    assert.ok(combined.refused.actual >= 400);
+    assert.equal((await outcome(false, 'live-strip')).refused, undefined, 'stripped, the carrier isn\'t sent, so its estimate stands and fits');
+  });
+
+  it('floors a summary whose text the combined pair\'s cap cut, since the cap passes its carrier through whole, and prices it below the same summary uncut', async () => {
+    const price = async (maxMessageTokens?: number) => {
+      const strategy = middleStrategy({ positionedRecallPairs: false, ...(maxMessageTokens ? { maxMessageTokens } : {}) });
+      let actual = 0;
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        strategy.seedCarrierL1('L1-carrier', ids, 400, 'memory '.repeat(50));
+        const error = await refusal(manager, undefined, { maxTokens: 220, reserveForResponse: 20 });
+        assert.equal(unit(error), 'selection-items', 'the pair refuses');
+        actual = error.actual;
+      });
+      return actual;
+    };
+    const cut = await price(20);
+    const whole = await price();
+    // Unfloored, the cut pair would price at its label and twenty tokens of text.
+    assert.ok(cut > 200, `floored, the carrier at its measured size: ${cut}`);
+    assert.ok(cut < whole, `the cut text isn't charged: ${cut} cut, ${whole} whole`);
+  });
+
+  it('sums the combined pair\'s floors over its summaries, and names its count and its deepest level', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: false });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+      strategy.seedCarrierL1('L1-carrier', [ids[0]!], 400);
+      strategy.seedL1('L1-merged', [ids[1]!], 'L2-carrier');
+      strategy.seedCarrierL2('L2-carrier', ['L1-merged'], 300);
+      const error = await refusal(manager);
+      assert.equal(unit(error), 'selection-items');
+      assert.match(error.message, /selected middle representations=2, attempted representation level=L2/);
+      assert.ok(error.actual > 700, `both floors, 400 and 300: ${error.actual}`);
+    });
+  });
+
+  it('floors no summary the xml envelope\'s cap leaves out of the combined pair', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: false, recallEnvelope: 'xml', maxMessageTokens: 20 });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+      // The cap cuts the first summary's text, and the envelope's cap then admits nothing after it.
+      strategy.seedCarrierL1('L1-first', [ids[0]!], 400, 'memory '.repeat(50));
+      strategy.seedCarrierL1('L1-second', [ids[1]!], 400, 'memory '.repeat(50));
+      const error = await refusal(manager, undefined, { maxTokens: 220, reserveForResponse: 20 });
+      assert.equal(unit(error), 'selection-items');
+      assert.match(error.message, /selected middle representations=2,/, 'the premise: both are selected');
+      // Each floor adds about 300, so one floor reads between 200 and 600, and two past 600.
+      assert.ok(error.actual > 200 && error.actual < 600, `the first summary's floor alone: ${error.actual}`);
+    });
+  });
+
+  it('floors a summary whose reasoning the xml envelope sends as a copy, released from its item, since its encrypted content still goes out', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: false, recallEnvelope: 'xml' });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+      // A Responses reply: encrypted reasoning, then the message item its prose came from. Wrapping the prose releases
+      // the message's item and the reasoning paired with it, so both go out as copies.
+      strategy.seedCarrierL1('L1-responses', ids, 400, 'a short memory', [
+        { type: 'redacted_thinking', data: 'zz', rawItem: { type: 'reasoning', id: 'rs_zz', encrypted_content: 'zz', summary: [] } } as unknown as ContentBlock,
+        { type: 'text', text: 'a short memory', rawItem: { type: 'message', id: 'msg_zz', role: 'assistant', content: [] } } as unknown as ContentBlock,
+      ]);
+      const error = await refusal(manager, undefined, { maxTokens: 220, reserveForResponse: 20 });
+      assert.equal(unit(error), 'selection-items');
+      assert.ok(error.actual > 400, `floored at the measured 400: ${error.actual}`);
+    });
+  });
+
+  it('names nothing at the combined pair, or at the raw message after it, for a merge of summaries the xml envelope\'s cap leaves out of it', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: false, recallEnvelope: 'xml', maxMessageTokens: 20 });
+    await withManager(strategy, async (manager) => {
+      // m3 stays raw after the pair.
+      const ids = Array.from({ length: 4 }, (_, i) => say(manager, i));
+      // The cap cuts the first summary's text, and the envelope's cap then admits nothing after it.
+      strategy.seedCarrierL1('L1-first', [ids[0]!], 400, 'memory '.repeat(50));
+      strategy.seedCarrierL1('L1-second', [ids[1]!], 400, 'memory '.repeat(50));
+      strategy.seedCarrierL1('L1-third', [ids[2]!], 400, 'memory '.repeat(50));
+      strategy.queueMergeOf(['L1-second', 'L1-third']);
+      const error = await refusal(manager, undefined, { maxTokens: 220, reserveForResponse: 20 });
+      assert.equal(unit(error), 'selection-items');
+      assert.match(error.message, /selected middle representations=3,/, 'the premise: all three are selected');
+      assert.equal(strategy.countsCompressionWork(), true, 'the premise: the merge counts over the whole middle');
+      assert.deepEqual(error.clearedBy, [], 'the merge folds only summaries the answer leaves out');
+      const after = await refusal(manager, undefined, holding(error.actual));
+      assert.equal(unit(after), 'raw-messages', 'the premise: the pair fits, and m3 after it refuses');
+      assert.deepEqual(after.clearedBy, [], 'nor does the merge shrink what refused at m3');
+    }, { membrane: true });
+  });
+
+  it('names compression at a positioned raw message only for work that folds it or a message before it', async () => {
+    const strategy = middleStrategy({ positionedRecallPairs: true, targetChunkTokens: 40 });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 12 }, (_, i) => say(manager, i));
+      // A pin keeps m0 raw and out of compression, and it's first in the middle.
+      manager.pinRange(ids[0]!, ids[0]!, { name: 'zz-pin' });
+      const first = await refusal(manager, undefined, { maxTokens: 50, reserveForResponse: 20 });
+      assert.equal(unit(first), 'selection-items');
+      assert.match(first.message, /attempted representation level=L0/, 'the pinned m0 refuses');
+      assert.ok(strategy.queuedChunkIds().length > 0, 'the premise: chunks after it are queued');
+      assert.equal(strategy.countsCompressionWork(), true, 'the premise: they count over the whole middle');
+      assert.deepEqual(first.clearedBy, [], 'nothing folds the pinned message');
+      assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('prices afresh a strategy initialized over another store, whose estimator differs', async () => {
+    // One strategy instance, opened over a store at the default rate and then over one at twice it.
+    const strategy = middleStrategy({ positionedRecallPairs: true });
+    const twice = (text: string) => Math.ceil(text.length / 2);
+    const outcomes: Array<number | undefined> = [];
+    for (const tokenEstimator of [undefined, twice]) {
+      const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
+      const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
+      try {
+        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        strategy.seedPyramid(ids, 1);
+        await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        outcomes.push(undefined);
+      } catch (error) {
+        assert.ok(error instanceof OverBudgetError, String(error));
+        outcomes.push(error.actual);
+      } finally {
+        await manager.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+    assert.equal(outcomes[0], undefined, 'the premise: at the default rate the pair fits');
+    assert.ok((outcomes[1] ?? 0) > 300, `at the second store's rate it's refused, not priced from the first's: ${outcomes[1]}`);
+  });
+
+  it('prices the recall pairs with the store\'s estimator, as raw messages are priced', async () => {
+    // An estimator at twice the default rate: the pair the default rules fit in 250 is refused at the store's.
+    const outcome = async (positionedRecallPairs: boolean, tokenEstimator?: (text: string) => number) => {
+      const strategy = middleStrategy({ positionedRecallPairs });
+      const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
+      const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
+      try {
+        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        strategy.seedPyramid(ids, 1);
+        await manager.compile({ maxTokens: 260, reserveForResponse: 20 }, undefined, { dryRun: true }).catch(() => undefined);
+        assert.equal(Reflect.get(strategy, '_storeView'), null, 'a dry compile leaves no view bound');
+        try {
+          await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        } finally {
+          assert.equal(Reflect.get(strategy, '_storeView'), null, 'nor does a committing one, so a mint request prices as before');
+        }
+        return undefined;
+      } catch (error) {
+        assert.ok(error instanceof OverBudgetError, String(error));
+        return error;
+      } finally {
+        await manager.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    };
+    const twice = (text: string) => Math.ceil(text.length / 2);
+    for (const positionedRecallPairs of [true, false]) {
+      assert.equal(await outcome(positionedRecallPairs), undefined, 'the premise: at the default rate the pair fits');
+      const refused = await outcome(positionedRecallPairs, twice);
+      assert.ok(refused, `${positionedRecallPairs ? 'positioned' : 'combined'}: refused at the store's rate`);
+      assert.ok(refused.actual > 300, String(refused.actual));
+    }
+  });
 });

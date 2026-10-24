@@ -146,8 +146,11 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
   it("raw in the adaptive middle, with an image on the first shard: the run is counted as the text it sends", async () => {
     // Ingress puts a split body's other blocks on its first shard, and the
     // middle's shard path sends only its shards' text. The plan prices the
-    // image with the shard, so here it plans more than the run sends.
-    const o = await open([{ type: 'text', text: DENSE + PROSE }, IMAGE], WINDOWS['raw in the adaptive middle'].config);
+    // image with the shard, so here it plans more than the run sends. With
+    // no depth strip: at the default 30,000 tokens the first shard is the
+    // message that crosses the depth, so the estimate, as the strip, would
+    // price its image as the placeholder.
+    const o = await open([{ type: 'text', text: DENSE + PROSE }, IMAGE], { ...WINDOWS['raw in the adaptive middle'].config, imageStripDepthTokens: 0 });
     try {
       const compiled = await o.manager.compile(BIG);
       const stats = o.manager.getRenderStats()!;

@@ -13,6 +13,8 @@ jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    # A leg that hangs is stopped here, rather than at GitHub's six hours.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       # Both platforms: a package-lock.json regenerated over an existing
@@ -59,4 +61,12 @@ jobs:
       # Tests run on both platforms: process/stdio behaviour differs (pipes
       # are asynchronous on macOS), and ubuntu-only runs have missed that.
       - name: Test
+        if: ${{ !startsWith(matrix.node, '22') }}
         run: npm test
+
+      # On Node 22, each test file runs in a process of its own instead of
+      # through node --test, whose parent can hang there for good:
+      # scripts/test-each-file.sh says why.
+      - name: Test (each file in its own process)
+        if: ${{ startsWith(matrix.node, '22') }}
+        run: bash scripts/test-each-file.sh

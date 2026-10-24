@@ -151,6 +151,7 @@ export {
   accountFrontier,
   type OverBudgetClearedBy,
   type OverBudgetDiagnostics,
+  type OverBudgetRawPin,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,

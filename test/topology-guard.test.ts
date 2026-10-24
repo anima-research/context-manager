@@ -101,8 +101,8 @@ describe('merge adjacency is judged in store order (issue #122)', () => {
 });
 
 /** A Probe bound to a real store: branch-guarded entrypoints need one. */
-async function openProbe(path: string, membrane: unknown, count = 40): Promise<{ manager: ContextManager; p: Probe; ids: string[]; ctx: StrategyContext }> {
-  const p = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+async function openProbe(path: string, membrane: unknown, count = 40, mergeThreshold = 6): Promise<{ manager: ContextManager; p: Probe; ids: string[]; ctx: StrategyContext }> {
+  const p = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold, compressionModel: 'test-compression-model' });
   const manager = await ContextManager.open({ path, strategy: p, membrane: membrane as never });
   const out: string[] = [];
   for (let i = 0; i < count; i++) out.push(manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i} ` + 'w '.repeat(20) }]));
@@ -116,7 +116,7 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
 }
 const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
   './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off',
-  './test-topology-guard-gone'];
+  './test-topology-guard-gone', './test-topology-guard-damaged', './test-topology-guard-empty-group'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -210,6 +210,69 @@ describe('a crossed merge is refused at mint time', () => {
       assert.equal(debt.state, 'critical');
     } finally {
       reopened.close();
+    }
+  });
+
+  test('a restart leaves out a damaged record beside a standing one, says so, and reads critical from the one that stands', async () => {
+    const { manager, p, membrane } = await refusedCrossedMerge(STORES[8], true);
+    const internals = p as unknown as { store: { setStateJson(id: string, v: unknown): void }; mergeQuarantineStateId: string };
+    const [standing, damaged] = [...p.quarantine().values()] as Array<Record<string, unknown>>;
+    internals.store.setStateJson(internals.mergeQuarantineStateId, [standing, { ...damaged, sourceIds: undefined }]);
+    manager.close();
+    const again = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let reopened: ContextManager | undefined;
+    try {
+      reopened = await ContextManager.open({ path: STORES[8], strategy: again, membrane: membrane as never });
+    } finally {
+      console.warn = warn;
+    }
+    try {
+      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes("can't read"));
+      assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key, and sourceIds a list whose ids are all non-empty strings\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
+      assert.equal(again.quarantine().size, 1, 'the standing record loaded');
+      const stored = (again as unknown as { store: { getStateJson(id: string): unknown }; mergeQuarantineStateId: string });
+      assert.deepEqual(stored.store.getStateJson(stored.mergeQuarantineStateId), [standing], 'written back with the standing record alone');
+      const debt = again.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 1, 'only the standing record counts');
+      assert.equal(debt.state, 'critical');
+    } finally {
+      reopened?.close();
+    }
+  });
+
+  test('at mergeThreshold 0 the empty group is refused once, and its record stands, holding the threshold pass back (#285)', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'merged' }] }) };
+    const { manager, p, ids: all, ctx } = await openProbe(STORES[9], membrane, 40, 0);
+    const s = real(all);
+    p.setChunks([s(0, 9), s(10, 19)]);
+    p.setSummaries([l1r('a', s(0, 9)), l1r('b', s(10, 19))]);
+    const internals = p as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[] }>; checkMergeThreshold(): void; sweepPaidOffMergeQuarantine(): void };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      internals.checkMergeThreshold();
+      assert.deepEqual(internals.mergeQueue.map((m) => m.sourceIds), [[]], 'setup: the threshold pass queues the empty group');
+      const states: string[] = [];
+      for (let cycle = 0; cycle < 3; cycle++) {
+        // A drain passes the queue's head, with its own array; then the alarm's sweep, which runs the threshold pass after it removes anything.
+        const head = internals.mergeQueue[0];
+        if (head) await p.merge(head.level, head.sourceIds, ctx);
+        internals.sweepPaidOffMergeQuarantine();
+        states.push(p.getCompressionDebt().state);
+      }
+      assert.deepEqual(p.getMergeQuarantineStatus().records.map((r) => [r.lastOutcome, r.sourceIds]), [['topology_violation', []]]);
+      assert.deepEqual(internals.mergeQueue, [], 'not queued again while its record stands');
+      assert.deepEqual(states, ['critical', 'critical', 'critical']);
+      assert.equal(p.getCompressionDebt().topologyRefusals, 1);
+      assert.equal(errors.filter((line) => /refus/i.test(line)).length, 1, `refused once: ${JSON.stringify(errors)}`);
+    } finally {
+      console.error = error;
+      manager.close();
     }
   });
 

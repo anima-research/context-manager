@@ -27,7 +27,7 @@ function storeAt(calibration: number, messages: Array<{ id: string; content: Con
   };
 }
 
-/** The live-image placeholder; its raw price is its length / 4, like any text. */
+/** The live-image placeholder; this view prices it at its length / 4, like any text here. */
 const PLACEHOLDER = "[image not shown: this context keeps only some images]";
 const PLACEHOLDER_RAW = Math.ceil(PLACEHOLDER.length / 4);
 

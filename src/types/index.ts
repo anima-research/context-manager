@@ -40,6 +40,7 @@ export type {
   JournalMark,
   RenderedLayout,
   LayoutUnit,
+  ThinkingStrip,
 } from './context.js';
 
 // Strategy types
@@ -59,6 +60,9 @@ export type {
   AutobiographicalOptions,
   CompressionQuarantineStatus,
   CompressionQuarantineSpan,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,
@@ -79,6 +83,8 @@ export type {
   CalibrationReset,
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
+  ThinkingBinding,
+  RequestIdentity,
 } from './strategy.js';
 
 export {

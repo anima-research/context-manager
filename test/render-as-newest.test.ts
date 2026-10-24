@@ -102,6 +102,18 @@ describe('renderAsNewest', () => {
       });
     });
 
+    it(`${name}: an image nested in a tool result counts toward the limits, as in a compile`, async () => {
+      await withManager(make({ maxLiveImages: 1 }), async (manager) => {
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 't-1', name: 'shot', input: {} } as ContentBlock]);
+        const older = manager.addMessage('user', [{ type: 'tool_result', toolUseId: 't-1', content: imageMessage('older') } as unknown as ContentBlock]);
+        const newer = manager.addMessage('user', imageMessage('newer'));
+        const { rendered, next } = await renderedAndSent(manager, [older, newer]);
+        assert.deepEqual(rendered, next);
+        const nested = (content: unknown): number => imagesIn(((content as ContentBlock[])[0] as { content: unknown }).content);
+        assert.deepEqual([nested(rendered[0]), imagesIn(rendered[1])], [0, 1], 'the newer image takes the one slot, and the nested one is stripped');
+      });
+    });
+
     it(`${name}: an image past the byte limit on its own`, async () => {
       await withManager(make({ maxLiveImageBytes: 8 }), async (manager) => {
         const id = manager.addMessage('user', imageMessage('big', 1, 12));
@@ -389,34 +401,34 @@ describe('renderAsNewest', () => {
       }
     }
     const strategy = new FailingCut({
-      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0,
-      maxLiveImages: 2, imageStripHysteresisRatio: 0.5, maxMessageTokens: 50,
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, maxMessageTokens: 50,
     } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
     await withManager(strategy, async (manager) => {
-      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`img-${i}`, 1)));
+      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', [{ type: 'text', text: `message ${i}` }]));
       ids.push(manager.addMessage('user', longText('LONG', 300)));
-      const state = strategy as unknown as { _imageWatermark: unknown; _imageWatermarkLoaded: boolean; _postStripMemo: unknown; _dryRunSelect: boolean };
-      state._imageWatermark = undefined;
-      state._imageWatermarkLoaded = true;
-      state._postStripMemo = null;
+      const state = strategy as unknown as {
+        _dryRunSelect: boolean; chunks: unknown; compressionQueue: unknown; _storeOrder: unknown; _lastRenderStats: unknown;
+      };
+      const found = () => [state.chunks, state.compressionQueue, state._storeOrder, state._lastRenderStats];
+      const before = found();
       failCut = true;
       assert.throws(() => manager.renderAsNewest(ids), /cut failed/);
       failCut = false;
-      assert.equal(state._imageWatermark, undefined, 'the watermark is as it was');
-      assert.equal(state._postStripMemo, null, 'the estimates are as they were');
       assert.equal(state._dryRunSelect, false, 'the next select is live');
+      found().forEach((now, k) => assert.ok(now === before[k], `the chunks, the compression queue, the store order and the render stats are the ones it found (${k})`));
     });
   });
 
-  it("autobiographical: images the hysteresis watermark trims, as the next compile trims them", async () => {
-    // Eight new images under a count of 6 at ratio 0.5: the watermark keeps
-    // the newest 3 or 4, where the count alone would keep 6.
+  it("autobiographical: images the hysteresis rule trims, as the next compile trims them", async () => {
+    // Eight new images under a count of 6 at ratio 0.5: the rule keeps the
+    // newest 4 (a trim to 3 at the seventh, then the eighth), where the count
+    // alone would keep 6.
     await withManager(memory({ maxLiveImages: 6, imageStripHysteresisRatio: 0.5 }), async (manager) => {
       const ids: string[] = [];
       for (let i = 1; i <= 8; i++) ids.push(manager.addMessage('user', imageMessage(`new-${i}`, 1)));
       const { rendered, next } = await renderedAndSent(manager, ids);
       assert.deepEqual(rendered, next);
-      assert.ok(rendered.filter((c) => imagesIn(c) > 0).length < 6, `the watermark trimmed past the count (${rendered.map(imagesIn).join('')})`);
+      assert.equal(rendered.map(imagesIn).join(''), '00001111', 'the rule trimmed past the count, to the newest 4');
     });
   });
 
@@ -494,28 +506,6 @@ describe('renderAsNewest', () => {
       const id = manager.addMessage('user', [{ type: 'text', text: 'as stored' }]);
       assert.equal(manager.renderAsNewest([id]), undefined);
       assert.throws(() => manager.renderAsNewest([id, 'no-such-id']), /no stored message has id no-such-id/, 'it refuses an unknown id first');
-    });
-  });
-
-  it('autobiographical: rendering puts back the watermark and post-strip estimates it priced from', async () => {
-    // With the watermark unloaded and no estimates kept, the render's image
-    // pass prices afresh and advances the watermark for itself, as a dry
-    // select does; what the next compile reads must be as it was before.
-    const strategy = memory({ maxLiveImages: 2, imageStripHysteresisRatio: 0.5 });
-    await withManager(strategy, async (manager) => {
-      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`img-${i}`, 1)));
-      const state = strategy as unknown as { _imageWatermark: unknown; _imageWatermarkLoaded: boolean; _postStripMemo: unknown; imageWatermarkStateId: string };
-      state._imageWatermark = undefined;
-      state._imageWatermarkLoaded = true;
-      state._postStripMemo = null;
-      // The stored watermark a restart would load, older than any advance.
-      const store = (manager as unknown as { store: JsStore }).store;
-      store.setStateJson(state.imageWatermarkStateId, { sequence: 0, at: 1 });
-      const rendered = manager.renderAsNewest(ids)!;
-      assert.equal(rendered.map(imagesIn).join(''), '0001', 'the watermark the render advanced keeps one image, where the count alone keeps two');
-      assert.equal(state._imageWatermark, undefined, 'the watermark is as it was');
-      assert.equal(state._postStripMemo, null, 'the estimates are as they were');
-      assert.deepEqual(store.getStateJson(state.imageWatermarkStateId), { sequence: 0, at: 1 }, 'the stored watermark is as it was');
     });
   });
 
