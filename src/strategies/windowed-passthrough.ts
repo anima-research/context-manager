@@ -20,6 +20,7 @@ import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
+import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -28,12 +29,14 @@ export interface WindowedPassthroughOptions {
   /**
    * When the window no longer fits the budget, the anchor jumps forward so
    * the new window is roughly this fraction of the usable budget (default
-   * 0.5). Between jumps the anchor never moves, so compiled output between
-   * re-anchors is a byte-stable prefix plus pure appends — and the strategy
+   * 0.5), or, when the store holds system changes, which go out wherever the
+   * window starts, this fraction of the room they leave. Between jumps the
+   * anchor never moves, so compiled output between re-anchors is a
+   * byte-stable prefix plus pure appends — and the strategy
    * marks that prefix for the provider's prompt cache (see
    * {@link WindowedPassthroughStrategy} on cache markers), so the accepted
-   * cost is one cache miss per jump, amortized over ~(1 - fraction) × budget
-   * of appended tokens, instead of the per-turn prefix churn a naively
+   * cost is one cache miss per jump, amortized over ~(1 - fraction) × that
+   * room of appended tokens, instead of the per-turn prefix churn a naively
    * sliding front produces.
    */
   reAnchorFraction?: number;
@@ -120,14 +123,16 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * **Hard budget.** After per-message shaping (truncation, image policy) the
  * window is priced against `maxTokens - reserveForResponse`. Overflow
  * re-anchors; if the single newest message alone still exceeds the usable
- * budget the strategy refuses with {@link OverBudgetError} (the framework's
- * over-budget breaker handles it) rather than emitting a request the
- * provider will reject. Previews report the oversized window instead.
+ * budget, or with system changes, the changes and the newest conversation
+ * message, or the changes alone, the strategy refuses with
+ * {@link OverBudgetError} (the framework's over-budget breaker handles it)
+ * rather than emitting a request the provider will reject. Previews report
+ * the oversized window instead.
  */
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
-  /** Renders the window raw; history before the anchor is not rendered. */
+  /** Renders the window raw; history before the anchor is not rendered, but for its system changes. */
   readonly renderedForms = ['raw', 'omitted'] as const;
 
   private readonly reAnchorFraction: number;
@@ -299,17 +304,33 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       return estimate + cappedPriceExtra(store, msg, content);
     };
 
+    // A system change before the window is sent too, in its order ahead of
+    // it: it changes the tools and system text everything after it was read
+    // with (system-changes.ts). So every change is priced wherever the
+    // window starts.
+    const changes = systemChangePositions(messages);
+    const keptBefore = (from: number): number[] => changes.filter((i) => i < from);
+    let changeTokens = 0;
+    for (const i of changes) changeTokens += priced(i);
     let total = 0;
+    for (const i of keptBefore(start)) total += priced(i);
     for (let i = start; i < messages.length; i++) total += priced(i);
 
+    let movedAnchor: number | undefined;
     if (total > maxTokens) {
-      // Coarse re-anchor: jump forward so the window is ~fraction × budget,
-      // then emit from the new anchor. One prefix invalidation, then
-      // byte-stable prefix + appends again until the next overflow.
-      const target = maxTokens * this.reAnchorFraction;
-      let acc = 0;
+      // Coarse re-anchor: jump forward so the window holds the changes and
+      // about that fraction of the room they leave, then emit from the new
+      // anchor. One prefix invalidation, then
+      // byte-stable prefix + appends again until the next overflow. The
+      // system changes go out wherever the window starts, so its messages
+      // take that fraction of the room the changes leave, and appends get
+      // the rest of that room, (1 - fraction) × (budget - changes), before
+      // the next.
+      const target = changeTokens + (maxTokens - changeTokens) * this.reAnchorFraction;
+      let acc = changeTokens;
       let newStart = messages.length;
       for (let i = messages.length - 1; i >= start; i--) {
+        if (holdsSystemChange(messages[i]!.content)) continue; // priced above
         const tokens = priced(i);
         if (acc + tokens > target) break;
         acc += tokens;
@@ -317,20 +338,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
       // Always make progress: if even the newest message exceeds the
       // target, emit just that message rather than nothing — subject to the
-      // hard-budget check below.
+      // hard-budget check below. A system change is no conversation message,
+      // so that's the newest message that isn't one, if the window holds one.
       if (newStart === messages.length && messages.length > 0) {
         newStart = messages.length - 1;
+        while (newStart > start && holdsSystemChange(messages[newStart]!.content)) newStart--;
       }
       start = newStart;
       total = 0;
+      for (const i of keptBefore(start)) total += priced(i);
       for (let i = start; i < messages.length; i++) total += priced(i);
-      if (!opts?.dryRun && start < messages.length) {
-        const newAnchor = messages[start].sequence;
-        if (newAnchor !== this.anchor) {
-          this.anchor = newAnchor;
-          this.persistAnchor();
-          this.pendingCause = 'window';
-        }
+      if (start < messages.length && messages[start].sequence !== this.anchor) {
+        movedAnchor = messages[start].sequence;
       }
     }
 
@@ -339,27 +358,41 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // would reject the request; refuse loudly instead (the framework
     // recognizes OverBudgetError and runs its over-budget breaker), as the
     // autobiographical strategy does. Previews report rather than throw.
+    // The anchor moves only for a compile that sends, below: a refused one
+    // leaves it where the last sent window started, so the turns that fit
+    // once the caller consolidates its changes are still in the window.
     if (total > maxTokens && !opts?.dryRun) {
       throw new OverBudgetError({
         budget: maxTokens,
         actual: total,
-        stage: 'Windowed passthrough: the newest message alone',
+        stage: changeTokens === 0
+          ? 'Windowed passthrough: the newest message alone'
+          : total > changeTokens
+            ? 'Windowed passthrough: its system changes and the newest conversation message'
+            : 'Windowed passthrough: its system changes alone',
         // No compression here: the window moves past this message once a
-        // newer one that fits arrives (the progress clause above).
-        clearedBy: ['newer-message'],
+        // newer one that fits arrives (the progress clause above). System
+        // changes go out wherever the window starts, so once they leave no
+        // room for a message only the caller, consolidating them, clears it.
+        clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
         diagnostics: {
-          headTokens: 0,
-          tailTokens: total,
+          headTokens: changeTokens,
+          tailTokens: total - changeTokens,
           middleTokens: 0,
           middleChunkCount: 0,
           deepestLevel: 0,
         },
       });
     }
+    if (movedAnchor !== undefined && !opts?.dryRun) {
+      this.anchor = movedAnchor;
+      this.persistAnchor();
+      this.pendingCause = 'window';
+    }
 
     const entries: ContextEntry[] = [];
-    for (let i = start; i < messages.length; i++) {
-      const msg = messages[i];
+    const add = (i: number): void => {
+      const msg = messages[i]!;
       entries.push({
         index: i,
         sourceMessageId: msg.id,
@@ -367,7 +400,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         participant: msg.participant,
         content: shaped.get(i) ?? msg.content,
       });
-    }
+    };
+    for (const i of keptBefore(start)) add(i);
+    for (let i = start; i < messages.length; i++) add(i);
 
     this.stripImages(entries, policy);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
@@ -387,13 +422,16 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * message to its newest: each cut as select cuts it (cappedContent), then
    * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
    * each decided from its message and newer ones, with depth from the view's
-   * newest message, so they're select's. A message before the anchor, which select
-   * leaves out, comes back as null. Like select, it first reloads the
-   * branch the store has moved to. A re-anchor the next compile's budget
-   * forces isn't foreseen: it moves the anchor only past a window bigger
-   * than the budget allows. A body sharded under the autobiographical
-   * strategy comes back shard by shard, since select sends each as its own
-   * message.
+   * newest message, so they're select's. A message before the anchor comes
+   * back as null, since select leaves it out, but for a system change, which
+   * comes back as select sends it ahead of the window, cut as any message
+   * is: a compile moves the anchor only to a message it sent, but a
+   * caller's setAnchor can move it past one just stored. Like select, it
+   * first reloads the branch the store has moved to. A re-anchor the next
+   * compile's budget forces isn't foreseen: it moves the anchor only past a
+   * window bigger than the budget allows. A body sharded under the
+   * autobiographical strategy comes back shard by shard, since select sends
+   * each as its own message.
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.syncToBranch();
@@ -421,7 +459,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.stripImages(entries, this.liveImagePolicy(messages, store, from));
     const rendered = new Map<MessageId, ContentBlock[]>();
     for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
-    return ids.map((id) => rendered.get(id) ?? null);
+    return ids.map((id) => {
+      const i = at.get(id);
+      if (i !== undefined && !shown(i) && holdsSystemChange(messages[i]!.content)) return this.cappedContent(messages[i]!);
+      return rendered.get(id) ?? null;
+    });
   }
 
   /** 'window' when the last committed select moved the window's start. */

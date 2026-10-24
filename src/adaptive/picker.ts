@@ -86,10 +86,12 @@ export interface OverBudgetRawPin {
 
 /**
  * What clears an over-budget refusal at run time besides a larger budget,
- * which clears any of them: waiting, or a hot setting. Cold configuration,
+ * which clears any of them but the structural repair's (a newest turn the
+ * repair dropped, which no budget brings back): waiting, or a hot setting. Cold configuration,
  * such as the head window's size, isn't named, and neither is a head-window
  * reset (`resetHeadWindow`), which clears a head that's over but starts a new
- * topic, nor newer messages that would shrink a head holding images, since
+ * topic (the system changes stored before the new head stay in it, so a
+ * reset clears none of what they cost), nor newer messages that would shrink a head holding images, since
  * the image strip takes the oldest images first but may not take enough.
  * The strategy that refuses sets it, since it knows which part of the
  * context is over and what can shrink that part:
@@ -151,14 +153,17 @@ export interface OverBudgetRawPin {
  *   as before, since nothing says what it folds. Whether that work is
  *   enough to fit isn't checked, so a host can tell an agent that
  *   compression may make room, not that it will.
- * - `'newer-message'`: the newest message alone is over the budget, and a
- *   newer message that fits moves the window past it.
+ * - `'newer-message'`: the newest message, with the system changes sent
+ *   beside it, is over the budget, and a newer conversation message that
+ *   fits beside them moves the window past it (a newer change doesn't).
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the newest
  *   turn as the compile must keep it raw, or beside everything from a
- *   compression hold if one starts earlier. That's the newest message (for
- *   one split into shards, its newest shard, since the earlier shards can
- *   fold), unless the newest message's body holds a tool_result, on its first
+ *   compression hold if one starts earlier, and beside the system changes
+ *   outside the head, which stay raw wherever the window starts. That's the
+ *   newest conversation message, a system change being none, with the
+ *   changes after it (for one split into shards, its newest shard, since the
+ *   earlier shards can fold), unless the newest message's body holds a tool_result, on its first
  *   shard: then it's that whole body and the whole call before it, which the
  *   result must follow raw. A smaller
  *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw

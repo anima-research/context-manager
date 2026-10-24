@@ -14,11 +14,21 @@
  * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
  * blob, not media inside a `tool_result`, which it keeps as given.
- * Nothing else is checked: not ids, names or signatures, which a provider may
+ * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
  * still refuse a block without, and nothing else of a media source, such as
- * a URL image's URL, which the formatters and the providers read. A block of
- * a type none of these names passes as it is, since membrane adds types:
- * whether a provider can take one is the provider's to say. One type is the
+ * a URL image's URL, which the formatters and the providers read. A
+ * `system_change` (membrane's SystemChangeContent) carries its content in
+ * `removeTools` and `addSystem`, arrays of strings, and `defineTools`, an
+ * array of tool definitions, each where present. A definition has the
+ * fields membrane's ToolDefinition types and sends to the provider with every
+ * later request: a non-empty string `name`, a string `description` and an
+ * object `inputSchema` whose `type` is `'object'`, which the API requires.
+ * One stands alone in its message, at
+ * its top level: membrane sends such a message as a system message of its
+ * own, and refuses one that mixes it with other blocks. A write refuses one
+ * that doesn't, and a read leaves it out. A
+ * block of a type none of these names passes as it is, since membrane adds
+ * types: whether a provider can take one is the provider's to say. One type is the
  * store's own: a `blob_ref`, which the store writes in place of inline media.
  * A write can't give one, and a read takes one whose `ref` is an object with
  * a string `hash` and an `originalType` of image, document, audio or video,
@@ -92,6 +102,105 @@ function kindOf(value: unknown): string {
 /** The block types whose `source` carries their media. */
 const MEDIA_TYPES: ReadonlySet<string> = new Set(['image', 'document', 'audio', 'video']);
 
+/** Whether a value is a system change (membrane's `system_change` block, SystemChangeContent). */
+function isSystemChange(value: unknown): boolean {
+  return isRecord(value) && value.type === 'system_change';
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+/**
+ * Whether a value is a tool definition as membrane reads one (ToolDefinition):
+ * a non-empty string `name`, a string `description` and an object
+ * `inputSchema` whose `type` is `'object'`. Membrane sends each to the
+ * provider with every request from the change on, so one without them would
+ * be refused on every request: the API refuses a definition whose schema has
+ * no `type`, or another, with a 400.
+ */
+function isToolDefinition(value: unknown): boolean {
+  return isRecord(value) && typeof value.name === 'string' && value.name !== '' &&
+    typeof value.description === 'string' && isRecord(value.inputSchema) && value.inputSchema.type === 'object';
+}
+
+function stringPlaces(value: unknown, at: string, places: string[], what: string): void {
+  if (typeof value !== 'string') places.push(`${at} is ${kindOf(value)}, not ${what}`);
+}
+
+function toolDefinitionPlaces(value: unknown, at: string, places: string[]): void {
+  if (!isRecord(value)) {
+    places.push(`${at} is ${kindOf(value)}, not a tool definition (an object)`);
+    return;
+  }
+  if (value.name === '') places.push(`${at}.name is an empty string, not a tool name`);
+  else stringPlaces(value.name, `${at}.name`, places, 'a tool name (a string)');
+  stringPlaces(value.description, `${at}.description`, places, 'a string');
+  if (!isRecord(value.inputSchema)) places.push(`${at}.inputSchema is ${kindOf(value.inputSchema)}, not a JSON Schema (an object)`);
+  else if (value.inputSchema.type !== 'object') places.push(`${at}.inputSchema.type is ${kindOf(value.inputSchema.type)}, not 'object'`);
+}
+
+/**
+ * Whether every element of the content is a system change. An index loop, so
+ * a hole counts as an element that isn't one, as every walk here names a hole
+ * and refuses it like any other.
+ */
+function standsAlone(content: readonly unknown[]): boolean {
+  for (let i = 0; i < content.length; i++) if (!isSystemChange(content[i])) return false;
+  return true;
+}
+
+/** Whether any element of the content is a system change (a hole isn't one). */
+function holdsChange(content: readonly unknown[]): boolean {
+  for (let i = 0; i < content.length; i++) if (isSystemChange(content[i])) return true;
+  return false;
+}
+
+/** Whether a value is absent, or an array whose every element passes `each`. */
+function absentOrArrayOf(value: unknown, each: (element: unknown) => boolean): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  for (let i = 0; i < value.length; i++) if (!each(value[i])) return false;
+  return true;
+}
+
+/**
+ * The fields of a system change that carry its content, as membrane reads
+ * them when it sends the change: names to withdraw and system texts as arrays
+ * of strings, and definitions as an array of tool definitions
+ * (isToolDefinition), each where present. Each with the places an element
+ * that fails names.
+ */
+const SYSTEM_CHANGE_FIELDS: ReadonlyArray<readonly [
+  field: string,
+  each: (element: unknown) => boolean,
+  what: string,
+  elementPlaces: (element: unknown, at: string, places: string[]) => void,
+]> = [
+  ['removeTools', isString, 'an array of tool names', (v, at, places) => stringPlaces(v, at, places, 'a tool name (a string)')],
+  ['defineTools', isToolDefinition, 'an array of tool definitions', toolDefinitionPlaces],
+  ['addSystem', isString, 'an array of strings', (v, at, places) => stringPlaces(v, at, places, 'a string')],
+];
+
+function systemChangeWellFormed(block: Record<string, unknown>): boolean {
+  for (const [field, each] of SYSTEM_CHANGE_FIELDS) if (!absentOrArrayOf(block[field], each)) return false;
+  return true;
+}
+
+function systemChangePlaces(block: Record<string, unknown>, at: string, places: string[]): void {
+  for (const [field, each, what, elementPlaces] of SYSTEM_CHANGE_FIELDS) {
+    const value = block[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value)) {
+      places.push(`${at}.${field} is ${kindOf(value)}, not ${what}`);
+      continue;
+    }
+    for (let i = 0; i < value.length; i++) {
+      if (!each(value[i])) elementPlaces(value[i], `${at}.${field}[${i}]`, places);
+    }
+  }
+}
+
 /** Whether a block matches where its readers read it, without allocating: each side's common case. */
 function wellFormed(block: unknown, side: Side): boolean {
   if (!isRecord(block)) return false;
@@ -108,9 +217,13 @@ function wellFormed(block: unknown, side: Side): boolean {
       const inner = block.content;
       if (typeof inner === 'string') return true;
       if (!Array.isArray(inner)) return false;
-      for (let i = 0; i < inner.length; i++) if (!wellFormed(inner[i], side)) return false;
+      for (let i = 0; i < inner.length; i++) {
+        if (!wellFormed(inner[i], side) || isSystemChange(inner[i])) return false;
+      }
       return true;
     }
+    case 'system_change':
+      return systemChangeWellFormed(block);
     case 'generated_image':
       return typeof block.data === 'string' && typeof block.mimeType === 'string';
     case 'blob_ref':
@@ -152,10 +265,13 @@ function storeRefuses(block: unknown): boolean {
 }
 
 function allWellFormed(content: readonly unknown[], side: Side): boolean {
+  let changes = 0;
   for (let i = 0; i < content.length; i++) {
     if (!wellFormed(content[i], side) || (side === 'write' && storeRefuses(content[i]))) return false;
+    if (isSystemChange(content[i])) changes++;
   }
-  return true;
+  // A message holding a system change holds nothing else.
+  return changes === 0 || changes === content.length;
 }
 
 /**
@@ -231,9 +347,18 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
         places.push(`${at}.content is ${kindOf(inner)}, not a string or an array of content blocks`);
         return;
       }
-      for (let i = 0; i < inner.length; i++) placesIn(inner[i], `${at}.content[${i}]`, places, side);
+      for (let i = 0; i < inner.length; i++) {
+        if (isSystemChange(inner[i])) {
+          places.push(`${at}.content[${i}] is a system_change inside a tool_result; a system change goes in a message of its own`);
+        } else {
+          placesIn(inner[i], `${at}.content[${i}]`, places, side);
+        }
+      }
       return;
     }
+    case 'system_change':
+      systemChangePlaces(block, at, places);
+      return;
     case 'generated_image':
       if (typeof block.data !== 'string') places.push(`${at}.data is ${kindOf(block.data)}, not a string`);
       if (typeof block.mimeType !== 'string') places.push(`${at}.mimeType is ${kindOf(block.mimeType)}, not a string`);
@@ -274,9 +399,13 @@ function storePlacesIn(block: unknown, at: string, places: string[]): void {
 
 function malformedPlaces(content: readonly unknown[], side: Side, at = 'content'): string[] {
   const places: string[] = [];
+  const mixed = !standsAlone(content) && holdsChange(content);
   for (let i = 0; i < content.length; i++) {
     placesIn(content[i], `${at}[${i}]`, places, side);
     if (side === 'write') storePlacesIn(content[i], `${at}[${i}]`, places);
+    if (mixed && isSystemChange(content[i])) {
+      places.push(`${at}[${i}] is a system_change beside other blocks; a system change goes in a message of its own`);
+    }
   }
   return places;
 }
@@ -349,7 +478,10 @@ export function blockForWrite(block: ContentBlock, what: string): ContentBlock {
  * so each level is reconciled on its own, and a block mended inside a
  * `tool_result` gives up its form like one at the top.
  */
-function transformed(content: readonly unknown[], side: Side): ContentBlock[] {
+function transformed(content: readonly unknown[], side: Side, nested = false): ContentBlock[] {
+  // A system change that doesn't stand alone in its message, at its top
+  // level, is left out by a read, and a write has refused it already.
+  const changesStand = !nested && standsAlone(content);
   const before: ContentBlock[] = [];
   const after: ContentBlock[] = [];
   for (let i = 0; i < content.length; i++) {
@@ -358,7 +490,7 @@ function transformed(content: readonly unknown[], side: Side): ContentBlock[] {
     // read leaves it out, and a write has refused it already.
     if (!isRecord(block)) continue;
     before.push(block as unknown as ContentBlock);
-    const out = side === 'write' ? writeBlock(block) : readBlock(block);
+    const out = isSystemChange(block) && !changesStand ? undefined : side === 'write' ? writeBlock(block) : readBlock(block);
     if (out) after.push(out);
   }
   return releaseEditedRawForms(before, after);
@@ -369,7 +501,7 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
   if (wellFormed(block, 'write')) return block as unknown as ContentBlock;
   if (block.type === 'tool_use') return mendedToolUse(block)!;
   if (block.type === 'tool_result' && Array.isArray(block.content)) {
-    return { ...block, content: transformed(block.content, 'write') } as unknown as ContentBlock;
+    return { ...block, content: transformed(block.content, 'write', true) } as unknown as ContentBlock;
   }
   return block as unknown as ContentBlock;
 }
@@ -386,10 +518,14 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
  * out (undefined): a value that isn't an object, an array, a block without a
  * string `type`, a text block without its string, unsigned thinking without
  * its string, media without a source or the data and media type to make
- * one, a generated image without its data or media type, and a `blob_ref`
+ * one, a generated image without its data or media type, a `blob_ref`
  * that doesn't reference a blob, whose `originalType` isn't image, document,
  * audio or video, or, for a document, audio or video, without a string
- * `mediaType`.
+ * `mediaType`, and a `system_change` whose `removeTools`, `defineTools` or
+ * `addSystem` isn't the array its content needs (one element of
+ * `defineTools` that isn't a tool definition leaves the whole change out),
+ * or that doesn't stand alone in its message, at its top level
+ * (transformed).
  */
 function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
   if (wellFormed(block, 'read')) return block as unknown as ContentBlock;
@@ -406,9 +542,9 @@ function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
     case 'tool_result': {
       const inner = block.content;
       const content = Array.isArray(inner)
-        ? transformed(inner, 'read')
+        ? transformed(inner, 'read', true)
         : isRecord(inner)
-          ? transformed([inner], 'read')
+          ? transformed([inner], 'read', true)
           : typeof inner === 'number'
             ? String(inner)
             : [];

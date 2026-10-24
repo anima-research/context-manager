@@ -695,6 +695,29 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       cm.close();
     });
   });
+
+  it('counts no message of system changes toward the pins\' tokens: it stays raw whatever the pins', async () => {
+    await withDir(async (dir) => {
+      const { cm } = await open(dir);
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      const rules = (words('rule', 1500)[0] as { text: string }).text;
+      const changeId = cm.addMessage('Harness', [{ type: 'system_change', addSystem: [rules] } as unknown as ContentBlock]);
+      await traffic(cm, 360);
+      await ready(cm);
+      const mark = cm.markDocument(b);
+      const raw = (await refusalOf(cm, 30_000)).diagnostics.rawPins!;
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
+      assert.strictEqual(raw.tokens, raw.pins[0]!.tokens, 'the total is the mark\'s alone, not the change beside it');
+      // A pin over the mark's message and the change counts the change for nothing, too.
+      assert.ok(cm.unpin(mark));
+      const range = cm.pinRange(b, changeId);
+      const ranged = (await refusalOf(cm, 30_000)).diagnostics.rawPins!;
+      assert.deepStrictEqual(ranged.pins.map((p) => [p.pinId, p.tokens]), [[range, raw.tokens]]);
+      assert.strictEqual(ranged.tokens, raw.tokens);
+      await cm.close();
+    });
+  });
 });
 
 describe('the refusal\'s words for the pins it names', () => {

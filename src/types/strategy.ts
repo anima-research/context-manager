@@ -395,7 +395,10 @@ export interface SelectOptions {
    * throw as for a real compile, leaving nothing behind; `previewContext`
    * reports an over-budget throw, as the plan's own preview when the plan was
    * already over the budget (the live compile refuses it at the plan check),
-   * and passes any other throw through.
+   * and passes any other throw through. The passthrough strategies throw
+   * none of their budget refusals on a dry select: it returns what they would
+   * send, over the budget or without the newest message, with no verdict,
+   * and they have no `previewContext` report.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile

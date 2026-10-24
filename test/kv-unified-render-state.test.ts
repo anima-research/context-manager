@@ -1218,3 +1218,33 @@ describe('a reference loaded from the store', () => {
     });
   }
 });
+
+describe('system changes before a reset head', () => {
+  it("they lead the head, and the check's rebuild puts them there, as the emission sends them", async () => {
+    const { dir, strategy, manager } = await open({ headWindowTokens: 4_000, recentWindowTokens: 4_000 });
+    try {
+      const change = { type: 'system_change', addSystem: ['Answer in metric units.'] } as unknown as ContentBlock;
+      add(manager, [['u', [text('a')]], ['Harness', [change]], ['a', [text('b')]], ...MIDDLE, ...CLOSE]);
+      strategy.resetHeadWindow(ids(manager)[3]!);
+      const one = await compile(manager);
+      assert.deepEqual(one[0]!.content, [change], 'the change before the head leads');
+      assert.deepEqual(one[1]!.content, manager.getMessage(ids(manager)[3]!)!.content, 'then the head window');
+      accept(strategy, one);
+      const ref = reference(strategy)!;
+      assert.ok(ref.markers.length > 0, 'premise: the accepted request has markers');
+      const hooks = strategy as unknown as { kvUnifiedKeepEntries(...args: unknown[]): unknown };
+      const keep = hooks.kvUnifiedKeepEntries.bind(strategy);
+      let rebuilt = 0;
+      hooks.kvUnifiedKeepEntries = (...args) => { rebuilt++; return keep(...args); };
+      add(manager, SMALL);
+      const two = await compile(manager);
+      assert.ok(rebuilt > 0, 'premise: the check rebuilt');
+      assert.equal(firstChange(one, two), one.length, 'premise: nothing the accepted request sent changes');
+      assert.equal(solveMarkers(strategy), ref.markers.length, 'every accepted marker survives the check');
+      // afterEach: the self-check found the rebuild matching what was sent.
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
