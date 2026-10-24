@@ -160,27 +160,40 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
-   * What the next compile renders for each of `ids`, messages just stored
-   * and so among the newest of the window, in the order given, before the
-   * manager leaves out any thinking under `SelectOptions.thinkingBinding`. Each comes back
-   * cut by the per-message cap, and as one message where the compile joins a
-   * body's shards into one; the strategy makes every image decision it makes
-   * there: its count, depth and byte limits, counted newest-first over the
-   * view from the oldest of these messages to its newest, as a compile
-   * counts them. It's for a caller that appends messages it has just stored
-   * to a compiled request without recompiling, such as a turn's mid-turn
-   * injections, so that what it appends is what the next compile renders. A
-   * later compile can still strip an image of theirs as newer ones arrive.
+   * What the next compile sends for each of `ids`, in the order given,
+   * before the manager leaves out any thinking under
+   * `SelectOptions.thinkingBinding`. Each comes back in the form the compile
+   * sends it, wherever the compile places it: cut by the per-message cap, as
+   * one message where the compile joins a body's shards into one, and with
+   * every image decision the strategy makes there: its count, depth and byte
+   * limits, counted newest-first over the view from the oldest of these
+   * messages to its newest, as a compile counts them. It's for a caller that
+   * works from a compiled request without recompiling. One appends messages
+   * it has just stored, such as a turn's mid-turn injections, so that what it
+   * appends is what the next compile sends. Another renders messages its
+   * stream has already sent, such as the rows `ContextManager.noteRequestSent`
+   * digests over a whole turn, so that the next compile can tell which of
+   * them it sends as they were sent. A later compile can still strip
+   * an image of theirs as newer ones arrive, and their images can strip
+   * older images the request already carried, so the request they're
+   * appended to can still differ from the next compile before them.
    *
-   * `store` is the view a compile reads. An id comes back as null when the
-   * next compile doesn't send that message as one of its newest: the view
-   * leaves it out, such as by its filter, or the compile sends it elsewhere,
-   * such as a body too big for the window's recent part. What the next
-   * compile decides from its budget isn't foreseen, since a render has none:
-   * windowed passthrough's re-anchor, or its refusal of a newest message
-   * bigger than the budget; the memory strategy's refusal of a recent window
-   * over budget, or the adaptive select's drop of a provisional calibration
-   * that puts it over budget.
+   * The form isn't the place. Where the compile sends one of these messages
+   * before others, such as the memory strategy's head window a reset hasn't
+   * filled, which the history from before the reset follows, a request they
+   * are appended to differs from the next compile there, however they're
+   * rendered.
+   *
+   * `store` is the view a compile reads. An id comes back as null only when
+   * the next compile doesn't send that message: the view leaves it out, such
+   * as by its filter, or windowed passthrough's anchor is past it. What the
+   * next compile decides from its budget or its plan isn't foreseen, since a
+   * render has neither: windowed passthrough's re-anchor, or its refusal of a
+   * newest message bigger than the budget; the memory strategy's refusal of
+   * a recent window over budget, the adaptive select's drop of a provisional
+   * calibration that puts it over budget, or a plan that sends a summary in
+   * place of a message it covers, which comes back raw. A strategy's own doc
+   * names any other place where its compile sends a message otherwise.
    *
    * What comes back is made of the stored arrays and blocks, as a compile's
    * messages are, so a caller that edits what comes back copies it first.

@@ -19573,55 +19573,68 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for the
-   * messages it sends last and as they stand, over the view's suffix from the
-   * batch's oldest message to its newest: each stored copy cut as
-   * `cappedForSend` cuts it, a body's shards joined by
-   * `mergeAdjacentBodyGroupRaw` under adaptive resolution (the hierarchical
-   * select sends each shard as its own message), then `applyImageStripping`,
-   * so a message stored after the batch counts toward the images as in a
-   * compile. The tool pass that comes between them (postProcessToolEntries)
-   * is left out: it pairs and prunes by the window around these messages.
+   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for a
+   * message it sends raw, over the view's suffix from the batch's oldest
+   * message to its newest: each stored copy cut as `cappedForSend` cuts it, a
+   * body's shards joined by `mergeAdjacentBodyGroupRaw` under adaptive
+   * resolution (the hierarchical select sends each shard as its own message),
+   * then `applyImageStripping`, so a message stored after the batch counts
+   * toward the images as in a compile. The tool pass that comes between them
+   * (postProcessToolEntries) is left out: it pairs and prunes by the window
+   * around these messages. So the hierarchical select leaves out a newest
+   * message that holds a `tool_use` with no result after it, and the
+   * adaptive select refuses that compile, where the render gives the message
+   * as the cap leaves it; and both drop a `tool_result` whose call isn't
+   * sent before it.
    *
-   * Those messages are the recent window's, and the head window's too when
-   * no message comes between the two: a compile places the middle's
-   * messages, and the history before a head window that was reset, after
-   * the head. The hierarchical select can also place summaries there, which
-   * are text and change no image decision. A message before them comes back
-   * as null.
+   * Both selects send raw every message the view holds that no summary
+   * covers, whichever region holds it: the head window, the middle (the
+   * history before a head window that was reset included) or the recent
+   * window. Each such message goes through `cappedForSend`, apart from a
+   * body's shards in the adaptive middle (below). The image pass decides by
+   * stored position, newest first, not by where a region puts an entry. So
+   * these steps give a message's form wherever the compile places it, and
+   * no id the view holds comes back as null. Two kinds of message differ.
+   * - A message a summary covers comes back raw, while the compile sends its
+   *   summary where its plan folds it. Rendered raw, its images also count
+   *   toward the image limits of the messages older than it, where the
+   *   compile, sending its summary, doesn't count them.
+   * - A body whose shards the compile doesn't send together. The adaptive
+   *   middle, kv-unified's included, sends a raw run of a body's shards as
+   *   their text alone, uncut. A body whose shards sit across the middle
+   *   and a window, or across a reset head window's end with the history
+   *   from before the reset between them, goes out in more than one entry.
+   *   Here such a body comes back whole, as the windows join it.
    *
-   * It takes a compile's steps before its windows as a dry select takes
-   * them: it rebuilds the chunks, then, under adaptive resolution, loads the
-   * calibration, and it puts back what a dry select puts back, so it prices
-   * as the next compile will and leaves what that compile reads as it found
-   * it.
+   * Under adaptive resolution it loads the calibration as a dry select
+   * does, so the store's estimates, by which the image depth is measured,
+   * are the ones the next compile measures with. It doesn't rebuild the
+   * chunks, as a compile does before placing its windows, since nothing
+   * that decides what it gives reads them. (The image pass computes the
+   * window bounds they move, but decides nothing by them.) It puts back
+   * what a dry select puts back, so it leaves what the next compile reads
+   * as it found it.
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.requireLoadedBranch('renderAsNewest');
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
     try {
-      this.rebuildChunks(store);
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
       const messages = store.getAll();
       const posById = this.positionIndex(messages);
-      const headStart = this.getHeadWindowStartIndex(store);
-      const headEnd = this.getHeadWindowEnd(store);
-      const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-      const start = headStart === 0 && headEnd === tailStart ? 0 : tailStart;
       const msgCap = this.config.maxMessageTokens;
       // As selectPath chooses: only the adaptive select joins a body's
       // shards, so only there does an id stand for its whole body.
       const joins = this.config.adaptiveResolution;
       // Each id's whole body, read back by its first shard's id, which the
-      // merge keeps; one that starts before the suffix has none.
+      // merge keeps. An id the view leaves out has none.
       const firstOf = new Map<MessageId, MessageId>();
       let from = messages.length;
       for (const id of ids) {
         const at = posById.get(id);
         if (at === undefined) continue;
         const body = joins ? bodyBoundsIn(messages, at) : { from: at, to: at };
-        if (body.from < start) continue;
         firstOf.set(id, messages[body.from]!.id);
         from = Math.min(from, body.from);
       }
