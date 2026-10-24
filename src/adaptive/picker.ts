@@ -51,6 +51,37 @@ export interface OverBudgetDiagnostics {
   reserveForResponse?: number;
   /** Configured window minus the response reserve, before over-budget grace. */
   inputBudget?: number;
+  /**
+   * The pins that keep messages raw in the adaptive plan's middle, which
+   * compression would otherwise fold: outside the head and recent windows.
+   * `tokens` is the raw tokens they keep there together, estimated as the
+   * plan prices them, and each pin gives its own; a message two pins cover
+   * counts once in `tokens` and toward each pin. Set only by the refusal of a
+   * plan whose middle is over the budget ("Adaptive picker exhausted but …");
+   * every other refusal leaves it out, as does that one when no pin keeps
+   * any.
+   */
+  rawPins?: { tokens: number; pins: readonly OverBudgetRawPin[] };
+}
+
+/** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
+export interface OverBudgetRawPin {
+  /** The pin's id, as `unpin` takes it. */
+  pinId: string;
+  kind: 'pin' | 'document';
+  /** Its name, when it was given one. */
+  name?: string;
+  firstMessageId: string;
+  lastMessageId: string;
+  /**
+   * Under adaptive resolution, how many stored messages the pin covers when
+   * it covers more than its ids name: a pin on part of a message stored in
+   * parts covers that message's parts, less a part locked with `lockChunk`
+   * outside the span its ids name. Left out otherwise.
+   */
+  parts?: number;
+  /** Raw tokens the pin keeps in the middle. */
+  tokens: number;
 }
 
 /**
@@ -140,6 +171,32 @@ export interface OverBudgetDiagnostics {
  */
 export type OverBudgetClearedBy = 'compression' | 'newer-message' | 'smaller-recent-window';
 
+/** The sentence naming the pins that keep raw tokens in a refusal's middle, or nothing when none do. */
+function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
+  if (!raw || raw.pins.length === 0) return '';
+  const { tokens: total, pins } = raw;
+  const each = pins.map((pin) => {
+    const what = pin.kind === 'document' ? 'document mark' : 'pin';
+    const label = pin.name !== undefined ? `"${pin.name}" (${pin.pinId})` : pin.pinId;
+    const span = pin.firstMessageId === pin.lastMessageId
+      ? `message ${pin.firstMessageId}` : `messages ${pin.firstMessageId} to ${pin.lastMessageId}`;
+    const parts = pin.parts === undefined ? ''
+      : pin.firstMessageId === pin.lastMessageId ? `, covering ${pin.parts} stored parts of its message`
+        : `, covering ${pin.parts} stored messages`;
+    // A lone pin's own tokens are the total, already given.
+    return `${what} ${label}, ${span}${parts}${pins.length === 1 ? '' : `, ~${pin.tokens} tokens`}`;
+  });
+  // Several pins can cover one message, so unpinning one of them frees none
+  // of it: the remedy speaks of them together, whose tokens count it once.
+  // It says who can act rather than telling its reader to, since a host can
+  // pass the text on to an agent that can do neither. It comes last and is
+  // kept under 140 characters, so a host that quotes a long message by its
+  // head and last quarter, cut at 600 characters, still quotes it whole.
+  const remedy = `Whoever manages pins can unpin ${pins.length === 1 ? 'it' : 'them'}, freeing up to those tokens; ` +
+    `whoever sets the hard budget can raise it if the model's window allows.`;
+  return `. ${pins.length === 1 ? 'A pin keeps' : 'Pins keep'} ~${total} tokens raw in the middle: ${each.join('; ')}. ${remedy}`;
+}
+
 /**
  * Error raised when the picker has folded everything it can and the
  * resulting context still exceeds the hard token budget.
@@ -209,7 +266,7 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.configuredBudget === undefined ? '' : `, configured=${opts.diagnostics.configuredBudget}`) +
         (opts.diagnostics.reserveForResponse === undefined ? '' : `, response reserve=${opts.diagnostics.reserveForResponse}`) +
         (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
-        ')'
+        ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across
     // iframe / vm boundaries; the field stays writable on the prototype.
