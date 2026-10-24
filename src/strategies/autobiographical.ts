@@ -15208,9 +15208,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  recall pair of each recall unit the reference's layout has after the
    *  raw unit before it and with a message still present, as the emission
    *  renders it (recallPairEntries). Raw messages are cut by cappedForSend;
-   *  a body's raw shards in the middle join their text into one entry, as
-   *  the middle's shard path does, and shards in the head and recent
-   *  windows join through mergeAdjacentBodyGroupRaw. */
+   *  a run of a body's raw shards in the middle, each cut by cappedForSend,
+   *  joins into one entry (joinShards), as the middle's shard path does, and
+   *  shards in the head and recent windows join through
+   *  mergeAdjacentBodyGroupRaw. */
   private kvUnifiedKeepEntries(
     store: MessageStoreView,
     messages: readonly StoredMessage[],
@@ -18945,7 +18946,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
-   * middle's shard path, which sends a shard's text. A raw replay form an edit changes is released
+   * middle's shard path. A raw replay form an edit changes is released
    * (see raw-forms.ts). The store's own message is never written: chunking
    * and compression read it. Each message's form is kept with the
    * replacements and input cap it was made for, so a later decision that
@@ -19131,7 +19132,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Price a rendered body the way the store prices it. The plan and the
-   * emission must agree: every recall pair, envelope and raw shard's text
+   * emission must agree: every recall pair, envelope and raw shard
    * this strategy prices here (the adaptive middle prices a joined run of
    * shards as the sum of its shards' prices) is later emitted and measured
    * against the same budget the store's calibrated estimate feeds, so the
