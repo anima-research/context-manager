@@ -38,6 +38,16 @@ function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
 
+/**
+ * A message no head window here holds. While a reset head still fills, the
+ * compile sends store order (the history first), so a test that reads where
+ * the head starts from the first message sent adds this first: the head then
+ * goes first.
+ */
+function pastTheHead(manager: ContextManager): void {
+  manager.addMessage('user', textBlock(`Past the head: ${'word '.repeat(1000)}`));
+}
+
 describe('Head Window Reset', () => {
   before(() => cleanup());
   after(() => cleanup());
@@ -69,6 +79,7 @@ describe('Head Window Reset', () => {
 
       // Reset head window to start from the transition message
       strategy.resetHeadWindow(transitionId);
+      pastTheHead(manager);
 
       const { messages } = await manager.compile();
 
@@ -272,6 +283,7 @@ describe('Head Window Reset', () => {
       });
 
       // The head window should start from the transition message
+      pastTheHead(manager2);
       const { messages } = await manager2.compile();
       const allText = messages.flatMap(m =>
         m.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map(b => b.text)
@@ -313,6 +325,7 @@ describe('Head Window Reset', () => {
         textBlock('[Topic Transition]\n\nWe planned things.'));
       strategy1.resetHeadWindow(transitionId);
       manager1.addMessage('user', textBlock('New topic: execution'));
+      pastTheHead(manager1);
 
       manager1.sync();
       manager1.close();
@@ -418,6 +431,7 @@ describe('Head Window Reset', () => {
 
       manager.addMessage('user', textBlock('Knowledge topic B'));
       manager.addMessage('assistant', textBlock('Analyzing topic B'));
+      pastTheHead(manager);
 
       const { messages } = await manager.compile();
       assert.ok(messages.length > 0);

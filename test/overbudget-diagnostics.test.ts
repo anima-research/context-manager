@@ -1129,6 +1129,69 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  /** History, then a head-window reset whose head still fills: what the post-plan refusals report as head and tail. */
+  async function fillingReset(manager: ContextManager): Promise<void> {
+    await manager.resetHeadWindow('New.');
+    manager.addMessage('user', [{ type: 'text', text: 'hi' }]);
+  }
+  const headTail = (error: OverBudgetError) => [error.diagnostics.headTokens > 0, error.diagnostics.tailTokens];
+  function assertFilling(manager: ContextManager, strategy: AutobiographicalStrategy): void {
+    const view = (manager as unknown as { strategyMessageView(): never }).strategyMessageView();
+    const s = strategy as unknown as { getHeadWindowStartIndex(v: never): number; getHeadWindowEnd(v: never): number };
+    const length = (view as unknown as { getAll(): unknown[] }).getAll().length;
+    assert.ok(s.getHeadWindowStartIndex(view) > 0 && s.getHeadWindowEnd(view) === length, 'premise: the reset head is filling');
+  }
+
+  it('reports a filling reset head as the head at the emission refusal', async () => {
+    const strategy = new DiagnosticStrategy({ adaptiveResolution: true, headWindowTokens: 100_000, recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false });
+    strategy.drift = true;
+    strategy.level = 5;
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'raw '.repeat(200) }]);
+      const id = manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
+      strategy.seedPyramid([id], 5);
+      await fillingReset(manager);
+      assertFilling(manager, strategy);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Emission overran the plan/, error.message);
+      assert.deepEqual(headTail(error), [true, 0], `head ${error.diagnostics.headTokens}, tail ${error.diagnostics.tailTokens}`);
+    });
+  });
+
+  it('reports a filling reset head as the head at the tail-check refusal', async () => {
+    const strategy = new DiagnosticStrategy({ adaptiveResolution: true, headWindowTokens: 100_000, recentWindowTokens: 30,
+      overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false });
+    strategy.drift = true;
+    strategy.produce = true;
+    strategy.dropTailMessage = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
+      await fillingReset(manager);
+      assertFilling(manager, strategy);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Tail emission dropped reserved recent-window messages/, error.message);
+      assert.deepEqual(headTail(error), [true, 0], `head ${error.diagnostics.headTokens}, tail ${error.diagnostics.tailTokens}`);
+    });
+  });
+
+  it('reports a filling reset head as the head at the structural repair refusal', async () => {
+    const strategy = new DiagnosticStrategy({ adaptiveResolution: true, headWindowTokens: 100_000, recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false });
+    strategy.overstate = true;
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'message ' + 'word '.repeat(10) }]);
+      await fillingReset(manager);
+      manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      assertFilling(manager, strategy);
+      const error = await refusal(manager, { dryRun: true });
+      assert.match(error.message, /^Structural repair did not retain the newest turn/, error.message);
+      assert.deepEqual(headTail(error), [true, 0], `head ${error.diagnostics.headTokens}, tail ${error.diagnostics.tailTokens}`);
+    });
+  });
+
   it('reports a calibration retry\'s head/tail refusal in a preview, as the live compile does, not the discarded attempt\'s plan', async () => {
     // A provisional multiplier above 1 is dropped to 1 when its compile is
     // refused, and the select runs again (#179). At 1 the head window holds

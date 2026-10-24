@@ -13084,9 +13084,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
-    const headStart = this.getHeadWindowStartIndex(store);
-    const headEnd = this.getHeadWindowEnd(store);
-    const recentStart = this.getRecentWindowStart(store);
+    // As sent: while a reset head fills, it is sent last, as the tail. What
+    // this select reports and tallies still counts it as the head window.
+    const { headStart, headEnd, recentStart, filling } = this.sentWindows(store);
 
     const headMessageIds = new Set<MessageId>();
     const tailMessageIds = new Set<MessageId>();
@@ -13109,6 +13109,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tailMessageIds.add(msg.id);
       tailTokens += tokens;
     }
+    // As the head and recent windows hold them, for what this select reports:
+    // a filling reset head is sent as the tail, but it is the head window.
+    const reportedHeadTokens = filling ? tailTokens : headTokens;
+    const reportedTailTokens = filling ? 0 : tailTokens;
 
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
@@ -13130,14 +13134,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // holdBoundary counts it. A hold inside the head leaves every window's
       // tail starting at the head's end, so a floor counted from the hold
       // covers at least the tail, and nothing is named, as it should be. So
-      // does a newest turn that starts inside the head.
+      // does a newest turn that starts inside the head. A filling reset head
+      // is the whole tail (sentWindows), and no recent window shrinks it, so
+      // the floor then counts from the head's start, which names nothing.
       let floorTokens = 0;
       if (messages.length > 0) {
         const newestBody = bodyStart((k) => messages[k], messages.length - 1);
         const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
           ? bodyStart((k) => messages[k], newestBody - 1)
           : messages.length - 1;
-        const floorStart = Math.min(newestTurn, this.holdBoundary(store));
+        const floorStart = Math.min(newestTurn, this.holdBoundary(store), filling ? headStart : Infinity);
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
         }
@@ -13150,8 +13156,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'unplanned',
-          headTokens,
-          tailTokens,
+          headTokens: reportedHeadTokens,
+          tailTokens: reportedTailTokens,
           middleTokens: 0,
           // Include pre-head history after a reset, as middleSegments does below.
           middleChunkCount: messages.length - headMessageIds.size - tailMessageIds.size,
@@ -13600,8 +13606,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         fits: planFits,
         ...(planFits ? {} : { clearedBy: planClearedBy() }),
         exhausted: result.exhausted,
-        headTokens,
-        tailTokens,
+        headTokens: reportedHeadTokens,
+        tailTokens: reportedTailTokens,
         middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
         middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
         deepestLevel,
@@ -13635,8 +13641,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
-          headTokens,
-          tailTokens,
+          headTokens: reportedHeadTokens,
+          tailTokens: reportedTailTokens,
           middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
           middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
           deepestLevel,
@@ -13670,8 +13676,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
-          headTokens,
-          tailTokens,
+          headTokens: reportedHeadTokens,
+          tailTokens: reportedTailTokens,
           middleTokens: Math.max(0, attempted - headTokens),
           middleChunkCount: middleChunkCountDiag,
           deepestLevel,
@@ -13875,15 +13881,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
-          headTokens,
-          tailTokens,
+          headTokens: reportedHeadTokens,
+          tailTokens: reportedTailTokens,
           middleTokens: totalTokens - headTokens,
           middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
           deepestLevel,
         },
       });
     }
-    this.rsRaw('tail', tailStats.tokens, tailStats.messages);
+    this.rsRaw(filling ? 'head' : 'tail', tailStats.tokens, tailStats.messages);
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
     // Both head and tail emission paths emit shards as separate ContextEntries.
@@ -13936,8 +13942,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           diagnostics: {
             middleCountUnit: 'picker-chunks',
             deepestLevelKind: 'planned',
-            headTokens,
-            tailTokens,
+            headTokens: reportedHeadTokens,
+            tailTokens: reportedTailTokens,
             middleTokens: totalTokens - headTokens,
             middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
             deepestLevel,
@@ -15961,10 +15967,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let totalTokens = 0;
 
     // Phase 0: Head window — every message sent raw, each cut at the cap as
-    // any raw message is (from headStart, not necessarily 0)
-    const headStart = this.getHeadWindowStartIndex(store);
-    const headEnd = this.getHeadWindowEnd(store);
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    // any raw message is (from headStart, not necessarily 0). While a reset
+    // head fills, it is sent last, where the tail goes (sentWindows), but it
+    // is priced, refused and tallied here as the head is, ahead of the
+    // middle's budget, so the middle is selected as with the head first. Its
+    // entries wait for the tail.
+    const { headStart, headEnd, recentStart, filling } = this.sentWindows(store);
+    const headWalkEnd = filling ? messages.length : headEnd;
+    const fillingHead: ContextEntry[] = [];
+    for (let i = headStart; i < headWalkEnd && i < messages.length; i++) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       // The pruned form's price with its images whole: this selection's
@@ -16000,7 +16011,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
 
-      entries.push({
+      (filling ? fillingHead : entries).push({
         index: entries.length,
         sourceMessageId: msg.id,
         sourceRelation: 'copy',
@@ -16055,7 +16066,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
 
     // Compute recent window exclusion set (also exclude head window messages)
-    const recentStart = this.getRecentWindowStart(store);
     // The tail actually emitted below starts at max(recentStart, headEnd) —
     // when the recent window reaches back INTO or PAST the head window, the
     // region walks must bound the middle by this, not raw recentStart, or
@@ -16517,13 +16527,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // on) are preserved and the oldest recent-window messages are dropped.
     // Tail eviction is loss (no summary covers the recent window) — give it
     // the grace window before it records drops and the invariant refuses.
-    const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, graceLimit, totalTokens);
-    this.rsRaw('tail', tailStats.tokens, tailStats.messages);
+    if (filling) {
+      // The filling head, priced in Phase 0, goes here, last. The history
+      // before it is then the stable prefix, so its end is the cache
+      // boundary, as the head's end is once the head goes first.
+      if (entries.length > 0) entries[entries.length - 1].cacheMarker = true;
+      for (const entry of fillingHead) entries.push({ ...entry, index: entries.length });
+    } else {
+      const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, graceLimit, totalTokens);
+      this.rsRaw('tail', tailStats.tokens, tailStats.messages);
+    }
 
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
-    // Strip stale images (this path places no cache markers). Its emission
+    // Strip stale images (this path's one cache marker, set above on the
+    // head's last entry or, while a reset head fills, the history's, stays on
+    // that entry whatever the strip changes). Its emission
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
     // full price. So it priced no image as the placeholder, and the strip
@@ -18410,10 +18430,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Where a head window starting at `startIdx` ends, by the walk the live head
    * window takes (getHeadWindowEnd): the live head's start, or a past head's
-   * (headAsOf).
+   * (headAsOf). A head that starts past 0, at a head-window reset's
+   * transition, ends by resetHeadWindowEnd: whole bodies, the transition
+   * always whole.
    */
   protected headWindowEndFrom(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
     if (this.config.headWindowTokens <= 0) return 0;
+    if (startIdx > 0) return this.resetHeadWindowEnd(store, messages, startIdx);
     let tokens = 0;
 
     for (let i = startIdx; i < messages.length; i++) {
@@ -18430,6 +18453,123 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     return messages.length;
+  }
+
+  /**
+   * The head window's end after a head-window reset: whole bodies only (a
+   * message outside any shard group is a body of its own). The transition's
+   * body is always whole in the head, whatever its size: it anchors the new
+   * topic. After it the head takes whole bodies while their tokens fit
+   * headWindowTokens, and ends before the first that doesn't, or before the
+   * body ahead of it when that one holds a tool call, so a call stays with
+   * its result. (resetHeadWindow's transition holds no tool call; a strategy
+   * reset to a message that does can leave the head empty this way.) The
+   * compile sends the history before the head between the head and the rest
+   * (sentWindows), so a body the head ended inside would be sent in two
+   * parts with that history between them. The ratchet guard
+   * (anchorHeadToCoverage) then reads the boundary as it does without a
+   * reset, and can extend it to the first message chunk coverage owns after
+   * it. The extension leaves out the run at its end, from a body's start,
+   * that pins keep raw and that holds no tool result. The chunker takes no
+   * message while a pin keeps it raw, so the guard can reach over such a
+   * run: a pinned call whose result is chunked, a pinned message it could
+   * take whole, or the never-chunked first parts of a message marked after
+   * its later parts were chunked (by a mark from before pins covered whole
+   * messages, or one made after a head that ended inside the message).
+   * Left out, the run goes after the history: a pinned call ahead of its
+   * result, if it has one, as without a reset, and a marked message's first
+   * parts with the rest of it rather than in the head with the history
+   * between. Nothing left out answers a call in the head. Pinned messages
+   * from the last one that holds a tool result back stay in the extension,
+   * as without a reset: a call stays in the head with its pinned result, and
+   * such a result whose later parts were chunked before its pin stays in two
+   * parts where the extension ends inside it.
+   * (The guard itself, as without a reset, can also end the head right after
+   * a never-chunked unpinned call whose result is chunked.) Messages kept out of
+   * chunks without a pin (left by a head that ended inside a body whose rest
+   * was then chunked, or by a pin since removed) stay in the extension, so
+   * they aren't chunked out of order (#122), and such a body stays in two
+   * parts while the head's end is inside it. The walk back for a tool call
+   * reads the whole body before the boundary, every shard of it (without a
+   * reset, only the message before it), so a call whose results arrive in
+   * separate messages can keep only the first of them in the head. At
+   * headStart 0 nothing comes between the head and its continuation, so the
+   * head still ends where its tokens run out there, with the ratchet guard
+   * as before.
+   */
+  private resetHeadWindowEnd(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
+    const at = (k: number): StoredMessage | undefined => messages[k];
+    const transitionEnd = bodyEnd(messages.length, at, startIdx) + 1;
+    let tokens = 0;
+    for (let k = startIdx; k < transitionEnd; k++) tokens += store.estimateTokens(messages[k]);
+    for (let from = transitionEnd; from < messages.length;) {
+      const to = bodyEnd(messages.length, at, from) + 1;
+      for (let k = from; k < to; k++) tokens += store.estimateTokens(messages[k]);
+      if (tokens > this.config.headWindowTokens) {
+        let boundary = from;
+        // A start inside a body (a strategy reset to a later shard) is
+        // where its body's walk back stops.
+        const previous = Math.max(startIdx, bodyStart(at, boundary - 1));
+        for (let k = previous; k < boundary; k++) {
+          if (this.hasToolUse(messages[k])) { boundary = previous; break; }
+        }
+        // The guard counts on from the boundary's own message, so what it's
+        // given runs through that message. (Without a reset it's given one
+        // message more when the walk back for a tool call moves the boundary.)
+        let through = 0;
+        for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
+        const end = this.anchorHeadToCoverage(store, messages, boundary, through);
+        if (end === boundary) return end;
+        // The extension keeps never-chunked messages in the head so they
+        // aren't chunked after the coverage that follows them (#122). A pin
+        // that keeps a message raw keeps it out of every chunk made while the
+        // pin stands (getCompressibleMessages), so the run at the extension's
+        // end that pins keep raw, from a body's start, is left out of it:
+        // otherwise a pinned call could stay in the head apart from its
+        // chunked result, and the first parts of a message marked after its
+        // rest was chunked could end the head inside it, sending it in two
+        // parts with the history between. The run left out holds no tool
+        // result, so no call in the head loses one to it, and a call it leaves
+        // out goes after the history ahead of its result, if any, as without a
+        // reset. Messages kept out of chunks without a pin (left by a head
+        // that ended inside their message, or by a pin since removed) stay in
+        // it, and so do the pinned messages from the last one holding a tool
+        // result back, as without this.
+        const raw = this.forceRawPinPositions(messages);
+        let kept = end;
+        for (let k = end - 1; k >= boundary && raw.has(k) && !this.hasToolResult(messages[k]); k--) {
+          if (bodyStart(at, k) === k) kept = k;
+        }
+        return kept;
+      }
+      from = to;
+    }
+    return messages.length;
+  }
+
+  /**
+   * The head and recent windows as a compile sends them: the head
+   * [headStart, headEnd) first, then the middle, then the tail from
+   * max(recentStart, headEnd). While a reset head is filling (headStart > 0
+   * and the head window reaching the store's end), the compile sends store
+   * order instead: the history before the head, then the head window last,
+   * as the tail. So the newest message is the last one sent, and the history
+   * keeps its place at the front of the request through the fill, where its
+   * prefix can stay cached. This returns an empty head at headStart then, and a
+   * recent window that starts no later. Once a body no longer fits the head
+   * window, the head goes first again. Each compile decides it from the head
+   * window's end as it prices it then. Only the order moves: the head
+   * window's messages stay out of compression either way
+   * (getCompressibleMessages reads the head window itself).
+   */
+  protected sentWindows(store: MessageStoreView): { headStart: number; headEnd: number; recentStart: number; filling: boolean } {
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const recentStart = this.getRecentWindowStart(store);
+    if (headStart > 0 && headEnd >= store.getAll().length) {
+      return { headStart, headEnd: headStart, recentStart: Math.min(recentStart, headStart), filling: true };
+    }
+    return { headStart, headEnd, recentStart, filling: false };
   }
 
   /**
@@ -19586,9 +19726,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Those messages are the recent window's, and the head window's too when
    * no message comes between the two: a compile places the middle's
    * messages, and the history before a head window that was reset, after
-   * the head. The hierarchical select can also place summaries there, which
-   * are text and change no image decision. A message before them comes back
-   * as null.
+   * the head. A reset head that is still filling is sent last itself, after
+   * that history, so its messages are among them (sentWindows). The
+   * hierarchical select can also place summaries there, which are text and
+   * change no image decision. A message before them comes back as null.
    *
    * It takes a compile's steps before its windows as a dry select takes
    * them: it rebuilds the chunks, then, under adaptive resolution, loads the
@@ -19605,9 +19746,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
       const messages = store.getAll();
       const posById = this.positionIndex(messages);
-      const headStart = this.getHeadWindowStartIndex(store);
-      const headEnd = this.getHeadWindowEnd(store);
-      const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
+      // As sent: a filling reset head is the tail (sentWindows).
+      const { headStart, headEnd, recentStart } = this.sentWindows(store);
+      const tailStart = Math.max(recentStart, headEnd);
       const start = headStart === 0 && headEnd === tailStart ? 0 : tailStart;
       const msgCap = this.config.maxMessageTokens;
       // As selectPath chooses: only the adaptive select joins a body's
