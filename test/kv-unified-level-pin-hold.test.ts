@@ -17,7 +17,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import type { AutobiographicalConfig } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'kv-unified-level-pin-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -273,5 +275,113 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
       'autobio: kv-unified holds pin pin-0 ("shared")',
     ]);
     store.cm.close();
+  });
+});
+
+/**
+ * Under adaptive resolution a long message is stored in parts, and a pin
+ * naming any part covers the whole message (`pinPositions`), for the forest
+ * and for the report alike. These stores follow whole-body-pins.test.ts: six
+ * history messages, a 6,000-word message that ingress stores in nine parts
+ * (1,500-token chunks), then traffic; a head window of 500 tokens and a recent
+ * window of 8,000.
+ */
+describe('the hold report reads a pin over a message stored in parts as the forest does', () => {
+  const words = (label: string, n: number): ContentBlock[] =>
+    [{ type: 'text', text: `${label} ${Array.from({ length: n }, (_, i) => `word${i}`).join(' ')}` }];
+  const budget = { maxTokens: 60_000, reserveForResponse: 0 };
+  type View = { getAll(): Array<{ id: string; bodyGroupId?: string }> };
+  const allIds = (cm: ContextManager): string[] =>
+    (cm as unknown as { strategyMessageView(): View }).strategyMessageView().getAll().map((m) => m.id);
+  /** The ids of the parts of the message `id` is in, in store order. */
+  const partsOf = (cm: ContextManager, id: string): string[] => {
+    const all = (cm as unknown as { strategyMessageView(): View }).strategyMessageView().getAll();
+    const group = all.find((m) => m.id === id)!.bodyGroupId;
+    return all.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === group).map((m) => m.id);
+  };
+  /** The levels of the summaries over the message `id`, as a set. */
+  const levelsOver = (cm: ContextManager, strategy: AutobiographicalStrategy, id: string): Set<number> => {
+    const all = allIds(cm);
+    const at = all.indexOf(id);
+    return new Set(summariesOf(strategy)
+      .filter((s) => all.indexOf(s.sourceRange.first) <= at && at <= all.indexOf(s.sourceRange.last))
+      .map((s) => s.level));
+  };
+  const ready = async (cm: ContextManager) => {
+    for (let i = 0; i < 800 && !cm.isReady(); i++) await cm.tick();
+    assert.ok(cm.isReady(), 'compression caught up');
+  };
+
+  async function longMessage(extra: Partial<AutobiographicalConfig> = {}) {
+    const path = join(dir, `store-${stores++}`);
+    let n = 0;
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `[S${++n}] ` + 'recalled '.repeat(30) }], usage: { input_tokens: 100, output_tokens: 40 } }) };
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 500, recentWindowTokens: 8000, imageStripDepthTokens: 0, compressionModel: 'test-model',
+      hierarchical: false, adaptiveResolution: true, targetChunkTokens: 1500,
+      foldingStrategy: 'kv-unified', kvUnified: KV_UNIFIED, ...extra,
+    } as AutobiographicalConfig);
+    const cm = await ContextManager.open({ path, strategy, membrane: membrane as never });
+    for (let i = 0; i < 6; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', words(`hist${i}`, 200));
+    await cm.compile(budget);
+    const long = cm.addMessage('user', words('Bdoc', 6000));
+    const parts = partsOf(cm, long);
+    assert.equal(parts.length, 9, 'setup: the message is stored in nine parts');
+    let traffic = 0;
+    const add = async (n: number): Promise<string[]> => {
+      const ids: string[] = [];
+      for (let i = 0; i < n; i++, traffic++) ids.push(cm.addMessage(traffic % 2 ? 'assistant' : 'user', words(`event${traffic}`, 200)));
+      await ready(cm);
+      return ids;
+    };
+    return { cm, strategy, parts, add };
+  }
+
+  it('counts a message stored in parts once, beside a plain message the same pin covers', async () => {
+    const { cm, strategy, parts, add } = await longMessage();
+    const [next] = await add(120);
+    assert.ok(parts.every((id) => levelsOver(cm, strategy, id).has(1)), 'setup: every part is summarized at L1');
+    // Named by its fourth part, the pin covers the whole message, all nine
+    // parts held at L1: two messages, not the seven positions its ids name.
+    cm.pinRange(parts[3], next, { level: 2 });
+    const lines = await holdLines(async () => { await cm.compile(budget); });
+    assert.deepEqual(lines, [
+      'autobio: kv-unified holds pin pin-0, pinned at L2, at L1 in 2 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
+    ]);
+    cm.close();
+  });
+
+  it('reports a pin held over the parts outside the recent window when the part it names is still inside it', async () => {
+    const { cm, parts, add } = await longMessage();
+    await add(4);
+    cm.pinRange(parts.at(-1)!, parts.at(-1)!, { level: 2 });
+    const lines = await holdLines(async () => { await cm.compile(budget); });
+    assert.deepEqual(lines, [
+      'autobio: kv-unified holds pin pin-0, pinned at L2, at raw in 1 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
+    ]);
+    cm.close();
+  });
+
+  it('keeps reporting the hold while the level reaches the part the pin names before the rest', async () => {
+    // With mergeThreshold 2, the first L2 covers the message's first parts
+    // before its last ones.
+    const { cm, strategy, parts, add } = await longMessage({ hierarchical: true, mergeThreshold: 2 });
+    cm.markDocument(parts[0], { level: 2, name: 'doc' });
+    const steps: Array<{ lines: string[]; first: boolean; all: boolean }> = [];
+    for (let step = 0; step < 60; step++) {
+      await add(1);
+      const lines = await holdLines(async () => { await cm.compile(budget); });
+      const first = levelsOver(cm, strategy, parts[0]).has(2);
+      const all = parts.every((id) => levelsOver(cm, strategy, id).has(2));
+      steps.push({ lines, first, all });
+      if (all) break;
+    }
+    assert.ok(steps.some((s) => s.first && !s.all), 'setup: L2 reaches the named part before the rest');
+    const said = steps.flatMap((s, k) => s.lines.map((line) => ({ line, k })));
+    assert.equal(said.length, 2, said.map((s) => s.line).join('\n'));
+    assert.match(said[0].line, /^autobio: kv-unified holds pin pin-0 \("doc"\), pinned at L2, at .* in 1 message\(s\)/);
+    assert.equal(said[1].line, 'autobio: kv-unified no longer holds pin pin-0 ("doc") below its L2. ns=default');
+    assert.ok(steps[said[1].k].all, 'the hold ends when L2 covers every part');
+    cm.close();
   });
 });

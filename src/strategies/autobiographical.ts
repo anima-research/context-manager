@@ -15618,10 +15618,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the levels its messages are held at and how many are held then, and one
    * when a later compile finds none of its messages held for it (its level
    * arrived over them, another pin's bound took them, or they left the folded
-   * middle) or the pin gone. A message counts toward a pin only when that
-   * pin's level is the one its bound took (`resolvedPinBounds`). The record
-   * starts over with each open and branch switch (`clearBranchMirrors`), so a
-   * pin still held then is reported again. It reports what the solve found,
+   * middle) or the pin gone. A pin covers what `pinPositions` says, as it
+   * does for the forest: under adaptive resolution, a message stored in parts
+   * whole when its ids name one of its parts, less a part locked outside the
+   * span they name. A message counts once however many of its parts are held.
+   * A part counts toward a pin only when that pin's level is the one its
+   * bound took (`resolvedPinBounds`). The record starts over with each open
+   * and branch switch (`clearBranchMirrors`), so a pin still held then is
+   * reported again. It reports what the solve found,
    * before the frontier is presented: a compile the solver refuses reports
    * nothing, since its error names the cause, and one refused after the
    * solve, such as over budget, has already reported the holds its solve made.
@@ -15639,19 +15643,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const positionOf = this.positionIndex(messages);
       for (const pin of this.pins) {
         if (pin.level === undefined || pin.level <= 0) continue;
-        const first = positionOf.get(pin.firstMessageId);
-        const last = positionOf.get(pin.lastMessageId);
-        if (first === undefined || last === undefined) continue;
+        const covered = this.pinPositions(pin, positionOf, messages);
+        if (covered === undefined) continue;
         const heldAt = new Set<number>();
-        let count = 0;
-        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+        // Held messages, each by its first position: a message's parts are one.
+        const bodies = new Set<number>();
+        for (const i of covered) {
           const hold = held.get(messages[i].id);
           if (!hold || hold.level !== pin.level) continue;
           heldAt.add(hold.heldAt);
-          count++;
+          bodies.add(bodyBoundsIn(messages, i).from);
         }
         const label = pin.name ? `${pin.id} ("${pin.name}")` : pin.id;
-        if (count > 0) now.set(pin.id, { label, level: pin.level, heldAt, count });
+        if (bodies.size > 0) now.set(pin.id, { label, level: pin.level, heldAt, count: bodies.size });
       }
     }
     const levelName = (level: number): string => (level === 0 ? 'raw' : `L${level}`);
