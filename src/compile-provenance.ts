@@ -409,9 +409,11 @@ function carriesWithRelocated(
  * A composite entry (the strategy merged several shards into one message)
  * carries its members unaltered only when it carries their text,
  * concatenated in shard order, intact, and every non-text block of theirs,
- * unaltered and in their order, among its own non-text blocks. A composite
- * gathers the text into one block, so where a non-text block sits relative
- * to the text is not compared.
+ * unaltered and in their order, among its own non-text blocks. A body's
+ * composite holds its blocks in place (joinBodyContent), and one stored
+ * before blocks were kept in place gathers its text into one block after
+ * its other blocks, so where a non-text block sits relative to the text is
+ * not compared.
  */
 function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boolean {
   const ordered = [...members].sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));

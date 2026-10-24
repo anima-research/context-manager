@@ -477,17 +477,19 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
     });
   });
 
-  it('prices a marked message\'s parts uncut, as the plan sends a run of them joined', async () => {
+  it('prices a marked message\'s parts each cut, as the plan sends a run of them', async () => {
     await withDir(async (dir) => {
-      // Parts of about 2,000 tokens, each over a cap of 300 that the plan doesn't apply to them.
+      // Parts of about 2,000 tokens, each over a cap of 300, which cuts each part in a run as it cuts any raw message.
       const { cm } = await open(dir, 'adaptive', 8000, { maxMessageTokens: 300 });
       await history(cm);
       const b = cm.addMessage('user', words('Bdoc', 6000));
       await traffic(cm, 360);
       await ready(cm);
+      const parts = partsOf(cm, b);
+      assert.ok(parts.length > 2, 'the message is stored in parts');
       const mark = cm.markDocument(b);
       let raw: NonNullable<OverBudgetError['diagnostics']['rawPins']> | undefined;
-      for (const maxTokens of [30_000, 25_000, 20_000, 15_000]) {
+      for (const maxTokens of [30_000, 25_000, 20_000, 15_000, 12_000, 9_000, 7_000, 5_000, 4_000, 3_000, 2_000]) {
         try {
           await cm.compile(budget(maxTokens));
         } catch (err) {
@@ -497,8 +499,10 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
         }
       }
       assert.ok(raw, 'a refusal named the mark');
-      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
-      assert.ok(raw.tokens > 10_000, `priced uncut: ${raw.tokens}`);
+      assert.deepStrictEqual(raw.pins.map((p) => [p.pinId, p.parts]), [[mark, parts.length]]);
+      // Each part is priced cut, at 400 to 450 tokens: one part priced uncut (about 2,000) goes over, one part left out goes under.
+      const tokens = raw.pins[0]!.tokens;
+      assert.ok(tokens >= parts.length * 400 && tokens < parts.length * 450, `priced each part cut: ${tokens} for ${parts.length} parts`);
       await cm.close();
     });
   });

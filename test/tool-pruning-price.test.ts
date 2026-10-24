@@ -13,6 +13,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { CompileResult, SummaryEntry } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { legacyIngress } from './_harness/legacy-ingress.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'tool-pruning-price-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -41,10 +42,18 @@ class SeedableStrategy extends AutobiographicalStrategy {
     return this.prunedForSend(store, msg);
   }
 }
+/** Ingress as bodies were stored before each block was kept in place: the
+ *  text joined into one block, cut across the shards, and the other blocks on
+ *  the first shard after its text, with no seam declared. */
+class LegacyIngressStrategy extends SeedableStrategy {
+  override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+    return legacyIngress(super.chunkIngressMessage(participant, content), content);
+  }
+}
 const viewOf = (cm: ContextManager) => (cm as unknown as { strategyMessageView(): MessageStoreView }).strategyMessageView();
 
-async function open(config: Record<string, unknown>, path = join(dir, `store-${stores++}`)) {
-  const strategy = new SeedableStrategy({ compressionModel: 'mock', headWindowTokens: 0, recentWindowTokens: 1_000_000, ...config } as never);
+async function open(config: Record<string, unknown>, path = join(dir, `store-${stores++}`), Strategy: typeof SeedableStrategy = SeedableStrategy) {
+  const strategy = new Strategy({ compressionModel: 'mock', headWindowTokens: 0, recentWindowTokens: 1_000_000, ...config } as never);
   const cm = await ContextManager.open({ path, strategy });
   const store = (cm as unknown as { messageStore: StoreInternals }).messageStore;
   return { cm, strategy, store, internals: strategy as unknown as StrategyInternals, path };
@@ -226,16 +235,18 @@ describe('tool pruning, priced as sent', () => {
     });
   }
 
-  it('counts a result whose call is on the first shard of a sharded message', async () => {
-    // Ingress chunking puts a message's non-text blocks on its first shard,
-    // so the call and its result aren't adjacent in the store: more shards
-    // come between them than pairing repair looks ahead over. The count
-    // follows calls, not adjacency, and the head and recent windows join a
-    // body's shards, so the result answers its call and takes a slot.
-    const { cm } = await open({ adaptiveResolution: true, targetChunkTokens: 100, toolResultMaxLastN: 1 });
+  it('counts a result whose call is on the first shard of a sharded message stored before blocks were kept in place', async () => {
+    // Such a message holds its non-text blocks on its first shard, so the
+    // call and its result aren't adjacent in the store: more shards come
+    // between them than pairing repair looks ahead over. The count follows
+    // calls, not adjacency, and the head and recent windows join a body's
+    // shards, so the result answers its call and takes a slot.
+    const { cm } = await open({ adaptiveResolution: true, targetChunkTokens: 100, toolResultMaxLastN: 1 }, undefined, LegacyIngressStrategy);
     cm.addMessage('u', text('look these up'));
     cm.addMessage('a', [{ type: 'text', text: `thinking aloud ${PROSE}` }, call('call-1')]);
     assert.ok(cm.getAllMessages().filter((m) => m.bodyGroupId).length > 7, 'more shards than pairing repair looks ahead over');
+    assert.ok(cm.getAllMessages().find((m) => m.bodyGroupId && m.shardIndex === 0)!.content.some((b) => b.type === 'tool_use'),
+      'premise: the call is on the first shard');
     cm.addMessage('u', [result('call-1', 'short one')]);
     cm.addMessage('a', [call('call-2')]);
     cm.addMessage('u', [result('call-2', 'short two')]);
@@ -244,6 +255,24 @@ describe('tool pruning, priced as sent', () => {
     const compiled = await cm.compile(BUDGET);
     assert.equal(resultOf(compiled, 'call-1'), MARKER);
     assert.equal(resultOf(compiled, 'call-2'), 'short two');
+    cm.close();
+  });
+
+  it("orders a sharded reply's calls as one message's, by where their results sit, though the calls sit on different shards", async () => {
+    const { cm } = await open({ adaptiveResolution: true, targetChunkTokens: 100, toolResultMaxLastN: 1 });
+    cm.addMessage('u', text('look these up'));
+    cm.addMessage('a', [{ type: 'text', text: 'first, ' } as ContentBlock, call('call-1'), { type: 'text', text: `then ${PROSE}` } as ContentBlock, call('call-2')]);
+    const shards = cm.getAllMessages().filter((m) => m.bodyGroupId);
+    const holding = shards.flatMap((m, k) => (m.content.some((b) => b.type === 'tool_use') ? [k] : []));
+    assert.ok(holding.length === 2 && holding[0] !== holding[1], `premise: the two calls are on different shards (${JSON.stringify(holding)})`);
+    // Answered in the other order: within one message, the call whose result
+    // comes first is the older, so with one kept it's call-2's that goes.
+    cm.addMessage('u', [result('call-2', 'short two'), result('call-1', 'short one')]);
+    cm.addMessage('a', text('ok'));
+    cm.addMessage('u', text('next'));
+    const compiled = await cm.compile(BUDGET);
+    assert.equal(resultOf(compiled, 'call-2'), MARKER, "call-2's result, the first in its message, is replaced");
+    assert.equal(resultOf(compiled, 'call-1'), 'short one', "call-1's, the last, is kept, though its call is on the earlier shard");
     cm.close();
   });
 

@@ -361,12 +361,25 @@ const TIES: Record<string, TieCase> = {
     premise: (w) => has(w, (b) => textOf(b).includes('[truncated')),
     what: 'a cut message',
   },
-  "a body's raw shards in the middle, the first holding an image the composite leaves out": {
+  "a body's raw shards in the middle, the first holding an image, which the composite sends where it sat": {
     config: { headWindowTokens: 0, recentWindowTokens: 300 },
     first: [['u', [text('intro')]], ['a', [text('hi')]], ['u', [image(), text(PROSE.slice(0, 80_000))]], ['a', [text(plain(1))]], ...CLOSE],
-    premise: (w) => w.some((m) => m.content.length === 1 && textOf(m.content[0]!).length >= 70_000) &&
-      !has(w, (b) => (b as { type: string }).type === 'image'),
-    what: 'a middle composite of text alone',
+    premise: (w) => w.some((m) => m.content.length === 2 && (m.content[0] as { type: string }).type === 'image' &&
+      textOf(m.content[1]!).length >= 70_000),
+    what: 'a middle composite of the image and the text',
+  },
+  "a long reply ending in a call, raw in the middle, with its result after it": {
+    config: { headWindowTokens: 0, recentWindowTokens: 300 },
+    first: [['u', [text('intro')]], ['a', [text(PROSE.slice(0, 80_000)), call('call-1', 'x')]], ['u', [result('call-1', plain(2))]], ['a', [text(plain(3))]], ...CLOSE],
+    premise: (w) => w.some((m) => m.content.length === 2 && textOf(m.content[0]!).length >= 70_000 &&
+      (m.content[1] as { type: string }).type === 'tool_use') && has(w, (b) => (b as { type: string }).type === 'tool_result'),
+    what: 'the reply with its call, and the result',
+  },
+  "a body's raw shards cut at maxMessageTokens, raw in the middle": {
+    config: { headWindowTokens: 0, recentWindowTokens: 300, maxMessageTokens: 1_000 },
+    first: [['u', [text('intro')]], ['a', [text('hi')]], ['u', [text(PROSE.slice(0, 80_000))]], ['a', [text(plain(1))]], ...CLOSE],
+    premise: (w) => w.some((m) => m.content.some((b) => textOf(b).split('[truncated').length > 2)),
+    what: 'a middle composite of shards each cut at the cap',
   },
   "a body's raw shards in the recent window, which the merge joins": {
     config: { headWindowTokens: 0, recentWindowTokens: 1_000_000 },

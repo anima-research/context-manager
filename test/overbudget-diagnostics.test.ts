@@ -8,6 +8,7 @@ import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/ind
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import type { ContentBlock, Membrane } from '@animalabs/membrane';
+import { legacyIngress } from './_harness/legacy-ingress.js';
 
 class DiagnosticStrategy extends AutobiographicalStrategy {
   // A host that compresses names its model; a test of one that doesn't passes `compressionModel: undefined`.
@@ -781,9 +782,24 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  for (const [callWords, expected] of [[200, []], [30, ['smaller-recent-window']]] as const) {
-    it(`counts a call split into shards from its first shard, which holds the tool_use, before the newest tool_result (${expected.length ? 'names a smaller window when the whole call and its result fit' : 'names nothing when only its last shard and the result would'})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+  /** Ingress as bodies were stored before each block was kept in place: the
+   *  text joined into one block, cut across the shards, and the other blocks
+   *  on the first shard after its text, with no seam declared. */
+  class LegacyIngress extends AutobiographicalStrategy {
+    override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+      return legacyIngress(super.chunkIngressMessage(participant, content), content);
+    }
+  }
+
+  for (const [legacy, callWords, expected, when] of [
+    [false, 200, ['smaller-recent-window'], 'names a smaller window when that shard and the result fit, however long the call'],
+    [false, 30, ['smaller-recent-window'], 'names a smaller window when the whole call and its result fit'],
+    [true, 200, [], 'a body stored before then holds it on its first shard: names nothing when only its last shard and the result would'],
+    [true, 30, ['smaller-recent-window'], 'a body stored before then holds it on its first shard: names a smaller window when the whole call and its result fit'],
+  ] as const) {
+    it(`counts a call split into shards from the shard holding its tool_use, before the newest tool_result (${when})`, async () => {
+      const Strategy = legacy ? LegacyIngress : AutobiographicalStrategy;
+      const strategy = new Strategy({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,
@@ -800,8 +816,10 @@ describe('OverBudgetError.clearedBy', () => {
         const stored = manager.getAllMessages();
         const shards = stored.slice(before, -1);
         assert.ok(shards.length > 1, `the call is stored as shards (got ${shards.length})`);
-        assert.ok(shards[0]!.content.some((block) => block.type === 'tool_use'), 'its first shard holds the tool_use');
-        assert.ok(!shards.at(-1)!.content.some((block) => block.type === 'tool_use'), 'its last shard holds none');
+        const holding = shards.map((shard) => shard.content.some((block) => block.type === 'tool_use'));
+        assert.deepEqual(holding.indexOf(true), legacy ? 0 : shards.length - 1,
+          legacy ? 'its first shard holds the tool_use' : 'its last shard holds the tool_use, where it sat');
+        assert.equal(holding.filter(Boolean).length, 1, 'no other shard holds one');
         const error = await refusal(manager);
         assert.match(error.message, /^Head\/tail reservation exceeded budget/);
         assert.deepEqual(error.clearedBy, expected);
@@ -809,13 +827,15 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const [resultWords, callWords, expected, when] of [
-    [200, 0, [], 'names nothing when only its last shard would fit'],
-    [30, 0, ['smaller-recent-window'], 'names a smaller window when they fit'],
-    [30, 60, [], 'names nothing when its body alone would fit but not with its call'],
+  for (const [resultWords, callWords, legacy, expected, when] of [
+    [200, 0, false, [], 'names nothing when only its last shard would fit'],
+    [30, 0, false, ['smaller-recent-window'], 'names a smaller window when they fit'],
+    [30, 60, false, ['smaller-recent-window'], "names a smaller window when its body fits with its sharded call's last shard, which holds the tool_use"],
+    [30, 60, true, [], 'a call stored before then holds its tool_use on its first shard: names nothing when its body alone would fit but not with its whole call'],
   ] as const) {
     it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${when})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+      const Strategy = legacy ? LegacyIngress : AutobiographicalStrategy;
+      const strategy = new Strategy({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,
@@ -845,6 +865,63 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  for (const [resultWords, expected, when] of [
+    [200, [], 'names nothing when only its last shard, which holds the tool_result, would fit'],
+    [30, ['smaller-recent-window'], 'names a smaller window when its body and the call fit'],
+  ] as const) {
+    it(`counts a result after a long text, on a later shard, with its whole body and its call (${when})`, async () => {
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true,
+        targetChunkTokens: 10,
+        headWindowTokens: 0,
+        recentWindowTokens: 100_000,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        manager.addMessage('agent', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+        const before = manager.getAllMessages().length;
+        manager.addMessage('user', [
+          { type: 'text', text: 'result ' + 'word '.repeat(resultWords) },
+          { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+        ]);
+        const shards = manager.getAllMessages().slice(before);
+        assert.ok(shards.length > 1, `the result is stored as shards (got ${shards.length})`);
+        assert.ok(!shards[0]!.content.some((block) => block.type === 'tool_result'), 'its first shard holds no tool_result');
+        assert.ok(shards.at(-1)!.content.some((block) => block.type === 'tool_result'), 'its last shard holds the tool_result');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+        assert.deepEqual(error.clearedBy, expected);
+      });
+    });
+  }
+
+  it("counts a result message that is the store's first message with its whole body (names nothing when only its last shard would fit)", async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 10,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [
+        { type: 'text', text: 'result ' + 'word '.repeat(200) },
+        { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+      ]);
+      const shards = manager.getAllMessages();
+      assert.ok(shards.length > 1 && shards.every((m) => m.bodyGroupId === shards[0]!.bodyGroupId), 'premise: the store is one message, stored as shards');
+      assert.ok(shards.at(-1)!.content.some((block) => block.type === 'tool_result'), 'premise: its last shard holds the tool_result');
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, []);
+    });
+  });
 
   it('clears the head/tail refusal at the smaller window it names (the next refusal can be the picker\'s)', async () => {
     const strategy = recentOnly(100_000);

@@ -14,7 +14,8 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 
-import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import { ContextManager, AutobiographicalStrategy, joinBodyContent } from '../../src/index.js';
 
 const TEST_STORE_PATH = './test-adaptive-ingestion-store';
 
@@ -326,7 +327,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
-  it('flag on: non-text content (e.g., tool_use blocks) is preserved on first shard', async () => {
+  it('flag on: every block keeps its place, so the stored shards join back into the message as given', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
       compressionModel: 'mock',      adaptiveResolution: true,
@@ -337,24 +338,267 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
       strategy,
       membrane: mock as any,
     });
-    // A big text payload + a tool_use-like non-text block
-    const bigText = 'paragraph. '.repeat(2000);
-    manager.addMessage('User', [
-      { type: 'text', text: bigText },
-      // A simulated non-text block; the chunker passes it through.
+    // A reply that thinks, writes a long text, then calls a tool.
+    const given: ContentBlock[] = [
+      { type: 'thinking', thinking: 'let me look', signature: 'SIG' } as any,
+      { type: 'text', text: 'paragraph. '.repeat(2000) },
       { type: 'tool_use', id: 'tool-1', name: 'search', input: { q: 'test' } } as any,
-    ]);
+    ];
+    manager.addMessage('Claude', given);
 
     const all = manager.getAllMessages();
-    assert.ok(all.length > 1, 'should be sharded');
-    // First shard should carry the non-text block(s)
-    const firstNonText = all[0].content.filter((b: any) => b.type !== 'text');
-    assert.equal(firstNonText.length, 1, 'first shard should carry the tool_use block');
-    // Other shards should not
-    for (let idx = 1; idx < all.length; idx++) {
-      const nonText = all[idx].content.filter((b: any) => b.type !== 'text');
-      assert.equal(nonText.length, 0, `shard ${idx} should not carry tool_use`);
-    }
+    assert.ok(all.length > 2, 'should be sharded');
+    const types = all.map((m) => m.content.map((b) => b.type));
+    assert.deepEqual(types[0], ['thinking', 'text'], 'the thinking leads the first shard');
+    assert.deepEqual(types.at(-1), ['text', 'tool_use'], 'the call ends the last shard, next to where its result goes');
+    for (const t of types.slice(1, -1)) assert.deepEqual(t, ['text']);
+    assert.equal(all[0]!.continuesBlock, undefined, 'the first shard declares no seam');
+    assert.ok(all.slice(1).every((m) => m.continuesBlock === true), 'every seam is inside the one text block');
+    assert.deepEqual(joinBodyContent(all), given, 'the shards join back into the message as given');
     manager.close();
   });
+});
+
+describe('chunkIngressMessage keeps each block in place', () => {
+  const strategy = () => new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 });
+  const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as unknown as ContentBlock;
+  const shardsOf = (content: ContentBlock[]) => {
+    const decision = strategy().chunkIngressMessage('User', content);
+    assert.ok(decision && decision.shards.length > 1, 'premise: the message is sharded');
+    return decision.shards;
+  };
+  const textLength = (content: readonly ContentBlock[]) =>
+    content.reduce((n, b) => n + (b.type === 'text' ? b.text.length : 0), 0);
+
+  it('two text blocks, a seam inside the second: both blocks come back, with their own boundary', () => {
+    // No line break anywhere, so the chunker cuts at its 2,000-character target.
+    const given: ContentBlock[] = [{ type: 'text', text: 'first. '.repeat(100) }, { type: 'text', text: 'second. '.repeat(1500) }];
+    const shards = shardsOf(given);
+    assert.ok(shards.every((s, k) => k === 0 || s.continuesBlock === true), 'premise: no seam falls on the boundary between them');
+    assert.deepEqual(shards[0]!.content.map((b) => b.type), ['text', 'text'], 'the first shard holds the first block and the start of the second');
+    assert.deepEqual(joinBodyContent(shards), given);
+  });
+
+  it('two text blocks, a seam on the boundary between them: the seam declares it, and the blocks stay apart', () => {
+    // The first block's 1,854 characters end in a blank line and the second
+    // opens with a heading, the chunker's preferred seam, and the only one
+    // before the 2,000 characters it aims for.
+    const given: ContentBlock[] = [
+      { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
+      { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
+    ];
+    const shards = shardsOf(given);
+    const firstLength = (given[0] as { text: string }).text.length;
+    assert.equal(textLength(shards[0]!.content), firstLength, 'premise: the first seam falls on the boundary');
+    assert.equal(shards[1]!.continuesBlock, false, 'that seam splits no block');
+    assert.deepEqual(joinBodyContent(shards), given, 'and the two blocks come back as two');
+  });
+
+  it('a short text, an image, then a long text: the image stays between them', () => {
+    const given: ContentBlock[] = [{ type: 'text', text: 'Look at this:' }, image, { type: 'text', text: 'detail. '.repeat(2000) }];
+    const shards = shardsOf(given);
+    assert.deepEqual(shards[0]!.content.map((b) => b.type), ['text', 'image', 'text']);
+    assert.deepEqual(joinBodyContent(shards), given);
+  });
+
+  it('an image before its caption, and one at the end: each stays where it sat', () => {
+    const given: ContentBlock[] = [image, { type: 'text', text: 'caption. '.repeat(2000) }, image];
+    const shards = shardsOf(given);
+    assert.equal(shards[0]!.content[0]!.type, 'image', 'the first image leads the first shard');
+    assert.equal(shards.at(-1)!.content.at(-1)!.type, 'image', 'the last image ends the last shard');
+    assert.ok(shards.slice(1, -1).every((s) => s.content.every((b) => b.type === 'text')));
+    assert.deepEqual(joinBodyContent(shards), given);
+  });
+
+  it('a tool result, then a long text: the result leads the first shard', () => {
+    const given: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: 'tool-1', content: 'done' } as unknown as ContentBlock,
+      { type: 'text', text: 'note. '.repeat(2500) },
+    ];
+    const shards = shardsOf(given);
+    assert.equal(shards[0]!.content[0]!.type, 'tool_result');
+    assert.deepEqual(joinBodyContent(shards), given);
+  });
+
+  it('an image and an empty text block on a seam go on the shard after it, and the body joins back as given', () => {
+    // As the boundary case: the first block's 1,854 characters end in a blank
+    // line, and the heading after it is the chunker's seam.
+    const given: ContentBlock[] = [
+      { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
+      image,
+      { type: 'text', text: '' },
+      { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
+    ];
+    const shards = shardsOf(given);
+    assert.deepEqual(shards[0]!.content, [given[0]], 'premise: the first seam falls after the first block');
+    assert.deepEqual(shards[1]!.content.slice(0, 2), [image, given[2]], 'the image and the empty text lead the next shard');
+    assert.equal(shards[1]!.continuesBlock, false);
+    assert.deepEqual(joinBodyContent(shards), given);
+  });
+
+  it("a cut text block's pieces are plain text, and a raw form is kept only where all its blocks land, unchanged, on one shard", () => {
+    // As a Responses reply: a reasoning item, a message item whose two text
+    // parts share its rawItem, then a function call with its own item.
+    const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_1' } } as unknown as ContentBlock;
+    const message = { type: 'message', id: 'msg_1' };
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_1' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [
+      reasoning,
+      { type: 'text', text: 'part one. '.repeat(600), rawItem: message, cache_control: { type: 'ephemeral' } } as unknown as ContentBlock,
+      { type: 'text', text: 'part two. '.repeat(600), rawItem: message } as unknown as ContentBlock,
+      call,
+    ];
+    const shards = shardsOf(given);
+    const all = shards.flatMap((s) => s.content);
+    const keys = (b: ContentBlock) => Object.keys(b).sort().join(',');
+    assert.ok(all.filter((b) => b.type === 'text').every((b) => keys(b) === 'text,type'),
+      "every text piece is plain: the message item's parts were cut, and their rawItem and cache_control are the whole block's");
+    assert.equal((all.find((b) => b.type === 'thinking') as { rawItem?: unknown }).rawItem, undefined,
+      'the reasoning gives up its item with the message item it leads to');
+    assert.equal(all.find((b) => b.type === 'tool_use'), call, 'the call, alone with its own item on one shard, keeps it');
+  });
+
+  it('a raw form whose blocks land whole on different shards is given up by each', () => {
+    // As the boundary case, twice: each block ends in a blank line and the
+    // heading after it is a seam, so each lands whole on a shard of its own.
+    const item = { type: 'message', id: 'msg_3' };
+    const given: ContentBlock[] = [
+      { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n', rawItem: item } as unknown as ContentBlock,
+      { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(100) + 'end.\n\n', rawItem: item } as unknown as ContentBlock,
+      { type: 'text', text: '## Third\n\n' + 'third sentence. '.repeat(400) },
+    ];
+    const shards = shardsOf(given);
+    const bare = (b: ContentBlock) => ({ type: 'text', text: (b as { text: string }).text });
+    assert.deepEqual(shards[0]!.content, [bare(given[0]!)], 'the first part, whole on the first shard, gives the item up');
+    assert.deepEqual(shards[1]!.content[0], bare(given[1]!), 'the second part, whole on the next shard, gives it up too');
+    assert.equal(shards[1]!.continuesBlock, false, 'premise: the seam falls between the two parts');
+  });
+
+  it('a reasoning pairing whose members land whole on different shards is given up by both', () => {
+    // A reasoning item, plain text with no raw form, then the function call
+    // the reasoning led to: the reasoning lands on the first shard, the call
+    // on the last, each whole.
+    const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_9' } } as unknown as ContentBlock;
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_9' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [reasoning, { type: 'text', text: 'a plain long text. '.repeat(400) }, call];
+    const shards = shardsOf(given);
+    assert.equal(shards[0]!.content[0]!.type, 'thinking', 'premise: the reasoning is on the first shard');
+    assert.equal(shards.at(-1)!.content.at(-1)!.type, 'tool_use', 'premise: the call is on the last shard');
+    assert.equal((shards[0]!.content[0] as { rawItem?: unknown }).rawItem, undefined, 'the reasoning gives up its item');
+    assert.equal((shards.at(-1)!.content.at(-1) as { rawItem?: unknown }).rawItem, undefined, 'and so does the call it led to');
+  });
+
+  it('a reasoning pairing whose members land whole on one shard keeps both items', () => {
+    // Plain text first, then a reasoning item and the function call it led
+    // to, both at the message's end, so both land on its last shard.
+    const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_8' } } as unknown as ContentBlock;
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_8' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [{ type: 'text', text: 'a plain long text. '.repeat(400) }, reasoning, call];
+    const last = shardsOf(given).at(-1)!.content;
+    assert.deepEqual(last.slice(-2), [reasoning, call], 'both keep their items, unchanged, on the last shard');
+  });
+
+  it('a raw form whose blocks land whole on one shard is kept', () => {
+    const item = { type: 'message', id: 'msg_2' };
+    const given: ContentBlock[] = [
+      { type: 'text', text: 'a long first part. '.repeat(400) },
+      { type: 'text', text: 'short one', rawItem: item } as unknown as ContentBlock,
+      { type: 'text', text: 'short two', rawItem: item } as unknown as ContentBlock,
+    ];
+    const shards = shardsOf(given);
+    const last = shards.at(-1)!.content;
+    assert.ok(given.slice(1).every((b) => last.includes(b)), 'premise: both parts of the item are on the last shard, uncut');
+  });
+
+  it("a body stored before blocks were kept in place joins as it always did: its other blocks first, then its text", () => {
+    // No shard declares continuesBlock: the text joined into one block, cut
+    // across the shards, and the other blocks on the first shard after its text.
+    const legacy = [
+      { content: [{ type: 'text', text: 'one ' } as ContentBlock, image] },
+      { content: [{ type: 'text', text: 'two' } as ContentBlock] },
+    ];
+    assert.deepEqual(joinBodyContent(legacy), [image, { type: 'text', text: 'one two' }]);
+    assert.deepEqual(joinBodyContent(legacy.slice(0, 1)), legacy[0]!.content, 'one part is its own content');
+  });
+});
+
+describe('continuesBlock is stored and checked', () => {
+  beforeEach(() => cleanup());
+  after(() => cleanup());
+
+  it('a shard keeps its continuesBlock, false and true, through the store and a reopen', async () => {
+    const open = () => ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy: new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 }),
+      membrane: makeMockMembrane() as any,
+    });
+    const manager = await open();
+    // The boundary case: the first seam falls between the two blocks, the later ones inside the second.
+    manager.addMessage('User', [
+      { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
+      { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
+    ]);
+    const declared = (m: { getAllMessages(): Array<{ continuesBlock?: boolean }> }) => m.getAllMessages().map((s) => s.continuesBlock);
+    const stored = declared(manager);
+    assert.equal(stored[0], undefined);
+    assert.equal(stored[1], false);
+    assert.ok(stored.length > 2 && stored.slice(2).every((d) => d === true), JSON.stringify(stored));
+    manager.close();
+    const reopened = await open();
+    assert.deepEqual(declared(reopened), stored);
+    reopened.close();
+  });
+
+  for (const [what, declare] of [
+    ['declares continuesBlock on some shards after the first and not others', (k: number) => (k === 1 ? { continuesBlock: true } : {})],
+  ] as const) {
+    it(`a chunking that ${what} is refused before any shard is written`, async () => {
+      class Mixed extends AutobiographicalStrategy {
+        override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+          const decision = super.chunkIngressMessage(participant, content);
+          if (!decision) return decision;
+          return {
+            bodyGroupId: decision.bodyGroupId,
+            shards: decision.shards.map(({ continuesBlock: _drop, ...shard }, k) => ({ ...shard, ...declare(k) })),
+          };
+        }
+      }
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new Mixed({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 }),
+        membrane: makeMockMembrane() as any,
+      });
+      assert.throws(() => manager.addMessage('User', [{ type: 'text', text: 'paragraph. '.repeat(2000) }]), /continuesBlock/);
+      assert.equal(manager.getAllMessages().length, 0, 'no shard was written');
+      manager.close();
+    });
+  }
+
+  for (const first of [false, true]) {
+    it(`a chunking that also declares continuesBlock ${first} on its first shard is accepted, and joins back as given`, async () => {
+      class FirstDeclared extends AutobiographicalStrategy {
+        override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+          const decision = super.chunkIngressMessage(participant, content);
+          if (!decision) return decision;
+          return { ...decision, shards: decision.shards.map((shard, k) => (k === 0 ? { ...shard, continuesBlock: first } : shard)) };
+        }
+      }
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy: new FirstDeclared({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 }),
+        membrane: makeMockMembrane() as any,
+      });
+      // The boundary case: the first seam falls between the two blocks, the later ones inside the second.
+      const given: ContentBlock[] = [
+        { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
+        { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
+      ];
+      manager.addMessage('User', given);
+      const stored = manager.getAllMessages();
+      assert.ok(stored.length > 2, 'premise: the message is sharded');
+      assert.equal(stored[0]!.continuesBlock, first, 'premise: the first shard keeps its declaration');
+      assert.deepEqual(joinBodyContent(stored), given);
+      manager.close();
+    });
+  }
 });
