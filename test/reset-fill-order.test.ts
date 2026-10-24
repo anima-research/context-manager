@@ -349,30 +349,11 @@ describe('what a compile sends after a head-window reset', () => {
   });
 
   for (const name of ['adaptive', 'kv-unified'] as const) {
-    describe(`a long body after a reset whose first shard a host pins while it's recent (${name})`, () => {
-      /** After a reset: a short message, then B, stored as shards, whose first shard (the id addMessage returns) is
-       *  pinned while the recent window holds B; then traffic that pushes B out, so compression chunks B's rest. */
-      async function pinnedBody(m: ContextManager): Promise<{ pin: string; first: number; shards: number[]; view: never }> {
-        await history(m);
-        await m.resetHeadWindow('A new topic.');
-        m.addMessage('user', words('after1', 20));
-        const id = m.addMessage('assistant', words('Bbody', 6000));
-        const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-        const all = (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
-        const first = all.findIndex((x) => x.id === id);
-        const shards = all.flatMap((x, i) => (x.bodyGroupId && x.bodyGroupId === all[first]!.bodyGroupId ? [i] : []));
-        assert.ok(shards.length > 2 && shards[0] === first, 'premise: B is stored as shards, and addMessage returns the first');
-        const pin = m.pinRange(id, id);
-        for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-        for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-        await m.compile(BUDGET);
-        const owned = (m as unknown as { strategy: { chunks: Array<{ messages: Array<{ id: string }> }> } }).strategy.chunks
-          .flatMap((c) => c.messages.map((x) => x.id));
-        const now = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-        assert.ok(!owned.includes(now[shards[0]!]!.id) && owned.includes(now[shards[1]!]!.id),
-          "premise: B's first shard stays out of chunks, and coverage after the head starts at its second");
-        return { pin, first, shards, view };
-      }
+    describe(`a pinned run at a reset head's end that compression never took (${name})`, () => {
+      // A pin or a document mark covers a message stored in parts whole, for compression as for the selects, so a
+      // message pinned while it's recent is never chunked, and the ratchet guard can take it into the head whole. A
+      // message whose later parts were chunked before it was marked (a mark from before whole-message pins, or an
+      // earlier version's head that ended inside it) keeps those chunks, and is built below as such a store left it.
       const make = () => new AutobiographicalStrategy({ ...base, recentWindowTokens: 30_000, hierarchical: false, adaptiveResolution: true,
         targetChunkTokens: 1500, ...(name === 'kv-unified' ? { foldingStrategy: 'kv-unified', kvUnified: { ...KVU, policy: { ...KVU.policy } } } : {}),
         compressionModel: 'test-model' } as never);
@@ -387,69 +368,176 @@ describe('what a compile sends after a head-window reset', () => {
         const m = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: stub() });
         try { await body(m, strategy); } finally { await m.close(); rmSync(dir, { recursive: true, force: true }); }
       };
+      type View = { getAll(): Array<{ id: string; bodyGroupId?: string }>; estimateTokens(x: unknown): number };
+      const viewOf = (m: ContextManager) => (m as unknown as { strategyMessageView(): View }).strategyMessageView();
+      const ownedOf = (strategy: AutobiographicalStrategy) => new Set((strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> })
+        .chunks.flatMap((c) => c.messages.map((x) => x.id)));
+      const headEnd = (strategy: AutobiographicalStrategy, view: View) =>
+        (strategy as unknown as { getHeadWindowEnd(v: View): number }).getHeadWindowEnd(view);
+      const headStart = (strategy: AutobiographicalStrategy, view: View) =>
+        (strategy as unknown as { getHeadWindowStartIndex(v: View): number }).getHeadWindowStartIndex(view);
+      /** The store positions of the message `id`'s parts, the first included. */
+      const partsOf = (view: View, id: string): number[] => {
+        const all = view.getAll();
+        const first = all.findIndex((x) => x.id === id);
+        const group = all[first]!.bodyGroupId;
+        return group === undefined ? [first] : all.flatMap((x, i) => (x.bodyGroupId === group ? [i] : []));
+      };
+      const settle = async (m: ContextManager) => {
+        for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+        for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+        await m.compile(BUDGET);
+      };
 
-      it('ends the head at the body\'s start and sends the body whole after the history', () =>
+      /** After a reset: a short message, then B, pinned or marked while recent, then traffic that compression chunks.
+       *  B is small enough for the ratchet guard to reach over it whole. */
+      async function pinnedWhole(m: ContextManager, strategy: AutobiographicalStrategy, how: 'pin' | 'mark'): Promise<{ first: number; parts: number[]; view: View }> {
+        await history(m);
+        await m.resetHeadWindow('A new topic.');
+        m.addMessage('user', words('after1', 20));
+        const id = m.addMessage('assistant', words('Bbody', 1800));
+        const view = viewOf(m);
+        const parts = partsOf(view, id);
+        assert.ok(parts.length > 1, 'premise: B is stored as parts');
+        if (how === 'mark') m.markDocument(id);
+        else m.pinRange(id, id);
+        await settle(m);
+        const all = view.getAll();
+        const owned = ownedOf(strategy);
+        assert.ok(parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+          'premise: no part of B is chunked, and coverage after the head starts right after it');
+        return { first: parts[0]!, parts, view };
+      }
+
+      /** A store an earlier version left: the head ended inside B, after its first part, so compression chunked
+       *  B's rest, and B is marked only then if at all; then a reset to the message before B, as `/newtopic` makes. */
+      async function chunkedRest(m: ContextManager, strategy: AutobiographicalStrategy, mark: boolean): Promise<{ first: number; parts: number[]; view: View }> {
+        m.addMessage('user', words('hist0', 200));
+        const after1 = m.addMessage('user', words('after1', 20));
+        const id = m.addMessage('assistant', words('Bbody', 6000));
+        const view = viewOf(m);
+        const parts = partsOf(view, id);
+        assert.strictEqual(headStart(strategy, view), 0, 'premise: no reset yet');
+        assert.strictEqual(headEnd(strategy, view), parts[1], 'premise: the head ends inside B, after its first part');
+        await settle(m);
+        const all = view.getAll();
+        const owned = ownedOf(strategy);
+        assert.ok(!owned.has(all[parts[0]!]!.id) && parts.slice(1).every((k) => owned.has(all[k]!.id)),
+          "premise: B's first part was never chunked, and its rest was");
+        if (mark) m.markDocument(id);
+        (strategy as unknown as { resetHeadWindow(id: string): void }).resetHeadWindow(after1);
+        assert.strictEqual(headStart(strategy, view), parts[0]! - 1, 'premise: the head now starts at the message before B');
+        return { first: parts[0]!, parts, view };
+      }
+
+      for (const how of ['pin', 'mark'] as const) {
+        it(`leaves a ${how === 'mark' ? 'marked' : 'pinned'} message the guard reaches out of the head, and sends it whole after the history`, () =>
+          open(async (m, strategy) => {
+            const { first, view } = await pinnedWhole(m, strategy, how);
+            assert.strictEqual(headEnd(strategy, view), first, 'the head stops at B\'s start rather than take B into it');
+            const out = (await m.compile(BUDGET)).messages as unknown as Sent[];
+            assert.deepStrictEqual(out.slice(0, 2 + H.length).map(label), ['TT', 'after1', ...H]);
+            const at = out.findIndex((x) => textOf(x).startsWith('Bbody word0 '));
+            assert.strictEqual(at, 2 + H.length, 'B starts right after the history');
+            // The compile joins a body's parts sent one after another into one message.
+            assert.ok(textOf(out[at]!).endsWith(' word1799'), 'B is sent whole, as one message');
+            assert.strictEqual(label(out[at + 1]!), 'event0', 'and the rest follows it');
+          }));
+      }
+
+      it('leaves out a message marked after its later parts were chunked, so the head doesn\'t end inside it', () =>
         open(async (m, strategy) => {
-          const { first, view } = await pinnedBody(m);
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first,
-            'the head stops at B\'s start rather than take its pinned first shard');
+          const { first, view } = await chunkedRest(m, strategy, true);
+          assert.strictEqual(headEnd(strategy, view), first, 'the head stops at B\'s start rather than take its marked first part');
           const out = (await m.compile(BUDGET)).messages as unknown as Sent[];
-          assert.deepStrictEqual(out.slice(0, 2 + H.length).map(label), ['TT', 'after1', ...H]);
+          assert.strictEqual(label(out[0]!), 'after1', 'the head sends after1 alone');
           const at = out.findIndex((x) => textOf(x).startsWith('Bbody word0 '));
-          assert.strictEqual(at, 2 + H.length, 'B starts right after the history');
-          // The compile joins a body's shards sent one after another into one message.
-          assert.ok(textOf(out[at]!).endsWith(' word5999'), 'B is sent whole, as one message');
-          assert.strictEqual(label(out[at + 1]!), 'event0', 'and the rest follows it');
+          assert.ok(at > 1 && label(out[at - 1]!) === 'hist0', "B's first part goes after the history, with the rest of B, not in the head");
         }));
 
-      it('keeps the extension over a body whose first shard is unpinned and its second pinned', () =>
+      it('keeps the extension over a first part an earlier head kept out of chunks and no pin holds, so it is never chunked after the rest', () =>
+        open(async (m, strategy) => {
+          const { parts, view } = await chunkedRest(m, strategy, false);
+          assert.strictEqual(headEnd(strategy, view), parts[1], 'the head keeps B\'s unpinned first part, up to where coverage starts');
+          if (name === 'kv-unified') {
+            // kv-unified reads pin bounds: a pin that lets the part fold keeps it no more out of chunks than none.
+            const all0 = view.getAll();
+            const bounded = m.pinRange(all0[parts[0]!]!.id, all0[parts[0]!]!.id, { maxLevel: 1 });
+            assert.strictEqual(headEnd(strategy, view), parts[1], 'a bounded pin is no raw pin: the extension stands');
+            m.unpin(bounded);
+          }
+          const before = ownedOf(strategy).size;
+          for (let i = 120; i < 140; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
+          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
+          await m.compile(BUDGET);
+          assert.ok(ownedOf(strategy).size > before, 'premise: compression chunked more after the head');
+          const all = view.getAll();
+          assert.ok(!ownedOf(strategy).has(all[parts[0]!]!.id), 'no chunk takes B\'s first part after the chunks of its rest');
+        }));
+
+      it("doesn't trim past the boundary into a pinned message the head already holds", () =>
         open(async (m, strategy) => {
           await history(m);
           await m.resetHeadWindow('A new topic.');
-          m.addMessage('user', words('after1', 20));
-          const id = m.addMessage('assistant', words('Bbody', 6000));
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-          const first = all().findIndex((x) => x.id === id);
-          // B's first two shards are kept out of chunks by one pin, the second by another; the first pin is removed later.
-          const both = m.pinRange(id, all()[first + 1]!.id);
-          m.pinRange(all()[first + 1]!.id, all()[first + 1]!.id);
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          m.unpin(both);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(all()[first]!.id) && !owned.includes(all()[first + 1]!.id) && owned.includes(all()[first + 2]!.id),
-            "premise: B's first two shards stay out of chunks, and coverage starts at its third");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first + 2,
-            "the head keeps both shards: leaving out the pinned second would end it inside B all the same, and the unpinned first needs the head");
+          const a = m.addMessage('user', words('after1', 20));
+          const id = m.addMessage('assistant', words('Bbody', 1800));
+          m.pinRange(a, id);
+          await settle(m);
+          const view = viewOf(m);
+          const parts = partsOf(view, id);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok(parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+            'premise: B stays out of chunks and coverage starts right after it, so the guard\'s extension reaches over it');
+          assert.strictEqual(headEnd(strategy, view), parts[0], 'the pinned message that fits the head stays in it; only B is left out');
         }));
 
-      it('leaves two pinned bodies out of the head together', () =>
+      it('leaves two pinned messages out of the head together', () =>
         open(async (m, strategy) => {
           await history(m);
           await m.resetHeadWindow('A new topic.');
           m.addMessage('user', words('after1', 20));
           const d = m.addMessage('assistant', words('Dbody', 1800));
-          const id = m.addMessage('assistant', words('Bbody', 6000));
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-          const first = all().findIndex((x) => x.id === id);
-          const dAt = all().findIndex((x) => x.id === d);
-          m.pinRange(d, all()[first - 1]!.id);
+          const id = m.addMessage('assistant', words('Bbody', 500));
+          const view = viewOf(m);
+          const dParts = partsOf(view, d);
+          const bParts = partsOf(view, id);
+          m.pinRange(d, d);
           m.pinRange(id, id);
-          const est = view as unknown as { estimateTokens(x: unknown): number };
-          const headStart = (strategy as unknown as { getHeadWindowStartIndex(v: never): number }).getHeadWindowStartIndex(view);
+          // A head window D just doesn't fit, so the guard reaches past D and B to their coverage.
           (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
-            all().slice(headStart, first).reduce((t, x) => t + est.estimateTokens(x), 0) - 1;
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(d) && !owned.includes(id) && owned.includes(all()[first + 1]!.id),
-            "premise: D and B's first shard stay out of chunks, and coverage starts at B's second");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), dAt,
-            'the head ends before D: both pinned bodies are left out');
+            view.getAll().slice(headStart(strategy, view), bParts[0]).reduce((t, x) => t + view.estimateTokens(x), 0) - 1;
+          await settle(m);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok([...dParts, ...bParts].every((k) => !owned.has(all[k]!.id)) && owned.has(all[bParts.at(-1)! + 1]!.id),
+            'premise: D and B stay out of chunks, and coverage starts right after B');
+          assert.strictEqual(headEnd(strategy, view), dParts[0], 'the head ends before D: both pinned messages are left out');
+        }));
+
+      it('leaves a run of pinned messages out of the head, and keeps an unpinned message before it', () =>
+        open(async (m, strategy) => {
+          await history(m);
+          await m.resetHeadWindow('A new topic.');
+          m.addMessage('user', words('after1', 20));
+          const d = m.addMessage('assistant', words('Dbody', 1800));
+          const id = m.addMessage('assistant', words('Bbody', 500));
+          const view = viewOf(m);
+          const dParts = partsOf(view, d);
+          const bParts = partsOf(view, id);
+          // D is pinned while recent, so compression never takes it, and its pin is removed after; B stays pinned.
+          const dPin = m.pinRange(d, d);
+          m.pinRange(id, id);
+          (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
+            view.getAll().slice(headStart(strategy, view), bParts[0]).reduce((t, x) => t + view.estimateTokens(x), 0) - 1;
+          await settle(m);
+          m.unpin(dPin);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok([...dParts, ...bParts].every((k) => !owned.has(all[k]!.id)) && owned.has(all[bParts.at(-1)! + 1]!.id),
+            'premise: D and B stay out of chunks, and coverage starts right after B');
+          assert.ok(headStart(strategy, view) < dParts[0]!, 'premise: D starts after the reset');
+          assert.strictEqual(headEnd(strategy, view), bParts[0], 'the head keeps unpinned D and leaves pinned B out');
         }));
 
       it('keeps a parallel call\'s pinned result with its call', () =>
@@ -459,76 +547,39 @@ describe('what a compile sends after a head-window reset', () => {
           m.addMessage('assistant', [...words('calling', 5), { type: 'tool_use', id: 'p1', name: 'search', input: {} },
             { type: 'tool_use', id: 'p2', name: 'search', input: {} }]);
           m.addMessage('user', [{ type: 'tool_result', toolUseId: 'p1', content: 'First.' }]);
-          const second = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'p2', content: 'Second.' }, ...words('Rbody', 6000)]);
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
-          const at = all().findIndex((x) => x.id === second);
-          assert.ok(all()[at + 1]?.bodyGroupId === all()[at]!.bodyGroupId, 'premise: the second result is stored as shards');
+          const second = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'p2', content: 'Second.' }, ...words('Rbody', 1800)]);
+          const view = viewOf(m);
+          const parts = partsOf(view, second);
+          assert.ok(parts.length > 1, 'premise: the second result is stored as parts');
           m.pinRange(second, second);
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(second) && owned.includes(all()[at + 1]!.id), "premise: the second result's first shard stays out of chunks, its rest chunked");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), at + 1,
-            "the head keeps the second result's first shard with the call it answers");
+          await settle(m);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok(parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+            'premise: the second result stays out of chunks, and coverage starts right after it');
+          assert.strictEqual(headEnd(strategy, view), parts.at(-1)! + 1, 'the head keeps the second result whole, with the call it answers');
         }));
 
-      it('leaves a run of pinned shards out of the head, and keeps an unpinned body before it', () =>
-        open(async (m, strategy) => {
-          await history(m);
-          await m.resetHeadWindow('A new topic.');
-          m.addMessage('user', words('after1', 20));
-          const d = m.addMessage('assistant', words('Dbody', 1800));
-          const id = m.addMessage('assistant', words('Bbody', 6000));
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
-          const first = all().findIndex((x) => x.id === id);
-          const dAt = all().findIndex((x) => x.id === d);
-          const dLast = first - 1;
-          // D's shards and B's first two shards are pinned while recent; B's rest is chunked once it leaves.
-          const dPin = m.pinRange(d, all()[dLast]!.id);
-          m.pinRange(id, all()[first + 1]!.id);
-          // A head window D just doesn't fit, so twice it reaches past B's pinned shards to its coverage.
-          const est = view as unknown as { estimateTokens(x: unknown): number };
-          const headStart = (strategy as unknown as { getHeadWindowStartIndex(v: never): number }).getHeadWindowStartIndex(view);
-          (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
-            all().slice(headStart, first).reduce((t, x) => t + est.estimateTokens(x), 0) - 1;
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          m.unpin(dPin);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok([dAt, dLast, first, first + 1].every((k) => !owned.includes(all()[k]!.id)) && owned.includes(all()[first + 2]!.id),
-            "premise: D and B's first two shards stay out of chunks, and coverage starts at B's third");
-          const s = strategy as unknown as { getHeadWindowEnd(v: never): number; getHeadWindowStartIndex(v: never): number };
-          assert.ok(s.getHeadWindowStartIndex(view) < dAt && dAt > 0, 'premise: D starts after the reset');
-          assert.strictEqual(s.getHeadWindowEnd(view), first, `the head keeps unpinned D and leaves B's pinned shards out: D ${dAt}..${dLast}, B from ${first}, head start ${s.getHeadWindowStartIndex(view)}, end ${s.getHeadWindowEnd(view)}`);
-        }));
-
-      it('keeps a call with its result when the call is unpinned and the result\'s first shard pinned, its rest chunked', () =>
+      it('keeps a call with its pinned result when the call is unpinned', () =>
         open(async (m, strategy) => {
           await history(m);
           await m.resetHeadWindow('A new topic.');
           m.addMessage('user', words('after1', 20));
           const call = m.addMessage('assistant', [...words('calling', 5), { type: 'tool_use', id: 'c6', name: 'search', input: {} }]);
-          const result = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'c6', content: 'Sunny.' }, ...words('Rbody', 6000)]);
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string; bodyGroupId?: string }> }).getAll();
-          const at = all().findIndex((x) => x.id === result);
-          assert.ok(all()[at]!.bodyGroupId && all()[at + 1]!.bodyGroupId === all()[at]!.bodyGroupId, 'premise: the result is stored as shards');
-          // The call and the result's first shard are pinned while recent, then the call's pin is removed.
+          const result = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'c6', content: 'Sunny.' }, ...words('Rbody', 1800)]);
+          const view = viewOf(m);
+          const parts = partsOf(view, result);
+          assert.ok(parts.length > 1, 'premise: the result is stored as parts');
+          // The call and the result are pinned while recent, then the call's pin is removed.
           const callPin = m.pinRange(call, call);
           m.pinRange(result, result);
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
+          await settle(m);
           m.unpin(callPin);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(call) && !owned.includes(result) && owned.includes(all()[at + 1]!.id),
-            "premise: the call and the result's first shard stay out of chunks, and the result's rest is chunked");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), at + 1,
-            `the head keeps the call and the result's first shard together: result at ${at}, end ${(strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view)}`);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok(!owned.has(call) && parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+            'premise: the call and the result stay out of chunks, and coverage starts right after the result');
+          assert.strictEqual(headEnd(strategy, view), parts.at(-1)! + 1, 'the head keeps the call and its result together');
           const out = (await m.compile(BUDGET)).messages as unknown as Sent[];
           const callAt = out.findIndex((x) => x.content.some((b) => b.type === 'tool_use'));
           assert.strictEqual(callAt, 2, 'the call is in the head');
@@ -565,29 +616,25 @@ describe('what a compile sends after a head-window reset', () => {
         open(async (m, strategy) => {
           await history(m);
           await m.resetHeadWindow('A new topic.');
-          // after1 is large enough that the guard's cap (twice the head window) takes in the call, its result and B's first shard.
+          // after1 is large enough that the guard's cap (twice the head window) takes in the call, its result and B.
           m.addMessage('user', words('after1', 900));
           const call = m.addMessage('assistant', [...words('calling', 5), { type: 'tool_use', id: 'c4', name: 'search', input: {} }]);
           const result = m.addMessage('user', [{ type: 'tool_result', toolUseId: 'c4', content: 'Done.' }]);
-          const id = m.addMessage('assistant', words('Bbody', 6000));
+          const id = m.addMessage('assistant', words('Bbody', 500));
           m.pinRange(call, id);
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = () => (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-          const est = view as unknown as { estimateTokens(x: unknown): number };
-          const headStart = (strategy as unknown as { getHeadWindowStartIndex(v: never): number }).getHeadWindowStartIndex(view);
-          const callAt = all().findIndex((x) => x.id === call);
+          const view = viewOf(m);
+          const callAt = view.getAll().findIndex((x) => x.id === call);
           // The head window holds the transition and after1 exactly, so the call and its result are the guard's to extend over.
           (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
-            all().slice(headStart, callAt).reduce((t, x) => t + est.estimateTokens(x), 0);
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          const first = all().findIndex((x) => x.id === id);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok([call, result, id].every((x) => !owned.includes(x)) && owned.includes(all()[first + 1]!.id),
-            "premise: the call, its result and B's first shard stay out of chunks, and coverage starts at B's second shard");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first,
-            `the head keeps the call and its result, which it holds by the guard's extension alone, and leaves B's pinned shard out (call at ${callAt}, B at ${first})`);
+            view.getAll().slice(headStart(strategy, view), callAt).reduce((t, x) => t + view.estimateTokens(x), 0);
+          await settle(m);
+          const parts = partsOf(view, id);
+          const all = view.getAll();
+          const owned = ownedOf(strategy);
+          assert.ok([call, result].every((x) => !owned.has(x)) && parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+            'premise: the call, its result and B stay out of chunks, and coverage starts right after B');
+          assert.strictEqual(headEnd(strategy, view), parts[0],
+            `the head keeps the call and its result, which it holds by the guard's extension alone, and leaves pinned B out (call at ${callAt}, B at ${parts[0]})`);
           const out = (await m.compile(BUDGET)).messages as unknown as Sent[];
           const at = out.findIndex((x) => x.content.some((b) => b.type === 'tool_use'));
           const kind = (x: Sent): string => (x.content.some((b) => b.type === 'tool_use') ? 'call'
@@ -597,78 +644,33 @@ describe('what a compile sends after a head-window reset', () => {
           assert.ok(textOf(out[at + 2 + H.length]!).startsWith('Bbody word0 '), 'B follows the history');
         }));
 
-      it("doesn't trim past the boundary into a pinned message the head already holds", () =>
-        open(async (m, strategy) => {
-          await history(m);
-          await m.resetHeadWindow('A new topic.');
-          const a = m.addMessage('user', words('after1', 20));
-          const id = m.addMessage('assistant', words('Bbody', 6000));
-          m.pinRange(a, id);
-          for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-          const all = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-          const first = all.findIndex((x) => x.id === id);
-          const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(id) && owned.includes(all[first + 1]!.id),
-            "premise: B's first shard stays out of chunks and coverage starts at its second, so the guard's extension reaches it");
-          assert.strictEqual((strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first,
-            'the pinned message that fits the head stays in it; only B is left out');
-        }));
-
       it('leaves a pinned run in the extension when it holds a tool result, and leaves the same run out without one', async () => {
-        const headEnd = async (withResult: boolean): Promise<{ end: number; first: number }> => {
-          let found = { end: -1, first: -1 };
+        const run = async (withResult: boolean): Promise<{ end: number; parts: number[] }> => {
+          let found = { end: -1, parts: [] as number[] };
           await open(async (m, strategy) => {
             m.addMessage('user', words('hist0', 200));
             m.addMessage('assistant', [...words('hist1', 5), { type: 'tool_use', id: 'x1', name: 'search', input: {} }]);
             for (let i = 2; i < 6; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`hist${i}`, 200));
             await m.resetHeadWindow('A new topic.');
             m.addMessage('user', words('after1', 20));
-            const id = m.addMessage('user', [...(withResult ? [{ type: 'tool_result', toolUseId: 'x1', content: 'Late.' } as ContentBlock] : []), ...words('Bbody', 6000)]);
+            const id = m.addMessage('user', [...(withResult ? [{ type: 'tool_result', toolUseId: 'x1', content: 'Late.' } as ContentBlock] : []), ...words('Bbody', 1800)]);
             m.pinRange(id, id);
-            for (let i = 0; i < 120; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-            for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-            await m.compile(BUDGET);
-            const view = (m as unknown as { strategyMessageView(): never }).strategyMessageView();
-            const all = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-            const first = all.findIndex((x) => x.id === id);
-            const owned = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.flatMap((c) => c.messages.map((x) => x.id));
-            assert.ok(!owned.includes(id) && owned.includes(all[first + 1]!.id), "premise: B's first shard stays out of chunks, and its rest is chunked");
-            found = { end: (strategy as unknown as { getHeadWindowEnd(v: never): number }).getHeadWindowEnd(view), first };
+            await settle(m);
+            const view = viewOf(m);
+            const parts = partsOf(view, id);
+            const all = view.getAll();
+            const owned = ownedOf(strategy);
+            assert.ok(parts.length > 1 && parts.every((k) => !owned.has(all[k]!.id)) && owned.has(all[parts.at(-1)! + 1]!.id),
+              'premise: B is stored as parts and stays out of chunks, and coverage starts right after it');
+            found = { end: headEnd(strategy, view), parts };
           });
           return found;
         };
-        const plain = await headEnd(false);
-        assert.strictEqual(plain.end, plain.first, 'without a tool result, the pinned shard is left out and the head ends at B\'s start');
-        const result = await headEnd(true);
-        assert.strictEqual(result.end, result.first + 1, 'with a tool result on it, the pinned shard stays in the extension');
+        const plain = await run(false);
+        assert.strictEqual(plain.end, plain.parts[0], 'without a tool result, pinned B is left out and the head ends at its start');
+        const result = await run(true);
+        assert.strictEqual(result.end, result.parts.at(-1)! + 1, 'with a tool result on it, pinned B stays in the extension, whole');
       });
-
-      it('keeps the extension over an unpinned first shard, so it is never chunked after B\'s rest', () =>
-        open(async (m, strategy) => {
-          const { pin, shards, view } = await pinnedBody(m);
-          m.unpin(pin);
-          const s = strategy as unknown as { getHeadWindowEnd(v: never): number };
-          assert.strictEqual(s.getHeadWindowEnd(view), shards[1], 'the head keeps the unpinned first shard, up to where coverage starts');
-          if (name === 'kv-unified') {
-            // kv-unified reads pin bounds: a pin that lets the shard fold keeps it no more out of chunks than none.
-            const all0 = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-            const bounded = m.pinRange(all0[shards[0]!]!.id, all0[shards[0]!]!.id, { maxLevel: 1 });
-            assert.strictEqual(s.getHeadWindowEnd(view), shards[1], 'a bounded pin is no raw pin: the extension stands');
-            m.unpin(bounded);
-          }
-          const chunksOf = () => (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks;
-          const before = chunksOf().length;
-          for (let i = 120; i < 140; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`event${i}`, 200));
-          for (let i = 0; i < 500 && !m.isReady(); i++) await m.tick();
-          await m.compile(BUDGET);
-          assert.ok(chunksOf().length > before, 'premise: compression chunked more after the head');
-          const all = (view as unknown as { getAll(): Array<{ id: string }> }).getAll();
-          const owned = chunksOf().flatMap((c) => c.messages.map((x) => x.id));
-          assert.ok(!owned.includes(all[shards[0]!]!.id), 'no chunk takes it after the chunks of B\'s rest');
-        }));
     });
   }
 
