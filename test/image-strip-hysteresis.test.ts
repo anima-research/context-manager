@@ -551,7 +551,7 @@ describe('imageStripHysteresisRatio', () => {
       assert.deepEqual(patterns, ['...III', '...III']);
     });
 
-    it('render stats before a compile reconstruct the window, leave the stored state as they found it, and the next compile strips as the rule says', async () => {
+    it('render stats before a compile are null, leave the stored state as they found it, and the next compile strips as the rule says', async () => {
       const s = adaptive({ imageStripHysteresisRatio: undefined });
       let m = await ContextManager.open({ path: STORE, strategy: s });
       for (let i = 1; i <= 6; i++) m.addMessage('user', img(`img-${i}`));
@@ -563,7 +563,7 @@ describe('imageStripHysteresisRatio', () => {
       const before = stored();
       const chunks = (on as unknown as { chunks: unknown }).chunks;
       const stats = m.getRenderStats();
-      assert.ok(stats && stats.tail.messages === 6, 'the observer reconstructs the window');
+      assert.strictEqual(stats, null, 'no live compile has recorded stats yet');
       assert.equal(stored(), before, 'the observer writes no stored state');
       assert.ok((on as unknown as { chunks: unknown }).chunks === chunks, 'and leaves the chunks it found');
       assert.equal(await stripped(m, 6), '...III');

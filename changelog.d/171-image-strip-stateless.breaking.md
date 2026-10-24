@@ -1,1 +1,0 @@
-- **Subclasses of `AutobiographicalStrategy`:** the image watermark's protected members are gone: `imageWatermark()`, `maybeAdvanceImageWatermark()`, `belowImageWatermark()` and `imageWatermarkStateId`. `imageStripReplay(store)` gives `imageStripHysteresisRatio`'s set: for each message with stripped images, how many of its first images are stripped (#171).

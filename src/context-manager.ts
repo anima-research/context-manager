@@ -1199,6 +1199,8 @@ export class ContextManager {
       opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
+    // Read now, before anything else selects: these are this select's own.
+    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
@@ -1246,6 +1248,7 @@ export class ContextManager {
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
       result.rawBodies = rawBodiesOf(attribution);
+      if (renderStats) result.renderStats = renderStats;
       const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
       result.provenance = {
         compileId: randomUUID(),
@@ -1650,7 +1653,11 @@ export class ContextManager {
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps the
    * messages out of compression and renders them raw at their original
-   * chronological position. A bound above 0 is read only under
+   * chronological position, a message stored in parts whole, as
+   * `ProtectedRange` describes. A compile whose budget can't hold them beside
+   * the rest refuses with `OverBudgetError`; where the adaptive plan's middle
+   * is over the budget, its message and `diagnostics.rawPins` name each pin
+   * keeping raw tokens in that middle. A bound above 0 is read only under
    * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution`: there the range is still compressed, since only a
    * summary can supply its level, and is held at `level`, or no deeper than
@@ -1691,7 +1698,13 @@ export class ContextManager {
    * `kind: 'document'`, levels included (see `pinRange`): without a `level`
    * or `maxLevel` the message is kept raw, while
    * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
-   * where the selector reads level bounds.
+   * where the selector reads level bounds. Under adaptive resolution, a mark
+   * on any part of a message stored in parts covers the whole message, less
+   * a part locked with `lockChunk` outside the span the mark's id names, as
+   * `pinRange` does.
+   * Under `kv-stable`, a mark with `level` (not `maxLevel`) holds whole each
+   * summary it reaches, so a locked part that shares a summary with a part
+   * the mark covers renders at the level the mark holds that summary at.
    * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
@@ -1770,9 +1783,13 @@ export class ContextManager {
   }
 
   /**
-   * Per-render stats from the active strategy: head/tail message + token
+   * Per-render stats of the last live compile: head/tail message + token
    * counts, plus per-level summary counts and total tokens. Returns null
-   * if the strategy doesn't implement `getRenderStats`.
+   * if the strategy doesn't implement `getRenderStats`, and before a live
+   * compile has run since the strategy loaded its branch (opening the store,
+   * `setStrategy()`, a branch switch). A dry run or preview leaves it as it
+   * was; a compile's own stats, a dry one's included, are its result's
+   * `renderStats`.
    *
    * Designed for TUIs / dashboards that want to display "how much of the
    * agent's context is folded vs raw" at a glance.

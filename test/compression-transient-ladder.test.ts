@@ -712,8 +712,10 @@ describe('progress is a shared record, not an instance snapshot', () => {
     await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz network failure/);
     assert.equal(progressSlot(a.manager).length, 1);
 
-    const want = new Set(a.ids.slice(6, 9));
-    const other: Chunk = { index: 998, startIndex: 6, endIndex: 9, messages: managerContext(b.manager).messageStore.getAll().filter((m) => want.has(m.id)), tokens: 100, compressed: false };
+    // B's family: a chunk of its own that carries the skip_reply cycle, so its hoist rung applies. (A chunk before
+    // the cycle no longer does: its request's head ends at the chunk, #317.)
+    const want = new Set(a.ids.slice(11, 13));
+    const other: Chunk = { index: 998, startIndex: 11, endIndex: 13, messages: managerContext(b.manager).messageStore.getAll().filter((m) => want.has(m.id)), tokens: 100, compressed: false };
     await assert.rejects(b.strategy.run(other, managerContext(b.manager)), /zz network failure/);
     assert.equal(progressSlot(a.manager).length, 2, "B's write kept A's family");
 

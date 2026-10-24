@@ -21,6 +21,7 @@ import type {
 import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
+import { storedJson } from './stored-json.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -611,7 +612,7 @@ export class MessageStore {
     const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    this.store.editStateItem(this.stateId, index, storedJson(updated));
 
     // Write-through the materialized cache (see append — the cached entry
     // must be the chronicle round-trip form, so re-fetch it canonically).

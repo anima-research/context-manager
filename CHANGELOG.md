@@ -12,6 +12,124 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.20.1 — 2026-10-23
+
+### Added
+
+- `AutobiographicalStrategy.setLoadRepairHandler(fn)` tells a host when a load's repair of the summary state drops summaries holding text, so whoever keeps the agent can learn that its memory changed from more than a log line (#175). A load runs at each initialization (an open, a branch switch, a fork, `setStrategy`) and at each take-up of what another instance on the store wrote. The handler gets one `LoadRepairReport` per such load. The report holds no summary text. For each dropped summary that held text, it gives the id, the level and the stored `tokens` (each null where it isn't a number), why it was dropped (`unreadable`, `names-missing`, `names-not-below` or `names-non-child`), and, where its range can be read, the messages it covered, with each end's stored time where the strategy's message view gives it. It also gives the sum of those tokens, how many empty summaries the same repair dropped, the namespace, and where the old summaries read back from: `getStateJsonAt(stateId, sequenceBefore)`, with `branch`, the Chronicle branch the repair wrote on, current. A repair that drops only empty summaries, or none, makes no report, and the repair's diagnostic line is written as before. A report made while a handler is set goes to it once its load's synchronous run has ended, never during it. Reports made while no handler is set, such as an open's where the host sets the handler after opening, are held in memory and handed to the handler, oldest first, when it's set. Each strategy instance holds its own. A handler that throws, or whose returned promise or thenable rejects, is logged, and stops neither the load nor the next report. `getLatestLoadRepairReport()` gives the newest report the instance has made, whether held or handed on, for a health surface to show. A load that drops text makes no report only where the store's branch or sequence can't be read, which is logged.
+
+- `CompileResult.renderStats`: each compile's result carries the render stats its own select recorded. A dry compile's (`dryRun`) are its own, which `getRenderStats()` never returns, so a host can show the composition of the request a dry compile built, beside the last live compile's, without sending anything. A live compile's are the object `getRenderStats()` then returns. Strategies supply them through an optional `RenderStatsCapableStrategy.getLastSelectStats()`; a strategy without it gives compiles none.
+
+### Changed
+
+- A compression request recalls only the summaries that start before the history it summarizes, the rule a merge's recall already used (#317). A source-only request (`compressionSourceOnly`) recalls none, before or after.
+  - **Before:** it recalled every summary on the frontier, as 0.15.0's entry said: "Only pins before the chunk being compressed count, so a summary after it is recalled as before." So a chunk compressed after later history had been summarized was given those later summaries too, ahead of it. That's the old head's chunk, which a head-window reset makes compressible late, or a pinned or quarantined chunk let go late.
+  - **Now:** a summary that starts after the history being summarized isn't recalled, and its messages stay out of the request, as before. Pins still count only before the chunk.
+  - **What still reaches a request from after it:** a summary that starts before the history being summarized and reaches past it is still recalled, since what it covers before that history has no other form there. So its later part reaches the request, and only where a summary straddles the chunk. When a refused request is retried with a recalled summary above L1 replaced by its children (the recall-curve fallback), a straddling summary's later child is recalled too: the same later part, as a summary of its own. Summaries written before this change are recalled as written, and one written after a reset may already carry the new topic.
+
+### Fixed
+
+- After a head-window reset (`ContextManager.resetHeadWindow()`), a compression or merge request for history from before the reset no longer gets the new topic's opening as its head, ahead of the history it summarizes (#317). A source-only request (`compressionSourceOnly` or `compressionMergeSourceOnly`) carries no head, so this didn't reach it. The other way later history reached a compression request, its recall pairs, is under Changed.
+  - **The head it gets now:** the head that history followed, the opening or its own topic's transition and opening, cut at the request's first message. A merge gets the head as of its first message.
+  - **Which head:** before the live head's start, the one starting at the latest Context Manager message whose text starts with `[Topic Transition]` at or before the request's first message, or the opening when there is none. That's the store as a restart reads it, so for that history a strategy-level `resetHeadWindow` to a message that isn't a transition doesn't count. It ends by the walk the live head takes, priced with today's `headWindowTokens` and calibration. There, a chunk that starts at a transition gets no head, and so does the opening's own chunk: nothing came before either.
+  - **From the live head's start on,** a request still gets the live head, but now cut at its first message. So a queued chunk inside the live head window (one a widened window grew over) no longer gets the head's messages after it, and before the host declares its tools, tick no longer defers it for a tool cycle among them.
+  - **Removed messages:** where history starts is its first message still in the store, for a queued chunk, a summary (its first leaf still there) and a merge alike: a host can remove stored messages (agent-framework's Discord module does) while a summary over them or a queued chunk holding them lives on. A summary whose first message was removed is still recalled, in its place, so its other messages keep a form. History with no message left gets no head and recalls nothing: nothing in the store says when it happened. Before, a summary whose first message was removed was left out of a merge's recall while its other messages stayed out too, and a compression request placed it after newer ones.
+  - **Unchanged:** what every compile selects and sends, and every summary already written. What an over-budget refusal names as clearing it (`clearedBy`) follows tick's deferral, which reads the request's head.
+  - **Prompt cache:** a request for older history after a reset carries on the prefix it had before the reset, where it used to restart with the new topic, and restart again each time the live head grew.
+
+## 0.20.0 — 2026-10-23
+
+### Breaking
+
+- **Hosts and anyone installing context-manager beside its siblings:**
+  context-manager now requires `@animalabs/membrane` ^0.7.1 (was ^0.6.1),
+  which admits no 0.6.x. A host whose own membrane range is still ^0.6 gets
+  two membrane copies, and an error one copy builds isn't an instance of the
+  other's `MembraneError`. **Migration:** move the host, agent-framework and
+  context-manager to membrane ^0.7.1 together (agent-framework 0.26.0,
+  connectome-host 0.13.0). context-manager's compression calls run on the
+  `Membrane` the host passes in, so membrane 0.7's retry changes reach them
+  through the host's retry config; its compression lane keeps its own
+  backoff. **Unchanged:** context-manager's API, and what a compile sends.
+
+## 0.19.0 — 2026-10-22
+
+### Breaking
+
+- **Subclasses of `AutobiographicalStrategy`:** the image watermark's protected members are gone: `imageWatermark()`, `maybeAdvanceImageWatermark()`, `belowImageWatermark()` and `imageWatermarkStateId`. `imageStripReplay(store)` gives `imageStripHysteresisRatio`'s set: for each message with stripped images, how many of its first images are stripped (#171).
+
+- **Hosts and dashboards that read `getRenderStats()`:** it now returns `null` until a live compile has run since the strategy loaded its branch (opening the store, `setStrategy()`, a branch switch), and a dry run or preview still records none. Before, it returned a stand-in built from the head and tail windows and every live summary, with no raw middle, and that described neither the hierarchical cut nor the adaptive one (#304). Under `foldingStrategy: 'kv-stable'` a store whose compile sent 160 messages and 16,690 tokens reported 9 messages and 438 tokens, and connectome-host#425's health readout showed 192 messages beside a 377-message request. `RenderStatsCapableStrategy.getRenderStats()` is now typed `RenderStats | null`, as `ContextManager.getRenderStats()` already was.
+  - **Migration:** treat `null` as "no live compile since the store opened, the strategy changed or the branch switched". A caller that needs figures before a resident's first turn can run `previewContext(..., { render: true })`, whose `stats` describe that preview's compile, under adaptive resolution.
+  - **Unchanged:** after a live compile, the stats are that compile's as before, and a later dry run or preview leaves them as the live compile left them.
+
+### Changed
+
+- The live window's image limits count every `image` block, whatever its source (base64, a `data:` URL or a remote URL), and every `generated_image`, top-level or nested in a tool result, as the window sends them: the images the compression image cap sees, apart from those in a result `toolResultMaxLastN` replaces, which the window sends as its marker. `maxLiveImages` counted only top-level `image` blocks, and `maxLiveImageBytes` only a base64 source's bytes, so images nested in tool results and generated images weren't limited at all, and a `data:` URL image counted toward the number but not the bytes. Both strategies' strip, the autobiographical strategy's post-strip estimates and its `imageStripHysteresisRatio` set now count them all, so a window holding such images keeps fewer of them live than before, and the rest become the window's placeholder. A stored window where these counts now bind renders differently after the upgrade, so its first request misses the prompt cache. A tool result whose nested image is replaced gives up its replay form (`rawItem`, `rawXml`), and so does every block of its message that shares that form, so the formatter can't send the image from it. An image inside an opaque provider item, such as a Responses `image_generation_call`, which membrane keeps only as its raw form, still isn't counted. `AutobiographicalStrategy.imageBlockBytes`, which subclasses can call, gives the same inline sizes, where it counted base64 sources only.
+- A `generated_image` block is priced like an `image` without a `tokenEstimate`: 1,600 tokens, where the store priced it at 0. Membrane sends a generated image to the provider as an image, so a layout holding one ran larger than its estimate. Stores holding generated images now estimate larger and may fold or strip more, and the fold planner weighs a top-level generated image as an image: the estimate now counts what is sent, at the store's flat image price. Since the price changed, the calibration's pricing epoch is 5, after the tool pruning's 4, and a calibration multiplier learned under any earlier pricing epoch, or with no stamp (0.13.0 or earlier), is discarded in a store holding a generated image, top-level or nested: it restarts from 1, which the first provider sample within the calibration's sanity band sets. A provisional 1, the restart of an earlier discard that no sample has confirmed yet, is kept there instead, re-stamped and still provisional, with the reset that records what it replaced. In a store without a generated image, a multiplier is kept or discarded as before, so one stamped with the previous epoch is kept and re-stamped. The protected `formatChunkForCompression`, which no built-in path calls, marks a top-level generated image `[Image]` where it wrote nothing for one, so a subclass that sends its transcript sends new bytes for a chunk holding one. A stored window that any of this re-renders, by a generated image's new price or a discarded multiplier, misses the prompt cache on its first request after the upgrade, as one whose image counts now bind does.
+- Where `adaptiveResolution` is on, the autobiographical strategy's strip counts the images of a message no entry sends, such as one a fold left out, as its post-strip estimates, which that selection budgets by, always have, so the two keep and strip the same images: the strip applies the verdict the estimate gave each image, wherever pairing repair moves the tool result that holds it (#294). Such a message's images took live slots in the estimate and none in the strip, so a window kept images that its estimate had priced as the placeholder, and sent more than it planned for. Count and bytes go newest-first, and a folded chunk is older than the recent window, so the images this newly strips sit in raw messages older than a folded one, such as the head window's, whose slot a folded message's image takes. A window with folds can then keep fewer live images than its limits allow, and it no longer sends more image than it planned for. A stored window this re-renders misses the prompt cache on its first request after the upgrade. The hierarchical selection, the default, prices the messages it emits at the store's full estimate, plus what a `maxMessageTokens` cut changes. It prices no image it emits as the placeholder, so its strip still counts only the images it sends, apart from `imageStripHysteresisRatio`, whose set every selection applies as the estimates give it.
+
+- Requires `@animalabs/membrane` ^0.6.1 (was ^0.6.0), whose native tool loops
+  and `complete()` run complete tool calls a provider returns under
+  `stop_reason: end_turn`, where 0.6.0 ended the turn without running them.
+
+### Fixed
+
+- `imageStripHysteresisRatio` computes its stripped set from the stored messages and the limits, with no stored state (#171). The messages are replayed oldest first, and whenever a limit binds, the oldest live images are stripped one at a time until every limit fits ratio × itself. So a preview or a dry compile no longer changes what the next live compile strips, and a compile, a preview, a reopen and a fork at the same point give the same set. Switching the option on later gives the set it would have had from the start, and a fold moves nothing.
+  - **Per image:** a message with more images than the target keeps its newest ones, rather than losing all of them.
+  - **The newest image:** it stays while it fits the full limits, so one large image no longer strips every image. So do the other images of its message while only depth is over its target, since stripping them can't lower the depth they're at.
+  - **Depth:** a trim happens at the message whose arrival puts the oldest live image past the limit, with depth counted as the limit counts it without the option.
+  - **A target that rounds to 0** is 0, not "no limit". `maxLiveImages: 1` gets no headroom.
+  - **The price, now in the option's doc:** an edit or a removal of any message, text-only included, replays a different history, so it can strip or bring back images on either side of it. Many of them are newer than the change, where the prompt is rewritten anyway. Depth is counted at the store's calibrated estimates, so a calibration change can move the set, as it moves the limits' own.
+  - **A store that had the option on:** its stripped set changes once, from the first image where the new set differs from the old watermark's. The watermark's state slot is no longer registered, written or read, and a store that has one keeps it unread.
+
+- A strategy's `onNewMessage` that throws before returning, or returns no promise, no longer escapes `addMessage` after the message is stored. A throw is logged as a rejection is, and a hook that returns no promise is no failure. Either way the message stays stored: `addMessage` returns its id, a sharded body keeps all its shards, where before the whole body was removed and the add refused, and an `onMessage` listener registered after the manager still hears the add. Before, a throw escaped `addMessage` with the message stored, and a hook returning no promise threw a `TypeError` the same way. The bundled strategies' hooks are `async` and never did either. The hook still runs inside the write, so its synchronous part comes before `addMessage` returns. The failure's log line, a rejection's included, was `Strategy onNewMessage failed:`. It now names the message, and a shard's body group: `Strategy onNewMessage failed for message <id>:`, or `… for message <id> (body group <group>):`. A `%` in a body group a host's strategy chose prints as itself in that line, and now in an `onMessage` listener's line too, where console read it as a format directive (#288).
+
+- Under `positionedRecallPairs: false`, a hierarchical compile whose combined
+  recall pair takes it past the grace window now refuses at the pair with
+  `OverBudgetError`, as it refuses a positioned pair: stage "Hierarchical
+  emission overran the budget", `middleCountUnit` `'selection-items'`.
+  Before, the pair went out unguarded, so the compile returned a context over
+  the budget, refused at the raw message after the pair, or refused the
+  recent window's eviction (`UncoveredDropError`). The pair is priced at what
+  goes out: each summary its answer holds is floored at its measured `tokens`
+  under `carrierPolicy: 'full'`, as a positioned pair's answer is.
+- The hierarchical path prices recall pairs with the store's estimator (its
+  `tokenEstimator` and calibration) while it selects, as it prices raw
+  messages. Before, it priced them by the fallback rules, so under an
+  estimator that differs a pair could go out past the grace window, or be
+  refused where it fit. A compression or merge request prices its recall
+  pairs as before.
+- The hierarchical middle's refusals (a positioned pair, a raw middle
+  message, and the combined pair) report what the head took as `headTokens`,
+  and the rest, the refused item included, as `middleTokens`. Before, they
+  reported `headTokens: 0` and counted the head as middle.
+- Those refusals name `'compression'` in `clearedBy` only for work that folds
+  a message before the refused item or in it, where a summary the combined
+  pair's cap leaves out counts as neither. A compression in flight with
+  nothing recorded of what it folds still counts, since nothing says what it
+  folds. Before, they named it for work on any message the selection can
+  fold, including messages after the refused item, and for a chunk's
+  compression that only moves raw messages into the combined pair, neither of
+  which can clear the refusal.
+
+- The autobiographical strategy's post-strip estimates count a message's own tokens toward its depth, as the live strip does. The message whose tokens cross `imageStripDepthTokens` had its images stripped while the estimate priced them live.
+
+- A message's edit, a context log entry's edit, a merge recorded on a
+  summary, a chunk record's update, the strategy's whole-state writes and
+  `scripts/backfill-summary-reasoning.ts`'s summary edits store a lone UTF-16
+  surrogate half in a string as U+FFFD, as an append of the same string
+  stores it. In an object key the half becomes U+FFFD too, where an append
+  drops the key. Before, these writes stored the half as a JSON escape the
+  store couldn't parse back, so every later read of that state threw. A
+  message's edit itself threw, every message then failed to read, and the
+  store couldn't be opened; after a merge's record, the summaries failed to
+  read and the store couldn't be opened. A store that already holds such a
+  write isn't repaired by this (anima-research/chronicle#52).
+
+- The autobiographical strategy's post-strip estimates take a stripped image's placeholder at the store's price for its text. They took 14 tokens for it, a token per four of its 54 characters, where the store prices that text with its own estimator, 19 tokens by the default one, so each stripped image came off 5 tokens too much, times the calibration, and a window holding many stripped images was priced a little under what it sent. An image priced below the placeholder, such as one stamped with a small `tokenEstimate`, now makes its message cost more when it's stripped, where its saving was clamped at 0. A stored window this re-renders misses the prompt cache on its first request after the upgrade.
+
+- Windowed passthrough prices its window after its live-image policy, as its documentation says. Its fit check and hard-budget check priced every image at full, though the strip then replaced some with the placeholder, so a message whose images the policy strips was refused with `OverBudgetError` where it fits once stripped, and a window holding stripped images moved its anchor before it had to. The policy's verdicts are now decided once per selection, from the newest message down to the anchor, and both the pricing and the strip use them.
+
 ## 0.18.0 — 2026-10-21
 
 ### Breaking

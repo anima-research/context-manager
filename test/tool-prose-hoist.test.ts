@@ -125,8 +125,9 @@ function scripted(responses: Array<typeof REFUSAL | ReturnType<typeof OK>>) {
   return { calls, membrane: { complete: async (request: NormalizedRequest) => { calls.push(structuredClone(request)); return responses[Math.min(n++, responses.length - 1)]; } } as never };
 }
 
-// The fixture's large head window replays the chunk's messages in the head as
-// well as in the target slot, so canonical requests carry each call twice.
+// The fixture's large head window holds every message, but a request's head is
+// cut at its chunk's start (headAsOf, #317), so canonical requests carry each of
+// the chunk's calls once, in the target slot.
 const names = (req: NormalizedRequest): string => [...new Set(toolUses(req).map((u) => u.name))].join('+');
 
 describe('tool-prose hoist rung', () => {

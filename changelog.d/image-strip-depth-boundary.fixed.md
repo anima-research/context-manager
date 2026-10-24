@@ -1,1 +1,0 @@
-- The autobiographical strategy's post-strip estimates count a message's own tokens toward its depth, as the live strip does. The message whose tokens cross `imageStripDepthTokens` had its images stripped while the estimate priced them live.

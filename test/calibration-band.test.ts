@@ -588,9 +588,17 @@ describe('estimator calibration band', () => {
     assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), unstamped);
     assert.equal(reopened.internals._calibration, 1, 'put back: nothing loaded yet');
     assert.equal(reopened.internals._calibrationProvisional, null);
+    // A dry compile's result carries the retry's stats, priced by the dropped
+    // multiplier, not the refused attempt's.
+    const dryCompile = await reopened.cm.compile(tight, undefined, { dryRun: true });
+    assert.equal(dryCompile.renderStats!.calibration!.multiplier, 1, "the dry result's stats are the retry's");
+    assert.equal(dryCompile.renderStats!.total.messages, dryCompile.messages.length);
+    assert.equal(reopened.internals._calibration, 1, 'put back after the dry compile too');
     // The real compile: refused at 1.45, dropped, resolved at 1; the drop is
     // logged and persisted, and visible as the reset.
-    const { lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
+    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
+    assert.equal(live.renderStats, reopened.cm.getRenderStats(), "the live result's stats are the retry's, the getter's");
+    assert.equal(live.renderStats!.total.messages, live.messages.length);
     assert.equal(reopened.internals._calibration, 1);
     const cal = reopened.cm.getRenderStats()!.calibration!;
     assert.deepEqual([cal.multiplier, cal.provisional, cal.reset?.discardedMultiplier, cal.reset?.fromEpoch], [1, true, 1.45, null]);
