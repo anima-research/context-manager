@@ -309,6 +309,21 @@ test('kv-unified holds a level pin only while every other constraint on its leaf
   }
 });
 
+test('kv-unified holds a level pin at the deepest level below it, not at a level above it that the chain supplies (#193)', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['a', 'b']);
+  const l2 = chronicle.produceUpper(2, [l1.id]);
+  // A lineage that skips a level: the summary over the L2 is an L4.
+  (chronicle.produceUpper(3, [l2.id]) as { level: number }).level = 4;
+  a.pinLevel = 3;
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  assert.deepEqual(forest.leaf('a')?.availableLevels, [0, 1, 2, 4], 'setup: the chain supplies L1, L2 and L4, and no L3');
+  assert.deepEqual(forest.leaf('a')?.allowedLevels, [2]);
+  assert.deepEqual(heldLevelPin(forest.leaf('a')!), { level: 3, heldAt: 2 });
+});
+
 test('kv-unified suggests producing the missing levels only where that clears every conflict', () => {
   const release = 'Release or reconcile the listed constraints.';
   const produce = 'Release or reconcile the listed constraints, or produce the missing levels.';

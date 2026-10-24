@@ -15617,8 +15617,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * one line when a compile first finds the pin held, naming it, its level,
    * the levels its messages are held at and how many are held then, and one
    * when a later compile finds none of its messages held for it (its level
-   * arrived over them, another pin's bound took them, or they left the folded
-   * middle) or the pin gone. A pin covers what `pinPositions` says, as it
+   * arrived over them, another pin's bound took them, they left the folded
+   * middle, or the store no longer holds an end the pin names) or the pin
+   * gone. A pin covers what `pinPositions` says, as it
    * does for the forest: under adaptive resolution, a message stored in parts
    * whole when its ids name one of its parts, less a part locked outside the
    * span they name. A message counts once however many of its parts are held.

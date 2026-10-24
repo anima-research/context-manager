@@ -2255,9 +2255,9 @@ export interface ProtectedRange {
    * Under kv-unified, until a summary over a message supplies it, the message
    * is held at the deepest level below it that a summary over the message
    * does supply, raw when none does, and it moves to the pinned level once
-   * that exists; kv-unified logs when it starts and stops holding a pin. A
-   * lock at another level still conflicts with the pin there, whether or not
-   * the pinned level exists yet. Under
+   * that exists; kv-unified logs when it starts and stops holding a pin. On
+   * a message in the folded middle, a lock at another level still conflicts
+   * with the pin, whether or not the pinned level exists yet. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
    * configured selector keeps raw, where its budgets allow (see

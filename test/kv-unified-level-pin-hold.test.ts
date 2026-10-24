@@ -337,16 +337,20 @@ describe('the hold report reads a pin over a message stored in parts as the fore
     return { cm, strategy, parts, add };
   }
 
-  it('counts a message stored in parts once, beside a plain message the same pin covers', async () => {
+  it('counts a message stored in parts once, beside a plain message the same pin covers, and each pin over its own span', async () => {
     const { cm, strategy, parts, add } = await longMessage();
-    const [next] = await add(120);
+    const after = await add(120);
     assert.ok(parts.every((id) => levelsOver(cm, strategy, id).has(1)), 'setup: every part is summarized at L1');
-    // Named by its fourth part, the pin covers the whole message, all nine
-    // parts held at L1: two messages, not the seven positions its ids name.
-    cm.pinRange(parts[3], next, { level: 2 });
+    // Named by its fourth part, the first pin covers the whole message, all
+    // nine parts held at L1: two messages, not the seven positions its ids
+    // name. The second, at the same level over three plain messages, counts
+    // only those.
+    cm.pinRange(parts[3], after[0], { level: 2 });
+    cm.pinRange(after[10], after[12], { level: 2 });
     const lines = await holdLines(async () => { await cm.compile(budget); });
     assert.deepEqual(lines, [
       'autobio: kv-unified holds pin pin-0, pinned at L2, at L1 in 2 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
+      'autobio: kv-unified holds pin pin-1, pinned at L2, at L1 in 3 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
     ]);
     cm.close();
   });
@@ -379,9 +383,27 @@ describe('the hold report reads a pin over a message stored in parts as the fore
     assert.ok(steps.some((s) => s.first && !s.all), 'setup: L2 reaches the named part before the rest');
     const said = steps.flatMap((s, k) => s.lines.map((line) => ({ line, k })));
     assert.equal(said.length, 2, said.map((s) => s.line).join('\n'));
-    assert.match(said[0].line, /^autobio: kv-unified holds pin pin-0 \("doc"\), pinned at L2, at .* in 1 message\(s\)/);
+    assert.equal(said[0].line, 'autobio: kv-unified holds pin pin-0 ("doc"), pinned at L2, at raw in 1 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default');
     assert.equal(said[1].line, 'autobio: kv-unified no longer holds pin pin-0 ("doc") below its L2. ns=default');
     assert.ok(steps[said[1].k].all, 'the hold ends when L2 covers every part');
+    cm.close();
+  });
+
+  it('names every level the parts of a held message are held at', async () => {
+    // Twenty messages on, with mergeThreshold 2, the message's first parts
+    // have L1 and L2, the next ones L1 alone, and the last ones no summary,
+    // all of them in the folded middle.
+    const { cm, strategy, parts, add } = await longMessage({ hierarchical: true, mergeThreshold: 2 });
+    await add(20);
+    assert.deepEqual(parts.map((id) => Math.max(0, ...levelsOver(cm, strategy, id))), [2, 2, 2, 1, 1, 1, 1, 0, 0], 'setup: the deepest level over each part');
+    const view = (cm as unknown as { strategyMessageView(): never }).strategyMessageView();
+    const recentStart = (strategy as unknown as { getRecentWindowStart(view: never): number }).getRecentWindowStart(view);
+    assert.ok(parts.every((id) => allIds(cm).indexOf(id) < recentStart), 'setup: every part is before the recent window, so the parts with no summary are held raw in the folded middle');
+    cm.markDocument(parts[0], { level: 3 });
+    const lines = await holdLines(async () => { await cm.compile(budget); });
+    assert.deepEqual(lines, [
+      'autobio: kv-unified holds pin pin-0, pinned at L3, at raw and L1 and L2 in 1 message(s): no summary supplies L3 over them yet. They move to L3 once one does. ns=default',
+    ]);
     cm.close();
   });
 });
