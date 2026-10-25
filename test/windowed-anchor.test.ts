@@ -376,11 +376,47 @@ describe('windowed passthrough: a derived context', () => {
 
     const childStrategy = new WindowedPassthroughStrategy({ anchorStateId: ANCHOR });
     const child = await parent.derive({ branch: 'zz/child', strategy: childStrategy });
-    // Whether or not the child has the parent's window index, it reads the
-    // slot: by ordinal with it, by the sequence beside it without.
+    // The child has the parent's window index (derive lists it among the
+    // manager's own states), so it reads the slot by ordinal. A branch
+    // without that index would read it by the sequence beside it.
     assert.equal(childStrategy.getAnchor(), strategy.getAnchor());
+    assert.equal(child.presentationMode(), 'presented');
+    assert.equal(childStrategy.getAnchorOrdinal(), strategy.getAnchorOrdinal());
     assert.deepEqual((await child.compile(OVERFLOW)).messages.map((m) => m.content), sent.messages.map((m) => m.content));
     child.close();
     parent.close();
+  });
+
+  it('a child reopened before it moves its anchor reads the ordinal against the window it inherited', { skip }, async () => {
+    // A row stored before the anchor's sequence and presented after its row
+    // is in the window by ordinal and out of it by sequence, so the two
+    // readings send different windows. Before derive carried the index, the
+    // child read this slot by sequence, in legacy mode; and once it had
+    // written its own index, a reopen read the parent's ordinal against it.
+    const path = freshPath();
+    const { cm: parent, strategy } = await open(path);
+    parent.presentRows([]);
+    const early = parent.addMessage('u', long('early'));
+    const ids = Array.from({ length: 3 }, (_, i) => parent.addMessage('u', long(`m${i}`)));
+    parent.presentRows(ids);
+    strategy.setAnchorOrdinal(parent.ordinalOf(ids[1]!)!);
+    parent.presentRows([early]);
+    const sent = await parent.compile(BIG);
+    assert.deepEqual(texts(sent), ['m1', 'm2', 'early']);
+    const ordinal = strategy.getAnchorOrdinal();
+
+    const child = await parent.derive({ branch: 'zz/child', strategy: new WindowedPassthroughStrategy({ anchorStateId: ANCHOR }) });
+    assert.deepEqual(texts(await child.compile(BIG)), ['m1', 'm2', 'early']);
+    const derivation = child.getDerivation()!;
+    child.close();
+    parent.close();
+
+    const root = await ContextManager.open({ path, namespace: 'zz', strategy: new WindowedPassthroughStrategy({ anchorStateId: ANCHOR }) });
+    const reopenedStrategy = new WindowedPassthroughStrategy({ anchorStateId: ANCHOR });
+    const reopened = await ContextManager.reopenDerived({ store: root.getStore(), derivation, strategy: reopenedStrategy });
+    assert.equal(reopenedStrategy.getAnchorOrdinal(), ordinal);
+    assert.deepEqual(texts(await reopened.compile(BIG)), ['m1', 'm2', 'early']);
+    reopened.close();
+    root.close();
   });
 });

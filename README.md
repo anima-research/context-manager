@@ -100,7 +100,7 @@ Several managers can read one record: agents that share the un-namespaced messag
 
 ## Branches
 
-Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch.
+Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch, and so does each window: a branch starts with the window as it stood at its branch point. Once a host presents rows, `branchAt` cuts at the write that presented the row, so the new branch's window holds it. `derive()` carries the window too, whatever the strategy's derivation manifest names.
 
 ## Inspecting and repairing stores
 

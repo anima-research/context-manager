@@ -446,9 +446,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * window is first read (presentedAnchor): a branch made before the
    * upgrade, or by `createBranchAt` or `derive` from one, carries its own,
    * so each is converted where it is read. On a branch in legacy mode an
-   * ordinal names nothing, there being no index there (a derived context
-   * that didn't inherit the parent's), so the sequence beside it is the
-   * anchor.
+   * ordinal names nothing, there being no index there (a branch a host
+   * made without carrying the manager's index; derive carries it), so the
+   * sequence beside it is the anchor.
    */
   private loadBranchState(): void {
     this.anchor = 0;
@@ -844,10 +844,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   /**
    * A derived context inherits the anchor; nothing else is persisted. The
-   * window index isn't the strategy's to name: the manager owns it. The
-   * slot carries the anchor's sequence beside its ordinal, so the child
-   * reads it either way: by ordinal on a branch where rows are presented,
-   * by sequence on one where they aren't.
+   * window index isn't the strategy's to name: the manager owns it, and
+   * ContextManager.derive carries it whatever this names, so the child
+   * reads an ordinal against the parent's index as of the checkpoint. The
+   * slot carries the anchor's sequence beside its ordinal, so a child on a
+   * branch without that index still reads it, by sequence.
    */
   derivationManifest(namespace: string): DerivationManifest {
     return { stateIds: [this.anchorStateIdOverride ?? `${namespace}/windowed:anchor`], statePrefixes: [] };

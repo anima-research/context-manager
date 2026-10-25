@@ -56,7 +56,8 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, type PresentationMode } from './window-index.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type PresentationMode } from './window-index.js';
+import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -429,6 +430,8 @@ export class ContextManager {
   private windowIndex: WindowIndex;
   /** Rows presented while the strategy wasn't initialized, for it to hear once it is (notifyPresented). */
   private presentedUnheard: MessageId[] = [];
+  /** While removeMessages removes a range in presented mode: the range's ids, read before they went. */
+  private removingRange: MessageId[] | null = null;
 
   private constructor(
     store: JsStore,
@@ -1038,6 +1041,13 @@ export class ContextManager {
 
   /**
    * Remove a message from the store. Propagates to context log.
+   *
+   * Once a host presents rows on the branch (see presentRows), a row the
+   * window holds leaves it as retractRows takes a row out: a tombstone at
+   * its ordinal, so no other row's ordinal moves. A removal through another
+   * manager on the same slot isn't heard here: a host takes that row out of
+   * this window with retractRows, which takes a row the store no longer
+   * holds by its id.
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
@@ -1046,12 +1056,34 @@ export class ContextManager {
   }
 
   /**
-   * Remove a range of messages from the store.
+   * Remove a range of messages from the store. Every row of the range the
+   * window holds leaves it, as removeMessage says.
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
-    this.write(() => this.messageStore.removeRange(fromId, toId));
+    this.write(() => {
+      // The store's event names the range by its ends, and its rows are gone
+      // by the time the event is heard, so the window's share of them is
+      // read here first (handleMessageStoreEvent). Only in presented mode:
+      // in legacy mode the window is the record, and nothing is written.
+      this.removingRange = this.windowIndex.mode() === 'presented' ? this.slotIdsBetween(fromId, toId) : null;
+      try {
+        this.messageStore.removeRange(fromId, toId);
+      } finally {
+        this.removingRange = null;
+      }
+    });
     // Propagation handled by event listener
+  }
+
+  /** The ids of this manager's slot from `fromId` to `toId`, in slot order; empty when either isn't there. */
+  private slotIdsBetween(fromId: MessageId, toId: MessageId): MessageId[] {
+    const view = this.messageStore.createView();
+    const listing = view.getAll();
+    const from = recordPositionOf(view, listing, fromId);
+    const to = recordPositionOf(view, listing, toId);
+    if (from === undefined || to === undefined) return [];
+    return listing.slice(from, to + 1).map((m) => m.id);
   }
 
   /**
@@ -1343,6 +1375,16 @@ export class ContextManager {
   /**
    * Create a branch from a specific message.
    * The new branch will have state as of that message's sequence (time-travel branching).
+   * The message can be in this manager's slot or one of its auxiliary slots.
+   *
+   * Once a host presents rows on the branch (see presentRows), a row is in
+   * the window only from the write that presented it, which comes after the
+   * row's own. For a row the window holds, the branch is then cut at that
+   * write, the last of its body's shards, so the new branch's window holds
+   * the row and every row presented before it. Rows stored after the row and
+   * not presented by then are in the new branch's record, arrived and not
+   * presented. A row the window doesn't hold, and every row in legacy mode,
+   * is cut at its own sequence, as before.
    *
    * Returns the new branch *name*, which is what `switchBranch` and `forkAt`
    * expect. (Chronicle's branch APIs are name-keyed; the numeric `id` field
@@ -1350,7 +1392,8 @@ export class ContextManager {
    */
   branchAt(messageId: MessageId, name?: string): string {
     this.requireInitialized('branchAt');
-    const message = this.messageStore.get(messageId);
+    const merged = this.mergedMessageView();
+    const message = merged.get(messageId);
     if (!message) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -1361,10 +1404,32 @@ export class ContextManager {
     // Get current branch name to branch from
     const currentBranch = this.store.currentBranch();
 
-    // Use createBranchAt to branch at the message's sequence (time-travel)
-    const branch = this.store.createBranchAt(branchName, currentBranch.name, message.sequence);
+    // Use createBranchAt to branch at the message's sequence (time-travel),
+    // or at the write that presented it
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, this.branchPointOf(message, merged));
 
     return branch.name;
+  }
+
+  /**
+   * The sequence branchAt cuts at for `message`: its own, unless the window
+   * holds it, and then the latest write that presented a shard of its body.
+   * Each presented row is one record for now (WindowIndex.write), so a cut
+   * there takes no row presented after the body's last shard.
+   */
+  private branchPointOf(message: StoredMessage, merged: MessageStoreView): number {
+    const index = this.windowIndex;
+    if (index.ordinalOf(message.id) === undefined) return message.sequence;
+    const record = merged.getAll();
+    const at = recordPositionOf(merged, record, message.id);
+    if (at === undefined) return message.sequence;
+    const { from, to } = bodyBoundsIn(record, at);
+    let cut = message.sequence;
+    for (let k = from; k <= to; k++) {
+      const row = record[k]!;
+      cut = Math.max(cut, row.sequence, index.presentedAt(row.id) ?? row.sequence);
+    }
+    return cut;
   }
 
   /**
@@ -1396,7 +1461,8 @@ export class ContextManager {
   /**
    * Fork from the current head: create a new branch at the current sequence
    * and switch to it. The new branch starts with all current state (messages,
-   * context log, and strategy state) and diverges from there.
+   * context log, the window index, and strategy state) and diverges from
+   * there.
    *
    * Use this when an agent wants to explore an alternate timeline from
    * "now" — e.g. trying a different response without committing.
@@ -1448,8 +1514,14 @@ export class ContextManager {
    * derived manager holds a handle bound to its own branch.
    *
    * What is inherited is the set of states this manager owns: its message
-   * slot, its auxiliary slots, its context log and its strategy's states.
-   * Other states in the store are not carried onto the derived branch.
+   * slot, its auxiliary slots, its context log, its window index (see
+   * presentRows) and its strategy's states. Other states in the store are
+   * not carried onto the derived branch. The window is the parent's as of
+   * the checkpoint: at the head the child starts with the parent's window
+   * and its arrived-and-not-presented rows (getUnpresentedMessages), and
+   * from `atSequence` it starts with the window as it stood then, which
+   * names only rows stored by then. A parent that hadn't presented a row by
+   * the checkpoint has no window written, and the child is in legacy mode.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.
@@ -1472,6 +1544,11 @@ export class ContextManager {
       MessageStore.registrationFor(this.slots.messageNamespace).id,
       ...this.slots.auxiliaryNamespaces.map((ns) => MessageStore.registrationFor(ns).id),
       ContextLog.stateIdFor(this.slots.contextNamespace),
+      // The window: the manager's, not the strategy's, so it is listed here
+      // whatever a strategy's manifest names. A parent still in legacy mode
+      // has none written, and the child is in legacy mode too, its window the
+      // record as of the checkpoint, as the parent's was then.
+      windowIndexStateId(this.strategyNamespace),
       // Authoring-request preimages are keyed by hash in one store-wide
       // tree; inherited so the child can still resolve a memory's origin.
       // Ignored by the store when the tree was never created.
@@ -1535,6 +1612,12 @@ export class ContextManager {
       this.viewFilter,
       auxiliaryStores,
     );
+    // At the head the child's branch took the window's chain head as it was,
+    // so the child starts from the parent's reading of it, as its message
+    // store starts from the parent's listing. The reading is taken only
+    // while it is current and is of the record the child's chain ends at;
+    // otherwise the child reads its own branch when it first asks.
+    if (atHead) derived.windowIndex.seedFrom(this.windowIndex);
     derived.now = this.now;
     derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
     derived.toolDefinitions = this.toolDefinitions;
@@ -1573,7 +1656,10 @@ export class ContextManager {
    * Reopen a derived context on its own branch — after a restart, to resume
    * the agent that owned it, or to inspect what it left. The branch is the
    * derived context's durable state: this reads it cold, as any reopened
-   * store is read, and neither creates a branch nor touches the parent.
+   * store is read, and neither creates a branch nor touches the parent. The
+   * window is read from the branch too, as derive left it and the derived
+   * context's own presentations grew it, under the namespace the derivation
+   * names.
    */
   static async reopenDerived(options: ReopenDerivedOptions): Promise<ContextManager> {
     if (!ContextManager.supportsDerivation(options.store)) {
@@ -2841,6 +2927,7 @@ export class ContextManager {
         break;
       case 'remove':
         this.handleMessageRemove(event.messageId);
+        this.retractRemoved([event.messageId]);
         break;
       case 'removeRange':
         // Ids of the removed span aren't in the event; prune holds whose
@@ -2857,7 +2944,36 @@ export class ContextManager {
         }
         // For range removes, we need to check all affected messages
         // This is a simplification - in practice we'd need to track the IDs
+        //
+        // The window's rows of the span were read before it went
+        // (removeMessages). The only other range removed here is what a
+        // sharded addMessage that failed partway wrote, which no host has
+        // presented yet. Holds can be probed by asking the slot, since every
+        // held row is this slot's; the window can't, since it also holds
+        // rows of the auxiliary slots, and a row of a slot this manager no
+        // longer merges would read as removed and leave the window for good.
+        if (this.removingRange) this.retractRemoved(this.removingRange);
         break;
+    }
+  }
+
+  /**
+   * Take rows just removed from this manager's slot out of the window (see
+   * removeMessage). The removal stands whatever happens here: a tombstone
+   * that can't be written is logged, and the row, which the record no
+   * longer holds, is already out of the listing the strategy reads; it
+   * keeps its ordinal until a retractRows takes it out.
+   */
+  private retractRemoved(ids: readonly MessageId[]): void {
+    try {
+      this.windowIndex.retractRemoved(ids);
+    } catch (err) {
+      // A format string, since the error follows it: a '%' in an id is doubled.
+      const rows = ids.length === 1 ? `removed message ${ids[0]}` : `${ids.length} removed messages`;
+      const message =
+        `[context-manager] taking ${rows} out of the window failed; ` +
+        `the window leaves them out of what it lists, and their ordinals stay issued:`;
+      logThrown(message.replaceAll('%', '%%'), err, this.diag);
     }
   }
 

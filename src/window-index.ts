@@ -16,14 +16,19 @@
  * The index is that order, kept per manager namespace as a Chronicle
  * append-log state, `<namespace>/presentation`, so it is per branch, survives
  * a restart, and a branch made from another starts from the parent's index
- * as of the branch point. Its items are:
+ * as of the branch point: `fork`, `branchAt` and `derive` carry it, the last
+ * by listing it among the states the manager owns. Rows are stored before
+ * they are presented, so the index as of any sequence names only rows the
+ * record held by then. Chronicle carries a state's chain, not its
+ * registration, so a branch made before the first presentation has no
+ * index, and is in legacy mode, as its parent was then. Its items are:
  *
  * - a header, `{ v: 1 }`, the first item a manager writes;
  * - a presentation, `{ id }`: the stored row with that id (a record id, as a
  *   string) entered the window;
- * - a tombstone, `{ retract, undone? }`: the row left the window. With
- *   `undone`, it was a row of an undone turn, which stays out until it is
- *   presented again (a redo).
+ * - a tombstone, `{ retract, undone? }`: the row left the window, taken out
+ *   by a host or removed from the record. With `undone`, it was a row of an
+ *   undone turn, which stays out until it is presented again (a redo).
  *
  * Each item also carries `at` and `by`, the sequence and id of the record
  * that wrote it, which come after the row's own: a presentation is a later
@@ -464,6 +469,49 @@ export class WindowIndex {
       .filter(inWindow)
       .map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
     this.write(legacy ? [...this.bootstrap(record), ...tombstones] : tombstones);
+  }
+
+  /**
+   * Take rows the record no longer holds out of the window: a tombstone for
+   * each of `ids` the window holds, as retract writes one, so no other
+   * row's ordinal moves. An id the window doesn't hold is passed over. In
+   * legacy mode it writes nothing: the window is the record, and a row
+   * removed from the record has left it already. Returns the ids taken out.
+   */
+  retractRemoved(ids: readonly MessageId[]): MessageId[] {
+    const state = this.current();
+    if (state.rows.length === 0) return [];
+    const leaving: MessageId[] = [];
+    for (const id of new Set(ids)) if (state.ordinals.has(id)) leaving.push(id);
+    this.write(leaving.map((id): IndexItem => ({ retract: id })));
+    return leaving;
+  }
+
+  /**
+   * Start from `parent`'s reading of the index instead of reading the state
+   * again, where both handles' chains end at the record that reading was
+   * of: a manager derived at the head, on a branch that took its parent's
+   * chain head as it was. The reading is copied, so neither side's later
+   * presentations reach the other's. Otherwise this does nothing, and the
+   * index is read from the store when it is first asked for.
+   */
+  seedFrom(parent: WindowIndex): void {
+    const state = parent.state;
+    // Only a reading keyed on the state's offset can be shared: one keyed
+    // on the branch (a chronicle without offsets) names the parent's branch.
+    if (!state || state.branchId !== null || this.branchKey() !== null) return;
+    if (state.revision !== parent.revision() || state.revision !== this.revision()) return;
+    this.state = {
+      branchId: null,
+      revision: state.revision,
+      rows: [...state.rows],
+      at: [...state.at],
+      ordinals: new Map(state.ordinals),
+      undone: new Set(state.undone),
+      version: ++versions,
+      // Never changed in place (a write sets it to null), so both can read it.
+      presented: state.presented,
+    };
   }
 
   private bootstrap(record: readonly StoredMessage[]): IndexItem[] {
