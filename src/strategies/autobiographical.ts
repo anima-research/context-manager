@@ -18863,48 +18863,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The head window's end after a head-window reset: whole bodies only (a
-   * message outside any shard group is a body of its own). The transition's
-   * body is always whole in the head, whatever its size: it anchors the new
-   * topic. After it the head takes whole bodies while their tokens fit
-   * headWindowTokens, and ends before the first that doesn't, or before the
-   * body ahead of it when that one holds a tool call, so a call stays with
-   * its result. (resetHeadWindow's transition holds no tool call; a strategy
-   * reset to a message that does can leave the head empty this way.) The
-   * compile sends the history before the head between the head and the rest
-   * (sentWindows), so a body the head ended inside would be sent in two
-   * parts with that history between them. The ratchet guard
-   * (anchorHeadToCoverage) then reads the boundary as it does without a
-   * reset, and can extend it to the first message chunk coverage owns after
-   * it. The extension leaves out the run at its end, from a body's start,
-   * that pins keep raw and that holds no tool result. The messages pins keep
-   * raw include every system change's (resolvedPinBounds), which stays raw
-   * wherever it is. The chunker takes no message while a pin keeps it raw,
-   * so the guard can reach over such a run: a pinned call whose result is
-   * chunked, a pinned message it could take whole, system changes, or the
-   * never-chunked first parts of a message marked after its later parts
-   * were chunked (by a mark from before pins covered whole messages, or one
-   * made after a head that ended inside the message). Left out, the run
-   * goes after the history: a pinned call ahead of its result, if it has
-   * one, as without a reset; a system change still ahead of every message
-   * stored after it; and a marked message's first parts with the rest of it
-   * rather than in the head with the history between. Nothing left out answers a call in the head. Pinned messages
-   * from the last one that holds a tool result back stay in the extension,
-   * as without a reset: a call stays in the head with its pinned result, and
-   * such a result whose later parts were chunked before its pin stays in two
-   * parts where the extension ends inside it.
-   * (The guard itself, as without a reset, can also end the head right after
-   * a never-chunked unpinned call whose result is chunked.) Messages kept out of
-   * chunks without a pin (left by a head that ended inside a body whose rest
-   * was then chunked, or by a pin since removed) stay in the extension, so
-   * they aren't chunked out of order (#122), and such a body stays in two
-   * parts while the head's end is inside it. The walk back for a tool call
-   * reads the whole body before the boundary, every shard of it (without a
-   * reset, only the message before it), so a call whose results arrive in
-   * separate messages can keep only the first of them in the head. At
-   * headStart 0 nothing comes between the head and its continuation, so the
-   * head still ends where its tokens run out there, with the ratchet guard
-   * as before.
+   * The head window's end after a head-window reset. The transition's body is
+   * always whole in the head, whatever its size: it anchors the new topic.
+   * After it the head takes whole bodies (a message outside any shard group is
+   * a body of its own) while their tokens fit headWindowTokens, and ends
+   * before the first that doesn't, or before the body ahead of it when that
+   * one holds a tool call, so a call stays with its result. (resetHeadWindow's
+   * transition holds no tool call; a strategy reset to a message that does
+   * can leave the head empty this way.) Whole bodies, because the compile
+   * sends the history before the head between the head and what follows it
+   * (sentWindows), so a body the head ended inside would go out in two parts
+   * with that history between them. The ratchet guard (anchorHeadToCoverage)
+   * then reads the boundary as it does without a reset, so it can extend the
+   * head over messages compression never took, and end it inside a body, as
+   * it can without a reset (#122). At headStart 0 nothing comes between the
+   * head and its continuation, so the head still ends where its tokens run
+   * out.
    */
   private resetHeadWindowEnd(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
     const at = (k: number): StoredMessage | undefined => messages[k];
@@ -18927,29 +18901,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // message more when the walk back for a tool call moves the boundary.)
         let through = 0;
         for (let k = startIdx; k <= boundary && k < messages.length; k++) through += store.estimateTokens(messages[k]);
-        const end = this.anchorHeadToCoverage(store, messages, boundary, through);
-        if (end === boundary) return end;
-        // The extension keeps never-chunked messages in the head so they
-        // aren't chunked after the coverage that follows them (#122). A pin
-        // that keeps a message raw keeps it out of every chunk made while the
-        // pin stands (getCompressibleMessages), so the run at the extension's
-        // end that pins keep raw, from a body's start, is left out of it:
-        // otherwise a pinned call could stay in the head apart from its
-        // chunked result, and the first parts of a message marked after its
-        // rest was chunked could end the head inside it, sending it in two
-        // parts with the history between. The run left out holds no tool
-        // result, so no call in the head loses one to it, and a call it leaves
-        // out goes after the history ahead of its result, if any, as without a
-        // reset. Messages kept out of chunks without a pin (left by a head
-        // that ended inside their message, or by a pin since removed) stay in
-        // it, and so do the pinned messages from the last one holding a tool
-        // result back, as without this.
-        const raw = this.forceRawPinPositions(messages);
-        let kept = end;
-        for (let k = end - 1; k >= boundary && raw.has(k) && !this.hasToolResult(messages[k]); k--) {
-          if (bodyStart(at, k) === k) kept = k;
-        }
-        return kept;
+        return this.anchorHeadToCoverage(store, messages, boundary, through);
       }
       from = to;
     }
