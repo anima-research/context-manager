@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
+import { assertStage } from './fixtures/over-budget-hook.js';
 import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
@@ -503,6 +504,7 @@ async function refusalOfWholeMiddle(manager: ContextManager): Promise<OverBudget
   }
   const error = await refusal(manager, undefined, { maxTokens: low, reserveForResponse: 20 });
   assert.match(error.message, /^Hierarchical emission overran the budget/, 'a refusal in the hierarchical middle');
+  assertStage(error, 'hierarchical-emission-overran');
   const strategy = (manager as unknown as { strategy: DiagnosticStrategy }).strategy;
   assert.ok(strategy.prefixHoldsWholeMiddle(), 'the refusal\'s prefix holds every message the selection can fold');
   return error;
@@ -542,6 +544,7 @@ describe('OverBudgetError diagnostics', () => {
           assert.doesNotMatch(error.message, /deepest planned level/);
         } else {
           assert.match(error.message, /^Hierarchical emission overran the budget/);
+          assertStage(error, 'hierarchical-emission-overran');
           assert.match(error.message, /attempted representation level=L0/);
         }
       });
@@ -650,6 +653,7 @@ describe('OverBudgetError diagnostics', () => {
       strategy.seedPyramid([id], 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      assertStage(error, 'emission-overran-plan');
       checkBudget(error);
       assert.deepEqual(error.clearedBy, [], 'the plan has no summaries left to produce');
       assert.equal(error.diagnostics.deepestLevel, 5, 'the first raw emission fails, but the complete plan reaches L5');
@@ -1022,6 +1026,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      assertStage(error, 'emission-overran-plan');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
@@ -1043,10 +1048,12 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Tail emission dropped reserved recent-window messages/);
+      assertStage(error, 'tail-emission-dropped');
       assert.deepEqual(error.clearedBy, ['compression']);
       strategy.produce = false;
       const without = await refusal(manager);
       assert.match(without.message, /^Tail emission dropped reserved recent-window messages/);
+      assertStage(without, 'tail-emission-dropped');
       assert.deepEqual(without.clearedBy, [], 'a plan with nothing to produce names nothing');
     });
   });
@@ -1112,6 +1119,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const dry = await refusal(manager, { dryRun: true });
       assert.match(dry.message, /^Structural repair did not retain the newest turn/);
+      assertStage(dry, 'repair-lost-newest-turn');
       assert.deepEqual(dry.clearedBy, []);
       // The live compile refuses the plan at its gate first, so the preview
       // names what that refusal names.
@@ -1223,9 +1231,11 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const dry = await refusal(manager, { dryRun: true });
       assert.match(dry.message, /^Emission overran the plan/);
+      assertStage(dry, 'emission-overran-plan');
       assert.deepEqual(dry.clearedBy, []);
       const live = await refusal(manager);
       assert.match(live.message, /^Emission overran the plan/);
+      assertStage(live, 'emission-overran-plan');
       assert.deepEqual(live.clearedBy, ['compression'], 'the live compile demands the chunk first');
     });
   });
@@ -1246,6 +1256,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.equal(strategy.checkReadiness().ready, false, 'chunks are waiting for compression');
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
@@ -2034,6 +2045,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.seedL1('L1-covering', ids);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // Tick drops each one without compressing it: the stub membrane has no
       // model to call, and no L1 is added.
@@ -2089,6 +2101,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(!strategy.summaryIds().some((id) => id.startsWith('L1-stored-')), 'no exact L1 is in memory');
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
       for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
@@ -2108,6 +2121,7 @@ describe('OverBudgetError.clearedBy', () => {
       });
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, [], 'adoption doesn\'t persist, so the stored L1s shrink nothing');
     }, { membrane: true });
   });
@@ -2122,6 +2136,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(error.clearedBy, ['compression']);
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
@@ -2153,6 +2168,7 @@ describe('OverBudgetError.clearedBy', () => {
         queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
         assert.deepEqual(error.clearedBy, persistChunks ? ['compression'] : []);
         if (!persistChunks) return;
@@ -2449,6 +2465,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'the merge is queued');
         const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages',
           'the pair, or with the combined pair fitting, the raw message after it, refuses');
         assert.deepEqual(error.clearedBy, [], 'tick stops at a blocked merge until the hold is released');
@@ -2493,6 +2510,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(error.clearedBy, merge === 'blocked' ? [] : ['compression']);
       });
     });
@@ -2636,6 +2654,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // The premise: tick still takes them, adopting each stored L1.
       await adoptAll(manager, strategy);
@@ -2653,6 +2672,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // The premise: adopting the exact L1s leaves the render as it was, where unpinned chunks' adoption shrinks it.
       const before = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
@@ -2777,6 +2797,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
   });
@@ -2791,6 +2812,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
   });
@@ -2804,6 +2826,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });

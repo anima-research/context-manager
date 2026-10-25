@@ -8,6 +8,7 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
+import type { ContextObserver } from '../observer.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 import type { WindowMode } from '../window-index.js';
 
@@ -170,6 +171,12 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
+  /**
+   * The host's observer (`ContextManagerConfig.observer`), already isolated:
+   * a strategy reports its compression refusals and calibration samples to it
+   * and needs no guard of its own. Absent when the host gave none.
+   */
+  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
@@ -194,7 +201,8 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether compile() can proceed immediately */
+  /** Whether the strategy has no background work pending. compile() doesn't
+   *  wait for that work either way: it compiles from what's there. */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
@@ -356,8 +364,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Check if strategy is ready to compile.
-   * Returns pending work info if not ready.
+   * Whether the strategy has background work pending, with its info if so.
+   * compile() doesn't wait for it.
    */
   checkReadiness(): ReadinessState;
 
@@ -2305,9 +2313,11 @@ export interface AutobiographicalConfig {
    * folds it demands through the normal drain queues. Once the forest has
    * converged, the live budget can be lowered to the target in one move: no
    * fold-storm, a single KV invalidation ("produce first, fold once").
-   * If the target is unreachable even fully folded (head + tail + max-depth
-   * summaries still exceed it), every compile warns loudly — a descent to
-   * that budget would hard-fail with OverBudgetError. Shadow demand is
+   * If the shadow pick runs out of folds and produce requests with its plan
+   * still over the target's soft line, the compile warns, giving the plan's
+   * size and the line above which a compile at the target is refused with
+   * OverBudgetError: lowering the live budget to the target fails only while
+   * the plan is over that line. Shadow demand is
    * speculative and never bypasses the `l1HoldbackChunks` window. Must be
    * positive; no effect unless lower than the live compile budget.
    */
@@ -2545,9 +2555,14 @@ export interface ProtectedRange {
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
    * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
    * it is still compressed, since only a summary can supply that level.
-   * Under kv-unified, a pinned level on a message between the head window
-   * and the recent window that no summary supplies yet is a constraint
-   * conflict, and every compile fails until one does. Under
+   * Under kv-unified, until a summary over a message supplies it, the message
+   * is held at the deepest level below it that a summary over the message
+   * does supply, raw when none does, and it moves to the pinned level once
+   * that exists; kv-unified logs when it starts and stops holding a pin. A
+   * message of system changes stays raw whatever the pins, so a pin over one
+   * neither holds nor moves it, and the log doesn't count it. On
+   * a message in the folded middle, a lock at another level still conflicts
+   * with the pin, whether or not the pinned level exists yet. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
    * configured selector keeps raw, where its budgets allow (see
@@ -2572,8 +2587,8 @@ export interface ProtectedRange {
 export interface PinLevelOptions {
   name?: string;
   /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
-   *  kv-stable's exceptions for a chunk its summaries don't reach there
-   *  (`ProtectedRange.level`). */
+   *  kv-stable's exceptions for a chunk its summaries don't reach there and,
+   *  under kv-unified, once a summary supplies it (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;

@@ -1,10 +1,11 @@
 /**
  * Flat-profile folding solver: keep visible-item counts roughly equal across levels.
  *
- * Greedy: while over the soft target, find the level with the most *rendered
- * items* (distinct ancestors among chunks at that resolution), pick the oldest
- * raisable group at that level, raise it. Tiebreak on level: lower level wins
- * (fold finer detail before consolidating coarser regions).
+ * Greedy: while over the soft target, rank the levels by their *rendered
+ * items* (distinct ancestors among chunks at that resolution), most first,
+ * and raise the oldest raisable group at the best-ranked level that has one.
+ * Tiebreak on level: lower level wins (fold finer detail before consolidating
+ * coarser regions).
  *
  * Monotonic within a solve (never lowers). Memory-fading by construction: a
  * given chunk's resolution only ever increases within a solve, and the carried
@@ -23,17 +24,25 @@ import type {
   SummaryId,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
-import { runGreedy, type GreedyState, type GreedyOp } from '../greedy-fold.js';
+import { runGreedy, type GreedyChunkView, type GreedyState, type GreedyOp, type GreedyStep } from '../greedy-fold.js';
+import type { SummaryNode } from '../summary-tree.js';
 
 export class FlatProfileStrategy implements FoldingSolver {
   readonly name = 'flat-profile';
 
   solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
-    return runGreedy(inputs, budget, flatProfileStep);
+    return runGreedy(inputs, budget, [passingOver, oldestOnly]);
   }
 }
 
-function flatProfileStep(state: GreedyState, budget: FoldingBudget): GreedyOp | null {
+/** The step's rule: pass over a chunk with no summary above it. Where a
+ *  solve that passes over ends over the hard budget, the solve that takes
+ *  only each level's oldest chunk, this solver's rule before, is tried
+ *  (runGreedy). */
+const passingOver: GreedyStep = (state, budget) => flatProfileStep(state, budget, true);
+const oldestOnly: GreedyStep = (state, budget) => flatProfileStep(state, budget, false);
+
+function flatProfileStep(state: GreedyState, budget: FoldingBudget, passOver: boolean): GreedyOp | null {
   if (state.tokenCount() <= budget.targetBudget) return null;
 
   const middle = state.foldableMiddle();
@@ -73,22 +82,35 @@ function flatProfileStep(state: GreedyState, budget: FoldingBudget): GreedyOp | 
   // can shrink the plan, not the first resort.
   let fallbackProduce: GreedyOp | null = null;
   for (const bestLevel of rankedLevels) {
-    // Raise the group of the oldest chunk at this level: the chunks sharing
-    // its next summary up, its L_{k+1} ancestor, or, past a level where it
-    // has none (one its lineage skips, or one whose summary doesn't list it),
-    // the next one up where it has one. The group is raised all the way to
-    // that summary. Younger chunks at the level aren't tried.
-    const oldestChunk = middle.find((c) => c.currentResolution === bestLevel);
+    // Raise the group of the oldest chunk at this level that can rise: the
+    // chunks sharing its next summary up, its L_{k+1} ancestor, or, past a
+    // level where it has none (one its lineage skips, or one whose summary
+    // doesn't list it), the next one up where it has one. The group is
+    // raised all the way to that summary. With `passOver`, a chunk with no
+    // summary above it is passed over for the next one at the level: under a
+    // summary no merge can take as the store stands (an operator hold, a
+    // quarantined merge, a summary stranded beside a hole), the oldest chunks
+    // of a level would otherwise stop every raise there, and a compile the
+    // younger ones could fit is refused. Without it, only the level's oldest
+    // chunk is tried, the rule a solve falls back on (runGreedy).
+    let oldestChunk: GreedyChunkView | undefined;
+    let parentSummary: SummaryNode | null = null;
+    for (const chunk of middle) {
+      if (chunk.currentResolution !== bestLevel) continue;
+      oldestChunk ??= chunk;
+      parentSummary = state.nextAncestor(chunk);
+      if (parentSummary || !passOver) break;
+    }
     if (!oldestChunk) continue;
 
     const parentLevel = bestLevel + 1;
-    const parentSummary = state.nextAncestor(oldestChunk);
     if (!parentSummary) {
-      // No summary above lists this chunk: request L_{k+1} for its group, but
-      // only if no other level can raise. The strategy makes it only on the
-      // terms GreedyState.nextAncestor names, so for a chunk whose summary
-      // links upward to one that doesn't list it, the request comes back on
-      // the next compile.
+      // No summary above lists the chunks tried at this level: request
+      // L_{k+1} for the oldest chunk's group, but only if no other level can
+      // raise. The strategy makes it only on the terms
+      // GreedyState.nextAncestor names, so for a chunk whose summary links
+      // upward to one that doesn't list it, the request comes back on the
+      // next compile.
       //
       // Range semantics differ by level:
       //  - bestLevel === 0: the caller is asking for an L1 covering this

@@ -673,11 +673,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       throw new OverBudgetError({
         budget: maxTokens,
         actual: total,
-        stage: changeTokens === 0
-          ? 'Windowed passthrough: the newest message alone'
+        // Which part is over: the newest message alone, or the system
+        // changes sent beside it, with it or alone.
+        stageId: changeTokens === 0
+          ? 'windowed-newest-message'
           : total > changeTokens
-            ? 'Windowed passthrough: its system changes and the newest conversation message'
-            : 'Windowed passthrough: its system changes alone',
+            ? 'windowed-changes-and-newest-message'
+            : 'windowed-system-changes',
         // No compression here: the window moves past this message once a
         // newer one that fits arrives (the progress clause above). System
         // changes go out wherever the window starts, so once they leave no

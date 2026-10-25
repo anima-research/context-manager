@@ -11,10 +11,13 @@
  * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
  * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
  * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and reconciles a
- * from-scratch relevance-ideal cut against the carried frontier under a
- * perturbation TRUST REGION P (exact kvCost, not a spatial gate) — adopting
- * the ideal within P, amortizing bigger repairs via suffix adoption, and
- * exceeding P only with a recorded override. There is no emergency path.
+ * relevance-ideal cut (seeded from the carried frontier unless its
+ * `seedFromCarried` option is false, as a measurement's from-scratch arm
+ * sets it) against the carried frontier
+ * under a perturbation TRUST REGION P (exact kvCost, not a spatial gate) —
+ * adopting the ideal within P, amortizing bigger repairs via suffix
+ * adoption, and exceeding P only with a recorded override. There is no
+ * emergency path.
  *
  * It does not SPECULATIVELY emit produce requests — deeper folding than has
  * been produced is the speculative pre-producer's job; the controller only
@@ -68,6 +71,9 @@ export interface KvStableOptions {
   goalTargetTokens?: number;
   /** Enforce reach as a hard transition pace instead of allowing quality overrides. */
   strictReach?: boolean;
+  /** Seed the ideal cut from the carried frontier (hysteresis at band
+   *  boundaries; see `planControlledFrontier`). Default true. */
+  seedFromCarried?: boolean;
 }
 
 export class KvStableStrategy implements FoldingSolver {
@@ -168,6 +174,7 @@ export class KvStableStrategy implements FoldingSolver {
       reachTokens: this.opts.reachTokens,
       strictReach: this.opts.strictReach,
       qualityGapRatio: this.opts.qualityGapRatio,
+      seedFromCarried: this.opts.seedFromCarried,
       rawZone,
       frozen,
       fixedLevels,
