@@ -380,11 +380,14 @@ export interface JournalMark {
  *
  * What the numbers are depends on the manager's window on the compile's
  * branch (`keyedBy`, agent-framework #291). While the window is the record
- * (legacy mode, see ContextManager.presentationMode) they are the messages'
+ * (legacy mode, see ContextManager.windowMode) they are the messages'
  * store sequences, which ascend in the record's order. Once rows are
  * presented the window can list them in another order, and they are the
  * messages' window-index ordinals (ContextManager.ordinalOf), which ascend
- * in the window's.
+ * in the window's. Before this, a layout was `v: 2`, without `keyedBy` or
+ * `memberSequences`, and its members were store sequences: acceptRound
+ * reads a layout without `keyedBy` that way, so a provenance an earlier
+ * release's compile returned is still accepted.
  */
 export interface RenderedLayout {
   readonly v: 3;

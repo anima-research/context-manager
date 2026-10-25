@@ -1,4 +1,5 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
+import { describeThrown } from '../describe-thrown.js';
 import type {
   ContextStrategy,
   ImageCeilings,
@@ -146,12 +147,15 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * sequence anchor, persisted by an earlier release or set before the first
  * presentation, is converted when the branch is first read in presented
  * mode: to the ordinal of the first row in the window stored at that
- * sequence or after (WindowIndexView.ordinalFrom). The window is then the
- * one the sequence gave, since the index is first written down in record
- * order. From then on a row stored before the anchor's sequence but
- * presented after that row is in the window, where a sequence anchor would
- * leave it out: the window is what the agent was shown since, not what was
- * stored since.
+ * sequence or after (WindowIndexView.ordinalFrom), which is written to the
+ * slot then. The window is then the one the sequence gave, since the index
+ * is first written down in record order. From then on a row stored before
+ * the anchor's sequence but presented after that row is in the window,
+ * where a sequence anchor would leave it out: the window is what the agent
+ * was shown since, not what was stored since. The conversion gives the
+ * sequence's window exactly until such a row is presented (one taken out
+ * and presented again, as an undo and its redo do), so it is made at the
+ * branch's first read in presented mode and kept.
  *
  * **Branch scoping.** The anchor persists in a chronicle snapshot slot, so
  * it survives restarts and follows branches like every other piece of
@@ -164,12 +168,18 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * yielding an empty window.
  *
  * The slot holds `{ anchor }`, the sequence, while the window is the
- * record, as it always has, and `{ anchor, ordinal, v: 2 }` once a compile
- * or a setter moves the anchor in presented mode: a load stays read-only,
- * so a converted sequence anchor is written as an ordinal only by the next
- * move. `anchor` stays a sequence in both, at or before the branch head,
- * so a release that reads only it still loads the slot: the sequence
- * setAnchor was given, or that of the row the window starts at.
+ * record, as it always has, and `{ anchor, ordinal, v: 2 }` once the anchor
+ * is an ordinal: once a compile or a setter moves it in presented mode, or
+ * a sequence anchor is converted. A conversion is written when it is made,
+ * since converting the same sequence later, once rows have been presented
+ * out of record order, can give another ordinal, and so another window,
+ * with no move: a reload has to read the ordinal the window was sent
+ * from. A load itself stays read-only, a preview (`dryRun`) converts
+ * without keeping or writing anything, and an anchor of 0, the start,
+ * isn't written, as it converts to the whole window whenever it is
+ * converted. `anchor` stays a sequence in both forms, at or before the
+ * branch head, so a release that reads only it still loads the slot: the
+ * sequence setAnchor was given, or that of the row the window starts at.
  *
  * **Cache markers.** The strategy holds first claim on message-level cache
  * breakpoints under the same slot contract as the autobiographical
@@ -327,7 +337,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * The current window start (inclusive), as an index ordinal, on a branch
    * where the manager presents rows: the window is the row at it and every
    * row presented after it. Undefined in legacy mode, and under a context
-   * without a window index.
+   * without a window index. A sequence anchor not converted yet is
+   * converted here, as a compile converts it, and written to the slot (see
+   * the class doc).
    */
   getAnchorOrdinal(): number | undefined {
     this.syncToBranch();
@@ -340,7 +352,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * active tune-out"). Moving the anchor earlier deliberately accepts one
    * full prefix invalidation. The sequence the anchor already has changes
    * nothing, so a host that sets a tune-out's start again at a restart
-   * keeps the window it had.
+   * keeps the window it had, but only while the anchor hasn't moved since.
+   * A re-anchor (select, on overflow) gives the anchor the sequence of the
+   * row it starts the window at, so the tune-out's start is then converted
+   * again, which can give another window (below).
    *
    * While the window is the record, the window is every row stored at
    * `sequence` or after. Once the manager presents rows on the branch, the
@@ -353,7 +368,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * `currentSequence()` keeps every row presented to the agent from then
    * on, wherever the record has it. A caller that moves the anchor back to
    * a place it was before, once rows have been presented out of record
-   * order, gets that place back only by ordinal (setAnchorOrdinal).
+   * order, gets that place back only by ordinal (setAnchorOrdinal): the
+   * same sequence converted again can give a later ordinal, leaving out a
+   * row stored before it that was presented after the first conversion. A
+   * host that sets a tune-out's start again after a re-anchor, at a
+   * restart or when another tune-out starts, keeps the window by recording
+   * the tune-out's start as an ordinal (ContextManager.indexLength() at
+   * that start) and setting it with setAnchorOrdinal.
    */
   setAnchor(sequence: Sequence): void {
     this.syncToBranch();
@@ -399,16 +420,40 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /**
    * The window's ordinals and the anchor as an ordinal, on a branch where
    * the manager presents rows; null in legacy mode, where the anchor is a
-   * sequence. A sequence anchor (persisted by an earlier release, or set
-   * before the first presentation) is converted here, in memory, as
-   * setAnchor converts one, and written as an ordinal by the next move
-   * only. Read once per select: the ordinals are one reading of the index.
+   * sequence. Read once per select: the ordinals are one reading of the
+   * index.
+   *
+   * A sequence anchor (persisted by an earlier release, or set before the
+   * first presentation) is converted here, as setAnchor converts one, and
+   * written to the slot at once (see the class doc): converted again later,
+   * once a row stored before it has been presented after the row it names,
+   * it would give another ordinal. A `preview` (a dryRun select) converts
+   * for itself and keeps nothing, so a later read converts and writes it.
+   * An anchor of 0, the start, which a branch with no slot has, is kept in
+   * memory only: the row it converts to is the first in the window, so
+   * every row presented since is at or after it, whenever it is converted.
    */
-  private presentedAnchor(): { ordinals: ReadonlyMap<MessageId, number>; from: number } | null {
+  private presentedAnchor(preview = false): { ordinals: ReadonlyMap<MessageId, number>; from: number } | null {
     const ordinals = this.window?.ordinals() ?? null;
     if (!ordinals) return null;
-    if (this.anchorOrdinal === null) this.anchorOrdinal = this.window!.ordinalFrom(this.anchor) ?? 0;
-    return { ordinals, from: this.anchorOrdinal };
+    if (this.anchorOrdinal !== null) return { ordinals, from: this.anchorOrdinal };
+    const from = this.window!.ordinalFrom(this.anchor) ?? 0;
+    if (preview) return { ordinals, from };
+    this.anchorOrdinal = from;
+    if (this.anchor !== 0) {
+      try {
+        this.persistAnchor();
+      } catch (err) {
+        // The window is the same either way: a slot not written is
+        // converted again at the next load, as before the conversion was
+        // written.
+        this.diag.warn(
+          `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written, ` +
+            `so a reload converts its sequence ${this.anchor} again: ${describeThrown(err)}`,
+        );
+      }
+    }
+    return { ordinals, from };
   }
 
   /**
@@ -442,13 +487,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * never).
    *
    * Read-only, as it always was. A slot of the first form, `{ anchor }`,
-   * loads its sequence, which a branch in presented mode converts when the
-   * window is first read (presentedAnchor): a branch made before the
-   * upgrade, or by `createBranchAt` or `derive` from one, carries its own,
-   * so each is converted where it is read. On a branch in legacy mode an
-   * ordinal names nothing, there being no index there (a branch a host
-   * made without carrying the manager's index; derive carries it), so the
-   * sequence beside it is the anchor.
+   * loads its sequence, which a branch in presented mode converts, and
+   * writes as an ordinal, when the window is first read (presentedAnchor):
+   * a branch made before the upgrade, or by `createBranchAt` or `derive`
+   * from one, carries its own, so each is converted where it is read. On a
+   * branch in legacy mode an ordinal names nothing, there being no index
+   * there (a branch a host made without carrying the manager's index;
+   * derive carries it), so the sequence beside it is the anchor.
    */
   private loadBranchState(): void {
     this.anchor = 0;
@@ -519,7 +564,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.syncToBranch();
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
-    const presented = this.presentedAnchor();
+    const presented = this.presentedAnchor(opts?.dryRun === true);
     const shown = this.atOrAfterAnchor(presented);
 
     // The window: everything at or after the anchor. The view lists rows in

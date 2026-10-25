@@ -153,7 +153,7 @@ describe('onPresented in presented mode', () => {
     const b = cm.addMessage('bob', [text('b')]);
     assert.deepEqual(strategy.heard.map((h) => h.rows), [[a], [b]], 'each row was heard at its add');
     cm.presentRows([a, b]);
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     assert.equal(strategy.heard.length, 2, 'nothing entered the window, so nothing is heard again');
     const c = cm.addMessage('alice', [text('c')]);
     assert.equal(strategy.heard.length, 2);

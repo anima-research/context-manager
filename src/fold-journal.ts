@@ -87,6 +87,20 @@ const SEQUENCE_FORMAT = 3;
 const ORDINAL_FORMAT = 4;
 type RecordFormat = typeof SEQUENCE_FORMAT | typeof ORDINAL_FORMAT;
 
+/**
+ * A layout as the journal reads it. One without `keyedBy` is a `v: 2`
+ * layout, which a compile returned before the window could be presented
+ * (agent-framework #291) and a host can carry across the upgrade to accept:
+ * its members were store sequences, so it is read as keyed by sequence,
+ * with each member its own sequence. Any other layout is read as it is.
+ */
+function keyedLayout(layout: RenderedLayout): RenderedLayout {
+  const read = layout as Omit<RenderedLayout, 'keyedBy' | 'memberSequences'> &
+    Partial<Pick<RenderedLayout, 'keyedBy' | 'memberSequences'>>;
+  if (read.keyedBy !== undefined) return layout;
+  return { ...layout, keyedBy: 'sequence', memberSequences: read.memberSequences ?? layout.members };
+}
+
 /** The format a layout's record takes; null for a layout that doesn't say what its members count. */
 function formatFor(layout: RenderedLayout): RecordFormat | null {
   if (layout.keyedBy === 'sequence') return SEQUENCE_FORMAT;
@@ -125,14 +139,24 @@ export type FoldForm =
   | { form: 'summary'; level: number; summaries: Array<{ id: string; level: number; method: string; partial?: true }> }
   | { form: 'omitted' };
 
-/** A run's first or last message: its store sequence and id. */
+/** A run's first or last message: its store sequence and id. The two bounds of a run needn't bound its messages' sequences (FoldChange). */
 export interface FoldSpanBound {
   /** The message's store sequence, as the record holds it, also when the layout counted members by window ordinal. */
   sequence: number;
   messageId: string;
 }
 
-/** One run of messages whose form changed, as rendered before and after. */
+/**
+ * One run of messages whose form changed, as rendered before and after. A
+ * run is consecutive in the layout's order, the window's: `first` and
+ * `last` name its first and last messages, not a range of sequences. While
+ * the window is the record the two agree, and the run holds the messages
+ * stored from `first.sequence` to `last.sequence` that the view held. Once
+ * rows are presented (format 4) they needn't: a run can hold a message
+ * stored after `last` or before `first`, presented between them, and
+ * `first.sequence` can exceed `last.sequence`. Read a run's messages from a
+ * window, not from the record by sequence.
+ */
 export interface FoldChange {
   first: FoldSpanBound;
   last: FoldSpanBound;
@@ -146,7 +170,11 @@ export interface FoldChange {
   estimatedTokensAfter: number;
 }
 
-/** One run of a baseline's layout, as rendered then. */
+/**
+ * One run of a baseline's layout, as rendered then: consecutive in the
+ * window's order, its bounds its first and last messages, not a range of
+ * sequences (see FoldChange).
+ */
 export interface FoldLayoutRun {
   first: FoldSpanBound;
   last: FoldSpanBound;
@@ -700,10 +728,12 @@ export class FoldJournal {
    * returns the receipt that acceptance wrote, or null when it wrote none.
    * Returns the receipt, if any. A compile of another namespace is refused,
    * and so is one whose branch this store doesn't know, live or recorded,
-   * and one whose layout doesn't say what its members count, whose members
-   * aren't in ascending order, whose units' counts aren't positive whole
-   * numbers adding up to its members, or that doesn't have one id and one
-   * sequence for each member.
+   * and one whose layout names a count it doesn't know (`keyedBy`), whose
+   * members aren't in ascending order, whose units' counts aren't positive
+   * whole numbers adding up to its members, or that doesn't have one id and
+   * one sequence for each member. A layout without `keyedBy`, a `v: 2` one
+   * an earlier release's compile returned, is read as keyed by sequence
+   * (keyedLayout).
    *
    * A layout's members are store sequences while the manager's window is
    * the record, and window-index ordinals once rows are presented on its
@@ -724,7 +754,7 @@ export class FoldJournal {
           `${JSON.stringify(this.namespace)}: accept it on the manager that compiled it`,
       );
     }
-    const layout = provenance.layout;
+    const layout = provenance.layout ? keyedLayout(provenance.layout) : null;
     if (!layout) return null;
     const index = storeIndex(this.store);
     const branch = this.branchState(index, provenance.branch);

@@ -2281,9 +2281,41 @@ describe('fold journal over a presented window', () => {
     // unchanged, is no fold.
     cm.close();
     const reopened = await open(strategy);
-    assert.equal(reopened.cm.presentationMode(), 'presented');
+    assert.equal(reopened.cm.windowMode(), 'presented');
     assert.equal(await acceptCompile(reopened.cm), null);
     reopened.cm.close();
+  });
+
+  it('accepts a layout an earlier release\'s compile returned (v 2, without keyedBy) as keyed by sequence, in format 3', async () => {
+    // Review CM-Y: a v 2 layout says nothing of what its members count, and
+    // acceptRound refused it, so a provenance carried across the upgrade
+    // couldn't be accepted. Its members were store sequences, as they still
+    // are while the window is the record.
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const asV2 = (provenance: CompileProvenance): CompileProvenance => {
+      const { keyedBy: _keyedBy, memberSequences: _memberSequences, ...rest } = provenance.layout!;
+      return { ...provenance, layout: { ...rest, v: 2 } as unknown as RenderedLayout };
+    };
+    const older = asV2((await cm.compile(BUDGET)).provenance!);
+    assert.deepEqual(older.layout!.members, ids.map((id) => sequenceOf(cm, id)));
+    const baseline = cm.acceptRound({ provenance: older });
+    assert.equal(baseline?.kind, 'baseline');
+    assert.deepEqual(baseline!.layout!.map((run) => [run.first, run.last, run.messages]), [
+      [{ sequence: sequenceOf(cm, ids[0]!), messageId: ids[0] }, { sequence: sequenceOf(cm, ids[2]!), messageId: ids[2] }, 3],
+    ], 'each bound named by its sequence, the member itself');
+    assert.deepEqual(formats(cm.getStore()), [[3, 'snapshot']]);
+
+    // Compared as format 3, with this release's layouts and with another v 2.
+    assert.equal(await acceptCompile(cm), null, 'the same window as a v 3 layout is no change');
+    strategy.plan.set(ids[1]!, 'omit');
+    const folded = await acceptCompile(cm);
+    assert.deepEqual(folded?.changes?.map((change) => [change.first.messageId, change.before.form, change.after.form]), [[ids[1], 'raw', 'omitted']]);
+    strategy.plan.set(ids[2]!, 'omit');
+    const again = cm.acceptRound({ provenance: asV2((await cm.compile(BUDGET)).provenance!) });
+    assert.deepEqual(again?.changes?.map((change) => [change.first.messageId, change.before.form, change.after.form]), [[ids[2], 'raw', 'omitted']]);
+    assert.ok(formats(cm.getStore()).every(([v]) => v === 3), 'every record counts sequences');
+    cm.close();
   });
 
   it('a branch whose layouts count sequences starts again from one baseline at its first presentation, and keeps listing its receipts', async () => {

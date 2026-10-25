@@ -56,7 +56,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type PresentationMode } from './window-index.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type WindowMode } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -1315,6 +1315,10 @@ export class ContextManager {
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
+   *
+   * Presenting a row to the agent is not the fold journal's
+   * `presentation`, which acceptRound takes: that says how a provider
+   * round carried a compile.
    */
   presentRows(ids: readonly MessageId[]): number[] {
     this.requireOpen('presentRows');
@@ -1379,7 +1383,7 @@ export class ContextManager {
    * no row. A write-down cut short leaves it `'legacy'` (see presentRows),
    * as does an index in another version's format.
    */
-  presentationMode(): PresentationMode {
+  windowMode(): WindowMode {
     return this.windowIndex.mode();
   }
 
@@ -1388,6 +1392,17 @@ export class ContextManager {
    * and never move, whatever leaves the window or the store, so a host can
    * compare them as watermarks. Undefined for a row not in the window, and
    * for every row in legacy mode, where there is no index.
+   *
+   * An id can outlive its row here. A removal through this manager takes
+   * the row out of its window (removeMessage, removeMessages), but one
+   * through another manager, on this manager's slot or an auxiliary one,
+   * isn't heard: the row leaves the record, and so the rows this manager's
+   * reads list (getPresentedMessages, presentedLength, the compile), but
+   * its ordinal stays issued, ordinalOf still gives it, and the strategy's
+   * `ordinals()` (StrategyContext.window) still maps it, until retractRows
+   * takes it out by its id. A host that keeps watermarks or cursors by
+   * ordinal takes such a row out of each window that holds it, or reads
+   * them from the listing.
    */
   ordinalOf(id: MessageId): number | undefined {
     return this.windowIndex.ordinalOf(id);
@@ -1427,8 +1442,18 @@ export class ContextManager {
     return this.windowIndex.unpresented(this.mergedMessageView().getAll());
   }
 
-  /** The highest record sequence among the rows in the window, undefined when it holds none. */
-  lastPresentedSequence(): number | undefined {
+  /**
+   * The newest store sequence among the rows in the window, before the view
+   * filter, the record's newest row's in legacy mode; undefined when the
+   * window holds none. It is the sequence a row was stored at, not where
+   * the window reached: a row is presented by a later write than its own,
+   * and the window can hold an older row presented after a newer one. The
+   * write that presented a row is where branchAt cuts for it; for a place
+   * in the record that follows a presentation, as derive's `atSequence`
+   * needs, read currentSequence() after the presentRows. For where the
+   * window reached, compare ordinals (indexLength, ordinalOf).
+   */
+  newestWindowSequence(): number | undefined {
     let last: number | undefined;
     for (const message of this.getPresentedMessages()) if (last === undefined || message.sequence > last) last = message.sequence;
     return last;
@@ -2247,7 +2272,9 @@ export class ContextManager {
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
    * `altered`, or `unknown`, the default); receipts record it beside the
-   * layout, which is the compile's.
+   * layout, which is the compile's. It has nothing to do with presentRows,
+   * which puts rows in the agent's window; the window decides only what a
+   * layout's members count.
    *
    * Returns the receipt, or null: no change, or a compile with no layout to
    * record (`provenance.layout` is null): a strategy that doesn't report its
@@ -2264,8 +2291,10 @@ export class ContextManager {
    * another store's: accept a compile on the manager that compiled it. So is
    * a layout whose shape changed after compile returned it: members out of
    * order, unit counts that aren't positive whole numbers adding up to the
-   * members, not one id and one sequence for each member, or no word of what
-   * its members count.
+   * members, not one id and one sequence for each member, or a word of what
+   * its members count that the journal doesn't know. A layout with no word
+   * of it, as compile returned before RenderedLayout was `v: 3` (one carried
+   * across the upgrade), is read as counting store sequences, which it did.
    */
   acceptRound(args: {
     provenance: CompileProvenance;

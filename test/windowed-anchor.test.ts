@@ -9,9 +9,10 @@
  * first read in presented mode, to the ordinal of the first row in the
  * window stored at that sequence or after, so the window at the conversion
  * is the one the sequence gave; it is written as `{ anchor, ordinal, v: 2 }`
- * by the next move only, keeping the sequence for a release that reads it
- * alone. From then on a row stored before the anchor's sequence and
- * presented later is in the window, which a sequence anchor leaves out.
+ * when it is made, keeping the sequence for a release that reads it alone,
+ * so a reload reads the ordinal back rather than converting again. From
+ * then on a row stored before the anchor's sequence and presented later is
+ * in the window, which a sequence anchor leaves out.
  */
 
 import { describe, it, after } from 'node:test';
@@ -73,13 +74,13 @@ describe('windowed passthrough: the anchor while the window is the record', () =
     const result = await cm.compile(OVERFLOW);
     assert.ok(result.messages.length < 5, 'the overflow re-anchored');
     assert.deepEqual(slot(cm), { anchor: strategy.getAnchor() });
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     cm.close();
   });
 });
 
 describe('windowed passthrough: a sequence anchor once rows are presented', () => {
-  it('converts to the same window at the first presentation, and is written as an ordinal by the next move only', async () => {
+  it('converts to the same window at the first presentation, and writes the conversion when it makes it', async () => {
     const { cm, strategy } = await open(freshPath());
     const ids = ['a', 'b', 'c', 'd', 'e'].map((t) => cm.addMessage('u', text(t)));
     const anchor = sequenceOf(cm, ids[2]!);
@@ -88,6 +89,11 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
     assert.deepEqual(texts(legacy), ['c', 'd', 'e']);
 
     cm.presentRows([]);
+    // A preview converts for itself and writes nothing.
+    const head = cm.getStore().currentSequence();
+    assert.deepEqual(texts(await cm.compile(BIG, undefined, { dryRun: true })), ['c', 'd', 'e']);
+    assert.deepEqual(slot(cm), { anchor });
+    assert.equal(cm.getStore().currentSequence(), head, 'a preview writes nothing');
     const converted = await cm.compile(BIG);
     assert.deepEqual(converted.messages, legacy.messages, 'byte-identical across the first presentation');
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[2]!), 'the first row in the window stored at the anchor or after');
@@ -97,7 +103,10 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
     const listed = window.findIndex((m) => cm.ordinalOf(m.id)! >= strategy.getAnchorOrdinal()!);
     assert.equal(listed, window.filter((m) => m.sequence < anchor).length);
     assert.equal(strategy.getAnchor(), anchor);
-    assert.deepEqual(slot(cm), { anchor }, 'a load and a compile that moves nothing write nothing');
+    // The compile that converted the anchor wrote it (review CM-L). Before,
+    // only the next move wrote it, which left a reload to convert the
+    // sequence again against a window that may have changed since.
+    assert.deepEqual(slot(cm), { anchor, ordinal: cm.ordinalOf(ids[2]!), v: 2 }, 'the compile that converted it wrote it');
 
     strategy.setAnchor(sequenceOf(cm, ids[3]!));
     assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[3]!), ordinal: cm.ordinalOf(ids[3]!), v: 2 });
@@ -105,7 +114,7 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
     cm.close();
   });
 
-  it('converts an earlier release\'s slot on each branch where it is read, and leaves it as it is', async () => {
+  it('converts an earlier release\'s slot on each branch where it is read, and writes it there', async () => {
     const path = freshPath();
     let { cm } = await open(path);
     const ids = ['a', 'b', 'c', 'd'].map((t) => cm.addMessage('u', text(t)));
@@ -120,9 +129,12 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
 
     let strategy: WindowedPassthroughStrategy;
     ({ cm, strategy } = await open(path));
-    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[1]!));
-    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'd']);
+    // The load is read-only; the read that converts writes the conversion
+    // (review CM-L: before, nothing was written until the next move).
     assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!) }, 'read-only on load');
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[1]!));
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal: cm.ordinalOf(ids[1]!), v: 2 });
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'd']);
 
     // Main moves on and writes its anchor as an ordinal.
     const e = cm.addMessage('u', text('e'));
@@ -131,14 +143,76 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
     assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, e), ordinal: cm.ordinalOf(e), v: 2 });
 
     // The older branch, switched to underneath as a host's undo does,
-    // converts its own slot when it is read, and keeps it as it was.
+    // converts its own slot when it is read, and writes it there; main's is
+    // untouched.
     cm.getStore().switchBranch('zz-older');
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!) });
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[1]!));
     assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'd']);
-    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!) });
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal: cm.ordinalOf(ids[1]!), v: 2 });
     cm.getStore().switchBranch(main);
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, e), ordinal: cm.ordinalOf(e), v: 2 });
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(e));
     assert.deepEqual(texts(await cm.compile(BIG)), ['e']);
+    cm.close();
+  });
+
+  // Review CM-L: the conversion was kept in memory only, so a reload
+  // converted the sequence again against the window as it stood then. Once
+  // a row stored before the sequence was presented again after the first
+  // conversion, the reload started the window after it, a change of window
+  // with no move. Each fails on the build before the conversion was written.
+  it('a converted anchor survives a reload after an older row is presented again', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    const [, b] = ['a', 'b'].map((t) => cm.addMessage('u', text(t)));
+    // A tune-out starts at the head in legacy mode: the slot is a sequence
+    // past every row.
+    const start = cm.getStore().currentSequence() + 1;
+    strategy.setAnchor(start);
+    assert.deepEqual(slot(cm), { anchor: start });
+    cm.presentRows([]);
+    assert.deepEqual(texts(await cm.compile(BIG)), [], 'the first compile converts it: no row is stored at the start or after');
+    const ordinal = strategy.getAnchorOrdinal();
+    assert.equal(ordinal, cm.indexLength());
+    assert.deepEqual(slot(cm), { anchor: start, ordinal, v: 2 });
+
+    // b, stored before the start, is taken out and presented again, as an
+    // undo and its redo do; c arrives and is presented.
+    cm.retractRows([b!]);
+    cm.presentRows([b!]);
+    const c = cm.addMessage('u', text('c'));
+    cm.presentRows([c]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c']);
+    cm.close();
+
+    ({ cm, strategy } = await open(path));
+    assert.equal(strategy.getAnchorOrdinal(), ordinal, 'the ordinal the window was sent from');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'the same window: converting the start again would leave b out');
+    cm.close();
+  });
+
+  it('a conversion a read makes is written by that read', async () => {
+    // The reviewer's probe: the anchor is read, not compiled, before the
+    // older row is presented again.
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    const [, b] = ['a', 'b'].map((t) => cm.addMessage('u', text(t)));
+    const start = cm.getStore().currentSequence() + 1;
+    strategy.setAnchor(start);
+    cm.presentRows([]);
+    const ordinal = strategy.getAnchorOrdinal();
+    assert.deepEqual(slot(cm), { anchor: start, ordinal, v: 2 });
+    cm.retractRows([b!]);
+    cm.presentRows([b!]);
+    const c = cm.addMessage('u', text('c'));
+    cm.presentRows([c]);
+    assert.deepEqual(cm.renderAsNewest([b!, c]), [text('b'), text('c')]);
+    cm.close();
+
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(cm.renderAsNewest([b!, c]), [text('b'), text('c')], 'renderAsNewest reads the same window');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c']);
     cm.close();
   });
 });
@@ -305,9 +379,12 @@ describe('windowed passthrough: a persisted anchor that names no place', () => {
     const path = freshPath();
     let { cm } = await open(path);
     cm.addMessage('u', text('a'));
-    cm.addMessage('u', text('b'));
+    const b = cm.addMessage('u', text('b'));
     cm.presentRows([]);
-    cm.getStore().setStateJson(ANCHOR, { anchor: 0, ordinal: 1_000, v: 2 });
+    // The sequence beside the bad ordinal is b's, not 0 (review CM-P): with
+    // 0 there, a load that kept the sequence, or converted it, would pass
+    // as a reset. Kept, it would start the window at b.
+    cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, b), ordinal: 1_000, v: 2 });
     cm.close();
 
     const reopened = await reopenWarned(path);
@@ -318,7 +395,7 @@ describe('windowed passthrough: a persisted anchor that names no place', () => {
     );
     assert.equal(reopened.strategy.getAnchor(), 0);
     assert.equal(reopened.strategy.getAnchorOrdinal(), cm.ordinalOf(cm.getAllMessages()[0]!.id));
-    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b']);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b'], 'the window from its start, not from b');
     cm.close();
   });
 
@@ -355,6 +432,7 @@ describe('windowed passthrough: a persisted anchor that names no place', () => {
     assert.equal(strategy.getAnchor(), 0, 'the in-memory anchor is not carried over');
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[0]!));
     assert.deepEqual(texts(await cm.compile(BIG)), ['m1', 'm2']);
+    assert.equal(slot(cm), null, 'an anchor at the start is converted in memory only: it is the whole window whenever it is converted');
     cm.getStore().switchBranch(main);
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(m3));
     cm.close();
@@ -380,7 +458,7 @@ describe('windowed passthrough: a derived context', () => {
     // manager's own states), so it reads the slot by ordinal. A branch
     // without that index would read it by the sequence beside it.
     assert.equal(childStrategy.getAnchor(), strategy.getAnchor());
-    assert.equal(child.presentationMode(), 'presented');
+    assert.equal(child.windowMode(), 'presented');
     assert.equal(childStrategy.getAnchorOrdinal(), strategy.getAnchorOrdinal());
     assert.deepEqual((await child.compile(OVERFLOW)).messages.map((m) => m.content), sent.messages.map((m) => m.content));
     child.close();

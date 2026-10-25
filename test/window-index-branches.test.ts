@@ -76,12 +76,12 @@ class Sharding extends PassthroughStrategy {
 /** What a manager's window says, as a host reads it. */
 function windowOf(cm: ContextManager, rows: MessageId[]) {
   return {
-    mode: cm.presentationMode(),
+    mode: cm.windowMode(),
     window: ids(cm.getPresentedMessages()),
     unpresented: ids(cm.getUnpresentedMessages()),
     ordinals: rows.map((id) => cm.ordinalOf(id)),
     length: cm.indexLength(),
-    last: cm.lastPresentedSequence(),
+    newest: cm.newestWindowSequence(),
   };
 }
 
@@ -185,13 +185,13 @@ describe('derive and the window', () => {
 
     const atStored = await parent.derive({ branch: 'zz/at-stored', strategy: new Manifested(), atSequence: stored });
     assert.deepEqual(windowOf(atStored, [a, b, c]), {
-      mode: 'presented', window: [], unpresented: [a, b], ordinals: [undefined, undefined, undefined], length: 1, last: undefined,
+      mode: 'presented', window: [], unpresented: [a, b], ordinals: [undefined, undefined, undefined], length: 1, newest: undefined,
     }, 'rows stored by then and not yet presented are arrivals there');
 
     const atPresented = await parent.derive({ branch: 'zz/at-presented', strategy: new Manifested(), atSequence: presented });
     assert.deepEqual(windowOf(atPresented, [a, b, c]), {
       mode: 'presented', window: [b], unpresented: [a], ordinals: [undefined, parent.ordinalOf(b), undefined],
-      length: 2, last: parent.getMessage(b)!.sequence,
+      length: 2, newest: parent.getMessage(b)!.sequence,
     }, 'the window names only rows stored by then');
     assert.deepEqual(texts(await atPresented.compile(BIG)), ['b']);
     atPresented.presentRows([a]);
@@ -240,12 +240,12 @@ describe('derive and the window', () => {
     const parent = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Manifested() });
     const a = parent.addMessage('alice', [text('a')]);
     const child = await parent.derive({ branch: 'zz/child', strategy: new Manifested() });
-    assert.equal(child.presentationMode(), 'legacy');
+    assert.equal(child.windowMode(), 'legacy');
     parent.presentRows([]);
     const b = parent.addMessage('bob', [text('b')]);
-    assert.equal(parent.presentationMode(), 'presented');
+    assert.equal(parent.windowMode(), 'presented');
     assert.deepEqual(ids(parent.getPresentedMessages()), [a]);
-    assert.equal(child.presentationMode(), 'legacy', 'nothing was written on the child\'s branch');
+    assert.equal(child.windowMode(), 'legacy', 'nothing was written on the child\'s branch');
     const c = child.addMessage('carol', [text('c')]);
     assert.deepEqual(ids(child.getPresentedMessages()), [a, c], 'the child\'s window is its record, live');
     assert.equal(child.getMessage(b), null);
@@ -373,7 +373,7 @@ describe('branchAt and the window', () => {
     const [u1, a1] = rows as [MessageId, MessageId];
     const legacy = cm.branchAt(a1, 'zz-legacy-at-a1'); // what a branch made before the write-down gives
     cm.presentRows([]); // a host's boot call writes the window down
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     const main = cm.currentBranch().name;
 
     // The write-down presented a1 after every row was stored. A cut at that
@@ -382,7 +382,7 @@ describe('branchAt and the window', () => {
     assert.equal(branchPoint(cm, atA1), cm.getMessage(a1)!.sequence);
     assert.equal(branchPoint(cm, atA1), branchPoint(cm, legacy));
     await cm.switchBranch(atA1);
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.equal(cm.indexLength(), 0);
     assert.deepEqual(ids(cm.getAllMessages()), [u1, a1]);
     assert.deepEqual(ids(cm.getPresentedMessages()), [u1, a1]);
@@ -403,7 +403,7 @@ describe('branchAt and the window', () => {
     const atY = cm.branchAt(y, 'zz-at-y');
     assert.ok(branchPoint(cm, atY)! > cm.getMessage(x)!.sequence);
     await cm.switchBranch(atY);
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(ids(cm.getPresentedMessages()), [...rows, y]);
     assert.deepEqual(ids(cm.getUnpresentedMessages()), [x]);
     cm.close();
@@ -419,7 +419,7 @@ describe('branchAt and the window', () => {
     const atA = cm.branchAt(a, 'zz-at-a');
     assert.ok(branchPoint(cm, atA)! > cm.getMessage(c)!.sequence);
     await cm.switchBranch(atA);
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'a']);
     cm.close();
   });
@@ -435,7 +435,7 @@ describe('branchAt and the window', () => {
     const atDoc = cm.branchAt(doc, 'zz-at-doc');
     assert.equal(branchPoint(cm, atDoc), cm.getMessage(body[2]!)!.sequence);
     await cm.switchBranch(atDoc);
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.deepEqual(ids(cm.getAllMessages()), [u, ...body], 'the body is whole, and nothing stored after it is there');
     assert.deepEqual(texts(await cm.compile(BIG)), ['u', 'p1', 'p2', 'p3']);
     cm.close();
@@ -453,7 +453,7 @@ describe('branchAt and the window', () => {
     const atA = cm.branchAt(a, 'zz-at-a'); // written by the first try
     assert.equal(branchPoint(cm, atA), cm.getMessage(a)!.sequence);
     await cm.switchBranch(atA);
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.deepEqual(texts(await cm.compile(BIG)), ['a']);
 
     await cm.switchBranch(main);
@@ -462,7 +462,7 @@ describe('branchAt and the window', () => {
     await cm.switchBranch(atE);
     // The first try's rows are there without their header: legacy mode,
     // the window the record, and the boot call finishes it.
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.deepEqual(ids(cm.getPresentedMessages()), [a, b, c, e]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'e']);
     cm.presentRows([]);
@@ -485,7 +485,7 @@ describe('branchAt and the window', () => {
     // anchor, past every row its window holds, and compile nothing.
     const atA1 = cm.branchAt(rows[1]!, 'zz-at-a1');
     await cm.switchBranch(atA1);
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.deepEqual(texts(await cm.compile(BIG)), ['u1', 'a1']);
     cm.close();
   });
@@ -657,7 +657,7 @@ describe('removal and the window', () => {
     cm.removeMessage(a!);
     cm.removeMessages(b!, c!);
     assert.equal(cm.getStore().getStateJson(INDEX), null);
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     cm.close();
   });
 

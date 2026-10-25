@@ -106,7 +106,7 @@ describe('the window in legacy mode', () => {
     // gives, as it did before there was a window.
     assert.equal(strategy.last().listing, cm.getAllMessages());
     assert.equal(cm.getPresentedMessages(), cm.getAllMessages());
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     assert.equal(cm.getStore().getStateJson(windowIndexStateId('zz-agent')), null, 'no index state is written');
     assert.equal(cm.indexLength(), 0);
     assert.equal(cm.ordinalOf(cm.getAllMessages()[0]!.id), undefined);
@@ -139,19 +139,19 @@ describe('the window in legacy mode', () => {
     main.addMessage('alice', [text('m3')]);
     const legacy = await side.compile(BIG);
     assert.deepEqual(texts(legacy), ['m1', 's1', 'm2', 'm3'], 'the merge keeps growing while nothing is presented');
-    assert.equal(side.presentationMode(), 'legacy');
+    assert.equal(side.windowMode(), 'legacy');
     assert.equal(main.getStore().getStateJson(windowIndexStateId('subconscious/zz')), null);
     const before = side.getPresentedMessages();
 
     // The first presentation writes the window down as it stands: the same
     // rows, in the same order, the same array, so the compile is the same.
     assert.deepEqual(side.presentRows([]), []);
-    assert.equal(side.presentationMode(), 'presented');
+    assert.equal(side.windowMode(), 'presented');
     assert.equal(side.getPresentedMessages(), before, 'the bootstrap keeps the listing the strategy last read');
     const bootstrapped = await side.compile(BIG);
     assert.deepEqual(bootstrapped.messages, legacy.messages, 'byte-identical across the bootstrap');
     assert.equal(side.indexLength(), 5, 'a header and one item per row');
-    assert.equal(main.presentationMode(), 'legacy', "another namespace's window is its own");
+    assert.equal(main.windowMode(), 'legacy', "another namespace's window is its own");
 
     // From here the window grows only by presentation.
     const m4 = main.addMessage('alice', [text('m4')]);
@@ -170,7 +170,7 @@ describe('the window in legacy mode', () => {
     assert.equal(m4Ordinal, side.ordinalOf(m4));
     assert.ok(m4Ordinal! > side.ordinalOf(s2)!, 'ordinals follow the window');
     assert.deepEqual(side.getUnpresentedMessages(), []);
-    assert.equal(side.lastPresentedSequence(), side.getMessage(s2)!.sequence);
+    assert.equal(side.newestWindowSequence(), side.getMessage(s2)!.sequence);
     side.close();
     main.close();
   });
@@ -220,7 +220,7 @@ describe('writing the window down', () => {
       const rows = ['a', 'b', 'c', 'd'].map((t) => cm.addMessage('alice', [text(t)]));
       cutShortWriteDown(cm, failing);
       assert.deepEqual(indexItems(cm), rows.slice(0, failing - 1).map((id) => ({ id })), `the rows before the failure are written, and no header, ${cut}`);
-      assert.equal(cm.presentationMode(), 'legacy', cut);
+      assert.equal(cm.windowMode(), 'legacy', cut);
       assert.equal(cm.indexLength(), 0, cut);
       assert.equal(cm.ordinalOf(rows[0]!), undefined, cut);
       assert.deepEqual(cm.getUnpresentedMessages(), [], cut);
@@ -231,14 +231,14 @@ describe('writing the window down', () => {
       // store hadn't synced leaves such a prefix too.
       cm.close();
       cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
-      assert.equal(cm.presentationMode(), 'legacy', `after a reopen, ${cut}`);
+      assert.equal(cm.windowMode(), 'legacy', `after a reopen, ${cut}`);
       const e = cm.addMessage('alice', [text('e')]);
       assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], `a row stored meanwhile reaches the window at once, ${cut}`);
 
       // The boot call finishes it: the rows not written yet, each once, in
       // record order after the ones that were, then the header.
       assert.deepEqual(cm.presentRows([]), []);
-      assert.equal(cm.presentationMode(), 'presented', cut);
+      assert.equal(cm.windowMode(), 'presented', cut);
       assert.deepEqual(indexItems(cm), [...[...rows, e].map((id) => ({ id })), { v: 1 }], cut);
       assert.deepEqual([...rows, e].map((id) => cm.ordinalOf(id)), [0, 1, 2, 3, 4], cut);
       assert.equal(cm.indexLength(), 6, cut);
@@ -253,7 +253,7 @@ describe('writing the window down', () => {
       assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], cut);
       cm.close();
       cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
-      assert.equal(cm.presentationMode(), 'presented', `after a reopen, ${cut}`);
+      assert.equal(cm.windowMode(), 'presented', `after a reopen, ${cut}`);
       assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], `after a reopen, ${cut}`);
       cm.close();
     }
@@ -287,7 +287,7 @@ describe('writing the window down', () => {
     cm.retractRows([]);
     cm.retractRows([], { undone: true });
     assert.equal(cm.getStore().getStateJson(INDEX), null, 'nothing is written');
-    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.windowMode(), 'legacy');
     const c = cm.addMessage('alice', [text('c')]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'a later write still reaches the window at once');
     assert.throws(() => cm.retractRows(['zz-no-such-row']), /no stored message has id zz-no-such-row, and the window holds none/);
@@ -296,7 +296,7 @@ describe('writing the window down', () => {
     // Any other retract switches the mode: the window is written down as
     // it stands, then the rows named leave it.
     cm.retractRows([b!]);
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }, { id: c }, { v: 1 }, { retract: b }]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c']);
     const d = cm.addMessage('alice', [text('d')]);
@@ -336,7 +336,7 @@ describe('writing the window down', () => {
       const warn = console.warn;
       console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
       try {
-        assert.equal(cm.presentationMode(), 'legacy', label);
+        assert.equal(cm.windowMode(), 'legacy', label);
         assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b'], label);
         assert.equal(cm.getPresentedMessages(), cm.getAllMessages(), label);
         assert.equal(cm.ordinalOf(a!), undefined, label);
@@ -552,7 +552,7 @@ describe('the window in presented mode', () => {
     cm.close();
 
     cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
-    assert.equal(cm.presentationMode(), 'presented');
+    assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(texts(await cm.compile(BIG)), ['y', 'x']);
     assert.deepEqual([cm.ordinalOf(x), cm.ordinalOf(y)], ordinals);
 

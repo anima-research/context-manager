@@ -14,7 +14,7 @@
  * next tool boundary or turn start.
  *
  * The index is that order, kept per manager namespace as a Chronicle
- * append-log state, `<namespace>/presentation`, so it is per branch, survives
+ * append-log state, `<namespace>/window`, so it is per branch, survives
  * a restart, and a branch made from another starts from the parent's index
  * as of the branch point: `fork`, `branchAt` and `derive` carry it, the last
  * by listing it among the states the manager owns. Rows are stored before
@@ -52,10 +52,12 @@
  *
  * Until a host presents anything on a branch, the manager is in legacy
  * mode: there is no index, and the window is the record itself, live, as it
- * always was, so every compile is byte for byte what it was before this
- * module existed. A host's first presentation writes the index down as the
- * window stands then (every row of the record, in record order, then the
- * header) and the manager is in presented mode on that branch from then on.
+ * always was, so every compile sends byte for byte the messages it sent
+ * before this module existed. (Its provenance differs: the rendered layout
+ * says what its members count, RenderedLayout.keyedBy.) A host's first
+ * presentation writes the index down as the window stands then (every row
+ * of the record, in record order, then the header) and the manager is in
+ * presented mode on that branch from then on.
  *
  * The header is what switches the mode. Each item is one record, so a
  * write-down can be cut short, by a failed append or by a crash that loses
@@ -73,7 +75,11 @@
  *
  * Not to be confused with two other senses of the word in this package:
  * kv-unified's presentation receipts (a provider submission's leaf layout)
- * and the fold journal's `Presentation` (how a round carried a compile).
+ * and the fold journal's `Presentation` (how a round carried a compile,
+ * which acceptRound takes as `presentation`). So the index's mode, its
+ * newest row and its state are named by the window (`windowMode`,
+ * `newestWindowSequence`, `<namespace>/window`), and the verb names only
+ * rows entering it (presentRows, getPresentedMessages, onPresented).
  */
 
 import type { JsStore } from '@animalabs/chronicle';
@@ -83,7 +89,7 @@ import { registerStateIfAbsent } from './state-registration.js';
 import type { MessageId, MessageStoreView, StoredMessage } from './types/index.js';
 
 /** Whether a manager's window is the record (`legacy`) or its index (`presented`), on the branch its store is on. */
-export type PresentationMode = 'legacy' | 'presented';
+export type WindowMode = 'legacy' | 'presented';
 
 /**
  * The format the header names. An index whose header names another is
@@ -93,7 +99,7 @@ const INDEX_FORMAT = 1;
 
 /** The state that holds a namespace's window index. */
 export function windowIndexStateId(namespace: string): string {
-  return `${namespace}/presentation`;
+  return `${namespace}/window`;
 }
 
 /**
@@ -365,11 +371,16 @@ export class WindowIndex {
   }
 
   /** `presented` once the index holds this format's header, which the write-down writes last; `legacy` before. */
-  mode(): PresentationMode {
+  mode(): WindowMode {
     return inEffect(this.current()) ? 'presented' : 'legacy';
   }
 
-  /** The row's index ordinal, while it is in the window; undefined otherwise, and in legacy mode. */
+  /**
+   * The row's index ordinal, while the index holds it; undefined otherwise,
+   * and in legacy mode. A row removed from the record through another
+   * manager keeps its ordinal here until a retract takes it out (see
+   * ContextManager.ordinalOf).
+   */
   ordinalOf(id: MessageId): number | undefined {
     const state = this.current();
     return inEffect(state) ? state.ordinals.get(id) : undefined;
@@ -380,7 +391,8 @@ export class WindowIndex {
    * null in legacy mode, where there is none. For a caller asking of many
    * rows at once, such as a compile's rendered layout, where ordinalOf
    * would read the state's revision once a row. Read it at once: a later
-   * write changes it.
+   * write changes it. Like ordinalOf, it can hold the id of a row the
+   * record no longer has, which listing leaves out.
    */
   ordinals(): ReadonlyMap<MessageId, number> | null {
     const state = this.current();
@@ -411,9 +423,7 @@ export class WindowIndex {
    * was in the window from its own write, as every row is in legacy mode,
    * and the rows before it there were the rows stored before it, since the
    * write-down follows record order. A row taken out since and presented
-   * again holds a later ordinal and is not one. False in legacy mode, and
-   * for every row of an index an earlier build of this branch wrote header
-   * first.
+   * again holds a later ordinal and is not one. False in legacy mode.
    */
   presentedByWriteDown(id: MessageId): boolean {
     const state = this.current();

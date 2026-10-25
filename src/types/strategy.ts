@@ -9,7 +9,7 @@ import type {
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
-import type { PresentationMode } from '../window-index.js';
+import type { WindowMode } from '../window-index.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -97,10 +97,13 @@ export interface ContextLogView {
  */
 export interface WindowIndexView {
   /** `'legacy'` while the window is the record, `'presented'` once a host has presented rows on the branch. */
-  mode(): PresentationMode;
+  mode(): WindowMode;
   /**
    * The ordinal of every row in the window, from one reading of the index;
    * null in legacy mode. Read it at once: a later presentation changes it.
+   * It can map the id of a row the record no longer has, removed through
+   * another manager, until a host retracts it (ContextManager.ordinalOf);
+   * the view never lists such a row.
    */
   ordinals(): ReadonlyMap<MessageId, number> | null;
   /** The ordinal the next presented row will take. 0 in legacy mode. */

@@ -139,7 +139,7 @@ describe('ContextManager.derive', () => {
     // lists its own states beside the manifest's, the window index among
     // them (agent-framework #291), which no strategy's manifest names.
     assert.deepEqual(derivation.inherited.statePrefixes, []);
-    for (const id of ['messages', 'context', 'default/presentation', 'mint-preimage-envelopes', 'default/autobio:summaries', 'default/autobio:resolutions', 'default/autobio:merge-quarantine']) {
+    for (const id of ['messages', 'context', 'default/window', 'mint-preimage-envelopes', 'default/autobio:summaries', 'default/autobio:resolutions', 'default/autobio:merge-quarantine']) {
       assert.ok(derivation.inherited.stateIds.includes(id), `inherits ${id}`);
     }
     for (const id of ['default/autobio:mergeQueue', 'default/autobio:compression-refusal-quarantine-events']) {
