@@ -34,7 +34,8 @@
  * - An index ordinal is an item's place in the log. It never changes: a
  *   row that leaves the window leaves a hole at its ordinal, and a row
  *   presented again takes a new one at the end. Ordinals are what a host's
- *   watermarks compare and what stays stable across a removal
+ *   watermarks compare, what a compile's rendered layout counts its members
+ *   by (RenderedLayout.keyedBy), and what stays stable across a removal
  *   (`ContextManager.ordinalOf`).
  * - A listing position is a row's place in the presented listing a
  *   strategy reads (`MessageStoreView.positionOf`). It shifts when a row
@@ -283,6 +284,18 @@ export class WindowIndex {
   /** The row's index ordinal, while it is in the window; undefined otherwise, and in legacy mode. */
   ordinalOf(id: MessageId): number | undefined {
     return this.current().ordinals.get(id);
+  }
+
+  /**
+   * The ordinal of every row in the window, from one reading of the index;
+   * null in legacy mode, where there is none. For a caller asking of many
+   * rows at once, such as a compile's rendered layout, where ordinalOf
+   * would read the state's revision once a row. Read it at once: a later
+   * write changes it.
+   */
+  ordinals(): ReadonlyMap<MessageId, number> | null {
+    const state = this.current();
+    return state.rows.length === 0 ? null : state.ordinals;
   }
 
   /** Ordinals issued on this branch: the one the next item takes. 0 in legacy mode. */

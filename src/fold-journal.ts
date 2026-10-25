@@ -28,15 +28,17 @@
  *   receipt can never exist without the layout it was compared into, or the
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
- *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts). A delta holds the members that changed
- *   and the units from the first that changed to the last, so changes far
- *   apart re-send the units between them. A snapshot holds the whole layout,
- *   the history behind the window as its members; it is written only once
- *   the records since the last one would outweigh it, so snapshots are
- *   amortized against the deltas between them, and on average the bytes
- *   stored per acceptance stay bounded while the deltas do, though each
- *   snapshot holds the whole view's members.
+ *   message view. A layout persists as its members (gap-coded numbers:
+ *   store sequences, or window-index ordinals once rows are presented on
+ *   the branch, by the record's format) and its units (forms with counts).
+ *   A delta holds the members that changed and the units from the first
+ *   that changed to the last, so changes far apart re-send the units
+ *   between them. A snapshot holds the whole layout, the history behind
+ *   the window as its members; it is written only once the records since
+ *   the last one would outweigh it, so snapshots are amortized against the
+ *   deltas between them, and on average the bytes stored per acceptance
+ *   stay bounded while the deltas do, though each snapshot holds the whole
+ *   view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
@@ -69,9 +71,37 @@ import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
 
-/** The accepted-layout record format. Records of another format are not
- *  read: formats 1 and 2 were never released. */
-const RECORD_VERSION = 3;
+/**
+ * The accepted-layout record formats, by what a layout's members count
+ * (RenderedLayout.keyedBy). Format 3 counts store sequences: the manager's
+ * window is the record (legacy mode). Format 4 counts window-index ordinals:
+ * rows are presented on the branch (agent-framework #291), so the window's
+ * order can differ from the record's, and a member's sequence needn't
+ * ascend with its place. The two share the envelope and the receipt, so a
+ * branch's receipts are listed across both, but a layout of one is never
+ * compared with the other's: the first acceptance in the other format
+ * writes a baseline, once per namespace and branch. Records of any other
+ * format are not read: formats 1 and 2 were never released.
+ */
+const SEQUENCE_FORMAT = 3;
+const ORDINAL_FORMAT = 4;
+type RecordFormat = typeof SEQUENCE_FORMAT | typeof ORDINAL_FORMAT;
+
+/** The format a layout's record takes; null for a layout that doesn't say what its members count. */
+function formatFor(layout: RenderedLayout): RecordFormat | null {
+  if (layout.keyedBy === 'sequence') return SEQUENCE_FORMAT;
+  if (layout.keyedBy === 'ordinal') return ORDINAL_FORMAT;
+  return null;
+}
+
+function isKnownFormat(v: unknown): v is RecordFormat {
+  return v === SEQUENCE_FORMAT || v === ORDINAL_FORMAT;
+}
+
+/** What a format's members count. */
+function memberKind(format: RecordFormat): string {
+  return format === ORDINAL_FORMAT ? 'window-index ordinal' : 'store sequence';
+}
 /** How many receipts listFoldReceipts returns when no limit is given, and the most it returns for any limit. */
 export const FOLD_QUERY_DEFAULT_LIMIT = 10;
 export const FOLD_QUERY_MAX_LIMIT = 100;
@@ -95,7 +125,9 @@ export type FoldForm =
   | { form: 'summary'; level: number; summaries: Array<{ id: string; level: number; method: string; partial?: true }> }
   | { form: 'omitted' };
 
+/** A run's first or last message: its store sequence and id. */
 export interface FoldSpanBound {
+  /** The message's store sequence, as the record holds it, also when the layout counted members by window ordinal. */
   sequence: number;
   messageId: string;
 }
@@ -215,19 +247,21 @@ export interface FoldQueryResult {
 }
 
 /**
- * One accepted-layout record (format 3). Every acceptance writes one: the
- * branch's new last accepted layout, as a snapshot or as a delta on the
+ * One accepted-layout record (format 3 or 4). Every acceptance writes one:
+ * the branch's new last accepted layout, as a snapshot or as a delta on the
  * branch's previous record, together with the receipt it produced, if any.
  *
- * A layout is kept as two parts: its members (sequences, gap-coded; see
- * encodeSequences) and its units (forms with counts). A delta edits each
- * part separately: members as the sequences removed and added, units as a
- * prefix kept, a span replaced and a tail appended. Arrivals cost their own
- * members and units; a fold costs the units it changes; and the history
- * behind the window costs nothing beyond its members, in snapshots only.
+ * A layout is kept as two parts: its members (store sequences in format 3,
+ * window-index ordinals in format 4, gap-coded; see encodeMembers) and its
+ * units (forms with counts). A delta edits each part separately: members as
+ * the ones removed and added, units as a prefix kept, a span replaced and a
+ * tail appended. Arrivals cost their own members and units; a fold costs
+ * the units it changes; and the history behind the window costs nothing
+ * beyond its members, in snapshots only. A delta edits a record of its own
+ * format.
  */
 interface AcceptedLayoutRecord {
-  v: typeof RECORD_VERSION;
+  v: RecordFormat;
   ns: string;
   branch: BranchRef;
   compileId: string;
@@ -260,7 +294,7 @@ interface AcceptedLayoutRecord {
   receipt?: Omit<FoldReceipt, 'id'>;
 }
 
-/** A layout as an acceptance persists it: membership and forms, no ids. */
+/** A layout as an acceptance persists it: membership (as its record's format counts it) and forms, no ids. */
 export interface StoredLayout {
   readonly members: readonly number[];
   readonly units: readonly LayoutUnit[];
@@ -268,6 +302,7 @@ export interface StoredLayout {
 
 interface LatestLayout extends StoredLayout {
   recordId: string;
+  format: RecordFormat;
   totalTokens: number;
   chain: number;
   snapshotBytes: number;
@@ -356,7 +391,7 @@ function sizeCounting(record: AcceptedLayoutRecord, field: 'sb' | 'db', base: nu
 }
 
 function isLayoutRecord(record: AcceptedLayoutRecord | null): record is AcceptedLayoutRecord {
-  return !!record && record.v === RECORD_VERSION && typeof record.ns === 'string'
+  return !!record && isKnownFormat(record.v) && typeof record.ns === 'string'
     && typeof record.compileId === 'string' && !!record.branch;
 }
 
@@ -370,22 +405,27 @@ interface RecordHead {
   receiptAt: number | null;
   /** The branch's newest receipt before it, if any. */
   prevReceipt: string | null;
-  /** Of this format, so its layout can be rebuilt. */
+  /** Of a format this version reads, so its receipt and links are read and its layout can be rebuilt. */
   readable: boolean;
+  /** That format, which says what its layout's members count; null when it is another. */
+  format: RecordFormat | null;
 }
 
 function headOf(id: string, record: Partial<AcceptedLayoutRecord> | null): RecordHead | null {
   if (!record || typeof record !== 'object' || typeof record.ns !== 'string'
     || typeof record.compileId !== 'string' || !record.branch || typeof record.branch.id !== 'string') return null;
+  const format = isKnownFormat(record.v) ? record.v : null;
   return {
     id,
     ns: record.ns,
     branch: record.branch,
     compileId: record.compileId,
-    // Another format's receipt and links aren't read: only its envelope places it.
-    receiptAt: record.v === RECORD_VERSION && record.receipt ? Date.parse(record.receipt.acceptedAt) : null,
-    prevReceipt: record.v === RECORD_VERSION && typeof record.pr === 'string' ? record.pr : null,
-    readable: record.v === RECORD_VERSION,
+    // Another format's receipt and links aren't read: only its envelope
+    // places it. Formats 3 and 4 differ only in their members.
+    receiptAt: format !== null && record.receipt ? Date.parse(record.receipt.acceptedAt) : null,
+    prevReceipt: format !== null && typeof record.pr === 'string' ? record.pr : null,
+    readable: format !== null,
+    format,
   };
 }
 
@@ -660,9 +700,17 @@ export class FoldJournal {
    * returns the receipt that acceptance wrote, or null when it wrote none.
    * Returns the receipt, if any. A compile of another namespace is refused,
    * and so is one whose branch this store doesn't know, live or recorded,
-   * and one whose layout's members aren't in ascending order, whose units'
-   * counts aren't positive whole numbers adding up to its members, or that
-   * doesn't have one id for each member.
+   * and one whose layout doesn't say what its members count, whose members
+   * aren't in ascending order, whose units' counts aren't positive whole
+   * numbers adding up to its members, or that doesn't have one id and one
+   * sequence for each member.
+   *
+   * A layout's members are store sequences while the manager's window is
+   * the record, and window-index ordinals once rows are presented on its
+   * branch (RenderedLayout.keyedBy), recorded in formats 3 and 4. A branch
+   * whose newest record counts its members the other way is compared with
+   * nothing: the acceptance writes a baseline, as for a branch with no
+   * record, and links its receipt to the branch's receipts before it.
    */
   accept(
     provenance: CompileProvenance,
@@ -729,14 +777,19 @@ export class FoldJournal {
     // member. Only its shape can be checked: the ids aren't stored, and a
     // unit's form can't be told from its count, so a change that keeps the
     // shape lands as written. Checked before anything reads it for this record.
-    if (!wellFormed(layout) || layout.memberIds.length !== layout.members.length) {
+    const format = formatFor(layout);
+    if (format === null || !wellFormed(layout) || layout.memberIds.length !== layout.members.length
+      || layout.memberSequences?.length !== layout.members.length) {
+      const members = format === null ? 'members' : `members (each a ${memberKind(format)})`;
       throw new Error(
-        `the layout of compile ${provenance.compileId} can't be accepted: its members aren't in ascending order, its ` +
-          `units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id for each ` +
-          `member, so accepting it again is refused the same way. Accept a compile's provenance as compile returned it`,
+        `the layout of compile ${provenance.compileId} can't be accepted: it doesn't say whether its members are ` +
+          `store sequences or window-index ordinals, its ${members} aren't in ascending order, its units' counts ` +
+          `aren't positive whole numbers adding up to its members, or it doesn't have one id and one sequence for ` +
+          `each member, so accepting it again is refused the same way. Accept a compile's provenance as compile ` +
+          `returned it`,
       );
     }
-    const prev = branch ? this.loadLatest(index, branch) : null;
+    const prev = branch ? this.loadLatest(index, branch, format) : null;
 
     let draft: Omit<FoldReceipt, 'id'> | null = null;
     if (!prev) {
@@ -745,7 +798,7 @@ export class FoldJournal {
       const changes = diffLayouts(prev, layout, layout.calibration);
       if (changes.length > 0) draft = this.changeReceipt(provenance, layout, prev, changes, acceptedAt, usage, presentation);
     }
-    const receipt = this.commit(index, branch, provenance, layout, prev, draft);
+    const receipt = this.commit(index, branch, provenance, layout, format, prev, draft);
     if (receipt) this.announce(receipt);
     return receipt;
   }
@@ -1053,6 +1106,7 @@ export class FoldJournal {
     branch: BranchState | null,
     provenance: CompileProvenance,
     layout: RenderedLayout,
+    format: RecordFormat,
     prev: LatestLayout | null,
     draft: Omit<FoldReceipt, 'id'> | null,
   ): FoldReceipt | null {
@@ -1064,7 +1118,7 @@ export class FoldJournal {
     const next: StoredLayout = { members: [...layout.members], units: layout.units.map(copyUnit) };
     const pr = branch?.newestReceipt ?? null;
     const base = {
-      v: RECORD_VERSION as typeof RECORD_VERSION,
+      v: format,
       ns: this.namespace,
       branch: copyBranch(provenance.branch),
       compileId: provenance.compileId,
@@ -1083,7 +1137,7 @@ export class FoldJournal {
     }
     if (!record) {
       const snapshot: AcceptedLayoutRecord = {
-        ...base, kind: 'snapshot', m: encodeSequences(next.members), units: next.units,
+        ...base, kind: 'snapshot', m: encodeMembers(next.members), units: next.units,
         chain: 0, sb: 0, db: 0, ...receipt,
       };
       record = { ...snapshot, sb: sizeCounting(snapshot, 'sb', 0) };
@@ -1115,6 +1169,7 @@ export class FoldJournal {
     markDurable(index);
     this.latest.set(key, {
       recordId: written.id,
+      format,
       members: next.members,
       units: next.units,
       totalTokens: layout.totalTokens,
@@ -1126,15 +1181,33 @@ export class FoldJournal {
   }
 
   /**
-   * The last accepted layout of a branch: its newest record in the index,
-   * whichever journal on the store wrote it, rebuilt unless this journal
-   * already holds that record's layout.
+   * The last accepted layout of a branch, to compare a layout of `format`
+   * with: its newest record in the index, whichever journal on the store
+   * wrote it, rebuilt unless this journal already holds that record's
+   * layout. Null, so the acceptance writes a baseline, when that record's
+   * members count something other than `format`'s: the branch's window was
+   * the record when it was written, and rows are presented on it now, or
+   * the other way around (see SEQUENCE_FORMAT).
    */
-  private loadLatest(index: StoreIndex, branch: BranchState): LatestLayout | null {
+  private loadLatest(index: StoreIndex, branch: BranchState, format: RecordFormat): LatestLayout | null {
     const key = branchKey(branch.ref);
     const id = branch.newest.id;
+    if (branch.newest.format !== null && branch.newest.format !== format) {
+      // Expected once per branch, at the first acceptance after a host
+      // presents rows there: a warning, not an unreadable record.
+      const said = `switch ${id} ${format}`;
+      if (!index.warned.has(said)) {
+        index.warned.add(said);
+        this.diag.warn(
+          `[fold-journal] branch ${branch.ref.name}'s last accepted layout, record ${id}, counts its members by ` +
+            `${memberKind(branch.newest.format)} and this compile's by ${memberKind(format)}; the branch's layouts ` +
+            `start again from a baseline, and its receipts before it stay listed`,
+        );
+      }
+      return null;
+    }
     const cached = this.latest.get(key);
-    if (cached && cached.recordId === id) return cached;
+    if (cached && cached.recordId === id && cached.format === format) return cached;
     if (!branch.newest.readable) {
       warnUnreadable(index, id, `it is of another format; branch ${branch.ref.name} is treated as unrecorded`, this.diag);
       return null;
@@ -1158,6 +1231,7 @@ export class FoldJournal {
     }
     const latest: LatestLayout = {
       recordId: id,
+      format: record.v,
       ...layout,
       totalTokens: record.totalTokens,
       chain: record.chain,
@@ -1184,11 +1258,15 @@ export class FoldJournal {
       if (older.ns !== record.ns || branchKey(older.branch) !== branchKey(record.branch)) {
         throw new Error(`record ${current.prev} in its chain belongs to another namespace or branch`);
       }
+      // A chain's members are all of one kind: sequences and ordinals don't mix.
+      if (older.v !== record.v) {
+        throw new Error(`record ${current.prev} in its chain counts its members by ${memberKind(older.v)}, not by ${memberKind(record.v)}`);
+      }
       current = older;
     }
     if (current.kind !== 'snapshot' || current.m === undefined || !current.units) throw new Error('its chain ends in no snapshot');
     if (chain.length !== record.chain) throw new Error(`its chain has ${chain.length} deltas where the record counts ${record.chain}`);
-    const layout = applyLayoutChain({ members: decodeSequences(current.m), units: current.units }, chain.reverse());
+    const layout = applyLayoutChain({ members: decodeMembers(current.m), units: current.units }, chain.reverse());
     if (!wellFormed(layout)) throw new Error('members and units disagree');
     return layout;
   }
@@ -1250,19 +1328,21 @@ function parseSince(since: string): number {
 // ============================================================================
 
 /**
- * Ascending sequences as text: the first, then each gap to the next, every
- * number an unsigned LEB128 varint, all base64url. Store sequences are
- * shared with every other record on the branch, so a layout's members are
- * rarely consecutive; their gaps are small, about 1.3 bytes each.
+ * A layout's members as text, ascending: the first, then each gap to the
+ * next, every number an unsigned LEB128 varint, all base64url. Store
+ * sequences (format 3) are shared with every other record on the branch,
+ * so a layout's members are rarely consecutive; their gaps are small, about
+ * 1.3 bytes each. Window-index ordinals (format 4) number only the
+ * window's own items, so their gaps are mostly 1.
  */
-export function encodeSequences(sequences: readonly number[]): string {
+export function encodeMembers(members: readonly number[]): string {
   const bytes: number[] = [];
   let prev = 0;
-  for (let i = 0; i < sequences.length; i++) {
-    const value = sequences[i]!;
+  for (let i = 0; i < members.length; i++) {
+    const value = members[i]!;
     let v = i === 0 ? value : value - prev;
     if (!Number.isSafeInteger(value) || v < (i === 0 ? 0 : 1)) {
-      throw new Error(`sequences must be ascending non-negative integers (at ${i}: ${value})`);
+      throw new Error(`members must be ascending non-negative integers (at ${i}: ${value})`);
     }
     while (v >= 128) {
       bytes.push((v % 128) + 128);
@@ -1274,7 +1354,7 @@ export function encodeSequences(sequences: readonly number[]): string {
   return Buffer.from(bytes).toString('base64url');
 }
 
-export function decodeSequences(text: string): number[] {
+export function decodeMembers(text: string): number[] {
   const bytes = Buffer.from(text, 'base64url');
   const out: number[] = [];
   let value = 0;
@@ -1284,21 +1364,21 @@ export function decodeSequences(text: string): number[] {
     value += (byte % 128) * scale;
     if (byte >= 128) {
       scale *= 128;
-      if (scale > 2 ** 56) throw new Error('sequence varint too long');
+      if (scale > 2 ** 56) throw new Error('member varint too long');
       continue;
     }
-    const sequence = out.length === 0 ? value : prev + value;
-    if (out.length > 0 && value < 1) throw new Error('sequences must ascend');
-    out.push(sequence);
-    prev = sequence;
+    const member = out.length === 0 ? value : prev + value;
+    if (out.length > 0 && value < 1) throw new Error('members must ascend');
+    out.push(member);
+    prev = member;
     value = 0;
     scale = 1;
   }
-  if (scale !== 1) throw new Error('truncated sequence varint');
+  if (scale !== 1) throw new Error('truncated member varint');
   return out;
 }
 
-/** The sequences only `before` holds, and those only `after` holds. */
+/** The members only `before` holds, and those only `after` holds. */
 function membershipDelta(before: readonly number[], after: readonly number[]): { removed: number[]; added: number[] } {
   const removed: number[] = [];
   const added: number[] = [];
@@ -1312,7 +1392,7 @@ function membershipDelta(before: readonly number[], after: readonly number[]): {
   return { removed, added };
 }
 
-/** `members` with each sequence's final change applied: false removes it, true adds it. */
+/** `members` with each member's final change applied: false removes it, true adds it. */
 function applyMembershipChanges(members: readonly number[], changed: ReadonlyMap<number, boolean>): number[] {
   if (changed.size === 0) return [...members];
   const kept = members.filter((s) => changed.get(s) !== false);
@@ -1400,12 +1480,15 @@ class UnitCursor {
 /**
  * Compare two layouts over exactly the messages present in both: a merge
  * walk over the two member lists, so a message one view lacked (removed,
- * filtered out) never counts, however near a range it lies. Each message
- * whose form differs is part of a change, and consecutive changed messages
- * with the same before/after forms make one run (messages present on only
- * one side do not break a run). Boundaries and counts are exact; boundary
- * ids are the compile's, from `after`. Tokens count each raw message once,
- * and each summary once per side, in the first changed run that names it.
+ * taken out of the window, filtered out) never counts, however near a
+ * range it lies. Both lists count the same thing (one record format). Each
+ * message whose form differs is part of a change, and consecutive changed
+ * messages with the same before/after forms make one run (messages present
+ * on only one side do not break a run). Boundaries and counts are exact;
+ * boundary ids and sequences are the compile's, from `after`, so a
+ * boundary names a store sequence whatever the members count. Tokens count
+ * each raw message once, and each summary once per side, in the first
+ * changed run that names it.
  */
 export function diffLayouts(before: StoredLayout, after: RenderedLayout, calibration: number): FoldChange[] {
   const changes: FoldChange[] = [];
@@ -1435,7 +1518,7 @@ export function diffLayouts(before: StoredLayout, after: RenderedLayout, calibra
     if (keyBefore === keyAfter) {
       flush();
     } else {
-      const bound = { sequence: B[j]!, messageId: after.memberIds[j]! };
+      const bound = { sequence: after.memberSequences[j]!, messageId: after.memberIds[j]! };
       const tokensBefore = unitTokens(u, countedBefore);
       const tokensAfter = unitTokens(v, countedAfter);
       const key = `${keyBefore}>${keyAfter}`;
@@ -1489,7 +1572,8 @@ function unitTokens(u: LayoutUnit, counted: Set<string>): number {
 
 /**
  * A baseline's layout as runs: consecutive raw units grouped. Each summary's
- * tokens count once, in the first run that names it.
+ * tokens count once, in the first run that names it. A run's bounds name
+ * store sequences, whatever the members count.
  */
 export function layoutRuns(layout: RenderedLayout, calibration: number): FoldLayoutRun[] {
   const runs: FoldLayoutRun[] = [];
@@ -1497,8 +1581,8 @@ export function layoutRuns(layout: RenderedLayout, calibration: number): FoldLay
   let at = 0;
   for (const u of layout.units) {
     const n = unitCount(u);
-    const first = { sequence: layout.members[at]!, messageId: layout.memberIds[at]! };
-    const last = { sequence: layout.members[at + n - 1]!, messageId: layout.memberIds[at + n - 1]! };
+    const first = { sequence: layout.memberSequences[at]!, messageId: layout.memberIds[at]! };
+    const last = { sequence: layout.memberSequences[at + n - 1]!, messageId: layout.memberIds[at + n - 1]! };
     at += n;
     const prev = runs[runs.length - 1];
     if (u.k === 'r' && prev && prev.form.form === 'raw' && Boolean(prev.form.partial) === Boolean(u.p)) {
@@ -1532,8 +1616,8 @@ export interface LayoutDelta {
 }
 
 /**
- * Express `next` as an edit of `prev`: its members as the sequences removed
- * and added, its units as a common prefix of `p` kept, `drop` dropped, `ins`
+ * Express `next` as an edit of `prev`: its members as the ones removed and
+ * added, its units as a common prefix of `p` kept, `drop` dropped, `ins`
  * inserted, the rest of `prev` kept, then `app` appended. Arrivals become
  * added members and appended units; a fold in the middle becomes a small
  * drop/ins; a change to `prev`'s last unit replaces everything after the
@@ -1545,8 +1629,8 @@ export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta
   const units = unitsDelta(prev.units, next.units);
   const { removed, added } = membershipDelta(prev.members, next.members);
   return {
-    ...(removed.length > 0 ? { mr: encodeSequences(removed) } : {}),
-    ...(added.length > 0 ? { ma: encodeSequences(added) } : {}),
+    ...(removed.length > 0 ? { mr: encodeMembers(removed) } : {}),
+    ...(added.length > 0 ? { ma: encodeMembers(added) } : {}),
     p: units.p,
     ...(units.drop > 0 ? { drop: units.drop } : {}),
     ...(units.ins.length > 0 ? { ins: units.ins } : {}),
@@ -1588,7 +1672,7 @@ export function applyLayoutDelta(prev: StoredLayout, record: LayoutDelta): Store
 }
 
 /**
- * Apply a chain of deltas, oldest first, in one pass: each sequence's last
+ * Apply a chain of deltas, oldest first, in one pass: each member's last
  * change wins, merged into the members once, and each unit edit applies in
  * place. So rebuilding a long chain costs the members once plus the edits,
  * not a pass over the members per delta.
@@ -1597,8 +1681,8 @@ export function applyLayoutChain(base: StoredLayout, deltas: readonly LayoutDelt
   const changed = new Map<number, boolean>();
   let units = [...base.units];
   for (const d of deltas) {
-    if (d.mr !== undefined) for (const s of decodeSequences(d.mr)) changed.set(s, false);
-    if (d.ma !== undefined) for (const s of decodeSequences(d.ma)) changed.set(s, true);
+    if (d.mr !== undefined) for (const s of decodeMembers(d.mr)) changed.set(s, false);
+    if (d.ma !== undefined) for (const s of decodeMembers(d.ma)) changed.set(s, true);
     const p = d.p ?? 0;
     const drop = d.drop ?? 0;
     const ins = d.ins ?? [];

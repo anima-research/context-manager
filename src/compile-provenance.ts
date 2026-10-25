@@ -224,7 +224,12 @@ export function attributeEntries(
 /**
  * Build the rendered layout of one compile: the view's members, and one unit
  * per raw message and per run of summarized or omitted messages, in view
- * order. `view` is in sequence order, as every message view is.
+ * order. `view` is the strategy's view, in the manager's window order.
+ * Without `ordinalOf` the window is the record, in sequence order, and the
+ * members are the messages' sequences. With it the window is the manager's
+ * index, and the members are its ordinals, which ascend in window order
+ * whatever the sequences do; it must answer for every message of the view,
+ * as the window it lists does.
  *
  * `estimateBase` returns a base (calibration-free) token estimate for some
  * rendered content. Raw message tokens are their entry's estimate, split
@@ -242,6 +247,8 @@ export function buildRenderedLayout(opts: {
   extraTokens: number;
   calibration: number;
   cause?: string;
+  /** Each view message's window-index ordinal, once rows are presented (see RenderedLayout.keyedBy). */
+  ordinalOf?: (id: MessageId) => number | undefined;
 }): RenderedLayout {
   const rawTokens = new Map<MessageId, number>();
   const summaryTokens = new Map<string, number>();
@@ -277,13 +284,24 @@ export function buildRenderedLayout(opts: {
     }
   }
 
+  const ordinalOf = opts.ordinalOf;
   const members: number[] = [];
   const memberIds: MessageId[] = [];
+  const memberSequences: number[] = [];
   // The layout's units are read-only once returned; here each run grows.
   const units: Array<Growing<LayoutUnit>> = [];
   for (const msg of opts.view) {
-    members.push(msg.sequence);
+    if (ordinalOf) {
+      const ordinal = ordinalOf(msg.id);
+      if (ordinal === undefined) {
+        throw new Error(`the rendered layout can't name ${msg.id}: the compile's view holds it, and the window it lists has no ordinal for it`);
+      }
+      members.push(ordinal);
+    } else {
+      members.push(msg.sequence);
+    }
     memberIds.push(msg.id);
+    memberSequences.push(msg.sequence);
     if (rawTokens.has(msg.id)) {
       const t = Math.round(rawTokens.get(msg.id)!);
       units.push(opts.rawComplete.get(msg.id) === false ? { k: 'r', t, p: 1 } : { k: 'r', t });
@@ -313,9 +331,11 @@ export function buildRenderedLayout(opts: {
   }
 
   return {
-    v: 2,
+    v: 3,
+    keyedBy: ordinalOf ? 'ordinal' : 'sequence',
     members,
     memberIds,
+    memberSequences,
     units,
     totalTokens: Math.round(totalTokens),
     calibration: opts.calibration,

@@ -2013,6 +2013,11 @@ export class ContextManager {
     const estimateBase = (content: ContentBlock[]): number => this.messageStore.estimateBaseTokens(content);
     let extraTokens = 0;
     for (const content of injected) extraTokens += estimateBase(content);
+    // Members are the rows' sequences while the window is the record, and
+    // their ordinals once rows are presented, which ascend in the window's
+    // order whatever order the record has (RenderedLayout.keyedBy). Read in
+    // the same synchronous compile as the view, so the two agree.
+    const ordinals = this.windowIndex.ordinals();
     return buildRenderedLayout({
       view: viewMessages,
       entries,
@@ -2022,6 +2027,7 @@ export class ContextManager {
       extraTokens,
       calibration: factor,
       cause,
+      ...(ordinals ? { ordinalOf: (id: MessageId) => ordinals.get(id) } : {}),
     });
   }
 
@@ -2039,6 +2045,11 @@ export class ContextManager {
    * in its namespace, by any manager of it on the store — even when another
    * branch is selected by now — and appends a fold receipt when any message
    * changed form, or a baseline when that branch has no record it can read.
+   * A layout counts its members by store sequence while the window is the
+   * record, and by window-index ordinal once rows are presented on its
+   * branch (RenderedLayout.keyedBy). The journal never compares one with the
+   * other, so the first compile accepted after the first presentRows on a
+   * branch writes a baseline there, and the receipts before it stay listed.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
@@ -2060,7 +2071,8 @@ export class ContextManager {
    * another store's: accept a compile on the manager that compiled it. So is
    * a layout whose shape changed after compile returned it: members out of
    * order, unit counts that aren't positive whole numbers adding up to the
-   * members, or not one id for each member.
+   * members, not one id and one sequence for each member, or no word of what
+   * its members count.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
