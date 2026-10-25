@@ -23,7 +23,9 @@
  * registration, so a branch made before the first presentation has no
  * index, and is in legacy mode, as its parent was then. Its items are:
  *
- * - a header, `{ v: 1 }`, the first item a manager writes;
+ * - a header, `{ v: 1 }`, naming the format: the last item of the write-down
+ *   (below), so an index holds one only once the window was written down
+ *   whole;
  * - a presentation, `{ id }`: the stored row with that id (a record id, as a
  *   string) entered the window;
  * - a tombstone, `{ retract, undone? }`: the row left the window, taken out
@@ -52,8 +54,22 @@
  * mode: there is no index, and the window is the record itself, live, as it
  * always was, so every compile is byte for byte what it was before this
  * module existed. A host's first presentation writes the index down as the
- * window stands then (every row of the record, in record order) and the
- * manager is in presented mode on that branch from then on.
+ * window stands then (every row of the record, in record order, then the
+ * header) and the manager is in presented mode on that branch from then on.
+ *
+ * The header is what switches the mode. Each item is one record, so a
+ * write-down can be cut short, by a failed append or by a crash that loses
+ * the records the store hadn't synced, and the rows it wrote are a prefix of
+ * the window without the header. Such an index is not in effect: the
+ * manager stays in legacy mode, its window still the whole record, and the
+ * next presentRows or retractRows finishes the write-down, the rows it
+ * hasn't written then the header, before it does its own work.
+ *
+ * A header naming a format other than this version's is another version's
+ * index, and so is a log with items this version can't read and no header
+ * to say whose they are. The manager reads the window as the record there,
+ * with a warning, and refuses to present or retract, so it never writes its
+ * items into a log another format keeps.
  *
  * Not to be confused with two other senses of the word in this package:
  * kv-unified's presentation receipts (a provider submission's leaf layout)
@@ -69,7 +85,10 @@ import type { MessageId, MessageStoreView, StoredMessage } from './types/index.j
 /** Whether a manager's window is the record (`legacy`) or its index (`presented`), on the branch its store is on. */
 export type PresentationMode = 'legacy' | 'presented';
 
-/** The format the header names. */
+/**
+ * The format the header names. An index whose header names another is
+ * another version's, which this one reads as the record and never writes to.
+ */
 const INDEX_FORMAT = 1;
 
 /** The state that holds a namespace's window index. */
@@ -114,20 +133,71 @@ interface IndexState {
   version: number;
   /** `rows` without its holes, once asked for. */
   presented: MessageId[] | null;
+  /**
+   * The ordinal of this format's header, the write-down's last item, once
+   * read; null while the index holds none, and is not in effect (legacy
+   * mode, see inEffect). The rows at ordinals below it are the ones the
+   * write-down presented.
+   */
+  header: number | null;
+  /** A header's format that isn't this version's, the first one read; null when there is none. */
+  otherFormat: number | null;
+  /** How many items this version can't read. */
+  unreadable: number;
 }
 
 /** Bumped for every new reading or change of any index, so versions never repeat. */
 let versions = 0;
 
 function emptyState(branchId: unknown, revision: number | null): IndexState {
-  return { branchId, revision, rows: [], at: [], ordinals: new Map(), undone: new Set(), version: ++versions, presented: null };
+  return {
+    branchId,
+    revision,
+    rows: [],
+    at: [],
+    ordinals: new Map(),
+    undone: new Set(),
+    version: ++versions,
+    presented: null,
+    header: null,
+    otherFormat: null,
+    unreadable: 0,
+  };
 }
 
-/** Applies one item at `ordinal`, the next one; false for an item this version can't read, which leaves a hole. */
+/**
+ * Why this version must not write to the index, or null: a header naming
+ * another format, or, with no header, items it can't read, which some other
+ * format's write-down left. The window reads as the record there.
+ */
+function foreignness(state: IndexState): string | null {
+  if (state.otherFormat !== null) return `is in format ${state.otherFormat}, which this version (format ${INDEX_FORMAT}) doesn't read`;
+  if (state.header === null && state.unreadable > 0) {
+    return `holds ${state.unreadable} item(s) this version can't read and no header naming their format`;
+  }
+  return null;
+}
+
+/**
+ * Whether the index is the window: it holds this format's header, which
+ * the write-down writes last, and nothing of another format's. Otherwise the
+ * manager is in legacy mode, whatever rows a write-down cut short left.
+ */
+function inEffect(state: IndexState): boolean {
+  return state.header !== null && foreignness(state) === null;
+}
+
+/**
+ * Applies one item at `ordinal`, the next one; false for an item this
+ * version can't read, which leaves a hole. A header leaves a hole too.
+ */
 function apply(state: IndexState, item: unknown, ordinal: number, at: number | undefined): boolean {
   state.at[ordinal] = at;
   state.rows[ordinal] = null;
-  if (typeof item !== 'object' || item === null) return false;
+  if (typeof item !== 'object' || item === null) {
+    state.unreadable++;
+    return false;
+  }
   const fields = item as { id?: unknown; retract?: unknown; undone?: unknown; v?: unknown };
   if (typeof fields.id === 'string') {
     // A row presented twice keeps its first ordinal: the window only grows
@@ -149,7 +219,13 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
     else state.undone.delete(fields.retract);
     return true;
   }
-  return typeof fields.v === 'number';
+  if (typeof fields.v === 'number') {
+    if (fields.v !== INDEX_FORMAT) state.otherFormat ??= fields.v;
+    else state.header ??= ordinal;
+    return true;
+  }
+  state.unreadable++;
+  return false;
 }
 
 /** Positions of each id in a listing, built once per listing (a listing is never changed in place). */
@@ -268,28 +344,35 @@ export class WindowIndex {
     if (revision === null) return state;
     const items = this.store.getStateJson(this.stateId) as unknown;
     if (!Array.isArray(items)) return state;
-    let unreadable = 0;
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as { at?: unknown } | null;
       const at = typeof item?.at === 'number' ? item.at : undefined;
-      if (!apply(state, item, i, at)) unreadable++;
+      apply(state, item, i, at);
     }
-    if (unreadable > 0) {
+    const foreign = foreignness(state);
+    if (foreign !== null) {
       this.diag.warn(
-        `[context-manager] the window index of branch ${this.store.currentBranch().name} holds ${unreadable} ` +
+        `[context-manager] the window index of branch ${this.store.currentBranch().name} ${foreign}; ` +
+          `the window there is the record (legacy mode), and presentRows and retractRows refuse to write to it`,
+      );
+    } else if (state.unreadable > 0) {
+      this.diag.warn(
+        `[context-manager] the window index of branch ${this.store.currentBranch().name} holds ${state.unreadable} ` +
           `item(s) this version can't read; each is left out of the window as a hole`,
       );
     }
     return state;
   }
 
+  /** `presented` once the index holds this format's header, which the write-down writes last; `legacy` before. */
   mode(): PresentationMode {
-    return this.current().rows.length > 0 ? 'presented' : 'legacy';
+    return inEffect(this.current()) ? 'presented' : 'legacy';
   }
 
   /** The row's index ordinal, while it is in the window; undefined otherwise, and in legacy mode. */
   ordinalOf(id: MessageId): number | undefined {
-    return this.current().ordinals.get(id);
+    const state = this.current();
+    return inEffect(state) ? state.ordinals.get(id) : undefined;
   }
 
   /**
@@ -301,12 +384,13 @@ export class WindowIndex {
    */
   ordinals(): ReadonlyMap<MessageId, number> | null {
     const state = this.current();
-    return state.rows.length === 0 ? null : state.ordinals;
+    return inEffect(state) ? state.ordinals : null;
   }
 
   /** Ordinals issued on this branch: the one the next item takes. 0 in legacy mode. */
   length(): number {
-    return this.current().rows.length;
+    const state = this.current();
+    return inEffect(state) ? state.rows.length : 0;
   }
 
   /**
@@ -316,6 +400,7 @@ export class WindowIndex {
    */
   presentedAt(id: MessageId): number | undefined {
     const state = this.current();
+    if (!inEffect(state)) return undefined;
     const ordinal = state.ordinals.get(id);
     return ordinal === undefined ? undefined : state.at[ordinal];
   }
@@ -341,7 +426,7 @@ export class WindowIndex {
    */
   listing(source: StoredMessage[]): StoredMessage[] {
     const state = this.current();
-    if (state.rows.length === 0) return source;
+    if (!inEffect(state)) return source;
     const built = this.built;
     if (built && built.source === source && built.version === state.version) return built.listing;
     const messages = messagesIn(source);
@@ -374,7 +459,7 @@ export class WindowIndex {
    */
   ordinalFrom(sequence: number, source: StoredMessage[]): number | undefined {
     const state = this.current();
-    if (state.rows.length === 0) return undefined;
+    if (!inEffect(state)) return undefined;
     for (const message of this.listing(source)) {
       if (message.sequence >= sequence) return state.ordinals.get(message.id);
     }
@@ -388,6 +473,7 @@ export class WindowIndex {
    */
   sequenceFrom(ordinal: number, source: StoredMessage[]): number | undefined {
     const state = this.current();
+    if (!inEffect(state)) return undefined;
     const messages = messagesIn(source);
     for (let i = Math.max(0, ordinal); i < state.rows.length; i++) {
       const id = state.rows[i];
@@ -400,7 +486,7 @@ export class WindowIndex {
   /** The record's rows not in the window, in record order, leaving out an undone turn's rows. Empty in legacy mode. */
   unpresented(source: readonly StoredMessage[]): StoredMessage[] {
     const state = this.current();
-    if (state.rows.length === 0) return [];
+    if (!inEffect(state)) return [];
     return source.filter((m) => !state.ordinals.has(m.id) && !state.undone.has(m.id));
   }
 
@@ -408,8 +494,9 @@ export class WindowIndex {
    * Present `ids`, rows of `record` (the merged listing, in record order),
    * in the order given, after checking every one before writing any. In
    * legacy mode the window is the whole record already: the call writes it
-   * down as the index (the header, then every row of `record` in record
-   * order), and the rows it names are among them. Returns each named row's
+   * down as the index (writeDown: every row of `record` in record order,
+   * then the header), or finishes a write-down an earlier call left cut
+   * short, and the rows it names are among them. Returns each named row's
    * ordinal, and `entered`, the rows that entered the window, in window
    * order, every shard of a body: none when the call wrote the window down
    * in legacy mode, since each of its rows was in the window already.
@@ -423,8 +510,8 @@ export class WindowIndex {
     const rows = wholeBodies('presentRows', ids, record, positionOf, (id) => {
       throw new Error(`ContextManager.presentRows: no stored message has id ${id}; give each row by the id addMessage returned for it`);
     });
-    if (state.rows.length === 0) {
-      this.write(this.bootstrap(record));
+    if (!inEffect(state)) {
+      this.write(this.writeDown('presentRows', state, record));
       const ordinals = this.current().ordinals;
       return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [] };
     }
@@ -440,8 +527,11 @@ export class WindowIndex {
   /**
    * Take `ids` out of the window, leaving their ordinals as holes, after
    * checking every one before writing any. A row the record no longer has
-   * can still be taken out by its id. In legacy mode the window is first
-   * written down as `present` writes it.
+   * can still be taken out by its id. An empty `ids` takes nothing out and
+   * writes nothing, in either mode. In legacy mode, where the window is the
+   * record, the window is first written down as `present` writes it, and
+   * the manager is in presented mode from then on: the rows taken out are
+   * holes in the index that write-down began.
    */
   retract(
     ids: readonly MessageId[],
@@ -450,12 +540,15 @@ export class WindowIndex {
     undone: boolean,
   ): void {
     const state = this.current();
-    const legacy = state.rows.length === 0;
+    const legacy = !inEffect(state);
     const rows = wholeBodies('retractRows', ids, record, positionOf, (id) => {
-      if (!state.ordinals.has(id)) {
+      // In legacy mode the window is the record, so a row it doesn't hold
+      // isn't in the window either, whatever a write-down cut short wrote.
+      if (legacy || !state.ordinals.has(id)) {
         throw new Error(`ContextManager.retractRows: no stored message has id ${id}, and the window holds none`);
       }
     });
+    if (rows.length === 0) return;
     // In legacy mode every row of the record is in the window. Otherwise a
     // row named must be; a shard that came with its first shard's id and
     // isn't (a body a failed write left part-presented) has nothing to take.
@@ -468,7 +561,7 @@ export class WindowIndex {
     const tombstones = rows
       .filter(inWindow)
       .map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
-    this.write(legacy ? [...this.bootstrap(record), ...tombstones] : tombstones);
+    this.write(legacy ? [...this.writeDown('retractRows', state, record), ...tombstones] : tombstones);
   }
 
   /**
@@ -480,7 +573,7 @@ export class WindowIndex {
    */
   retractRemoved(ids: readonly MessageId[]): MessageId[] {
     const state = this.current();
-    if (state.rows.length === 0) return [];
+    if (!inEffect(state)) return [];
     const leaving: MessageId[] = [];
     for (const id of new Set(ids)) if (state.ordinals.has(id)) leaving.push(id);
     this.write(leaving.map((id): IndexItem => ({ retract: id })));
@@ -511,18 +604,46 @@ export class WindowIndex {
       version: ++versions,
       // Never changed in place (a write sets it to null), so both can read it.
       presented: state.presented,
+      header: state.header,
+      otherFormat: state.otherFormat,
+      unreadable: state.unreadable,
     };
   }
 
-  private bootstrap(record: readonly StoredMessage[]): IndexItem[] {
-    return [{ v: INDEX_FORMAT }, ...record.map((m) => ({ id: m.id }))];
+  /**
+   * The items that write the window down, in legacy mode, where the window
+   * is the whole record: every row of `record` in record order, then the
+   * header, which puts the index in effect. The header goes last so that a
+   * write-down cut short leaves the manager in legacy mode (write). The next
+   * one finishes it from where it stopped. A row it wrote that has since
+   * left the record (a removal writes nothing in legacy mode) is taken out,
+   * and the rows it didn't write follow the ones it did: those were a
+   * prefix of the record and still are, since later rows are stored after
+   * them. Throws for an index this version must not write to (foreignness).
+   */
+  private writeDown(operation: string, state: IndexState, record: readonly StoredMessage[]): IndexItem[] {
+    const foreign = foreignness(state);
+    if (foreign !== null) {
+      throw new Error(
+        `ContextManager.${operation}: the window index of branch ${this.store.currentBranch().name} ${foreign}, ` +
+          `so this version writes nothing to it; the window there is the record`,
+      );
+    }
+    const held = messagesIn(record);
+    const items: IndexItem[] = [];
+    for (const id of state.ordinals.keys()) if (!held.has(id)) items.push({ retract: id });
+    for (const message of record) if (!state.ordinals.has(message.id)) items.push({ id: message.id });
+    items.push({ v: INDEX_FORMAT });
+    return items;
   }
 
   /**
    * Append items, one record each. A store that can append several items in
    * one record would make a presentation one write; until then a failure
-   * partway leaves the items before it written, and the index is read again
-   * from the store.
+   * partway, or a crash before the store synced, leaves the items before it
+   * written, and the index is read again from the store. For a write-down
+   * that is a prefix of its rows without the header, which leaves the index
+   * out of effect until the next write-down finishes it (writeDown).
    */
   private write(items: IndexItem[]): void {
     if (items.length === 0) return;

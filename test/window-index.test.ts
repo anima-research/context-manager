@@ -6,6 +6,10 @@
  * - Legacy mode: until a host presents a row, the window is the merged
  *   record itself, read live, and nothing is written, so compiles are what
  *   they were. A reader that merges another slot keeps seeing it grow.
+ * - The write-down: the first presentRows, or a retractRows that names a
+ *   row, writes the window down, its header last, so one cut short leaves
+ *   legacy mode and the next call finishes it. An index in another format
+ *   is read as the record and never written to.
  * - Presented mode: the window is the index. A row stored and not presented
  *   stays out of it; rows presented out of record order are compiled in
  *   the window's order, and compile provenance still finds each body.
@@ -165,6 +169,188 @@ describe('the window in legacy mode', () => {
     assert.equal(side.lastPresentedSequence(), side.getMessage(s2)!.sequence);
     side.close();
     main.close();
+  });
+});
+
+const INDEX = windowIndexStateId('zz-agent');
+
+/** The index's items as stored, without the `at` and `by` each record adds. */
+function indexItems(cm: ContextManager): Array<Record<string, unknown>> {
+  const items = (cm.getStore().getStateJson(INDEX) as Array<Record<string, unknown>> | null) ?? [];
+  return items.map((item) => Object.fromEntries(Object.entries(item).filter(([key]) => key !== 'at' && key !== 'by')));
+}
+
+/** Makes the `failing`-th append to the window index from now on throw, as a full disk would; returns the undo. */
+function failIndexAppend(cm: ContextManager, failing: number): () => void {
+  const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+  const append = store.appendToStateJsonWithIdentity;
+  let appends = 0;
+  store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+    if (id === INDEX && ++appends === failing) throw new Error('zz-index-append-failed');
+    return append.call(this, id, ...rest);
+  };
+  return () => {
+    store.appendToStateJsonWithIdentity = append;
+  };
+}
+
+/** Runs `presentRows([])` with the `failing`-th index append throwing. */
+function cutShortWriteDown(cm: ContextManager, failing: number): void {
+  const restore = failIndexAppend(cm, failing);
+  try {
+    assert.throws(() => cm.presentRows([]), /zz-index-append-failed/);
+  } finally {
+    restore();
+  }
+}
+
+describe('writing the window down', () => {
+  it('cut short at any item, it leaves legacy mode and the whole record, and the next presentRows([]) finishes it once', async () => {
+    // Four rows and the header are five items, one record each. The header
+    // is the last, so wherever the write-down stops, the index has none and
+    // the window is still the record.
+    for (let failing = 1; failing <= 5; failing++) {
+      const cut = `cut short at item ${failing}`;
+      const path = freshPath();
+      let cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const rows = ['a', 'b', 'c', 'd'].map((t) => cm.addMessage('alice', [text(t)]));
+      cutShortWriteDown(cm, failing);
+      assert.deepEqual(indexItems(cm), rows.slice(0, failing - 1).map((id) => ({ id })), `the rows before the failure are written, and no header, ${cut}`);
+      assert.equal(cm.presentationMode(), 'legacy', cut);
+      assert.equal(cm.indexLength(), 0, cut);
+      assert.equal(cm.ordinalOf(rows[0]!), undefined, cut);
+      assert.deepEqual(cm.getUnpresentedMessages(), [], cut);
+      assert.equal(cm.getPresentedMessages(), cm.getAllMessages(), `the window is the record itself, ${cut}`);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd'], cut);
+
+      // A restart reads it the same way; a crash that loses the records the
+      // store hadn't synced leaves such a prefix too.
+      cm.close();
+      cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      assert.equal(cm.presentationMode(), 'legacy', `after a reopen, ${cut}`);
+      const e = cm.addMessage('alice', [text('e')]);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], `a row stored meanwhile reaches the window at once, ${cut}`);
+
+      // The boot call finishes it: the rows not written yet, each once, in
+      // record order after the ones that were, then the header.
+      assert.deepEqual(cm.presentRows([]), []);
+      assert.equal(cm.presentationMode(), 'presented', cut);
+      assert.deepEqual(indexItems(cm), [...[...rows, e].map((id) => ({ id })), { v: 1 }], cut);
+      assert.deepEqual([...rows, e].map((id) => cm.ordinalOf(id)), [0, 1, 2, 3, 4], cut);
+      assert.equal(cm.indexLength(), 6, cut);
+      assert.deepEqual(cm.getUnpresentedMessages(), [], cut);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], cut);
+
+      // From here the window grows only by presentation, and the boot call
+      // writes nothing more.
+      cm.addMessage('bob', [text('f, not presented')]);
+      assert.deepEqual(cm.presentRows([]), []);
+      assert.equal(indexItems(cm).length, 6, cut);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], cut);
+      cm.close();
+      cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      assert.equal(cm.presentationMode(), 'presented', `after a reopen, ${cut}`);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e'], `after a reopen, ${cut}`);
+      cm.close();
+    }
+  });
+
+  it('finishing it takes out a row it wrote that the record no longer holds', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
+    cutShortWriteDown(cm, 3);
+    assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }]);
+    // In legacy mode a removal writes nothing: the window is the record.
+    cm.removeMessage(b!);
+    assert.equal(indexItems(cm).length, 2);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c']);
+    // Nor is it in the window, whatever the write-down wrote for it.
+    assert.throws(() => cm.retractRows([b!]), new RegExp(`no stored message has id ${b}, and the window holds none`));
+    assert.equal(indexItems(cm).length, 2);
+
+    // A call that names a row finishes it as the boot call does.
+    assert.deepEqual(cm.presentRows([c!]), [3]);
+    assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }, { retract: b }, { id: c }, { v: 1 }]);
+    assert.equal(cm.ordinalOf(b!), undefined, 'the removed row is not in the window');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c']);
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    cm.close();
+  });
+
+  it('retractRows([]) writes nothing in either mode; any other retract in legacy mode writes the window down first', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+    cm.retractRows([]);
+    cm.retractRows([], { undone: true });
+    assert.equal(cm.getStore().getStateJson(INDEX), null, 'nothing is written');
+    assert.equal(cm.presentationMode(), 'legacy');
+    const c = cm.addMessage('alice', [text('c')]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'a later write still reaches the window at once');
+    assert.throws(() => cm.retractRows(['zz-no-such-row']), /no stored message has id zz-no-such-row, and the window holds none/);
+    assert.equal(cm.getStore().getStateJson(INDEX), null);
+
+    // Any other retract switches the mode: the window is written down as
+    // it stands, then the rows named leave it.
+    cm.retractRows([b!]);
+    assert.equal(cm.presentationMode(), 'presented');
+    assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }, { id: c }, { v: 1 }, { retract: b }]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c']);
+    const d = cm.addMessage('alice', [text('d')]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c'], 'a row stored now enters the window only when presented');
+    assert.deepEqual(cm.getUnpresentedMessages().map((m) => m.id), [b, d]);
+
+    cm.retractRows([]);
+    assert.equal(indexItems(cm).length, 5, 'nor in presented mode');
+    cm.close();
+  });
+
+  it('a retract finishes a write-down cut short before it takes its rows out', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
+    cutShortWriteDown(cm, 2);
+    assert.deepEqual(indexItems(cm), [{ id: a }]);
+    cm.retractRows([c!], { undone: true });
+    assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }, { id: c }, { v: 1 }, { retract: c, undone: true }]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b']);
+    assert.deepEqual(cm.getUnpresentedMessages(), [], "an undone turn's row isn't offered");
+    cm.close();
+  });
+
+  it('an index in another format reads as the record, with one warning, and is never written to', async () => {
+    const cases: Array<[label: string, items: unknown[], says: RegExp]> = [
+      ['a header naming format 2', [{ v: 2 }, { ids: ['zz-x'] }], /is in format 2, which this version \(format 1\) doesn't read/],
+      // Another format's write-down cut short before its header.
+      ['an item it can\'t read and no header', [{ ids: ['zz-x'] }], /holds 1 item\(s\) this version can't read and no header naming their format/],
+    ];
+    for (const [label, items, says] of cases) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+      const store = cm.getStore();
+      store.registerState({ id: INDEX, strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+      for (const item of items) store.appendToStateJsonWithIdentity(INDEX, item, 'by', 'at');
+      const warned: string[] = [];
+      const warn = console.warn;
+      console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+      try {
+        assert.equal(cm.presentationMode(), 'legacy', label);
+        assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b'], label);
+        assert.equal(cm.getPresentedMessages(), cm.getAllMessages(), label);
+        assert.equal(cm.ordinalOf(a!), undefined, label);
+        assert.equal(cm.indexLength(), 0, label);
+        assert.deepEqual(cm.getUnpresentedMessages(), [], label);
+        assert.throws(() => cm.presentRows([]), says, label);
+        assert.throws(() => cm.presentRows([b!]), says, label);
+        assert.throws(() => cm.retractRows([a!]), says, label);
+        cm.retractRows([]);
+      } finally {
+        console.warn = warn;
+      }
+      const lines = warned.filter((line) => line.includes('window index'));
+      assert.equal(lines.length, 1, `${label}: ${warned.join('\n')}`);
+      assert.match(lines[0]!, says, label);
+      assert.equal(store.getStateLen(INDEX), items.length, `nothing is written, ${label}`);
+      cm.close();
+    }
   });
 });
 

@@ -1261,7 +1261,16 @@ export class ContextManager {
    * A host that presents starts each agent's window at boot, before
    * anything arrives mid-turn, with presentRows([]). Until the store can append
    * several items in one record, each row presented is one record, the
-   * first call's one per stored row.
+   * first call's one per stored row. The write-down switches the mode only
+   * with its last record, so one cut short (the call threw partway, or the
+   * process died before the store synced) leaves the manager in legacy
+   * mode, its window still the whole record, and the next presentRows or
+   * retractRows, the boot call presentRows([]) among them, finishes the
+   * write-down before it does its own work.
+   *
+   * On a branch whose window index another version wrote in a format this
+   * one doesn't read, the window is the record (with a warning when the
+   * index is read), and this throws, writing nothing.
    *
    * The strategy hears the rows that entered the window
    * (ContextStrategy.onPresented) once they are in it and before this
@@ -1300,8 +1309,14 @@ export class ContextManager {
    * A body goes whole, named as presentRows names it. A row the store no
    * longer holds can still be taken out by its id. Throws, taking out
    * nothing, for a row not in the window, a row named twice, or a later
-   * shard named without its first. In legacy mode the window is first
-   * written down, as presentRows writes it. A closed manager refuses it.
+   * shard named without its first. A closed manager refuses it.
+   *
+   * retractRows([]) takes nothing out and writes nothing, in either mode.
+   * Any other call in legacy mode switches the manager to presented mode:
+   * the window, which is the whole record there, is first written down, as
+   * presentRows writes it, and the rows named leave it, so a row stored
+   * after the call enters the window only when presented. It refuses, as
+   * presentRows does, an index in another version's format.
    */
   retractRows(ids: readonly MessageId[], options?: { undone?: boolean }): void {
     this.requireOpen('retractRows');
@@ -1314,8 +1329,10 @@ export class ContextManager {
 
   /**
    * `'legacy'` until the first presentRows or retractRows on the store's
-   * branch, while the window is the merged record itself; `'presented'`
-   * after, even while the window holds no row.
+   * branch has written the window down whole, while the window is the
+   * merged record itself; `'presented'` after, even while the window holds
+   * no row. A write-down cut short leaves it `'legacy'` (see presentRows),
+   * as does an index in another version's format.
    */
   presentationMode(): PresentationMode {
     return this.windowIndex.mode();
