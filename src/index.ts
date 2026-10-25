@@ -85,6 +85,7 @@ export type {
   // Strategy types
   MessageStoreView,
   ContextLogView,
+  WindowIndexView,
   StrategyContext,
   ReadinessState,
   ContextStrategy,

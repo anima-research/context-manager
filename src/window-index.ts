@@ -35,7 +35,8 @@
  *   row that leaves the window leaves a hole at its ordinal, and a row
  *   presented again takes a new one at the end. Ordinals are what a host's
  *   watermarks compare, what a compile's rendered layout counts its members
- *   by (RenderedLayout.keyedBy), and what stays stable across a removal
+ *   by (RenderedLayout.keyedBy), where windowed passthrough's anchor sits
+ *   (StrategyContext.window), and what stays stable across a removal
  *   (`ContextManager.ordinalOf`).
  * - A listing position is a row's place in the presented listing a
  *   strategy reads (`MessageStoreView.positionOf`). It shifts when a row
@@ -351,6 +352,44 @@ export class WindowIndex {
       : built && sameElements(window, built.listing) ? built.listing : window;
     this.built = { source, version: state.version, listing };
     return listing;
+  }
+
+  /**
+   * The ordinal of the first row in the window, in window order, stored at
+   * `sequence` or after, as `source` (the record) holds it: where a window
+   * that starts at that sequence starts once rows are presented. The next
+   * ordinal (`length()`) when no row in the window is. Undefined in legacy
+   * mode, where there is no ordinal.
+   *
+   * While the window is in record order, as it is when the index is first
+   * written down, the rows at that ordinal and after are the rows stored at
+   * `sequence` and after. Once rows are presented out of record order they
+   * aren't: a row stored before `sequence` but presented after that first
+   * row is after it in the window too.
+   */
+  ordinalFrom(sequence: number, source: StoredMessage[]): number | undefined {
+    const state = this.current();
+    if (state.rows.length === 0) return undefined;
+    for (const message of this.listing(source)) {
+      if (message.sequence >= sequence) return state.ordinals.get(message.id);
+    }
+    return state.rows.length;
+  }
+
+  /**
+   * The sequence of the first row in the window at `ordinal` or after, as
+   * `source` (the record) holds it; undefined when no row is, and in legacy
+   * mode.
+   */
+  sequenceFrom(ordinal: number, source: StoredMessage[]): number | undefined {
+    const state = this.current();
+    const messages = messagesIn(source);
+    for (let i = Math.max(0, ordinal); i < state.rows.length; i++) {
+      const id = state.rows[i];
+      const message = id == null ? undefined : messages.get(id);
+      if (message) return message.sequence;
+    }
+    return undefined;
   }
 
   /** The record's rows not in the window, in record order, leaving out an undone turn's rows. Empty in legacy mode. */

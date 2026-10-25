@@ -14,6 +14,7 @@ import type {
   BranchInfo,
   ContextStrategy,
   StrategyContext,
+  WindowIndexView,
   MessageQuery,
   MessageQueryResult,
   TimeRangeQueryOptions,
@@ -497,6 +498,23 @@ export class ContextManager {
    */
   private presentedMessageView(): MessageStoreView {
     return presentedMessageView(this.mergedMessageView(), this.windowIndex);
+  }
+
+  /**
+   * The window index as a strategy reads it (StrategyContext.window), live:
+   * each read asks the index on the branch the store is on, and the
+   * lookups by sequence read the merged record as it stands.
+   */
+  private windowIndexView(): WindowIndexView {
+    const index = this.windowIndex;
+    const record = () => this.mergedMessageView().getAll();
+    return {
+      mode: () => index.mode(),
+      ordinals: () => index.ordinals(),
+      length: () => index.length(),
+      ordinalFrom: (sequence) => index.ordinalFrom(sequence, record()),
+      sequenceFrom: (ordinal) => index.sequenceFrom(ordinal, record()),
+    };
   }
 
   /**
@@ -2793,6 +2811,7 @@ export class ContextManager {
     const self = this;
     return {
       messageStore: this.strategyMessageView(),
+      window: this.windowIndexView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
       currentSequence: this.store.currentSequence(),

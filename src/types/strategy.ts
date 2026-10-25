@@ -9,6 +9,7 @@ import type {
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
+import type { PresentationMode } from '../window-index.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -82,11 +83,53 @@ export interface ContextLogView {
 }
 
 /**
+ * Read-only view of the agent's window index for strategies (see
+ * window-index.ts and ContextManager.presentRows): where each row entered
+ * the window, by index ordinal. An ordinal never moves, whatever leaves the
+ * window or the store, and it counts the window before the view filter, so
+ * a strategy can keep a place in the window that a host's filter, a removal
+ * or a retracted row doesn't shift. Every read asks the index on the branch
+ * the store is on, so a view held across a branch switch follows it.
+ *
+ * In legacy mode, until a host presents a row on the branch, the window is
+ * the record and there are no ordinals: a strategy keeps its places by
+ * sequence there, as it always has.
+ */
+export interface WindowIndexView {
+  /** `'legacy'` while the window is the record, `'presented'` once a host has presented rows on the branch. */
+  mode(): PresentationMode;
+  /**
+   * The ordinal of every row in the window, from one reading of the index;
+   * null in legacy mode. Read it at once: a later presentation changes it.
+   */
+  ordinals(): ReadonlyMap<MessageId, number> | null;
+  /** The ordinal the next presented row will take. 0 in legacy mode. */
+  length(): number;
+  /**
+   * The ordinal of the first row in the window, in window order, stored at
+   * `sequence` or after; `length()` when no row in the window is. Undefined
+   * in legacy mode. While the window is in record order its rows from there
+   * on are the rows stored at `sequence` and after; once rows are presented
+   * out of record order, a row stored before `sequence` and presented after
+   * that first row is after it in the window too.
+   */
+  ordinalFrom(sequence: Sequence): number | undefined;
+  /** The sequence of the first row in the window at `ordinal` or after, before the view filter; undefined when none is, and in legacy mode. */
+  sequenceFrom(ordinal: number): Sequence | undefined;
+}
+
+/**
  * Context provided to strategy methods.
  */
 export interface StrategyContext {
   /** Read-only view of message store */
   messageStore: MessageStoreView;
+  /**
+   * The agent's window index (optional: a context a caller builds by hand
+   * has none, which a strategy reads as legacy mode). A ContextManager
+   * gives its own, live.
+   */
+  window?: WindowIndexView;
   /**
    * The agent's live tool definitions, as last supplied by the host (set on
    * every activation via ContextManager.setToolDefinitions). Summarizer /

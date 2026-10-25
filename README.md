@@ -44,7 +44,7 @@ To use a store your application already holds, pass it as `store` (a Chronicle `
 | Strategy | What a compile sends |
 |---|---|
 | `PassthroughStrategy` (the default) | Every message as stored. When they don't all fit, the most recent ones that do. |
-| `WindowedPassthroughStrategy` | Every message since an anchor, without compression. The anchor moves forward in coarse jumps when the window outgrows the budget, or wherever `setAnchor` puts it. Between moves the window only grows at its end, which keeps the compiled prefix stable for the provider's prompt cache, apart from images it strips past its live-image limits. |
+| `WindowedPassthroughStrategy` | Every message since an anchor, without compression. The anchor moves forward in coarse jumps when the window outgrows the budget, or wherever `setAnchor` puts it. Between moves the window only grows at its end, which keeps the compiled prefix stable for the provider's prompt cache, apart from images it strips past its live-image limits. Once a host presents rows (below), the anchor is a place in the agent's window rather than a sequence, so a row presented after it is in the window wherever the record has it. |
 | `AutobiographicalStrategy` | Recent messages as they are, and older history as summaries the agent's model writes, merged into higher levels as they accumulate. |
 | `KnowledgeStrategy` | An `AutobiographicalStrategy` for knowledge-extraction work. It chunks at phase transitions, compresses each phase with its own prompts, and keeps unresolved leads across levels. |
 
