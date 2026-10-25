@@ -495,6 +495,7 @@ describe("the recent window's start, wherever it falls inside a call before the 
         const config = (strategy as unknown as { config: Record<string, number> }).config;
         const callAt = stored.findIndex((m, k) => k >= callFrom && (holds(m, 'tool_use') || holds(m, 'thinking')));
         const callEnd = stored.findIndex((m, k) => k > callFrom && holds(m, 'tool_result')) - 1;
+        assert.ok(callAt >= 0 && callEnd > callAt, `premise: an edge can fall inside the call before its answer (${callAt}, ${callEnd})`);
         const pse = (strategy as Exposed).estimates(store);
         for (let edge = callAt + 1; edge <= callEnd; edge++) {
           // A window the messages from `edge` on fill exactly: its edge falls at `edge`.
@@ -692,8 +693,69 @@ describe("parallel calls' results, each in a message of its own", () => {
     estimates(store: unknown) { return this.postStripEstimates(store as never); }
     held(messages: unknown[], from: number) { return this.closesHeld(messages as never, from); }
     parted(messages: unknown[], from?: number, until?: number) { return this.callPartedStarts(messages as never, from, until); }
+    startOfCall(messages: unknown[], at: number) { return this.callStart(messages as never, at); }
+    hold(store: unknown) { return this.holdBoundary(store as never); }
   }
   const config = (strategy: AutobiographicalStrategy) => (strategy as unknown as { config: Record<string, number> }).config;
+
+  it('a message answering one of the calls and making its own keeps the others waiting: no boundary parts the first call from its later result', async () => {
+    const writes: Array<[string, ContentBlock[]]> = [
+      ['Claude', [text('looking them up'), call('call-a'), call('call-b')]],
+      ['User', [result('call-a', 'a'), call('call-c')]],
+      ['User', [result('call-b', 'b')]],
+      ['User', [result('call-c', 'c')]],
+    ];
+    await withWrites(Exposed, writes, async (manager, strategy, first) => {
+      const starts = (strategy as Exposed).parted(manager.getAllMessages());
+      assert.deepEqual([...starts.slice(first, first + 4)], [first, first, first, -1]);
+    });
+  });
+
+  it('a message answering none of the calls ends their run, a result for another call included: a later result is as before', async () => {
+    const writes: Array<[string, ContentBlock[]]> = [
+      ['Claude', [text('looking them up'), call('call-a'), call('call-b')]],
+      ['User', [result('call-a', 'a')]],
+      ['User', [result('elsewhere', 'not one of these')]],
+      ['User', [result('call-b', 'b')]],
+    ];
+    await withWrites(Exposed, writes, async (manager, strategy, first) => {
+      const starts = (strategy as Exposed).parted(manager.getAllMessages());
+      assert.deepEqual([...starts.slice(first, first + 4)], [first, -1, -1, -1]);
+    });
+  });
+
+  it("the listing's end holds a close after a result while another call waits, and not once the last has come", async () => {
+    await withWrites(Exposed, parallel(2), async (manager, strategy, first) => {
+      const all = manager.getAllMessages();
+      const toFirst = all.slice(0, first + 2);
+      const toLast = all.slice(0, first + 3);
+      assert.equal((strategy as Exposed).held(toFirst, 0)[first + 1], 1, 'after the first of two results');
+      assert.equal((strategy as Exposed).held(toLast, 0)[first + 2], 0, 'after the second of two');
+    });
+  });
+
+  it('the smaller-window floor and the compression hold count a later result from its call', async () => {
+    await withWrites(Exposed, parallel(3), async (manager, strategy, first) => {
+      assert.equal((strategy as Exposed).startOfCall(manager.getAllMessages(), first + 3), first, 'callStart for the third result');
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-parallel-hold-'));
+    const strategy = new Exposed({ autoTickOnNewMessage: false, targetChunkTokens: 40, headWindowTokens: 0, recentWindowTokens: 0 });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    manager.setToolDefinitions(tools as never);
+    try {
+      for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(10))]);
+      const first = manager.getAllMessages().length;
+      const writes = parallel(3);
+      writes.forEach(([participant, content], k) => manager.addMessage(participant, content, undefined, undefined, k === 3 ? { holdCompression: true } : undefined));
+      // The view the strategy reads, which carries the holds.
+      const view = (manager as unknown as { strategyMessageView(): unknown }).strategyMessageView();
+      assert.ok(strategy.hold(view) <= first + 3, 'premise: the third result is held');
+      assert.equal(strategy.hold(view), first, 'the hold on the third result starts at the call');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("the recent window's start, with its edge on any of the results, starts at the call", async () => {
     for (const n of [2, 3, 5]) {
@@ -756,10 +818,16 @@ describe("parallel calls' results, each in a message of its own", () => {
         for (let from = 1; from <= length; from++) {
           const part = (strategy as Exposed).held(listing, from);
           for (let p = from; p < length; p++) assert.equal(part[p], whole[p], `a listing of ${length}, from ${from}, position ${p}`);
-          // As the head's end and the window's start ask: from the position before a boundary, up to it.
+          // As the head's end and the window's start ask, from the position before a boundary up to
+          // it: where the head steps back to along the answer, and where the window's one step lands.
           const around = (strategy as Exposed).parted(listing, from - 1, from);
-          assert.equal(around[from - 1], starts[from - 1], `a listing of ${length}, the call start at ${from - 1}`);
-          for (let p = 0; p < from; p++) if (around[p]! >= 0) assert.equal(around[p], starts[p], `a listing of ${length}, asked at ${from - 1}, position ${p}`);
+          const stepBack = (a: Int32Array, once: boolean) => {
+            let b = from;
+            while (b > 0 && a[b - 1]! >= 0) { b = a[b - 1]!; if (once) break; }
+            return b;
+          };
+          assert.equal(stepBack(around, false), stepBack(starts, false), `a listing of ${length}, the head stepping back from ${from}`);
+          assert.equal(stepBack(around, true), stepBack(starts, true), `a listing of ${length}, the window stepping back from ${from}`);
         }
       }
     }, { adaptiveResolution: true });

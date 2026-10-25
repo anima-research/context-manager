@@ -398,6 +398,7 @@ Algorithm: chunks transitioning out of the tail default to `currentResolution: 0
 
 Edge cases:
 - **A single chunk larger than K tokens**: the tail expands to include the whole chunk, even past K. The picker can't fold the most recent chunk ever — only previous ones. Combined with `bodyGroupId` chunking at ingestion, this is bounded by `chunkSize`, not message size.
+- **A tool call and its results at the tail boundary**: the window's start steps back to keep a call with all its results, wherever their shards hold them and when parallel calls' results come one to a message, so the tail can run past K by that call and the results before the edge. It steps back once: where each message answers the call before it and makes the next, it doesn't follow the chain.
 - **Chunks at the tail boundary mid-bodyGroup**: the tail is defined over chunks, not over logical messages. A bodyGroup may straddle the boundary — its newer shards are tail-protected, older shards are picker-eligible. Render concatenates them back into one API message regardless.
 
 ## 4. Operations

@@ -13310,9 +13310,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // blocks on its first), and a result whose call isn't raw just before
       // it is blanked as an orphan (enforceToolPairing), without a refusal.
       // So when the newest body
-      // holds a tool_result, the turn is the whole body and the call before
-      // it, from the call's first shard that holds a tool_use or a thinking
-      // block (callStart), as holdBoundary counts it. A hold inside the head
+      // holds a tool_result, the turn is the whole body and the call it
+      // answers, from the call's first shard that holds a tool_use or a
+      // thinking block, with the results between when parallel calls'
+      // results come one to a message (callStart), as holdBoundary counts it. A hold inside the head
       // leaves every window's tail starting at the head's end, so a floor
       // counted from the hold covers at least the tail, and nothing is named,
       // as it should be. So does a newest turn that starts inside the head.
@@ -18636,10 +18637,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Where the call a result at `resultAt` answers starts to matter: the
-   * first shard of the body before the result's body that holds a
-   * tool_use or a thinking block (thinking or redacted_thinking), or
-   * that body's start when none does. A sharded call keeps each tool_use
+   * Where the call a result at `resultAt` answers starts to matter: for a
+   * result answering calls carried to it across the results before it
+   * (callRuns), as parallel calls' results come one to a message, where
+   * those calls start; otherwise the first shard of the body before the
+   * result's body that holds a tool_use or a thinking block (thinking or
+   * redacted_thinking), or that body's start when none does. The recent
+   * window's start, the smaller-window floor and the compression hold's
+   * boundary step back to it. A sharded call keeps each tool_use
    * where it sat (chunkIngressMessage), which for a reply that ends in
    * its calls is its last shard, so the earlier shards of a call with no
    * thinking can fold while the shards holding the calls stay raw before
@@ -18652,10 +18657,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * id.
    */
   protected callStart(messages: readonly StoredMessage[], resultAt: number): number {
-    // The call is the body before the result's own body, wherever in it
-    // `resultAt` falls.
     const resultBody = bodyStart((k) => messages[k], resultAt);
     if (resultBody === 0) return 0;
+    // The calls the result's body answers, carried across the results
+    // between them (callRuns), as parallel calls' results come one to a
+    // message.
+    const carried = this.callPartedStarts(messages, resultBody - 1, resultBody)[resultBody - 1]!;
+    if (carried >= 0) return carried;
+    // Otherwise the body before the result's own body, wherever in it
+    // `resultAt` falls.
     const to = resultBody - 1;
     const from = bodyStart((k) => messages[k], to);
     for (let k = from; k <= to; k++) {
@@ -18673,9 +18683,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * For each position in `messages`, where the call starts that a boundary
-   * right after that position would part from a result of it, or -1 where a
-   * boundary there parts none, worked out in one pass (callRuns): for the
-   * whole listing, or exactly for the positions from `from` up to `until`.
+   * right after that position would part from a result of it, or from the
+   * rest of a message answering it, or -1 where a boundary there parts
+   * none, worked out in one pass (callRuns): for the whole listing, or
+   * exactly for the positions from `from` up to `until`.
    */
   protected callPartedStarts(messages: readonly StoredMessage[], from = 0, until = messages.length): Int32Array {
     return this.callRuns(messages, from, until).starts;
@@ -18689,15 +18700,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * from that position on, and the pass begins at the last message before
    * it that holds no tool_result: a run crosses only messages answering its
    * calls, so none begins before that message and reaches past it. With
-   * `until`, the pass ends at the first message from there that leaves no
-   * calls waiting, so `starts` is exact up to `until`, and `openFrom` and
-   * `openFromBeforeLast` hold only for a pass to the listing's end.
+   * `until`, the pass ends where no call that started before `until` is
+   * still waiting, so `starts` is exact up to `until`, and `openFrom` and
+   * `openFromBeforeLast` hold only for a pass to the listing's end. The
+   * array spans the listing; the pass reads only the messages from its
+   * start to its end, which a chain of calls can stretch to the chain's
+   * length.
    *
    * A message's calls are its tool_use blocks, on any of its shards, and they
    * start at its first shard holding a tool_use or a thinking block. They
    * stay open across the messages after it that each answer one of them with
    * a tool_result, as parallel calls' results come in messages of their own,
-   * until a message answers none of them or makes calls of its own. A
+   * until a message answers none of them. A message that answers some of
+   * them and makes calls of its own adds its calls to those still waiting,
+   * from the earlier start; once none of the earlier ones is waiting, its
+   * own calls start a run of their own. A result after a message that
+   * answers none of the calls is as it was: so is a result that comes much
+   * later, which would otherwise hold every close between. A
    * boundary after any position from the calls' start to the shard before
    * the last answering message's last shard is held, so each answering
    * message stays whole with the calls, wherever in it the result sits. A
@@ -18711,8 +18730,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * before then holds its tool_use on its first shard; in neither is the
    * result in the message right after the tool_use. Where runs overlap, as
    * where a message both answers a call and makes one, a position takes the
-   * earliest start; the head's end, stepping back to it, asks again from
-   * there, and the recent window's start steps back once.
+   * earliest start; the head's end, stepping back to it, reads the start
+   * there in turn, and the recent window's start steps back once.
    */
   protected callRuns(messages: readonly StoredMessage[], from = 0, until = messages.length): { starts: Int32Array; openFrom: number; openFromBeforeLast: number } {
     const n = messages.length;
@@ -18725,20 +18744,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mark = (from: number, to: number, start: number): void => {
       for (let p = from; p <= to; p++) if (starts[p]! < 0 || start < starts[p]!) starts[p] = start;
     };
+    // The calls still waiting for a result, from the earliest one's start;
+    // null when none is.
     let calls: { open: Set<string>; from: number } | null = null;
     let openFromBeforeLast = -1;
-    for (let from = begin; from < n && (from < until || calls !== null); ) {
+    for (let from = begin; from < n && (from < until || (calls !== null && calls.from < until)); ) {
       const to = bodyEnd(n, at, from);
-      if (to === n - 1 && calls !== null && calls.open.size > 0) openFromBeforeLast = calls.from;
+      if (to === n - 1 && calls !== null) openFromBeforeLast = calls.from;
       const open = new Set<string>();
       let first = -1;
-      let makes = false;
       let answers = false;
       for (let k = from; k <= to; k++) {
         for (const b of messages[k]!.content) {
           if (b.type === 'tool_use') {
             open.add((b as { id: string }).id);
-            makes = true;
             if (first < 0) first = k;
           } else if (b.type === 'thinking' || b.type === 'redacted_thinking') {
             if (first < 0) first = k;
@@ -18754,12 +18773,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
       }
-      if (answers) mark(calls!.from, to - 1, calls!.from);
-      if (open.size > 0) calls = { open, from: first };
-      else if (!answers || makes) calls = null;
+      if (answers && calls !== null) {
+        mark(calls.from, to - 1, calls.from);
+        if (calls.open.size > 0) {
+          for (const id of open) calls.open.add(id);
+        } else {
+          calls = open.size > 0 ? { open, from: first } : null;
+        }
+      } else {
+        calls = open.size > 0 ? { open, from: first } : null;
+      }
       from = to + 1;
     }
-    const openFrom = calls !== null && calls.open.size > 0 ? calls.from : -1;
+    const openFrom = calls !== null ? calls.from : -1;
     return { starts, openFrom, openFromBeforeLast };
   }
 
