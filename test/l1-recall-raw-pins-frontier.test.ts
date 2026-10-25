@@ -837,7 +837,7 @@ describe('the raw pins add is spent from the recall budget', () => {
 });
 
 describe('a pin resolves once, for compression and every selector', () => {
-  const messages = Array.from({ length: 11 }, (_, i) => ({ id: `m${i}` }));
+  const messages = Array.from({ length: 11 }, (_, i) => ({ id: `m${i}`, content: [] }));
   const pins: Array<Omit<ProtectedRange, 'firstMessageId' | 'lastMessageId' | 'kind' | 'created' | 'id'> & { at: number }> = [
     { at: 1 },                          // classic raw pin
     { at: 2, level: 0 },

@@ -83,6 +83,7 @@ export type {
   CalibrationReset,
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
+  ImageCeilings,
   ThinkingBinding,
   RequestIdentity,
 } from './strategy.js';

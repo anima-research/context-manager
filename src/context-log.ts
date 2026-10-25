@@ -342,6 +342,9 @@ export class ContextLog {
       case 'audio':
       case 'video':
         return 1000;
+      case 'system_change':
+        // Mirrors MessageStore.computeBlockTokensRaw: priced from its JSON.
+        return this.tokenEstimator(JSON.stringify(block));
       default:
         // Mirrors MessageStore.computeBlockTokensRaw: membrane's XML-history
         // carriers (tool_attempt, tool_notice) are priced as the markup they

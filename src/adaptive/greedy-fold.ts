@@ -58,30 +58,73 @@ export interface GreedyState {
    *  strategy can't produce a summary there: below that level the lineage
    *  already links upward, and its production (`handleProducedOps`) makes an
    *  L1 only for a chunk without one, and merges only summaries that link to
-   *  none, two or more at a time. With null, a step asks for the next level,
-   *  which that production makes only on those terms. A method of the state
-   *  rather than of each view, since the engine makes every view again after
-   *  each raise. */
+   *  none, two or more at a time. A step that passes over passes a chunk
+   *  with null by; a step asks for the next level only when every chunk it
+   *  tries has null, which that production makes only on those terms. A
+   *  method of the state rather than of each view, since the engine makes
+   *  every view again after each raise. */
   nextAncestor(chunk: GreedyChunkView): SummaryNode | null;
 }
 
+/** One greedy step: a raise, a produce, or null when the plan is done. */
+export type GreedyStep = (state: GreedyState, budget: FoldingBudget) => GreedyOp | null;
+
 /**
- * Drive a greedy step function to a full solution.
+ * Drive greedy steps to a full solution.
  *
- * The step is called with the current state and must return a raise, a
+ * A step is called with the current state and must return a raise, a
  * produce (recorded; solving stops — the caller enqueues production and the
  * next compile retries), or null (done). The internal bound is a safety net
  * against a non-monotonic step; a well-behaved greedy step raises each chunk
  * at most maxLevel times.
+ *
+ * Each step function in `steps` is a rule for a whole solve, tried in order.
+ * The first is the solver's rule: its solve is the solution if its last plan
+ * fits the hard budget (`totalBudget`). Each later one is a rule the solver
+ * used before, whose last plan is the plan a store got before: it is the
+ * solution if the caller accepts it (within `rejectionBudget`), so where the
+ * first rule's plan doesn't fit, a store that compiled before compiles with
+ * the same plan. A raise can grow the plan: it moves only the group's
+ * unprotected middle leaves, and the summary's recall takes their place, so
+ * where the rest of the group is pinned, locked or in the head or tail
+ * window, the summary can cost more than what it replaces. So otherwise the
+ * solution is the plan with the fewest tokens that any solve passed through,
+ * the starting plan included, with the produce that solve asked for, the
+ * first solve's winning a tie. The caller refuses it if it's over the
+ * caller's line.
  */
-export function runGreedy(
-  inputs: PickerInputs,
-  budget: FoldingBudget,
-  step: (state: GreedyState, budget: FoldingBudget) => GreedyOp | null,
-): FoldingSolution {
+export function runGreedy(inputs: PickerInputs, budget: FoldingBudget, steps: readonly GreedyStep[]): FoldingSolution {
+  const accepted = budget.rejectionBudget ?? budget.totalBudget;
+  const solves: Solve[] = [];
+  for (const step of steps) {
+    const solve = solveWith(inputs, budget, step);
+    const line = solves.length === 0 ? budget.totalBudget : accepted;
+    if (solve.engine.tokenCount() <= line) return solutionOf(solve.engine, solve.produced, budget);
+    solves.push(solve);
+  }
+  let best = solves[0]!;
+  for (const solve of solves) if (solve.fewest.tokens < best.fewest.tokens) best = solve;
+  const replayed = new GreedyEngine(inputs);
+  for (const groupRoot of best.raises.slice(0, best.fewest.raises)) replayed.applyRaise(groupRoot);
+  return solutionOf(replayed, best.produced, budget);
+}
+
+/** A whole solve under one step rule: its last plan, the produce it asked
+ *  for, the raises it applied, and the fewest-token plan it passed through,
+ *  as the number of those raises that made it. */
+interface Solve {
+  engine: GreedyEngine;
+  produced: ProduceRequest[];
+  raises: SummaryId[];
+  fewest: { raises: number; tokens: number };
+}
+
+function solveWith(inputs: PickerInputs, budget: FoldingBudget, step: GreedyStep): Solve {
   const engine = new GreedyEngine(inputs);
   const produced: ProduceRequest[] = [];
+  const raises: SummaryId[] = [];
   const bound = Math.max(1000, inputs.chunks.length * 10);
+  let fewest: Solve['fewest'] = { raises: 0, tokens: engine.tokenCount() };
   let iterations = 0;
 
   for (;;) {
@@ -97,8 +140,14 @@ export function runGreedy(
       break; // record and stop; caller enqueues, next compile retries
     }
     engine.applyRaise(op.groupRoot);
+    raises.push(op.groupRoot);
+    const tokens = engine.tokenCount();
+    if (tokens < fewest.tokens) fewest = { raises: raises.length, tokens };
   }
+  return { engine, produced, raises, fewest };
+}
 
+function solutionOf(engine: GreedyEngine, produced: ProduceRequest[], budget: FoldingBudget): FoldingSolution {
   return {
     frontier: engine.snapshotResolutions(),
     produced,
