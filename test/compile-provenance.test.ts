@@ -9,9 +9,12 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { attributeEntries as attributeIn, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
 import type { ContextEntry, ContextLogView, MessageStoreView, StoredMessage, TokenBudget } from '../src/index.js';
 
-/** Attribution over `stored`, resolving an id to its sequence among those messages, as a store's lookup does. */
+/** Attribution over `stored`, resolving an id to its position among those messages, as the compile's view does. */
 function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]) {
-  return attributeIn(entries, stored, (id) => stored.find((m) => m.id === id)?.sequence);
+  return attributeIn(entries, stored, (id) => {
+    const at = stored.findIndex((m) => m.id === id);
+    return at === -1 ? undefined : at;
+  });
 }
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -349,7 +352,9 @@ describe('attribution reads what the raw entries name, not the stored history', 
     const history = Array.from({ length: n }, (_, i) => msg(`m${i}`, 2 * i + 1, [text(`message ${i}`)]));
     const g = { bodyGroupId: 'tail-doc', shardCount: 3 };
     for (let s = 0; s < 3; s++) history[n - 3 + s] = msg(`d${s}`, 2 * (n - 3 + s) + 1, [text(`part ${s} `)], { ...g, shardIndex: s });
-    const sequences = new Map(history.map((m) => [m.id, m.sequence]));
+    // The lookup answers a position, as the compile's view does (#291): the
+    // count of lookups per run is what this pins, not how they search.
+    const positions = new Map(history.map((m, i) => [m.id, i]));
     let reads = 0;
     const stored = new Proxy(history, {
       get(target, prop, receiver) {
@@ -358,15 +363,15 @@ describe('attribution reads what the raw entries name, not the stored history', 
       },
     });
     let lookups = 0;
-    const sequenceOf = (id: string) => {
+    const positionOf = (id: string) => {
       lookups++;
-      return sequences.get(id);
+      return positions.get(id);
     };
     const window = history.slice(n - 20, n - 3);
     const doc: ContextEntry = { index: 0, sourceMessageIds: ['d0', 'd1', 'd2'], sourceRelation: 'copy', participant: 'user', content: [text('part 0 part 1 part 2 ')] };
     const entries = [copy(history[1000]!), ...window.map((m) => copy(m)), doc];
 
-    const result = attributeIn(entries, stored, sequenceOf);
+    const result = attributeIn(entries, stored, positionOf);
     const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : null));
     assert.deepEqual(heads, [[['m1000', true]], ...window.map((m) => [[m.id, true]]), [['d0', true]]]);
     assert.deepEqual(rawBodiesOf(result).get('d0')!.map((m) => m.id), ['d0', 'd1', 'd2']);
@@ -375,11 +380,14 @@ describe('attribution reads what the raw entries name, not the stored history', 
     assert.ok(lookups <= 2, `${lookups} lookups for two runs of consecutive messages`);
   });
 
-  it("finds nothing where the lookup answers with another message's sequence, or with one no stored message has", () => {
+  it("finds nothing where the lookup answers with another message's position, or with one no stored message has", () => {
+    // The lookup answers a position in `stored` since the compile's view is
+    // the agent's window, which needn't be in sequence order (#291); it used
+    // to answer a sequence, binary-searched here.
     const stored = [msg('a', 1, [text('a')]), msg('b', 3, [text('b')]), msg('c', 5, [text('c')]), msg('d', 7, [text('d')])];
-    // c's lookup answers with b's sequence, d's with a sequence nothing has,
-    // and an unknown id's with nothing; b is found through its own.
-    const answers = new Map([['c', 3], ['d', 4], ['b', 3]]);
+    // c's lookup answers with b's position, d's with a position past the
+    // end, and an unknown id's with nothing; b is found through its own.
+    const answers = new Map([['c', 1], ['d', 4], ['b', 1]]);
     const entries = [copy(stored[2]!), copy(stored[3]!), copy(msg('x', 9, [text('x')])), copy(stored[1]!)];
     const result = attributeIn(entries, stored, (id) => answers.get(id));
     const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => b.messageId) : null));

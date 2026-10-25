@@ -26,6 +26,16 @@ export interface MessageStoreView {
    * view asks each source's, and the source's `get` where it has none.
    */
   sequenceOf?(id: MessageId): number | undefined;
+  /**
+   * A message's position in `getAll()`, undefined when the listing doesn't
+   * hold it, without reading the message where the view can (optional).
+   * The window a ContextManager gives its strategy and its compile answers
+   * it: by sequence while the window is the record, which lists by
+   * sequence, and from the window's own positions once a host presents
+   * rows to the agent in another order (`ContextManager.presentRows`). A
+   * filtered view doesn't forward it, since its positions are its own.
+   */
+  positionOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */

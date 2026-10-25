@@ -94,6 +94,10 @@ For a model that binds each signed thinking block to the request it was minted i
 
 Every option is documented on `AutobiographicalConfig` in `src/types/strategy.ts`.
 
+## One record, a window per agent
+
+Several managers can read one record: agents that share the un-namespaced message slot, or one that merges another's slot with `auxiliaryMessageViews`. The record keeps every row in the order it arrived. Each manager also has a window, the rows its agent was shown in the order it was shown them, and its strategy and compiles read that. Until a host presents a row, a manager's window is the record itself, as it always was. Once a host calls `presentRows(ids)`, the window grows only by presentation: a host presents an agent's own rows as it writes them and another writer's at the agent's turn start or tool boundary, so each compile sends the order the agent's requests carried. The first call writes the window down as it stands; a host starts each agent's window at boot with `presentRows([])`. `retractRows` takes rows out, `getUnpresentedMessages` lists the rows that arrived and weren't presented, and `ordinalOf` gives a row's place in the window, which never moves. See `src/window-index.ts`.
+
 ## Branches
 
 Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch.

@@ -55,6 +55,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, type PresentationMode } from './window-index.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -423,6 +424,8 @@ export class ContextManager {
   private derivation: ContextDerivation | null = null;
   /** Fold receipts for this manager's namespace (see fold-journal.ts). */
   private foldJournal: FoldJournal;
+  /** The rows this manager's agent has been shown, in order (see window-index.ts). */
+  private windowIndex: WindowIndex;
 
   private constructor(
     store: JsStore,
@@ -447,6 +450,7 @@ export class ContextManager {
     this.viewFilter = viewFilter;
     this.auxiliaryStores = auxiliaryStores;
     this.foldJournal = new FoldJournal(store, strategyNamespace);
+    this.windowIndex = new WindowIndex(store, strategyNamespace, this.diag);
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
@@ -456,11 +460,14 @@ export class ContextManager {
    * The strategy-facing message view — the single choke point through which
    * every strategy read passes (compile, preview, render stats, and the
    * tick/onNewMessage StrategyContext). Composition order: merge auxiliary
-   * slots into the timeline first, then apply the exclusion filter, so a
-   * filter sees (and can exclude from) the merged world.
+   * slots into the timeline first, then take the agent's window over it
+   * (presentedMessageView), then apply the exclusion filter, so a filter
+   * sees (and can exclude from) the merged world as the agent was shown it.
+   * Until a host presents rows the window is the merged record itself, so
+   * the strategy reads what it always read.
    */
   private strategyMessageView() {
-    let view = this.mergedMessageView();
+    let view = this.presentedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
@@ -472,12 +479,22 @@ export class ContextManager {
     return view;
   }
 
-  /** This manager's messages merged with its auxiliary slots, before the view filter. */
+  /** This manager's messages merged with its auxiliary slots, before the view filter: the record, in record order. */
   private mergedMessageView(): MessageStoreView {
     return mergeMessageStoreViews(
       this.messageStore.createView(),
       this.auxiliaryStores.map((s) => s.createView()),
     );
+  }
+
+  /**
+   * The agent's window before the view filter: the merged record in legacy
+   * mode, the rows its index holds in its order once a host has presented
+   * any (see window-index.ts). It answers `positionOf`, which compile's
+   * attribution looks bodies up by.
+   */
+  private presentedMessageView(): MessageStoreView {
+    return presentedMessageView(this.mergedMessageView(), this.windowIndex);
   }
 
   /**
@@ -1162,6 +1179,130 @@ export class ContextManager {
   }
 
   // ==========================================================================
+  // The agent's window: which stored rows it was shown, in what order
+  // ==========================================================================
+
+  /**
+   * Present rows to this manager's agent: they enter its window, after the
+   * rows already there, in the order given. The window is what every
+   * strategy read and every compile follows (see window-index.ts); the
+   * store's record keeps the order rows arrived in. A host presents an
+   * agent's own rows as it writes them and another writer's at the agent's
+   * turn start or tool boundary, so a row stored during the agent's turn
+   * enters its window after the turn's own rows, as its requests carried
+   * them.
+   *
+   * Give each row by its id. A body stored as shards is presented whole, by
+   * the id addMessage returned for it (its first shard's), which stands for
+   * every shard in order; its other shards may follow that id in order.
+   * Throws, presenting nothing, for an id no merged slot holds (this
+   * manager's own or an auxiliary one), a row in the window already, a row
+   * named twice, or a later shard of a body named without its first.
+   *
+   * Until the first presentation on a branch the manager is in legacy
+   * mode: the window is the merged record itself, read live, so compiles
+   * are what they always were. That first call writes the window down as it
+   * stands (every row of the record, in record order, which takes in the
+   * rows it names), and from then on the window grows only by presentation.
+   * A host that presents starts each agent's window at boot, before
+   * anything arrives mid-turn, with presentRows([]). Until the store can append
+   * several items in one record, each row presented is one record, the
+   * first call's one per stored row.
+   *
+   * Returns each named row's index ordinal (see ordinalOf). A closed
+   * manager refuses it.
+   */
+  presentRows(ids: readonly MessageId[]): number[] {
+    this.requireOpen('presentRows');
+    const merged = this.mergedMessageView();
+    const record = merged.getAll();
+    return this.write(() => this.windowIndex.present(ids, record, (id) => recordPositionOf(merged, record, id)));
+  }
+
+  /**
+   * Take rows out of this manager's agent's window. Each leaves a hole at
+   * its ordinal, so no other row's ordinal moves, and the rows after it in
+   * the window move up one place in what the strategies read. A row taken
+   * out is presented again only by a later presentRows, which gives it a
+   * new ordinal at the end.
+   *
+   * With `undone`, the rows are an undone turn's: getUnpresentedMessages()
+   * leaves them out until they are presented again (a redo). Without it, a
+   * row taken out counts as arrived and not presented, as another agent's
+   * row presented during an undone turn does.
+   *
+   * A body goes whole, named as presentRows names it. A row the store no
+   * longer holds can still be taken out by its id. Throws, taking out
+   * nothing, for a row not in the window, a row named twice, or a later
+   * shard named without its first. In legacy mode the window is first
+   * written down, as presentRows writes it. A closed manager refuses it.
+   */
+  retractRows(ids: readonly MessageId[], options?: { undone?: boolean }): void {
+    this.requireOpen('retractRows');
+    const merged = this.mergedMessageView();
+    const record = merged.getAll();
+    this.write(() =>
+      this.windowIndex.retract(ids, record, (id) => recordPositionOf(merged, record, id), options?.undone === true),
+    );
+  }
+
+  /**
+   * `'legacy'` until the first presentRows or retractRows on the store's
+   * branch, while the window is the merged record itself; `'presented'`
+   * after, even while the window holds no row.
+   */
+  presentationMode(): PresentationMode {
+    return this.windowIndex.mode();
+  }
+
+  /**
+   * A row's index ordinal: where it entered the window. Ordinals only grow
+   * and never move, whatever leaves the window or the store, so a host can
+   * compare them as watermarks. Undefined for a row not in the window, and
+   * for every row in legacy mode, where there is no index.
+   */
+  ordinalOf(id: MessageId): number | undefined {
+    return this.windowIndex.ordinalOf(id);
+  }
+
+  /** The ordinal the next presented row will take: every ordinal below it has been issued on this branch. 0 in legacy mode. */
+  indexLength(): number {
+    return this.windowIndex.length();
+  }
+
+  /** How many rows the window holds, before the view filter: the record's count in legacy mode. */
+  presentedLength(): number {
+    return this.getPresentedMessages().length;
+  }
+
+  /**
+   * The rows in the window, in order, before the view filter: the merged
+   * record (this manager's slot and its auxiliary slots) in legacy mode.
+   * The same array comes back while the window is unchanged, the store's
+   * own listing when the window is the whole record in record order; never
+   * change it.
+   */
+  getPresentedMessages(): StoredMessage[] {
+    return this.presentedMessageView().getAll();
+  }
+
+  /**
+   * The stored rows not in the window, in record order, from this manager's
+   * slot and its auxiliary slots: arrived and not presented. Leaves out an
+   * undone turn's rows (retractRows with `undone`). Empty in legacy mode.
+   */
+  getUnpresentedMessages(): StoredMessage[] {
+    return this.windowIndex.unpresented(this.mergedMessageView().getAll());
+  }
+
+  /** The highest record sequence among the rows in the window, undefined when it holds none. */
+  lastPresentedSequence(): number | undefined {
+    let last: number | undefined;
+    for (const message of this.getPresentedMessages()) if (last === undefined || message.sequence > last) last = message.sequence;
+    return last;
+  }
+
+  // ==========================================================================
   // Branching
   // ==========================================================================
 
@@ -1553,14 +1694,13 @@ export class ContextManager {
     // body from the strategy, but the body's identity (shard 0, the id
     // addMessage returned) and its membership are the stored group's. The
     // layout stays on the filtered view the strategy rendered. Attribution
-    // reads only around the messages the raw entries name, and a lookup
-    // asks for a sequence, not the message (#273).
-    const storedView = this.viewFilter ? this.mergedMessageView() : view;
+    // reads the agent's window before the filter, only around the messages
+    // the raw entries name, and a lookup asks for a position, which the
+    // window answers without reading the message (#273).
+    const storedView = this.viewFilter ? this.presentedMessageView() : view;
     const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
-    const sequenceOf = storedView.sequenceOf
-      ? (id: MessageId) => storedView.sequenceOf!(id)
-      : (id: MessageId) => storedView.get(id)?.sequence;
-    const attribution = attributeEntries(entries, storedMessages, sequenceOf);
+    const positionOf = (id: MessageId) => storedView.positionOf!(id);
+    const attribution = attributeEntries(entries, storedMessages, positionOf);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -2061,10 +2201,11 @@ export class ContextManager {
    * Undefined when the strategy has no such hook, so a caller appends the
    * content as stored. An id comes back as null when the next compile
    * doesn't send that message as one of its newest, such as one the view
-   * filter leaves out. It throws for an id no stored message has, before
-   * the strategy has initialized, and where the strategy's select would
-   * throw first, as the autobiographical strategy does on a branch it
-   * hasn't loaded. Like a compile, it releases compression holds that have
+   * filter leaves out, or one the agent hasn't been presented yet (see
+   * presentRows): present a row before rendering it. It throws for an id no
+   * stored message has, before the strategy has initialized, and where the
+   * strategy's select would throw first, as the autobiographical strategy
+   * does on a branch it hasn't loaded. Like a compile, it releases compression holds that have
    * timed out before it renders, so it reads the holds the next compile
    * will.
    */
@@ -2119,7 +2260,8 @@ export class ContextManager {
    * compression holds that have timed out, as `renderAsNewest` does.
    * Without `renderAsNewest`, a row is its stored content, and a body stored
    * as shards matches nothing, and so does an id the store doesn't hold, as
-   * after a removal.
+   * after a removal, and, once a host presents rows (see presentRows), one
+   * the agent's window doesn't hold.
    *
    * Returns false and writes nothing when `compileId` isn't the compile that
    * wrote the branch's record, as for a stream whose note arrives after
@@ -2153,9 +2295,11 @@ export class ContextManager {
     // another committing compile with binds its replies were minted under a
     // prefix the record no longer holds.
     if (record === null || record.compileId !== compileId) return false;
-    const view = this.mergedMessageView();
+    const view = this.presentedMessageView();
     // An id the store doesn't hold, as after a removal, is nothing the next
-    // compile sends: it vouches for nothing, as the marker does.
+    // compile sends: it vouches for nothing, as the marker does. Nor is a row
+    // the agent's window doesn't hold, once a host presents rows: present
+    // the rows a request carried before noting them.
     const ids = rows.filter((row): row is MessageId => typeof row === 'string' && view.get(row) !== null);
     const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
     let next = 0;
