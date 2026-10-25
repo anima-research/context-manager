@@ -674,6 +674,18 @@ describe("parallel calls' results, each in a message of its own", () => {
     });
   }
 
+  it('autobiographical: a walk over a long run of unchunked messages at once, as when the recent window shrinks, keeps the call with its results', async () => {
+    await withWrites(AutobiographicalStrategy, parallel(3), async (manager, strategy) => {
+      const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void; config: Record<string, number> };
+      assert.equal(chunker.chunks.length, 0, 'premise: nothing was chunked while the window held everything');
+      chunker.config.recentWindowTokens = 0;
+      chunker.rebuildChunks(storeOf(manager));
+      const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
+      assert.ok(chunker.chunks.length >= 3 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
+      assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, 3, 'the chunk holding the call holds all three results');
+    }, { recentWindowTokens: 1_000_000 });
+  });
+
   class Exposed extends AutobiographicalStrategy {
     recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
     headEnd(store: unknown) { return this.getHeadWindowEnd(store as never); }
