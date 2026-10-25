@@ -633,6 +633,127 @@ describe('a message stored as shards that answers its own calls holds no close',
   });
 });
 
+describe("parallel calls' results, each in a message of its own", () => {
+  const parallel = (n: number): Array<[string, ContentBlock[]]> => {
+    const ids = Array.from({ length: n }, (_, k) => `call-${k}`);
+    return [['Claude', [text('looking them up'), ...ids.map(call)]], ...ids.map((id): [string, ContentBlock[]] => ['User', [result(id, `${id} answered ` + 'w '.repeat(60))]])];
+  };
+  /** Short plain turns, the writes, more short plain turns; `first` is where the writes start. */
+  async function withWrites(
+    Strategy: typeof AutobiographicalStrategy,
+    writes: Array<[string, ContentBlock[]]>,
+    body: (manager: ContextManager, strategy: AutobiographicalStrategy, first: number) => Promise<void>,
+    config: Record<string, unknown> = {},
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-parallel-'));
+    const strategy = new Strategy({ autoTickOnNewMessage: false, targetChunkTokens: 40, headWindowTokens: 0, recentWindowTokens: 0, ...config });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    manager.setToolDefinitions(tools as never);
+    try {
+      for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(10))]);
+      const first = manager.getAllMessages().length;
+      for (const [participant, content] of writes) manager.addMessage(participant, content);
+      for (let k = 0; k < 12; k++) manager.addMessage(k % 2 ? 'User' : 'Claude', [text(`after ${k} ` + 'w '.repeat(10))]);
+      await body(manager, strategy, first);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const storeOf = (manager: ContextManager) => (manager as unknown as { messageStore: unknown }).messageStore;
+
+  for (const [name, { inPlace }] of Object.entries(STRATEGIES)) {
+    it(`${name}: no chunk parts the call from any of its three results, written one by one`, async () => {
+      await withWrites(inPlace, parallel(3), async (manager, strategy) => {
+        const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void };
+        chunker.rebuildChunks(storeOf(manager));
+        const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
+        assert.ok(chunker.chunks.length >= 3 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
+        assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, 3, 'the chunk holding the call holds all three results');
+      });
+    });
+  }
+
+  class Exposed extends AutobiographicalStrategy {
+    recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
+    headEnd(store: unknown) { return this.getHeadWindowEnd(store as never); }
+    estimates(store: unknown) { return this.postStripEstimates(store as never); }
+    held(messages: unknown[], from: number) { return this.closesHeld(messages as never, from); }
+    parted(messages: unknown[], from?: number, until?: number) { return this.callPartedStarts(messages as never, from, until); }
+  }
+  const config = (strategy: AutobiographicalStrategy) => (strategy as unknown as { config: Record<string, number> }).config;
+
+  it("the recent window's start, with its edge on any of the results, starts at the call", async () => {
+    for (const n of [2, 3, 5]) {
+      await withWrites(Exposed, parallel(n), async (manager, strategy, first) => {
+        const store = storeOf(manager);
+        const pse = (strategy as Exposed).estimates(store);
+        for (let edge = first + 1; edge <= first + n; edge++) {
+          config(strategy).recentWindowTokens = pse.slice(edge).reduce((t, x) => t + x, 0);
+          assert.equal((strategy as Exposed).recentStart(store), first, `${n} results, an edge on message ${edge}`);
+        }
+      });
+    }
+  });
+
+  it("the head window's end, with its edge on any of the results, ends before the call", async () => {
+    await withWrites(Exposed, parallel(3), async (manager, strategy, first) => {
+      const store = storeOf(manager) as { estimateTokens(m: unknown): number };
+      const stored = manager.getAllMessages();
+      for (let edge = first + 1; edge <= first + 3; edge++) {
+        config(strategy).headWindowTokens = stored.slice(0, edge).reduce((t, m) => t + store.estimateTokens(m), 0);
+        assert.equal((strategy as Exposed).headEnd(store), first, `an edge on message ${edge}`);
+      }
+    });
+  });
+
+  it("in a chain of calls, each message answering the call before and making the next, the recent window's start steps back once and no further", async () => {
+    const links = 5;
+    const writes: Array<[string, ContentBlock[]]> = [['Claude', [text('start'), call('call-0')]]];
+    for (let k = 1; k < links; k++) writes.push(['User', [result(`call-${k - 1}`, `answer ${k - 1}`), call(`call-${k}`)]]);
+    writes.push(['User', [result(`call-${links - 1}`, 'last answer')]]);
+    await withWrites(Exposed, writes, async (manager, strategy, first) => {
+      const store = storeOf(manager);
+      const pse = (strategy as Exposed).estimates(store);
+      const last = first + links;
+      config(strategy).recentWindowTokens = pse.slice(last).reduce((t, x) => t + x, 0);
+      // main's own step takes the window to the last call's message; this one to the call before it.
+      assert.equal((strategy as Exposed).recentStart(store), last - 2);
+    });
+  });
+
+  it('the holds a walk asks from a position, and the call starts asked around one, are those of the whole listing', async () => {
+    const writes: Array<[string, ContentBlock[]]> = [
+      ...parallel(3),
+      ['Claude', [text('next'), call('chain-0')]],
+      ['User', [result('chain-0', 'a'), call('chain-1')]],
+      ['User', [result('chain-1', 'b')]],
+      ['Claude', [text('one'), call('own'), text(prose('NOTE', 2_000)), result('own', 'x'), text('done')]],
+      ['Claude', [text(prose('REPLY', 2_000)), call('sharded')]],
+      ['User', [text(prose('LOG', 2_000)), result('sharded', 'y')]],
+      ['Claude', [call('open')]],
+    ];
+    await withWrites(Exposed, writes, async (manager, strategy) => {
+      // Every listing the store passed through as it was written, shard by shard, from every position.
+      const all = manager.getAllMessages();
+      assert.ok(all.length - new Set(all.map((m) => m.bodyGroupId ?? m.id)).size >= 4, 'premise: some messages are stored as shards');
+      for (let length = 1; length <= all.length; length++) {
+        const listing = all.slice(0, length);
+        const whole = (strategy as Exposed).held(listing, 0);
+        const starts = (strategy as Exposed).parted(listing);
+        for (let from = 1; from <= length; from++) {
+          const part = (strategy as Exposed).held(listing, from);
+          for (let p = from; p < length; p++) assert.equal(part[p], whole[p], `a listing of ${length}, from ${from}, position ${p}`);
+          // As the head's end and the window's start ask: from the position before a boundary, up to it.
+          const around = (strategy as Exposed).parted(listing, from - 1, from);
+          assert.equal(around[from - 1], starts[from - 1], `a listing of ${length}, the call start at ${from - 1}`);
+          for (let p = 0; p < from; p++) if (around[p]! >= 0) assert.equal(around[p], starts[p], `a listing of ${length}, asked at ${from - 1}, position ${p}`);
+        }
+      }
+    }, { adaptiveResolution: true });
+  });
+});
+
 describe('a result whose call compresses first, end to end', () => {
   for (const [name, { inPlace, legacy }] of Object.entries(STRATEGIES)) {
     for (const [shape, pair] of Object.entries(PAIRS)) {

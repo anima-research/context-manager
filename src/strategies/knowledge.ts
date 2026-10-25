@@ -176,8 +176,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       // Same tool-pair boundary guard as the base chunker (rebuildChunks in
       // AutobiographicalStrategy, closingPartsCall): never close a chunk
       // whose LAST message contains a tool_use block, nor anywhere between a
-      // call and the message answering it, which holds its result on a later
-      // shard when the result comes after a long text. Closing there would
+      // call and a message answering it, on a later shard when the result
+      // comes after a long text or in a later message when parallel calls'
+      // results come one to a message. Closing there would
       // split the pair across chunks; a compression request drops the
       // tool_result whose call isn't in it (stripUnpairedToolBlocks), and
       // when the earlier chunk compresses first, pairing repair drops the raw
