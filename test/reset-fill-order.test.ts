@@ -22,6 +22,11 @@
  *   end inside a body).
  * - Without a reset (headStart 0) the head still ends where its tokens run out,
  *   with the ratchet guard as before.
+ * - System changes stored before a reset head stay in the history, in store
+ *   order, while the head fills, so each message stored after a change is
+ *   sent after it; once the head is full they go first in it, in their order
+ *   (headPositions). Their refusal when they alone pass the budget holds
+ *   while the head fills.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
@@ -30,6 +35,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
+import { assertStage } from './fixtures/over-budget-hook.js';
 
 const BUDGET = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const words = (label: string, n: number): ContentBlock[] =>
@@ -747,4 +753,61 @@ describe('a past reset head, as compression requests read it (headAsOf)', () => 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+describe('system changes stored before a reset head', () => {
+  const tool = { name: 'get_weather', description: 'Weather.', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } };
+  const change = (extra: Record<string, unknown>): ContentBlock => ({ type: 'system_change', ...extra }) as unknown as ContentBlock;
+  const DEFINE = change({ defineTools: [tool] });
+  const REMOVE = change({ removeTools: ['get_weather'] });
+  /** Each entry as label() gives it, a change as DEFINE or REMOVE. */
+  const tag = (m: Sent): string => {
+    const block = m.content.find((b) => b.type === ('system_change' as string)) as { removeTools?: unknown } | undefined;
+    if (!block) return label(m);
+    return block.removeTools ? 'REMOVE' : 'DEFINE';
+  };
+  for (const [name, make] of Object.entries(SELECTS)) {
+    it(`${name}: stay in the history, in store order, while the head fills, and go first in the head once it is full`, () =>
+      withStore(make, async (m) => {
+        const stored = ['hist0', 'hist1', 'DEFINE', 'hist2', 'hist3', 'REMOVE', 'hist4', 'hist5'];
+        stored.forEach((item, i) => {
+          if (item === 'DEFINE') m.addMessage('Harness', [DEFINE]);
+          else if (item === 'REMOVE') m.addMessage('Harness', [REMOVE]);
+          else m.addMessage(i % 2 ? 'assistant' : 'user', words(item, 200));
+        });
+        await m.compile(BUDGET);
+        await m.resetHeadWindow('A new topic.');
+        const tags = async (): Promise<string[]> => ((await m.compile(BUDGET)).messages as unknown as Sent[]).map(tag);
+        // While the head fills, store order: each message stored after a
+        // change is sent after it, and each compile appends to the last.
+        assert.deepStrictEqual(await tags(), [...stored, 'TT']);
+        m.addMessage('user', words('after1', 5));
+        m.addMessage('assistant', words('after2', 5));
+        m.addMessage('user', words('batch1', 5));
+        m.addMessage('user', words('batch2', 5));
+        assert.deepStrictEqual(await tags(), [...stored, 'TT', 'after1', 'after2', 'batch1', 'batch2']);
+        for (let i = 0; i < 3; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`new${i}`, 400));
+        assert.deepStrictEqual(await tags(), [...stored, 'TT', 'after1', 'after2', 'batch1', 'batch2', 'new0', 'new1', 'new2'],
+          'still filling: the changes keep their places in the history');
+        m.addMessage('assistant', words('new3', 400));
+        assert.deepStrictEqual(await tags(),
+          ['DEFINE', 'REMOVE', 'TT', 'after1', 'after2', 'batch1', 'batch2', 'new0', 'new1', 'new2', ...H, 'new3'],
+          'once full, the head goes first and takes the changes before it, in their order, each once');
+      }));
+
+    it(`${name}: refuse while the head fills when the changes alone pass the budget, naming nothing that clears it`, () =>
+      withStore(make, async (m) => {
+        m.addMessage('user', [{ type: 'text', text: 'hello' }]);
+        m.addMessage('Harness', [change({ addSystem: ['Rule. '.repeat(400)] })]);
+        m.addMessage('assistant', [{ type: 'text', text: 'again' }]);
+        await m.resetHeadWindow('A new topic.');
+        m.addMessage('user', words('after1', 5));
+        await assert.rejects(m.compile({ maxTokens: 300, reserveForResponse: 0 }), (err: unknown) => {
+          assert.ok(err instanceof OverBudgetError, `${name}: ${String(err)}`);
+          assert.deepStrictEqual(err.clearedBy, [], `${name}: only consolidating clears it`);
+          if (name === 'hierarchical') assertStage(err, 'hierarchical-system-changes');
+          return true;
+        });
+      }));
+  }
 });

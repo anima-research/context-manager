@@ -8,6 +8,8 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
+import type { ContextObserver } from '../observer.js';
+import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -113,6 +115,12 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
+  /**
+   * The host's observer (`ContextManagerConfig.observer`), already isolated:
+   * a strategy reports its compression refusals and calibration samples to it
+   * and needs no guard of its own. Absent when the host gave none.
+   */
+  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
@@ -137,7 +145,8 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether compile() can proceed immediately */
+  /** Whether the strategy has no background work pending. compile() doesn't
+   *  wait for that work either way: it compiles from what's there. */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
@@ -184,8 +193,9 @@ export interface ContextStrategy {
    *
    * What comes back is made of the stored arrays and blocks, as a compile's
    * messages are, so a caller that edits what comes back copies it first.
-   * Tool blocks come back as the cap leaves them, since how a compile pairs
-   * and prunes them depends on the window around them. Rendering doesn't
+   * Tool blocks come back as the cap leaves them, with what sending prunes
+   * from them, since how a compile pairs them depends on the window around
+   * them. Rendering doesn't
    * change what a later compile sends.
    */
   renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
@@ -246,8 +256,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Check if strategy is ready to compile.
-   * Returns pending work info if not ready.
+   * Whether the strategy has background work pending, with its info if so.
+   * compile() doesn't wait for it.
    */
   checkReadiness(): ReadinessState;
 
@@ -314,6 +324,19 @@ export interface ContextStrategy {
   takeSelectionCause?(): string | undefined;
 
   /**
+   * The image ceilings this strategy keeps its live window within and holds
+   * a compression prompt to (`imageCeiling` and `imageByteCeiling`, 0 for
+   * none). They're configuration, not usage: they bound the images the
+   * window counts (see `AutobiographicalConfig.maxLiveImages`), not every
+   * image a request carries, and nothing here bounds what a caller injects
+   * at compile time or appends to a compiled request. A caller that wants
+   * its request within them counts that request's images itself, every
+   * shape included, and compares the counts with these. Absent on a strategy with no live-image
+   * window.
+   */
+  imageCeilings?(): ImageCeilings;
+
+  /**
    * The context manager left these thinking blocks of stored messages out of
    * the request the last committing select priced, after the select (see
    * `SelectOptions.thinkingBinding`). A strategy that calibrates its
@@ -321,6 +344,16 @@ export interface ContextStrategy {
    * price off what it expects the count to be. Not called for a dry compile.
    */
   noteThinkingLeftOut?(blocks: readonly ContentBlock[]): void;
+}
+
+/**
+ * A strategy's image ceilings (see ContextStrategy.imageCeilings): the most
+ * images, and the most inline base64 image bytes, its live window keeps and
+ * a compression prompt carries. 0 is no ceiling.
+ */
+export interface ImageCeilings {
+  imageCeiling: number;
+  imageByteCeiling: number;
 }
 
 /**
@@ -395,7 +428,10 @@ export interface SelectOptions {
    * throw as for a real compile, leaving nothing behind; `previewContext`
    * reports an over-budget throw, as the plan's own preview when the plan was
    * already over the budget (the live compile refuses it at the plan check),
-   * and passes any other throw through.
+   * and passes any other throw through. The passthrough strategies throw
+   * none of their budget refusals on a dry select: it returns what they would
+   * send, over the budget or without the newest message, with no verdict,
+   * and they have no `previewContext` report.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
@@ -1428,13 +1464,20 @@ export interface AutobiographicalConfig {
 
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
-   *  beyond this many are replaced with a text placeholder. 0 = unlimited.
-   *  A hard ceiling for dense bursts that pack many images into the live window.
+   *  beyond this many are replaced with a text placeholder. Kept within
+   *  `imageCeiling`, so 0 means up to that ceiling. A window kept at the
+   *  ceiling leaves no room under it for images a caller appends to the
+   *  compiled request, so a caller that keeps its requests within the
+   *  ceilings recompiles at each image it adds; at about 1,600 tokens an
+   *  image, the token budget binds first unless the images are small. A
+   *  fraction is floored, to at least 1.
+   *  A hard limit for dense bursts that pack many images into the live window.
    *  Every `image` block counts, whatever its source (base64, a `data:` URL
    *  or a remote URL), and so does every generated image, top-level or
    *  nested in a tool result (see inline-images.ts). An image inside an
    *  opaque provider item, such as a Responses `image_generation_call`
-   *  replayed from its raw form, doesn't. */
+   *  replayed from its raw form, doesn't. Every live-image limit and image
+   *  ceiling below counts the same way. */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
@@ -1458,14 +1501,14 @@ export interface AutobiographicalConfig {
   /**
    * Byte wall for live images (2026-07-12): keep inline images newest-first
    * only while their cumulative inline size (a base64 source, a `data:` URL's
-   * payload, a generated image's `data`; 0 for a remote URL) stays
-   * under this budget — on top
-   * of `maxLiveImages` / `imageStripDepthTokens`. It keeps the images it
-   * counts from pushing the compiled window past the API's total request size
-   * cap (413 request_too_large), so that membrane's oversize check isn't what
-   * edits them. An image inside an opaque provider item (see `maxLiveImages`)
-   * isn't counted, so it's outside this budget.
-   * Default 20MB (of base64; the API cap is 32MB total).
+   * payload, a generated image's `data`; 0 for a remote URL) stays under
+   * this budget — on top of `maxLiveImages` / `imageStripDepthTokens`.
+   * Default 20 MiB of base64. The window keeps at most `imageByteCeiling`
+   * whatever this says, and 0 here means up to that ceiling. It counts the
+   * images the window counts (see `maxLiveImages`), not the request's other
+   * bytes, so on its own it can't keep a request under membrane's byte cap:
+   * see `imageByteCeiling`. An image inside an opaque provider item (see
+   * `maxLiveImages`) isn't counted, so it's outside this budget.
    */
   maxLiveImageBytes?: number;
 
@@ -1507,9 +1550,81 @@ export interface AutobiographicalConfig {
    * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the
    * live window's: the prompt also carries the head, the recall frontier and
    * the raw chunk. Newest-first; older images become loud placeholders.
-   * Default 12MB of base64.
+   * Default 12MB of base64. A compression prompt carries at most
+   * `imageCeiling` images and `imageByteCeiling` bytes whatever this
+   * says, and 0 here, or any value that isn't a positive finite number, means
+   * up to the byte ceiling.
    */
   maxCompressionImageBytes?: number;
+
+  /**
+   * The most images a strategy's live window keeps, whatever `maxLiveImages`
+   * says, and the most images a compression prompt carries (2026-10-19). A
+   * `maxLiveImages` of 0 means up to this many. It counts images as
+   * `maxLiveImages` does: every image, nested ones and generated ones
+   * included, but not one inside an opaque provider item.
+   *
+   * It doesn't bound a whole request. Images inside opaque provider items
+   * aren't counted, and neither is anything a caller injects at compile time
+   * or appends to a compiled request; `imageCeilings()` reports this
+   * ceiling, so such a caller can count its request's images itself and
+   * compare. The provider refuses a
+   * request with more than 600 images and documents together (measured
+   * 2026-10-13, and again on 2026-10-19), and the default, 500, leaves room
+   * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
+   * finite number above it takes the default, and the strategy's warning at
+   * initialize names it. A fraction is floored, to at least 1. Under a
+   * window limit of 0 or above this ceiling, the strategy says once that
+   * this ceiling holds it, at the first render a select returns where images
+   * are shown as placeholders and the limit this ceiling sets was over: at
+   * an image the render replaces, or, with `imageStripHysteresisRatio`,
+   * where it brought a trim on anywhere in the rule's replay of the history.
+   * The depth limit or a limit the host set may be stripping images there
+   * too.
+   *
+   * A window held at a ceiling strips its oldest images as new ones come,
+   * as under any limit, but from deep in the request, so the prompt cache is
+   * rewritten from there at every new image. The memory strategy's
+   * `imageStripHysteresisRatio` strips in batches instead, so the cache is
+   * rewritten once a batch, and while that option is off the line names it.
+   */
+  imageCeiling?: number;
+
+  /**
+   * The most inline image bytes of the images a strategy's live window
+   * keeps, whatever `maxLiveImageBytes` says, and the most of its images'
+   * bytes a compression prompt carries (2026-10-19). A `maxLiveImageBytes`
+   * of 0 means up to this many. It measures an image as `maxLiveImageBytes`
+   * does: a base64 source's length, a `data:` URL's payload, a generated
+   * image's `data`, and 0 for a remote URL.
+   *
+   * It doesn't bound a request's bytes: the messages' text and JSON,
+   * documents, the images the window doesn't count, and anything a caller
+   * injects or appends aren't counted. membrane's byte cap is 28 MiB of
+   * serialized messages unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise,
+   * and the default, 24 MiB, leaves 4 MiB of that cap for what this doesn't
+   * count. Where membrane checks a request against its cap, it refuses one
+   * over it before sending it; an XML-mode continuation round isn't checked
+   * there, and of the provider adapters only Anthropic's checks again. A
+   * request that asks membrane to shed images, as this strategy's compression
+   * requests do, first has its oldest images replaced until it fits or none
+   * is left, and then only the Anthropic adapter's own check refuses it if
+   * it's still over (`src/live-image-limits.ts` says where each check runs).
+   * That's for a formatter whose messages keep membrane's `image` blocks:
+   * such a request built with membrane's `openai-responses` formatter
+   * carries `input_image` parts, which aren't shed, and it isn't checked
+   * either. This
+   * setting isn't read from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes
+   * membrane's cap sets this too, keeping room under the cap for what this
+   * doesn't count.
+   * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
+   * value that isn't 0 or a finite number above it takes the default, and a
+   * fraction is floored, to at least 1. Under a window limit of 0 or above
+   * this ceiling, the strategy says so once, and a window held at it rewrites
+   * the prompt cache from deep in the request at every new image, both as
+   * for `imageCeiling`.
+   */
+  imageByteCeiling?: number;
 
   /**
    * Merge grouping: exclude candidates whose OWN source span exceeds the
@@ -2016,9 +2131,11 @@ export interface AutobiographicalConfig {
    * folds it demands through the normal drain queues. Once the forest has
    * converged, the live budget can be lowered to the target in one move: no
    * fold-storm, a single KV invalidation ("produce first, fold once").
-   * If the target is unreachable even fully folded (head + tail + max-depth
-   * summaries still exceed it), every compile warns loudly — a descent to
-   * that budget would hard-fail with OverBudgetError. Shadow demand is
+   * If the shadow pick runs out of folds and produce requests with its plan
+   * still over the target's soft line, the compile warns, giving the plan's
+   * size and the line above which a compile at the target is refused with
+   * OverBudgetError: lowering the live budget to the target fails only while
+   * the plan is over that line. Shadow demand is
    * speculative and never bypasses the `l1HoldbackChunks` window. Must be
    * positive; no effect unless lower than the live compile budget.
    */
@@ -2362,6 +2479,8 @@ Write naturally, as recollection of what you experienced.`,
   maxMessageTokens: 0,
   maxLiveImages: 6,
   imageStripDepthTokens: 30000,
+  imageCeiling: DEFAULT_IMAGE_CEILING,
+  imageByteCeiling: DEFAULT_IMAGE_BYTE_CEILING,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,

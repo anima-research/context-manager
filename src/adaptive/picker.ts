@@ -86,10 +86,12 @@ export interface OverBudgetRawPin {
 
 /**
  * What clears an over-budget refusal at run time besides a larger budget,
- * which clears any of them: waiting, or a hot setting. Cold configuration,
+ * which clears any of them but the structural repair's (a newest turn the
+ * repair dropped, which no budget brings back): waiting, or a hot setting. Cold configuration,
  * such as the head window's size, isn't named, and neither is a head-window
  * reset (`resetHeadWindow`), which clears a head that's over but starts a new
- * topic, nor newer messages that would shrink a head holding images, since
+ * topic (the system changes stored before the new head stay in it, so a
+ * reset clears none of what they cost), nor newer messages that would shrink a head holding images, since
  * the image strip takes the oldest images first but may not take enough.
  * The strategy that refuses sets it, since it knows which part of the
  * context is over and what can shrink that part:
@@ -151,14 +153,17 @@ export interface OverBudgetRawPin {
  *   as before, since nothing says what it folds. Whether that work is
  *   enough to fit isn't checked, so a host can tell an agent that
  *   compression may make room, not that it will.
- * - `'newer-message'`: the newest message alone is over the budget, and a
- *   newer message that fits moves the window past it.
+ * - `'newer-message'`: the newest message, with the system changes sent
+ *   beside it, is over the budget, and a newer conversation message that
+ *   fits beside them moves the window past it (a newer change doesn't).
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the newest
  *   turn as the compile must keep it raw, or beside everything from a
- *   compression hold if one starts earlier. That's the newest message (for
- *   one split into shards, its newest shard, since the earlier shards can
- *   fold), unless the newest message's body holds a tool_result, on its first
+ *   compression hold if one starts earlier, and beside the system changes
+ *   outside the head, which stay raw wherever the window starts. That's the
+ *   newest conversation message, a system change being none, with the
+ *   changes after it (for one split into shards, its newest shard, since the
+ *   earlier shards can fold), unless the newest message's body holds a tool_result, on its first
  *   shard: then it's that whole body and the whole call before it, which the
  *   result must follow raw. A smaller
  *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
@@ -170,6 +175,83 @@ export interface OverBudgetRawPin {
  * compression.
  */
 export type OverBudgetClearedBy = 'compression' | 'newer-message' | 'smaller-recent-window';
+
+/**
+ * Which stage of a compile refused (`OverBudgetError.stageId`), from a closed
+ * list a host can read without parsing the message:
+ * - `'picker-exhausted'`: the adaptive picker folded everything it could.
+ * - `'head-tail-reservation'`: the head and the recent window alone exceed
+ *   the budget.
+ * - `'emission-overran-plan'`: the emitter spent more than the plan priced
+ *   (planner/emitter estimator drift).
+ * - `'tail-emission-dropped'`: tail emission would have dropped messages
+ *   reserved for the recent window.
+ * - `'repair-lost-newest-turn'`: structural repair didn't keep the newest
+ *   turn.
+ * - `'hierarchical-emission-overran'`: the hierarchical emitter overran the
+ *   budget.
+ * - `'hierarchical-system-changes'`: the hierarchical emitter's system
+ *   changes alone exceed the budget.
+ * - `'passthrough-system-changes'`: `PassthroughStrategy`'s system changes
+ *   alone exceed the budget.
+ * - `'passthrough-changes-and-newest-message'`: its system changes and the
+ *   newest conversation message together exceed the budget.
+ * - `'windowed-newest-message'`: `WindowedPassthroughStrategy`'s newest
+ *   message alone exceeds the budget.
+ * - `'windowed-changes-and-newest-message'`: its system changes and the
+ *   newest conversation message together exceed the budget.
+ * - `'windowed-system-changes'`: its system changes alone exceed the budget.
+ * - `'strategy-defined'`: a strategy named its stage only in words of its
+ *   own (the constructor's `stage`), which open the message.
+ */
+export const OVER_BUDGET_STAGES = [
+  'picker-exhausted',
+  'head-tail-reservation',
+  'emission-overran-plan',
+  'tail-emission-dropped',
+  'repair-lost-newest-turn',
+  'hierarchical-emission-overran',
+  'hierarchical-system-changes',
+  'passthrough-system-changes',
+  'passthrough-changes-and-newest-message',
+  'windowed-newest-message',
+  'windowed-changes-and-newest-message',
+  'windowed-system-changes',
+  'strategy-defined',
+] as const;
+
+/** A stage of {@link OVER_BUDGET_STAGES}. */
+export type OverBudgetStage = typeof OVER_BUDGET_STAGES[number];
+
+/** A stage context-manager's own strategies refuse at, which has words of its own: what the constructor's `stageId` takes. */
+type LibraryStage = Exclude<OverBudgetStage, 'strategy-defined'>;
+
+/** How each of context-manager's own stages opens the refusal's message. Every such stage has words, and nothing else does. */
+const OVER_BUDGET_STAGE_TEXT: Record<LibraryStage, string> = {
+  'picker-exhausted': 'Adaptive picker exhausted',
+  'head-tail-reservation': 'Head/tail reservation exceeded budget',
+  'emission-overran-plan': 'Emission overran the plan (planner/emitter estimator drift)',
+  'tail-emission-dropped': 'Tail emission dropped reserved recent-window messages',
+  'repair-lost-newest-turn': 'Structural repair did not retain the newest turn',
+  'hierarchical-emission-overran': 'Hierarchical emission overran the budget',
+  'hierarchical-system-changes': 'Hierarchical: its system changes alone exceed the budget',
+  'passthrough-system-changes': 'Passthrough kept only its system changes',
+  'passthrough-changes-and-newest-message': 'Passthrough: its system changes and the newest conversation message',
+  'windowed-newest-message': 'Windowed passthrough: the newest message alone',
+  'windowed-changes-and-newest-message': 'Windowed passthrough: its system changes and the newest conversation message',
+  'windowed-system-changes': 'Windowed passthrough: its system changes alone',
+};
+
+/**
+ * The options a library site refusing at `stageId` gives: the id, and its
+ * words as `stage`. AutobiographicalStrategy's sites go through its
+ * protected `overBudgetError` hook, whose override received the words as
+ * `stage` in 0.21.0 and still does; the message and the field are as for
+ * the id alone.
+ */
+export function overBudgetStage(stageId: LibraryStage): { stageId: LibraryStage; stage: string } {
+  return { stageId, stage: OVER_BUDGET_STAGE_TEXT[stageId] };
+}
 
 /** The sentence naming the pins that keep raw tokens in a refusal's middle, or nothing when none do. */
 function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
@@ -224,6 +306,13 @@ export class OverBudgetError extends Error {
    * {@link OverBudgetClearedBy}). Empty when nothing else is known to clear it.
    */
   readonly clearedBy: readonly OverBudgetClearedBy[];
+  /**
+   * Which stage refused (see {@link OVER_BUDGET_STAGES}): the `stageId` the
+   * thrower gave, `'strategy-defined'` when it gave only words of its own
+   * (`stage`), or `'picker-exhausted'` when it gave neither. A `stageId` that
+   * isn't one of the library's counts as none given.
+   */
+  readonly stageId: OverBudgetStage;
 
   constructor(opts: {
     budget: number;
@@ -231,9 +320,15 @@ export class OverBudgetError extends Error {
     diagnostics: OverBudgetError['diagnostics'];
     /** What clears the refusal besides a larger budget; empty when left out. */
     clearedBy?: readonly OverBudgetClearedBy[];
-    /** Which stage refused — defaults to the plan-stage wording. Emission
-     *  sites pass their own so a planner/emitter drift refusal doesn't
-     *  masquerade as picker exhaustion (it cost a debugging session once). */
+    /** Which of the library's stages refused — defaults to
+     *  `'picker-exhausted'`. Emission sites pass their own so a
+     *  planner/emitter drift refusal doesn't masquerade as picker exhaustion
+     *  (it cost a debugging session once). Its words open the message unless
+     *  `stage` gives words. */
+    stageId?: LibraryStage;
+    /** A strategy's own words for the stage that refused, which open the
+     *  message exactly as given, as in 0.21.0; `stageId` then reads
+     *  `'strategy-defined'` unless the thrower also gave a `stageId`. */
     stage?: string;
   }) {
     const countLabels = {
@@ -253,8 +348,16 @@ export class OverBudgetError extends Error {
     const depth = opts.diagnostics.deepestLevelKind === 'unplanned'
       ? 'fold plan=not computed'
       : `${depthLabel}=L${opts.diagnostics.deepestLevel}`;
+    // Words open the message exactly as 0.21.0 built it (`stage ?? default`),
+    // whatever they say. An id names a stage only as the map's own key, so a
+    // caller past the type who gives another value gives no id.
+    const words: unknown = opts.stage;
+    const named: unknown = opts.stageId;
+    const id = typeof named === 'string' && Object.hasOwn(OVER_BUDGET_STAGE_TEXT, named) ? named as LibraryStage : undefined;
+    const stageId: OverBudgetStage = id ?? (words != null ? 'strategy-defined' : 'picker-exhausted');
+    const opening = words != null ? `${words}` : OVER_BUDGET_STAGE_TEXT[id ?? 'picker-exhausted'];
     super(
-      `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
+      `${opening} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
         ` middle=${opts.diagnostics.middleTokens}${middleCount}, ${depth}` +
         (opts.diagnostics.deepestAvailableLevel === undefined ? '' :
@@ -275,6 +378,7 @@ export class OverBudgetError extends Error {
     this.actual = opts.actual;
     this.diagnostics = opts.diagnostics;
     this.clearedBy = Object.freeze([...(opts.clearedBy ?? [])]);
+    this.stageId = stageId;
   }
 }
 

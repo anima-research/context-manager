@@ -58,6 +58,7 @@ import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.j
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
+import { isCompileRefusal, isolateObserver, type ContextObserver } from './observer.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
@@ -77,6 +78,37 @@ import type {
 } from './types/index.js';
 
 type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
+
+/**
+ * A compiled message as `firstChanged` compares it. An injection's content
+ * is the caller's, which may change in place, so its bytes are taken when
+ * it's compiled, also when a binding compile sends it without its thinking,
+ * as a new array of the caller's blocks. Other content is the store's, the
+ * strategy's or the manager's own, which nothing changes in place (as the
+ * store's own per-message caches assume), so the same array is the same
+ * content, and its bytes are taken only when a comparison with another array
+ * needs them.
+ */
+interface CompiledMessageKey {
+  readonly participant: string;
+  readonly content: readonly ContentBlock[];
+  readonly injected: boolean;
+  bytes?: string;
+}
+
+/** The index of the first of `keys` that differs from `before`'s at its index, or has none there (ContextManager.recordFirstChanged). */
+function firstDifference(keys: readonly CompiledMessageKey[], before: readonly CompiledMessageKey[]): number {
+  const bytesOf = (key: CompiledMessageKey): string => (key.bytes ??= JSON.stringify(key.content));
+  let i = 0;
+  for (; i < keys.length && i < before.length; i++) {
+    const now = keys[i]!;
+    const then = before[i]!;
+    if (now.participant !== then.participant) break;
+    if (now.content === then.content && !now.injected && !then.injected) continue;
+    if (bytesOf(now) !== bytesOf(then)) break;
+  }
+  return i;
+}
 
 /**
  * Base configuration for ContextManager.
@@ -110,6 +142,18 @@ interface ContextManagerBaseConfig {
    * inject a fake clock.
    */
   now?: () => number;
+  /**
+   * Told of each compile, of each refusal context-manager itself makes of
+   * compression, and of each calibration sample, as each happens (see
+   * `ContextObserver`). The manager hands it to its strategy in
+   * `StrategyContext`. It's called synchronously, and what it throws or
+   * rejects never reaches the work: the manager logs a callback's first
+   * failure through its diagnostics and drops the rest. (A returned promise
+   * no JavaScript can give a handler is outside that; see
+   * `ContextObserver`.) A record's error and render
+   * stats are the objects the caller gets, so treat them as read-only.
+   */
+  observer?: ContextObserver;
   /**
    * Strategy-facing exclusion predicate: return true to keep a message
    * visible. When set, the view handed to the strategy — for compile,
@@ -261,11 +305,19 @@ export class ContextManager {
   private compressionHolds = new Set<MessageId>();
   /** Summaries the strategy rendered but couldn't describe, already reported. */
   private undescribedSummariesReported = new Set<string>();
+  /**
+   * The last committing compile's messages, for the next one's
+   * `firstChanged`, whatever branch or strategy it read; null before this
+   * manager's first committing compile.
+   */
+  private lastCompiled: CompiledMessageKey[] | null = null;
   /** Sharded adds held on ingress: first-shard id -> every shard id. */
   private compressionHoldGroups = new Map<MessageId, MessageId[]>();
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
   private compressionHoldInfo = new Map<MessageId, CompressionHoldInfo>();
   private now: () => number = Date.now;
+  /** The host's observer, isolated (`ContextManagerConfig.observer`), or none. */
+  private observer: ContextObserver | undefined;
   /** Hold options + shared heldAt for the addMessage currently appending. */
   private holdingAddOptions: CompressionHoldOptions | undefined;
   private holdingAddAt = 0;
@@ -492,6 +544,14 @@ export class ContextManager {
       auxiliaryStores,
     );
     if (config.now) manager.now = config.now;
+    if (config.observer) {
+      manager.observer = isolateObserver(config.observer, (callback, error) => logThrown(
+        `[context-manager] the observer's ${callback} callback threw or rejected; the work it observes goes on, ` +
+          `and its later failures aren't logged:`,
+        error,
+        manager.diag,
+      ));
+    }
 
     try {
       await manager.initializeStrategy();
@@ -538,6 +598,9 @@ export class ContextManager {
     // later (appendMessage), once expired holds have been released, as at
     // any add.
     content = contentForWrite(content, 'Message refused');
+    // So is a system change between a tool call and its result
+    // (MessageStore.refuseToolPairSplit).
+    this.messageStore.refuseToolPairSplit(content, 'Message refused');
     return this.write(() => {
       this.expireCompressionHolds();
       if (!options?.holdCompression) {
@@ -1120,7 +1183,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Check if compile() will block waiting for background work.
+   * Whether the strategy has no background work pending (its
+   * `checkReadiness()`). compile() doesn't wait for that work: it compiles
+   * from what's there.
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
@@ -1158,13 +1223,48 @@ export class ContextManager {
    * model that binds thinking can no longer take, injections placed (see
    * `SelectOptions.thinkingBinding`).
    *
-   * May block if strategy has pending work.
+   * With `ContextManagerConfig.observer`, it tells the observer of the
+   * compile as it returns or throws (`ContextObserver.compile`).
+   *
+   * It awaits nothing, so it doesn't wait for the strategy's background work.
    */
   async compile(
     budget?: TokenBudget,
     injections?: ContextInjection[],
     opts?: SelectOptions
   ): Promise<CompileResult> {
+    const observer = this.observer;
+    if (!observer?.compile) return this.compileNow(budget, injections, opts);
+    // A compile awaits nothing, so it's timed whole on one clock reading
+    // each side, and the observer hears of it as it returns or throws. The
+    // wall clock, not the manager's own, so an observer adds no read of now().
+    const startedAt = Date.now();
+    const start = performance.now();
+    const strategy = this.strategy.name;
+    const dryRun = opts?.dryRun === true;
+    let result: CompileResult;
+    try {
+      result = this.compileNow(budget, injections, opts);
+    } catch (error) {
+      observer.compile({
+        strategy, dryRun, startedAt, durationMs: performance.now() - start,
+        outcome: isCompileRefusal(error) ? 'refused' : 'failed', error,
+      });
+      throw error;
+    }
+    observer.compile({
+      strategy, dryRun, startedAt, durationMs: performance.now() - start, outcome: 'compiled',
+      ...(result.renderStats ? { renderStats: result.renderStats } : {}),
+    });
+    return result;
+  }
+
+  /** compile()'s work, which awaits nothing. */
+  private compileNow(
+    budget?: TokenBudget,
+    injections?: ContextInjection[],
+    opts?: SelectOptions
+  ): CompileResult {
     this.requireInitialized('compile');
     // Before anything is selected or committed: a compile refused here leaves
     // nothing behind.
@@ -1296,8 +1396,10 @@ export class ContextManager {
       };
       if (this.debugLogContext) this.logCompiledContext(result);
       // Last, once nothing of the compile can still fail: what a committing
-      // compile leaves behind for the next one.
+      // compile leaves behind for the next one. A compile that throws before
+      // here, which no caller sends, is never the one the next is compared with.
       if (opts?.dryRun !== true) {
+        this.recordFirstChanged(result, messageSources);
         if (binding) {
           // Nothing here fails the compile: a record it can't write leaves
           // the one before, if any, which this compile's stream can't note
@@ -1393,6 +1495,52 @@ export class ContextManager {
     }
 
     return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * Records a committing compile's messages for the next one's comparison
+   * (CompiledMessageKey), and gives `result` its `firstChanged`, compared
+   * when it's read: a caller that never reads it pays for no comparison.
+   * That is the index of the first compiled message whose
+   * participant or content bytes differ from the last committing compile's
+   * message at that index, or that has none there (so the first appended
+   * index after appends alone, and the message count when these messages are
+   * that compile's or a prefix of them); null before this manager's first
+   * committing compile. The comparison is by bytes, so it holds across a
+   * branch or strategy switch, which the manager can't always see (a direct
+   * switch of the store's branch away and back). Cache markers are message
+   * flags, not content, so they don't count. Read after later compiles, it
+   * still compares this compile with the one before it. Until it's read, a
+   * result keeps this compile's keys and the last one's.
+   */
+  private recordFirstChanged(result: CompileResult, sources: readonly CompiledMessageSources[]): void {
+    // An injection is told by its source, not its array: a binding compile
+    // sends one that holds thinking as a new array.
+    const keys: CompiledMessageKey[] = result.messages.map((message, i) => sources[i]?.kind === 'injection'
+      ? { participant: message.participant, content: message.content, injected: true, bytes: JSON.stringify(message.content) }
+      : { participant: message.participant, content: message.content, injected: false });
+    const before = this.lastCompiled;
+    this.lastCompiled = keys;
+    // The first read, or a write, settles the value and lets go of both
+    // compiles' keys, so the result then holds a number. It stays an
+    // accessor, so a frozen or sealed result reads it too.
+    let pending: { keys: CompiledMessageKey[]; before: typeof before } | null = { keys, before };
+    let value: number | null | undefined;
+    Object.defineProperty(result, 'firstChanged', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        if (pending) {
+          value = pending.before ? firstDifference(pending.keys, pending.before) : null;
+          pending = null;
+        }
+        return value;
+      },
+      set: (next: number | null | undefined) => {
+        value = next;
+        pending = null;
+      },
+    });
   }
 
   /**
@@ -2243,6 +2391,7 @@ export class ContextManager {
       messageStore: this.strategyMessageView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
+      ...(this.observer ? { observer: this.observer } : {}),
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,

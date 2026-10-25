@@ -1,6 +1,7 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
+  ImageCeilings,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
@@ -20,6 +21,16 @@ import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
+import {
+  DEFAULT_IMAGE_CEILING,
+  DEFAULT_IMAGE_BYTE_CEILING,
+  liveImageLimitsWarning,
+  ceilingBoundLine,
+  ceilingSetLimits,
+  resolveLiveImageLimits,
+  type ResolvedImageLimits,
+} from '../live-image-limits.js';
+import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -28,12 +39,14 @@ export interface WindowedPassthroughOptions {
   /**
    * When the window no longer fits the budget, the anchor jumps forward so
    * the new window is roughly this fraction of the usable budget (default
-   * 0.5). Between jumps the anchor never moves, so compiled output between
-   * re-anchors is a byte-stable prefix plus pure appends — and the strategy
+   * 0.5), or, when the store holds system changes, which go out wherever the
+   * window starts, this fraction of the room they leave. Between jumps the
+   * anchor never moves, so compiled output between re-anchors is a
+   * byte-stable prefix plus pure appends — and the strategy
    * marks that prefix for the provider's prompt cache (see
    * {@link WindowedPassthroughStrategy} on cache markers), so the accepted
-   * cost is one cache miss per jump, amortized over ~(1 - fraction) × budget
-   * of appended tokens, instead of the per-turn prefix churn a naively
+   * cost is one cache miss per jump, amortized over ~(1 - fraction) × that
+   * room of appended tokens, instead of the per-turn prefix churn a naively
    * sliding front produces.
    */
   reAnchorFraction?: number;
@@ -69,19 +82,41 @@ export interface WindowedPassthroughOptions {
    * `imageStripDepthTokens` from the newest message, or past
    * `maxLiveImageBytes` of cumulative inline image bytes (newest-first).
    * Defaults follow `DEFAULT_AUTOBIOGRAPHICAL_CONFIG` (and the memory
-   * strategy's byte wall); 0 disables that dimension. A strip changes the
+   * strategy's byte wall). A count or byte limit of 0 means up to its
+   * image ceiling, below, and a depth of 0 means no depth strip. A strip changes the
    * bytes at that position, which the cache-marker placement absorbs by
    * measurement (the marker falls back to the deepest byte-stable entry).
    */
   maxLiveImages?: number;
   imageStripDepthTokens?: number;
   maxLiveImageBytes?: number;
+  /**
+   * The image ceilings, mirroring `AutobiographicalConfig.imageCeiling` and
+   * `imageByteCeiling`: the most images, and the most of their inline image
+   * bytes, the window keeps, counted as
+   * `AutobiographicalConfig.maxLiveImages` says, whatever `maxLiveImages` and
+   * `maxLiveImageBytes` say (0 there means up to these). They don't bound a
+   * whole request: what the window doesn't count, and what a caller injects
+   * or appends, isn't counted. `imageCeilings()` reports them.
+   * Defaults 500 images and 24 MiB; 0 = no ceiling, and a value that isn't 0
+   * or a finite number above it takes the default.
+   */
+  imageCeiling?: number;
+  imageByteCeiling?: number;
 }
 
 /** Text substituted for an image block once it leaves the live-image window
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
 const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
+
+/** The live-image policy's verdicts, by message position (see liveImagePolicy). */
+interface ImagePolicy {
+  strips: (boolean[] | undefined)[];
+  saved: number[];
+  ceilings: ({ images: boolean; bytes: boolean } | undefined)[];
+}
+
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -120,21 +155,31 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * **Hard budget.** After per-message shaping (truncation, image policy) the
  * window is priced against `maxTokens - reserveForResponse`. Overflow
  * re-anchors; if the single newest message alone still exceeds the usable
- * budget the strategy refuses with {@link OverBudgetError} (the framework's
- * over-budget breaker handles it) rather than emitting a request the
- * provider will reject. Previews report the oversized window instead.
+ * budget, or with system changes, the changes and the newest conversation
+ * message, or the changes alone, the strategy refuses with
+ * {@link OverBudgetError} (the framework's over-budget breaker handles it)
+ * rather than emitting a request the provider will reject. Previews report
+ * the oversized window instead.
  */
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
-  /** Renders the window raw; history before the anchor is not rendered. */
+  /** Renders the window raw; history before the anchor is not rendered, but for its system changes. */
   readonly renderedForms = ['raw', 'omitted'] as const;
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
-  private readonly maxLiveImages: number;
+  /** The image limits as configured, with the defaults where unset. */
+  private readonly configuredImageLimits: {
+    maxLiveImages: number; maxLiveImageBytes: number; imageCeiling: number; imageByteCeiling: number;
+  };
+  /** The image limits the options didn't give, whose values are defaults. */
+  private readonly imageLimitsDefaulted: ReadonlySet<string>;
   private readonly imageStripDepthTokens: number;
-  private readonly maxLiveImageBytes: number;
+  /** Whether the image limits' warning has been said (once per instance). */
+  private imageLimitsWarningReported = false;
+  /** Which ceilings have been said to strip the live window (once each per instance). */
+  private readonly ceilingBoundReported = { images: false, bytes: false };
 
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
@@ -157,15 +202,51 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.reAnchorFraction = fraction;
     this.anchorStateIdOverride = options.anchorStateId;
     this.maxMessageTokens = options.maxMessageTokens;
-    this.maxLiveImages = options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0;
+    this.configuredImageLimits = {
+      maxLiveImages: options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0,
+      maxLiveImageBytes: options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES,
+      imageCeiling: options.imageCeiling ?? DEFAULT_IMAGE_CEILING,
+      imageByteCeiling: options.imageByteCeiling ?? DEFAULT_IMAGE_BYTE_CEILING,
+    };
+    this.imageLimitsDefaulted = new Set(
+      (['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling'] as const).filter((key) => options[key] == null),
+    );
     this.imageStripDepthTokens =
       options.imageStripDepthTokens ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.imageStripDepthTokens ?? 0;
-    this.maxLiveImageBytes = options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES;
+  }
+
+  /**
+   * The image ceilings (see ContextStrategy.imageCeilings), as the window
+   * applies them: a malformed one at its default, a fraction floored.
+   */
+  imageCeilings(): ImageCeilings {
+    const { ceiling } = this.resolvedImageLimits();
+    return { imageCeiling: ceiling.images, imageByteCeiling: ceiling.bytes };
+  }
+
+  /** The live window's count and byte limits, kept within the image
+   *  ceilings, and the ceilings themselves. */
+  private resolvedImageLimits(): ResolvedImageLimits {
+    return resolveLiveImageLimits(this.configuredImageLimits);
+  }
+
+  /** Say once that an image ceiling holds a limit the options set as none
+   *  or above it, once a limit it sets was over where the window strips an
+   *  image (liveImagePolicy's `ceilings`). */
+  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this.ceilingBoundReported[kind]) return;
+    this.ceilingBoundReported[kind] = true;
+    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits, this.imageLimitsDefaulted));
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    if (!this.imageLimitsWarningReported) {
+      this.imageLimitsWarningReported = true;
+      const line = liveImageLimitsWarning(this.name, this.configuredImageLimits, this.imageLimitsDefaulted);
+      if (line) this.diag.warn(line);
+    }
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
     registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
@@ -299,17 +380,33 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       return estimate + cappedPriceExtra(store, msg, content);
     };
 
+    // A system change before the window is sent too, in its order ahead of
+    // it: it changes the tools and system text everything after it was read
+    // with (system-changes.ts). So every change is priced wherever the
+    // window starts.
+    const changes = systemChangePositions(messages);
+    const keptBefore = (from: number): number[] => changes.filter((i) => i < from);
+    let changeTokens = 0;
+    for (const i of changes) changeTokens += priced(i);
     let total = 0;
+    for (const i of keptBefore(start)) total += priced(i);
     for (let i = start; i < messages.length; i++) total += priced(i);
 
+    let movedAnchor: number | undefined;
     if (total > maxTokens) {
-      // Coarse re-anchor: jump forward so the window is ~fraction × budget,
-      // then emit from the new anchor. One prefix invalidation, then
-      // byte-stable prefix + appends again until the next overflow.
-      const target = maxTokens * this.reAnchorFraction;
-      let acc = 0;
+      // Coarse re-anchor: jump forward so the window holds the changes and
+      // about that fraction of the room they leave, then emit from the new
+      // anchor. One prefix invalidation, then
+      // byte-stable prefix + appends again until the next overflow. The
+      // system changes go out wherever the window starts, so its messages
+      // take that fraction of the room the changes leave, and appends get
+      // the rest of that room, (1 - fraction) × (budget - changes), before
+      // the next.
+      const target = changeTokens + (maxTokens - changeTokens) * this.reAnchorFraction;
+      let acc = changeTokens;
       let newStart = messages.length;
       for (let i = messages.length - 1; i >= start; i--) {
+        if (holdsSystemChange(messages[i]!.content)) continue; // priced above
         const tokens = priced(i);
         if (acc + tokens > target) break;
         acc += tokens;
@@ -317,20 +414,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
       // Always make progress: if even the newest message exceeds the
       // target, emit just that message rather than nothing — subject to the
-      // hard-budget check below.
+      // hard-budget check below. A system change is no conversation message,
+      // so that's the newest message that isn't one, if the window holds one.
       if (newStart === messages.length && messages.length > 0) {
         newStart = messages.length - 1;
+        while (newStart > start && holdsSystemChange(messages[newStart]!.content)) newStart--;
       }
       start = newStart;
       total = 0;
+      for (const i of keptBefore(start)) total += priced(i);
       for (let i = start; i < messages.length; i++) total += priced(i);
-      if (!opts?.dryRun && start < messages.length) {
-        const newAnchor = messages[start].sequence;
-        if (newAnchor !== this.anchor) {
-          this.anchor = newAnchor;
-          this.persistAnchor();
-          this.pendingCause = 'window';
-        }
+      if (start < messages.length && messages[start].sequence !== this.anchor) {
+        movedAnchor = messages[start].sequence;
       }
     }
 
@@ -339,27 +434,43 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // would reject the request; refuse loudly instead (the framework
     // recognizes OverBudgetError and runs its over-budget breaker), as the
     // autobiographical strategy does. Previews report rather than throw.
+    // The anchor moves only for a compile that sends, below: a refused one
+    // leaves it where the last sent window started, so the turns that fit
+    // once the caller consolidates its changes are still in the window.
     if (total > maxTokens && !opts?.dryRun) {
       throw new OverBudgetError({
         budget: maxTokens,
         actual: total,
-        stage: 'Windowed passthrough: the newest message alone',
+        // Which part is over: the newest message alone, or the system
+        // changes sent beside it, with it or alone.
+        stageId: changeTokens === 0
+          ? 'windowed-newest-message'
+          : total > changeTokens
+            ? 'windowed-changes-and-newest-message'
+            : 'windowed-system-changes',
         // No compression here: the window moves past this message once a
-        // newer one that fits arrives (the progress clause above).
-        clearedBy: ['newer-message'],
+        // newer one that fits arrives (the progress clause above). System
+        // changes go out wherever the window starts, so once they leave no
+        // room for a message only the caller, consolidating them, clears it.
+        clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
         diagnostics: {
-          headTokens: 0,
-          tailTokens: total,
+          headTokens: changeTokens,
+          tailTokens: total - changeTokens,
           middleTokens: 0,
           middleChunkCount: 0,
           deepestLevel: 0,
         },
       });
     }
+    if (movedAnchor !== undefined && !opts?.dryRun) {
+      this.anchor = movedAnchor;
+      this.persistAnchor();
+      this.pendingCause = 'window';
+    }
 
     const entries: ContextEntry[] = [];
-    for (let i = start; i < messages.length; i++) {
-      const msg = messages[i];
+    const add = (i: number): void => {
+      const msg = messages[i]!;
       entries.push({
         index: i,
         sourceMessageId: msg.id,
@@ -367,9 +478,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         participant: msg.participant,
         content: shaped.get(i) ?? msg.content,
       });
-    }
+    };
+    for (const i of keptBefore(start)) add(i);
+    for (let i = start; i < messages.length; i++) add(i);
 
     this.stripImages(entries, policy);
+    // Only a render select returns says a ceiling's line, for the images it
+    // holds. A preview's (dryRun) doesn't, nor any other caller's.
+    if (!opts?.dryRun) this.reportCeilings(entries, policy);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
   }
@@ -387,13 +503,16 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * message to its newest: each cut as select cuts it (cappedContent), then
    * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
    * each decided from its message and newer ones, with depth from the view's
-   * newest message, so they're select's. A message before the anchor, which select
-   * leaves out, comes back as null. Like select, it first reloads the
-   * branch the store has moved to. A re-anchor the next compile's budget
-   * forces isn't foreseen: it moves the anchor only past a window bigger
-   * than the budget allows. A body sharded under the autobiographical
-   * strategy comes back shard by shard, since select sends each as its own
-   * message.
+   * newest message, so they're select's. A message before the anchor comes
+   * back as null, since select leaves it out, but for a system change, which
+   * comes back as select sends it ahead of the window, cut as any message
+   * is: a compile moves the anchor only to a message it sent, but a
+   * caller's setAnchor can move it past one just stored. Like select, it
+   * first reloads the branch the store has moved to. A re-anchor the next
+   * compile's budget forces isn't foreseen: it moves the anchor only past a
+   * window bigger than the budget allows. A body sharded under the
+   * autobiographical strategy comes back shard by shard, since select sends
+   * each as its own message.
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.syncToBranch();
@@ -421,7 +540,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.stripImages(entries, this.liveImagePolicy(messages, store, from));
     const rendered = new Map<MessageId, ContentBlock[]>();
     for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
-    return ids.map((id) => rendered.get(id) ?? null);
+    return ids.map((id) => {
+      const i = at.get(id);
+      if (i !== undefined && !shown(i) && holdsSystemChange(messages[i]!.content)) return this.cappedContent(messages[i]!);
+      return rendered.get(id) ?? null;
+    });
   }
 
   /** 'window' when the last committed select moved the window's start. */
@@ -442,7 +565,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * each message's estimate gives back for the images it loses (`saved`).
    * `select` prices the window by `saved` and applies `strips` to what it
    * emits (stripImages), so the verdicts it prices are the ones the strip
-   * applies.
+   * applies. `ceilings` names, for each message, the limits an image
+   * ceiling sets (ceilingSetLimits) that were over where one of its images
+   * is stripped, whatever else strips it too, for the line a returned
+   * render says (reportCeilings).
    *
    * That holds wherever the window starts, and the re-anchor walk reads them
    * as they are, as `renderAsNewest` does from the batch's oldest message:
@@ -458,13 +584,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     messages: StoredMessage[],
     store: MessageStoreView,
     from: number,
-  ): { strips: (boolean[] | undefined)[]; saved: number[] } {
+  ): ImagePolicy {
     const strips: (boolean[] | undefined)[] = [];
     const saved: number[] = [];
-    const maxLive = this.maxLiveImages;
+    const ceilings: ({ images: boolean; bytes: boolean } | undefined)[] = [];
+    // Count and bytes within the image ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.imageStripDepthTokens;
-    const maxLiveBytes = this.maxLiveImageBytes;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved };
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved, ceilings };
     const calibration = store.getTokenCalibration?.() ?? 1;
     // The placeholder as the store prices it, calibrated, by its own text estimator.
     const placeholderPrice = store.estimateTokens({ content: [{ type: 'text', text: IMAGE_PLACEHOLDER }] } as unknown as StoredMessage);
@@ -480,6 +607,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
     }
 
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits);
     let keptImages = 0;
     let keptImageBytes = 0;
     // Newest-first. Every image a message carries, nested in a tool_result
@@ -496,6 +624,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
         const strip = tooDeep || overCount || overBytes;
+        const decided = (ceilings[i] ??= { images: false, bytes: false });
+        decided.images ||= overCount && ceilingSet.images;
+        decided.bytes ||= overBytes && ceilingSet.bytes;
         if (strip) {
           tokens += strippedImageSaving(image, placeholderPrice, calibration);
         } else {
@@ -507,7 +638,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       strips[i] = verdicts;
       saved[i] = tokens;
     }
-    return { strips, saved };
+    return { strips, saved, ceilings };
   }
 
   /** The policy's verdicts applied to entries whose `index` is their
@@ -520,6 +651,15 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       if (!strips) continue;
       let k = 0;
       entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
+    }
+  }
+
+  /** Says a ceiling's line once, for a ceiling whose limit was over where the window strips an image of an entry the render holds. */
+  private reportCeilings(entries: ContextEntry[], policy: ImagePolicy): void {
+    for (const entry of entries) {
+      const decided = policy.ceilings[entry.index];
+      if (decided?.images) this.reportCeilingBoundOnce('images');
+      if (decided?.bytes) this.reportCeilingBoundOnce('bytes');
     }
   }
 

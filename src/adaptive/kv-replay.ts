@@ -28,6 +28,7 @@ import type { SummaryEntry } from '../types/strategy.js';
 import { SummaryTree } from './summary-tree.js';
 import { Picker } from './picker.js';
 import { FlatProfileStrategy } from './strategies/flat-profile.js';
+import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/strategy.js';
 import { renderLayout, type RenderLayout, type Frontier } from './render-offsets.js';
 import { placeMarkers, CacheStore } from './kv-cache-sim.js';
 
@@ -141,10 +142,14 @@ export function replaySession(fullInputs: PickerInputs, opts: ReplayOptions): Re
 
     // Baseline policy: the production default, FlatProfileStrategy, via the real
     // Picker — folds the middle to the budget, leaving the pinned flat zone raw.
+    // Its solver judges an earlier rule's plan against the line a compile
+    // refuses above, as AutobiographicalStrategy passes it with its default
+    // grace (overBudgetGraceRatio).
     const result = new Picker(new FlatProfileStrategy()).run(inputs, {
       totalBudget: opts.budgetTokens,
       targetBudget: opts.budgetTokens,
       slack: 0,
+      rejectionBudget: Math.floor(opts.budgetTokens * (1 + (DEFAULT_AUTOBIOGRAPHICAL_CONFIG.overBudgetGraceRatio ?? 0))),
     });
     const resolutions = result.finalResolutions;
 

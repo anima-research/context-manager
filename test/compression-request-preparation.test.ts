@@ -204,7 +204,8 @@ describe('preparation counts and logging', () => {
     assert.deepEqual(sent.logs, [
       '[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [count-test]',
       '[autobiographical] compression prompt: replaced 1 image(s) with placeholders to stay under the ' +
-        '3.0MiB inline image budget (kept 2.5MiB, newest messages first) [count-test]',
+        '3.0MiB inline image budget and the 500-image ceiling (kept 1 image(s), 2.5MiB, newest messages first) ' +
+        '[count-test]',
     ]);
     assert.deepEqual(captureErrors(() => strategy.send(request([{ type: 'text', text: 'plain' }]), 'unchanged')).logs, []);
   });

@@ -66,7 +66,7 @@ This redesign must balance four forces:
 Non-goals (V1):
 
 - **Speculative unfolding to use spare budget.** Default V1 strategies are monotonic. Non-monotonic strategies are *permitted* by the architecture but not shipped.
-- **Reordering folds.** Folds happen chronologically per the spec's "Compression is always chronological and never destructive" principle. Specific strategies may reorder; the default does not.
+- **Reordering folds.** Folds happen chronologically per the spec's "Compression is always chronological and never destructive" principle. Specific strategies may reorder; the default does not, except that it passes over a chunk with no summary above it, which then stays shallower than younger content beside it.
 - **Removing summaries from the archive.** Summaries are write-once. Pre-computed L_n summaries are retained for future folds.
 
 ## 3. Model
@@ -262,22 +262,25 @@ selectNextFold(state, budget):
     visible[chunk.currentResolution].add(chunk.ancestorAt(chunk.currentResolution))
   visibleCounts = { k: len(visible[k]) for k in visible }
 
-  // Pick the most-populous level. Tiebreak: lower level (so we fold
+  // Rank the levels most-populous first. Tiebreak: lower level (so we fold
   // older fragmented detail before consolidating coarser regions).
-  k = argmax(visibleCounts)
-  // Within that level, pick the oldest group eligible to raise: the oldest
-  // chunk's next summary up, past a level where it has none.
-  groupRoot = oldestRaisableGroupAtLevel(state, k)
-  if !groupRoot:
-    // No summary above lists it: try to produce the next level.
-    return { kind: 'produce', level: k+1, range: oldestGroupRange(state, k) }
-  return { kind: 'raise', groupRoot: groupRoot }
+  for k in levelsByVisibleCount(visibleCounts):
+    // Within that level, pick the oldest group eligible to raise: the next
+    // summary up, past a level where it has none, of the oldest chunk at the
+    // level that has one. A chunk with no summary above it is passed over.
+    groupRoot = oldestRaisableGroupAtLevel(state, k)
+    if groupRoot:
+      return { kind: 'raise', groupRoot: groupRoot }
+  // No summary above lists any chunk at any level: try to produce the next
+  // level over the oldest chunk's group at the best-ranked level.
+  k = levelsByVisibleCount(visibleCounts)[0]
+  return { kind: 'produce', level: k+1, range: oldestGroupRange(state, k) }
 ```
 
 Properties:
 - **Even distribution across levels in steady state.** With enough budget pressure, the picker spreads the fold depth roughly evenly: more recent regions at lower levels, older regions at higher levels, with no sudden cliffs.
-- **Oldest-first behavior preserved *within* a level**, so the narrative property "memory fades chronologically" still holds.
-- **Cache cost: bounded re-raises.** A chunk is raised at level k once when level k becomes the most-populous, then again at level k+1 only after k+1 becomes the most populous in turn — typically many turns later.
+- **Oldest-first behavior preserved *within* a level**, so the narrative property "memory fades chronologically" still holds, except where an older chunk has no summary above it: it is passed over and stays shallower than the younger chunks raised past it.
+- **Cache cost: bounded re-raises.** Each raise lifts a chunk to a higher level, through its group's next summary up, so a chunk is raised at most once for each level above it, typically many turns apart.
 
 ### 3.8 Group-fold semantics
 
@@ -303,8 +306,9 @@ raiseGroup(groupRoot):
 > foldable group is excluded from the fold rather than vetoing it — boundary-cut
 > tolerance, §13.6. Group atomicity means "every participating leaf".
 
-**Producing missing summaries.** If no summary above the chunk lists it,
-the strategy emits a `produce` op for L_{k+1} instead of a `raise`. A level
+**Producing missing summaries.** If no summary above lists any chunk the
+step tries, the strategy emits a `produce` op for L_{k+1} instead of a
+`raise`. A level
 the chunk's lineage skips, or one whose summary doesn't list it, is passed
 over to the next summary up that lists it rather than produced: below it the
 lineage already links upward, and the handler below makes an L1 only for a
@@ -652,7 +656,7 @@ Rev 3.0 documented the PR #19 picker with `FlatProfileStrategy` as the only ship
 
 ### 12.1 Strategy lineup (`config.foldingStrategy`)
 
-- **`flat-profile`** -- the library default. Level-equalizing: when over the soft target, raise the most-populous level, oldest-first, and exit as soon as the budget is met. Monotonic (raises only). No per-chunk depth ceiling, so it descends to whatever level fits the budget.
+- **`flat-profile`** -- the library default. Level-equalizing: when over the soft target, raise the most-populous level that can rise, oldest-first, passing over a chunk with no summary above it, and exit as soon as the budget is met. Monotonic (raises only). No per-chunk depth ceiling, so it descends to whatever level fits the budget.
 - **`oldest-first`** -- chronological variant of the same shedder.
 - **`kv-stable`** -- the production controller the deployed agents run (connectome-host recipes select it). Described in §13.
 

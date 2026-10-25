@@ -55,6 +55,13 @@ export interface FoldingBudget {
   targetBudget: number;
   /** Slack ratio (e.g., 0.1 for 10%). */
   slack: number;
+  /** The plan size above which the caller refuses the compile, which
+   *  AutobiographicalStrategy passes as floor(totalBudget × (1 +
+   *  overBudgetGraceRatio)). totalBudget when absent. Solvers still fold
+   *  toward targetBudget within totalBudget; the greedy solvers read it
+   *  only to return the plan their earlier rule gives wherever the caller
+   *  accepts that plan (runGreedy). */
+  rejectionBudget?: number;
 }
 
 /** The complete result of one solve. */

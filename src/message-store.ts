@@ -23,6 +23,37 @@ import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js'
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
 
+/** Whether content, written or stored, holds a top-level block of `type`; content that isn't an array holds none. */
+function holdsBlock(content: unknown, type: string): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: unknown } | null)?.type === type);
+}
+
+/**
+ * Each call content holds, by id, and whether it's still open after the
+ * content's own later blocks: a result after its call in the same content,
+ * as in a bundled cycle (splitMixedToolMessages), answers it.
+ */
+function callsInOrder(content: unknown): Map<string, boolean> {
+  const calls = new Map<string, boolean>();
+  if (!Array.isArray(content)) return calls;
+  for (const block of content as Array<{ type?: unknown; id?: unknown; toolUseId?: unknown } | null>) {
+    if (block?.type === 'tool_use' && typeof block.id === 'string') calls.set(block.id, true);
+    else if (block?.type === 'tool_result' && typeof block.toolUseId === 'string' && calls.has(block.toolUseId)) calls.set(block.toolUseId, false);
+  }
+  return calls;
+}
+
+/** The ids of content's top-level calls (`tool_use`), or of the calls its results (`tool_result`) answer, in block order. */
+function toolIds(content: unknown, type: 'tool_use' | 'tool_result'): string[] {
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as Array<{ type?: unknown; id?: unknown; toolUseId?: unknown } | null>) {
+    const id = type === 'tool_use' ? block?.id : block?.toolUseId;
+    if (block?.type === type && typeof id === 'string') ids.push(id);
+  }
+  return ids;
+}
+
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
 /**
@@ -460,6 +491,7 @@ export class MessageStore {
     }
   ): StoredMessage {
     content = contentForWrite(content, 'Message refused');
+    this.refuseToolPairSplit(content, 'Message refused');
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
@@ -569,6 +601,115 @@ export class MessageStore {
   }
 
   /**
+   * Refuses a write that would put a system change between a tool call and
+   * a result that answers it: a message of changes while one of the nearest
+   * calls before it has no result between it and the change, a tool result
+   * answering a call that a change already follows, or an edit giving a
+   * message a `tool_use` that a change follows before the call's results.
+   * The API takes a system message with content only after a user turn, or an
+   * assistant turn ending in a server tool result, so membrane sends a change
+   * stored after a call after the call's result anyway, and one written after
+   * the result goes out the same. Stored between them, a change parts them:
+   * the autobiographical and Knowledge strategies keep a change raw and close
+   * a chunk at it, so the call and its result would be folded into different
+   * summaries, and a compile's pairing repair (enforceToolPairing) would drop
+   * the result once the call was folded.
+   *
+   * It reads back from `index` over changes and messages holding results but
+   * no call, to the nearest message that holds a call, reading each message
+   * whole, every shard of its body, since ingress sharding puts a message's
+   * calls and results on its body's first shard. It checks that message's
+   * calls, by id: those a result in a later message answers, as parallel
+   * calls' results in messages of their own do, and those its own later
+   * blocks answer, as in a bundled cycle (splitMixedToolMessages), are
+   * answered. The walk stops at a message of any other kind, so a call no
+   * result answered, further back, refuses nothing. `index` is where the
+   * content goes: the end for an append, the message's place for an edit.
+   *
+   * It leaves alone what a write can't see, as main does: a message of
+   * another kind between a call and its result, which is already off the
+   * API's shape; a call in an earlier message than the nearest one holding
+   * a call; a shape that exists only in a view, filtered or merged from
+   * several stores; and a removal, or an edit, that takes away a result or a
+   * message between. Each parts the pair once the call is folded.
+   */
+  refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
+    const length = this.length();
+    const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
+    // A body is one step of either walk, read whole: ingress sharding puts a
+    // message's non-text blocks, its calls and results, on its first shard.
+    const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
+      const from = bodyStart(at, i);
+      const to = bodyEnd(length, at, i);
+      const shards: StoredMessageInternal[] = [];
+      for (let k = from; k <= to; k++) shards.push(at(k)!);
+      return { from, to, shards };
+    };
+    const holds = (shards: StoredMessageInternal[], type: string): boolean => shards.some((shard) => holdsBlock(shard.content, type));
+    const idsIn = (shards: StoredMessageInternal[], type: 'tool_use' | 'tool_result'): string[] =>
+      shards.flatMap((shard) => toolIds(shard.content, type));
+    const change = holdsBlock(content, 'system_change');
+    const answers = change ? [] : toolIds(content, 'tool_result');
+    if (change || answers.length > 0) {
+      // Back over changes and results, to the nearest body holding a call.
+      const answered = new Set<string>();
+      let changeBetween: StoredMessageInternal | undefined;
+      const calls = new Map<string, MessageId>();
+      for (let i = index - 1; i >= 0; ) {
+        const { from, shards } = bodyAt(i);
+        if (holds(shards, 'tool_use')) {
+          // The body's calls left open by its own blocks, read in order
+          // across its shards, each by the shard that holds it.
+          const holder = new Map<string, MessageId>();
+          for (const shard of shards) for (const id of toolIds(shard.content, 'tool_use')) holder.set(id, shard.id);
+          for (const [id, open] of callsInOrder(shards.flatMap((shard) => shard.content))) if (open) calls.set(id, holder.get(id)!);
+          break;
+        }
+        if (holds(shards, 'system_change')) changeBetween ??= shards[0];
+        else if (holds(shards, 'tool_result')) for (const id of idsIn(shards, 'tool_result')) answered.add(id);
+        else break;
+        i = from - 1;
+      }
+      if (calls.size > 0) {
+        if (change) {
+          const open = [...calls].filter(([id]) => !answered.has(id));
+          if (open.length > 0) {
+            throw new Error(
+              `${what}: a system change can't go between a tool call and its result, and message ${open[0]![1]} holds a tool_use ` +
+                `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.`,
+            );
+          }
+        } else if (changeBetween) {
+          const id = answers.find((answer) => calls.has(answer));
+          if (id !== undefined) {
+            throw new Error(
+              `${what}: a tool_result can't follow a system change (message ${changeBetween.id}) that follows its tool call ` +
+                `(${id}, message ${calls.get(id)}). Remove the change and write it after the result.`,
+            );
+          }
+        }
+      }
+    }
+    if (index < length && holdsBlock(content, 'tool_use')) {
+      // Forward over changes and results, while a call here is unanswered.
+      const open = new Set([...callsInOrder(content)].filter(([, stillOpen]) => stillOpen).map(([id]) => id));
+      for (let i = index + 1; i < length && open.size > 0; ) {
+        const { to, shards } = bodyAt(i);
+        if (holds(shards, 'tool_use')) break;
+        if (holds(shards, 'system_change')) {
+          throw new Error(
+            `${what}: a tool_use (${[...open].join(', ')}) can't go before a system change (message ${shards[0]!.id}) that comes before its result; ` +
+              "a change goes after the call's result.",
+          );
+        }
+        if (!holds(shards, 'tool_result')) break;
+        for (const id of idsIn(shards, 'tool_result')) open.delete(id);
+        i = to + 1;
+      }
+    }
+  }
+
+  /**
    * Edit a message's content.
    *
    * Throws if `messageId` belongs to a bodyGroup (i.e., is a shard of a
@@ -594,6 +735,7 @@ export class MessageStore {
           `Sharded messages are immutable — remove the whole bodyGroup and re-append instead.`,
       );
     }
+    this.refuseToolPairSplit(newContent, `Edit of ${messageId} refused`, index);
 
     // The old content as a read gives it, so an edit can replace a message
     // whose stored content doesn't match ContentBlock.
@@ -1158,6 +1300,10 @@ export class MessageStore {
       case 'audio':
       case 'video':
         return 1000; // Default estimate for media
+      case 'system_change':
+        // Its tool definitions and system text go out whole, so it's priced
+        // from its JSON, as a tool call's input is.
+        return jsonTokenEstimator(JSON.stringify(block));
       default:
         return MessageStore.xmlHistoryCarrierTokens(block);
     }

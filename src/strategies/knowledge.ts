@@ -9,6 +9,7 @@ import type {
 } from '../types/index.js';
 import { AutobiographicalStrategy, type Chunk } from './autobiographical.js';
 import type { ConfigLayer } from '../config-provenance.js';
+import { systemChangePositions } from '../system-changes.js';
 
 const DEFAULT_RESEARCH_PREFIXES = ['mcpl:', 'zulip:'];
 const DEFAULT_SUBAGENT_PREFIXES = ['subagent:'];
@@ -65,6 +66,12 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
 
   protected rebuildChunks(store: MessageStoreView): void {
     const messagesToChunk = this.getCompressibleMessages(store);
+    const all = store.getAll();
+    const position = this.positionIndex(all);
+    const changes = systemChangePositions(all);
+    // The walk below is in store order, so one cursor finds the changes
+    // stored between each message and the one before it.
+    let nextChange = 0;
 
     // Preserve existing compressed chunks
     const existingCompressed = new Map<string, Chunk>();
@@ -72,6 +79,20 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       if (chunk.compressed) {
         existingCompressed.set(this.chunkKey(chunk), chunk);
       }
+    }
+    // A chunk holds the messages of one summary, or of none, but for a call's
+    // result: it closes where the summary covering the walk's messages
+    // changes, except between a call and its result (below). The walk otherwise
+    // decides boundaries afresh, so once a message that closed a chunk is
+    // removed (a consolidation removes its system changes), a chunk could run
+    // into or across a summary's span; the overlap guard refuses to compress
+    // such a chunk for good, and its messages go out raw beside the summary
+    // that already covers some of them. Where the chunks already match the
+    // summaries, the walk closes there anyway. An L2's sources are summaries,
+    // not messages.
+    const coveredBy = new Map<string, string>();
+    for (const s of this.summaries) {
+      if (s.level === 1) for (const id of s.sourceIds) coveredBy.set(id, s.id);
     }
 
     this.chunks = [];
@@ -82,9 +103,52 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     let currentPhase: PhaseType | null = null;
     let lastToolPhase: PhaseType = 'synthesis';
     let chunkFilteredStart = 0;
+    const closeAt = (end: number): void => {
+      const chunk = this.createChunk(
+        this.chunks.length,
+        chunkFilteredStart,
+        end,
+        currentChunk,
+        currentTokens,
+        existingCompressed
+      );
+      chunk.phaseType = currentPhase!;
+      this.chunks.push(chunk);
+      if (!chunk.compressed) this.compressionQueue.push(chunk.index);
+
+      currentChunk = [];
+      currentTokens = 0;
+      chunkFilteredStart = end;
+    };
 
     for (let i = 0; i < messagesToChunk.length; i++) {
       const msg = messagesToChunk[i];
+      const previous = currentChunk[currentChunk.length - 1];
+      let changeBefore = false;
+      const at = position.get(msg.id)!;
+      while (nextChange < changes.length && changes[nextChange]! < at) {
+        changeBefore = true;
+        nextChange++;
+      }
+      // Not between a call and its result: closing there would leave the
+      // result with its call folded into the summary, and pairing repair
+      // drops a result whose call isn't before it. So when a summary ends at
+      // a call answered only later, the result joins the summary's chunk,
+      // which the overlap guard then refuses, as on main.
+      const summaryChanges = previous !== undefined
+        && coveredBy.get(previous.id) !== coveredBy.get(msg.id)
+        && !(this.hasToolUse(previous) && this.hasToolResult(msg));
+      if (previous && (changeBefore || summaryChanges)) {
+        // The compressible stream skips a system change, which stays raw. A
+        // chunk across it would summarize both sides as one, rendered at its
+        // first message, ahead of the change, so what came after the change
+        // would be read before it. Close even a thin run there. A store
+        // without changes whose chunks match its summaries chunks as before.
+        // The store refuses a change between a call and its result where a
+        // write can see it (MessageStore.refuseToolPairSplit), so this close
+        // parts a pair only in a shape that refusal leaves alone.
+        closeAt(i);
+      }
       const phase = this.classifyMessage(msg, lastToolPhase);
 
       // Track tool phase for tool_result inheritance
@@ -118,23 +182,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
         (phaseChanged || sizeExceeded) &&
         !this.lastMessageContainsToolUse(currentChunk);
 
-      if (shouldClose) {
-        const chunk = this.createChunk(
-          this.chunks.length,
-          chunkFilteredStart,
-          i,
-          currentChunk,
-          currentTokens,
-          existingCompressed
-        );
-        chunk.phaseType = currentPhase!;
-        this.chunks.push(chunk);
-        if (!chunk.compressed) this.compressionQueue.push(chunk.index);
-
-        currentChunk = [];
-        currentTokens = 0;
-        chunkFilteredStart = i;
-      }
+      if (shouldClose) closeAt(i);
 
       currentChunk.push(msg);
       currentTokens += msgTokens;
