@@ -7446,8 +7446,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { ready: true };
   }
 
-  async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
-    this.requireLoadedBranch('onNewMessage');
+  /**
+   * Rows entered the window: rebuild the chunks over it and, with
+   * `autoTickOnNewMessage`, start background compression. In legacy mode
+   * the manager calls this from inside each add, as it called onNewMessage
+   * before there was a window. Once a host presents rows, it calls this from
+   * presentRows, so the chunks are built over presented rows only: a row
+   * stored and not presented is never chunked or folded, and one presented
+   * later starts the drain when it is.
+   */
+  async onPresented(_rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+    this.windowGrew('onPresented', ctx);
+  }
+
+  /**
+   * One row entered the window: what onPresented does. The manager calls
+   * onPresented, never this; it stays for a caller that drives the strategy
+   * itself.
+   */
+  async onNewMessage(_message: StoredMessage, ctx: StrategyContext): Promise<void> {
+    this.windowGrew('onNewMessage', ctx);
+  }
+
+  private windowGrew(operation: string, ctx: StrategyContext): void {
+    this.requireLoadedBranch(operation);
     this.rebuildChunks(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
@@ -7528,8 +7550,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // started with: once the strategy is detached or reinitialized, or
         // the store's branch moved, the drain stops here quietly, rather than
         // run a tick that requireLoadedBranch() refuses and the catch below
-        // logs. A strategy set again starts its own drain from its next
-        // message.
+        // logs. A strategy set again starts its own drain from the next
+        // rows that enter its window.
         setTimeout(() => {
           // No caller awaits this tick, so nothing it throws may leave the
           // timer: an uncaught exception ends the host's process. A tick that
@@ -7601,8 +7623,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Preflight hook for whether speculative compression should fire on
-   * `onNewMessage`. Returns true by default (current eager behavior).
+   * Preflight hook for whether speculative compression should fire when
+   * rows enter the window (`onPresented`). Returns true by default
+   * (current eager behavior).
    * Subclasses can override for predictive scheduling — e.g. only fire
    * when the live tail token count is approaching some threshold.
    */
@@ -9181,7 +9204,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Merged from two independent fixes for the same disease:
     //
     // 1. EXACT MATCH → adopt (bug 6.10, Tengro). rebuildChunks (fired by
-    //    onNewMessage / select) can re-queue a span whose compression already
+    //    onPresented / select) can re-queue a span whose compression already
     //    completed against a stale chunk object — or, under chunk
     //    persistence, a crash between the L1 append and the record edit
     //    leaves a record uncompressed with its summary already in the log.
@@ -13739,7 +13762,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //
     // The actual compression/merge work runs asynchronously via the next
     // `tick()` invocation (or the speculative drain kicked from
-    // `onNewMessage`). This call only enqueues; it does not await.
+    // `onPresented`). This call only enqueues; it does not await.
     // Dry run: never enqueue. `handleProducedOps` writes the mergeQueue state
     // slot and the background drain would then spend real LLM tokens on a
     // layout the operator was only looking at.

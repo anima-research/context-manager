@@ -149,7 +149,7 @@ interface ContextManagerBaseConfig {
   /**
    * Strategy-facing exclusion predicate: return true to keep a message
    * visible. When set, the view handed to the strategy — for compile,
-   * preview, ticks, and onNewMessage context alike — contains only kept
+   * preview, ticks, and onPresented/onNewMessage context alike — contains only kept
    * messages, so chunking, selection, emission, and coverage invariants
    * all see the same excluded-free world. Excluded messages remain in the
    * store: direct accessors (getMessage/getAllMessages/query) and the raw
@@ -426,6 +426,8 @@ export class ContextManager {
   private foldJournal: FoldJournal;
   /** The rows this manager's agent has been shown, in order (see window-index.ts). */
   private windowIndex: WindowIndex;
+  /** Rows presented while the strategy wasn't initialized, for it to hear once it is (notifyPresented). */
+  private presentedUnheard: MessageId[] = [];
 
   private constructor(
     store: JsStore,
@@ -459,7 +461,7 @@ export class ContextManager {
   /**
    * The strategy-facing message view — the single choke point through which
    * every strategy read passes (compile, preview, render stats, and the
-   * tick/onNewMessage StrategyContext). Composition order: merge auxiliary
+   * tick/onPresented StrategyContext). Composition order: merge auxiliary
    * slots into the timeline first, then take the agent's window over it
    * (presentedMessageView), then apply the exclusion filter, so a filter
    * sees (and can exclude from) the merged world as the agent was shown it.
@@ -692,9 +694,11 @@ export class ContextManager {
    * returned MessageId is the first shard's id.
    *
    * `options.holdCompression` places a compression hold (see
-   * holdCompression) on the new message BEFORE the strategy's onNewMessage
-   * fires, so not even the ingress chunk rebuild can fold it. Release it
-   * with releaseCompression([returnedId]) (releases every shard).
+   * holdCompression) on the new message BEFORE the strategy hears of it
+   * (ContextStrategy.onPresented: inside this add in legacy mode, at the
+   * row's presentRows once a host presents rows), so not even the ingress
+   * chunk rebuild can fold it. Release it with
+   * releaseCompression([returnedId]) (releases every shard).
    */
   addMessage(
     participant: string,
@@ -1209,6 +1213,13 @@ export class ContextManager {
    * several items in one record, each row presented is one record, the
    * first call's one per stored row.
    *
+   * The strategy hears the rows that entered the window
+   * (ContextStrategy.onPresented) once they are in it and before this
+   * returns, fire and forget: its failure is logged, and the rows stay
+   * presented. The first call, which writes the legacy window down, enters
+   * no new row, so the strategy hears nothing: it heard each row as it was
+   * stored.
+   *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
    */
@@ -1216,7 +1227,12 @@ export class ContextManager {
     this.requireOpen('presentRows');
     const merged = this.mergedMessageView();
     const record = merged.getAll();
-    return this.write(() => this.windowIndex.present(ids, record, (id) => recordPositionOf(merged, record, id)));
+    const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
+    return this.write(() => {
+      const { ordinals, entered } = this.windowIndex.present(ids, record, positionOf);
+      this.notifyPresented(entered.map((id) => record[positionOf(id)!]!));
+      return ordinals;
+    });
   }
 
   /**
@@ -2682,6 +2698,7 @@ export class ContextManager {
     }
     this.initializedAttempt = attempt;
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
+    if (this.presentedUnheard.length > 0) this.deliverPresentedUnheard();
   }
 
   /** Refuse an operation on a closed manager, naming it. */
@@ -2814,34 +2831,87 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
+    // What a write holds is placed as it is stored, in either mode: the hold
+    // shapes what the store keeps folded, and touches no window.
     if (this.holdingAdds) {
       this.holdingAdds.push(message.id);
       this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
     }
-    // Notify strategy of new message. After close() nothing reaches the
-    // strategy: a close() from a listener lets the write it interrupted
-    // finish, and that write's remaining shards are stored unheard.
-    if (this.strategy.onNewMessage && !this.closed) {
-      // Fire and forget: the write doesn't wait for the strategy, and the
-      // strategy's failure isn't the write's (#288). The hook runs here,
-      // inside the append, so its synchronous part comes before addMessage
-      // returns, after a holdCompression hold is placed. A hook that isn't
-      // async can throw before it returns, and the throw is logged the same
-      // way as a rejection. It can also return no promise, which isn't a
-      // failure. Either way the message stays stored, as do a sharded body's
-      // remaining shards, and the strategy isn't offered it again. Only the
-      // strategy's call is caught: the manager's own work around it, the
-      // context it hands the strategy among it, still fails the write, as
-      // onMessage's note says. The log is logThrown's, which survives a
-      // thrown value that can't be formatted.
-      const failed = (err: unknown) =>
-        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
-      const ctx = this.createStrategyContext();
+    // In legacy mode the window is the record, so the row enters it here,
+    // and the strategy hears it inside the append: its synchronous part
+    // comes before addMessage returns, after a holdCompression hold is
+    // placed (#288). Once a host presents rows on the branch, the row
+    // enters the window at its presentRows, and the strategy hears it then.
+    if (this.windowIndex.mode() === 'legacy') this.notifyPresented([message]);
+  }
+
+  /**
+   * Tell the strategy rows entered the agent's window
+   * (ContextStrategy.onPresented), or, for a strategy without that hook,
+   * each row in turn through onNewMessage. After close() nothing reaches
+   * the strategy: a close() from a listener lets the write it interrupted
+   * finish, and that write's remaining shards are stored unheard. While the
+   * strategy isn't initialized the rows wait for it (deliverPresentedUnheard);
+   * an add, the legacy caller, requires an initialized strategy.
+   *
+   * Fire and forget: the write doesn't wait for the strategy, and the
+   * strategy's failure isn't the write's (#288). A hook that isn't async can
+   * throw before it returns, and the throw is logged the same way as a
+   * rejection. It can also return no promise, which isn't a failure. Either
+   * way the rows stay stored and in the window, as do a sharded body's
+   * remaining shards, and the strategy isn't offered them again. Only the
+   * strategy's call is caught: the manager's own work around it, the
+   * context it hands the strategy among it, still fails the write, as
+   * onMessage's note says. The log is logThrown's, which survives a thrown
+   * value that can't be formatted.
+   */
+  private notifyPresented(rows: readonly StoredMessage[]): void {
+    const strategy = this.strategy;
+    if (rows.length === 0 || this.closed || (!strategy.onPresented && !strategy.onNewMessage)) return;
+    if (this.initializedAttempt !== this.initializationAttempt) {
+      for (const row of rows) this.presentedUnheard.push(row.id);
+      return;
+    }
+    const ctx = this.createStrategyContext();
+    if (strategy.onPresented) {
+      const failed = (err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag);
       try {
-        Promise.resolve(this.strategy.onNewMessage(message, ctx)).catch(failed);
+        Promise.resolve(strategy.onPresented(rows, ctx)).catch(failed);
       } catch (err) {
         failed(err);
       }
+      return;
+    }
+    for (const message of rows) {
+      const failed = (err: unknown) =>
+        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
+      try {
+        Promise.resolve(strategy.onNewMessage!(message, ctx)).catch(failed);
+      } catch (err) {
+        failed(err);
+      }
+    }
+  }
+
+  /**
+   * Once the strategy is initialized, the rows presented while it wasn't
+   * that are still in the window, in window order. A branch the strategy
+   * initialized on holds only its own index's rows: a row presented on
+   * another branch, or a branch still in legacy mode, has no ordinal there.
+   * Nothing here fails the initialization that ran it: a failure of the
+   * manager's own work is logged, and the strategy's next rebuild reads the
+   * window.
+   */
+  private deliverPresentedUnheard(): void {
+    const unheard = new Set(this.presentedUnheard);
+    this.presentedUnheard = [];
+    try {
+      const rows = this.presentedMessageView()
+        .getAll()
+        .filter((m) => unheard.has(m.id) && this.windowIndex.ordinalOf(m.id) !== undefined);
+      this.notifyPresented(rows);
+    } catch (err) {
+      logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; its next rebuild reads them:', err, this.diag);
     }
   }
 
@@ -3032,4 +3102,14 @@ function describeStoreEvent(event: MessageStoreEvent): string {
     }
   })();
   return text.replaceAll('%', '%%');
+}
+
+/**
+ * The rows a presentation entered into a window, for a log line's message,
+ * as describeStoreEvent describes one: one row as its add is described,
+ * several by their count and the first and last of them in window order.
+ */
+function describeRows(rows: readonly StoredMessage[]): string {
+  if (rows.length === 1) return describeStoreEvent({ type: 'add', message: rows[0]! });
+  return `${rows.length} messages presented, ${rows[0]!.id} to ${rows[rows.length - 1]!.id}`.replaceAll('%', '%%');
 }

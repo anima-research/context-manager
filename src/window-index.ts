@@ -353,9 +353,15 @@ export class WindowIndex {
    * legacy mode the window is the whole record already: the call writes it
    * down as the index (the header, then every row of `record` in record
    * order), and the rows it names are among them. Returns each named row's
-   * ordinal.
+   * ordinal, and `entered`, the rows that entered the window, in window
+   * order, every shard of a body: none when the call wrote the window down
+   * in legacy mode, since each of its rows was in the window already.
    */
-  present(ids: readonly MessageId[], record: readonly StoredMessage[], positionOf: (id: MessageId) => number | undefined): number[] {
+  present(
+    ids: readonly MessageId[],
+    record: readonly StoredMessage[],
+    positionOf: (id: MessageId) => number | undefined,
+  ): { ordinals: number[]; entered: MessageId[] } {
     const state = this.current();
     const rows = wholeBodies('presentRows', ids, record, positionOf, (id) => {
       throw new Error(`ContextManager.presentRows: no stored message has id ${id}; give each row by the id addMessage returned for it`);
@@ -363,7 +369,7 @@ export class WindowIndex {
     if (state.rows.length === 0) {
       this.write(this.bootstrap(record));
       const ordinals = this.current().ordinals;
-      return ids.map((id) => ordinals.get(id)!);
+      return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [] };
     }
     const already = rows.filter((id) => state.ordinals.has(id));
     if (already.length > 0) {
@@ -371,7 +377,7 @@ export class WindowIndex {
     }
     this.write(rows.map((id) => ({ id })));
     const ordinals = this.current().ordinals;
-    return ids.map((id) => ordinals.get(id)!);
+    return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows };
   }
 
   /**

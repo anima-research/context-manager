@@ -240,12 +240,50 @@ export interface ContextStrategy {
   tick?(ctx: StrategyContext): Promise<void>;
 
   /**
-   * React to new messages.
-   * Called after a message is added to the store, inside the write that
-   * stored it, so its synchronous part runs before addMessage returns; the
-   * manager doesn't wait for the promise. A rejection, or a throw before it
-   * returns, is logged through the manager's diagnostics, naming the message,
-   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * React to rows entering the agent's window, the rows its strategy reads
+   * (see ContextManager.presentRows). Called with the rows that entered, in
+   * window order, every shard of a body, and a context whose view holds
+   * them.
+   *
+   * While the manager is in legacy mode its window is the record, so a row
+   * enters it when this manager stores it: the call comes from inside the
+   * write that stored it, one row at a time, after a holdCompression hold
+   * is placed, and its synchronous part runs before addMessage returns.
+   * Once a host presents rows on the branch, a stored row isn't heard until
+   * it is presented: the call comes from presentRows, once per call, after
+   * the rows are in the window and before presentRows returns. A row
+   * presented again after retractRows is heard again. A row from an
+   * auxiliary slot is heard only when a host presents it; in legacy mode it
+   * enters the window unheard, as it always has. The first presentRows on a
+   * branch, which writes the legacy window down, enters no new row and
+   * calls nothing. While the strategy isn't initialized (it is initializing,
+   * or its last initialization failed), the calls from presentRows wait until
+   * it is, and then one call carries the rows still in the window, in
+   * window order, each once.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * rows, and doesn't reach the caller: the rows stay stored and in the
+   * window, and the strategy isn't offered them again. A hook that returns
+   * no promise isn't a failure, and nothing is logged.
+   *
+   * A strategy with this hook isn't called through onNewMessage.
+   */
+  onPresented?(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void>;
+
+  /**
+   * React to a new row in the agent's window, one row at a time: the older
+   * form of onPresented, called only for a strategy without onPresented, at
+   * the points onPresented says. While the manager is in legacy mode, that
+   * is after a message is added to the store, inside the write that stored
+   * it, so its synchronous part runs before addMessage returns. Once a host
+   * presents rows on the branch, it is from presentRows, once per row
+   * presented, in window order, and no longer at the add: a row stored and
+   * not presented isn't in the window the context reads.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * message, and doesn't reach the caller: the message stays stored, and the
    * strategy isn't offered it again. A hook that returns no promise, as one
    * written in JavaScript can, isn't a failure, and nothing is logged.
    */
@@ -1300,8 +1338,10 @@ export interface AutobiographicalConfig {
   chunkOnMessageBoundary: boolean;
   /** Don't count attachment tokens toward chunk size */
   attachmentsIgnoreSize: boolean;
-  /** When true, onNewMessage() fires tick() as a background promise so compression
-   *  runs automatically without the framework calling tick() explicitly. */
+  /** When true, rows entering the window (onPresented: each add in legacy
+   *  mode, each presentRows once a host presents rows) fire tick() as a
+   *  background promise so compression runs automatically without the
+   *  framework calling tick() explicitly. The name is the hook's older one. */
   autoTickOnNewMessage: boolean;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
@@ -2106,8 +2146,8 @@ export interface AutobiographicalConfig {
    * toward the cap without holding production. Under `hierarchical: false`
    * tick runs no merge, so the cap holds nothing.
    *
-   * Default: undefined (no cap; compression fires eagerly on every
-   * new message when `autoTickOnNewMessage` is true).
+   * Default: undefined (no cap; compression fires eagerly whenever rows
+   * enter the window when `autoTickOnNewMessage` is true).
    */
   maxSpeculativeL1s?: number;
 
