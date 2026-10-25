@@ -69,6 +69,8 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     const all = store.getAll();
     const position = this.positionIndex(all);
     const changes = systemChangePositions(all);
+    // Where a close would part a call from its result (closingPartsCall).
+    const held = this.closesHeld(all);
     // The walk below is in store order, so one cursor finds the changes
     // stored between each message and the one before it.
     let nextChange = 0;
@@ -187,7 +189,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const shouldClose =
         currentChunk.length >= 2 &&
         (phaseChanged || sizeExceeded) &&
-        !this.closingPartsCall(currentChunk, all, position);
+        !this.closingPartsCall(currentChunk, held, position);
 
       if (shouldClose) closeAt(i);
 

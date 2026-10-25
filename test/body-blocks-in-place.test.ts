@@ -360,6 +360,14 @@ const PAIRS: Record<string, { legacy: boolean; call: ContentBlock[]; result: Con
   'a call stored before each block was kept in place, its tool_use on its first shard': {
     legacy: true, call: [text(prose('REPLY', 2_000)), call('call-1')], result: [result('call-1', 'Sunny.')],
   },
+  'a call whose text follows its tool_use, answered by a result after a long text': {
+    legacy: false, call: [call('call-1'), text(prose('REPLY', 2_000))], result: [text(prose('NOTE', 2_000)), result('call-1', 'Sunny.')],
+  },
+  'a call that thinks first, its tool_use on its last shard, answered by a result after a long text': {
+    legacy: false,
+    call: [{ type: 'thinking', thinking: 'let me look it up', signature: 'SIG' } as unknown as ContentBlock, text(prose('REPLY', 2_000)), call('call-1')],
+    result: [text(prose('NOTE', 2_000)), result('call-1', 'Sunny.')],
+  },
 };
 /** A subclass whose boundary hint asks for a close between every two messages. */
 class HintEverywhere extends AutobiographicalStrategy {
@@ -423,6 +431,35 @@ describe('no compression chunk parts a call from the message answering it, where
   }
 });
 
+describe('no compression chunk parts a call from its own result across the shards of one message', () => {
+  for (const [name, { inPlace }] of Object.entries(STRATEGIES)) {
+    it(`${name}: a message that makes a call, then a long text, then the call's result`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-own-'));
+      const strategy = new inPlace({ adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0 });
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+      manager.setToolDefinitions(tools as never);
+      try {
+        for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(60))]);
+        const from = manager.getAllMessages().length;
+        manager.addMessage('Claude', [text('looking it up'), call('call-1'), text(prose('NOTE', 2_000)), result('call-1', 'Sunny.'), text('done')]);
+        const shards = manager.getAllMessages().slice(from);
+        for (let k = 0; k < 6; k++) manager.addMessage(k % 2 ? 'User' : 'Claude', [text(`after ${k} ` + 'w '.repeat(60))]);
+        const useAt = shards.findIndex((m) => holds(m, 'tool_use'));
+        const resultAt = shards.findIndex((m) => holds(m, 'tool_result'));
+        assert.ok(useAt >= 0 && resultAt - useAt >= 2, `premise: the call and its result are on shards apart (${useAt}, ${resultAt} of ${shards.length})`);
+        const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ id: string; content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void };
+        chunker.rebuildChunks((manager as unknown as { messageStore: unknown }).messageStore);
+        const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
+        assert.ok(chunker.chunks.length > 2 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
+        assert.ok(withCall[0]!.messages.some((m) => holds(m, 'tool_result')), 'the chunk holding the tool_use holds its tool_result');
+      } finally {
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("the head window's end, wherever it falls in a call and the message answering it, leaves them on one side", () => {
   for (const [shape, pair] of Object.entries(PAIRS)) {
     it(shape, async () => {
@@ -433,7 +470,8 @@ describe("the head window's end, wherever it falls in a call and the message ans
         const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
         const stored = manager.getAllMessages();
         const config = (strategy as unknown as { config: Record<string, number> }).config;
-        const callAt = pair.legacy ? callFrom : stored.findIndex((m) => holds(m, 'tool_use'));
+        // The call starts at its first shard holding a tool_use or a thinking block.
+        const callAt = stored.findIndex((m, k) => k >= callFrom && (holds(m, 'tool_use') || holds(m, 'thinking')));
         for (let edge = callAt + 1; edge <= resultTo; edge++) {
           // A head window the messages before `edge` fill exactly: its edge falls at `edge`.
           config.headWindowTokens = stored.slice(0, edge).reduce((n, m) => n + store.estimateTokens(m), 0);
@@ -442,6 +480,110 @@ describe("the head window's end, wherever it falls in a call and the message ans
       });
     });
   }
+});
+
+describe("the head window's end at messages without shards, paired by the calls each leaves open", () => {
+  const STUB = "this call's result isn't shown in this context";
+  /** Plain turns, the shape, more plain turns; the head's tokens run out at the shape's message `edge` (from 0). */
+  async function headAt(writes: Array<[string, ContentBlock[]]>, body: (headEnd: number, first: number, sent: string) => void, edge = 2) {
+    const requests: string[] = [];
+    const membrane = {
+      complete: async (req: unknown) => {
+        requests.push(JSON.stringify(req));
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${requests.length}` }] };
+      },
+    };
+    class Exposed extends AutobiographicalStrategy {
+      headEnd(store: unknown) { return this.getHeadWindowEnd(store as never); }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-head-'));
+    const strategy = new Exposed({
+      autoTickOnNewMessage: false, targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0,
+      compressionModel: 'm', minChunkCharsForLLM: 0, l1HoldbackChunks: 0,
+    });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: membrane as never });
+    manager.setToolDefinitions(tools as never);
+    try {
+      for (let k = 0; k < 6; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(30))]);
+      const first = manager.getAllMessages().length;
+      for (const [participant, content] of writes) manager.addMessage(participant, content);
+      for (let k = 0; k < 8; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`after ${k} ` + 'w '.repeat(30))]);
+      const stored = manager.getAllMessages();
+      assert.ok(stored.every((m) => !m.bodyGroupId), 'premise: no message is stored as shards');
+      const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+      const config = (strategy as unknown as { config: Record<string, number> }).config;
+      config.headWindowTokens = stored.slice(0, first + edge).reduce((n, m) => n + store.estimateTokens(m), 0);
+      const headEnd = strategy.headEnd(store);
+      // Fold what follows the head, so a call the head keeps is sent without the message after it.
+      const queue = (strategy as unknown as { compressionQueue: number[] }).compressionQueue;
+      await manager.compile();
+      for (let guard = 0; queue.length > 0 && guard < 80; guard++) await manager.tick();
+      assert.ok(requests.length > 0, 'premise: what follows the head compresses');
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      body(headEnd, first, JSON.stringify(compiled.messages));
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('a call, then a message answering it that makes the next call: the head ends before the call, and no call goes out with a stub for its result', async () => {
+    await headAt([
+      ['Claude', [text('looking it up'), call('c')]],
+      ['User', [result('c', 'Sunny.'), call('d')]],
+      ['User', [result('d', 'Rain.')]],
+    ], (headEnd, first, sent) => {
+      assert.equal(headEnd, first, 'the head ends before the call');
+      assert.ok(!sent.includes(STUB), 'no call is sent with a stub in place of its result');
+    });
+  });
+
+  it('a chain of such messages: the head ends before the first call', async () => {
+    await headAt([
+      ['Claude', [text('looking it up'), call('c')]],
+      ['User', [result('c', 'Sunny.'), call('d')]],
+      ['User', [result('d', 'Rain.'), call('e')]],
+      ['User', [result('e', 'Snow.')]],
+    ], (headEnd, first, sent) => {
+      assert.equal(headEnd, first, 'the head ends before the first call');
+      assert.ok(!sent.includes(STUB), 'no call is sent with a stub in place of its result');
+    }, 3);
+  });
+
+  it('two bundles in a row, each answering its own call: the head ends after the first, as main ends it', async () => {
+    await headAt([
+      ['Claude', [text('one'), call('c'), result('c', 'Sunny.'), text('done one')]],
+      ['Claude', [call('d'), result('d', 'Rain.'), text('done two')]],
+    ], (headEnd, first) => {
+      assert.equal(headEnd, first + 1, 'the head ends after the first bundle');
+    });
+  });
+});
+
+describe('a message stored as shards that answers its own calls holds no close', () => {
+  it('two such bundles in a row: a chunk closes inside the second', async () => {
+    const bundle = (id: string): ContentBlock[] => [text(prose(`OPEN-${id}`, 1_000)), call(id), result(id, 'Sunny.'), text(prose(`CLOSE-${id}`, 1_000))];
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-bundles-'));
+    const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0 });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    manager.setToolDefinitions(tools as never);
+    try {
+      for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(60))]);
+      manager.addMessage('Claude', bundle('c'));
+      const second = manager.getAllMessages().length;
+      manager.addMessage('Claude', bundle('d'));
+      const shards = manager.getAllMessages().slice(second).map((m) => m.id);
+      for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'User' : 'Claude', [text(`after ${k} ` + 'w '.repeat(60))]);
+      assert.ok(shards.length > 3, `premise: the second bundle is stored as shards (${shards.length})`);
+      const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }>; rebuildChunks(store: unknown): void };
+      chunker.rebuildChunks((manager as unknown as { messageStore: unknown }).messageStore);
+      const holding = chunker.chunks.filter((c) => c.messages.some((m) => shards.includes(m.id)));
+      assert.ok(holding.length > 1, `a chunk closes inside the second bundle (its shards fall in ${holding.length} chunk${holding.length === 1 ? '' : 's'})`);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('a result whose call compresses first, end to end', () => {
@@ -460,7 +602,13 @@ describe('a result whose call compresses first, end to end', () => {
           await manager.compile();
           for (let guard = 0; queue.length > 0 && guard < 80; guard++) await manager.tick();
           assert.ok(requests.length > 2, `premise: the store compresses in several requests (${requests.length})`);
-          assert.ok(requests.some((r) => r.includes('Sunny.') && r.includes('"call-1"')), 'a compression request carries the result, beside its call');
+          const blocksOf = (r: string) => (JSON.parse(r) as { messages: Array<{ content: Array<{ type: string; id?: string; toolUseId?: string; content?: unknown }> }> })
+            .messages.flatMap((m) => m.content);
+          assert.ok(requests.some((r) => {
+            const blocks = blocksOf(r);
+            return blocks.some((b) => b.type === 'tool_use' && b.id === 'call-1')
+              && blocks.some((b) => b.type === 'tool_result' && b.toolUseId === 'call-1' && JSON.stringify(b.content).includes('Sunny.'));
+          }), 'a compression request carries the call and its result');
         }, membrane);
       });
     }

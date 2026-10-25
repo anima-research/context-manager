@@ -171,7 +171,7 @@ describe('a system change, written and priced', () => {
     const cm = await open(new PassthroughStrategy());
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Summarize this and look it up.')]);
-    // Ingress sharding puts a message's non-text blocks on its body's first shard.
+    // A body stored before blocks were kept in place has its non-text blocks on its first shard.
     const first = store.append('Claude', [text('part one '), toolUse('t1')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 0, shardCount: 2 });
     store.append('Claude', [text('part two')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${first.id} holds a tool_use \\(t1\\) with no result between it and this change`));
@@ -184,7 +184,7 @@ describe('a system change, written and priced', () => {
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Weather in Oslo and Bergen?')]);
     const call = cm.addMessage('Claude', [toolUse('a'), toolUse('b')]);
-    // Ingress sharding puts a message's results on its first shard, its long text after.
+    // A body stored before blocks were kept in place has its results on its first shard, its long text after.
     store.append('User', [toolResult('a')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 0, shardCount: 2 });
     store.append('User', [text('a long note beside the result')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${call} holds a tool_use \\(b\\) with no result between it and this change`));

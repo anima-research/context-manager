@@ -165,8 +165,9 @@ export interface OverBudgetRawPin {
  *   changes after it (for one split into shards, its newest shard, since the
  *   earlier shards can fold), unless the newest message's body holds a
  *   tool_result, on any of its shards: then it's that whole body and the call
- *   before it, from the call's first shard that holds a tool_use or thinking,
- *   which the result must follow raw. A smaller
+ *   before it, from the call's first shard that holds a tool_use or a
+ *   thinking block (thinking or redacted_thinking), which the result must
+ *   follow raw. A smaller
  *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
  *   window into the middle, which folds once its chunks have closed and
  *   compression has summarized them.

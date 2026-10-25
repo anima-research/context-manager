@@ -10948,11 +10948,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const textOf = (m: { content: ContentBlock[] }): string =>
             m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
           const hasType = (m: { content: ContentBlock[] }, t: string): boolean => m.content.some((blk) => blk.type === t);
+          const parted = this.callPartedStarts(chunk.messages);
           const groupEnd = (i: number): number => {
             let j = i;
             if (hasType(chunk.messages[i], 'tool_use')) {
               while (j + 1 < chunk.messages.length && hasType(chunk.messages[j + 1], 'tool_result')) j++;
             }
+            // Nor between a call and the message answering it, wherever their
+            // shards hold the tool_use and the tool_result (callPartedStarts).
+            while (j + 1 < chunk.messages.length && parted[j]! >= 0) j++;
             return j;
           };
           const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
@@ -17383,6 +17387,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const messagesToChunk = this.getCompressibleMessages(store, consumed);
     const livePosition = position;
+    // Where a close would part a call from its result (closingPartsCall).
+    const held = this.closesHeld(listing);
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
@@ -17458,7 +17464,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // against parting a call from its result still apply.
       if (
         currentChunk.length >= 4 &&
-        !this.closingPartsCall(currentChunk, listing, livePosition) &&
+        !this.closingPartsCall(currentChunk, held, livePosition) &&
         this.chunkBoundaryHint(currentChunk[currentChunk.length - 1], msg, currentChunk)
       ) {
         closeCurrent(i);
@@ -17482,7 +17488,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Defer the close until the result rides along in the same chunk.
       // The stripUnpairedToolBlocks runtime pass is a safety net for the
       // rare case where a tool_use is the very last message in the store.
-      if (shouldClose && this.closingPartsCall(currentChunk, listing, livePosition)) {
+      if (shouldClose && this.closingPartsCall(currentChunk, held, livePosition)) {
         continue;
       }
 
@@ -18664,68 +18670,143 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Where the call starts that a boundary right after position `at` would
-   * part from the message answering it, or -1 when a boundary there parts
-   * none. A message holding a tool_result, on any of its shards, answers the
-   * message before it when that one holds a tool_use, on any of its shards:
-   * the two run from the call's start (callStart) through the answering
-   * message's last shard, and a boundary after any position in that run but
-   * its last parts them. Ingress keeps each block where it sat
-   * (chunkIngressMessage), so a result after a long text is on its
-   * message's last shard, and a call stored before then holds its tool_use
-   * on its first shard; in neither is the result in the message right after
-   * the tool_use. A caller stepping back to the start returned asks again
-   * from there, since that start can lie inside an earlier call and its
-   * answer, as where a message both answers a call and makes one.
+   * The calls the message holding position `at` makes and leaves open: the
+   * ids of its tool_use blocks, on any of its shards, that no tool_result
+   * after them in the same message answers. A bundled cycle (a claude.ai
+   * export's assistant message, splitMixedToolMessages) answers its own.
    */
-  protected callPartedAfter(messages: readonly StoredMessage[], at: number): number {
-    if (at < 0 || at >= messages.length) return -1;
+  protected openCallIds(messages: readonly StoredMessage[], at: number): Set<string> {
     const { from, to } = bodyBoundsIn(messages, at);
-    // Inside the answering message, before its last shard.
-    if (at < to && from > 0 && this.bodyHoldsToolResult(messages, at) && this.bodyHoldsToolUse(messages, from - 1)) {
-      return this.callStart(messages, from);
+    const open = new Set<string>();
+    for (let k = from; k <= to; k++) {
+      for (const b of messages[k]!.content) {
+        if (b.type === 'tool_use') open.add((b as { id: string }).id);
+        else if (b.type === 'tool_result') open.delete((b as { toolUseId: string }).toolUseId);
+      }
     }
-    // Inside the call, from its start, with the message after it answering.
-    if (to + 1 < messages.length && this.bodyHoldsToolUse(messages, at) && this.bodyHoldsToolResult(messages, to + 1)) {
-      const start = this.callStart(messages, to + 1);
-      if (at >= start) return start;
-    }
-    return -1;
+    return open;
   }
 
   /**
-   * Whether closing a chunk after its last message would part a call from
-   * its result: the message holds a tool_use (lastMessageContainsToolUse),
-   * whose result comes in a later message or hasn't been written yet, or a
-   * boundary there falls between a call and the message answering it
-   * (callPartedAfter). `messages` is the store's listing, and `position`
-   * places a message in it.
+   * For each position in `messages`, where the call starts that a boundary
+   * right after that position would part from its result, or -1 where a
+   * boundary there parts none, worked out for the whole listing in one pass.
+   *
+   * A message answers the message before it when it holds a tool_result for
+   * a call that message left open (openCallIds), on any of either's shards:
+   * the two run from the call's start (callStart: the call's first shard
+   * holding a tool_use or a thinking block, or its first shard) through the
+   * answering message's last shard, and a boundary after any position in
+   * that run but its last parts them. A message that makes a call and answers
+   * it itself, as a bundled cycle does, can hold the two on different
+   * shards: a boundary after the shard holding the call, and before the one
+   * holding its result, parts them too, and the run starts at the message's
+   * first shard holding a tool_use or a thinking block. Ingress keeps each
+   * block where it sat (chunkIngressMessage), so a result after a long text
+   * is on its message's last shard, and a call stored before then holds its
+   * tool_use on its first shard; in neither is the result in the message
+   * right after the tool_use. Where runs overlap, as where a message both
+   * answers a call and makes one, a position takes the earliest start, and
+   * a caller stepping back to it asks again from there.
+   */
+  protected callPartedStarts(messages: readonly StoredMessage[]): Int32Array {
+    const n = messages.length;
+    const starts = new Int32Array(n).fill(-1);
+    const mark = (from: number, to: number, start: number): void => {
+      for (let p = from; p <= to; p++) if (starts[p]! < 0 || start < starts[p]!) starts[p] = start;
+    };
+    let before: { to: number; open: Set<string>; callFrom: number } | null = null;
+    for (let from = 0; from < n; ) {
+      const to = bodyEnd(n, (k) => messages[k], from);
+      const open = new Set<string>();
+      const madeAt = new Map<string, number>();
+      let first = -1;
+      let answersBefore = false;
+      for (let k = from; k <= to; k++) {
+        for (const b of messages[k]!.content) {
+          if (b.type === 'tool_use') {
+            const id = (b as { id: string }).id;
+            open.add(id);
+            madeAt.set(id, k);
+            if (first < 0) first = k;
+          } else if (b.type === 'thinking' || b.type === 'redacted_thinking') {
+            if (first < 0) first = k;
+          } else if (b.type === 'tool_result') {
+            const id = (b as { toolUseId: string }).toolUseId;
+            if (open.has(id)) {
+              open.delete(id);
+              const made = madeAt.get(id)!;
+              if (k > made) mark(made, k - 1, first);
+            } else if (before?.open.has(id)) {
+              answersBefore = true;
+            }
+          }
+        }
+      }
+      if (answersBefore && before) {
+        mark(before.callFrom, before.to, before.callFrom);
+        if (to > from) mark(from, to - 1, before.callFrom);
+      }
+      before = { to, open, callFrom: first >= 0 ? first : from };
+      from = to + 1;
+    }
+    return starts;
+  }
+
+  /**
+   * For each position in `messages`, whether a chunk ending there would
+   * part a call from its result: where a boundary falls between a call and
+   * the message answering it (callPartedStarts), and at the listing's end.
+   * The rule for a message holding a tool_use is lastMessageContainsToolUse,
+   * which closingPartsCall asks beside this.
    *
    * At the listing's end, what comes next isn't written yet. The chunkers
    * run as each shard lands (onNewMessage), and the autobiographical one
    * keeps each chunk it closes for good (its chunk records). So a close
    * there waits as it would once the rest is written: inside a message still
    * being written, which may yet hold a call or the result answering the one
-   * before it, and inside a call, from its start (callStart), whose result
-   * hasn't come. The walk after the write closes where the whole store
-   * allows.
+   * before it, and inside a call, from its start (callStart), that leaves a
+   * call open (openCallIds) while the message that may answer it hasn't come
+   * or is the one still being written. The walk after the write closes where
+   * the whole store allows. A body an interrupted write left short of its
+   * count holds a close only while nothing follows it.
    */
-  protected closingPartsCall(
-    chunk: StoredMessage[],
-    messages: readonly StoredMessage[],
-    position: ReadonlyMap<MessageId, number>,
-  ): boolean {
+  protected closesHeld(messages: readonly StoredMessage[]): Uint8Array {
+    const n = messages.length;
+    const held = new Uint8Array(n);
+    const parted = this.callPartedStarts(messages);
+    for (let p = 0; p < n; p++) if (parted[p]! >= 0) held[p] = 1;
+    if (n === 0) return held;
+    const lastAt = n - 1;
+    const end = messages[lastAt]!;
+    const lastFrom = bodyStart((k) => messages[k], lastAt);
+    // A body declares its size on each shard (StoredMessage.shardCount).
+    const writing = end.bodyGroupId !== undefined && end.shardCount !== undefined && (end.shardIndex ?? 0) + 1 < end.shardCount;
+    if (writing) {
+      for (let p = lastFrom; p <= lastAt; p++) held[p] = 1;
+      // The message before it, if it leaves a call open, from the call's start.
+      if (lastFrom > 0 && this.openCallIds(messages, lastFrom - 1).size > 0) {
+        for (let p = this.callStart(messages, lastFrom); p < lastFrom; p++) held[p] = 1;
+      }
+    } else if (this.openCallIds(messages, lastAt).size > 0) {
+      for (let p = this.callStart(messages, n); p <= lastAt; p++) held[p] = 1;
+    }
+    return held;
+  }
+
+  /**
+   * Whether closing a chunk after its last message would part a call from
+   * its result: the message holds a tool_use (lastMessageContainsToolUse),
+   * whose result comes in a later message or hasn't been written yet, or
+   * closesHeld holds a close there. `held` is closesHeld's answer for the
+   * store's listing, worked out once per walk, and `position` places a
+   * message in that listing.
+   */
+  protected closingPartsCall(chunk: StoredMessage[], held: Uint8Array, position: ReadonlyMap<MessageId, number>): boolean {
     if (this.lastMessageContainsToolUse(chunk)) return true;
     const last = chunk[chunk.length - 1];
     const at = last === undefined ? undefined : position.get(last.id);
-    if (at === undefined) return false;
-    if (this.callPartedAfter(messages, at) >= 0) return true;
-    const { to } = bodyBoundsIn(messages, at);
-    if (to !== messages.length - 1) return false;
-    const end = messages[to]!;
-    // A body declares its size on each shard (StoredMessage.shardCount).
-    if (end.bodyGroupId !== undefined && end.shardCount !== undefined && (end.shardIndex ?? 0) + 1 < end.shardCount) return true;
-    return this.bodyHoldsToolUse(messages, at) && at >= this.callStart(messages, messages.length);
+    return at !== undefined && held[at] === 1;
   }
 
   /**
@@ -19021,12 +19102,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         // Nor anywhere between a call and the message answering it, which
         // holds its result on a later shard when it comes after a long text:
-        // pull back to the call's start (callPartedAfter).
-        for (;;) {
-          const start = boundary > startIdx ? this.callPartedAfter(messages, boundary - 1) : -1;
-          if (start < 0) break;
-          boundary = Math.max(startIdx, start);
-        }
+        // pull back to the call's start (callPartedStarts).
+        const parted = this.callPartedStarts(messages);
+        while (boundary > startIdx && parted[boundary - 1]! >= 0) boundary = Math.max(startIdx, parted[boundary - 1]!);
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
     }
