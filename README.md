@@ -100,7 +100,7 @@ Several managers can read one record: agents that share the un-namespaced messag
 
 ## Branches
 
-Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch, and so does each window: a branch starts with the window as it stood at its branch point. Once a host presents rows, `branchAt` cuts at the write that presented the row, so the new branch's window holds it. `derive()` carries the window too, whatever the strategy's derivation manifest names.
+Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch, and so does each window: a branch starts with the window as it stood at its branch point. Once a host presents rows, `branchAt` cuts at the write that presented the row, so the new branch's window holds it. A row the window holds from its write-down was in the window from its own write, so it is cut there, as in legacy mode, and the new branch is in legacy mode. `derive()` carries the window too, whatever the strategy's derivation manifest names. Its `atSequence` is cut as given, so once a host presents, give it a presentation boundary, such as `currentSequence()` read after a `presentRows`: a cut at a presented row's own sequence leaves that row out of the child's window.
 
 ## Inspecting and repairing stores
 

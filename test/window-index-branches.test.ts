@@ -7,11 +7,16 @@
  *   with the parent's window and its arrivals, from the parent's reading of
  *   it; from an earlier checkpoint it starts with the window as it stood
  *   then. reopenDerived() finds it on the branch.
+ *   derive() cuts at the sequence it is given, so a cut at a presented
+ *   row's own sequence leaves that row out of the child's window.
  * - branchAt() cuts at the write that presented a row, the last of its
  *   body's shards, once a host presents, so the new branch's window holds
- *   the row; it finds a row of an auxiliary slot too.
+ *   the row; it finds a row of an auxiliary slot too. A row the write-down
+ *   presented is cut at its own sequence, as in legacy mode.
  * - A row removed from the manager's slot leaves the window as a
- *   tombstone, so no other row's ordinal moves.
+ *   tombstone, so no other row's ordinal moves, also when the context log
+ *   throws on the removal. A window that can't be read before a range is
+ *   removed doesn't stop the removal.
  */
 
 import { describe, it, after } from 'node:test';
@@ -19,7 +24,7 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, windowIndexStateId } from '../src/index.js';
 import type { CompileResult, DerivationManifest, MessageId } from '../src/index.js';
 
 const BASE = './test-window-index-branches';
@@ -82,6 +87,27 @@ function windowOf(cm: ContextManager, rows: MessageId[]) {
 
 function indexItems(cm: ContextManager): Array<Record<string, unknown>> {
   return (cm.getStore().getStateJson(INDEX) as Array<Record<string, unknown>> | null) ?? [];
+}
+
+/** The sequence `branchAt` cut `branch` at. */
+function branchPoint(cm: ContextManager, branch: string): number | undefined {
+  return cm.listBranches().find((b) => b.name === branch)?.branchPoint;
+}
+
+/** Runs `presentRows([])` with the `failing`-th append to the window index throwing, as a full disk would. */
+function cutShortWriteDown(cm: ContextManager, failing: number): void {
+  const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+  const append = store.appendToStateJsonWithIdentity;
+  let appends = 0;
+  store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+    if (id === INDEX && ++appends === failing) throw new Error('zz-index-append-failed');
+    return append.call(this, id, ...rest);
+  };
+  try {
+    assert.throws(() => cm.presentRows([]), /zz-index-append-failed/);
+  } finally {
+    store.appendToStateJsonWithIdentity = append;
+  }
 }
 
 describe('derive and the window', () => {
@@ -173,6 +199,40 @@ describe('derive and the window', () => {
     assert.deepEqual(texts(await parent.compile(BIG)), ['b', 'a', 'c']);
     atStored.close();
     atPresented.close();
+    parent.close();
+  });
+
+  it('cuts at the sequence given: at a presented row\'s own, the row is an arrival there; at the boundary after its presentation, it is in the window', { skip }, async () => {
+    // The contract derive documents: atSequence is a presentation boundary.
+    // A host that inspects "the context as of a row" by the row's own
+    // sequence gets the window without that row.
+    const parent = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    parent.presentRows([]);
+    const rows: MessageId[] = [];
+    const boundaries: number[] = [];
+    for (const t of ['u1', 'a1', 'u2', 'a2']) {
+      const id = parent.addMessage(t.startsWith('u') ? 'User' : 'Claude', [text(t)]);
+      parent.presentRows([id]);
+      rows.push(id);
+      boundaries.push(parent.getStore().currentSequence());
+    }
+    const [u1, a1, u2] = rows as [MessageId, MessageId, MessageId];
+    const own = parent.getMessage(u2)!.sequence;
+    assert.ok(own < boundaries[2]!, 'setup: u2 was presented at a write after its own');
+
+    const atRow = await parent.derive({ branch: 'zz/at-u2', strategy: new PassthroughStrategy(), atSequence: own });
+    assert.deepEqual(ids(atRow.getAllMessages()), [u1, a1, u2], 'the row is in the child\'s record');
+    assert.deepEqual(ids(atRow.getPresentedMessages()), [u1, a1], 'and not in its window');
+    assert.deepEqual(ids(atRow.getUnpresentedMessages()), [u2]);
+    assert.deepEqual(texts(await atRow.compile(BIG)), ['u1', 'a1']);
+
+    const atBoundary = await parent.derive({ branch: 'zz/after-u2', strategy: new PassthroughStrategy(), atSequence: boundaries[2]! });
+    assert.deepEqual(ids(atBoundary.getAllMessages()), [u1, a1, u2]);
+    assert.deepEqual(ids(atBoundary.getPresentedMessages()), [u1, a1, u2]);
+    assert.deepEqual(atBoundary.getUnpresentedMessages(), []);
+    assert.deepEqual(texts(await atBoundary.compile(BIG)), ['u1', 'a1', 'u2']);
+    atRow.close();
+    atBoundary.close();
     parent.close();
   });
 
@@ -307,6 +367,129 @@ describe('branchAt and the window', () => {
     cm.close();
   });
 
+  it('cuts a row the write-down presented at its own sequence: the new branch is in legacy mode, its window the record up to the row', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const rows = ['u1', 'a1', 'u2', 'a2', 'u3', 'a3'].map((t, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [text(t)]));
+    const [u1, a1] = rows as [MessageId, MessageId];
+    const legacy = cm.branchAt(a1, 'zz-legacy-at-a1'); // what a branch made before the write-down gives
+    cm.presentRows([]); // a host's boot call writes the window down
+    assert.equal(cm.presentationMode(), 'presented');
+    const main = cm.currentBranch().name;
+
+    // The write-down presented a1 after every row was stored. A cut at that
+    // write would keep u2..a3 in the new branch's record, as arrivals.
+    const atA1 = cm.branchAt(a1, 'zz-at-a1');
+    assert.equal(branchPoint(cm, atA1), cm.getMessage(a1)!.sequence);
+    assert.equal(branchPoint(cm, atA1), branchPoint(cm, legacy));
+    await cm.switchBranch(atA1);
+    assert.equal(cm.presentationMode(), 'legacy');
+    assert.equal(cm.indexLength(), 0);
+    assert.deepEqual(ids(cm.getAllMessages()), [u1, a1]);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [u1, a1]);
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u1', 'a1']);
+    // Its own boot call writes its window down as it stands there.
+    cm.presentRows([]);
+    assert.deepEqual([cm.ordinalOf(u1), cm.ordinalOf(a1)], [0, 1]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u1', 'a1']);
+
+    // A row presented after the write-down is cut at the write that
+    // presented it, as before.
+    await cm.switchBranch(main);
+    const x = cm.addMessage('Other', [text('x')]);
+    const y = cm.addMessage('Claude', [text('y')]);
+    cm.presentRows([y]);
+    cm.presentRows([x]);
+    const atY = cm.branchAt(y, 'zz-at-y');
+    assert.ok(branchPoint(cm, atY)! > cm.getMessage(x)!.sequence);
+    await cm.switchBranch(atY);
+    assert.equal(cm.presentationMode(), 'presented');
+    assert.deepEqual(ids(cm.getPresentedMessages()), [...rows, y]);
+    assert.deepEqual(ids(cm.getUnpresentedMessages()), [x]);
+    cm.close();
+  });
+
+  it('a row the write-down presented, taken out and presented again, is cut at the write that presented it again', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([]);
+    cm.retractRows([a]);
+    cm.presentRows([a]);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [b, c, a], 'setup: a holds an ordinal after the header');
+    const atA = cm.branchAt(a, 'zz-at-a');
+    assert.ok(branchPoint(cm, atA)! > cm.getMessage(c)!.sequence);
+    await cm.switchBranch(atA);
+    assert.equal(cm.presentationMode(), 'presented');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'a']);
+    cm.close();
+  });
+
+  it('cuts a body the write-down presented after its last shard\'s own write', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Sharding() });
+    const u = cm.addMessage('User', [text('u')]);
+    const doc = cm.addMessage('User', [text('p1'), text('p2'), text('p3')]);
+    cm.addMessage('User', [text('v')]);
+    assert.equal(cm.getAllMessages().length, 5, 'setup: the body is stored as three shards');
+    const body = ids(cm.getAllMessages()).slice(1, 4);
+    cm.presentRows([]);
+    const atDoc = cm.branchAt(doc, 'zz-at-doc');
+    assert.equal(branchPoint(cm, atDoc), cm.getMessage(body[2]!)!.sequence);
+    await cm.switchBranch(atDoc);
+    assert.equal(cm.presentationMode(), 'legacy');
+    assert.deepEqual(ids(cm.getAllMessages()), [u, ...body], 'the body is whole, and nothing stored after it is there');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u', 'p1', 'p2', 'p3']);
+    cm.close();
+  });
+
+  it('cuts each row of a write-down cut short and finished later at its own sequence', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cutShortWriteDown(cm, 3); // a and b written, then the failure
+    const e = cm.addMessage('alice', [text('e')]); // stored while still in legacy mode
+    cm.presentRows([]); // finishes it: c, e, then the header
+    assert.deepEqual(indexItems(cm).map((item) => item.id ?? item.v), [a, b, c, e, 1]);
+    const main = cm.currentBranch().name;
+
+    const atA = cm.branchAt(a, 'zz-at-a'); // written by the first try
+    assert.equal(branchPoint(cm, atA), cm.getMessage(a)!.sequence);
+    await cm.switchBranch(atA);
+    assert.equal(cm.presentationMode(), 'legacy');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a']);
+
+    await cm.switchBranch(main);
+    const atE = cm.branchAt(e, 'zz-at-e'); // written by the second
+    assert.equal(branchPoint(cm, atE), cm.getMessage(e)!.sequence);
+    await cm.switchBranch(atE);
+    // The first try's rows are there without their header: legacy mode,
+    // the window the record, and the boot call finishes it.
+    assert.equal(cm.presentationMode(), 'legacy');
+    assert.deepEqual(ids(cm.getPresentedMessages()), [a, b, c, e]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'e']);
+    cm.presentRows([]);
+    assert.deepEqual(indexItems(cm).map((item) => item.id ?? item.v), [a, b, c, e, 1]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'e']);
+    cm.close();
+  });
+
+  it('windowed passthrough: a branch at a row the write-down presented doesn\'t take the anchor set after it', async () => {
+    const strategy = new WindowedPassthroughStrategy({ anchorStateId: 'zz-agent/windowed:anchor' });
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const rows = ['u1', 'a1', 'u2', 'a2', 'u3', 'a3'].map((t, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [text(t)]));
+    // A tune-out anchors the window at u3 while the window is the record.
+    strategy.setAnchor(cm.getMessage(rows[4]!)!.sequence);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u3', 'a3']);
+    cm.presentRows([]);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u3', 'a3'], 'setup: the write-down keeps the anchor\'s window');
+
+    // Cut at the write-down's item for a1, the branch would hold the
+    // anchor, past every row its window holds, and compile nothing.
+    const atA1 = cm.branchAt(rows[1]!, 'zz-at-a1');
+    await cm.switchBranch(atA1);
+    assert.equal(cm.presentationMode(), 'legacy');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u1', 'a1']);
+    cm.close();
+  });
+
   it('finds a row of an auxiliary slot, and cuts at the write that presented it', async () => {
     const main = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     const side = await ContextManager.open({
@@ -387,6 +570,85 @@ describe('removal and the window', () => {
     assert.deepEqual(side.getUnpresentedMessages(), []);
     side.close();
     main.close();
+  });
+
+  it('removeMessages over a presented body takes every shard out, and no other row', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Sharding() });
+    cm.presentRows([]);
+    const u = cm.addMessage('User', [text('u')]);
+    const doc = cm.addMessage('User', [text('p1'), text('p2'), text('p3')]);
+    const v = cm.addMessage('User', [text('v')]);
+    cm.presentRows([u, doc, v]);
+    const all = ids(cm.getAllMessages());
+    assert.equal(all.length, 5, 'setup: the body is stored as three shards');
+    const before = all.map((id) => cm.ordinalOf(id));
+    const items = indexItems(cm).length;
+
+    cm.removeMessages(all[1]!, all[3]!);
+    assert.deepEqual(all.map((id) => cm.ordinalOf(id)), [before[0], undefined, undefined, undefined, before[4]]);
+    assert.deepEqual(indexItems(cm).slice(items).map((item) => item.retract), all.slice(1, 4), 'one tombstone a shard');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['u', 'v']);
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    cm.close();
+  });
+
+  it('a removal the context log throws on still takes the row out of the window', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const ob = cm.ordinalOf(b);
+    const internals = cm as unknown as { handleMessageRemove: (id: MessageId) => void };
+    internals.handleMessageRemove = () => {
+      throw new Error('zz-context-log-failed');
+    };
+    assert.throws(() => cm.removeMessage(a), /zz-context-log-failed/, 'the failure reaches the caller');
+    assert.equal(cm.getMessage(a), null, 'the removal stands');
+    assert.equal(cm.ordinalOf(a), undefined, 'and the row has left the window');
+    assert.equal(indexItems(cm).at(-1)!.retract, a);
+    assert.equal(cm.ordinalOf(b), ob);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b']);
+    cm.close();
+  });
+
+  it('a window that can\'t be read before a range is removed is logged once, and the removal stands', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    const oc = cm.ordinalOf(c);
+    // Every reading of the index asks the store for its revision first.
+    const store = cm.getStore() as unknown as Record<'stateHeadOffset' | 'getStateLen', (id: string) => unknown>;
+    const originals = { stateHeadOffset: store.stateHeadOffset, getStateLen: store.getStateLen };
+    for (const name of ['stateHeadOffset', 'getStateLen'] as const) {
+      const original = originals[name];
+      if (typeof original !== 'function') continue;
+      store[name] = function (this: unknown, id: string) {
+        if (id === INDEX) throw new Error('zz-index-read-failed');
+        return original.call(this, id);
+      };
+    }
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      cm.removeMessages(a, b);
+    } finally {
+      console.error = error;
+      store.stateHeadOffset = originals.stateHeadOffset;
+      store.getStateLen = originals.getStateLen;
+    }
+    assert.deepEqual([cm.getMessage(a), cm.getMessage(b)], [null, null], 'the removal stands');
+    assert.equal(logged.length, 1, logged.join('\n'));
+    assert.ok(logged[0]!.includes(`removing messages ${a} to ${b}`) && logged[0]!.includes('zz-index-read-failed'), logged[0]);
+    // Their ordinals stay issued until a host takes them out; the window
+    // lists only what the record holds.
+    assert.notEqual(cm.ordinalOf(a), undefined);
+    assert.equal(cm.ordinalOf(c), oc);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['c']);
+    cm.retractRows([a, b]);
+    assert.equal(cm.ordinalOf(a), undefined);
+    cm.close();
   });
 
   it('in legacy mode a removal writes nothing', async () => {

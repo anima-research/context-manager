@@ -247,6 +247,14 @@ export interface DeriveContextOptions {
    * Derive from an earlier point: a sequence on the parent's branch. The
    * child then starts from history as it was, loaded cold (the parent's
    * live caches describe the head, not the past). Default: the current head.
+   *
+   * Once the parent's host presents rows (see presentRows), give a
+   * presentation boundary here, such as `currentSequence()` read after a
+   * presentRows, not a row's own sequence: a row enters the window at a
+   * write after its own, so a cut at a presented row's own sequence holds
+   * the row in the child's record but not in its window, and the child
+   * lists it among its arrived rows (getUnpresentedMessages). branchAt,
+   * which takes a row's id, finds that boundary itself.
    */
   atSequence?: number;
   debugLogContext?: boolean;
@@ -1066,7 +1074,18 @@ export class ContextManager {
       // by the time the event is heard, so the window's share of them is
       // read here first (handleMessageStoreEvent). Only in presented mode:
       // in legacy mode the window is the record, and nothing is written.
-      this.removingRange = this.windowIndex.mode() === 'presented' ? this.slotIdsBetween(fromId, toId) : null;
+      // The removal goes ahead whatever happens here, as it does when a
+      // tombstone can't be written (retractRemoved).
+      try {
+        this.removingRange = this.windowIndex.mode() === 'presented' ? this.slotIdsBetween(fromId, toId) : null;
+      } catch (err) {
+        this.removingRange = null;
+        // A format string, since the error follows it: a '%' in an id is doubled.
+        const message =
+          `[context-manager] reading the window before removing messages ${fromId} to ${toId} failed; ` +
+          `the removal goes ahead, and the window's rows of it keep their ordinals:`;
+        logThrown(message.replaceAll('%', '%%'), err, this.diag);
+      }
       try {
         this.messageStore.removeRange(fromId, toId);
       } finally {
@@ -1403,6 +1422,15 @@ export class ContextManager {
    * presented. A row the window doesn't hold, and every row in legacy mode,
    * is cut at its own sequence, as before.
    *
+   * A row the window holds from the write-down (the first presentRows on
+   * the branch, which writes the window down as the record stood) was in
+   * the window from its own write, as every row was then: it is cut at its
+   * own sequence, its body's last shard's, as in legacy mode. The new
+   * branch has no index, or the start of one without its header, and is in
+   * legacy mode, its window the record up to the row; a cut at the
+   * write-down's item would keep every row stored before the write-down in
+   * the new branch's record, and the strategy state written after the row.
+   *
    * Returns the new branch *name*, which is what `switchBranch` and `forkAt`
    * expect. (Chronicle's branch APIs are name-keyed; the numeric `id` field
    * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
@@ -1432,7 +1460,9 @@ export class ContextManager {
    * The sequence branchAt cuts at for `message`: its own, unless the window
    * holds it, and then the latest write that presented a shard of its body.
    * Each presented row is one record for now (WindowIndex.write), so a cut
-   * there takes no row presented after the body's last shard.
+   * there takes no row presented after the body's last shard. A body the
+   * write-down presented, every shard of it, is cut at its last shard's own
+   * sequence instead: it was in the window from its own write.
    */
   private branchPointOf(message: StoredMessage, merged: MessageStoreView): number {
     const index = this.windowIndex;
@@ -1441,12 +1471,16 @@ export class ContextManager {
     const at = recordPositionOf(merged, record, message.id);
     if (at === undefined) return message.sequence;
     const { from, to } = bodyBoundsIn(record, at);
-    let cut = message.sequence;
+    let stored = message.sequence;
+    let presented = message.sequence;
+    let writtenDown = true;
     for (let k = from; k <= to; k++) {
       const row = record[k]!;
-      cut = Math.max(cut, row.sequence, index.presentedAt(row.id) ?? row.sequence);
+      stored = Math.max(stored, row.sequence);
+      presented = Math.max(presented, row.sequence, index.presentedAt(row.id) ?? row.sequence);
+      if (!index.presentedByWriteDown(row.id)) writtenDown = false;
     }
-    return cut;
+    return writtenDown ? stored : presented;
   }
 
   /**
@@ -1537,8 +1571,13 @@ export class ContextManager {
    * the checkpoint: at the head the child starts with the parent's window
    * and its arrived-and-not-presented rows (getUnpresentedMessages), and
    * from `atSequence` it starts with the window as it stood then, which
-   * names only rows stored by then. A parent that hadn't presented a row by
-   * the checkpoint has no window written, and the child is in legacy mode.
+   * names only rows stored by then. The cut is taken as given: a row stored
+   * by then and presented after it is in the child's record and not in its
+   * window. A row is presented at a write after its own, so a cut at a
+   * presented row's own sequence leaves that row out of the child's window
+   * too: give a presentation boundary (`currentSequence()` read after a
+   * presentRows) instead. A parent that hadn't presented a row by the
+   * checkpoint has no window written, and the child is in legacy mode.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.
@@ -2943,8 +2982,13 @@ export class ContextManager {
         this.handleMessageEdit(event.messageId, event.newContent);
         break;
       case 'remove':
-        this.handleMessageRemove(event.messageId);
-        this.retractRemoved([event.messageId]);
+        // The row is gone from the record whatever the context log makes of
+        // it, so it leaves the window even when that throws.
+        try {
+          this.handleMessageRemove(event.messageId);
+        } finally {
+          this.retractRemoved([event.messageId]);
+        }
         break;
       case 'removeRange':
         // Ids of the removed span aren't in the event; prune holds whose

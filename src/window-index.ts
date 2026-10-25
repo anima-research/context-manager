@@ -405,6 +405,23 @@ export class WindowIndex {
     return ordinal === undefined ? undefined : state.at[ordinal];
   }
 
+  /**
+   * Whether the row is in the window at the ordinal the write-down gave it,
+   * one below the header's, which the write-down writes last. Such a row
+   * was in the window from its own write, as every row is in legacy mode,
+   * and the rows before it there were the rows stored before it, since the
+   * write-down follows record order. A row taken out since and presented
+   * again holds a later ordinal and is not one. False in legacy mode, and
+   * for every row of an index an earlier build of this branch wrote header
+   * first.
+   */
+  presentedByWriteDown(id: MessageId): boolean {
+    const state = this.current();
+    if (!inEffect(state)) return false;
+    const ordinal = state.ordinals.get(id);
+    return ordinal !== undefined && ordinal < state.header!;
+  }
+
   /** The rows in the window, in order. */
   private presentedIds(state: IndexState): MessageId[] {
     if (!state.presented) {
