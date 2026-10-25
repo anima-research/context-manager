@@ -286,10 +286,12 @@ export interface ContextStrategy {
    * React to rows entering the agent's window, the rows its strategy reads
    * (see ContextManager.presentRows). Called with the rows that entered, in
    * window order, every shard of a body, and a context whose view holds
-   * them. Each row presented is one record, so a presentRows cut short by a
-   * failed write calls this with the rows it got in before it throws, which
-   * can be a body's first shards; the call that completes that body later
-   * gives only the shards that entered then.
+   * them, unless the manager's view filter leaves them out: a row the filter
+   * leaves out is given here all the same, and the view doesn't list it or
+   * give it a position. Each row presented is one record, so a presentRows
+   * cut short by a failed write calls this with the rows it got in before
+   * it throws, which can be a body's first shards; the call that completes
+   * that body later gives only the shards that entered then.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
@@ -305,7 +307,10 @@ export interface ContextStrategy {
    * calls nothing. While the strategy isn't initialized (it is initializing,
    * or its last initialization failed), the calls from presentRows wait until
    * it is, and then one call carries the rows still in the window, in
-   * window order, each once.
+   * window order, each once. They wait for the manager's strategy, not for
+   * this instance: a strategy set with setStrategy() while rows wait hears
+   * them after its own initialize, though that initialize read a window
+   * that held them.
    *
    * The manager doesn't wait for the promise. A rejection, or a throw before
    * it returns, is logged through the manager's diagnostics, naming the
@@ -325,7 +330,13 @@ export interface ContextStrategy {
    * it, so its synchronous part runs before addMessage returns. Once a host
    * presents rows on the branch, it is from presentRows, once per row
    * presented, in window order, and no longer at the add: a row stored and
-   * not presented isn't in the window the context reads.
+   * not presented isn't in the window the context reads. Each row's call
+   * is made only if the manager is still open, with this strategy
+   * initialized: a call that closes the manager, sets a strategy, or starts
+   * an initialization (a setStrategy() or switchBranch() called before its
+   * first await) stops the calls for the rows after it. Those rows wait for the
+   * initialization, as onPresented's do, and so reach a replacement after
+   * its initialize; after close() nothing hears them.
    *
    * The manager doesn't wait for the promise. A rejection, or a throw before
    * it returns, is logged through the manager's diagnostics, naming the

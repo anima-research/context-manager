@@ -336,6 +336,120 @@ describe('onPresented in presented mode', () => {
   }
 });
 
+/**
+ * A strategy that knows only onNewMessage, keeping the rows it hears, whose
+ * first row's hook runs `onFirst`; its initialize waits for `gate`.
+ */
+class Reacts extends PassthroughStrategy {
+  heard: MessageId[] = [];
+  detached = 0;
+  gate: Promise<void> | undefined;
+  constructor(public onFirst?: () => void) {
+    super();
+  }
+  async initialize(_ctx: StrategyContext): Promise<void> {
+    await this.gate;
+  }
+  detach(): void {
+    this.detached++;
+  }
+  async onNewMessage(message: StoredMessage, _ctx: StrategyContext): Promise<void> {
+    this.heard.push(message.id);
+    if (this.heard.length === 1) this.onFirst?.();
+  }
+}
+
+/** A gate for an initialize, and the function that opens it. */
+function gated(): { gate: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => { open = resolve; });
+  return { gate, open };
+}
+
+// presentRows calls a strategy with only onNewMessage once per row. Each
+// call is checked as a call of its own, as each add's was in legacy mode:
+// a row's hook that closes the manager or lets the strategy go stops the
+// calls for the rows after it, and those rows go where a call made then
+// sends them.
+describe("a row's onNewMessage hook that closes the manager or sets a strategy", () => {
+  it('a hook that closes the manager: the rows after it are not heard, and the presentation stands', async () => {
+    let cm!: ContextManager;
+    const strategy = new Reacts(() => cm.close());
+    let ids: MessageId[] = [];
+    let ordinals: number[] = [];
+    const errors = await errorsDuring(async () => {
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      ids = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
+      ordinals = cm.presentRows(ids);
+      await settle();
+    });
+    assert.deepEqual(strategy.heard, [ids[0]], "after close() nothing reaches the strategy: b and c aren't heard");
+    assert.equal(strategy.detached, 1, 'close() let the strategy go');
+    assert.equal(ordinals.length, 3, 'presentRows finished the write and returned every ordinal');
+    assert.deepEqual(errors, []);
+    assert.ok(cm.isClosed());
+  });
+
+  it('a hook that sets a strategy: the one it replaced hears no more, and the rest reach the new one after its initialize', async () => {
+    let cm!: ContextManager;
+    const { gate, open } = gated();
+    const next = new Reacts();
+    next.gate = gate;
+    let replaced!: Promise<void>;
+    const first = new Reacts(() => { replaced = cm.setStrategy(next); });
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: first });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    assert.deepEqual(first.heard, [a], 'the replaced strategy heard only the row whose hook replaced it');
+    assert.equal(first.detached, 1);
+    assert.deepEqual(next.heard, [], 'nothing reaches the new strategy while it initializes');
+    open();
+    await replaced;
+    assert.deepEqual(next.heard, [b, c], 'once it initialized, the rows after the hook, in window order');
+    await settle();
+    assert.deepEqual(first.heard, [a]);
+    cm.close();
+  });
+
+  it('a hook that sets a strategy with no initialize: the rest reach it before presentRows returns', async () => {
+    let cm!: ContextManager;
+    const next = new HearsNewMessages();
+    const first = new Reacts(() => { void cm.setStrategy(next); });
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: first });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    assert.deepEqual(first.heard, [a]);
+    assert.deepEqual(next.heard, [{ id: b, window: [a, b, c] }, { id: c, window: [a, b, c] }]);
+    await settle();
+    assert.deepEqual(first.heard, [a]);
+    cm.close();
+  });
+
+  it('a hook that starts its own strategy initializing again: the rest wait for it and reach it once it has', async () => {
+    let cm!: ContextManager;
+    const { gate, open } = gated();
+    let reinitialized!: Promise<void>;
+    const strategy = new Reacts(() => {
+      strategy.gate = gate;
+      reinitialized = cm.setStrategy(strategy);
+    });
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    assert.deepEqual(strategy.heard, [a], 'nothing reaches a strategy that is initializing');
+    assert.equal(strategy.detached, 0, 'the same instance is kept');
+    open();
+    await reinitialized;
+    assert.deepEqual(strategy.heard, [a, b, c], 'once it initialized again, the rows after the hook, each once');
+    await settle();
+    cm.close();
+  });
+});
+
 describe('onPresented in legacy mode', () => {
   it('a strategy with onPresented hears each row from inside the add, after its hold is placed, and not through onNewMessage', async () => {
     const strategy = new Records();

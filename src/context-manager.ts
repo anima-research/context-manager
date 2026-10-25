@@ -3095,6 +3095,13 @@ export class ContextManager {
    * strategy isn't initialized the rows wait for it (deliverPresentedUnheard);
    * an add, the legacy caller, requires an initialized strategy.
    *
+   * Each row's onNewMessage call is checked as a call of its own, so a hook
+   * that closes the manager, sets a strategy or starts an initialization
+   * (a setStrategy() or switchBranch() called before its first await) stops
+   * the calls after it. The rows it hasn't been given go where a call made then
+   * sends them: nowhere after close(), to wait for the initialization, or
+   * to a replacement that has none. The strategy it let go hears no more.
+   *
    * Fire and forget: the write doesn't wait for the strategy, and the
    * strategy's failure isn't the write's (#288). A hook that isn't async can
    * throw before it returns, and the throw is logged the same way as a
@@ -3123,7 +3130,14 @@ export class ContextManager {
       }
       return;
     }
-    for (const message of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      if (i > 0 && (this.closed || this.strategy !== strategy || this.initializedAttempt !== this.initializationAttempt)) {
+        // The previous row's hook closed the manager, set a strategy or started
+        // an initialization: the rest go as a call made now sends them.
+        this.notifyPresented(rows.slice(i));
+        return;
+      }
+      const message = rows[i]!;
       const failed = (err: unknown) =>
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
       try {
