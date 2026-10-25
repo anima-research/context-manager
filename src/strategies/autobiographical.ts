@@ -18690,24 +18690,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * For each position in `messages`, where the call starts that a boundary
    * right after that position would part from its result, or -1 where a
-   * boundary there parts none, worked out for the whole listing in one pass.
+   * boundary there parts none, worked out for the whole listing in one
+   * pass.
    *
    * A message answers the message before it when it holds a tool_result for
    * a call that message left open (openCallIds), on any of either's shards:
    * the two run from the call's start (callStart: the call's first shard
    * holding a tool_use or a thinking block, or its first shard) through the
    * answering message's last shard, and a boundary after any position in
-   * that run but its last parts them. A message that makes a call and answers
-   * it itself, as a bundled cycle does, can hold the two on different
-   * shards: a boundary after the shard holding the call, and before the one
-   * holding its result, parts them too, and the run starts at the message's
-   * first shard holding a tool_use or a thinking block. Ingress keeps each
-   * block where it sat (chunkIngressMessage), so a result after a long text
-   * is on its message's last shard, and a call stored before then holds its
-   * tool_use on its first shard; in neither is the result in the message
-   * right after the tool_use. Where runs overlap, as where a message both
-   * answers a call and makes one, a position takes the earliest start, and
-   * a caller stepping back to it asks again from there.
+   * that run but its last is held, so the answering message stays whole
+   * with its call, wherever in it the result sits. A message that makes a
+   * call and answers it itself, as a bundled cycle does, can hold the two
+   * on different shards: its run goes from its first shard holding a
+   * tool_use or a thinking block to the shard before the one holding the
+   * call's result.
+   * Ingress keeps each block where it sat (chunkIngressMessage), so a
+   * result after a long text is on its message's last shard, and a call
+   * stored before then holds its tool_use on its first shard; in neither is
+   * the result in the message right after the tool_use. Where runs overlap,
+   * as where a message both answers a call and makes one, a position takes
+   * the earliest start, and a caller stepping back to it asks again from
+   * there.
    */
   protected callPartedStarts(messages: readonly StoredMessage[]): Int32Array {
     const n = messages.length;
@@ -18719,7 +18722,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let from = 0; from < n; ) {
       const to = bodyEnd(n, (k) => messages[k], from);
       const open = new Set<string>();
-      const madeAt = new Map<string, number>();
       let first = -1;
       let answersBefore = false;
       for (let k = from; k <= to; k++) {
@@ -18727,7 +18729,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (b.type === 'tool_use') {
             const id = (b as { id: string }).id;
             open.add(id);
-            madeAt.set(id, k);
             if (first < 0) first = k;
           } else if (b.type === 'thinking' || b.type === 'redacted_thinking') {
             if (first < 0) first = k;
@@ -18735,8 +18736,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const id = (b as { toolUseId: string }).toolUseId;
             if (open.has(id)) {
               open.delete(id);
-              const made = madeAt.get(id)!;
-              if (k > made) mark(made, k - 1, first);
+              mark(first, k - 1, first);
             } else if (before?.open.has(id)) {
               answersBefore = true;
             }
@@ -18745,7 +18745,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (answersBefore && before) {
         mark(before.callFrom, before.to, before.callFrom);
-        if (to > from) mark(from, to - 1, before.callFrom);
+        mark(from, to - 1, before.callFrom);
       }
       before = { to, open, callFrom: first >= 0 ? first : from };
       from = to + 1;
@@ -18905,6 +18905,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (boundary > 0 && boundary < messages.length && this.bodyHoldsToolResult(messages, boundary)) {
           boundary = this.callStart(messages, boundary);
         }
+        // Nor inside a call, or inside a message answering its own call,
+        // where the boundary would part them (callPartedStarts): as when a
+        // call's text follows its tool_use, on the shards after it.
+        const parted = this.callPartedStarts(messages);
+        while (boundary > 0 && parted[boundary - 1]! >= 0) boundary = parted[boundary - 1]!;
         return boundary;
       }
     }

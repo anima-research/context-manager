@@ -482,6 +482,53 @@ describe("the head window's end, wherever it falls in a call and the message ans
   }
 });
 
+describe("the recent window's start, wherever it falls inside a call before the message answering it, keeps the call from its start", () => {
+  for (const [shape, pair] of Object.entries(PAIRS)) {
+    it(shape, async () => {
+      class Exposed extends (pair.legacy ? LegacyIngress : AutobiographicalStrategy) {
+        recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
+        estimates(store: unknown) { return this.postStripEstimates(store as never); }
+      }
+      await withPair(Exposed, pair, {}, async (manager, strategy, { callFrom }) => {
+        const store = (manager as unknown as { messageStore: unknown }).messageStore;
+        const stored = manager.getAllMessages();
+        const config = (strategy as unknown as { config: Record<string, number> }).config;
+        const callAt = stored.findIndex((m, k) => k >= callFrom && (holds(m, 'tool_use') || holds(m, 'thinking')));
+        const callEnd = stored.findIndex((m, k) => k > callFrom && holds(m, 'tool_result')) - 1;
+        const pse = (strategy as Exposed).estimates(store);
+        for (let edge = callAt + 1; edge <= callEnd; edge++) {
+          // A window the messages from `edge` on fill exactly: its edge falls at `edge`.
+          config.recentWindowTokens = pse.slice(edge).reduce((n, t) => n + t, 0);
+          assert.equal((strategy as Exposed).recentStart(store), callAt, `an edge on message ${edge}`);
+        }
+      });
+    });
+  }
+});
+
+describe('the head window\'s end inside a message that thinks, makes a call and answers it itself', () => {
+  it('steps back to the message\'s first shard, which holds the thinking', async () => {
+    class Exposed extends AutobiographicalStrategy {
+      headEnd(store: unknown) { return this.getHeadWindowEnd(store as never); }
+    }
+    const pair = {
+      call: [{ type: 'thinking', thinking: 'let me look it up', signature: 'SIG' } as unknown as ContentBlock, text(prose('REPLY', 1_000)), call('call-1'), text(prose('NOTE', 1_000)), result('call-1', 'Sunny.'), text('done')],
+      result: [text('thanks')],
+    };
+    await withPair(Exposed, pair, {}, async (manager, strategy, { callFrom }) => {
+      const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+      const stored = manager.getAllMessages();
+      const config = (strategy as unknown as { config: Record<string, number> }).config;
+      const resultAt = stored.findIndex((m) => holds(m, 'tool_result'));
+      assert.ok(holds(stored[callFrom]!, 'thinking') && resultAt - callFrom >= 3, `premise: thinking on the first shard, the result shards later (${callFrom}, ${resultAt})`);
+      for (let edge = callFrom + 1; edge <= resultAt; edge++) {
+        config.headWindowTokens = stored.slice(0, edge).reduce((n, m) => n + store.estimateTokens(m), 0);
+        assert.equal((strategy as Exposed).headEnd(store), callFrom, `an edge on message ${edge}`);
+      }
+    });
+  });
+});
+
 describe("the head window's end at messages without shards, paired by the calls each leaves open", () => {
   const STUB = "this call's result isn't shown in this context";
   /** Plain turns, the shape, more plain turns; the head's tokens run out at the shape's message `edge` (from 0). */

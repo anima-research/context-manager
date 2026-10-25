@@ -33,25 +33,31 @@
   leaving its `tool_use` out when the call was stored before blocks were
   kept in place. Tool-result pruning counts a sharded reply's calls as one
   turn, wherever they sit in it.
-- Compression keeps a tool call and its result in one chunk, and in one
-  piece where the split fallback folds a refused chunk in pieces, and the
-  head window's end leaves them on one side, wherever their shards hold the
-  `tool_use` and the `tool_result`, when the result is in the call's own
-  message or in the message right after it: a result after a long text now
-  sits on its message's last shard, a call stored before blocks were kept in
-  place has its `tool_use` on its first shard and its text on the shards
-  after it, and a message that makes a call and answers it itself can hold
-  the two on different shards. A chunk's close waited only one message past
-  a `tool_use`, the head's end stepped back only past a message holding one,
-  and the split fallback kept together only a message holding a `tool_use`
-  and the messages holding results right after it, so a chunk, a piece or
-  the head could end between a call and its result. A compression request
-  drops a `tool_result` whose call isn't in it, so a result parted that way
-  from its call by a chunk reached no summary. A result in a later message,
-  as when parallel calls' results come in messages of their own, is as
-  before. In a store without shards, chunks close where they did, and the
-  head's end moves only where it ended between a call and the message
-  answering it, which can happen when that message also makes the next call:
-  the call went out in the head with a stub in place of its result once that
-  message was folded. Such a store rewrites its prompt once, from the head's
-  end, at its first compile after upgrading.
+- A chunk's close, the split fallback's cuts, the head window's end and the
+  recent window's start now keep a tool call and its result on one side,
+  wherever their shards hold the `tool_use` and the `tool_result`, when the
+  result is in the call's own message or in the message right after it: a
+  result after a long text now sits on its message's last shard, a call
+  stored before blocks were kept in place has its `tool_use` on its first
+  shard and its text on the shards after it, a call whose text follows its
+  `tool_use` has the same shape, and a message that makes a call and answers
+  it itself can hold the two on different shards. A chunk's close waited
+  only one message past a `tool_use`, the head's end stepped back only past
+  a message holding one, the recent window's start stepped back only from a
+  message holding a result, and the split fallback kept together only a
+  message holding a `tool_use` and the result messages right after it, so a
+  chunk, a piece or a window could end between a call and its result. A
+  compression request drops a `tool_result` whose call isn't in it, so a
+  result parted that way from its call by a chunk reached no summary. As
+  before: a result in a later message, as when parallel calls' results come
+  in messages of their own; a chunk closed where a pinned message, the head
+  or an earlier chunk interrupts the compressible messages, and the
+  Knowledge chunker's last, unclosed chunk; and the head's end moving
+  forward to where chunks resume (#122). In a store without shards, chunks
+  close where they did, and the head's end moves only where it ended between
+  a call and the message answering it, which can happen when that message
+  also makes the next call: the call went out in the head with a stub in
+  place of its result once that message was folded. Such a store, and one
+  whose recent window's edge falls inside a call stored as shards, after its
+  first shard holding a `tool_use` or thinking, can rewrite its prompt once,
+  from that edge, at its first compile after upgrading.

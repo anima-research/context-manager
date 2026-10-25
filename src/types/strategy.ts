@@ -649,7 +649,8 @@ export interface IngressChunkResult {
    * replay form) that were the whole block's, and a raw form whose blocks
    * don't all sit unchanged on one shard is given up, with its reasoning
    * pairing, as is a raw form whose reasoning pairing's members land on
-   * different shards (raw-forms.ts); every other block keeps its raw form.
+   * different shards (raw-forms.ts). An opaque carrier keeps its raw item,
+   * which is its whole content, and every other block keeps its raw form.
    */
   shards: Array<{
     content: ContentBlock[];
