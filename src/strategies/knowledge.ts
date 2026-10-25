@@ -133,11 +133,15 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       // Not between a call and its result: closing there would leave the
       // result with its call folded into the summary, and pairing repair
       // drops a result whose call isn't before it. So when a summary ends at
-      // a call answered only later, the result joins the summary's chunk,
-      // which the overlap guard then refuses, as on main.
+      // a call answered only later, the message answering it joins the
+      // summary's chunk, which the overlap guard then refuses, as on main.
+      // Each is asked on all its shards: a call can hold its tool_use on any
+      // of them, and the message answering it its tool_result, on a later
+      // shard when it comes after a long text. The size close below keeps
+      // the rest of that message in the chunk.
       const summaryChanges = previous !== undefined
         && coveredBy.get(previous.id) !== coveredBy.get(msg.id)
-        && !(this.hasToolUse(previous) && this.hasToolResult(msg));
+        && !(this.bodyHoldsToolUse(all, position.get(previous.id)!) && this.bodyHoldsToolResult(all, at));
       if (previous && (changeBefore || summaryChanges)) {
         // The compressible stream skips a system change, which stays raw. A
         // chunk across it would summarize both sides as one, rendered at its
@@ -168,19 +172,22 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const maxTokens = this.getMaxChunkTokens(currentPhase ?? phase);
       const sizeExceeded = currentTokens >= maxTokens;
       // Same tool-pair boundary guard as the base chunker (rebuildChunks in
-      // AutobiographicalStrategy): never close a chunk whose LAST message
-      // contains a tool_use block — its matching tool_result lives in the
-      // immediately-following message (the one about to be pushed). Closing
-      // here would split the pair across chunks; when the earlier chunk
-      // compresses first, the raw orphan tool_result renders unpaired and
-      // the Anthropic API rejects the request. Deferring the close by one
-      // iteration pulls the tool_result into the same chunk. (Phase never
-      // changes between a tool_use and its tool_result — the result inherits
-      // lastToolPhase — so this defers sizeExceeded closes in practice.)
+      // AutobiographicalStrategy, closingPartsCall): never close a chunk
+      // whose LAST message contains a tool_use block, nor anywhere between a
+      // call and the message answering it, which holds its result on a later
+      // shard when the result comes after a long text. Closing there would
+      // split the pair across chunks; a compression request drops the
+      // tool_result whose call isn't in it (stripUnpairedToolBlocks), and
+      // when the earlier chunk compresses first, pairing repair drops the raw
+      // orphan tool_result. Deferring the close pulls the tool_result into the
+      // same chunk. (A message holding only a tool_result inherits
+      // lastToolPhase, but the text-only shards before a result on a later
+      // shard classify as synthesis, so this defers phase closes there as
+      // well as sizeExceeded closes.)
       const shouldClose =
         currentChunk.length >= 2 &&
         (phaseChanged || sizeExceeded) &&
-        !this.lastMessageContainsToolUse(currentChunk);
+        !this.closingPartsCall(currentChunk, all, position);
 
       if (shouldClose) closeAt(i);
 

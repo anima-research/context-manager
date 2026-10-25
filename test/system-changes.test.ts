@@ -625,6 +625,30 @@ describe('the autobiographical strategy and a system change', () => {
     assert.ok(blocks.some((b) => b.type === 'tool_result' && b.toolUseId === 't1' && b.content === 'read it'), 'the result is sent with its content');
   });
 
+  it('KnowledgeStrategy: a summary ending at an unanswered call doesn\'t part the call from a result after a long text, on a later shard of its message', async () => {
+    const { requests, membrane } = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0, autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0, summaryParticipant: 'Claude', mergeThreshold: 1000, adaptiveResolution: true,
+    });
+    const cm = await open(strategy, membrane);
+    for (let i = 0; i < 9; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
+    const use = cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
+    // Compressed by ticks alone: an adaptive compile of this store, which
+    // ends at an unanswered call, refuses it (repair-lost-newest-turn).
+    for (let r = 0, before = -1; r < 200 && requests.length !== before; r++) { before = requests.length; await cm.tick(); await cm.tick(); }
+    const chunks = (): Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> =>
+      (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> }).chunks;
+    assert.ok(chunks().some((c) => c.compressed && c.messages.at(-1)!.id === use), 'setup: a summary ends at the call');
+    const before = cm.getAllMessages().length;
+    cm.addMessage('User', [text(`NOTE ${'word '.repeat(400)}`), { type: 'tool_result', toolUseId: 't1', content: 'read it' } as ContentBlock]);
+    const shards = cm.getAllMessages().slice(before);
+    const result = shards.findIndex((m) => m.content.some((b) => b.type === 'tool_result'));
+    assert.ok(shards.length > 2 && result === shards.length - 1, `setup: the result is on the last of the message's shards (${result + 1} of ${shards.length})`);
+    await cm.compile(BIG);
+    assert.ok(chunks().some((c) => c.messages.some((m) => m.id === use) && c.messages.some((m) => m.id === shards[result]!.id)), 'the call and its result share a chunk');
+  });
+
   it('KnowledgeStrategy: a summary ending at a call that a plain message follows still closes there', async () => {
     const { requests, membrane } = recordingMembrane();
     const strategy = new KnowledgeStrategy({

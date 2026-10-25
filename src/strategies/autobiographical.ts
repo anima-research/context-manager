@@ -17454,11 +17454,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // subclass marks a semantic boundary between the running chunk's last
       // message and this one (e.g. a chat-topic transition). An undersized
       // boundary chunk is deliberate — a semantic boundary outranks the size
-      // target — but the chunker's minimum message count and the tool_use
-      // pairing guard below still apply.
+      // target — but the chunker's minimum message count and the guard below
+      // against parting a call from its result still apply.
       if (
         currentChunk.length >= 4 &&
-        !this.lastMessageContainsToolUse(currentChunk) &&
+        !this.closingPartsCall(currentChunk, listing, livePosition) &&
         this.chunkBoundaryHint(currentChunk[currentChunk.length - 1], msg, currentChunk)
       ) {
         closeCurrent(i);
@@ -17471,14 +17471,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         currentTokens >= this.config.targetChunkTokens &&
         currentChunk.length >= 4;
 
-      // Don't close a chunk on a message containing a tool_use block —
-      // the matching tool_result lives in the immediately-following user
-      // message, and the Anthropic API rejects a request where a tool_use
-      // isn't immediately followed by its tool_result. Defer the close
-      // by one iteration so the result rides along in the same chunk.
+      // Don't close a chunk where it would part a call from its result
+      // (closingPartsCall): on a message containing a tool_use block, nor
+      // anywhere between a call and the message answering it, which holds
+      // its result on a later shard when the result comes after a long text.
+      // The Anthropic API rejects a request where a tool_use isn't
+      // immediately followed by its tool_result, so a compression request
+      // drops a tool_result whose call isn't in it (stripUnpairedToolBlocks),
+      // and the chunk holding the result would be summarized without it.
+      // Defer the close until the result rides along in the same chunk.
       // The stripUnpairedToolBlocks runtime pass is a safety net for the
       // rare case where a tool_use is the very last message in the store.
-      if (shouldClose && this.lastMessageContainsToolUse(currentChunk)) {
+      if (shouldClose && this.closingPartsCall(currentChunk, listing, livePosition)) {
         continue;
       }
 
@@ -17535,10 +17539,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Returns true if the last message in the chunk-in-progress contains a
-   * `tool_use` block. Used by `rebuildChunks` to defer chunk closure until
-   * the matching `tool_result` (in the immediately-following user message)
-   * is pulled into the same chunk. See `stripUnpairedToolBlocks` for the
-   * runtime safety net.
+   * `tool_use` block, whose `tool_result` comes in a later message or hasn't
+   * been written yet. closingPartsCall asks it, so the chunkers defer a close
+   * there until the result is pulled into the same chunk. See
+   * `stripUnpairedToolBlocks` for the runtime safety net.
    */
   protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
     const last = chunk[chunk.length - 1];
@@ -18652,6 +18656,78 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return from;
   }
 
+  /** Whether the message holding position `at` holds a tool_use on any of its shards. */
+  protected bodyHoldsToolUse(messages: readonly StoredMessage[], at: number): boolean {
+    const { from, to } = bodyBoundsIn(messages, at);
+    for (let k = from; k <= to; k++) if (this.hasToolUse(messages[k]!)) return true;
+    return false;
+  }
+
+  /**
+   * Where the call starts that a boundary right after position `at` would
+   * part from the message answering it, or -1 when a boundary there parts
+   * none. A message holding a tool_result, on any of its shards, answers the
+   * message before it when that one holds a tool_use, on any of its shards:
+   * the two run from the call's start (callStart) through the answering
+   * message's last shard, and a boundary after any position in that run but
+   * its last parts them. Ingress keeps each block where it sat
+   * (chunkIngressMessage), so a result after a long text is on its
+   * message's last shard, and a call stored before then holds its tool_use
+   * on its first shard; in neither is the result in the message right after
+   * the tool_use. A caller stepping back to the start returned asks again
+   * from there, since that start can lie inside an earlier call and its
+   * answer, as where a message both answers a call and makes one.
+   */
+  protected callPartedAfter(messages: readonly StoredMessage[], at: number): number {
+    if (at < 0 || at >= messages.length) return -1;
+    const { from, to } = bodyBoundsIn(messages, at);
+    // Inside the answering message, before its last shard.
+    if (at < to && from > 0 && this.bodyHoldsToolResult(messages, at) && this.bodyHoldsToolUse(messages, from - 1)) {
+      return this.callStart(messages, from);
+    }
+    // Inside the call, from its start, with the message after it answering.
+    if (to + 1 < messages.length && this.bodyHoldsToolUse(messages, at) && this.bodyHoldsToolResult(messages, to + 1)) {
+      const start = this.callStart(messages, to + 1);
+      if (at >= start) return start;
+    }
+    return -1;
+  }
+
+  /**
+   * Whether closing a chunk after its last message would part a call from
+   * its result: the message holds a tool_use (lastMessageContainsToolUse),
+   * whose result comes in a later message or hasn't been written yet, or a
+   * boundary there falls between a call and the message answering it
+   * (callPartedAfter). `messages` is the store's listing, and `position`
+   * places a message in it.
+   *
+   * At the listing's end, what comes next isn't written yet. The chunkers
+   * run as each shard lands (onNewMessage), and the autobiographical one
+   * keeps each chunk it closes for good (its chunk records). So a close
+   * there waits as it would once the rest is written: inside a message still
+   * being written, which may yet hold a call or the result answering the one
+   * before it, and inside a call, from its start (callStart), whose result
+   * hasn't come. The walk after the write closes where the whole store
+   * allows.
+   */
+  protected closingPartsCall(
+    chunk: StoredMessage[],
+    messages: readonly StoredMessage[],
+    position: ReadonlyMap<MessageId, number>,
+  ): boolean {
+    if (this.lastMessageContainsToolUse(chunk)) return true;
+    const last = chunk[chunk.length - 1];
+    const at = last === undefined ? undefined : position.get(last.id);
+    if (at === undefined) return false;
+    if (this.callPartedAfter(messages, at) >= 0) return true;
+    const { to } = bodyBoundsIn(messages, at);
+    if (to !== messages.length - 1) return false;
+    const end = messages[to]!;
+    // A body declares its size on each shard (StoredMessage.shardCount).
+    if (end.bodyGroupId !== undefined && end.shardCount !== undefined && (end.shardIndex ?? 0) + 1 < end.shardCount) return true;
+    return this.bodyHoldsToolUse(messages, at) && at >= this.callStart(messages, messages.length);
+  }
+
   /**
    * Index where the hold region begins: the earliest held message, stepped
    * back, when its message holds a tool_result on any of its shards, onto
@@ -18942,6 +19018,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // predecessor has tool_use, pull back by one so the pair stays together.
         if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
+        }
+        // Nor anywhere between a call and the message answering it, which
+        // holds its result on a later shard when it comes after a long text:
+        // pull back to the call's start (callPartedAfter).
+        for (;;) {
+          const start = boundary > startIdx ? this.callPartedAfter(messages, boundary - 1) : -1;
+          if (start < 0) break;
+          boundary = Math.max(startIdx, start);
         }
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }

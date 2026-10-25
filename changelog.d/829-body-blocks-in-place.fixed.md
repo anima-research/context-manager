@@ -33,3 +33,14 @@
   leaving its `tool_use` out when the call was stored before blocks were
   kept in place. Tool-result pruning counts a sharded reply's calls as one
   turn, wherever they sit in it.
+- Compression keeps a tool call and the message answering it in one
+  chunk, and the head window's end leaves them on one side, wherever in
+  their shards the `tool_use` and the `tool_result` sit: a result after a
+  long text now sits on its message's last shard, and a call stored before
+  blocks were kept in place has its `tool_use` on its first shard and its
+  text on the shards after it. A chunk's close waited only one message past
+  a `tool_use`, and the head's end stepped back only past a message holding
+  one, so such a call's text shards could end a chunk, or the head, with its
+  result after them. A compression request drops a `tool_result` whose call
+  isn't in it, so a result parted that way from its call by a chunk reached
+  no summary.

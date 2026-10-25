@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy } from '../src/index.js';
 import { legacyIngress } from './_harness/legacy-ingress.js';
 
 const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as unknown as ContentBlock;
@@ -338,4 +338,131 @@ describe('the recent window at a result on a later shard of the store\'s first m
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+/** Ingress as LegacyIngress has it, for the Knowledge strategy. */
+class LegacyKnowledgeIngress extends KnowledgeStrategy {
+  override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+    return legacyIngress(super.chunkIngressMessage(participant, content), content);
+  }
+}
+
+/**
+ * The two ways a sharded body puts a call's result past the message right
+ * after its tool_use: a result after a long text, on its message's last
+ * shard, and a call stored before each block was kept in place, whose
+ * tool_use is on its first shard and its text on the shards after it.
+ */
+const PAIRS: Record<string, { legacy: boolean; call: ContentBlock[]; result: ContentBlock[] }> = {
+  'a result after a long text, on its message\'s last shard': {
+    legacy: false, call: [text('looking it up'), call('call-1')], result: [text(prose('NOTE', 2_000)), result('call-1', 'Sunny.')],
+  },
+  'a call stored before each block was kept in place, its tool_use on its first shard': {
+    legacy: true, call: [text(prose('REPLY', 2_000)), call('call-1')], result: [result('call-1', 'Sunny.')],
+  },
+};
+/** A subclass whose boundary hint asks for a close between every two messages. */
+class HintEverywhere extends AutobiographicalStrategy {
+  protected override chunkBoundaryHint(): boolean { return true; }
+}
+class LegacyHintEverywhere extends HintEverywhere {
+  override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+    return legacyIngress(super.chunkIngressMessage(participant, content), content);
+  }
+}
+const STRATEGIES = {
+  autobiographical: { inPlace: AutobiographicalStrategy, legacy: LegacyIngress },
+  'a boundary hint at every message': { inPlace: HintEverywhere, legacy: LegacyHintEverywhere },
+  Knowledge: { inPlace: KnowledgeStrategy, legacy: LegacyKnowledgeIngress },
+} as const;
+
+/** A store of plain turns, then the pair, then more turns, chunked small. */
+async function withPair(
+  Strategy: typeof AutobiographicalStrategy,
+  pair: { call: ContentBlock[]; result: ContentBlock[] },
+  config: Record<string, unknown>,
+  body: (manager: ContextManager, strategy: AutobiographicalStrategy, at: { callFrom: number; resultTo: number }) => Promise<void>,
+  membrane?: unknown,
+) {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-pair-'));
+  const strategy = new Strategy({
+    adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0, ...config,
+  });
+  const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, ...(membrane ? { membrane: membrane as never } : {}) });
+  manager.setToolDefinitions(tools as never);
+  try {
+    for (let k = 0; k < 4; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(60))]);
+    const callFrom = manager.getAllMessages().length;
+    manager.addMessage('Claude', pair.call);
+    manager.addMessage('User', pair.result);
+    const resultTo = manager.getAllMessages().length - 1;
+    for (let k = 0; k < 6; k++) manager.addMessage(k % 2 ? 'User' : 'Claude', [text(`after ${k} ` + 'w '.repeat(60))]);
+    assert.ok(resultTo - callFrom >= 3, `premise: the call and its result are stored as shards (${callFrom}..${resultTo})`);
+    await body(manager, strategy, { callFrom, resultTo });
+  } finally {
+    await manager.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const holds = (m: { content: ContentBlock[] }, type: string) => m.content.some((b) => b.type === type);
+
+describe('no compression chunk parts a call from the message answering it, wherever in their shards the tool_use and the tool_result sit', () => {
+  for (const [name, { inPlace, legacy }] of Object.entries(STRATEGIES)) {
+    for (const [shape, pair] of Object.entries(PAIRS)) {
+      it(`${name}: ${shape}`, async () => {
+        await withPair(pair.legacy ? legacy : inPlace, pair, {}, async (manager, strategy) => {
+          const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ id: string; content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void };
+          chunker.rebuildChunks((manager as unknown as { messageStore: unknown }).messageStore);
+          const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
+          assert.ok(chunker.chunks.length > 2 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
+          assert.ok(withCall[0]!.messages.some((m) => holds(m, 'tool_result')), 'the chunk holding the tool_use holds its tool_result');
+        });
+      });
+    }
+  }
+});
+
+describe("the head window's end, wherever it falls in a call and the message answering it, leaves them on one side", () => {
+  for (const [shape, pair] of Object.entries(PAIRS)) {
+    it(shape, async () => {
+      class Exposed extends (pair.legacy ? LegacyIngress : AutobiographicalStrategy) {
+        headEnd(store: unknown) { return this.getHeadWindowEnd(store as never); }
+      }
+      await withPair(Exposed, pair, {}, async (manager, strategy, { callFrom, resultTo }) => {
+        const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+        const stored = manager.getAllMessages();
+        const config = (strategy as unknown as { config: Record<string, number> }).config;
+        const callAt = pair.legacy ? callFrom : stored.findIndex((m) => holds(m, 'tool_use'));
+        for (let edge = callAt + 1; edge <= resultTo; edge++) {
+          // A head window the messages before `edge` fill exactly: its edge falls at `edge`.
+          config.headWindowTokens = stored.slice(0, edge).reduce((n, m) => n + store.estimateTokens(m), 0);
+          assert.equal((strategy as Exposed).headEnd(store), callAt, `an edge on message ${edge}`);
+        }
+      });
+    });
+  }
+});
+
+describe('a result whose call compresses first, end to end', () => {
+  for (const [name, { inPlace, legacy }] of Object.entries(STRATEGIES)) {
+    for (const [shape, pair] of Object.entries(PAIRS)) {
+      it(`${name}: ${shape}: the result reaches a summary, beside its call`, async () => {
+        const requests: string[] = [];
+        const membrane = {
+          complete: async (req: unknown) => {
+            requests.push(JSON.stringify(req));
+            return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${requests.length}` }] };
+          },
+        };
+        await withPair(pair.legacy ? legacy : inPlace, pair, { compressionModel: 'm', minChunkCharsForLLM: 0, l1HoldbackChunks: 0 }, async (manager, strategy) => {
+          const queue = (strategy as unknown as { compressionQueue: number[] }).compressionQueue;
+          await manager.compile();
+          for (let guard = 0; queue.length > 0 && guard < 80; guard++) await manager.tick();
+          assert.ok(requests.length > 2, `premise: the store compresses in several requests (${requests.length})`);
+          assert.ok(requests.some((r) => r.includes('Sunny.') && r.includes('"call-1"')), 'a compression request carries the result, beside its call');
+        }, membrane);
+      });
+    }
+  }
 });

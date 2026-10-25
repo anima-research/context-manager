@@ -618,11 +618,12 @@ export class MessageStore {
    *
    * It reads back from `index` over changes and messages holding results but
    * no call, to the nearest message that holds a call, reading each message
-   * whole, every shard of its body, since ingress sharding puts a message's
-   * calls and results on its body's first shard. It checks that message's
-   * calls, by id: those a result in a later message answers, as parallel
-   * calls' results in messages of their own do, and those its own later
-   * blocks answer, as in a bundled cycle (splitMixedToolMessages), are
+   * whole, every shard of its body, since ingress sharding keeps each block
+   * where it sat, so a message's calls and results can be on any of its
+   * shards (a body stored before holds them on its first). It checks that
+   * message's calls, by id: those a result in a later message answers, as
+   * parallel calls' results in messages of their own do, and those its own
+   * later blocks answer, as in a bundled cycle (splitMixedToolMessages), are
    * answered. The walk stops at a message of any other kind, so a call no
    * result answered, further back, refuses nothing. `index` is where the
    * content goes: the end for an append, the message's place for an edit.
@@ -637,8 +638,8 @@ export class MessageStore {
   refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
     const length = this.length();
     const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
-    // A body is one step of either walk, read whole: ingress sharding puts a
-    // message's non-text blocks, its calls and results, on its first shard.
+    // A body is one step of either walk, read whole: ingress sharding keeps
+    // each block where it sat, so its calls and results can be on any shard.
     const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
       const from = bodyStart(at, i);
       const to = bodyEnd(length, at, i);
