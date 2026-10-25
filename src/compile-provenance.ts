@@ -122,8 +122,11 @@ function storedBodyFinder(
  * body is judged as stored, so a shard the filter hid from the strategy
  * still belongs to its body, whose head is shard 0 whether or not it was
  * visible. A body is presented whole, so its shards are consecutive in
- * either order. `positionOf` resolves an id among those same messages to
- * its position in `stored` (undefined when none has it).
+ * either order, but for one a presentation cut short left partly in the
+ * window and a later presentRows completed after other rows entered: its
+ * shards are then two runs in `stored`, each read as a body of its own and
+ * neither complete. `positionOf` resolves an id among those same messages
+ * to its position in `stored` (undefined when none has it).
  */
 export function attributeEntries(
   entries: readonly ContextEntry[],

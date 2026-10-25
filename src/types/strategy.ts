@@ -286,7 +286,10 @@ export interface ContextStrategy {
    * React to rows entering the agent's window, the rows its strategy reads
    * (see ContextManager.presentRows). Called with the rows that entered, in
    * window order, every shard of a body, and a context whose view holds
-   * them.
+   * them. Each row presented is one record, so a presentRows cut short by a
+   * failed write calls this with the rows it got in before it throws, which
+   * can be a body's first shards; the call that completes that body later
+   * gives only the shards that entered then.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the

@@ -77,7 +77,7 @@
  */
 
 import type { JsStore } from '@animalabs/chronicle';
-import { bodyBoundsIn } from './body-runs.js';
+import { bodyBoundsIn, continuesBody } from './body-runs.js';
 import type { Diagnostics } from './diagnostics.js';
 import { registerStateIfAbsent } from './state-registration.js';
 import type { MessageId, MessageStoreView, StoredMessage } from './types/index.js';
@@ -500,11 +500,29 @@ export class WindowIndex {
     return undefined;
   }
 
-  /** The record's rows not in the window, in record order, leaving out an undone turn's rows. Empty in legacy mode. */
+  /**
+   * The record's rows not in the window, in record order, leaving out an
+   * undone turn's rows. Empty in legacy mode.
+   *
+   * A body partly in the window (a presentation cut short, or a branch cut
+   * between its shards' presentations, left its first shards in) lists the
+   * shards it lacks, undone or not: the window holds part of it, so the
+   * rest is due, and present takes the first of them as naming the rest.
+   * A host that presents these rows by id completes the body.
+   */
   unpresented(source: readonly StoredMessage[]): StoredMessage[] {
     const state = this.current();
     if (!inEffect(state)) return [];
-    return source.filter((m) => !state.ordinals.has(m.id) && !state.undone.has(m.id));
+    const rows: StoredMessage[] = [];
+    // Whether the body the row before belongs to has a shard in the window.
+    let bodyInWindow = false;
+    for (let i = 0; i < source.length; i++) {
+      const message = source[i]!;
+      if (i === 0 || !continuesBody(source[i - 1], message)) bodyInWindow = false;
+      if (state.ordinals.has(message.id)) bodyInWindow = true;
+      else if (bodyInWindow || !state.undone.has(message.id)) rows.push(message);
+    }
+    return rows;
   }
 
   /**
@@ -517,26 +535,68 @@ export class WindowIndex {
    * ordinal, and `entered`, the rows that entered the window, in window
    * order, every shard of a body: none when the call wrote the window down
    * in legacy mode, since each of its rows was in the window already.
+   *
+   * A body enters whole, but each item is one record, so a presentation
+   * cut short can leave a body's first shards in the window and the rest
+   * out, and so can a branch cut between its shards' presentations. Naming
+   * such a body, by its first shard's id or by the first shard the window
+   * lacks (the one unpresented lists first), presents only the shards it
+   * lacks, in body order, at the end of the window: the shards in it keep
+   * their ordinals, and `entered` holds only the new ones. A row presented
+   * between the two calls stays between them in the window, so the body is
+   * then sent as two runs. A name whose rows are all in the window already
+   * is refused.
+   *
+   * `cutShort`, when given, hears the rows that entered before a write that
+   * threw partway, in window order, before the error is thrown on: each is
+   * in the window, and no later call presents it again.
    */
   present(
     ids: readonly MessageId[],
     record: readonly StoredMessage[],
     positionOf: (id: MessageId) => number | undefined,
+    cutShort?: (entered: MessageId[]) => void,
   ): { ordinals: number[]; entered: MessageId[] } {
     const state = this.current();
-    const rows = wholeBodies('presentRows', ids, record, positionOf, (id) => {
-      throw new Error(`ContextManager.presentRows: no stored message has id ${id}; give each row by the id addMessage returned for it`);
-    });
-    if (!inEffect(state)) {
+    const legacy = !inEffect(state);
+    // A cut-short write-down's rows aren't a window: in legacy mode the
+    // window is the whole record, which holds no body in part.
+    const named = namedBodies(
+      'presentRows',
+      ids,
+      record,
+      positionOf,
+      (id) => {
+        throw new Error(`ContextManager.presentRows: no stored message has id ${id}; give each row by the id addMessage returned for it`);
+      },
+      legacy ? undefined : (id) => state.ordinals.has(id),
+    );
+    if (legacy) {
       this.write(this.writeDown('presentRows', state, record));
       const ordinals = this.current().ordinals;
       return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [] };
     }
-    const already = rows.filter((id) => state.ordinals.has(id));
+    const already = named.filter((name) => name.rows.every((id) => state.ordinals.has(id))).map((name) => name.id);
     if (already.length > 0) {
       throw new Error(`ContextManager.presentRows: ${already.join(', ')} ${already.length === 1 ? 'is' : 'are'} in the window already; a row is presented once`);
     }
-    this.write(rows.map((id) => ({ id })));
+    const rows = named.flatMap((name) => name.rows.filter((id) => !state.ordinals.has(id)));
+    try {
+      this.write(rows.map((id) => ({ id })));
+    } catch (error) {
+      if (cutShort) {
+        let entered: MessageId[] = [];
+        try {
+          const now = this.current().ordinals;
+          entered = rows.filter((id) => now.has(id));
+        } catch {
+          // The index can't be read: the error thrown on says why, and the
+          // next read finds what entered.
+        }
+        if (entered.length > 0) cutShort(entered);
+      }
+      throw error;
+    }
     const ordinals = this.current().ordinals;
     return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows };
   }
@@ -558,17 +618,18 @@ export class WindowIndex {
   ): void {
     const state = this.current();
     const legacy = !inEffect(state);
-    const rows = wholeBodies('retractRows', ids, record, positionOf, (id) => {
+    const rows = namedBodies('retractRows', ids, record, positionOf, (id) => {
       // In legacy mode the window is the record, so a row it doesn't hold
       // isn't in the window either, whatever a write-down cut short wrote.
       if (legacy || !state.ordinals.has(id)) {
         throw new Error(`ContextManager.retractRows: no stored message has id ${id}, and the window holds none`);
       }
-    });
+    }).flatMap((name) => name.rows);
     if (rows.length === 0) return;
     // In legacy mode every row of the record is in the window. Otherwise a
     // row named must be; a shard that came with its first shard's id and
-    // isn't (a body a failed write left part-presented) has nothing to take.
+    // isn't (a body a presentation cut short, or a branch cut between its
+    // shards, left partly in the window) has nothing to take.
     const inWindow = (id: MessageId) => legacy || state.ordinals.has(id);
     const named = new Set(ids);
     const absent = rows.filter((id) => named.has(id) && !inWindow(id));
@@ -684,52 +745,69 @@ export class WindowIndex {
   }
 }
 
+/** One name in a presentRows or retractRows call: the id given, and the rows it stands for, in record order. */
+interface Named {
+  id: MessageId;
+  rows: MessageId[];
+}
+
 /**
- * The rows `ids` name, each body whole. A body stored as shards is named by
- * its first shard's id, the one addMessage returned, which stands for every
- * shard in order; its other shards may follow it in the call, in order, and
- * then name the same body. A later shard named any other way is refused as
- * part of a body, and a row named twice as named twice. `unknown` decides
- * an id `record` doesn't hold: it throws, or lets the id through as it is.
+ * The rows `ids` name, name by name, each body whole. A body stored as
+ * shards is named by its first shard's id, the one addMessage returned,
+ * which stands for every shard in order; its other shards may follow it in
+ * the call, in order, and then name the same body. With `inWindow` (present,
+ * in presented mode, where a body can be partly in the window), a later
+ * shard whose earlier shards are all in the window names the rest of the
+ * body, itself and every shard after it, and those may follow it in the
+ * same way. A later shard named any other way is refused as part of a
+ * body, and a row named twice, by two names, as named twice. `unknown`
+ * decides an id `record` doesn't hold: it throws, or lets the id through as
+ * it is.
  */
-function wholeBodies(
+function namedBodies(
   operation: string,
   ids: readonly MessageId[],
   record: readonly StoredMessage[],
   positionOf: (id: MessageId) => number | undefined,
   unknown: (id: MessageId) => void,
-): MessageId[] {
+  inWindow?: (id: MessageId) => boolean,
+): Named[] {
   if (!Array.isArray(ids)) throw new TypeError(`ContextManager.${operation}: \`ids\` must be an array of message ids, got ${typeof ids}`);
   ids.forEach((id: unknown, i) => {
     if (typeof id !== 'string') throw new TypeError(`ContextManager.${operation}: id ${i} must be a message id, got ${JSON.stringify(id) ?? typeof id}`);
   });
-  const rows: MessageId[] = [];
+  const named: Named[] = [];
   for (let i = 0; i < ids.length; ) {
     const id = ids[i]!;
     const at = positionOf(id);
     if (at === undefined) {
       unknown(id);
-      rows.push(id);
+      named.push({ id, rows: [id] });
       i++;
       continue;
     }
     const { from, to } = bodyBoundsIn(record, at);
-    if (at !== from) {
+    if (at !== from && !(inWindow && record.slice(from, at).every((m) => inWindow(m.id)))) {
       throw new Error(
         `ContextManager.${operation}: ${id} is shard ${record[at]!.shardIndex ?? '?'} of a body stored as shards; ` +
-          `a body goes whole, named by its first shard's id (${record[from]!.id})`,
+          `a body goes whole, named by its first shard's id (${record[from]!.id})` +
+          (inWindow ? `, or the rest of one partly in the window by the first shard the window lacks` : ''),
       );
     }
-    for (let k = from; k <= to; k++) rows.push(record[k]!.id);
+    const rows: MessageId[] = [];
+    for (let k = at; k <= to; k++) rows.push(record[k]!.id);
+    named.push({ id, rows });
     i++;
-    for (let k = from + 1; k <= to && i < ids.length && ids[i] === record[k]!.id; k++) i++;
+    for (let k = at + 1; k <= to && i < ids.length && ids[i] === record[k]!.id; k++) i++;
   }
   const seen = new Set<MessageId>();
-  for (const id of rows) {
-    if (seen.has(id)) throw new Error(`ContextManager.${operation}: ${id} is named twice (a body's shards come with its first shard)`);
-    seen.add(id);
+  for (const { rows } of named) {
+    for (const id of rows) {
+      if (seen.has(id)) throw new Error(`ContextManager.${operation}: ${id} is named twice (a body's shards come with its first shard)`);
+      seen.add(id);
+    }
   }
-  return rows;
+  return named;
 }
 
 /**

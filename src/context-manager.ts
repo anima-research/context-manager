@@ -1270,7 +1270,20 @@ export class ContextManager {
    * every shard in order; its other shards may follow that id in order.
    * Throws, presenting nothing, for an id no merged slot holds (this
    * manager's own or an auxiliary one), a row in the window already, a row
-   * named twice, or a later shard of a body named without its first.
+   * named twice, or a later shard of a body named without its first, unless
+   * the window holds every shard before it (below).
+   *
+   * Each row presented is one record, so a call cut short (it threw
+   * partway, or the process died before the store synced) can leave a
+   * body's first shards in the window and the rest out; so can a branch or
+   * a derive cut between its shards' presentations. Such a body is
+   * completed, not refused: naming it, by its first shard's id or by the
+   * first shard the window lacks, which getUnpresentedMessages lists with
+   * the shards after it, presents only the shards it lacks, at the end of
+   * the window. The shards in it keep their ordinals. A row presented in
+   * between stays between them, and the body is then compiled as two runs,
+   * each reported incomplete in compile provenance. A host that presents
+   * its unpresented rows at turn start completes such a body that way.
    *
    * Until the first presentation on a branch the manager is in legacy
    * mode: the window is the merged record itself, read live, so compiles
@@ -1296,7 +1309,9 @@ export class ContextManager {
    * returns, fire and forget: its failure is logged, and the rows stay
    * presented. The first call, which writes the legacy window down, enters
    * no new row, so the strategy hears nothing: it heard each row as it was
-   * stored.
+   * stored. A call cut short by a throw tells the strategy the rows that
+   * entered before it, then throws; a call that completes a body tells it
+   * only the shards that entered then.
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
@@ -1306,9 +1321,19 @@ export class ContextManager {
     const merged = this.mergedMessageView();
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
+    const hear = (entered: readonly MessageId[]) => this.notifyPresented(entered.map((id) => record[positionOf(id)!]!));
     return this.write(() => {
-      const { ordinals, entered } = this.windowIndex.present(ids, record, positionOf);
-      this.notifyPresented(entered.map((id) => record[positionOf(id)!]!));
+      const { ordinals, entered } = this.windowIndex.present(ids, record, positionOf, (cutShort) => {
+        // The rows a failed write got in stay in the window, and no later
+        // call presents them again: this is the strategy's one hearing of
+        // them. The write's own error is the one thrown.
+        try {
+          hear(cutShort);
+        } catch (error) {
+          logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that entered before it failed:', error, this.diag);
+        }
+      });
+      hear(entered);
       return ordinals;
     });
   }
@@ -1325,10 +1350,11 @@ export class ContextManager {
    * row taken out counts as arrived and not presented, as another agent's
    * row presented during an undone turn does.
    *
-   * A body goes whole, named as presentRows names it. A row the store no
-   * longer holds can still be taken out by its id. Throws, taking out
-   * nothing, for a row not in the window, a row named twice, or a later
-   * shard named without its first. A closed manager refuses it.
+   * A body goes whole, named by its first shard's id, which stands for
+   * every shard the window holds. A row the store no longer holds can still
+   * be taken out by its id. Throws, taking out nothing, for a row not in
+   * the window, a row named twice, or a later shard named without its
+   * first. A closed manager refuses it.
    *
    * retractRows([]) takes nothing out and writes nothing, in either mode.
    * Any other call in legacy mode switches the manager to presented mode:
@@ -1392,6 +1418,10 @@ export class ContextManager {
    * The stored rows not in the window, in record order, from this manager's
    * slot and its auxiliary slots: arrived and not presented. Leaves out an
    * undone turn's rows (retractRows with `undone`). Empty in legacy mode.
+   *
+   * A body partly in the window (see presentRows) lists the shards it
+   * lacks, undone or not, and presentRows takes the first of them as
+   * naming the rest of the body, so presenting these ids completes it.
    */
   getUnpresentedMessages(): StoredMessage[] {
     return this.windowIndex.unpresented(this.mergedMessageView().getAll());
@@ -1576,8 +1606,11 @@ export class ContextManager {
    * window. A row is presented at a write after its own, so a cut at a
    * presented row's own sequence leaves that row out of the child's window
    * too: give a presentation boundary (`currentSequence()` read after a
-   * presentRows) instead. A parent that hadn't presented a row by the
-   * checkpoint has no window written, and the child is in legacy mode.
+   * presentRows) instead. A cut between a sharded body's presentations,
+   * one record per shard, leaves the body partly in the child's window,
+   * and the child's presentRows of the body completes it. A parent that
+   * hadn't presented a row by the checkpoint has no window written, and
+   * the child is in legacy mode.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.

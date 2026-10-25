@@ -13,6 +13,10 @@
  * - Presented mode: the window is the index. A row stored and not presented
  *   stays out of it; rows presented out of record order are compiled in
  *   the window's order, and compile provenance still finds each body.
+ * - A body partly in the window (a presentRows cut short, or a derive cut
+ *   between its shards' presentations): its missing shards are listed as
+ *   unpresented, and naming the body again presents only those, at the end,
+ *   so the shards in the window keep their ordinals.
  * - The presented listing keeps the strategies' memo contract: the same
  *   array while the window is unchanged, a new one when it changes, never
  *   one changed in place, and the store's own message objects.
@@ -563,6 +567,171 @@ describe('the window in presented mode', () => {
     await cm.switchBranch('zz-fork');
     assert.equal(cm.ordinalOf(z), Math.max(...ordinals.map((o) => o!)) + 1);
     cm.close();
+  });
+});
+
+describe('a body partly in the window', () => {
+  // Each row presented is one record, so a presentRows cut short partway
+  // through a sharded body, or a branch cut between its shards'
+  // presentations, leaves the body's first shards in the window and the
+  // rest out. Naming the body again completes it (FW-CM-3).
+
+  /** Sharding that keeps the ids each onPresented call was given. */
+  class Hearing extends Sharding {
+    heard: MessageId[][] = [];
+    async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+      this.heard.push(rows.map((m) => m.id));
+    }
+  }
+
+  /** A row `a`, then a three-shard body whose presentRows was cut short after its first shard. */
+  async function cutShortBody() {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([]);
+    const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+    const shards = cm.getAllMessages().filter((m) => m.bodyGroupId === 'zz-doc').map((m) => m.id);
+    assert.equal(shards[0], doc);
+    strategy.heard = [];
+    const restore = failIndexAppend(cm, 2);
+    try {
+      assert.throws(() => cm.presentRows([doc]), /zz-index-append-failed/);
+    } finally {
+      restore();
+    }
+    return { cm, strategy, a, doc, p1: shards[1]!, p2: shards[2]! };
+  }
+
+  it('presenting the unpresented rows completes it: only the shards it lacks enter, at the end, and the first keeps its ordinal', async () => {
+    const { cm, strategy, a, doc, p1, p2 } = await cutShortBody();
+    // The call cut short got the first shard in, and the strategy heard it:
+    // no later call presents it again.
+    assert.deepEqual(strategy.heard, [[doc]]);
+    assert.deepEqual(indexItems(cm).slice(-1), [{ id: doc }]);
+    const ordinal = cm.ordinalOf(doc)!;
+    assert.equal(ordinal, cm.indexLength() - 1);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, doc]);
+    const partial = await cm.compile(BIG);
+    assert.deepEqual(texts(partial), ['a', 'p0 ']);
+    assert.deepEqual(rawHeads(partial), [[a, true], [doc, false]]);
+
+    // The shards it lacks are listed, and presenting them, as a host's turn
+    // start presents every arrived row, is accepted. Before, the first of
+    // them was refused as a later shard named without its first, and every
+    // other row of the call with it.
+    const unpresented = cm.getUnpresentedMessages().map((m) => m.id);
+    assert.deepEqual(unpresented, [p1, p2]);
+    strategy.heard = [];
+    assert.deepEqual(cm.presentRows(unpresented), [ordinal + 1, ordinal + 2]);
+    assert.equal(cm.ordinalOf(doc), ordinal, 'the first shard keeps its ordinal');
+    assert.deepEqual(strategy.heard, [[p1, p2]], 'the strategy hears only the shards that entered');
+    assert.deepEqual(indexItems(cm).slice(-3), [{ id: doc }, { id: p1 }, { id: p2 }], 'each shard is presented once');
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    const whole = await cm.compile(BIG);
+    assert.deepEqual(texts(whole), ['a', 'p0 ', 'p1 ', 'p2 ']);
+    assert.deepEqual(rawHeads(whole), [[a, true], [doc, true], [doc, true], [doc, true]], 'compile provenance reports the body complete');
+
+    // Whole again, the body is refused by either name, as any row in the
+    // window is, and nothing is written.
+    const length = cm.getStore().getStateLen(INDEX);
+    assert.throws(() => cm.presentRows([doc]), new RegExp(`${doc} is in the window already`));
+    assert.throws(() => cm.presentRows([p1]), new RegExp(`${p1} is in the window already`));
+    assert.equal(cm.getStore().getStateLen(INDEX), length);
+    cm.close();
+  });
+
+  it('naming its first shard completes it too; a later shard is taken only after every shard before it', async () => {
+    const { cm, strategy, a, doc, p1, p2 } = await cutShortBody();
+    const b = cm.addMessage('bob', [text('b')]);
+    const q0 = cm.addMessage('bob', [text('q0 '), text('q1 ')]);
+    const q1 = cm.getAllMessages().at(-1)!.id;
+    const length = cm.getStore().getStateLen(INDEX);
+    assert.throws(
+      () => cm.presentRows([p2]),
+      new RegExp(`${p2} is shard 2 of a body stored as shards; a body goes whole, named by its first shard's id \\(${doc}\\), or the rest of one partly in the window by the first shard the window lacks`),
+      'a shard after one the window lacks',
+    );
+    assert.throws(() => cm.presentRows([q1, q0]), /shard 1 of a body stored as shards/, 'a later shard of a body the window holds none of');
+    assert.throws(() => cm.presentRows([doc, b, p1]), new RegExp(`${p1} is named twice`), 'the first shard and the first one missing name the same rows');
+    assert.throws(() => cm.presentRows([doc, doc]), new RegExp(`${doc} is named twice`));
+    assert.throws(() => cm.presentRows([b, a]), new RegExp(`${a} is in the window already`));
+    assert.equal(cm.getStore().getStateLen(INDEX), length, 'nothing was written');
+
+    // A row presented before the body is completed stays between its runs,
+    // and each run reads as a body of its own, neither complete.
+    cm.presentRows([b]);
+    strategy.heard = [];
+    const ordinal = cm.ordinalOf(doc);
+    assert.deepEqual(cm.presentRows([doc]), [ordinal]);
+    assert.deepEqual(strategy.heard, [[p1, p2]]);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, doc, b, p1, p2]);
+    assert.deepEqual(cm.getUnpresentedMessages().map((m) => m.id), [q0, q1]);
+    const result = await cm.compile(BIG);
+    assert.deepEqual(texts(result), ['a', 'p0 ', 'b', 'p1 ', 'p2 ']);
+    assert.deepEqual(rawHeads(result), [[a, true], [doc, false], [b, true], [p1, false], [p1, false]]);
+    cm.close();
+  });
+
+  it("an undone turn's body presented again in part lists the shards it lacks, and its first shard with them completes it", async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+    const [, p1, p2] = cm.getAllMessages().map((m) => m.id);
+    cm.presentRows([doc]);
+    cm.retractRows([doc], { undone: true });
+    assert.deepEqual(cm.getUnpresentedMessages(), [], "an undone turn's body is left out");
+
+    // The redo is cut short after the first shard. The body is partly in
+    // the window now, so the rest is due, undone or not.
+    strategy.heard = [];
+    const restore = failIndexAppend(cm, 2);
+    try {
+      assert.throws(() => cm.presentRows([doc]), /zz-index-append-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(strategy.heard, [[doc]]);
+    assert.deepEqual(cm.getUnpresentedMessages().map((m) => m.id), [p1!, p2!]);
+
+    // The first shard with the rest in order names the same body.
+    const ordinal = cm.ordinalOf(doc)!;
+    assert.deepEqual(cm.presentRows([doc, p1!, p2!]), [ordinal, ordinal + 1, ordinal + 2]);
+    assert.deepEqual(strategy.heard, [[doc], [p1, p2]]);
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    const result = await cm.compile(BIG);
+    assert.deepEqual(texts(result), ['p0 ', 'p1 ', 'p2 ']);
+    assert.deepEqual(rawHeads(result), [[doc, true], [doc, true], [doc, true]]);
+    cm.close();
+  });
+
+  it("a child derived between a body's shard presentations completes it with presentRows of its first shard", async () => {
+    const parent = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Sharding() });
+    parent.presentRows([]);
+    const u = parent.addMessage('User', [text('u')]);
+    parent.presentRows([u]);
+    const doc = parent.addMessage('User', [text('p0 '), text('p1 '), text('p2 ')]);
+    const [, p1, p2] = parent.getAllMessages().filter((m) => m.bodyGroupId === 'zz-doc').map((m) => m.id);
+    const before = parent.getStore().currentSequence();
+    parent.presentRows([doc]);
+    // One record per shard: two records on, the first two shards are in the
+    // window and the third isn't.
+    const child = await parent.derive({ branch: 'zz/mid-body', strategy: new Sharding(), atSequence: before + 2 });
+    assert.deepEqual(child.getPresentedMessages().map((m) => m.id), [u, doc, p1]);
+    assert.deepEqual(child.getUnpresentedMessages().map((m) => m.id), [p2]);
+    assert.deepEqual(rawHeads(await child.compile(BIG)), [[u, true], [doc, false], [doc, false]]);
+    const ordinals = [child.ordinalOf(doc), child.ordinalOf(p1!)];
+
+    assert.deepEqual(child.presentRows([doc]), [ordinals[0]]);
+    assert.deepEqual([child.ordinalOf(doc), child.ordinalOf(p1!)], ordinals, 'the shards in the window keep their ordinals');
+    assert.deepEqual(child.getUnpresentedMessages(), []);
+    const whole = await child.compile(BIG);
+    assert.deepEqual(texts(whole), ['u', 'p0 ', 'p1 ', 'p2 ']);
+    assert.deepEqual(rawHeads(whole), [[u, true], [doc, true], [doc, true], [doc, true]]);
+    assert.deepEqual(parent.getPresentedMessages().map((m) => m.id), [u, doc, p1, p2], "the parent's window is its own");
+    child.close();
+    parent.close();
   });
 });
 
