@@ -56,7 +56,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -1086,8 +1086,8 @@ export class ContextManager {
    * it was before it went. In legacy mode the window is the record, and the
    * strategy isn't told: what it folded of the row it keeps. A removal
    * through another manager on the same slot isn't heard here: a host takes
-   * that row out of this window with retractRows, which takes a row the
-   * store no longer holds by its id.
+   * that row out of this window with retractRemoved, naming it, or
+   * retractAbsentRows, which finds every such row.
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
@@ -1132,7 +1132,7 @@ export class ContextManager {
    * The rows a removal is about to take, as `read` finds them, in presented
    * mode; null in legacy mode, where the window is the record and nothing
    * is written or told. The removal goes ahead whatever happens here, as it
-   * does when a tombstone can't be written (retractRemoved): a read that
+   * does when a tombstone can't be written (retractOnRemoval): a read that
    * fails is logged, and the rows keep their ordinals.
    */
   private rowsBeforeRemoval(what: string, read: () => StoredMessage[]): StoredMessage[] | null {
@@ -1458,6 +1458,72 @@ export class ContextManager {
   }
 
   /**
+   * Take rows removed from the record out of this manager's agent's
+   * window, by their ids: the repair for a removal through another manager
+   * on this manager's slot or an auxiliary one, which this one doesn't hear
+   * (see ordinalOf). Each id the window holds and no slot the manager
+   * merges holds any more leaves a hole at its ordinal, as retractRows
+   * leaves one, so no other row's ordinal moves. Every other id is passed
+   * over: one the window doesn't hold, and one the record still holds on
+   * the store's branch, such as a row a branch made before the removal
+   * keeps (retractRows takes a held row out). Each id is one row, so a
+   * removed body is named by each of its shards. Returns the ids taken
+   * out, in window order.
+   *
+   * In legacy mode it writes nothing and takes nothing out: the window is
+   * the record there, and a removed row has left it already. Unlike
+   * retractRows it never writes the window down, nor finishes a write-down
+   * cut short, and on an index in another version's format it writes
+   * nothing either.
+   *
+   * A row of a slot the manager no longer merges (an auxiliary view
+   * dropped from its configuration since the row was presented) reads as
+   * removed, and leaves the window if it is named; a host presents it
+   * again once the slot is merged again.
+   *
+   * The strategy isn't told (ContextStrategy.onRetracted): the store holds
+   * no row to give it, as retractRows gives none for a row taken out by
+   * its id, so what it folded of the row it keeps. Each tombstone is one
+   * record, so a write that fails partway throws, and the rows taken out
+   * before it stay out; a later call passes over them. A closed manager
+   * refuses it.
+   */
+  retractRemoved(ids: readonly MessageId[]): MessageId[] {
+    this.requireOpen('retractRemoved');
+    requireMessageIds('retractRemoved', ids);
+    if (this.windowIndex.mode() === 'legacy') return [];
+    const merged = this.mergedMessageView();
+    const removed = ids.filter((id) => !holdsRow(merged, id));
+    return this.write(() => this.windowIndex.retractRemoved(removed)).map((row) => row.id);
+  }
+
+  /**
+   * Take out of this manager's agent's window every row no slot the
+   * manager merges holds any more on the store's branch, as retractRemoved
+   * takes out the rows it names: each leaves a hole at its ordinal, and no
+   * other row's ordinal moves. These are rows removed through managers
+   * this one didn't hear, the ones no live manager could reach among them
+   * (a removal made while the agent wasn't running), and rows whose own
+   * removal's tombstone failed. A host runs it at boot. Returns the ids
+   * taken out, in window order, and writes nothing when there are none.
+   *
+   * A row of a slot the manager no longer merges (an auxiliary view
+   * dropped from its configuration since the row was presented) reads as
+   * removed, and leaves the window: open the manager with every slot its
+   * window was presented from before calling this.
+   *
+   * As with retractRemoved, it writes nothing in legacy mode or on an
+   * index in another version's format, and the strategy isn't told. It
+   * reads the whole record. A closed manager refuses it.
+   */
+  retractAbsentRows(): MessageId[] {
+    this.requireOpen('retractAbsentRows');
+    if (this.windowIndex.mode() === 'legacy') return [];
+    const record = this.mergedMessageView().getAll();
+    return this.write(() => this.windowIndex.retractAbsent(record)).map((row) => row.id);
+  }
+
+  /**
    * `'legacy'` until the first presentRows or retractRows on the store's
    * branch has written the window down whole, while the window is the
    * merged record itself; `'presented'` after, even while the window holds
@@ -1480,10 +1546,12 @@ export class ContextManager {
    * isn't heard: the row leaves the record, and so the rows this manager's
    * reads list (getPresentedMessages, presentedLength, the compile), but
    * its ordinal stays issued, ordinalOf still gives it, and the strategy's
-   * `ordinals()` (StrategyContext.window) still maps it, until retractRows
-   * takes it out by its id. A host that keeps watermarks or cursors by
-   * ordinal takes such a row out of each window that holds it, or reads
-   * them from the listing.
+   * `ordinals()` (StrategyContext.window) still maps it, until a host takes
+   * it out by its id: retractRemoved for the rows a removal named,
+   * retractAbsentRows for every such row (at boot, say, for removals no
+   * live manager heard), or retractRows. A host that keeps watermarks or
+   * cursors by ordinal takes such a row out of each window that holds it,
+   * or reads them from the listing.
    */
   ordinalOf(id: MessageId): number | undefined {
     return this.windowIndex.ordinalOf(id);
@@ -1496,7 +1564,8 @@ export class ContextManager {
    * - `'absent'`: no slot the manager merges (its own and its auxiliary
    *   ones) holds the row: it was never stored on this branch, or it was
    *   removed. A row removed through another manager reads so while its
-   *   ordinal is still issued here (see ordinalOf).
+   *   ordinal is still issued here (see ordinalOf), until retractRemoved or
+   *   retractAbsentRows takes it out.
    * - `'in'`: the window holds it. In legacy mode that is every row the
    *   merged slots hold, the window being the record.
    * - `'undone'`: an undone turn's row (retractRows with `undone`), out of
@@ -1513,8 +1582,7 @@ export class ContextManager {
    */
   windowStatusOf(id: MessageId): WindowStatus {
     const merged = this.mergedMessageView();
-    const sequence = merged.sequenceOf ? merged.sequenceOf(id) : merged.get(id)?.sequence;
-    if (sequence === undefined) return 'absent';
+    if (!holdsRow(merged, id)) return 'absent';
     const index = this.windowIndex;
     if (index.mode() === 'legacy' || index.ordinalOf(id) !== undefined) return 'in';
     if (!index.isUndone(id)) return 'out';
@@ -3272,7 +3340,7 @@ export class ContextManager {
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          this.retractRemoved([event.messageId], this.removing ?? []);
+          this.retractOnRemoval([event.messageId], this.removing ?? []);
         }
         break;
       case 'removeRange':
@@ -3298,7 +3366,7 @@ export class ContextManager {
         // held row is this slot's; the window can't, since it also holds
         // rows of the auxiliary slots, and a row of a slot this manager no
         // longer merges would read as removed and leave the window for good.
-        if (this.removing) this.retractRemoved(this.removing.map((m) => m.id), this.removing);
+        if (this.removing) this.retractOnRemoval(this.removing.map((m) => m.id), this.removing);
         break;
     }
   }
@@ -3309,11 +3377,12 @@ export class ContextManager {
    * `removed` gives them, read before they went. The removal stands
    * whatever happens here: a tombstone that can't be written is logged, and
    * the row, which the record no longer holds, is already out of the
-   * listing the strategy reads; it keeps its ordinal until a retractRows
-   * takes it out. The strategy is told of the rows taken out before such a
-   * failure, and a failure to tell it is logged too.
+   * listing the strategy reads; it keeps its ordinal until retractAbsentRows,
+   * retractRemoved or retractRows takes it out. The strategy is told of the
+   * rows taken out before such a failure, and a failure to tell it is
+   * logged too.
    */
-  private retractRemoved(ids: readonly MessageId[], removed: readonly StoredMessage[]): void {
+  private retractOnRemoval(ids: readonly MessageId[], removed: readonly StoredMessage[]): void {
     let left: readonly LeftRow[] = [];
     try {
       left = this.windowIndex.retractRemoved(ids, (cutShort) => {
@@ -3663,6 +3732,15 @@ export class ContextManager {
       branches: this.listBranches().length,
     };
   }
+}
+
+/**
+ * Whether one of the slots `merged` merges holds the row on the store's
+ * branch, looked up by its sequence (MessageStoreView.sequenceOf) rather
+ * than read whole.
+ */
+function holdsRow(merged: MessageStoreView, id: MessageId): boolean {
+  return (merged.sequenceOf ? merged.sequenceOf(id) : merged.get(id)?.sequence) !== undefined;
 }
 
 /**

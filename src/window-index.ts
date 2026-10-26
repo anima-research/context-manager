@@ -737,6 +737,27 @@ export class WindowIndex {
   }
 
   /**
+   * Take out of the window every row `record` (the merged listing) doesn't
+   * hold: a tombstone for each, as retractRemoved writes one, so no other
+   * row's ordinal moves. Such a row was removed through a manager that
+   * doesn't keep this index, and this one never heard it go, or its own
+   * removal's tombstone failed (see ContextManager.ordinalOf). A row of a
+   * slot `record` no longer merges reads the same. In legacy mode, which
+   * includes a write-down cut short, it writes nothing, as retractRemoved.
+   * Returns the rows taken out, with the ordinals they held, in window
+   * order; `cutShort` is as retract's.
+   */
+  retractAbsent(record: readonly StoredMessage[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
+    const state = this.current();
+    if (!inEffect(state)) return [];
+    const held = positionsIn(record);
+    const left: LeftRow[] = [];
+    for (const [id, ordinal] of state.ordinals) if (!held.has(id)) left.push({ id, ordinal });
+    this.writeLeaving(left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
+    return inWindowOrder(left);
+  }
+
+  /**
    * Write `tombstones`, which take `left` out of the window. A write that
    * throws partway tells `cutShort` the rows of `left` out of the window by
    * then, in window order, and the error is thrown on.
@@ -858,6 +879,14 @@ interface Named {
   rows: MessageId[];
 }
 
+/** Refuses `ids` unless it is an array of message ids, naming the manager's operation. */
+export function requireMessageIds(operation: string, ids: unknown): asserts ids is readonly MessageId[] {
+  if (!Array.isArray(ids)) throw new TypeError(`ContextManager.${operation}: \`ids\` must be an array of message ids, got ${typeof ids}`);
+  ids.forEach((id: unknown, i) => {
+    if (typeof id !== 'string') throw new TypeError(`ContextManager.${operation}: id ${i} must be a message id, got ${JSON.stringify(id) ?? typeof id}`);
+  });
+}
+
 /**
  * The rows `ids` name, name by name, each body whole. A body stored as
  * shards is named by its first shard's id, the one addMessage returned,
@@ -879,10 +908,7 @@ function namedBodies(
   unknown: (id: MessageId) => void,
   inWindow?: (id: MessageId) => boolean,
 ): Named[] {
-  if (!Array.isArray(ids)) throw new TypeError(`ContextManager.${operation}: \`ids\` must be an array of message ids, got ${typeof ids}`);
-  ids.forEach((id: unknown, i) => {
-    if (typeof id !== 'string') throw new TypeError(`ContextManager.${operation}: id ${i} must be a message id, got ${JSON.stringify(id) ?? typeof id}`);
-  });
+  requireMessageIds(operation, ids);
   const named: Named[] = [];
   for (let i = 0; i < ids.length; ) {
     const id = ids[i]!;
