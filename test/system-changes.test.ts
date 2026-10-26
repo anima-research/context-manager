@@ -31,7 +31,6 @@ import {
   WindowedPassthroughStrategy,
   malformedContentPlaces,
 } from '../src/index.js';
-import { assertStage } from './fixtures/over-budget-hook.js';
 import { jsonTokenEstimator } from '../src/message-store.js';
 import { wellFormedContent } from '../src/well-formed-content.js';
 import { systemChangePositions } from '../src/system-changes.js';
@@ -487,6 +486,32 @@ describe('the autobiographical strategy and a system change', () => {
     }
   });
 
+  it('adaptive: a change after the newest turn is no turn, so the newest turn missing from what a compile sends still refuses', async () => {
+    let dropped = 0;
+    class DropsNewestTurn extends AutobiographicalStrategy {
+      protected override applyImageStripping(...args: Parameters<AutobiographicalStrategy['applyImageStripping']>): void {
+        super.applyImageStripping(...args);
+        const [entries, store] = args;
+        const all = store.getAll();
+        const newestTurn = all.filter((m) => !m.content.some((b) => b.type === ('system_change' as string))).at(-1)!;
+        const at = entries.findIndex((e) => e.sourceMessageId === newestTurn.id);
+        if (at >= 0) { entries.splice(at, 1); dropped++; }
+      }
+    }
+    const strategy = new DropsNewestTurn({ adaptiveResolution: true, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });
+    const cm = await open(strategy);
+    cm.addMessage('User', [text('message ' + 'word '.repeat(10))]);
+    cm.addMessage('Claude', [text('reply ' + 'word '.repeat(10))]);
+    cm.addMessage('User', [text('newest ' + 'word '.repeat(10))]);
+    cm.addMessage('Harness', [change()]);
+    await assert.rejects(cm.compile(BIG), (err: unknown) => {
+      assert.ok(err instanceof OverBudgetError, String(err));
+      assert.match(err.message, /^Structural repair did not retain the newest turn/);
+      return true;
+    });
+    assert.ok(dropped > 0, 'premise: the subclass took the newest turn out');
+  });
+
   it('a transition summary reads no change: a head message of changes alone adds no entry to its request', async () => {
     const { requests, membrane } = recordingMembrane();
     const cm = await open(new AutobiographicalStrategy({
@@ -859,27 +884,23 @@ describe('the passthrough strategies and a system change before their window', (
         assert.ok(err instanceof OverBudgetError, `${label}: ${String(err)}`);
         assert.deepEqual(err.clearedBy, [], `${label}: only consolidating clears it`);
         if (label === 'passthrough') assert.match(err.message, /^Passthrough kept only its system changes/, label);
-        if (label === 'passthrough') assertStage(err, 'passthrough-system-changes');
         // Its window still holds the newest conversation message, which its numbers count.
         if (label === 'windowed-passthrough') assert.match(err.message, /^Windowed passthrough: its system changes and the newest conversation message/, label);
-        if (label === 'windowed-passthrough') assertStage(err, 'windowed-changes-and-newest-message');
         if (label === 'hierarchical') assert.match(err.message, /system changes/, label);
-        if (label === 'hierarchical') assertStage(err, 'hierarchical-system-changes');
         return true;
       });
     }
     // A store of changes alone: over the budget, each passthrough strategy names them alone;
     // filling it exactly, each sends them.
-    for (const [label, make, stage, stageId] of [
-      ['passthrough', () => new PassthroughStrategy(), /^Passthrough kept only its system changes/, 'passthrough-system-changes'],
-      ['windowed-passthrough', () => new WindowedPassthroughStrategy(), /^Windowed passthrough: its system changes alone/, 'windowed-system-changes'],
+    for (const [label, make, stage] of [
+      ['passthrough', () => new PassthroughStrategy(), /^Passthrough kept only its system changes/],
+      ['windowed-passthrough', () => new WindowedPassthroughStrategy(), /^Windowed passthrough: its system changes alone/],
     ] as const) {
       const alone = await open(make());
       const id = alone.addMessage('Harness', [huge]);
       await assert.rejects(alone.compile(budget), (err: unknown) => {
         assert.ok(err instanceof OverBudgetError, `${label}: ${String(err)}`);
         assert.match(err.message, stage, label);
-        assertStage(err, stageId);
         return true;
       });
       assert.deepEqual(rawIds(await alone.compile({ maxTokens: estimateOf(alone, id), reserveForResponse: 0 })), [id], label);
@@ -1063,19 +1084,6 @@ describe('the passthrough strategies and a system change before their window', (
     await assert.rejects(windowed.compile({ maxTokens: estimateOf(windowed, big2) - 1, reserveForResponse: 0 }), (err: unknown) => {
       assert.ok(err instanceof OverBudgetError, String(err));
       assert.match(err.message, /^Windowed passthrough: the newest message alone/);
-      assertStage(err, 'windowed-newest-message');
-      return true;
-    });
-    // Passthrough's changes fit, but no conversation message fits beside them:
-    // it names both, and the newest message's tokens.
-    const both = await open(new PassthroughStrategy());
-    const rule = both.addMessage('Harness', [change({ addSystem: ['Rule. '.repeat(40)] })]);
-    const newest = both.addMessage('User', [text('big ' + 'word '.repeat(400))]);
-    await assert.rejects(both.compile({ maxTokens: estimateOf(both, rule) + 10, reserveForResponse: 0 }), (err: unknown) => {
-      assert.ok(err instanceof OverBudgetError, String(err));
-      assert.match(err.message, /^Passthrough: its system changes and the newest conversation message/);
-      assertStage(err, 'passthrough-changes-and-newest-message');
-      assert.equal(err.diagnostics.tailTokens, estimateOf(both, newest));
       return true;
     });
   });

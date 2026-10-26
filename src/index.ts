@@ -38,20 +38,8 @@ export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } fr
 // OverBudget drain breaker on these errors (AF PR #58, framework.ts
 // classifyInferenceError); exporting them from the root gives consumers a
 // real `instanceof` instead of stringly-typed `err.name` matching.
-export { OverBudgetError, UncoveredDropError, OVER_BUDGET_STAGES } from './adaptive/picker.js';
-export type { OverBudgetClearedBy, OverBudgetStage } from './adaptive/picker.js';
-
-// What a host observes as it happens (ContextManagerConfig.observer).
-export { COMPILE_REFUSALS, COMPRESSION_REFUSALS, CALIBRATION_SAMPLE_OUTCOMES } from './observer.js';
-export type {
-  ContextObserver,
-  CompileRecord,
-  CompressionRefusalRecord,
-  CalibrationSampleRecord,
-  CompileRefusal,
-  CompressionRefusal,
-  CalibrationSampleOutcome,
-} from './observer.js';
+export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
+export type { OverBudgetClearedBy } from './adaptive/picker.js';
 export { CompressionWithdrawn } from './compression-withdrawn.js';
 export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
 export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';

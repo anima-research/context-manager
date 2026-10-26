@@ -754,7 +754,8 @@ One solve, every turn. One hard constraint. Cache is a *priced quantity*, never
 an eligibility rule.
 
 ```
-build       ideal = relevanceCut(tree, target, W)   -- pure relevance, no P anywhere
+build       ideal = relevanceCut(tree, target, W, base)   -- pure relevance, no P anywhere;
+                                                      -- base = carried frontier (seedFromCarried, default) or raw
 reconcile   hold F_prev | adopt ideal | adopt a suffix of ideal | override
 subject to  render(F) ≤ W·(1+grace)   -- the enforced wall (see below)
             perturbation(F, F_prev) ≤ P   -- trust region: soft, default-on,
@@ -897,18 +898,29 @@ As shipped (`planControlledFrontier`, `kv-control.ts` — regenerated rev 5.1):
 
 ```
 solve(tree, F_prev, W, P):
-  ideal = relevanceCut(tree, target, W)
-      -- from scratch, no P anywhere:
+  ideal = relevanceCut(tree, target, W, base)
+      -- base = the carried frontier, or raw on bootstrap and in a
+      --   measurement's from-scratch arm (the controller's
+      --   `seedFromCarried: false`), with an inverted carried profile
+      --   lowered first so it re-folds in fold order; no P anywhere:
       -- phase A: fold in salience-then-age priority order, level-by-level,
       --   under the shape prior, toward the target;
       -- phase B: if still over W, keep folding past the prior (never past
       --   hard protections);
-      -- phase C: pack — un-fold youngest-first back toward the target,
-      --   accepting an un-fold that overshoots the target when it lands
-      --   CLOSER to it and stays under W (§13.6);
+      -- phase C: pack — un-fold back toward the target, the youngest
+      --   position first whatever its level, restarting from the youngest
+      --   after each accepted un-fold; each leaf is priced where the
+      --   projection will put it, and an un-fold that overshoots the target
+      --   is accepted when it lands CLOSER to it and stays under W (§13.6);
       -- project to a valid group-consistent cut and iterate fold→project
       --   to a fixpoint (§13.6). BEST-EFFORT: on a damaged tree this can
       --   return over-W with `escalated` set — it does not throw.
+
+  seeded, carried < expandAt, Δ(ideal) > 0,
+    Δ(ideal) ≥ 0.9 · Δ(from-scratch cut) → ideal = from-scratch cut
+      -- seedingReleased: the hysteresis buys nothing on such a raise. Δ is
+      --   the perturbation against F_prev, and the from-scratch cut is
+      --   built only once the first three hold
 
   gapCeiling = qualityGapRatio · max(1, loss(ideal))      -- ∞ under strictReach
 
@@ -953,8 +965,24 @@ Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally
 small, and the solve is indistinguishable from the old polite pass — nothing
 is legislated. The old behaviors (dead band, reach, emergency) are all regions
 of one parameter space instead of three code paths. A from-scratch solve is
-age/salience-monotone **by construction** (fold order = priority order), so
-the inversion class of bug cannot be produced.
+age/salience-monotone **by construction** (fold order = priority order),
+except at a boundary-cut fold: a group with a raw-zone, pinned or locked
+member of its own lineage folds its other members while older chunks beside it
+stay raw. Apart from that, the inversion class of bug cannot be produced by
+it. A carried-seeded solve (the default; the from-scratch solve is a
+measurement's control arm, set on the controller as `seedFromCarried: false`)
+inherits the carried profile, so an inverted carried profile is lowered to the
+older level before the phases run and re-folds in fold order. A boundary-cut
+fold isn't lowered, and an older chunk is weighed only against younger chunks
+at or above the next level its group can render at: one already at its
+group's deepest level, or whose lineage skips past the younger chunk's level,
+is no evidence of inversion. Monotone over-depth is kept — that
+retained depth is the hysteresis. Where the carried frontier is under
+expandAt, as after a budget raise, and the seeded plan would pay ≥ 90% of a
+from-scratch re-read anyway, or a re-read where the from-scratch cut pays
+none, the from-scratch cut is taken (`seedingReleased`); past P, as for any
+ideal, its newest part that fits within P is adopted, or the whole cut where
+the infeasible or quality-gap override applies.
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns
@@ -1110,8 +1138,11 @@ per (node, level, phase) — valid because the verdict is a pure function of
 static caps shared by every member; projection *unanimity* per (node, level)
 per pass — valid because a pass only lowers, which cannot make a group
 unanimous at that level; and phase C's `attempted` set short-circuits
-re-tries but is **cleared on every accepted un-fold**, so the accept sequence
-is exactly the naive one. Breaking any of these validity arguments either
+re-tries, and an accepted un-fold clears only the keys filed under the leaves
+it moved — valid because an accept only raises the ledger toward the target,
+which can't turn a declined verdict into an accepted one, and besides the
+ledger a key's verdict reads only the leaves it is filed under — so the accept
+sequence is exactly the naive one. Breaking any of these validity arguments either
 reintroduces the O(groupSize²) compile leak or silently changes the solve.
 
 ### 13.7 Prepared windows and paced transitions

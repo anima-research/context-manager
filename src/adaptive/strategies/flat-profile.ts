@@ -35,10 +35,7 @@ export class FlatProfileStrategy implements FoldingSolver {
   }
 }
 
-/** The step's rule: pass over a chunk with no summary above it. Where a
- *  solve that passes over ends over the hard budget, the solve that takes
- *  only each level's oldest chunk, this solver's rule before, is tried
- *  (runGreedy). */
+/** The step's rule: pass over a chunk with no summary above it. */
 const passingOver: GreedyStep = (state, budget) => flatProfileStep(state, budget, true);
 const oldestOnly: GreedyStep = (state, budget) => flatProfileStep(state, budget, false);
 
@@ -95,9 +92,11 @@ function flatProfileStep(state: GreedyState, budget: FoldingBudget, passOver: bo
     // chunk is tried, the rule a solve falls back on (runGreedy).
     let oldestChunk: GreedyChunkView | undefined;
     let parentSummary: SummaryNode | null = null;
+    let tried: GreedyChunkView | undefined;
     for (const chunk of middle) {
       if (chunk.currentResolution !== bestLevel) continue;
       oldestChunk ??= chunk;
+      tried = chunk;
       parentSummary = state.nextAncestor(chunk);
       if (parentSummary || !passOver) break;
     }
@@ -135,7 +134,7 @@ function flatProfileStep(state: GreedyState, budget: FoldingBudget, passOver: bo
       continue;
     }
 
-    return { kind: 'raise', groupRoot: parentSummary.id };
+    return { kind: 'raise', groupRoot: parentSummary.id, passedOver: tried !== oldestChunk };
   }
 
   return fallbackProduce;

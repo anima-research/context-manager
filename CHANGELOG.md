@@ -12,6 +12,102 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.1 — 2026-10-26
+
+### Fixed
+
+- Under `foldingStrategy: 'kv-unified'`, a level pin (`pinAtLevel`, or `pinRange` and `markDocument` with `level`) no longer makes every compile fail while no summary supplies its level over a pinned message (#193). Until compression and merging produce that level, the message is held at the deepest level below it that a summary over it does supply, raw when none does, and it moves to the pinned level once that exists. Compiles that refused with `kv-unified constraints are infeasible …` for such a pin now go through, with the range held finer than pinned until its level exists, so it can take more of the budget than the pin asked for. Where the range at the level it's held at takes the compile past its budget and `overBudgetGraceRatio`, the compile is refused as over budget. A pin placed while its range is in the recent window no longer starts refusing once the range leaves it, and a stored pin whose level no summary supplies any more, such as one whose summary the load repair dropped, is held the same way, where releases from 0.15.0 refused it as infeasible whatever the budget. A compile that finds a pin held logs `autobio: kv-unified holds pin …`, naming the pin, its level and the level its messages are held at, and a later compile that finds it no longer held, or gone, logs that too. The log follows the loaded branch, so after an open or a branch switch a pin that is still held is logged again. A message of system changes stays raw under any pin, as before, so it is neither held nor logged. A level pin and a lock at another level on a message in the folded middle are still refused, as before, even while the pinned level doesn't exist.
+
+- Docs: `ContextManager.compile()`'s doc said it may block if the strategy
+  has pending work, and the docs of `ContextManager.isReady()`,
+  `ReadinessState.ready` and `ContextStrategy.checkReadiness()` described
+  readiness as whether `compile()` would block or could proceed. At 0.22.0
+  as now, `compile()` awaits nothing: it doesn't wait for the strategy's
+  background work, and compiles from what's there. The docs now say so, and
+  say that readiness is only whether that work is pending. Nothing a caller
+  meets at run time changes.
+
+- `flat-profile`, the default folding solver, and `oldest-first` now raise the
+  oldest chunk at a level that can rise, passing over a chunk with no summary
+  above it. They tried only the oldest chunk. So a summary no merge could take
+  as the store stood, such as an operator-held L1, a quarantined merge's
+  sources or a summary stranded beside a hole, stopped every raise at its
+  level. Once that held at every level, a compile the younger chunks'
+  summaries fit was refused ("Adaptive picker exhausted"). The first compile
+  after upgrading can plan differently, which rewrites the request once, from
+  the first unit that changes, on a store where the oldest chunk at a level
+  the solve tries can't rise while a younger one can, and the plan that passes
+  over fits: one holding such a summary, or a chunk not yet summarized behind
+  newer summaries. Under `oldest-first` that includes ordinary stores, whose
+  oldest chunk reaches the top of its lineage. Other stores that compile today
+  are planned as before.
+- When a solve that passes over ends over the hard budget, the solver solves
+  again taking only the oldest chunk, as before this release, and returns that
+  plan wherever the compile accepts it (within the budget and its
+  `overBudgetGraceRatio`), which is the plan the store got before. So where
+  the plan that passes over doesn't fit, a store that compiled before still
+  compiles, with the same plan. Otherwise it returns the plan with the fewest
+  tokens that either solve passed through, with that solve's request for a
+  missing summary, and the compile refuses it if it is over. A raise folds
+  only the group's unprotected leaves, and the summary takes their place, so
+  where the rest of the group was pinned, locked or in the head or tail, a
+  raise could grow the plan and take a solve over a budget that a plan on its
+  way, or its start, had fit.
+
+- kv-stable: the ideal cut no longer flaps a deep group at a band boundary.
+  Two changes, measured together on a long-lived resident with `[fold-diff]`
+  (2026-10-07..09: the group at the L2↔L3 boundary went L3→L2→L3 seven times
+  in three days, each direction re-reading ~300k tokens; a fold confined to
+  the seam cost ~97k) and on a carried-growth replay (1,296 base-6 leaves at
+  50 raw / 100 recall, one appended leaf per turn, a summary every six, every
+  frontier carried; 120 turns at target 1600 / W 2150: no deep group is ever
+  raised, total re-read 20,000 against 22,500 on the previous release and
+  25,900 with the new walk but seeding off):
+  - **Phase C** (spend headroom by un-folding toward the target) walks chunks
+    youngest-first by **position**, whatever their level, and restarts from
+    the youngest after every accepted un-fold, so the youngest group steps
+    down L2→L1→raw before any older group is tried. It used to walk deepest
+    level first (`for level = max..1 { youngest-first }`), which raised the
+    youngest L3 group — the one right after the deep band — before any L1 at
+    the seam.
+  - **The ideal cut is seeded from the carried frontier**: phases A/B only
+    deepen what is carried (same salience-then-oldest, level-by-level order)
+    and only phase C un-folds. The from-scratch cut re-decided every band
+    boundary from the current balance of production and growth, so a deep
+    group was raised when a new mid-level summary landed and re-deepened when
+    growth crossed W — and the dead-band hold could not keep it, because its
+    relevance-gap check compared against that moving ideal. An inverted
+    carried profile (a chunk deeper than an older unprotected chunk) is still
+    lowered to the older level so the quality-gap self-heal keeps working.
+    An older chunk is weighed only against younger chunks at or above the
+    next level its group can render at, so one already at its group's
+    deepest level (lineage top, or a pin-max-level on a group-mate), or
+    whose lineage skips past the younger chunk's level, is no evidence of
+    inversion — without that, a seeded plan could alternate between two
+    frontiers on an imperfect tree, or lower a whole younger band on every
+    compile. A chunk whose group has a raw-zone, pinned or locked member of
+    its own lineage is part of a boundary-cut fold, which a from-scratch cut
+    makes too, and isn't lowered — lowering it moved the plan once on
+    unchanged inputs.
+    Seeding doesn't apply to bootstrap.
+  - **Cost, stated:** keeping monotone over-depth IS the hysteresis, and the
+    quality-gap check cannot see it (relevance loss only scores depth past
+    the age cap, and the seeded ideal keeps the carried depth). Depth the
+    budget once forced persists until the seam runs out of headroom; on the
+    replay the seeded plan's loss exceeded the from-scratch ceiling on 217 of
+    400 turns. Where the carried frontier is under the expand threshold, as
+    after a budget raise, and the seeded plan would pay at least 90% of a
+    from-scratch re-cut's re-read anyway, or a re-read where the re-cut pays
+    none, the from-scratch cut is taken instead, so a large raise is not
+    spent keeping a tight-budget allocation. Past the trust region, a release
+    is adopted as any ideal past it is: its newest part that fits within the
+    trust region, with the depth further back kept, or the whole cut where the
+    infeasible or quality-gap override applies. A shed, a hold in the dead band
+    and a fold at the seam keep the seeded plan, and a seeded plan that
+    re-reads nothing is kept without building the re-cut.
+  Accept rule, group consistency, protections and the phase A/B fold order
+  are unchanged. `kv-unified` is untouched.
+
 ## 0.22.0 — 2026-10-24
 
 ### Breaking

@@ -27,7 +27,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
-import { assertStage } from './fixtures/over-budget-hook.js';
 
 const BUDGET = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const words = (label: string, n: number): ContentBlock[] =>
@@ -186,7 +185,7 @@ describe('what a compile sends after a head-window reset', () => {
       assert.strictEqual(m.getRenderStats()!.head.messages, headEnd, 'the compile sends those shards as its head');
     }));
 
-  it('names no smaller recent window when a filling reset head alone is over the budget', () =>
+  it('names no smaller recent window and no reset when a filling reset head alone is over the budget, since the newest turn is in that head', () =>
     withStore(SELECTS.adaptive!, async (m) => {
       await history(m);
       await m.resetHeadWindow('A new topic.');
@@ -198,7 +197,35 @@ describe('what a compile sends after a head-window reset', () => {
       assert.deepStrictEqual(error.clearedBy, [], 'the reset head stays raw whatever the recent window');
       assert.ok(error.diagnostics.headTokens > 1500 && error.diagnostics.tailTokens === 0,
         `the refusal counts the filling head as the head: head=${error.diagnostics.headTokens} tail=${error.diagnostics.tailTokens}`);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget but /, 'its words name no reset');
     }));
+
+  it('names a new reset when a full reset head is what is over the budget, unless a compression hold inside the head reaches the floor or the head\'s system changes, which stay raw, do not fit beside it, under the adaptive select', async () => {
+    for (const shape of ['plain', 'hold', 'changes'] as const) {
+      const hold = shape === 'hold';
+      await withStore(SELECTS.adaptive!, async (m) => {
+        await history(m);
+        if (shape === 'changes') m.addMessage('Harness', [{ type: 'system_change', addSystem: ['Rule. '.repeat(2100)] } as unknown as ContentBlock]);
+        await m.resetHeadWindow(Array.from({ length: 900 }, (_, i) => `topic${i}`).join(' '));
+        const small = m.addMessage('user', words('small1', 5));
+        m.addMessage('assistant', words('big', 600));
+        const order = await sent(m);
+        assert.deepStrictEqual(order.filter((l) => l !== '').slice(0, 3), ['TT', 'small1', 'hist0'], `premise: a full head of the transition and small1: ${order.join(',')}`);
+        const head = m.getRenderStats()!.head.tokens;
+        if (hold) m.holdCompression([small], { timeoutMs: 60_000 });
+        try {
+          const error = await m.compile({ maxTokens: Math.floor(head * 0.8), reserveForResponse: 0 }).then(() => null, (e: unknown) => e);
+          assert.ok(error instanceof OverBudgetError, `${shape}: refused: ${String(error)}`);
+          assert.deepStrictEqual(error.clearedBy, [], `${shape}: premise`);
+          assert.match(error.message, /^Head\/tail reservation exceeded budget/, `${shape}: premise, the head refusal: ${error.message.slice(0, 100)}`);
+          if (shape === 'plain') assert.match(error.message, /^Head\/tail reservation exceeded budget, with a head from a head-window reset \(a new reset starts a new head, and this head's conversation becomes history/);
+          else assert.match(error.message, /^Head\/tail reservation exceeded budget but /, `${shape}: no reset named`);
+        } finally {
+          if (hold) m.releaseCompression([small]);
+        }
+      });
+    }
+  });
 
   it('prices a filling head ahead of the history under the hierarchical select, so the history is held to what is left', () =>
     withStore(SELECTS.hierarchical!, async (m) => {
@@ -224,10 +251,50 @@ describe('what a compile sends after a head-window reset', () => {
       const head = m.getRenderStats()!.head.tokens;
       const error = await m.compile({ maxTokens: Math.floor(head / 2), reserveForResponse: 0 }).then(() => null, (e: unknown) => e);
       assert.ok(error instanceof OverBudgetError, `refused: ${String(error)}`);
-      assert.deepStrictEqual(error.clearedBy, [], 'only a larger budget clears a head');
+      assert.deepStrictEqual(error.clearedBy, [], 'no run-time setting clears a head');
       assert.ok(error.diagnostics.headTokens > 0 && error.diagnostics.middleTokens === 0 && error.diagnostics.headTokens <= head,
         `the head's walk refused before the history: head=${error.diagnostics.headTokens} middle=${error.diagnostics.middleTokens}`);
+      assert.match(error.message, /^Hierarchical emission overran the budget in a head from a head-window reset \(a new reset starts a new head, and this head's conversation becomes history/,
+        'its words name a new reset');
     }));
+
+  it('names no reset in a head refusal when no head is over the budget, under the adaptive select', async () => {
+    const shapes = [
+      { head: 0, recent: 1000, after: 4, words: 200, toolResult: 0, maxTokens: 300, clearedBy: [] as string[] },
+      { head: 400, recent: 3000, after: 12, words: 300, toolResult: 0, maxTokens: 1500, clearedBy: ['smaller-recent-window'] },
+      { head: 400, recent: 6000, after: 1, words: 600, toolResult: 700, maxTokens: 1500, clearedBy: [] as string[] },
+    ];
+    for (const shape of shapes) {
+      await withStore(() => new AutobiographicalStrategy({ ...base, headWindowTokens: shape.head, recentWindowTokens: shape.recent,
+        hierarchical: false, adaptiveResolution: true, targetChunkTokens: 1500 }), async (m) => {
+        await history(m);
+        await m.resetHeadWindow('A new topic.');
+        for (let i = 0; i < shape.after; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`new${i}`, shape.words));
+        if (shape.toolResult > 0) {
+          m.addMessage('assistant', [{ type: 'tool_use', id: 'tu1', name: 'read', input: { path: 'x' } }]);
+          m.addMessage('user', [{ type: 'tool_result', toolUseId: 'tu1', content: textOf({ participant: '', content: words('result', shape.toolResult) }) }]);
+        }
+        const error = await m.compile({ maxTokens: shape.maxTokens, reserveForResponse: 0 }).then(() => null, (e: unknown) => e);
+        assert.ok(error instanceof OverBudgetError, `head ${shape.head}: refused: ${String(error)}`);
+        assert.deepStrictEqual(error.clearedBy, shape.clearedBy, `head ${shape.head}: premise`);
+        assert.match(error.message, /^Head\/tail reservation exceeded budget but /, `head ${shape.head}: ${error.message.slice(0, 120)}`);
+      });
+    }
+  });
+
+  for (const name of ['hierarchical', 'adaptive'] as const) {
+    it(`names no reset in a head refusal without one (${name})`, () =>
+      withStore(SELECTS[name]!, async (m) => {
+        for (let i = 0; i < 4; i++) m.addMessage(i % 2 ? 'assistant' : 'user', words(`first${i}`, 400));
+        m.addMessage('user', words('newest', 5));
+        await m.compile(BUDGET);
+        assert.ok(m.getRenderStats()!.head.messages < 5, `premise: the newest message is past the head: ${JSON.stringify(m.getRenderStats()!.head)}`);
+        const error = await m.compile({ maxTokens: 300, reserveForResponse: 0 }).then(() => null, (e: unknown) => e);
+        assert.ok(error instanceof OverBudgetError, `refused: ${String(error)}`);
+        assert.match(error.message, name === 'hierarchical' ? /^Hierarchical emission overran the budget but / : /^Head\/tail reservation exceeded budget but /,
+          `a head from the store's start: ${error.message.slice(0, 120)}`);
+      }));
+  }
 
   it('names compression when folding the history would make room beside a filling head', () =>
     withStore(() => new AutobiographicalStrategy({ ...base, hierarchical: true, targetChunkTokens: 300 }), async (m) => {
@@ -470,7 +537,7 @@ describe('system changes stored before a reset head', () => {
         await assert.rejects(m.compile({ maxTokens: 300, reserveForResponse: 0 }), (err: unknown) => {
           assert.ok(err instanceof OverBudgetError, `${name}: ${String(err)}`);
           assert.deepStrictEqual(err.clearedBy, [], `${name}: only consolidating clears it`);
-          if (name === 'hierarchical') assertStage(err, 'hierarchical-system-changes');
+          if (name === 'hierarchical') assert.match(err.message, /^Hierarchical: its system changes alone exceed the budget/);
           return true;
         });
       }));

@@ -339,6 +339,51 @@ function leafZones(chunks: readonly PickerChunk[], inputs: PickerInputs): Uint8A
   return zone;
 }
 
+/** The source of the constraint a picker chunk's `pinLevel` becomes. */
+const PIN_LEVEL_SOURCE = 'pin-level';
+
+/** The constraints `constraintsFor` makes from picker chunks' `pinLevel`: the
+ *  level pins the forest may hold (design F4b). Known by identity, since a
+ *  constraint's `source` is a label any caller of `CanonicalForestOptions`
+ *  can give, and a caller's exact constraint stays strict whatever it's
+ *  labelled. */
+const levelPins = new WeakSet<CanonicalLeafConstraint>();
+
+/**
+ * The hold a leaf's level pin is under (design F4b): the pinned level, and the
+ * level the leaf is held at, the deepest level its ownership chain supplies
+ * below the pinned one (raw when it supplies none). A pinned level exists only
+ * once compression and merging have produced it over the leaf, and until then
+ * the pin keeps the leaf finer than asked rather than making every compile
+ * infeasible. The hold relaxes only that, so it applies only where every other
+ * constraint on the leaf allows both the pinned level and the level held at.
+ * A pin another constraint contradicts, such as a lock at another level, isn't
+ * held, so the two conflict whether or not the pinned level exists yet; nor is
+ * one whose held level another constraint excludes, such as a floor above the
+ * held level and at or below the pinned one, so the conflict names the pinned
+ * level, which would clear it. Null when the leaf has no level pin, its pinned
+ * level isn't a non-negative integer (`buildLeaf` empties such a leaf), its
+ * chain supplies the pinned level, or another constraint rules the hold out.
+ */
+function levelPinHold(
+  constraints: readonly CanonicalLeafConstraint[],
+  availableLevels: readonly number[],
+): { level: number; heldAt: number } | null {
+  const pin = constraints.find((constraint) => levelPins.has(constraint));
+  const level = pin?.level;
+  if (level === undefined || !Number.isInteger(level) || level < 0 || availableLevels.includes(level)) return null;
+  let heldAt = 0;
+  for (const candidate of availableLevels) if (candidate < level && candidate > heldAt) heldAt = candidate;
+  const allowsHold = (other: CanonicalLeafConstraint) => constraintAdmits(other, level) && constraintAdmits(other, heldAt);
+  return constraints.every((other) => other === pin || allowsHold(other)) ? { level, heldAt } : null;
+}
+
+/** A leaf held below its level pin: the pinned level and the level it is
+ *  held at (`levelPinHold`). Null when it isn't held. */
+export function heldLevelPin(leaf: CanonicalLeaf): { level: number; heldAt: number } | null {
+  return levelPinHold(leaf.constraints, leaf.availableLevels);
+}
+
 /** Whether `chunk` would build the leaf `leaf` was built from, read from the
  * leaf's own record of its inputs and not from a chunk object a caller may
  * have updated in place: cost and carried level are leaf fields, pins and
@@ -353,7 +398,7 @@ function sameLeafInputs(leaf: CanonicalLeaf, chunk: PickerChunk): boolean {
     switch (constraint.source) {
       case 'raw-pin': pinned = true; break;
       case 'lockedByAgent': locked = true; break;
-      case 'pin-level': pinLevel = constraint.level; break;
+      case PIN_LEVEL_SOURCE: pinLevel = constraint.level; break;
       case 'pin-max-level': pinMaxLevel = constraint.level; break;
     }
   }
@@ -939,6 +984,7 @@ export class CanonicalSummaryForest {
     const availableLevels = levels.availableLevels;
     const repHashes = [`raw:${chunk.id}`, ...levels.hashTail];
     const constraints = CanonicalSummaryForest.constraintsFor(chunk, inputs, options);
+    const hold = levelPinHold(constraints, availableLevels);
     let allowedLevels = [...availableLevels];
     const requestedMissingLevels = new Set<number>();
     for (const constraint of constraints) {
@@ -948,8 +994,12 @@ export class CanonicalSummaryForest {
         continue;
       }
       if (constraint.kind === 'raw' || constraint.kind === 'exact') {
-        if (!availableLevels.includes(level)) requestedMissingLevels.add(level);
-        allowedLevels = allowedLevels.filter((candidate) => candidate === level);
+        // A held level pin narrows the leaf to the level it's held at (design
+        // F4b); a lock, every other exact constraint and a pin that isn't
+        // held name their own level.
+        const target = hold && levelPins.has(constraint) ? hold.heldAt : level;
+        if (!availableLevels.includes(target)) requestedMissingLevels.add(target);
+        allowedLevels = allowedLevels.filter((candidate) => candidate === target);
       } else if (constraint.kind === 'max') {
         allowedLevels = allowedLevels.filter((candidate) => candidate <= level);
       } else {
@@ -1843,7 +1893,9 @@ export class CanonicalSummaryForest {
       });
     }
     if (chunk.pinLevel !== undefined) {
-      constraints.push({ kind: 'exact', level: chunk.pinLevel, source: 'pin-level' });
+      const pin: CanonicalLeafConstraint = { kind: 'exact', level: chunk.pinLevel, source: PIN_LEVEL_SOURCE };
+      levelPins.add(pin);
+      constraints.push(pin);
     }
     if (chunk.pinMaxLevel !== undefined) {
       constraints.push({ kind: 'max', level: chunk.pinMaxLevel, source: 'pin-max-level' });
@@ -2003,8 +2055,9 @@ export class CanonicalSummaryForest {
   }
 }
 
-/** Whether a leaf constraint admits `level`, as buildLeaf reads it: a
- *  constraint whose own level isn't a non-negative integer admits nothing. */
+/** Whether a leaf constraint admits `level`, as buildLeaf reads it, whatever
+ *  the leaf's chain supplies: a constraint whose own level isn't a
+ *  non-negative integer admits nothing. */
 function constraintAdmits(constraint: CanonicalLeafConstraint, level: number): boolean {
   if (constraint.kind === 'raw') return level === 0;
   const bound = constraint.level;
