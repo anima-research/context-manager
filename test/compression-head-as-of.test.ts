@@ -17,7 +17,12 @@ import type { ContentBlock } from '@animalabs/membrane';
 
 const ROOT = './test-compression-head-as-of';
 let counter = 0;
-const freshPath = (): string => `${ROOT}-${counter++}`;
+/** A store directory of its own, emptied first: a run cut short leaves its stores behind for the next. */
+function freshPath(): string {
+  const path = `${ROOT}-${counter++}`;
+  if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+  return path;
+}
 
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {

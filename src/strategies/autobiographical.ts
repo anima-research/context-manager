@@ -2889,6 +2889,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       if (!this.config.auditOnly) this.sanitizePersistedMergeQueue(ctx.messageStore);
       if (abortIfStale()) return;
+      this.demoteSplitSummaries(messages, ctx);
+      if (abortIfStale()) return;
       this.assertStoreTopology(messages);
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
       // compression/merge completion does this, but a store that boots with a
@@ -6983,6 +6985,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 'reject';
   }
 
+  /**
+   * Load-time repair, once a host presents (`ctx.window` in presented
+   * mode), of a summary whose leaves the window holds apart, where the
+   * open would otherwise refuse the store (`topologyPolicy` `'reject'`, the
+   * default): such a summary is demoted, not thrown on. In a presented
+   * window a row that left and was presented again stands at the window's
+   * end, so a summary over it at its old place is non-contiguous when this
+   * strategy never heard it go: it left and came back while the strategy
+   * initialized, or the process stopped between the window's tombstone and
+   * the strategy's own writes (onRetracted). A store written down with such
+   * a summary already in it is repaired the same way.
+   *
+   * Each summary the audit names is dropped, with every summary above it,
+   * as onRetracted drops one (unfold). An L1's chunk record is compressed
+   * again over its longest run of rows the window holds together (the
+   * first, of runs as long), as the topology repair keeps an L1's longest
+   * run (src/repair/topology.ts), and its other rows are released, so the
+   * chunker takes them where the window holds them; a summary above L1 is
+   * dropped alone, and the summaries below it render on their own. The
+   * audit runs again over the rebuilt chunks until it names nothing; what
+   * it still names after that is the gate's (assertStoreTopology).
+   *
+   * In legacy mode the window is the record and its rows never move, so a
+   * non-contiguous summary there is a store the gate refuses, as it always
+   * has; under `'report'` the gate records it for inspection, and an
+   * audit-only open writes nothing, so neither is repaired here.
+   */
+  private demoteSplitSummaries(messages: readonly StoredMessage[], ctx: StrategyContext): void {
+    if (ctx.window?.mode() !== 'presented' || this.config.auditOnly || this.resolvedTopologyPolicy() !== 'reject') return;
+    // Each pass drops a summary at least, so the summaries bound the passes.
+    const passes = this.summaries.length;
+    for (let pass = 0; pass < passes; pass++) {
+      const violations = this.auditStoreTopology(messages);
+      if (violations.length === 0) return;
+      const position = this.ownershipPositionIndex();
+      const l1s = new Set(violations.filter((v) => v.level === 1).map((v) => v.id));
+      const released: MessageId[] = [];
+      const unfolded = this.unfold(new Set(violations.map((v) => v.id)), (record) => {
+        if (!record.summaryId || !l1s.has(record.summaryId)) return undefined;
+        const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
+        const kept = new Set(longest);
+        for (const id of record.sourceIds) if (!kept.has(id)) released.push(id);
+        return longest;
+      });
+      this.diag.warn(
+        `[autobiographical] the window holds the leaves of ${violations.length} summar${violations.length === 1 ? 'y' : 'ies'} apart ` +
+          `(a row that left the window and was presented again before this strategy heard it go): dropped ` +
+          `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
+          `compressed again over their longest run in the window [${unfolded.refolded.join(', ')}], releasing ` +
+          `[${released.join(', ')}] to be chunked where the window holds them; removed, keeping none [${unfolded.emptied.join(', ')}]`,
+      );
+      this.rebuildChunks(ctx.messageStore);
+    }
+  }
+
   /** Load-time gate: audit, then throw (reject) or record + shout (report). */
   protected assertStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): void {
     const violations = this.auditStoreTopology(messages);
@@ -7510,119 +7567,100 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Rows left the window (ContextStrategy.onRetracted): an undone turn's
    * rows, rows a host took out, or rows removed from the record once a host
-   * presents. Nothing this strategy keeps of them stays. A summary of a row
-   * that left shows the agent what it no longer holds, and a row presented
-   * again (a redo) enters the window at its end, where it would render raw
-   * beside the summary that still covers it at its old place.
+   * presents, through this manager or another one. Nothing this strategy
+   * keeps of them stays. A summary of a row that left shows the agent what
+   * it no longer holds, and a row presented again (a redo) enters the
+   * window at its end, where it would render raw beside the summary that
+   * still covers it at its old place.
    *
-   * So each L1 with one of the rows among its sources is dropped, with
-   * every summary above it, as the open drops a summary whose sources are
-   * gone: a summary the drop leaves without its parent renders, and merges,
-   * again. Each chunk record holding one of the rows gives it up and is
-   * compressed again over the rows it keeps, as is the record of a dropped
-   * L1, and a record left with none goes: the rows of a dropped summary
-   * that are still in the window are folded again, never shown folded where
-   * they aren't. A queued merge of a dropped summary goes, and the chunks
-   * are rebuilt over the window, which queues their compression again. A
-   * compression or merge in flight over the rows writes nothing when it
-   * lands. Then, as for rows entering, the merge check runs and, with
-   * `autoTickOnNewMessage`, background compression starts.
+   * The rows are named by `info.ids`, every row that left, `rows` among
+   * them: a row removed through another manager comes by its id alone, and
+   * is let go of as any other, so every reader of a removed row unfolds it,
+   * not only the manager that removed it. So each L1 with one of the rows
+   * among its sources is dropped, with every summary above it, as the open
+   * drops a summary whose sources are gone: a summary the drop leaves
+   * without its parent renders, and merges, again. Each chunk record holding
+   * one of the rows gives it up and is compressed again over the rows it
+   * keeps, as is the record of a dropped L1, and a record left with none
+   * goes: the rows of a dropped summary that are still in the window are
+   * folded again, never shown folded where they aren't. A queued merge of a
+   * dropped summary goes, and the chunks are rebuilt over the window, which
+   * queues their compression again. A compression or merge in flight over
+   * the rows writes nothing when it lands. Then, as for rows entering, the
+   * merge check runs and, with `autoTickOnNewMessage`, background
+   * compression starts.
    *
    * A row presented again is new to this strategy: onPresented chunks it at
-   * its place in the window. `info` changes none of this: an undone row, a
-   * row taken out and a removed row have each left. The manager doesn't
-   * call this for a removal in legacy mode, so a row removed there stays in
-   * what folded it, as it always has. The work is synchronous, so it is done
-   * when the manager's call returns, and written after the window's
-   * tombstones. A row that left and was presented again before this
-   * strategy heard it go, both while it initialized or across a crash
-   * between those writes, is still covered at its old place when the
-   * strategy opens, and the open's topology audit names the summary (under
-   * the default `topologyPolicy`, refusing the open).
+   * its place in the window. One presented again before this strategy heard
+   * it go (both while it initialized) is in the window again when this is
+   * called: what covered it at its old place goes all the same, and a chunk
+   * record that holds it in a run of window rows with a row of its own that
+   * didn't leave, one made over it at its new place, keeps it (and is
+   * compressed again). Should this strategy never hear it go (the process
+   * stopped between the window's tombstone and these writes), the next open
+   * demotes the summary the row's new place leaves non-contiguous
+   * (demoteSplitSummaries).
+   *
+   * `undone` and `removed` change none of this: an undone row, a row taken
+   * out and a removed row have each left. The manager doesn't call this for a removal
+   * in legacy mode, so a row removed there stays in what folded it, as it
+   * always has. The work is synchronous, so it is done when the manager's
+   * call returns, and written after the window's tombstones.
    */
-  async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, _info: { undone: boolean; removed: boolean }): Promise<void> {
+  async onRetracted(
+    rows: readonly StoredMessage[],
+    ctx: StrategyContext,
+    info: { undone: boolean; removed: boolean; ids?: readonly MessageId[] },
+  ): Promise<void> {
     this.requireLoadedBranch('onRetracted');
-    this.windowLost(new Set(rows.map((m) => m.id)), ctx);
+    const leaving = new Set<MessageId>(info?.ids ?? []);
+    for (const row of rows) leaving.add(row.id);
+    this.windowLost(leaving, ctx);
   }
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
     if (leaving.size === 0) return;
     // The L1s holding a row that left among their sources, the L1 of each
-    // chunk record holding one, and every summary above one of those.
-    const dropped = new Set<string>();
+    // chunk record holding one, and (in unfold) every summary above them.
+    const seeds = new Set<string>();
     for (const summary of this.summaries) {
-      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) dropped.add(summary.id);
+      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
     }
     for (const record of this.chunkRecords) {
-      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) dropped.add(record.summaryId);
+      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
     }
-    for (let grew = dropped.size > 0; grew;) {
-      grew = false;
-      for (const summary of this.summaries) {
-        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
-          dropped.add(summary.id);
-          grew = true;
+
+    // A row that left and is in the window again, presented again before
+    // this was heard, stays in a record that holds it beside a row of its
+    // own that didn't leave: that record was made over it where it stands.
+    const view = ctx.messageStore;
+    const back = [...leaving].filter((id) => view.get(id) !== null);
+    let staying: (record: ChunkRecord) => ReadonlySet<MessageId> = () => new Set();
+    if (back.length > 0) {
+      const position = this.positionIndex(view.getAll());
+      const returned = new Set(back);
+      staying = (record) => {
+        const kept = new Set<MessageId>();
+        const runs = windowRuns(record.sourceIds, position);
+        for (const run of runs) {
+          if (run.some((id) => !leaving.has(id))) for (const id of run) if (returned.has(id)) kept.add(id);
         }
-      }
+        return kept;
+      };
     }
 
     // Each record holding a row that left, or naming a dropped L1, is
     // compressed again over the rows it keeps; one left with none goes.
-    const refolded: string[] = [];
-    const emptied: string[] = [];
-    const records: ChunkRecord[] = [];
-    for (const record of this.chunkRecords) {
-      const losing = record.sourceIds.some((id) => leaving.has(id));
-      if (!losing && !(record.summaryId && dropped.has(record.summaryId))) {
-        records.push(record);
-        continue;
-      }
-      const sourceIds = losing ? record.sourceIds.filter((id) => !leaving.has(id)) : record.sourceIds;
-      if (sourceIds.length === 0) {
-        emptied.push(record.id);
-        continue;
-      }
-      const { summaryId: _summaryId, ...rest } = record;
-      records.push({ ...rest, sourceIds, compressed: false });
-      refolded.push(record.id);
-    }
-
-    // The summaries kept, each pointer naming a dropped summary cleared, so
-    // a summary whose parent was dropped renders and merges again. A copy
-    // is changed, as the open changes one, never the summary in place.
-    const orphaned: string[] = [];
-    const summaries = dropped.size === 0 ? this.summaries : this.summaries.filter((summary) => !dropped.has(summary.id)).map((summary) => {
-      const pointers = (['parentId', 'mergedInto'] as const).filter((field) => {
-        const pointer = summary[field] as unknown;
-        return typeof pointer === 'string' && dropped.has(pointer);
-      });
-      if (pointers.length === 0) return summary;
-      const copy = { ...summary };
-      for (const field of pointers) delete copy[field];
-      orphaned.push(summary.id);
-      return copy;
+    const unfolded = this.unfold(seeds, (record) => {
+      if (!record.sourceIds.some((id) => leaving.has(id))) return undefined;
+      const kept = staying(record);
+      return record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id));
     });
-    const mergeQueue = dropped.size === 0 ? this.mergeQueue : this.mergeQueue.filter((merge) => !merge.sourceIds.some((id) => dropped.has(id)));
-
-    // Summaries first: should the records' write not follow, the open makes
-    // a record whose L1 it lacks compressible again.
-    if (dropped.size > 0) {
-      this.summaries = summaries;
-      this.store?.setStateJson(this.summariesStateId, this.summaries);
-    }
-    if (refolded.length > 0 || emptied.length > 0) {
-      this.chunkRecords = records;
-      this.store?.setStateJson(this.chunksStateId, this.chunkRecords);
-    }
-    if (mergeQueue.length !== this.mergeQueue.length) {
-      this.mergeQueue = mergeQueue;
-      this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-    }
-    if (dropped.size > 0 || refolded.length > 0 || emptied.length > 0) {
+    if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
       this.diag.warn(
         `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
-          `[${[...dropped].join(', ')}] and cleared the parent of [${orphaned.join(', ')}]; chunk records to be ` +
-          `compressed again over the rows they keep [${refolded.join(', ')}], removed, keeping none [${emptied.join(', ')}]`,
+          `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
+          `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
       );
     }
 
@@ -7644,6 +7682,83 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
       this.driveSpeculativeDrain(ctx);
     }
+  }
+
+  /**
+   * Drop the summaries `seeds` names, with every summary above them, and
+   * what hangs on them (windowLost, demoteSplitSummaries). Each chunk
+   * record `sourcesOf` gives sources for is compressed again over them, as
+   * is the record of a dropped L1 over its own when `sourcesOf` gives none;
+   * a record left with no source goes. A pointer naming a dropped summary
+   * is cleared, so a summary the drop leaves without its parent renders and
+   * merges again, and a queued merge of a dropped summary goes. A copy is
+   * changed, as the open changes one, never a summary in place.
+   *
+   * The summaries are written first, then the records, then the queue:
+   * should the records' write not follow, the open makes a record whose L1
+   * it lacks compressible again. The chunks aren't rebuilt here.
+   */
+  private unfold(
+    seeds: ReadonlySet<string>,
+    sourcesOf: (record: ChunkRecord) => MessageId[] | undefined,
+  ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
+    const dropped = new Set(seeds);
+    for (let grew = dropped.size > 0; grew;) {
+      grew = false;
+      for (const summary of this.summaries) {
+        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
+          dropped.add(summary.id);
+          grew = true;
+        }
+      }
+    }
+
+    const refolded: string[] = [];
+    const emptied: string[] = [];
+    const records: ChunkRecord[] = [];
+    for (const record of this.chunkRecords) {
+      const kept = sourcesOf(record);
+      if (kept === undefined && !(record.summaryId && dropped.has(record.summaryId))) {
+        records.push(record);
+        continue;
+      }
+      const sourceIds = kept ?? record.sourceIds;
+      if (sourceIds.length === 0) {
+        emptied.push(record.id);
+        continue;
+      }
+      const { summaryId: _summaryId, ...rest } = record;
+      records.push({ ...rest, sourceIds, compressed: false });
+      refolded.push(record.id);
+    }
+
+    const orphaned: string[] = [];
+    const summaries = dropped.size === 0 ? this.summaries : this.summaries.filter((summary) => !dropped.has(summary.id)).map((summary) => {
+      const pointers = (['parentId', 'mergedInto'] as const).filter((field) => {
+        const pointer = summary[field] as unknown;
+        return typeof pointer === 'string' && dropped.has(pointer);
+      });
+      if (pointers.length === 0) return summary;
+      const copy = { ...summary };
+      for (const field of pointers) delete copy[field];
+      orphaned.push(summary.id);
+      return copy;
+    });
+    const mergeQueue = dropped.size === 0 ? this.mergeQueue : this.mergeQueue.filter((merge) => !merge.sourceIds.some((id) => dropped.has(id)));
+
+    if (dropped.size > 0) {
+      this.summaries = summaries;
+      this.store?.setStateJson(this.summariesStateId, this.summaries);
+    }
+    if (refolded.length > 0 || emptied.length > 0) {
+      this.chunkRecords = records;
+      this.store?.setStateJson(this.chunksStateId, this.chunkRecords);
+    }
+    if (mergeQueue.length !== this.mergeQueue.length) {
+      this.mergeQueue = mergeQueue;
+      this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    }
+    return { dropped: [...dropped], orphaned, refolded, emptied };
   }
 
   private windowGrew(operation: string, ctx: StrategyContext): void {
@@ -20476,4 +20591,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       restore();
     }
   }
+}
+
+/**
+ * The rows of `ids` that `position` places, split into runs of consecutive
+ * positions, each in position order, the runs in position order: one run
+ * when they stand together.
+ */
+function windowRuns(ids: readonly MessageId[], position: ReadonlyMap<MessageId, number>): MessageId[][] {
+  const placed = ids.filter((id) => position.has(id)).sort((a, b) => position.get(a)! - position.get(b)!);
+  const runs: MessageId[][] = [];
+  for (const id of placed) {
+    const run = runs[runs.length - 1];
+    if (run && position.get(id)! === position.get(run[run.length - 1]!)! + 1) run.push(id);
+    else runs.push([id]);
+  }
+  return runs;
 }

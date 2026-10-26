@@ -300,12 +300,14 @@ export interface ContextStrategy {
    * them, unless the manager's view filter leaves them out: a row the filter
    * leaves out is given here all the same, and the view doesn't list it or
    * give it a position. A presentRows call is one record where the store
-   * batches, so one that throws presents nothing and calls nothing. On a
-   * chronicle without the batched form each row presented is one record,
-   * so a presentRows cut short by a failed write calls this with the rows
-   * it got in before it throws, which can be a body's first shards; the
-   * call that completes that body later gives only the shards that entered
-   * then.
+   * batches, so one the store refuses presents nothing and calls nothing.
+   * On a chronicle without the batched form each row presented is one
+   * record, so a presentRows cut short by a failed write calls this with
+   * the rows it got in before it throws, which can be a body's first
+   * shards; the call that completes that body later gives only the shards
+   * that entered then. A presentRows that puts a body back whole, its first
+   * shard having been out while later ones were in, calls onRetracted for
+   * those later shards first, then this with every shard of the body.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
@@ -343,19 +345,40 @@ export interface ContextStrategy {
    * body, and a context whose view no longer holds them. The window leaves
    * the record alone: a row that left is still stored unless it was removed.
    *
+   * `info.ids` is every row that left in the call, in the same order, and
+   * `rows` the ones among them the manager can give: a row the store holds,
+   * or one a removal through this manager read before it went. A row the
+   * store no longer holds, removed through another manager (which this one
+   * doesn't hear) and taken out of this window by its id, has no row to
+   * give: it is in `info.ids` alone, with `removed: true`, and `rows` can be
+   * empty. A strategy that keeps rows by id lets go of these as of the
+   * others, so that every reader of a removed row unfolds it, not only the
+   * manager that removed it.
+   *
    * It is called once per call, before the call returns:
    *
    * - from ContextManager.retractRows, after the rows are out of the
-   *   window, with `undone` as the call gave it and `removed: false`. A row
-   *   the store no longer holds, taken out by its id (one removed through
-   *   another manager, which this one doesn't hear), isn't given: there is
-   *   no row to give, and a call that takes out only such rows calls
-   *   nothing. A retractRows in legacy mode writes the window down and then
-   *   takes the rows out, so it calls this as it would once a host presents.
+   *   window, with `undone` as the call gave it and `removed: false`. Rows
+   *   the store no longer holds, which retractRows takes out by their ids,
+   *   are given in a second call of their own, by `info.ids` alone, with
+   *   `removed: true`. A retractRows in legacy mode writes the window down
+   *   and then takes the rows out, so it calls this as it would once a host
+   *   presents.
+   * - from ContextManager.retractRemoved and retractAbsentRows, which take
+   *   out rows removed through another manager, by `info.ids` alone, with
+   *   `removed: true` and `undone: false`.
    * - once a host presents rows on the branch, from a removal through this
    *   manager (removeMessage, removeMessages) of rows the window held, after
    *   the row is out of the window, with the rows as they were before they
-   *   were removed, `removed: true` and `undone: false`.
+   *   were removed, `removed: true` and `undone: false`. The removal stands
+   *   whether or not the window's tombstone could be written, so a row
+   *   whose tombstone failed is given all the same, and is given again,
+   *   by its id, when retractAbsentRows later takes it out: a strategy
+   *   that kept nothing of a row takes such a call as nothing to do.
+   * - from ContextManager.presentRows, for the later shards of a body whose
+   *   first shard the window lacked, which leave so that the body enters
+   *   whole, with `undone: false` and `removed: false`, before the body is
+   *   heard through onPresented.
    *
    * While the manager is in legacy mode its window is the record, and a
    * removal takes the row out of both at once: nothing calls this, and a
@@ -374,19 +397,20 @@ export interface ContextStrategy {
    * While the strategy isn't initialized, the calls wait until it is, and
    * are then made in the order they came, before the rows presented
    * meanwhile are heard. A row that has been presented again since is still
-   * given, since what the strategy kept of it is at its old place. A row
-   * the window of the branch the strategy initialized on holds at the
-   * ordinal it left, a branch made before it left, is left out, as is every
-   * row while that branch is in legacy mode, and a call left with no row
-   * isn't made. They wait for the manager's strategy, not for this
-   * instance, as onPresented's do.
+   * given, since what the strategy kept of it is at its old place: the
+   * window holds it again, at a new ordinal, by the time this is called. A
+   * row the branch the strategy initialized on holds at the ordinal it
+   * left, in its window and its record (a branch made before it left), is
+   * left out, as is every row while that branch is in legacy mode, and a
+   * call left with no row isn't made. They wait for the manager's strategy,
+   * not for this instance, as onPresented's do.
    *
    * Fire and forget, as onPresented: a rejection, or a throw before it
    * returns, is logged through the manager's diagnostics, naming the rows,
    * and doesn't reach the caller. The rows stay out of the window, and the
    * strategy isn't offered them again.
    */
-  onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void>;
+  onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean; ids: readonly MessageId[] }): Promise<void>;
 
   /**
    * React to a new row in the agent's window, one row at a time: the older

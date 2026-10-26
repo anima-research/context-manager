@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
-import type { CompileResult, MessageId, StoredMessage, WindowStatus } from '../src/index.js';
+import type { CompileResult, MessageId, StoredMessage, StrategyContext, WindowStatus } from '../src/index.js';
 import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-window-status';
@@ -62,6 +62,17 @@ class Sharding extends PassthroughStrategy {
   chunkIngressMessage(_participant: string, content: ContentBlock[]) {
     if (content.length < 2) return null;
     return { bodyGroupId: `zz-doc-${content.length}-${(content[0] as { text: string }).text}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+  }
+}
+
+/** Sharding that keeps, in one log, the rows each onRetracted and onPresented call was given. */
+class ShardingRecords extends Sharding {
+  log: string[] = [];
+  async onRetracted(rows: readonly StoredMessage[], _ctx: StrategyContext, info: { undone: boolean }): Promise<void> {
+    this.log.push(`retracted${info.undone ? ' undone' : ''} ${rows.map((m) => m.id).join(',')}`);
+  }
+  async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+    this.log.push(`presented ${rows.map((m) => m.id).join(',')}`);
   }
 }
 
@@ -199,6 +210,56 @@ describe('windowStatusOf', () => {
     assert.deepEqual(ids(cm.getUnpresentedMessages()), shards.slice(1));
     cm.close();
   });
+});
+
+describe('a body whose first shard a retract cut short took out while the rest stayed in', () => {
+  for (const undone of [true, false]) {
+    it(`${undone ? 'undone' : 'taken out'}: its first shard reads as its tombstone left it, as getUnpresentedMessages has it, and presenting it puts the body back whole, in order`, async () => {
+      const path = freshPath();
+      const strategy = new ShardingRecords();
+      const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+      const shards = ids(cm.getAllMessages());
+      assert.equal(shards.length, 3, 'setup: the body is stored as three shards');
+      const a = cm.addMessage('alice', [text('a')]);
+      cm.presentRows([doc, a]);
+
+      // On a chronicle without the batched append each tombstone is a
+      // record of its own: the second fails, after the first shard's.
+      const restore = failAppend(cm, 2);
+      try {
+        assert.throws(() => cm.retractRows([doc], { undone }), /zz-index-append-failed/);
+      } finally {
+        restore();
+      }
+      const first = undone ? 'undone' : 'out';
+      assert.deepEqual(statuses(cm, shards), [first, 'in', 'in'], 'no shard before the first is in the window: it reads as its tombstone left it');
+      assert.deepEqual(ids(cm.getPresentedMessages()), [shards[1], shards[2], a]);
+      const listed = ids(cm.getUnpresentedMessages());
+      assert.deepEqual(listed, undone ? [] : [shards[0]]);
+      const out = [...shards, a].filter((id) => cm.windowStatusOf(id) === 'out');
+      assert.deepEqual(out, listed, "the rows that read 'out' are the rows getUnpresentedMessages lists");
+
+      // A redo, or a host presenting its arrived rows, names the body by its
+      // first shard: the shards in the window leave it, and the body enters
+      // whole at the end, so its head never follows its own later shards.
+      strategy.log = [];
+      const before = cm.indexLength();
+      const [ordinal] = cm.presentRows([shards[0]!]);
+      assert.deepEqual(ids(cm.getPresentedMessages()), [a, ...shards], 'the body is at the end, in body order');
+      assert.deepEqual(statuses(cm, shards), ['in', 'in', 'in']);
+      assert.equal(ordinal, before + 2, 'after the two tombstones of its later shards');
+      assert.deepEqual(shards.map((id) => cm.ordinalOf(id)), [before + 2, before + 3, before + 4]);
+      assert.deepEqual(strategy.log, [`retracted ${shards[1]},${shards[2]}`, `presented ${shards.join(',')}`], 'the strategy hears the shards leave, then the body enter');
+      assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'p0 ', 'p1 ', 'p2 ']);
+      cm.close();
+
+      const reopened = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new Sharding() });
+      assert.deepEqual(ids(reopened.getPresentedMessages()), [a, ...shards], 'the index reads the same after a reopen');
+      reopened.close();
+    });
+  }
 });
 
 describe('branchSequenceOf', () => {

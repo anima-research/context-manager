@@ -63,7 +63,9 @@
  * can append several items in one (chronicle's
  * appendManyToStateJsonWithIdentity): the write-down, the rows one
  * presentRows call presents, and the tombstones of one call. The store keeps
- * or loses such a record whole, so a write that throws has written nothing.
+ * or loses such a record whole: a write the store refuses writes nothing,
+ * and after any throw the index is read again from the store, so its
+ * reading is what the store holds, whatever the failure left.
  * A batch is one presentation point: every item of it carries the same `at`,
  * and chronicle cuts a branch only between records, so a cut at a row a
  * batch presented keeps every row of the batch, and a cut before it drops
@@ -627,16 +629,26 @@ export class WindowIndex {
    * then sent as two runs. A name whose rows are all in the window already
    * is refused.
    *
+   * A body the window holds the other way round, its first shard out and a
+   * later one in (a retract cut short after the first shard's tombstone, on
+   * such a chronicle, or a branch cut between its shards' tombstones), can't
+   * be completed where it stands: its head would follow its own later
+   * shards. Naming it by its first shard's id takes the shards in the window
+   * out and presents the body whole at the end, in body order, in the same
+   * write: those shards take new ordinals, `left` gives them with the
+   * ordinals they held, and `entered` holds every shard of the body.
+   *
    * `cutShort`, when given, hears the rows that entered before a write that
-   * threw partway, in window order, before the error is thrown on: each is
-   * in the window, and no later call presents it again.
+   * threw partway, and the rows that left, in window order, before the
+   * error is thrown on: each that entered is in the window, each that left
+   * is out of it, and no later call presents or takes it out again.
    */
   present(
     ids: readonly MessageId[],
     record: readonly StoredMessage[],
     positionOf: (id: MessageId) => number | undefined,
-    cutShort?: (entered: MessageId[]) => void,
-  ): { ordinals: number[]; entered: MessageId[] } {
+    cutShort?: (entered: MessageId[], left: LeftRow[]) => void,
+  ): { ordinals: number[]; entered: MessageId[]; left: LeftRow[] } {
     const state = this.current();
     const legacy = !inEffect(state);
     // A cut-short write-down's rows aren't a window: in legacy mode the
@@ -654,31 +666,46 @@ export class WindowIndex {
     if (legacy) {
       this.write(this.writeDown('presentRows', state, record));
       const ordinals = this.current().ordinals;
-      return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [] };
+      return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [], left: [] };
     }
     const already = named.filter((name) => name.rows.every((id) => state.ordinals.has(id))).map((name) => name.id);
     if (already.length > 0) {
       throw new Error(`ContextManager.presentRows: ${already.join(', ')} ${already.length === 1 ? 'is' : 'are'} in the window already; a row is presented once`);
     }
-    const rows = named.flatMap((name) => name.rows.filter((id) => !state.ordinals.has(id)));
+    // A body whose first named shard the window lacks while a later one is
+    // in it: the shards in the window leave, and the body enters whole.
+    const moving: LeftRow[] = [];
+    for (const name of named) {
+      if (state.ordinals.has(name.rows[0]!)) continue;
+      for (const id of name.rows.slice(1)) {
+        const ordinal = state.ordinals.get(id);
+        if (ordinal !== undefined) moving.push({ id, ordinal });
+      }
+    }
+    const moves = new Set(moving.map((row) => row.id));
+    const rows = named.flatMap((name) => name.rows.filter((id) => moves.has(id) || !state.ordinals.has(id)));
+    const items: IndexItem[] = [...moving.map((row): IndexItem => ({ retract: row.id })), ...rows.map((id): IndexItem => ({ id }))];
     try {
-      this.write(rows.map((id) => ({ id })));
+      this.write(items);
     } catch (error) {
       if (cutShort) {
         let entered: MessageId[] = [];
+        let left: LeftRow[] = [];
         try {
           const now = this.current().ordinals;
-          entered = rows.filter((id) => now.has(id));
+          left = moving.filter((row) => now.get(row.id) !== row.ordinal);
+          const before = new Map(moving.map((row) => [row.id, row.ordinal] as const));
+          entered = rows.filter((id) => now.has(id) && now.get(id) !== before.get(id));
         } catch {
           // The index can't be read: the error thrown on says why, and the
-          // next read finds what entered.
+          // next read finds what entered and what left.
         }
-        if (entered.length > 0) cutShort(entered);
+        if (entered.length > 0 || left.length > 0) cutShort(entered, inWindowOrder(left));
       }
       throw error;
     }
     const ordinals = this.current().ordinals;
-    return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows };
+    return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows, left: inWindowOrder(moving) };
   }
 
   /**
@@ -864,7 +891,7 @@ export class WindowIndex {
    * holds it (`at`, `by`). Several items go in as one record, at one
    * sequence, where the store can append them so
    * (appendManyToStateJsonWithIdentity): the store keeps or loses the write
-   * whole, and one that throws has written nothing. That is a presentation
+   * whole, and one it refuses has written nothing. That is a presentation
    * point (see the module comment). One item is one record, through the
    * single form, as it always was: a store all of whose writes are single
    * keeps its MANIFEST at version 1, as one presenting a row at a time to an
@@ -874,8 +901,8 @@ export class WindowIndex {
    * failure partway, or a crash before the store synced, leaves the items
    * before it written. For a write-down that is a prefix of its rows without
    * the header, which leaves the index out of effect until the next
-   * write-down finishes it (writeDown). After any failure the index is read
-   * again from the store.
+   * write-down finishes it (writeDown). After any throw, on either path,
+   * the index is read again from the store, which says what was written.
    */
   private write(items: IndexItem[]): void {
     if (items.length === 0) return;

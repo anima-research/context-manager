@@ -17,7 +17,11 @@
  * - In legacy mode, on a write-down cut short and on an index in another
  *   version's format, neither writes anything: a removed row has left a
  *   window that is the record already.
- * - The strategy isn't told: the store holds no row to give it.
+ * - The strategy is told the rows left (onRetracted), by their ids alone
+ *   with `removed`, since the store holds no row of them to give: a folding
+ *   reader lets go of what it folded of them, as the manager that removed
+ *   them did, and doesn't halt its compression over records whose rows are
+ *   gone (FW-CM-1, J-CM1).
  * - A row of an auxiliary slot the manager no longer merges reads as
  *   removed (the caveat their doc comments state).
  */
@@ -26,8 +30,8 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
-import type { MessageId, StoredMessage, StrategyContext } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
+import type { CompileResult, MessageId, StoredMessage, StrategyContext, SummaryEntry } from '../src/index.js';
 import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-retract-removed';
@@ -56,11 +60,13 @@ class Sharding extends PassthroughStrategy {
   }
 }
 
-/** Passthrough that keeps the rows each onRetracted call was given. */
+type Info = { undone: boolean; removed: boolean; ids: readonly MessageId[] };
+
+/** Passthrough that keeps the rows and the info each onRetracted call was given. */
 class Records extends PassthroughStrategy {
-  retracted: MessageId[][] = [];
-  async onRetracted(rows: readonly StoredMessage[], _ctx: StrategyContext): Promise<void> {
-    this.retracted.push(rows.map((m) => m.id));
+  retracted: Array<{ rows: MessageId[]; info: Info }> = [];
+  async onRetracted(rows: readonly StoredMessage[], _ctx: StrategyContext, info: Info): Promise<void> {
+    this.retracted.push({ rows: rows.map((m) => m.id), info });
   }
 }
 
@@ -311,7 +317,11 @@ describe('retractRemoved and retractAbsentRows', () => {
     cm.close();
   });
 
-  it('tell the strategy nothing, since the store holds no row to give it', async () => {
+  // This test said the strategy is told nothing, since the store holds no
+  // row to give it. A folding reader then kept summaries of the removed
+  // rows for good, and a large removal halted its compression (J-CM1): the
+  // rows are now told by their ids, as removed.
+  it('tell the strategy the rows that left, by their ids, removed', async () => {
     const strategy = new Records();
     const { writer, cm } = await writerAndReader(strategy);
     const [a, b, c] = ['a', 'b', 'c'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
@@ -319,12 +329,36 @@ describe('retractRemoved and retractAbsentRows', () => {
     writer.removeMessage(a);
     writer.removeMessage(b);
     assert.deepEqual(cm.retractRemoved([a]), [a]);
+    // Before anything settles: the call is made inside retractRemoved.
+    assert.deepEqual(strategy.retracted, [{ rows: [], info: { undone: false, removed: true, ids: [a] } }]);
     assert.deepEqual(cm.retractAbsentRows(), [b]);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(strategy.retracted, []);
-    // retractRows of a held row still tells it.
+    assert.deepEqual(strategy.retracted.slice(1), [{ rows: [], info: { undone: false, removed: true, ids: [b] } }]);
+    assert.deepEqual(cm.retractRemoved([a]), [], 'nothing left to take out');
+    assert.deepEqual(cm.retractAbsentRows(), []);
+    assert.equal(strategy.retracted.length, 2, 'a call that takes nothing out tells nothing');
+    // retractRows of a held row gives the row.
     cm.retractRows([c]);
-    assert.deepEqual(strategy.retracted, [[c]]);
+    assert.deepEqual(strategy.retracted.slice(2), [{ rows: [c], info: { undone: false, removed: false, ids: [c] } }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+    writer.close();
+  });
+
+  it('a write cut short tells the strategy the rows it took out before it', async () => {
+    const strategy = new Records();
+    const { writer, cm } = await writerAndReader(strategy);
+    const rows = ['a', 'b', 'c'].map((t) => writer.addMessage('alice', [text(t)])) as MessageId[];
+    cm.presentRows(rows);
+    writer.removeMessages(rows[0]!, rows[2]!);
+    const restore = failAppend(cm, 2);
+    try {
+      assert.throws(() => cm.retractAbsentRows(), /zz-index-append-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(strategy.retracted, [{ rows: [], info: { undone: false, removed: true, ids: [rows[0]] } }]);
+    assert.deepEqual(cm.retractAbsentRows(), rows.slice(1));
+    assert.deepEqual(strategy.retracted.slice(1), [{ rows: [], info: { undone: false, removed: true, ids: rows.slice(1) } }]);
     cm.close();
     writer.close();
   });
@@ -335,5 +369,213 @@ describe('retractRemoved and retractAbsentRows', () => {
     cm.close();
     assert.throws(() => cm.retractRemoved([]), { message: 'ContextManager.retractRemoved after close()' });
     assert.throws(() => cm.retractAbsentRows(), { message: 'ContextManager.retractAbsentRows after close()' });
+  });
+});
+
+// ----------------------------------------------------------------------------
+// A folding reader lets go of a row removed through another manager
+// ----------------------------------------------------------------------------
+
+/** Summarizer mock: each answer names the tags its request carried. */
+function mockMembrane() {
+  let calls = 0;
+  return {
+    complete: async (request: { messages: Array<{ content: ContentBlock[] }> }) => {
+      calls++;
+      const input = request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n');
+      const tags = [...new Set(input.match(/TAG\d+/g) ?? [])].join(',');
+      return {
+        stopReason: 'end_turn',
+        content: [{ type: 'text', text: `[summary ${calls} of ${tags}] ` + 'mem '.repeat(20) }],
+        usage: { input_tokens: 10, output_tokens: 10 },
+      };
+    },
+  } as never;
+}
+
+const FOLDING = { compressionModel: 'mock', targetChunkTokens: 200, recentWindowTokens: 300, headWindowTokens: 0, mergeThreshold: 4 } as const;
+const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
+
+interface Folding {
+  summaries: SummaryEntry[];
+  chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+  chunkRecordsOrphaned: boolean;
+}
+const folding = (strategy: AutobiographicalStrategy) => strategy as unknown as Folding;
+
+/** The message ids a summary covers. */
+function leavesOf(cm: ContextManager, id: string): MessageId[] {
+  const summary = cm.getSummary(id);
+  if (!summary) return [];
+  return summary.level === 1 ? summary.sourceIds : summary.sourceIds.flatMap((source) => leavesOf(cm, source));
+}
+
+/** The message ids some summary the strategy keeps covers. */
+function coveredRows(cm: ContextManager, strategy: AutobiographicalStrategy): Set<MessageId> {
+  return new Set(folding(strategy).summaries.flatMap((s) => leavesOf(cm, s.id)));
+}
+
+/** Each message id a compile renders, raw or inside a summary, as often as it renders it. */
+function renderedRows(cm: ContextManager, result: CompileResult): MessageId[] {
+  const raw: MessageId[] = [];
+  const summaries = new Set<string>();
+  for (const part of result.provenance?.messages ?? []) {
+    if (part.kind === 'raw') raw.push(...part.bodies.map((b) => b.messageId));
+    if (part.kind === 'summary') for (const s of part.summaries) summaries.add(s.id);
+  }
+  return [...raw, ...[...summaries].flatMap((id) => leavesOf(cm, id))];
+}
+
+/** Asserts the compile renders each row of the window once, and only those. */
+async function rendersWindowOnce(cm: ContextManager, label: string): Promise<void> {
+  const rendered = renderedRows(cm, await cm.compile(BIG));
+  assert.equal(new Set(rendered).size, rendered.length, `${label}: no row renders twice`);
+  assert.deepEqual(new Set(rendered), new Set(ids(cm.getPresentedMessages())), `${label}: every row of the window renders, and nothing else`);
+}
+
+async function drain(cm: ContextManager): Promise<void> {
+  for (let i = 0; i < 1000 && !cm.isReady(); i++) await cm.tick();
+  assert.ok(cm.isReady(), 'the drain finished');
+}
+
+/** console.error's and console.warn's lines while `fn` runs. */
+async function linesDuring(fn: () => Promise<void> | void): Promise<string[]> {
+  const lines: string[] = [];
+  const realError = console.error;
+  const realWarn = console.warn;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = realError;
+    console.warn = realWarn;
+  }
+  return lines;
+}
+
+/**
+ * Two residents on the shared slot, as agent-framework opens them (agents/<name>, not isolated), both folding and presented,
+ * each shown TAG0..TAG<rows-1> as it was stored, drained.
+ */
+async function residents(make: () => AutobiographicalStrategy = () => new AutobiographicalStrategy(FOLDING), rows = 40) {
+  const membrane = mockMembrane();
+  const sa = make();
+  const sb = make();
+  const a = await ContextManager.open({ path: freshPath(), namespace: 'agents/alice', strategy: sa, membrane });
+  const b = await ContextManager.open({ store: a.getStore(), namespace: 'agents/bob', strategy: sb, membrane });
+  a.presentRows([]);
+  b.presentRows([]);
+  const rowIds: MessageId[] = [];
+  for (let i = 0; i < rows; i++) {
+    const id = a.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+    a.presentRows([id]);
+    b.presentRows([id]);
+    rowIds.push(id);
+  }
+  await drain(a);
+  await drain(b);
+  return { a, b, sa, sb, rowIds };
+}
+
+describe('a folding reader of a removal through another manager unfolds the removed rows', () => {
+  for (const repair of ['retractRemoved', 'retractAbsentRows'] as const) {
+    it(`a single row and a 30-row range removed through A, B repaired with ${repair}: no B summary covers them, and B doesn't halt`, async () => {
+      // Rows enough after the range that the recent window stays where it
+      // was: a removal that pulls a folded chunk into it renders that
+      // chunk's last row twice, raw and folded, in legacy mode as well
+      // (pre-existing, not the window's).
+      const { a, b, sa, sb, rowIds } = await residents(undefined, 60);
+      const take = (gone: MessageId[]) => (repair === 'retractRemoved' ? b.retractRemoved(gone) : b.retractAbsentRows());
+
+      const single = rowIds[8]!;
+      assert.ok(coveredRows(b, sb).has(single), 'premise: B folded the row');
+      const singleLines = await linesDuring(() => {
+        a.removeMessage(single);
+        assert.ok(coveredRows(b, sb).has(single), 'premise: B hasn\'t heard the removal');
+        assert.deepEqual(take([single]), [single]);
+        // Before anything settles: B let go inside the repair.
+        assert.ok(!coveredRows(b, sb).has(single), 'no summary of B covers the removed row');
+        assert.ok(!coveredRows(a, sa).has(single), 'as none of A does');
+      });
+      assert.ok(singleLines.some((line) => line.includes('1 row(s) left the window') && line.includes('agents/bob')), singleLines.join('\n'));
+      assert.ok(folding(sb).chunkRecords.every((r) => !r.sourceIds.includes(single)), 'no chunk record of B holds it');
+      await drain(b);
+      await rendersWindowOnce(b, 'B after the single row');
+
+      const range = rowIds.slice(9, 39);
+      assert.equal(range.length, 30);
+      assert.ok(range.some((id) => coveredRows(b, sb).has(id)), 'premise: B folded rows of the range');
+      const rangeLines = await linesDuring(async () => {
+        a.removeMessages(range[0]!, range[range.length - 1]!);
+        assert.deepEqual(take(range), range, 'every row of the range, in window order');
+        assert.equal(folding(sb).chunkRecordsOrphaned, false, 'B\'s compression is not halted');
+        const window = new Set(ids(b.getPresentedMessages()));
+        assert.ok(folding(sb).chunkRecords.every((r) => r.sourceIds.some((id) => window.has(id))), 'no chunk record of B is left without a window row');
+        await drain(b);
+        await drain(a);
+      });
+      assert.ok(!rangeLines.some((line) => line.includes('FAIL-CLOSED')), rangeLines.join('\n'));
+      for (const id of range) assert.ok(!coveredRows(b, sb).has(id), 'no summary of B covers a removed row');
+      assert.equal(folding(sb).chunkRecordsOrphaned, false);
+      await rendersWindowOnce(b, 'B after the range');
+      await rendersWindowOnce(a, 'A after the range');
+      const rendered = renderedRows(b, await b.compile(BIG));
+      for (const id of [single, ...range]) assert.ok(!rendered.includes(id), 'B\'s compile omits the removed rows');
+      a.close();
+      b.close();
+    });
+  }
+
+  it('a manager\'s own removal whose window write fails still unfolds the row, and retractAbsentRows later takes its ordinal out', async () => {
+    const { a, b, sb, rowIds } = await residents();
+    const gone = rowIds[8]!;
+    assert.ok(coveredRows(b, sb).has(gone), 'premise: the row is folded');
+    const store = b.getStore() as unknown as Record<string, (id: string, ...rest: unknown[]) => unknown>;
+    const index = windowIndexStateId('agents/bob');
+    const saved: Record<string, (id: string, ...rest: unknown[]) => unknown> = {};
+    for (const name of ['appendManyToStateJsonWithIdentity', 'appendToStateJsonWithIdentity']) {
+      const write = store[name];
+      if (typeof write !== 'function') continue;
+      saved[name] = write;
+      store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (id === index) throw new Error('zz-index-append-failed');
+        return write.call(this, id, ...rest);
+      };
+    }
+    let lines: string[] = [];
+    try {
+      lines = await linesDuring(() => b.removeMessage(gone));
+    } finally {
+      for (const [name, write] of Object.entries(saved)) store[name] = write;
+    }
+    assert.ok(lines.some((line) => line.includes(`taking removed message ${gone} out of the window failed`)), lines.join('\n'));
+    assert.notEqual(b.ordinalOf(gone), undefined, 'the tombstone wasn\'t written');
+    assert.ok(!coveredRows(b, sb).has(gone), 'the removal stands, and the strategy let go of the row all the same');
+    assert.deepEqual(b.retractAbsentRows(), [gone]);
+    assert.equal(b.ordinalOf(gone), undefined);
+    assert.ok(!coveredRows(b, sb).has(gone));
+    await drain(b);
+    await rendersWindowOnce(b, 'after the repair');
+    a.close();
+    b.close();
+  });
+
+  it('KnowledgeStrategy, which inherits the hook, lets go of the row too', async () => {
+    const make = () => new KnowledgeStrategy({ ...FOLDING, mergeThreshold: 3 }) as unknown as AutobiographicalStrategy;
+    const { a, b, sb, rowIds } = await residents(make);
+    const gone = rowIds.find((id) => coveredRows(b, sb).has(id));
+    assert.ok(gone, 'premise: B folded a row');
+    a.removeMessage(gone);
+    assert.ok(coveredRows(b, sb).has(gone), 'premise: B hasn\'t heard the removal');
+    await linesDuring(() => {
+      assert.deepEqual(b.retractRemoved([gone]), [gone]);
+    });
+    assert.ok(!coveredRows(b, sb).has(gone), 'no summary of B covers the removed row');
+    await drain(b);
+    assert.ok(!coveredRows(b, sb).has(gone));
+    await rendersWindowOnce(b, 'B drained');
+    a.close();
+    b.close();
   });
 });

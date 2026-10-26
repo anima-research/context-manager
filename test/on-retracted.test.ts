@@ -15,6 +15,13 @@
  * presented meanwhile are heard. In legacy mode a removal takes the row out
  * of the record and the window at once, and nothing is called: a strategy
  * that folded the row keeps it, as it always has (#291 question 14).
+ *
+ * A row the store no longer holds, removed through another manager, comes
+ * by its id alone (`info.ids`, with `removed`), so every reader of a removed
+ * row lets go of it (FW-CM-1). A row that left and was presented again
+ * before the folding strategy heard it go is let go of at its old place when
+ * the strategy hears it, and the open demotes the summary such a row leaves
+ * non-contiguous instead of refusing the store.
  */
 
 import { describe, it, after } from 'node:test';
@@ -74,7 +81,7 @@ function watchUnhandled() {
   return { seen, restore: () => { process.off('uncaughtException', onError); process.off('unhandledRejection', onError); } };
 }
 
-type Info = { undone: boolean; removed: boolean };
+type Info = { undone: boolean; removed: boolean; ids: readonly MessageId[] };
 
 /** What one onRetracted call saw. */
 interface Left {
@@ -139,11 +146,11 @@ describe('onRetracted', () => {
     // Checked before anything settles: the hook's synchronous part ran
     // inside retractRows.
     assert.deepEqual(strategy.retracted, [
-      { rows: [a, c], texts: ['a', 'c'], info: { undone: true, removed: false }, window: [b] },
+      { rows: [a, c], texts: ['a', 'c'], info: { undone: true, removed: false, ids: [a, c] }, window: [b] },
     ]);
     cm.retractRows([b]);
     assert.deepEqual(strategy.retracted.slice(1), [
-      { rows: [b], texts: ['b'], info: { undone: false, removed: false }, window: [] },
+      { rows: [b], texts: ['b'], info: { undone: false, removed: false, ids: [b] }, window: [] },
     ]);
     cm.retractRows([]);
     assert.equal(strategy.retracted.length, 2, 'retractRows([]) takes nothing out and calls nothing');
@@ -174,7 +181,7 @@ describe('onRetracted', () => {
     cm.retractRows([c]);
     assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(strategy.retracted, [
-      { rows: [c], texts: ['c'], info: { undone: false, removed: false }, window: [b] },
+      { rows: [c], texts: ['c'], info: { undone: false, removed: false, ids: [c] }, window: [b] },
     ]);
     await settle();
     cm.close();
@@ -188,19 +195,23 @@ describe('onRetracted', () => {
     cm.presentRows([a, b, c]);
     cm.removeMessage(b);
     assert.deepEqual(strategy.retracted, [
-      { rows: [b], texts: ['b'], info: { undone: false, removed: true }, window: [a, c] },
+      { rows: [b], texts: ['b'], info: { undone: false, removed: true, ids: [b] }, window: [a, c] },
     ]);
     cm.removeMessage(d);
     assert.equal(strategy.retracted.length, 1, 'a row the window never held left nothing');
     cm.removeMessages(a, c);
     assert.deepEqual(strategy.retracted.slice(1), [
-      { rows: [a, c], texts: ['a', 'c'], info: { undone: false, removed: true }, window: [] },
+      { rows: [a, c], texts: ['a', 'c'], info: { undone: false, removed: true, ids: [a, c] }, window: [] },
     ]);
     await settle();
     cm.close();
   });
 
-  it("a removal through another manager isn't heard, and taking that row out by its id gives the strategy nothing", async () => {
+  // This test said a row taken out by its id gives the strategy nothing,
+  // since the store no longer holds it. That left every reader but the
+  // remover folding a removed row (FW-CM-1, J-CM1): such a row is now told
+  // by its id, as removed, in a call of its own after the held rows'.
+  it("a removal through another manager isn't heard, and taking that row out by its id tells the strategy by its id, removed", async () => {
     const main = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     const strategy = new Records();
     const side = await ContextManager.open({
@@ -218,9 +229,12 @@ describe('onRetracted', () => {
     assert.equal(strategy.retracted.length, 0, "the side manager doesn't hear the main manager's removal");
     side.retractRows([m1, m2]);
     assert.deepEqual(
-      strategy.retracted.map((l) => l.rows),
-      [[m2]],
-      'm1, which the store no longer holds, left by its id: there is no row of it to give',
+      strategy.retracted.map((l) => [l.rows, l.info]),
+      [
+        [[m2], { undone: false, removed: false, ids: [m2] }],
+        [[], { undone: false, removed: true, ids: [m1] }],
+      ],
+      'm1, which the store no longer holds, left by its id: no row of it to give, its id in a call of its own',
     );
     side.retractRows([]);
     await settle();
@@ -288,11 +302,41 @@ describe('onRetracted', () => {
     await initialized;
     assert.deepEqual(strategy.log, ['retracted a', 'retracted b', 'presented a'], 'the rows that left first, then the row presented again');
     assert.deepEqual(strategy.retracted.map((l) => [l.rows, l.info]), [
-      [[a], { undone: true, removed: false }],
-      [[b], { undone: false, removed: false }],
+      [[a], { undone: true, removed: false, ids: [a] }],
+      [[b], { undone: false, removed: false, ids: [b] }],
     ], 'a, presented again since, is still given: what was kept of it is at its old place');
     await settle();
     cm.close();
+  });
+
+  it('a row removed elsewhere, taken out while the strategy initializes, is told on a branch whose window holds it still, since its record lacks it too', async () => {
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    writer.removeMessage(a);
+    // A branch made after the removal and before this window heard it: its
+    // record lacks a, and its window holds a where it was.
+    const store = cm.getStore();
+    const later = store.createBranchAt('zz-later', cm.currentBranch().name, store.currentSequence()).name;
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    assert.deepEqual(cm.retractRemoved([a]), [a]);
+    const switched = cm.switchBranch(later);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, later);
+    assert.notEqual(cm.ordinalOf(a), undefined, 'setup: the branch\'s window holds a at the ordinal it left');
+    assert.deepEqual(strategy.retracted.map((l) => [l.rows, l.info]), [
+      [[], { undone: false, removed: true, ids: [a] }],
+    ], 'the branch\'s record lacks a: it left there too');
+    await settle();
+    cm.close();
+    writer.close();
   });
 
   it('a call waiting on an initialization of a branch made before the row left is not made there', async () => {
@@ -378,14 +422,16 @@ function mockMembrane() {
 
 const isMerge = (input: string) => input.includes('consolidate into a single L');
 
+const FOLDING = {
+  compressionModel: 'mock',
+  targetChunkTokens: 200,
+  recentWindowTokens: 300,
+  headWindowTokens: 0,
+  mergeThreshold: 4,
+} as const;
+
 function autobiographical() {
-  return new AutobiographicalStrategy({
-    compressionModel: 'mock',
-    targetChunkTokens: 200,
-    recentWindowTokens: 300,
-    headWindowTokens: 0,
-    mergeThreshold: 4,
-  });
+  return new AutobiographicalStrategy(FOLDING);
 }
 
 interface Internals {
@@ -580,6 +626,113 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     await drain(cm);
     assert.ok(!coveredRows(cm, strategy).has(leaving), 'nothing folded since covers the row');
     rendersWindowOnce(cm, await cm.compile(BIG), 'drained');
+    cm.close();
+  });
+
+  it('a row taken out and presented again while a strategy initializes: the open demotes what covered it, and the row renders once', async () => {
+    const path = freshPath();
+    const { cm, strategy, ids } = await folding(path);
+    await drain(cm);
+    const row = ids[3]!;
+    assert.ok(coveredRows(cm, strategy).has(row), 'premise: the row is folded');
+    const next = autobiographical();
+    // Both steps fall inside the initialization, which awaits before it
+    // reads the window: the strategy reads the row at its new place before
+    // it hears it left its old one. Before the load repair the open threw
+    // StoreTopologyError here, and the manager was left uninitialized.
+    const lines = await linesDuring(async () => {
+      const initialized = cm.setStrategy(next);
+      cm.retractRows([row], { undone: true });
+      cm.presentRows([row]);
+      await initialized;
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of') && line.includes('apart')), lines.join('\n'));
+    assert.ok(!coveredRows(cm, next).has(row), 'nothing covers the row at its old place');
+    assert.ok(next.getTopologyViolations().length === 0);
+    await drain(cm);
+    rendersWindowOnce(cm, await cm.compile(BIG), 'drained');
+    const tight = renderedRows(cm, await cm.compile({ maxTokens: 3000, reserveForResponse: 100 }));
+    assert.equal(new Set(tight).size, tight.length, 'at a tight budget: no row renders twice');
+    cm.close();
+    const reopened = await ContextManager.open({ path, namespace: 'agent', strategy: autobiographical(), membrane: mockMembrane().membrane });
+    rendersWindowOnce(reopened, await reopened.compile(BIG), 'reopened');
+    reopened.close();
+  });
+
+  it('a row taken out and presented again that no folding strategy heard go: the open demotes the summary over it instead of refusing the store', async () => {
+    const path = freshPath();
+    const { cm, strategy, ids } = await folding(path);
+    await drain(cm);
+    const row = ids[3]!;
+    const covering = internals(strategy).summaries.filter((s) => leavesOf(cm, s.id).includes(row)).map((s) => s.id);
+    assert.ok(covering.length > 0, 'premise: the row is folded');
+    cm.close();
+    // Through a strategy without the hook, as a crash between the window's
+    // tombstone and the folding strategy's own writes leaves the store.
+    const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    plain.retractRows([row], { undone: true });
+    plain.presentRows([row]);
+    plain.close();
+
+    // 'report' opens the store for inspection: it names the summaries and changes nothing.
+    const inspected = new AutobiographicalStrategy({ ...FOLDING, topologyPolicy: 'report' });
+    const inspector = await linesDuring(async () => {
+      const open = await ContextManager.open({ path, namespace: 'agent', strategy: inspected, membrane: mockMembrane().membrane });
+      open.close();
+    });
+    assert.deepEqual(inspected.getTopologyViolations().map((v) => v.id).sort(), [...covering].sort(), inspector.join('\n'));
+    assert.ok(!inspector.some((line) => line.includes('the window holds the leaves of')), 'nothing is demoted under report');
+
+    const next = autobiographical();
+    let reopened!: ContextManager;
+    const lines = await linesDuring(async () => {
+      reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of') && line.includes(`releasing [${row}]`)), lines.join('\n'));
+    for (const id of covering) assert.equal(reopened.getSummary(id), null, `${id}, over the row at its old place, is dropped`);
+    assert.ok(!coveredRows(reopened, next).has(row));
+    assert.ok(internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row)), 'the record gives the row up where it was');
+    await drain(reopened);
+    rendersWindowOnce(reopened, await reopened.compile(BIG), 'drained');
+    reopened.close();
+    // The repair was written: the next open finds nothing to demote.
+    const again = await linesDuring(async () => {
+      const open = await ContextManager.open({ path, namespace: 'agent', strategy: autobiographical(), membrane: mockMembrane().membrane });
+      open.close();
+    });
+    assert.ok(!again.some((line) => line.includes('the window holds the leaves of')), again.join('\n'));
+  });
+
+  it('a row presented again that the open chunked at its new place keeps that place when its retraction is heard', async () => {
+    const { cm, strategy, ids } = await folding();
+    await drain(cm);
+    const row = ids[22]!;
+    assert.ok(internals(strategy).chunkRecords.every((r) => !r.sourceIds.includes(row)), 'premise: the row is in the recent window, in no chunk');
+    const later: MessageId[] = [];
+    for (let i = TAGS; i < TAGS + 16; i++) later.push(cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
+    const next = autobiographical();
+    await linesDuring(async () => {
+      const initialized = cm.setStrategy(next);
+      cm.presentRows(later.slice(0, 2));
+      cm.retractRows([row], { undone: true });
+      cm.presentRows([row]);
+      cm.presentRows(later.slice(2));
+      await initialized;
+    });
+    // The open chunked the row with the rows around it at its new place;
+    // the retraction heard after leaves it there, so that record has no
+    // hole where the row stands.
+    const window = cm.getPresentedMessages().map((m) => m.id);
+    const position = new Map(window.map((id, i) => [id, i] as const));
+    const holding = internals(next).chunkRecords.filter((r) => r.sourceIds.includes(row));
+    assert.equal(holding.length, 1, 'the record made over the row at its new place keeps it');
+    for (const record of internals(next).chunkRecords) {
+      const at = record.sourceIds.filter((id) => position.has(id)).map((id) => position.get(id)!).sort((x, y) => x - y);
+      assert.ok(at.every((p, i) => i === 0 || p === at[i - 1]! + 1), `${record.id} holds rows the window holds together`);
+    }
+    await drain(cm);
+    rendersWindowOnce(cm, await cm.compile(BIG), 'drained');
+    assert.deepEqual(next.getTopologyViolations(), []);
     cm.close();
   });
 });

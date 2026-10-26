@@ -323,6 +323,15 @@ describe('a batch is one presentation point', () => {
     assert.deepEqual(ids(cm.getUnpresentedMessages()), [s]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['u', 'r', 'q0', 'q1', 'p']);
 
+    // p is the call's last row, so a cut per row would give that window
+    // too. r is its first: a cut at r keeps the rows the call presented
+    // after it, where one record per row would keep [u, r] alone.
+    await cm.switchBranch(main);
+    const atR = cm.branchAt(r, 'zz-at-r');
+    await cm.switchBranch(atR);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [u, r, q0, q1, p], 'a cut at the first row of the call keeps the rows it presented after that row');
+    assert.deepEqual(ids(cm.getUnpresentedMessages()), [s]);
+
     await cm.switchBranch(main);
     const atS = cm.branchAt(s, 'zz-at-s');
     await cm.switchBranch(atS);
