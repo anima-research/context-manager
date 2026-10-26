@@ -2128,6 +2128,18 @@ export class ContextManager {
    * Reset the head window to start from a new position.
    * Old head window messages become compressible.
    *
+   * With a head window (`headWindowTokens` above 0) and history before the
+   * reset, the new head starts at the transition message, whole whatever its
+   * size, and then holds whole messages while they fit. (The strategy's
+   * ratchet guard can keep in the head a message's first part that was never
+   * chunked while its rest was, and the head then ends inside that message.)
+   * While every message since the transition fits, as each compile prices
+   * them, that compile sends what happened in order:
+   * the history before the reset, then the transition and each message
+   * since, so the newest is the last one sent. Once one doesn't, it sends
+   * the head first: the transition and the new topic's opening, then the
+   * history, then the rest.
+   *
    * If transitionText is provided, it's used as the transition summary.
    * If omitted, an LLM call auto-generates a transition summary.
    *

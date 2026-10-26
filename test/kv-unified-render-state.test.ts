@@ -885,7 +885,8 @@ describe('the head window', () => {
       accept(strategy, one);
       const ref = reference(strategy)!;
       await manager.resetHeadWindow('a new topic');
-      add(manager, SMALL);
+      // A message past the reset head ends its fill, so the head goes first.
+      add(manager, [...SMALL, ['u', [text(plain(6))]]]);
       const two = await compile(manager);
       assert.equal(firstChange(one, two), 0, 'premise: the reset changed what is sent from its first message');
       assert.ok(ref.markers.length > 0, 'premise: the accepted request kept markers');
@@ -894,6 +895,44 @@ describe('the head window', () => {
       assert.equal(solveMarkers(strategy), 0, 'no marker is credited');
       const solve = solved(strategy)!;
       assert.ok(solve.selected && solve.cacheRelevant && solve.selected.cacheChurn > 0, 'the solve prices the rewrite');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a reset whose head still fills keeps the accepted markers past the old head in the cache check, and the solve credits the fill's own from the next compile", async () => {
+    // The head holds the first two messages, so the accepted layout opens with its unit.
+    const { dir, strategy, manager } = await open({ headWindowTokens: 4_500, recentWindowTokens: 300 });
+    try {
+      add(manager, [...MIDDLE, ['u', [text(plain(4))]], ['a', [text(plain(5))]], ...CLOSE]);
+      const one = await compile(manager);
+      accept(strategy, one);
+      const ref = reference(strategy)!;
+      assert.equal(ref.layout.units[0]?.kind, 'head', 'premise: the accepted layout opens with the head');
+      await manager.resetHeadWindow('a new topic');
+      add(manager, SMALL);
+      const two = await compile(manager);
+      assert.equal(firstChange(one, two), one.length, 'premise: the filling head is sent after the history, which is sent as it was');
+      // The old head's own marker stands for a head's end, and no head ends
+      // there now; every marker after it is still on the wire's prefix.
+      const past = ref.markers.filter((m) => ref.layout.units[m.unitIndex - 1]?.kind !== 'head').length;
+      assert.ok(past > 0, 'premise: the accepted request had markers past its head');
+      assert.equal(solveMarkers(strategy), past, 'each marker past the old head reaches the solve');
+      // The accepted layout opens with the old head's unit, which this
+      // compile sends as history, so by reading the solve's walk from the
+      // front (kv-unified-terminal's emit) credits none of them here, as on a
+      // reset before this change. The test checks that this compile pays
+      // churn and the next fill compile a tenth of it or less.
+      const atReset = solved(strategy)!;
+      assert.ok(atReset.selected && atReset.cacheRelevant && atReset.selected.cacheChurn > 0, 'the reset compile pays cache churn');
+      accept(strategy, two);
+      add(manager, [['a', [text('ok3')]], ['u', [text('next3')]]]);
+      const three = await compile(manager);
+      assert.equal(firstChange(two, three), two.length, 'premise: the next fill compile sends the last one as it was, and adds to it');
+      const next = solved(strategy)!;
+      assert.ok(next.selected && next.cacheRelevant && next.selected.cacheChurn < atReset.selected.cacheChurn / 10,
+        `the next fill compile is credited the history: churn ${next.selected?.cacheChurn} after ${atReset.selected.cacheChurn}`);
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });

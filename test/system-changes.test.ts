@@ -414,6 +414,10 @@ describe('the autobiographical strategy and a system change', () => {
         else if (i === 22) ids.push(cm.addMessage('Harness', [inHead]));
         else ids.push(cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(10)}`)]));
       }
+      // A newest message the head window can't hold ends the reset head's
+      // fill, so the head goes first (while it fills, a compile sends store
+      // order, and the changes keep their places: reset-fill-order.test.ts).
+      ids.push(cm.addMessage('User', [text(`M-30 ${'word '.repeat(400)}`)]));
       strategy.resetHeadWindow(ids[20]!);
       // No render stats before a live compile (#311).
       assert.equal(cm.getRenderStats(), null, 'no render stats before a compile');
@@ -457,24 +461,55 @@ describe('the autobiographical strategy and a system change', () => {
     });
   }
 
-  it('adaptive: a change after the newest turn is no turn, so a structural repair that drops that turn still refuses', async () => {
-    const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });
+  it('a reset at a change after an unanswered call sends store order while the head fills, the call kept with a stub, as without a reset', async () => {
+    for (const adaptiveResolution of [true, false]) {
+      const shapes: string[] = [];
+      for (const reset of [true, false]) {
+        const strategy = new AutobiographicalStrategy({ adaptiveResolution, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });
+        const cm = await open(strategy);
+        cm.addMessage('User', [text('message ' + 'word '.repeat(10))]);
+        cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
+        const result = cm.addMessage('User', [{ type: 'tool_result', toolUseId: 't1', content: 'read.' } as ContentBlock]);
+        const trailing = cm.addMessage('Harness', [change()]);
+        // Removing the result leaves an unanswered call as the newest turn,
+        // right before the change (a write can't put one there). A reset at
+        // the change gives a head that reaches the store's end, so it fills,
+        // and a filling head is sent last, in store order: the call isn't the
+        // last compiled message, the pairing pass answers it with a stub, and
+        // nothing is dropped, as without a reset.
+        cm.removeMessage(result);
+        if (reset) strategy.resetHeadWindow(trailing);
+        const compiled = await cm.compile(BIG);
+        shapes.push(compiled.messages.map((m) => m.content.map((b) => b.type).join('+')).join(' | '));
+      }
+      assert.deepEqual(shapes, Array(2).fill('text | text+tool_use | tool_result | system_change'), `adaptive ${adaptiveResolution}`);
+    }
+  });
+
+  it('adaptive: a change after the newest turn is no turn, so the newest turn missing from what a compile sends still refuses', async () => {
+    let dropped = 0;
+    class DropsNewestTurn extends AutobiographicalStrategy {
+      protected override applyImageStripping(...args: Parameters<AutobiographicalStrategy['applyImageStripping']>): void {
+        super.applyImageStripping(...args);
+        const [entries, store] = args;
+        const all = store.getAll();
+        const newestTurn = all.filter((m) => !m.content.some((b) => b.type === ('system_change' as string))).at(-1)!;
+        const at = entries.findIndex((e) => e.sourceMessageId === newestTurn.id);
+        if (at >= 0) { entries.splice(at, 1); dropped++; }
+      }
+    }
+    const strategy = new DropsNewestTurn({ adaptiveResolution: true, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });
     const cm = await open(strategy);
     cm.addMessage('User', [text('message ' + 'word '.repeat(10))]);
-    cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
-    const result = cm.addMessage('User', [{ type: 'tool_result', toolUseId: 't1', content: 'read.' } as ContentBlock]);
-    const trailing = cm.addMessage('Harness', [change()]);
-    // Removing the result leaves an unanswered call as the newest turn, right
-    // before the change (a write can't put one there). A reset at the change
-    // puts it in the head, so the call is the last compiled message, and the
-    // structural repair trims it.
-    cm.removeMessage(result);
-    strategy.resetHeadWindow(trailing);
+    cm.addMessage('Claude', [text('reply ' + 'word '.repeat(10))]);
+    cm.addMessage('User', [text('newest ' + 'word '.repeat(10))]);
+    cm.addMessage('Harness', [change()]);
     await assert.rejects(cm.compile(BIG), (err: unknown) => {
       assert.ok(err instanceof OverBudgetError, String(err));
       assert.match(err.message, /^Structural repair did not retain the newest turn/);
       return true;
     });
+    assert.ok(dropped > 0, 'premise: the subclass took the newest turn out');
   });
 
   it('a transition summary reads no change: a head message of changes alone adds no entry to its request', async () => {
