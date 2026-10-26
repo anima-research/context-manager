@@ -7,7 +7,12 @@ export interface StoreBranchGeneration {
 
 const branchGenerations = new WeakMap<JsStore, StoreBranchGeneration>();
 
-/** Observe direct/non-manager switches without advancing ordinary same-branch opens. */
+/**
+ * Observe direct/non-manager switches without advancing ordinary same-branch
+ * opens. ContextManager.reinitializeOnStoreBranch initializes at the
+ * generation this returns, so every manager on a store can follow one move
+ * without staling another.
+ */
 export function observeStoreBranch(store: JsStore): StoreBranchGeneration {
   const name = store.currentBranch().name;
   const previous = branchGenerations.get(store);

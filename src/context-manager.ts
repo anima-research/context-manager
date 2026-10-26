@@ -343,17 +343,23 @@ interface DerivableStore {
  * From switchBranch() or fork(), the call's branch selection, and a fork's
  * branch creation, had already happened: `branch` names the branch, and
  * `created` says whether this call created it. A caller never needs to retry
- * a fork to learn whether it happened. From setStrategy(), `branch` is
- * undefined.
+ * a fork to learn whether it happened. From reinitializeOnStoreBranch(),
+ * `branch` names the branch the store was on, which the call followed and
+ * didn't select (`followed` in the constructor's argument words the message
+ * so), and `created` is false. From setStrategy(), `branch` is undefined.
  */
 export class InitializationSupersededError extends Error {
   readonly branch: string | undefined;
   readonly created: boolean;
 
-  constructor(selection?: { branch: string; created: boolean }) {
+  constructor(selection?: { branch: string; created: boolean; followed?: boolean }) {
     super(
       selection
-        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+        ? `ContextManager.${
+          selection.created ? 'fork created and selected'
+            : selection.followed ? 'reinitializeOnStoreBranch followed the store to'
+              : 'switchBranch selected'
+        } ` +
           `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
         : 'Strategy initialization was superseded by a newer initialization',
     );
@@ -375,18 +381,20 @@ export class InitializationSupersededError extends Error {
  * be partial: isReady, getPendingWork, getHotContextSettings, previewContext,
  * listPins, searchSummaries, getSummary, getSummariesInRange,
  * getMaxSummaryLevel and getRenderStats. Raw message reads and branch
- * inspection remain available for recovery with switchBranch() or
- * setStrategy(). So do compression holds (holdCompression,
- * releaseCompression) and request settings (setToolDefinitions,
- * setSystemPrompt): they live in memory, and the strategy hears of a released
- * hold only once an attempt succeeds.
+ * inspection remain available for recovery with switchBranch(),
+ * reinitializeOnStoreBranch() or setStrategy(). So do compression holds
+ * (holdCompression, releaseCompression) and request settings
+ * (setToolDefinitions, setSystemPrompt): they live in memory, and the
+ * strategy hears of a released hold only once an attempt succeeds.
  *
  * The fence governs operations that start while an attempt is pending or
  * failed. Work already in flight when a transition begins, and a superseded
  * initializer's own writes before it returns, are the strategy's to guard;
  * transitions do not roll back earlier writes. Direct Chronicle switches retain
  * their existing strategy-specific semantics; this fence does not pin a manager
- * to a branch.
+ * to a branch. After one, or after another manager on the store switched or
+ * forked, reinitializeOnStoreBranch() initializes this manager's strategy on
+ * the branch the store is on.
  */
 export class ContextManager {
   private store: JsStore;
@@ -1800,6 +1808,14 @@ export class ContextManager {
    * switchBranch() or setStrategy(). Inspection and close remain available.
    * If a newer initialization supersedes this one, the call rejects with
    * InitializationSupersededError naming the branch it selected.
+   *
+   * The switch moves the store's branch, which every manager on the store
+   * follows, and starts a new branch generation. Every other manager's
+   * strategy was initialized at the old one, and a strategy that checks the
+   * generation, as AutobiographicalStrategy does, refuses its work until it
+   * initializes again: call reinitializeOnStoreBranch() on each of those
+   * managers, not switchBranch(), whose own new generation would leave this
+   * one's strategy stale in turn.
    */
   async switchBranch(branchId: string): Promise<void> {
     this.requireOpen('switchBranch');
@@ -1810,6 +1826,46 @@ export class ContextManager {
     this.store.switchBranch(name);
     const requested = markStoreBranchSwitch(this.store);
     await this.initializeStrategy(requested, { branch: requested.name, created });
+  }
+
+  /**
+   * Initialize the strategy again on the branch the store is on, after
+   * something else moved it: the call a host makes on every other manager
+   * sharing a store once it has moved the store's branch itself
+   * (`store.switchBranch`) or through one manager's switchBranch() or
+   * fork(). It selects no branch and starts no branch generation: it
+   * observes the store's, as the strategy does, so any number of managers on
+   * one store can each call it after one move, in any order or at once, and
+   * every one of them ends at the same generation, none leaving another's
+   * strategy stale (AutobiographicalStrategy refuses its work, "requires
+   * reinitialization for the current branch generation", until its manager
+   * initializes it at the current one). On the branch the strategy already
+   * loaded it loads it again: a move away and back that a manager or a
+   * strategy observed in between has moved the generation on too.
+   *
+   * Nothing is written to the record. The strategy reloads its
+   * branch-scoped state, and may write as its initialize() does on any
+   * branch. The window index follows the store's branch on its own, so on
+   * a branch made before this manager's write-down windowMode() reads
+   * 'legacy' after the call, as after a switchBranch(): a host that presents
+   * rows writes that branch down with presentRows([]). Rows presented or
+   * taken out while the strategy wasn't initialized are told to it once it
+   * is, by the same rule as after any initialization.
+   *
+   * The recovery contract is switchBranch()'s: if initialization rejects,
+   * mutations and strategy operations stay blocked until a successful
+   * reinitializeOnStoreBranch(), switchBranch() or setStrategy(); a store
+   * moved again while it initialized rejects it, and the caller calls it
+   * again once the move settles. If a newer initialization supersedes this
+   * one, the call rejects with InitializationSupersededError naming the
+   * branch it followed, `created` false. A manager made by derive() holds a
+   * handle bound to its own branch, which a move of the store doesn't
+   * touch: the call initializes its strategy again there.
+   */
+  async reinitializeOnStoreBranch(): Promise<void> {
+    this.requireOpen('reinitializeOnStoreBranch');
+    const observed = observeStoreBranch(this.store);
+    await this.initializeStrategy(observed, { branch: observed.name, created: false, followed: true });
   }
 
   /**
@@ -3203,7 +3259,7 @@ export class ContextManager {
 
   private async initializeStrategy(
     expectedBranch?: StoreBranchGeneration,
-    selection?: { branch: string; created: boolean },
+    selection?: { branch: string; created: boolean; followed?: boolean },
   ): Promise<void> {
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
