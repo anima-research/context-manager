@@ -10,11 +10,20 @@
  *   subject to  render(F) ≤ W            — the only physics
  *               perturbation(F, F_prev) ≤ P   — trust region; overridable
  *
- * - The IDEAL CUT is built from scratch each turn by pure relevance: fold in
- *   salience-then-age priority order, level by level, under the soft shape
- *   prior (`foldDepthCap`), past it if W demands, never past the hard
- *   protections (flat zone / pins / locked); then pack youngest-first back
- *   toward the target. Age/salience-monotone by construction.
+ * - The IDEAL CUT is built each turn by relevance, SEEDED from the carried
+ *   frontier (`seedFromCarried`, default; `false` builds it from raw): fold
+ *   in salience-then-age priority order, level by level, under the soft
+ *   shape prior (`foldDepthCap`), past it if W demands, never past the hard
+ *   protections (flat zone / pins / locked); then pack youngest-position-
+ *   first back toward the target. Of a seeded cut's phases, A and B only
+ *   deepen what is carried and only C un-folds. An inverted carried profile
+ *   is lowered before the phases run so it heals in fold order (ascending
+ *   salience, then oldest), a boundary-cut fold excepted; monotone
+ *   over-depth is kept (the hysteresis that stops a band boundary from
+ *   flapping with the balance of production and growth). Where a budget
+ *   raise leaves the seeded cut paying nearly the whole from-scratch re-read
+ *   anyway, the from-scratch cut is taken instead (`seedingReleased`).
+ *   Bootstrap (nothing carried) is from scratch.
  * - PERTURBATION is exact, not modeled: `kvCost` — the tokens the provider
  *   will re-read from the earliest layout divergence to the end.
  * - P (`reachTokens`, re-priced) is a TRUST REGION on per-turn divergence,
@@ -75,6 +84,12 @@ export interface ControlOptions {
   targetSteps?: number;
   /** Cache TTL in steps. Default Infinity. */
   cacheTtlSteps?: number;
+  /** Seed each turn's ideal cut from the carried frontier, the production
+   *  default (`ControlPlanParams.seedFromCarried` says when a budget raise
+   *  takes the from-scratch cut instead). Forwarded to every
+   *  `planControlledFrontier` call of the replay; `false` measures the
+   *  from-scratch ideal. Default true. */
+  seedFromCarried?: boolean;
 }
 
 export interface ControlStep {
@@ -253,7 +268,39 @@ class TokenLedger {
 }
 
 /**
- * Build the IDEAL CUT from scratch — pure relevance, no P anywhere (§13.4).
+ * Counts by position over 0..n-1 (a Fenwick tree), for phase C's walk list:
+ * `count(i, d)` adds d at position i, and `olderThan(i)` returns the largest
+ * position below i whose count is positive, or -1 when there's none. Each
+ * takes O(log n) steps, and `olderThan` calls `step` once for each of its
+ * steps (#156 R6-1).
+ */
+export function listedCounts(n: number, step: () => void = () => {}): { count(i: number, d: number): void; olderThan(i: number): number } {
+  const counts = new Int32Array(n + 1);
+  let top = 1;
+  while (top * 2 <= n) top *= 2;
+  return {
+    count(i: number, d: number): void {
+      for (let x = i + 1; x <= n; x += x & -x) counts[x] += d;
+    },
+    olderThan(i: number): number {
+      let k = 0; // counted positions before i
+      for (let x = i; x > 0; x -= x & -x) { k += counts[x]; step(); }
+      if (k === 0) return -1;
+      let pos = 0; // the k-th counted position
+      for (let half = top; half > 0; half >>= 1) {
+        step();
+        if (pos + half <= n && counts[pos + half] < k) { pos += half; k -= counts[pos]; }
+      }
+      return pos;
+    },
+  };
+}
+
+/**
+ * Build the IDEAL CUT from `base` — pure relevance, no P anywhere (§13.4).
+ * `base` is the carried frontier when seeded (the default), and raw on
+ * bootstrap, with `seedFromCarried: false` and for the release's from-scratch
+ * cut.
  *
  * Fold order is (salience ascending, then oldest-first), level by level, so the
  * profile is salience/age-monotone by construction: with uniform salience it
@@ -415,6 +462,17 @@ function relevanceCut(
   if (ledger.tokens > windowTokens) foldPass(true, target);
 
   // Phase C: pack youngest-first back toward the target (skip if infeasible).
+  //
+  // Youngest by POSITION, whatever its level — not deepest level first.
+  // Until 2026-10-09 the walk was `for level = max..1 { youngest-first }`,
+  // which un-folded the youngest L3 group before any L1: on a chronological
+  // layout that group sits right after the deep band, so every un-fold was a
+  // front edit. Measured on Fable (fold-diff, 2026-10-07..09): the group at
+  // the L2↔L3 boundary flapped L3→L2→L3 seven times in three days, each
+  // direction re-reading ~300k tokens, while a fold confined to the seam cost
+  // ~97k. The comment always said headroom goes to the most recent foldable
+  // content; the loop now does what it says, so an un-fold lands where the
+  // next fold will — at the seam — and the dead band can hold.
   if (ledger.tokens <= windowTokens && ledger.tokens < target) {
     // A group's un-fold verdict (eligibility + accept/revert) can only change
     // after the ledger moves — i.e. after some OTHER group's un-fold is
@@ -422,17 +480,135 @@ function relevanceCut(
     // remaining member chunk at that level: for a ~1.7k-leaf group the tail
     // boundary cuts through, that is ~1.7k attempts × 2×1.7k ledger moves
     // (try + revert) — the dominant term of the mythos 30s/turn leak.
-    // `attempted` short-circuits repeats and is cleared whenever an accept
-    // changes the ledger, so the accept SEQUENCE is exactly the naive one.
+    // `attempted` short-circuits repeats. An accept only raises the ledger
+    // toward the target (one that lowers it, or leaves it, isn't closer), so
+    // a group the accept test declined stays declined until a leaf its
+    // verdict read moves: its members, whose levels decide eligibility, and
+    // the members of each summary it would land on, whose levels decide the
+    // landing and the units the ledger counts. Each key is filed under those
+    // leaves, and an accept clears only the keys filed under what it moved.
+    // Clearing every key re-tried each declined group once per accept, and
+    // with the walk's restart that was quadratic again (#156 R5-1).
     const attempted = new Set<string>();
-    for (let level = maxFoldLevel; level >= 1 && ledger.tokens < target; level--) {
-      for (let oi = ordered.length - 1; oi >= 0; oi--) {
+    const readers = new Map<ChunkId, string[]>();
+    const fileReads = (key: string, nodeId: string, leafIds: readonly ChunkId[], level: number): void => {
+      for (const id of leafIds) {
+        // Only a leaf the summary renders at that level reaches the verdict:
+        // eligibility, the landing veto and the ledger's units all skip the rest.
+        if (tree.ancestorAt(id, level)?.id !== nodeId) continue;
+        const keys = readers.get(id);
+        if (keys) keys.push(key); else readers.set(id, [key]);
+      }
+    };
+    // After every accepted un-fold the walk RESTARTS from the youngest
+    // position, so the group that just stepped down is the first candidate
+    // for its next step (L2→L1→raw) before any older group is tried. Walking
+    // on from the accepting member instead reached the same group's next
+    // level only through its other members — a group left with one live
+    // member (store surgery) or whose accept came through its oldest member
+    // waited for the next pass, and an older group took the headroom first
+    // (#156 review, Greptile P1). Cost: each node/level is accepted at most
+    // once, so passes are bounded by accepts + 1, and a rejected group is
+    // tried again only after an accept moves a leaf its verdict read.
+    // Phase C only lowers levels (an accept lowers its group, a revert puts
+    // back levels of at least 1), so a chunk that is raw or protected stays
+    // out of reach for the rest of the phase. The walk follows a list of the
+    // chunks still at a level of at least 1 and unprotected, youngest first,
+    // and an accept unlinks each member it takes raw. A group phase C declines
+    // or can't take leaves the list too, until an accept moves a leaf its
+    // verdict read, and a chunk with no summary at its level leaves it on its
+    // first visit. Restarting at the
+    // youngest position and skipping raw chunks one by one rescanned every
+    // group earlier accepts had taken raw, quadratic in the groups a large
+    // raise un-folds (#156 R4-1). Skipping only the raw run at the young end
+    // still rescanned them behind a youngest group that stays declined.
+    const n = ordered.length;
+    const olderListed = new Int32Array(n); // the next older listed position, or -1
+    const youngerListed = new Int32Array(n); // the next younger listed position, or n
+    const listed = new Uint8Array(n);
+    // Phase C's pass and visit counts (KV_TIMING). They come before
+    // `listedCounts`, whose search counts each of its steps as a visit.
+    let passes = 0;
+    let visits = 0;
+    // Listed counts by position (a Fenwick tree), so `relist` finds the next
+    // older listed chunk in O(log n) rather than by scanning back over every
+    // parked or raw one: one accept per pass can relist a group behind a long
+    // unlisted run, and scanning it each time was quadratic in the run.
+    // Each step of that search counts as a visit (KV_TIMING's `visits`), so
+    // the tests that bound phase C's visits bound relist's search too (#156
+    // R6-1).
+    const { count, olderThan } = listedCounts(n, () => { visits++; });
+    let youngestListed = -1;
+    let oldestListed = n;
+    for (let i = 0; i < n; i++) {
+      const id = ordered[i].id;
+      if ((F.get(id) ?? 0) < 1 || rawZone.has(id) || immovable.has(id)) continue;
+      listed[i] = 1;
+      count(i, 1);
+      if (oldestListed === n) oldestListed = i;
+      olderListed[i] = youngestListed;
+      if (youngestListed >= 0) youngerListed[youngestListed] = i;
+      youngestListed = i;
+    }
+    if (youngestListed >= 0) youngerListed[youngestListed] = n;
+    const positionOf = new Map(ordered.map((c, i) => [c.id, i] as const));
+    const unlist = (i: number): void => {
+      if (!listed[i]) return;
+      listed[i] = 0;
+      count(i, -1);
+      const older = olderListed[i];
+      const younger = youngerListed[i];
+      if (older >= 0) youngerListed[older] = younger;
+      else oldestListed = younger;
+      if (younger < n) olderListed[younger] = older;
+      else youngestListed = older;
+    };
+    const relist = (i: number): void => {
+      if (listed[i]) return;
+      const older = olderThan(i);
+      listed[i] = 1;
+      count(i, 1);
+      const younger = older >= 0 ? youngerListed[older] : oldestListed;
+      olderListed[i] = older;
+      youngerListed[i] = younger;
+      if (older >= 0) youngerListed[older] = i;
+      else oldestListed = i;
+      if (younger < n) olderListed[younger] = i;
+      else youngestListed = i;
+    };
+    // A declined or ineligible group's members leave the walk until its key
+    // is cleared: they would only be visited to hit `attempted`.
+    const parked = new Map<string, number[]>();
+    const park = (key: string, nodeId: string, leafIds: readonly ChunkId[], level: number): void => {
+      const at: number[] = [];
+      for (const leafId of leafIds) {
+        const i = positionOf.get(leafId);
+        if (i === undefined || !listed[i]) continue;
+        if ((F.get(leafId) ?? 0) !== level || tree.ancestorAt(leafId, level)?.id !== nodeId) continue;
+        unlist(i);
+        at.push(i);
+      }
+      if (at.length) parked.set(key, at);
+    };
+    const clearKey = (key: string): void => {
+      if (!attempted.delete(key)) return;
+      const at = parked.get(key);
+      if (!at) return;
+      parked.delete(key);
+      for (const i of at) if ((F.get(ordered[i].id) ?? 0) >= 1) relist(i);
+    };
+    const _tc = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
+    let progressed = true;
+    while (progressed && ledger.tokens < target) {
+      progressed = false;
+      passes++;
+      for (let oi = youngestListed; oi >= 0; oi = olderListed[oi]) {
         if (ledger.tokens >= target) break;
-        const c = ordered[oi]; // youngest-first
-        if ((F.get(c.id) ?? 0) !== level) continue;
-        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
+        visits++;
+        const c = ordered[oi]; // youngest-first, among the listed chunks
+        const level = F.get(c.id) ?? 0;
         const node = tree.ancestorAt(c.id, level);
-        if (!node) continue;
+        if (!node) { unlist(oi); continue; } // static: no summary at its level
         const attemptKey = `${node.id}:${level}`;
         if (attempted.has(attemptKey)) continue;
         let eligible = true;
@@ -449,7 +625,7 @@ function relevanceCut(
             break;
           }
         }
-        if (!eligible) { attempted.add(attemptKey); continue; }
+        if (!eligible) { attempted.add(attemptKey); fileReads(attemptKey, node.id, node.leafChunkIds, level); park(attemptKey, node.id, node.leafChunkIds, level); continue; }
         const before = ledger.tokens;
         // Record exact prior levels for an honest revert: with boundary-cut
         // tolerance a group may hold members below `level` (protected raw,
@@ -472,12 +648,14 @@ function relevanceCut(
         // change while the un-fold moves its leaves, or when the projection
         // runs after it. Eligibility put every leaf moved here at `level`.
         const vetoMemo = new Map<string, boolean>();
+        const landings: Array<[{ id: string; leafChunkIds: readonly ChunkId[] }, number]> = [];
         const landingVetoed = (own: { id: string; leafChunkIds: readonly ChunkId[] }, at: number): boolean => {
           const key = `${own.id}:${at}`;
           let verdict = vetoMemo.get(key);
           if (verdict === undefined) {
             verdict = vetoed(tree, own, at, F, projectionExempt);
             vetoMemo.set(key, verdict);
+            landings.push([own, at]);
           }
           return verdict;
         };
@@ -513,14 +691,27 @@ function relevanceCut(
             F.set(leafId, from);
           }
           attempted.add(attemptKey);
+          fileReads(attemptKey, node.id, node.leafChunkIds, level);
+          for (const [own, at] of landings) fileReads(attemptKey, own.id, own.leafChunkIds, at);
+          park(attemptKey, node.id, node.leafChunkIds, level);
         } else {
-          // The ledger moved: previously reverted/ineligible groups may now
-          // verdict differently — exactly when the naive loop would have
-          // re-attempted them.
-          attempted.clear();
+          // The ledger moved: a group whose verdict read a moved leaf may now
+          // verdict differently, so it returns to the walk.
+          for (const [leafId] of moved) {
+            for (const key of readers.get(leafId) ?? []) clearKey(key);
+            readers.delete(leafId);
+          }
+          for (const [leafId, , to] of moved) {
+            if (to > 0) continue;
+            const i = positionOf.get(leafId);
+            if (i !== undefined) unlist(i);
+          }
+          progressed = true;
+          break; // restart from the youngest position
         }
       }
     }
+    if (_tc) log.error(`[kv-timing] phase-c ${Date.now() - _tc}ms passes=${passes} visits=${visits}`);
   }
 
   const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
@@ -829,6 +1020,28 @@ export interface ControlPlanParams {
   /** Never override P for quality while preparing a future window. If the
    * smallest realizable change exceeds P, hold and report a pace floor. */
   strictReach?: boolean;
+  /**
+   * Seed the ideal cut from the carried frontier instead of from raw: phases
+   * A/B only deepen what is carried (same salience-then-oldest, level-by-level
+   * order), and only phase C — youngest position first — un-folds. The
+   * from-scratch cut re-decides every band boundary from the current balance
+   * of production and growth, so a deep group near a boundary is raised when
+   * a new mid-level summary lands and re-deepened when growth crosses W —
+   * each direction a front edit (#156 review, Major 2). An inverted carried
+   * profile (a chunk deeper than an older unprotected chunk) is still lowered
+   * to the older level so phase A re-folds it in its own order (ascending
+   * salience, then oldest) — the quality-gap self-heal keeps working. An
+   * older chunk is weighed only against younger chunks at or above the next
+   * level its group can render at, so one already at its group's deepest
+   * level, or whose lineage skips past the younger chunk's level, is no
+   * evidence of inversion, and a boundary-cut fold isn't lowered. Where the
+   * carried frontier is under expandAt and the seeded cut would pay nearly
+   * the whole from-scratch re-read anyway, the from-scratch cut is taken
+   * instead (`ControlPlan.seedingReleased`). Seeding doesn't apply to
+   * bootstrap (nothing carried). Default true; `false` builds the ideal from
+   * raw every turn, keeping phase C's walk by youngest position.
+   */
+  seedFromCarried?: boolean;
   /** Quality-gap override threshold (§13.4): a plan within P is rejected — and
    *  the ideal adopted, paying the perturbation — when its relevance loss
    *  exceeds the ideal's by more than this fraction of the ideal's loss.
@@ -891,6 +1104,15 @@ export interface ControlPlan {
    *  - 'infeasible': nothing within P fits under W — feasibility beats P;
    *  - 'quality-gap': the best plan within P was certifiably bad vs the ideal. */
   override?: 'bootstrap' | 'infeasible' | 'quality-gap';
+  /** Seeded solve only: the from-scratch cut was taken instead of the
+   *  carried-seeded one. That's weighed only while the carried frontier is
+   *  under expandAt, as after a budget raise, and taken when the seeded plan
+   *  pays a re-read and would already pay ≥ 90% of the from-scratch one,
+   *  which may be none: keeping the tight-budget allocation buys nothing then
+   *  (#156 R2-3, R3-3; #186 R3-2). Past the trust region, a plan that adopts
+   *  the whole cut through an override, or its newest part (step 5), reports
+   *  it too; one that adopts none of it, where no part fits, doesn't. */
+  seedingReleased?: boolean;
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';
   /** The leaves that a summary this plan renders lists while their own
@@ -906,7 +1128,9 @@ export interface ControlPlan {
  * Plan one turn's frontier — the rev 5.0 single-path solve (§13.4), shared by
  * the replay harness (`replayControlled`) and `KvStableStrategy`.
  *
- *   1. Build the IDEAL CUT from scratch (pure relevance; W the only wall).
+ *   1. Build the IDEAL CUT by pure relevance (W the only wall), seeded from
+ *      the carried frontier by default (`seedFromCarried`; from raw on
+ *      bootstrap or when `false`).
  *   2. No carried frontier → adopt it (bootstrap; P not applicable).
  *   3. Carried frontier in the [expandAt, foldAt] dead band with a small
  *      quality gap → hold it (zero perturbation). A LARGE gap falls through:
@@ -1077,6 +1301,100 @@ function planUnreported(
   diagHist('carried(projected)', carried, tree, log);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
+  // Receding-horizon seeding (the default): the ideal starts where the
+  // carried frontier is, so A/B never un-fold and the only raises are phase
+  // C's seam-first ones — EXCEPT where the carried profile is inverted (a
+  // chunk carried deeper than some OLDER unprotected chunk): those are
+  // lowered to the older chunk's level so phase A re-folds the region in its
+  // own order (ascending salience, then oldest) and the inversion heals (the
+  // quality-gap self-heal's purpose). Monotone
+  // over-depth — the boundary group a new mid-level summary made
+  // unnecessary — is kept, which is the hysteresis the from-scratch cut
+  // lacks. Protected/base levels are already in `carried`.
+  let idealBase = base;
+  const seeded = (p.seedFromCarried ?? true) && carriedNonEmpty;
+  if (seeded) {
+    idealBase = new Map(carried);
+    // Per-node memo for the pin-cap scan below: the verdict depends only on
+    // the node, and every member chunk would otherwise rescan the node's
+    // leaves (O(N·groupSize) per compile on a 36k-message store).
+    const nodeFoldable = new Map<SummaryId, boolean>();
+    const canRenderAt = (node: { id: SummaryId; leafChunkIds: readonly ChunkId[] }, k: number): boolean => {
+      const hit = nodeFoldable.get(node.id);
+      if (hit !== undefined) return hit;
+      let ok = true;
+      for (const leafId of node.leafChunkIds) {
+        if (p.rawZone.has(leafId) || immovable.has(leafId)) continue;
+        // A listed leaf whose own lineage at this level is another node, or
+        // none, takes no part in the group's fold (groupEligible skips it),
+        // so its pin-max-level doesn't cap the group (#186 R3-3).
+        if (tree.ancestorAt(leafId, k)?.id !== node.id) continue;
+        const cap = pinCaps.get(leafId);
+        if (cap !== undefined && cap < k) { ok = false; break; }
+      }
+      nodeFoldable.set(node.id, ok);
+      return ok;
+    };
+    // A chunk whose group at its carried level has a hard-protected member
+    // (in the raw zone, pinned or locked) is part of a boundary-cut fold: the
+    // group's other members fold with the protected ones held, so a younger
+    // one can sit folded beside older raw chunks without being an inversion.
+    // So it isn't lowered as inverted, which moved the plan once on unchanged
+    // inputs after such a fold (R3-4). The group is the chunk's lineage at its
+    // carried level, which lists it, since the carried frontier was projected
+    // to a valid cut above. Its members are the leaves whose own lineage there
+    // is that node, as for canRenderAt: a protected leaf the node lists under
+    // another lineage takes no part in its fold. Each node's members are read
+    // once.
+    const boundaryCutMemo = new Map<SummaryId, boolean>();
+    const boundaryCut = (chunkId: ChunkId, lvl: number): boolean => {
+      const node = tree.ancestorAt(chunkId, lvl);
+      if (!node) return false;
+      let cut = boundaryCutMemo.get(node.id);
+      if (cut === undefined) {
+        cut = node.leafChunkIds.some((leafId) => (p.rawZone.has(leafId) || immovable.has(leafId))
+          && tree.ancestorAt(leafId, lvl)?.id === node.id);
+        boundaryCutMemo.set(node.id, cut);
+      }
+      return cut;
+    };
+    // An older chunk is evidence that a younger, deeper chunk is inverted
+    // only if it could fold deeper without passing the younger chunk's level:
+    // it is weighed against younger chunks at or above `next`, the lowest
+    // level above its own where a summary lists it and its group can render. olderMinAt[k] is
+    // the lowest carried level among older unprotected chunks whose `next` is
+    // k. On a nested tree `next` is the chunk's own level plus one, and a
+    // younger chunk deeper than any older chunk is lowered to the lowest such
+    // older level. A lineage can skip levels for a chunk, though: an L1
+    // listed directly by an L4 and dropped from its L2 can't fold to L2 or L3,
+    // and weighed against every younger L2 and L3 it lowered the whole younger
+    // band on every seeded compile (#156 R4-2). An older chunk already at the
+    // deepest level its GROUP can render at has no `next`, so it is no
+    // evidence at all (#156 R2-1: a parentless L1 beside an L3, or a
+    // pin-max-level on a group-mate, otherwise re-lowered the band on every
+    // compile, a two-cycle re-reading the whole layout, and the deep-band
+    // flap back under a pin). A level counts only where its summary lists the
+    // chunk (R3-2), which `ancestorAt` checks, and where no pin-max-level
+    // among the group's foldable leaves caps it (`canRenderAt`).
+    const olderMinAt: number[] = [];
+    for (const c of ordered) { // oldest first
+      if (p.rawZone.has(c.id) || immovable.has(c.id)) continue;
+      const lvl = carried.get(c.id) ?? 0;
+      let olderMin = Number.POSITIVE_INFINITY;
+      for (let k = 1; k <= lvl && k < olderMinAt.length; k++) {
+        const m = olderMinAt[k];
+        if (m !== undefined && m < olderMin) olderMin = m;
+      }
+      if (lvl > olderMin && !boundaryCut(c.id, lvl)) idealBase.set(c.id, olderMin);
+      let next = 0;
+      for (let k = lvl + 1, top = tree.maxLevel(c.id); k <= top; k++) {
+        const node = tree.ancestorAt(c.id, k);
+        if (node && canRenderAt(node, k)) { next = k; break; }
+      }
+      const prev = olderMinAt[next];
+      if (next > 0 && (prev === undefined || lvl < prev)) olderMinAt[next] = lvl;
+    }
+  }
 
   // Shape prior: soft per-chunk depth caps (log-age band + pin caps), with the
   // −1 sentinel marking the hard-protected set (never folded by anything).
@@ -1096,10 +1414,38 @@ function planUnreported(
 
   // 1. The ideal cut — pure relevance, no P anywhere.
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  const ideal = relevanceCut(
-    inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-    p.targetTokens, p.windowTokens, maxFoldLevel, log,
-  );
+  let ideal = relevanceCut(inputs, tree, ordered, idealBase, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+    p.targetTokens, p.windowTokens, maxFoldLevel, log);
+  // The hysteresis has a cost the quality-gap check cannot see: relevance
+  // loss scores only depth past the age cap, and the seeded ideal keeps the
+  // carried depth, so a budget raise can leave L4s in place that a
+  // from-scratch cut would open — while the seeded plan still pays most of
+  // the rewrite (the seam below the band churns either way). So where the
+  // carried frontier has headroom, under expandAt as after a raise, a seeded
+  // ideal that pays a re-read is set beside the from-scratch cut, and when it
+  // would already pay ≥ 90% of the from-scratch re-read, the from-scratch cut
+  // is taken: the hysteresis is buying nothing but a worse allocation. That
+  // includes a from-scratch cut that re-reads nothing, where the seeded ideal
+  // would re-lay a plan on unchanged inputs. A seeded ideal that re-reads
+  // nothing is kept without building the other cut. Past the trust region P,
+  // the from-scratch cut is adopted as any ideal past P is: its newest part
+  // that fits within P (step 5), and that plan reports the release if it takes
+  // any of it, or the whole cut where the infeasible or quality-gap override
+  // applies. Above expandAt (a shed, a hold, a fold at the seam) the seeded
+  // plan is kept. (#156 R2-3, R3-3; #186 R3-2)
+  let seedingReleased = false;
+  if (seeded && carriedTokens < expandAt) {
+    const seededPert = kvCost(carriedLayout, renderLayout(inputs, tree, ideal.F));
+    if (seededPert > 0) {
+      const scratch = relevanceCut(inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+        p.targetTokens, p.windowTokens, maxFoldLevel, log);
+      const scratchPert = kvCost(carriedLayout, renderLayout(inputs, tree, scratch.F));
+      if (seededPert >= 0.9 * scratchPert) {
+        ideal = scratch;
+        seedingReleased = true;
+      }
+    }
+  }
   if (_t0) log.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   diagHist('ideal', ideal.F, tree, log);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
@@ -1126,6 +1472,7 @@ function planUnreported(
     escalated: ideal.tokens > p.windowTokens,
     perturbation: kvCost(carriedLayout, idealLayout),
     ...(override ? { override } : {}),
+    ...(seedingReleased ? { seedingReleased: true } : {}),
     ...(strictReach && ideal.tokens > p.foldAtTokens
       ? { blocked: 'target-floor' as const }
       : {}),
@@ -1169,12 +1516,14 @@ function planUnreported(
   if (partial.tokens <= p.windowTokens && partialLoss - idealLoss <= gapCeiling && madeProgress) {
     diagBranch(`suffix-adopt (pert=${partial.perturbation} tokens=${partial.tokens})`, log);
     diagHist('partial', partial.F, tree, log);
+    const moved = flags(partial.F);
     return {
       resolutions: partial.F,
       tokens: partial.tokens,
-      ...flags(partial.F),
+      ...moved,
       escalated: false,
       perturbation: partial.perturbation,
+      ...(seedingReleased && (moved.folded || moved.expanded) ? { seedingReleased: true } : {}),
     };
   }
 
@@ -1256,6 +1605,7 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
     const plan = planControlledFrontier(inputs, tree, {
       previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
       windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,
+      seedFromCarried: opts.seedFromCarried,
     });
     // The replay renders each turn's plan, so it reports the plan's overlap.
     reportOverlap(plan.overlap);

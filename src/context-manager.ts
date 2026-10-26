@@ -58,7 +58,6 @@ import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.j
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
-import { isCompileRefusal, isolateObserver, type ContextObserver } from './observer.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
@@ -142,18 +141,6 @@ interface ContextManagerBaseConfig {
    * inject a fake clock.
    */
   now?: () => number;
-  /**
-   * Told of each compile, of each refusal context-manager itself makes of
-   * compression, and of each calibration sample, as each happens (see
-   * `ContextObserver`). The manager hands it to its strategy in
-   * `StrategyContext`. It's called synchronously, and what it throws or
-   * rejects never reaches the work: the manager logs a callback's first
-   * failure through its diagnostics and drops the rest. (A returned promise
-   * no JavaScript can give a handler is outside that; see
-   * `ContextObserver`.) A record's error and render
-   * stats are the objects the caller gets, so treat them as read-only.
-   */
-  observer?: ContextObserver;
   /**
    * Strategy-facing exclusion predicate: return true to keep a message
    * visible. When set, the view handed to the strategy — for compile,
@@ -316,8 +303,6 @@ export class ContextManager {
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
   private compressionHoldInfo = new Map<MessageId, CompressionHoldInfo>();
   private now: () => number = Date.now;
-  /** The host's observer, isolated (`ContextManagerConfig.observer`), or none. */
-  private observer: ContextObserver | undefined;
   /** Hold options + shared heldAt for the addMessage currently appending. */
   private holdingAddOptions: CompressionHoldOptions | undefined;
   private holdingAddAt = 0;
@@ -544,14 +529,6 @@ export class ContextManager {
       auxiliaryStores,
     );
     if (config.now) manager.now = config.now;
-    if (config.observer) {
-      manager.observer = isolateObserver(config.observer, (callback, error) => logThrown(
-        `[context-manager] the observer's ${callback} callback threw or rejected; the work it observes goes on, ` +
-          `and its later failures aren't logged:`,
-        error,
-        manager.diag,
-      ));
-    }
 
     try {
       await manager.initializeStrategy();
@@ -1236,9 +1213,6 @@ export class ContextManager {
    * model that binds thinking can no longer take, injections placed (see
    * `SelectOptions.thinkingBinding`).
    *
-   * With `ContextManagerConfig.observer`, it tells the observer of the
-   * compile as it returns or throws (`ContextObserver.compile`).
-   *
    * It awaits nothing, so it doesn't wait for the strategy's background work.
    */
   async compile(
@@ -1246,38 +1220,6 @@ export class ContextManager {
     injections?: ContextInjection[],
     opts?: SelectOptions
   ): Promise<CompileResult> {
-    const observer = this.observer;
-    if (!observer?.compile) return this.compileNow(budget, injections, opts);
-    // A compile awaits nothing, so it's timed whole on one clock reading
-    // each side, and the observer hears of it as it returns or throws. The
-    // wall clock, not the manager's own, so an observer adds no read of now().
-    const startedAt = Date.now();
-    const start = performance.now();
-    const strategy = this.strategy.name;
-    const dryRun = opts?.dryRun === true;
-    let result: CompileResult;
-    try {
-      result = this.compileNow(budget, injections, opts);
-    } catch (error) {
-      observer.compile({
-        strategy, dryRun, startedAt, durationMs: performance.now() - start,
-        outcome: isCompileRefusal(error) ? 'refused' : 'failed', error,
-      });
-      throw error;
-    }
-    observer.compile({
-      strategy, dryRun, startedAt, durationMs: performance.now() - start, outcome: 'compiled',
-      ...(result.renderStats ? { renderStats: result.renderStats } : {}),
-    });
-    return result;
-  }
-
-  /** compile()'s work, which awaits nothing. */
-  private compileNow(
-    budget?: TokenBudget,
-    injections?: ContextInjection[],
-    opts?: SelectOptions
-  ): CompileResult {
     this.requireInitialized('compile');
     // Before anything is selected or committed: a compile refused here leaves
     // nothing behind.
@@ -2075,7 +2017,10 @@ export class ContextManager {
    * deepest it has, and one whose own-lineage summary at `level` doesn't list
    * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
-   * resolution; under any other selector the range is raw, in the live view
+   * resolution (under kv-unified, a message no summary supplies that level
+   * over yet is held at the deepest level below it that one does; see
+   * `ProtectedRange.level`); under
+   * any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
@@ -2392,7 +2337,6 @@ export class ContextManager {
       messageStore: this.strategyMessageView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
-      ...(this.observer ? { observer: this.observer } : {}),
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,
