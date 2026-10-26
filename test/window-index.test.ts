@@ -44,6 +44,7 @@ import type {
   TokenBudget,
 } from '../src/index.js';
 import type { SelectOptions } from '../src/types/index.js';
+import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-window-index';
 let storeSeq = 0;
@@ -184,10 +185,17 @@ function indexItems(cm: ContextManager): Array<Record<string, unknown>> {
   return items.map((item) => Object.fromEntries(Object.entries(item).filter(([key]) => key !== 'at' && key !== 'by')));
 }
 
-/** Makes the `failing`-th append to the window index from now on throw, as a full disk would; returns the undo. */
+/**
+ * Makes the `failing`-th append to the window index from now on throw, as a
+ * full disk would; returns the undo. A write is cut short partway only
+ * where each item is one record, on a chronicle without the batched
+ * identity append, so the index writes so while this is installed
+ * (perItemIndexWrites); window-batches.test.ts has the batched form.
+ */
 function failIndexAppend(cm: ContextManager, failing: number): () => void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
   const append = store.appendToStateJsonWithIdentity;
+  const batched = perItemIndexWrites(cm.getStore());
   let appends = 0;
   store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
     if (id === INDEX && ++appends === failing) throw new Error('zz-index-append-failed');
@@ -195,6 +203,7 @@ function failIndexAppend(cm: ContextManager, failing: number): () => void {
   };
   return () => {
     store.appendToStateJsonWithIdentity = append;
+    batched();
   };
 }
 
@@ -714,9 +723,17 @@ describe('a body partly in the window', () => {
     const doc = parent.addMessage('User', [text('p0 '), text('p1 '), text('p2 ')]);
     const [, p1, p2] = parent.getAllMessages().filter((m) => m.bodyGroupId === 'zz-doc').map((m) => m.id);
     const before = parent.getStore().currentSequence();
-    parent.presentRows([doc]);
-    // One record per shard: two records on, the first two shards are in the
-    // window and the third isn't.
+    // One record per shard, as a chronicle without the batched identity
+    // append writes them (where it has it, the call is one record, and a cut
+    // takes the body whole or not at all: window-batches.test.ts): two
+    // records on, the first two shards are in the window and the third
+    // isn't.
+    const batched = perItemIndexWrites(parent.getStore());
+    try {
+      parent.presentRows([doc]);
+    } finally {
+      batched();
+    }
     const child = await parent.derive({ branch: 'zz/mid-body', strategy: new Sharding(), atSequence: before + 2 });
     assert.deepEqual(child.getPresentedMessages().map((m) => m.id), [u, doc, p1]);
     assert.deepEqual(child.getUnpresentedMessages().map((m) => m.id), [p2]);

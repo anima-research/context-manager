@@ -26,6 +26,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, windowIndexStateId } from '../src/index.js';
 import type { CompileResult, DerivationManifest, MessageId } from '../src/index.js';
+import { batchesIndexWrites, perItemIndexWrites, skipWithoutBatches } from './_harness/index-writes.js';
 
 const BASE = './test-window-index-branches';
 let storeSeq = 0;
@@ -94,10 +95,16 @@ function branchPoint(cm: ContextManager, branch: string): number | undefined {
   return cm.listBranches().find((b) => b.name === branch)?.branchPoint;
 }
 
-/** Runs `presentRows([])` with the `failing`-th append to the window index throwing, as a full disk would. */
+/**
+ * Runs `presentRows([])` with the `failing`-th append to the window index
+ * throwing, as a full disk would. A write-down is cut short partway only
+ * where each item is one record, on a chronicle without the batched
+ * identity append, so it writes so here (perItemIndexWrites).
+ */
 function cutShortWriteDown(cm: ContextManager, failing: number): void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
   const append = store.appendToStateJsonWithIdentity;
+  const batched = perItemIndexWrites(cm.getStore());
   let appends = 0;
   store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
     if (id === INDEX && ++appends === failing) throw new Error('zz-index-append-failed');
@@ -107,6 +114,7 @@ function cutShortWriteDown(cm: ContextManager, failing: number): void {
     assert.throws(() => cm.presentRows([]), /zz-index-append-failed/);
   } finally {
     store.appendToStateJsonWithIdentity = append;
+    batched();
   }
 }
 
@@ -306,14 +314,26 @@ describe('fork and the window', () => {
 });
 
 describe('branchAt and the window', () => {
-  it('cuts at the write that presented a row, so the new branch\'s window holds it', async () => {
+  /**
+   * a and c stored by the agent and presented in one call, b stored between
+   * them by another writer and presented at the next boundary; then the
+   * branch cut at b, and the one cut at a, switched to. With `perItem`, the
+   * index writes one record per row, as on a chronicle without the batched
+   * identity append.
+   */
+  async function cutsAfterOneCall(perItem: boolean) {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]);
     const a = cm.addMessage('Claude', [text('a')]);
     const b = cm.addMessage('Other', [text('b')]); // stored mid-turn by another writer
     const c = cm.addMessage('Claude', [text('c')]);
-    cm.presentRows([a, c]);
-    cm.presentRows([b]); // at the next boundary
+    const restore = perItem ? perItemIndexWrites(cm.getStore()) : () => {};
+    try {
+      cm.presentRows([a, c]);
+      cm.presentRows([b]); // at the next boundary
+    } finally {
+      restore();
+    }
     const main = cm.currentBranch().name;
 
     // At b's own sequence the window held nothing: a and c were presented
@@ -323,11 +343,35 @@ describe('branchAt and the window', () => {
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c', 'b']);
     assert.deepEqual(cm.getUnpresentedMessages(), []);
 
-    // a entered the window before c and b had: those are in the branch's
-    // record, arrived and not presented.
     await cm.switchBranch(main);
     const atA = cm.branchAt(a, 'zz-at-a');
+    const atC = cm.branchAt(c, 'zz-at-c');
     await cm.switchBranch(atA);
+    return { cm, a, b, c, cuts: { a: branchPoint(cm, atA)!, b: branchPoint(cm, atB)!, c: branchPoint(cm, atC)! } };
+  }
+
+  it('cuts at the write that presented a row, so the new branch\'s window holds it', { skip: skipWithoutBatches }, async () => {
+    const { cm, a, b, c, cuts } = await cutsAfterOneCall(false);
+    assert.ok(batchesIndexWrites(cm.getStore()), 'setup: the store appends a batch as one record');
+    // a entered the window in one call with c, and that call is one record:
+    // one presentation point. The cut at a is the cut at the call, so the
+    // new branch's window holds c too; b, presented at the next boundary,
+    // is in its record, arrived and not presented. (Before batched writes,
+    // each row was its own record, and c was an arrival here too: the twin
+    // below.)
+    assert.equal(cuts.a, cuts.c, 'a and c are cut at one write');
+    assert.ok(cuts.a < cuts.b);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c']);
+    assert.deepEqual(ids(cm.getUnpresentedMessages()), [b]);
+    assert.deepEqual(ids(cm.getAllMessages()), [a, b, c]);
+    cm.close();
+  });
+
+  it('on a chronicle without batched appends, each row presented is a write of its own, and the cut at one takes no row presented after it', async () => {
+    const { cm, a, b, c, cuts } = await cutsAfterOneCall(true);
+    // a entered the window before c and b had: those are in the branch's
+    // record, arrived and not presented.
+    assert.ok(cuts.a < cuts.c && cuts.c < cuts.b);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a']);
     assert.deepEqual(ids(cm.getUnpresentedMessages()), [b, c]);
     assert.deepEqual(ids(cm.getAllMessages()), [a, b, c]);

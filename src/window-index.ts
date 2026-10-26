@@ -59,13 +59,29 @@
  * of the record, in record order, then the header) and the manager is in
  * presented mode on that branch from then on.
  *
- * The header is what switches the mode. Each item is one record, so a
- * write-down can be cut short, by a failed append or by a crash that loses
- * the records the store hadn't synced, and the rows it wrote are a prefix of
- * the window without the header. Such an index is not in effect: the
- * manager stays in legacy mode, its window still the whole record, and the
- * next presentRows or retractRows finishes the write-down, the rows it
- * hasn't written then the header, before it does its own work.
+ * Each write to the index is one record, at one sequence, where the store
+ * can append several items in one (chronicle's
+ * appendManyToStateJsonWithIdentity): the write-down, the rows one
+ * presentRows call presents, and the tombstones of one call. The store keeps
+ * or loses such a record whole, so a write that throws has written nothing.
+ * A batch is one presentation point: every item of it carries the same `at`,
+ * and chronicle cuts a branch only between records, so a cut at a row a
+ * batch presented keeps every row of the batch, and a cut before it drops
+ * them all. A write of one item is one record as it always was, so a host
+ * that presents an agent's own rows one call at a time has a cut for each.
+ * The first batch a store records moves its MANIFEST to format version 2,
+ * which chronicle releases from before batched appends refuse to open.
+ *
+ * On a chronicle without the batched form, each item is one record. The
+ * header is what switches the mode, and the write-down writes it last, so
+ * there a write-down can be cut short, by a failed append or by a crash
+ * that loses the records the store hadn't synced, and the rows it wrote are
+ * a prefix of the window without the header. Such an index is not in
+ * effect: the manager stays in legacy mode, its window still the whole
+ * record, and the next presentRows or retractRows finishes the write-down,
+ * the rows it hasn't written then the header, before it does its own work.
+ * An index such a chronicle wrote is read the same on one that batches, and
+ * one cut short there is finished in one record.
  *
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header
@@ -117,10 +133,11 @@ export function windowIndexStateId(namespace: string): string {
 }
 
 /**
- * One presentation per row, so the index grows as the message slot does,
+ * One item per row presented, so the index grows as the message slot does,
  * and the slot's cadence fits it for the same reason (MessageStore.register):
  * a full snapshot of an append log copies its whole history, so it is kept
- * rare.
+ * rare. The cadence counts records, and a batch is one (write), so where the
+ * store batches, snapshots come rarer still.
  */
 function registrationFor(namespace: string) {
   return {
@@ -597,9 +614,11 @@ export class WindowIndex {
    * order, every shard of a body: none when the call wrote the window down
    * in legacy mode, since each of its rows was in the window already.
    *
-   * A body enters whole, but each item is one record, so a presentation
-   * cut short can leave a body's first shards in the window and the rest
-   * out, and so can a branch cut between its shards' presentations. Naming
+   * A body enters whole, in the call's one record where the store batches
+   * (write). On a chronicle that doesn't, each item is one record, so a
+   * presentation cut short can leave a body's first shards in the window
+   * and the rest out, and so can a branch cut between its shards'
+   * presentations, there or in an index such a chronicle wrote. Naming
    * such a body, by its first shard's id or by the first shard the window
    * lacks (the one unpresented lists first), presents only the shards it
    * lacks, in body order, at the end of the window: the shards in it keep
@@ -672,10 +691,12 @@ export class WindowIndex {
    * holes in the index that write-down began.
    *
    * Returns the rows taken out, with the ordinals they held, in window
-   * order. Each tombstone is one record, so a write can stop partway:
-   * `cutShort`, when given, hears the rows taken out before the write that
-   * threw, in window order, before the error is thrown on. A write-down that
-   * throws has taken nothing out.
+   * order. The tombstones are one record where the store batches (write),
+   * and the write-down another before them. On a chronicle that doesn't,
+   * each tombstone is one record, so a write can stop partway: `cutShort`,
+   * when given, hears the rows taken out before the write that threw, in
+   * window order, before the error is thrown on. A write-down that throws
+   * has taken nothing out.
    */
   retract(
     ids: readonly MessageId[],
@@ -839,12 +860,22 @@ export class WindowIndex {
   }
 
   /**
-   * Append items, one record each. A store that can append several items in
-   * one record would make a presentation one write; until then a failure
-   * partway, or a crash before the store synced, leaves the items before it
-   * written, and the index is read again from the store. For a write-down
-   * that is a prefix of its rows without the header, which leaves the index
-   * out of effect until the next write-down finishes it (writeDown).
+   * Append items, each stamped with the sequence and id of the record that
+   * holds it (`at`, `by`). Several items go in as one record, at one
+   * sequence, where the store can append them so
+   * (appendManyToStateJsonWithIdentity): the store keeps or loses the write
+   * whole, and one that throws has written nothing. That is a presentation
+   * point (see the module comment). One item is one record, through the
+   * single form, as it always was: a store all of whose writes are single
+   * keeps its MANIFEST at version 1, as one presenting a row at a time to an
+   * empty record does.
+   *
+   * On a chronicle without the batched form, every item is one record, so a
+   * failure partway, or a crash before the store synced, leaves the items
+   * before it written. For a write-down that is a prefix of its rows without
+   * the header, which leaves the index out of effect until the next
+   * write-down finishes it (writeDown). After any failure the index is read
+   * again from the store.
    */
   private write(items: IndexItem[]): void {
     if (items.length === 0) return;
@@ -853,10 +884,23 @@ export class WindowIndex {
       this.registered = true;
     }
     const state = this.current();
+    const batched = items.length > 1 ? batchedIdentityAppendOf(this.store) : null;
     try {
-      for (const item of items) {
-        const record = this.store.appendToStateJsonWithIdentity(this.stateId, item, 'by', 'at');
-        apply(state, item, state.rows.length, record.sequence);
+      if (batched) {
+        const { record, firstOrdinal } = batched.call(this.store, this.stateId, items, 'by', 'at');
+        // The batch went on at the end of the state as this reading had it,
+        // unless another handle wrote to it since: then the reading is
+        // stale, and the next read takes the store's.
+        if (firstOrdinal !== state.rows.length) {
+          this.state = null;
+          return;
+        }
+        items.forEach((item, i) => apply(state, item, firstOrdinal + i, record.sequence));
+      } else {
+        for (const item of items) {
+          const record = this.store.appendToStateJsonWithIdentity(this.stateId, item, 'by', 'at');
+          apply(state, item, state.rows.length, record.sequence);
+        }
       }
     } catch (error) {
       this.state = null;
@@ -866,6 +910,30 @@ export class WindowIndex {
     state.version = ++versions;
     state.presented = null;
   }
+}
+
+/**
+ * Chronicle's appendManyToStateJsonWithIdentity, as the index calls it: it
+ * appends `items` to the state as one record, stamping each with that
+ * record's id at `idField` and its sequence at `sequenceField`, and returns
+ * the record and the ordinal the first item took.
+ */
+type BatchedIdentityAppend = (
+  this: JsStore,
+  stateId: string,
+  items: IndexItem[],
+  idField: string,
+  sequenceField: string,
+) => { record: { sequence: number }; firstOrdinal: number };
+
+/**
+ * The store's batched identity append, or null on a chronicle without it
+ * (before chronicle's identity-stamped AppendMany), where each item is one
+ * record. Asked at each write, as stateHeadOffset is at each read.
+ */
+function batchedIdentityAppendOf(store: JsStore): BatchedIdentityAppend | null {
+  const append = (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity;
+  return typeof append === 'function' ? (append as BatchedIdentityAppend) : null;
 }
 
 /** Rows that left the window, in the order the window held them. */

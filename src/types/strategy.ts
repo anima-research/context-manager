@@ -299,10 +299,13 @@ export interface ContextStrategy {
    * window order, every shard of a body, and a context whose view holds
    * them, unless the manager's view filter leaves them out: a row the filter
    * leaves out is given here all the same, and the view doesn't list it or
-   * give it a position. Each row presented is one record, so a presentRows
-   * cut short by a failed write calls this with the rows it got in before
-   * it throws, which can be a body's first shards; the call that completes
-   * that body later gives only the shards that entered then.
+   * give it a position. A presentRows call is one record where the store
+   * batches, so one that throws presents nothing and calls nothing. On a
+   * chronicle without the batched form each row presented is one record,
+   * so a presentRows cut short by a failed write calls this with the rows
+   * it got in before it throws, which can be a body's first shards; the
+   * call that completes that body later gives only the shards that entered
+   * then.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
@@ -357,9 +360,11 @@ export interface ContextStrategy {
    * While the manager is in legacy mode its window is the record, and a
    * removal takes the row out of both at once: nothing calls this, and a
    * strategy that folded the row keeps what it folded, as it always has. A
-   * tombstone write that fails partway calls this with the rows it took out
-   * before the error is thrown or logged. A row presented again (a redo) is
-   * heard through onPresented, as a row new to the window, at its new place.
+   * tombstone write that fails partway, which only a chronicle without the
+   * batched form can leave (see ContextManager.retractRows), calls this
+   * with the rows it took out before the error is thrown or logged. A row
+   * presented again (a redo) is heard through onPresented, as a row new to
+   * the window, at its new place.
    *
    * A strategy that folds rows into summaries drops or folds again what
    * covers these: a summary of a row that left shows the agent what it no

@@ -27,6 +27,7 @@ import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
 import type { CompileResult, MessageId, StoredMessage, WindowStatus } from '../src/index.js';
+import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-window-status';
 let storeSeq = 0;
@@ -64,10 +65,17 @@ class Sharding extends PassthroughStrategy {
   }
 }
 
-/** Makes the `failing`-th append to `stateId` from now on throw, as a full disk would; returns the undo. */
+/**
+ * Makes the `failing`-th append to `stateId` from now on throw, as a full disk
+ * would; returns the undo. A write is cut short partway only where each
+ * item is one record, on a chronicle without the batched identity append,
+ * so the window index writes so while this is installed
+ * (perItemIndexWrites); window-batches.test.ts has the batched form.
+ */
 function failAppend(cm: ContextManager, failing: number, stateId = INDEX): () => void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
   const append = store.appendToStateJsonWithIdentity;
+  const batched = perItemIndexWrites(cm.getStore());
   let appends = 0;
   store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
     if (id === stateId && ++appends === failing) throw new Error('zz-index-append-failed');
@@ -75,6 +83,7 @@ function failAppend(cm: ContextManager, failing: number, stateId = INDEX): () =>
   };
   return () => {
     store.appendToStateJsonWithIdentity = append;
+    batched();
   };
 }
 
