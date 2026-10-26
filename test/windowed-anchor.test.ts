@@ -439,6 +439,102 @@ describe('windowed passthrough: a persisted anchor that names no place', () => {
   });
 });
 
+describe('windowed passthrough: a slot of another version', () => {
+  /** Runs `body` with console.warn captured. */
+  async function warnedDuring<T>(body: () => Promise<T> | T): Promise<{ value: T; warned: string[] }> {
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    try {
+      return { value: await body(), warned };
+    } finally {
+      console.warn = warn;
+    }
+  }
+
+  it('a later version\'s slot loads as no anchor, with a warning, and no move writes over it', async () => {
+    const path = freshPath();
+    let { cm } = await open(path);
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f'].map((t) => cm.addMessage('u', long(t)));
+    cm.presentRows([]);
+    const later = { anchor: sequenceOf(cm, ids[2]!), ordinal: 2, v: 3, zz: { kept: ['as', 'written'] } };
+    cm.getStore().setStateJson(ANCHOR, later);
+    const written = JSON.stringify(slot(cm));
+    cm.close();
+
+    const reopened = await warnedDuring(() => open(path));
+    ({ cm } = reopened.value);
+    const { strategy } = reopened.value;
+    assert.ok(
+      reopened.warned.some((w) => w.startsWith('[windowed-passthrough] the anchor slot of main is in format 3, which this version (format 2) doesn\'t read; the window starts at 0, and the slot isn\'t written over') && w.endsWith(' ns=zz')),
+      reopened.warned.join('\n'),
+    );
+    assert.equal(strategy.getAnchor(), 0, 'its anchor isn\'t read');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c', 'd', 'e', 'f']);
+
+    // Every way the anchor moves keeps the move in memory and the slot as
+    // the later version wrote it, byte for byte, without another warning.
+    const moves = await warnedDuring(async () => {
+      strategy.setAnchor(sequenceOf(cm, ids[3]!));
+      assert.deepEqual(texts(await cm.compile(BIG)), ['d', 'e', 'f'], 'the move holds in memory');
+      assert.equal(JSON.stringify(slot(cm)), written);
+      strategy.setAnchorOrdinal(cm.ordinalOf(ids[1]!)!);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'd', 'e', 'f']);
+      assert.equal(JSON.stringify(slot(cm)), written);
+      const result = await cm.compile(OVERFLOW);
+      assert.ok(result.messages.length < 5, 'the overflow re-anchored');
+      assert.equal(JSON.stringify(slot(cm)), written);
+    });
+    assert.deepEqual(moves.warned.filter((w) => w.startsWith('[windowed-passthrough] the anchor slot')), [], 'the load said it once');
+    cm.close();
+
+    // A reopen reads it so again: the moves were never written.
+    const again = await warnedDuring(() => open(path));
+    assert.equal(again.value.strategy.getAnchor(), 0);
+    assert.equal(JSON.stringify(slot(again.value.cm)), written);
+    again.value.cm.close();
+  });
+
+  it('a slot a later version writes after the load isn\'t written over either, and that is said once', async () => {
+    const { cm, strategy } = await open(freshPath());
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    strategy.setAnchor(sequenceOf(cm, ids[1]!));
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!) }, 'setup: the legacy form');
+    cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, ids[0]!), v: 4 });
+    const written = JSON.stringify(slot(cm));
+    const moves = await warnedDuring(() => {
+      strategy.setAnchor(sequenceOf(cm, ids[2]!));
+      strategy.setAnchor(sequenceOf(cm, ids[0]!));
+    });
+    assert.equal(JSON.stringify(slot(cm)), written);
+    const said = moves.warned.filter((w) => w.startsWith('[windowed-passthrough] the anchor slot of main is in format 4, a later version\'s'));
+    assert.equal(said.length, 1, moves.warned.join('\n'));
+    assert.equal(strategy.getAnchor(), sequenceOf(cm, ids[0]!), 'the anchor is kept in memory');
+    cm.close();
+  });
+
+  it('a slot naming a v that isn\'t a later version\'s loads as no anchor, and the next move writes over it', async () => {
+    const path = freshPath();
+    let { cm } = await open(path);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, ids[1]!), v: 1 });
+    cm.close();
+
+    const reopened = await warnedDuring(() => open(path));
+    ({ cm } = reopened.value);
+    const { strategy } = reopened.value;
+    assert.ok(
+      reopened.warned.some((w) => w.startsWith('[windowed-passthrough] the anchor slot of main is in format 1, which this version (format 2) doesn\'t read; the window starts at 0, and the next move of the anchor writes over it')),
+      reopened.warned.join('\n'),
+    );
+    assert.equal(strategy.getAnchor(), 0);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c']);
+    strategy.setAnchor(sequenceOf(cm, ids[2]!));
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[2]!) });
+    cm.close();
+  });
+});
+
 describe('windowed passthrough: a derived context', () => {
   const supported = typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function';
   const skip = supported ? false : 'installed @animalabs/chronicle has no JsStore.view (branch-bound handles)';

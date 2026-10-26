@@ -91,6 +91,14 @@ import type { MessageId, MessageStoreView, StoredMessage } from './types/index.j
 /** Whether a manager's window is the record (`legacy`) or its index (`presented`), on the branch its store is on. */
 export type WindowMode = 'legacy' | 'presented';
 
+/**
+ * Where a row stands with a manager's window (ContextManager.windowStatusOf):
+ * in it (`in`), stored and not in it (`out`), an undone turn's row, out of
+ * it until it is presented again (`undone`), or held by no slot the manager
+ * merges (`absent`).
+ */
+export type WindowStatus = 'in' | 'out' | 'undone' | 'absent';
+
 /** A row that left the window: its id, and the ordinal it held there. */
 export interface LeftRow {
   id: MessageId;
@@ -285,6 +293,21 @@ function positionOfSequence(listing: readonly StoredMessage[], sequence: number)
 }
 
 /**
+ * The position of the first message in a listing in record order stored
+ * after `sequence`, or the listing's length when none is.
+ */
+function firstStoredAfter(listing: readonly StoredMessage[], sequence: number): number {
+  let lo = 0;
+  let hi = listing.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (listing[mid]!.sequence > sequence) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+/**
  * A row's position in a listing in record order, found by its sequence
  * (`sequenceOf`, which a store answers from its listing while that is
  * cached), so it reads no message.
@@ -390,6 +413,16 @@ export class WindowIndex {
   ordinalOf(id: MessageId): number | undefined {
     const state = this.current();
     return inEffect(state) ? state.ordinals.get(id) : undefined;
+  }
+
+  /**
+   * Whether the row is an undone turn's: a tombstone with `undone` took it
+   * out of the window, and no presentation has put it back since. False in
+   * legacy mode. The id needn't be a row the record still holds.
+   */
+  isUndone(id: MessageId): boolean {
+    const state = this.current();
+    return inEffect(state) && state.undone.has(id);
   }
 
   /**
@@ -525,16 +558,28 @@ export class WindowIndex {
    * shards it lacks, undone or not: the window holds part of it, so the
    * rest is due, and present takes the first of them as naming the rest.
    * A host that presents these rows by id completes the body.
+   *
+   * With `afterSequence`, only the rows stored after it: the same rows the
+   * whole listing gives with a sequence greater than it, found from the
+   * first such row of `source` (which is in record order) by a binary
+   * search, so the walk is over those rows alone. A cut inside a body reads
+   * the body's shards before it to say whether the body is partly in the
+   * window.
    */
-  unpresented(source: readonly StoredMessage[]): StoredMessage[] {
+  unpresented(source: readonly StoredMessage[], afterSequence?: number): StoredMessage[] {
     const state = this.current();
     if (!inEffect(state)) return [];
+    const from = afterSequence === undefined ? 0 : firstStoredAfter(source, afterSequence);
     const rows: StoredMessage[] = [];
     // Whether the body the row before belongs to has a shard in the window.
     let bodyInWindow = false;
-    for (let i = 0; i < source.length; i++) {
+    if (from > 0 && from < source.length && continuesBody(source[from - 1], source[from])) {
+      const { from: start } = bodyBoundsIn(source, from);
+      for (let k = start; k < from && !bodyInWindow; k++) bodyInWindow = state.ordinals.has(source[k]!.id);
+    }
+    for (let i = from; i < source.length; i++) {
       const message = source[i]!;
-      if (i === 0 || !continuesBody(source[i - 1], message)) bodyInWindow = false;
+      if (i > from && !continuesBody(source[i - 1], message)) bodyInWindow = false;
       if (state.ordinals.has(message.id)) bodyInWindow = true;
       else if (bodyInWindow || !state.undone.has(message.id)) rows.push(message);
     }

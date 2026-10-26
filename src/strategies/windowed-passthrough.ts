@@ -180,6 +180,12 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * converted. `anchor` stays a sequence in both forms, at or before the
  * branch head, so a release that reads only it still loads the slot: the
  * sequence setAnchor was given, or that of the row the window starts at.
+ * A slot naming a `v` other than 2 is another version's, whose `anchor`
+ * this one can't vouch for: it is read as no anchor, so the window starts
+ * at the branch's start, with a warning. One naming a later version than 2 is
+ * never written over, so that version reads back what it wrote, and the
+ * anchor's moves here are kept in memory only; any other is written over
+ * by the next move.
  *
  * **Cache markers.** The strategy holds first claim on message-level cache
  * breakpoints under the same slot contract as the autobiographical
@@ -247,6 +253,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private prevCacheKeys: string[] | null = null;
   /** Set when a committed select moved the anchor (see takeSelectionCause). */
   private pendingCause: string | undefined;
+  /** Whether this branch load has said that a later version's slot is kept and not written over. */
+  private keptSlotReported = false;
 
   constructor(options: WindowedPassthroughOptions = {}) {
     const fraction = options.reAnchorFraction ?? 0.5;
@@ -493,14 +501,33 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * from one, carries its own, so each is converted where it is read. On a
    * branch in legacy mode an ordinal names nothing, there being no index
    * there (a branch a host made without carrying the manager's index;
-   * derive carries it), so the sequence beside it is the anchor.
+   * derive carries it), so the sequence beside it is the anchor. A slot
+   * naming another `v` is another version's and loads as no anchor (see
+   * the class doc).
    */
   private loadBranchState(): void {
     this.anchor = 0;
     this.anchorOrdinal = null;
     this.prevCacheKeys = null;
+    this.keptSlotReported = false;
     if (!this.store || !this.stateId) return;
     const persisted = this.store.getStateJson(this.stateId) as { anchor?: unknown; ordinal?: unknown; v?: unknown } | null;
+    const format = slotFormatOf(persisted);
+    if (format !== undefined && format !== ANCHOR_SLOT_FORMAT) {
+      // Another version's slot: its `anchor` may not mean what this
+      // version's does, so it names no place here, and the window starts
+      // at the branch's start, as for a value that names no position.
+      const newer = isNewerSlot(persisted);
+      if (newer) this.keptSlotReported = true;
+      this.diag.warn(
+        `[windowed-passthrough] the anchor slot of ${this.store.currentBranch().name} is in format ` +
+          `${JSON.stringify(format)}, which this version (format ${ANCHOR_SLOT_FORMAT}) doesn't read; the window starts at 0` +
+          (newer
+            ? `, and the slot isn't written over: a move of the anchor on this branch is kept in memory only`
+            : `, and the next move of the anchor writes over it`),
+      );
+      return;
+    }
     const value = persisted?.anchor;
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return;
     const head = this.store.currentSequence();
@@ -516,7 +543,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
     this.anchor = value;
     const ordinal = persisted!.ordinal;
-    if (persisted!.v !== 2 || typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0) return;
+    if (format !== ANCHOR_SLOT_FORMAT || typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0) return;
     if (!this.window?.ordinals()) return;
     const length = this.window.length();
     if (ordinal > length) {
@@ -963,15 +990,47 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /**
    * `{ anchor }` while the window is the record, as before, and
    * `{ anchor, ordinal, v: 2 }` once the anchor is an ordinal (see the
-   * class doc).
+   * class doc). A slot a later version wrote (a `v` above 2) is left as it
+   * is, with a warning once per branch load, and the anchor kept in memory:
+   * that version reads its slot back as it wrote it.
    */
   private persistAnchor(): void {
     if (!this.store || !this.stateId) return;
+    const persisted: unknown = this.store.getStateJson(this.stateId);
+    if (isNewerSlot(persisted)) {
+      if (!this.keptSlotReported) {
+        this.keptSlotReported = true;
+        this.diag.warn(
+          `[windowed-passthrough] the anchor slot of ${this.store.currentBranch().name} is in format ` +
+            `${JSON.stringify(slotFormatOf(persisted))}, a later version's, so this version doesn't write over it: ` +
+            `a move of the anchor on this branch is kept in memory only`,
+        );
+      }
+      return;
+    }
     this.store.setStateJson(
       this.stateId,
-      this.anchorOrdinal === null ? { anchor: this.anchor } : { anchor: this.anchor, ordinal: this.anchorOrdinal, v: 2 },
+      this.anchorOrdinal === null ? { anchor: this.anchor } : { anchor: this.anchor, ordinal: this.anchorOrdinal, v: ANCHOR_SLOT_FORMAT },
     );
   }
+}
+
+// ----------------------------------------------------------------------------
+// The anchor slot's format
+// ----------------------------------------------------------------------------
+
+/** The `v` of the slot's ordinal form, `{ anchor, ordinal, v: 2 }`; the first form, `{ anchor }`, has none. */
+const ANCHOR_SLOT_FORMAT = 2;
+
+/** The `v` a persisted slot names, or undefined for one that names none (the first form, or no slot). */
+function slotFormatOf(persisted: unknown): unknown {
+  return typeof persisted === 'object' && persisted !== null ? (persisted as { v?: unknown }).v : undefined;
+}
+
+/** Whether a persisted slot names a later format than this version writes, which it must not write over. */
+function isNewerSlot(persisted: unknown): boolean {
+  const v = slotFormatOf(persisted);
+  return typeof v === 'number' && v > ANCHOR_SLOT_FORMAT;
 }
 
 // ----------------------------------------------------------------------------

@@ -56,7 +56,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type LeftRow, type WindowMode } from './window-index.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -1489,6 +1489,43 @@ export class ContextManager {
     return this.windowIndex.ordinalOf(id);
   }
 
+  /**
+   * Where a row stands with this manager's agent's window, on the store's
+   * branch and before the view filter:
+   *
+   * - `'absent'`: no slot the manager merges (its own and its auxiliary
+   *   ones) holds the row: it was never stored on this branch, or it was
+   *   removed. A row removed through another manager reads so while its
+   *   ordinal is still issued here (see ordinalOf).
+   * - `'in'`: the window holds it. In legacy mode that is every row the
+   *   merged slots hold, the window being the record.
+   * - `'undone'`: an undone turn's row (retractRows with `undone`), out of
+   *   the window until a presentRows names it again, and left out of
+   *   getUnpresentedMessages.
+   * - `'out'`: stored and not in the window: arrived and not presented, or
+   *   taken out without `undone`. These are the rows getUnpresentedMessages
+   *   lists, so an undone turn's shard is `'out'` while its body is partly
+   *   in the window (a redo cut short), since the rest of the body is due.
+   *
+   * It looks the row up by its sequence (MessageStoreView.sequenceOf), as
+   * the window's other reads do, rather than reading it whole, and writes
+   * nothing.
+   */
+  windowStatusOf(id: MessageId): WindowStatus {
+    const merged = this.mergedMessageView();
+    const sequence = merged.sequenceOf ? merged.sequenceOf(id) : merged.get(id)?.sequence;
+    if (sequence === undefined) return 'absent';
+    const index = this.windowIndex;
+    if (index.mode() === 'legacy' || index.ordinalOf(id) !== undefined) return 'in';
+    if (!index.isUndone(id)) return 'out';
+    const record = merged.getAll();
+    const at = recordPositionOf(merged, record, id);
+    if (at === undefined) return 'undone';
+    const { from, to } = bodyBoundsIn(record, at);
+    for (let k = from; k <= to; k++) if (index.ordinalOf(record[k]!.id) !== undefined) return 'out';
+    return 'undone';
+  }
+
   /** The ordinal the next presented row will take: every ordinal below it has been issued on this branch. 0 in legacy mode. */
   indexLength(): number {
     return this.windowIndex.length();
@@ -1518,9 +1555,21 @@ export class ContextManager {
    * A body partly in the window (see presentRows) lists the shards it
    * lacks, undone or not, and presentRows takes the first of them as
    * naming the rest of the body, so presenting these ids completes it.
+   *
+   * With `afterSequence`, only the rows stored after that sequence: the
+   * rows the whole listing gives whose sequence is greater, found by a
+   * binary search over the merged record, so the call walks the rows
+   * stored since and not the whole record. A shard of a body stored across
+   * the cut is listed as the whole listing lists it. Throws a TypeError for
+   * an `afterSequence` that isn't a number.
    */
-  getUnpresentedMessages(): StoredMessage[] {
-    return this.windowIndex.unpresented(this.mergedMessageView().getAll());
+  getUnpresentedMessages(options?: { afterSequence?: number }): StoredMessage[] {
+    const after = options?.afterSequence;
+    if (after !== undefined && (typeof after !== 'number' || Number.isNaN(after))) {
+      const got = typeof after === 'number' ? String(after) : JSON.stringify(after) ?? typeof after;
+      throw new TypeError(`ContextManager.getUnpresentedMessages: afterSequence must be a sequence number, got ${got}`);
+    }
+    return this.windowIndex.unpresented(this.mergedMessageView().getAll(), after);
   }
 
   /**
@@ -1573,11 +1622,7 @@ export class ContextManager {
    */
   branchAt(messageId: MessageId, name?: string): string {
     this.requireInitialized('branchAt');
-    const merged = this.mergedMessageView();
-    const message = merged.get(messageId);
-    if (!message) {
-      throw new Error(`Message not found: ${messageId}`);
-    }
+    const branchPoint = this.branchSequenceOf(messageId);
 
     // Create branch name if not provided
     const branchName = name ?? `branch-${Date.now()}`;
@@ -1587,9 +1632,32 @@ export class ContextManager {
 
     // Use createBranchAt to branch at the message's sequence (time-travel),
     // or at the write that presented it
-    const branch = this.store.createBranchAt(branchName, currentBranch.name, this.branchPointOf(message, merged));
+    const branch = this.store.createBranchAt(branchName, currentBranch.name, branchPoint);
 
     return branch.name;
+  }
+
+  /**
+   * The sequence branchAt(messageId) cuts at, without making a branch: for
+   * a host that accounts for a cut, such as the rows a rollback to the row
+   * leaves out of the branch's record (those stored after the cut) and the
+   * rows it keeps there but not in the window (stored before the cut, and
+   * presented after the row or not at all). It is the named row's own
+   * sequence for a row the window doesn't hold and for every row in legacy
+   * mode, so a body stored as shards and named by its first shard's id is
+   * cut there; its body's last shard's own for a body the write-down
+   * presented; and the latest write that presented a shard of its body for
+   * any other row the window holds (see branchAt). The row can be in this manager's slot or an auxiliary one.
+   * Throws `Message not found: <id>`, as branchAt does, for a row no merged
+   * slot holds. It writes nothing.
+   */
+  branchSequenceOf(messageId: MessageId): Sequence {
+    const merged = this.mergedMessageView();
+    const message = merged.get(messageId);
+    if (!message) {
+      throw new Error(`Message not found: ${messageId}`);
+    }
+    return this.branchPointOf(message, merged);
   }
 
   /**
@@ -2944,11 +3012,22 @@ export class ContextManager {
    * If transitionText is provided, it's used as the transition summary.
    * If omitted, an LLM call auto-generates a transition summary.
    *
+   * The transition is stored as a message from 'Context Manager', with
+   * `options.metadata` when given (a host's stamps, such as who the row is
+   * for). Once a host presents rows on the branch (presentRows), a stored
+   * row enters the window only when presented, so the transition is
+   * presented before the head window is reset to start at it, and the
+   * strategy hears it there (ContextStrategy.onPresented); in legacy mode
+   * it is in the window from its add, as before, and nothing more is
+   * written.
+   *
    * Returns the transition summary text used. A close() from a listener of
    * the transition message's add lets the add finish, and the call then
    * rejects, naming the stored message, without resetting the head window.
+   * So does a presentation of it that fails, or whose strategy hook closes
+   * the manager, sets a strategy or moves the store's branch.
    */
-  async resetHeadWindow(transitionText?: string): Promise<string> {
+  async resetHeadWindow(transitionText?: string, options?: { metadata?: MessageMetadata }): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
     if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
@@ -2963,22 +3042,40 @@ export class ContextManager {
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
       { type: 'text', text: `[Topic Transition]\n\n${summary}` },
-    ]);
+    ], options?.metadata);
     // A listener of that add may have closed the manager, set a strategy or
     // moved the store's branch. The add stands and the strategy isn't told,
     // and the refusal says the message is stored. It gives the reason without
     // the advice to retry or to recover, and says instead what a later call
     // that goes ahead does: it stores a second transition. After a close(), or
     // while a strategy initializes, a later call refuses at once.
+    const refuse = (reason: string, where: string): Error =>
+      new Error(
+        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
+          `${where}, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds ` +
+          'another transition message.',
+      );
+    const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
     try {
       this.requireInitialized('resetHeadWindow', attempt, false);
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
-          "stored, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds " +
-          'another transition message.',
-      );
+      throw refuse(reasonOf(error), 'stored');
+    }
+
+    // Once rows are presented, the head window can start only at a row the
+    // window holds: the transition enters it first, as a host's own row does.
+    if (this.windowIndex.mode() === 'presented') {
+      try {
+        this.presentRows([msgId]);
+      } catch (error) {
+        throw refuse(`ContextManager.resetHeadWindow couldn't present its transition: ${reasonOf(error)}`, 'stored');
+      }
+      // The strategy's hook for the presentation may have done what a listener of the add can.
+      try {
+        this.requireInitialized('resetHeadWindow', attempt, false);
+      } catch (error) {
+        throw refuse(reasonOf(error), 'stored and presented');
+      }
     }
 
     // Reset head window to start from this message
