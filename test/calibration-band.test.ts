@@ -683,12 +683,6 @@ describe('estimator calibration band', () => {
     // The picker's over-budget throw is dry-run-guarded (a preview reports
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
-    // signature ("Adaptive picker exhausted ...") is this path. The picker's
-    // refusal is the only one the preview can fall back at here: the middle
-    // counts a body's raw shards as the plan does, so the emission can't
-    // refuse a plan that fits, and a small recent window keeps the head and
-    // tail reservations far under the budget. It also keeps the sharded body
-    // in the middle, where no summary exists yet to fold it.
     const BODY = `${'the quick brown fox jumps over the lazy dog and keeps running. '.repeat(45)}` +
       JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ id: i, key: `k_${i}`, value: [i, i * 2, i * 3], flag: i % 2 === 0 })));
     const openSharded = async (name: string, seed: boolean) => {
@@ -708,9 +702,6 @@ describe('estimator calibration band', () => {
     const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const reserve = 500;
 
-    // Size the budget from the store: the plan at 1.0 (P), which is what the
-    // emission commits at 1.0 (E). The rejection budget must take P (fits at
-    // 1.0) but not 1.45·P (the picker refuses at 1.45).
     const probe = await openSharded('picker-probe', true);
     assert.ok(probe.cm.getAllMessages().filter((m) => m.bodyGroupId).length >= 3, 'the body is sharded');
     const P = probe.cm.previewContext(BUDGET)!.finalTokens;

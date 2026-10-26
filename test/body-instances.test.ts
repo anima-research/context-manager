@@ -252,9 +252,6 @@ describe('two copies of one document', () => {
   });
 
   it('hold back to the start of the copy a held tool result answers, not the copy before it', () => {
-    // A sharded message stored before blocks were kept in place holds its
-    // tool_use on its first shard; a held tool_result after the second copy
-    // steps back over that copy alone.
     const shard = (id: string, shardIndex: number): StoredMessage =>
       ({ id, sequence: 0, participant: 'user', content: [...(shardIndex === 0 ? [{ type: 'tool_use', id: 't', name: 'tool', input: {} }] : []), ...text(`shard ${id}`)], bodyGroupId: 'g', shardIndex, timestamp: new Date(0) }) as unknown as StoredMessage;
     const messages = [

@@ -1,10 +1,3 @@
-/**
- * A body ingress splits into shards goes out as it was given, wherever its
- * shards render: every block in its place, its text blocks with their own
- * boundaries, and one message whichever regions its raw shards fall in. A
- * body stored before each block was kept in place goes out in the windows as
- * it always did, and in the middle as in the windows.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -21,7 +14,6 @@ const call = (id: string) => ({ type: 'tool_use', id, name: 'get_weather', input
 const result = (id: string, content: string) => ({ type: 'tool_result', toolUseId: id, content }) as unknown as ContentBlock;
 const tools = [{ name: 'get_weather', description: 'The weather in a city.', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }];
 
-/** Each shape: the messages written, and which of them is the body watched. */
 const SHAPES: Record<string, { writes: Array<[string, ContentBlock[]]>; body: number }> = {
   'a reply that thinks, writes and calls a tool': {
     writes: [['User', [text('please check the weather')]],
@@ -37,7 +29,6 @@ const SHAPES: Record<string, { writes: Array<[string, ContentBlock[]]>; body: nu
     body: 1,
   },
 };
-/** Where the body's raw shards render. No summary exists, so nothing folds. */
 const PLACES: Record<string, Record<string, unknown>> = {
   'in the recent window': { headWindowTokens: 0, recentWindowTokens: 1_000_000 },
   'raw in the adaptive middle': { headWindowTokens: 0, recentWindowTokens: 300 },
@@ -61,13 +52,9 @@ const FOLDS: Record<string, Record<string, unknown>> = {
   },
 };
 
-/** JSON with object keys sorted: the store keeps a block's fields, not their order. */
 const canonical = (v: unknown): string => JSON.stringify(v, (_k, x) =>
   x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x);
 
-/** Ingress as bodies were stored before each block was kept in place: the
- *  text joined into one block, cut across the shards, and the other blocks on
- *  the first shard after its text, with no seam declared. */
 class LegacyIngress extends AutobiographicalStrategy {
   override chunkIngressMessage(participant: string, content: ContentBlock[]) {
     return legacyIngress(super.chunkIngressMessage(participant, content), content);
@@ -111,15 +98,11 @@ describe('a sharded body goes out as it was given, wherever its shards render', 
         it(`${shapeName}, ${place}, under ${fold}`, async () => {
           const { compiled, stats, bodyIds } = await compileShape(shape, { ...placeConfig, ...foldConfig });
           assert.ok(bodyIds.length > 2, `premise: the body is stored as shards (${bodyIds.length})`);
-          // Messages written after the body: the rest of the shape, then four turns.
           const after = shape.writes.length - 1 - shape.body + 4;
           if (place === 'raw in the adaptive middle') assert.ok(stats.middleRaw.tokens > 0, 'premise: the middle sends raw history');
           const given = shape.writes[shape.body]![1];
           if (place === 'across the middle and the recent window') {
             if (given.some((b) => b.type === 'tool_result')) {
-              // A window's edge inside a message that holds a tool result moves
-              // back to its call, so the whole message and its call are raw in
-              // the recent window.
               assert.ok(stats.tail.messages >= after + bodyIds.length + 1,
                 `the recent window holds the whole message and its call (${stats.tail.messages} messages)`);
             } else {
@@ -129,14 +112,12 @@ describe('a sharded body goes out as it was given, wherever its shards render', 
           }
           const at = compiled.messages.findIndex((m) => canonical(m.content) === canonical(given));
           assert.ok(at >= 0, 'a message sends the body, exactly as given');
-          // Nothing of the body anywhere else: its tagged text, its images, its tool blocks.
           const tags = given.flatMap((b) => {
             const tag = b.type === 'text' ? /^([A-Z]{4,}) /.exec((b as { text: string }).text)?.[1] : undefined;
             return tag ? [tag] : [];
           });
           const uses = given.flatMap((b) => (b.type === 'tool_use' ? [(b as { id: string }).id] : []));
           const results = given.flatMap((b) => (b.type === 'tool_result' ? [(b as { toolUseId: string }).toolUseId] : []));
-          // The body's untagged text, such as an introduction, whole.
           const plain = given.flatMap((b) => (b.type === 'text' && !/^[A-Z]{4,} /.test((b as { text: string }).text) ? [(b as { text: string }).text] : []));
           const ownBlock = (b: ContentBlock) =>
             (b.type === 'text' && tags.some((tag) => b.text.includes(`${tag} sentence`))) ||
@@ -157,7 +138,6 @@ describe('a sharded body goes out as it was given, wherever its shards render', 
 describe('a body stored before each block was kept in place', () => {
   const shape = SHAPES['a short text, an image, a long text']!;
   const given = shape.writes[0]![1];
-  /** How such a body always went out from the windows: its other blocks, then its text joined. */
   const legacyRender = [image, text(given.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join(''))];
   for (const place of ['in the recent window', 'in the head window', 'raw in the adaptive middle', 'across the middle and the recent window']) {
     it(`goes out ${place} as the windows always sent it: its image, then its text as one block`, async () => {
@@ -200,7 +180,6 @@ describe("the recent window starting at a result keeps the call it answers, from
         const holding = before + callShards.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
         assert.equal(holding, legacy ? before : resultAt - 1, `premise: the ${legacy ? 'first' : 'last'} shard holds the tool_use`);
         const expected = thinking ? before : holding;
-        // A window that the result and what follows it fill exactly: its edge falls at the result.
         const store = (manager as unknown as { messageStore: unknown }).messageStore;
         const config = (strategy as unknown as { config: Record<string, number> }).config;
         config.recentWindowTokens = strategy.estimates(store).slice(resultAt).reduce((a, b) => a + b, 0);
@@ -265,7 +244,6 @@ describe('a result that sits after text, on a later shard of its message', () =>
     hold(store: unknown) { return this.holdBoundary(store as never); }
     estimates(store: unknown) { return this.postStripEstimates(store as never); }
   }
-  /** A call, then a result message `[long text, tool_result]` and a reply. */
   async function withLateResult(
     hold: boolean,
     body: (strategy: Exposed, store: unknown, at: { callAt: number; from: number; to: number; resultAt: number }, view: unknown) => void,
@@ -305,7 +283,6 @@ describe('a result that sits after text, on a later shard of its message', () =>
   });
 
   it('a compression hold on the message starts at the call', async () => {
-    // The strategy's view of the store, which carries the holds.
     await withLateResult(true, (strategy, _store, { callAt, from }, view) => {
       assert.ok(strategy.hold(view) <= from, 'premise: the message is held');
       assert.equal(strategy.hold(view), callAt);
@@ -340,19 +317,12 @@ describe('the recent window at a result on a later shard of the store\'s first m
   });
 });
 
-/** Ingress as LegacyIngress has it, for the Knowledge strategy. */
 class LegacyKnowledgeIngress extends KnowledgeStrategy {
   override chunkIngressMessage(participant: string, content: ContentBlock[]) {
     return legacyIngress(super.chunkIngressMessage(participant, content), content);
   }
 }
 
-/**
- * The two ways a sharded body puts a call's result past the message right
- * after its tool_use: a result after a long text, on its message's last
- * shard, and a call stored before each block was kept in place, whose
- * tool_use is on its first shard and its text on the shards after it.
- */
 const PAIRS: Record<string, { legacy: boolean; call: ContentBlock[]; result: ContentBlock[] }> = {
   'a result after a long text, on its message\'s last shard': {
     legacy: false, call: [text('looking it up'), call('call-1')], result: [text(prose('NOTE', 2_000)), result('call-1', 'Sunny.')],
@@ -369,7 +339,6 @@ const PAIRS: Record<string, { legacy: boolean; call: ContentBlock[]; result: Con
     result: [text(prose('NOTE', 2_000)), result('call-1', 'Sunny.')],
   },
 };
-/** A subclass whose boundary hint asks for a close between every two messages. */
 class HintEverywhere extends AutobiographicalStrategy {
   protected override chunkBoundaryHint(): boolean { return true; }
 }
@@ -384,7 +353,6 @@ const STRATEGIES = {
   Knowledge: { inPlace: KnowledgeStrategy, legacy: LegacyKnowledgeIngress },
 } as const;
 
-/** A store of plain turns, then the pair, then more turns, chunked small. */
 async function withPair(
   Strategy: typeof AutobiographicalStrategy,
   pair: { call: ContentBlock[]; result: ContentBlock[] },
@@ -470,10 +438,8 @@ describe("the head window's end, wherever it falls in a call and the message ans
         const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
         const stored = manager.getAllMessages();
         const config = (strategy as unknown as { config: Record<string, number> }).config;
-        // The call starts at its first shard holding a tool_use or a thinking block.
         const callAt = stored.findIndex((m, k) => k >= callFrom && (holds(m, 'tool_use') || holds(m, 'thinking')));
         for (let edge = callAt + 1; edge <= resultTo; edge++) {
-          // A head window the messages before `edge` fill exactly: its edge falls at `edge`.
           config.headWindowTokens = stored.slice(0, edge).reduce((n, m) => n + store.estimateTokens(m), 0);
           assert.equal((strategy as Exposed).headEnd(store), callAt, `an edge on message ${edge}`);
         }
@@ -498,7 +464,6 @@ describe("the recent window's start, wherever it falls inside a call before the 
         assert.ok(callAt >= 0 && callEnd > callAt, `premise: an edge can fall inside the call before its answer (${callAt}, ${callEnd})`);
         const pse = (strategy as Exposed).estimates(store);
         for (let edge = callAt + 1; edge <= callEnd; edge++) {
-          // A window the messages from `edge` on fill exactly: its edge falls at `edge`.
           config.recentWindowTokens = pse.slice(edge).reduce((n, t) => n + t, 0);
           assert.equal((strategy as Exposed).recentStart(store), callAt, `an edge on message ${edge}`);
         }
@@ -532,7 +497,6 @@ describe('the head window\'s end inside a message that thinks, makes a call and 
 
 describe("the head window's end at messages without shards, paired by the calls each leaves open", () => {
   const STUB = "this call's result isn't shown in this context";
-  /** Plain turns, the shape, more plain turns; the head's tokens run out at the shape's message `edge` (from 0). */
   async function headAt(writes: Array<[string, ContentBlock[]]>, body: (headEnd: number, first: number, sent: string) => void, edge = 2) {
     const requests: string[] = [];
     const membrane = {
@@ -562,7 +526,6 @@ describe("the head window's end at messages without shards, paired by the calls 
       const config = (strategy as unknown as { config: Record<string, number> }).config;
       config.headWindowTokens = stored.slice(0, first + edge).reduce((n, m) => n + store.estimateTokens(m), 0);
       const headEnd = strategy.headEnd(store);
-      // Fold what follows the head, so a call the head keeps is sent without the message after it.
       const queue = (strategy as unknown as { compressionQueue: number[] }).compressionQueue;
       await manager.compile();
       for (let guard = 0; queue.length > 0 && guard < 80; guard++) await manager.tick();
@@ -639,7 +602,6 @@ describe("parallel calls' results, each in a message of its own", () => {
     const ids = Array.from({ length: n }, (_, k) => `call-${k}`);
     return [['Claude', [text('looking them up'), ...ids.map(call)]], ...ids.map((id): [string, ContentBlock[]] => ['User', [result(id, `${id} answered ` + 'w '.repeat(60))]])];
   };
-  /** Short plain turns, the writes, more short plain turns; `first` is where the writes start. */
   async function withWrites(
     Strategy: typeof AutobiographicalStrategy,
     writes: Array<[string, ContentBlock[]]>,
@@ -748,7 +710,6 @@ describe("parallel calls' results, each in a message of its own", () => {
       const first = manager.getAllMessages().length;
       const writes = parallel(3);
       writes.forEach(([participant, content], k) => manager.addMessage(participant, content, undefined, undefined, k === 3 ? { holdCompression: true } : undefined));
-      // The view the strategy reads, which carries the holds.
       const view = (manager as unknown as { strategyMessageView(): unknown }).strategyMessageView();
       assert.ok(strategy.hold(view) <= first + 3, 'premise: the third result is held');
       assert.equal(strategy.hold(view), first, 'the hold on the third result starts at the call');
@@ -792,7 +753,6 @@ describe("parallel calls' results, each in a message of its own", () => {
       const pse = (strategy as Exposed).estimates(store);
       const last = first + links;
       config(strategy).recentWindowTokens = pse.slice(last).reduce((t, x) => t + x, 0);
-      // main's own step takes the window to the last call's message; this one to the call before it.
       assert.equal((strategy as Exposed).recentStart(store), last - 2);
     });
   });
@@ -809,7 +769,6 @@ describe("parallel calls' results, each in a message of its own", () => {
       ['Claude', [call('open')]],
     ];
     await withWrites(Exposed, writes, async (manager, strategy) => {
-      // Every listing the store passed through as it was written, shard by shard, from every position.
       const all = manager.getAllMessages();
       assert.ok(all.length - new Set(all.map((m) => m.bodyGroupId ?? m.id)).size >= 4, 'premise: some messages are stored as shards');
       for (let length = 1; length <= all.length; length++) {
@@ -819,8 +778,6 @@ describe("parallel calls' results, each in a message of its own", () => {
         for (let from = 1; from <= length; from++) {
           const part = (strategy as Exposed).held(listing, from);
           for (let p = from; p < length; p++) assert.equal(part[p], whole[p], `a listing of ${length}, from ${from}, position ${p}`);
-          // As the head's end and the window's start ask, from the position before a boundary up to
-          // it: where the head steps back to along the answer, and where the window's one step lands.
           const around = (strategy as Exposed).parted(listing, from - 1, from);
           const stepBack = (a: Int32Array, once: boolean) => {
             let b = from;
@@ -900,7 +857,6 @@ describe('a message stored as shards that answers its own call, after a long pla
     hold(store: unknown) { return this.holdBoundary(store as never); }
   }
   const bundle = (): ContentBlock[] => [text(prose('OPEN', 3_000)), call('b1'), text(prose('MIDDLE', 3_000)), result('b1', 'Sunny.'), text(prose('CLOSE', 1_500))];
-  /** `[hi] [a 12,000-character document] [the bundle] [thanks]`; `bundle` is where the bundle's shards run. */
   async function withBundle(
     hold: boolean,
     body: (strategy: Exposed, store: unknown, view: unknown, at: { from: number; to: number; callAt: number; resultAt: number }) => void,

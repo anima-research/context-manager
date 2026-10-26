@@ -128,13 +128,11 @@ describe('attributeEntries', () => {
         return this.mergeAdjacentBodyGroupRaw(entries, {} as never, messages);
       }
     }
-    // As a body with an image stored before blocks were kept in place: the
     // text across the shards, the image on shard 0 after its text.
     const g = { bodyGroupId: 'gm', shardCount: 2 };
     const s0 = msg('m0', 1, [text('part one '), image('AAAA')], { ...g, shardIndex: 0 });
     const s1 = msg('m1', 2, [text('part two')], { ...g, shardIndex: 1 });
     const stored = [s0, s1];
-    // The windows' join of such a body: media first, then the text joined.
     const [merged] = new Merger({}).merge([copy(s0), copy(s1)], stored);
     assert.deepEqual(merged!.content, [image('AAAA'), text('part one part two')]);
     const bodyOf = (entry: ContextEntry) => {

@@ -301,22 +301,6 @@ export function releaseSharedRawFormsOnMove(
   return shared.size === 0 ? moved : withoutRawForms(moved, shared);
 }
 
-/**
- * Reconcile a message's content after it was split into parts that render
- * apart, such as the shards ingress stores for a long message. `before` is
- * the message's content; `parts` hold its blocks, each unchanged block by
- * identity, and a block cut into pieces as new blocks. A raw form is true of
- * a part only when every block that shares it is in that part, unchanged: a
- * part replayed alone would otherwise carry blocks another part holds. So a
- * raw form that a cut block carried, or whose carriers land in more than one
- * part, is given up by every block that carries it, with the reasoning
- * pairing it belongs to, and so is a reasoning pairing whose members land in
- * more than one part. An opaque carrier keeps its raw item, which is its
- * whole content.
- *
- * Returns `parts` itself when nothing has to change, and otherwise new
- * arrays for the parts that change.
- */
 export function releaseRawFormsAcrossParts(
   before: readonly ContentBlock[],
   parts: ContentBlock[][],
@@ -344,8 +328,6 @@ export function releaseRawFormsAcrossParts(
     }
   }
   for (const [key, where] of landed) if (where.size > 1) released.add(key);
-  // A reasoning pairing is replayed as one: a pairing whose members land on
-  // different parts is true of no part alone.
   for (const pairing of pairingsOf(before)) {
     const where = new Set<number>();
     for (const key of pairing) for (const k of landed.get(key) ?? []) where.add(k);

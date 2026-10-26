@@ -170,7 +170,6 @@ describe('a system change, written and priced', () => {
     const cm = await open(new PassthroughStrategy());
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Summarize this and look it up.')]);
-    // A body stored before blocks were kept in place has its non-text blocks on its first shard.
     const first = store.append('Claude', [text('part one '), toolUse('t1')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 0, shardCount: 2 });
     store.append('Claude', [text('part two')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${first.id} holds a tool_use \\(t1\\) with no result between it and this change`));
@@ -183,7 +182,6 @@ describe('a system change, written and priced', () => {
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Weather in Oslo and Bergen?')]);
     const call = cm.addMessage('Claude', [toolUse('a'), toolUse('b')]);
-    // A body stored before blocks were kept in place has its results on its first shard, its long text after.
     store.append('User', [toolResult('a')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 0, shardCount: 2 });
     store.append('User', [text('a long note beside the result')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${call} holds a tool_use \\(b\\) with no result between it and this change`));
@@ -633,8 +631,6 @@ describe('the autobiographical strategy and a system change', () => {
     const cm = await open(strategy, membrane);
     for (let i = 0; i < 9; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
     const use = cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
-    // Compressed by ticks alone: an adaptive compile of this store, which
-    // ends at an unanswered call, refuses it (repair-lost-newest-turn).
     for (let r = 0, before = -1; r < 200 && requests.length !== before; r++) { before = requests.length; await cm.tick(); await cm.tick(); }
     const chunks = (): Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> =>
       (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> }).chunks;

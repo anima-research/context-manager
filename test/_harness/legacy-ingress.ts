@@ -1,10 +1,3 @@
-/**
- * The layout bodies were stored in before ingress kept each block in place:
- * the message's text joined into one block, cut across the shards, and every
- * other block on the first shard after its text, with no `continuesBlock`.
- * Tests of bodies stored that way rewrite a chunking decision with it, so
- * there is one copy of what that stored format was.
- */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { IngressChunkResult } from '../../src/types/strategy.js';
 

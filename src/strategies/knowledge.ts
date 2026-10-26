@@ -69,8 +69,6 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     const all = store.getAll();
     const position = this.positionIndex(all);
     const changes = systemChangePositions(all);
-    // Where a close would part a call from its result (closingPartsCall),
-    // from the first message the walk asks about.
     const held = this.closesHeld(all, messagesToChunk.length > 0 ? position.get(messagesToChunk[0]!.id) ?? 0 : all.length);
     // The walk below is in store order, so one cursor finds the changes
     // stored between each message and the one before it.

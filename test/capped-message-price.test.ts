@@ -21,8 +21,7 @@
  * whole, which the old rule charged the cap plus 50 too. Between them they
  * pin each place a raw message is priced but one:
  * the head window, the middle (positioned and combined recall pairs, a plan
- * whose level has no summary, and a body's raw shards, which every region
- * cuts as it sends them), the recent
+ * whose level has no summary, and a body's raw shards), the recent
  * window's reservation and eviction walk, the picker's pinned head and tail
  * chunks, kv-unified's tail units, and the windowed strategy's window. The
  * one, the refusal floor of the head and tail reservation, is pinned by
@@ -572,10 +571,6 @@ describe("the cut asks about a stored message's own content through the message'
 
 describe("a body's raw shards go out cut at the cap in every region, each priced as it's sent", () => {
   // Ingress splits a long text into shards of about targetChunkTokens at four
-  // characters a token, 12,000 characters by default. Every region sends a
-  // raw shard as any raw message is sent, cut at the cap: the middle's shard
-  // path cuts each shard before joining a body's raw run into one entry, as
-  // the head and recent windows cut each shard as they emit it.
   const body: Array<[string, ContentBlock[]]> = [
     ['u', [{ type: 'text', text: 'r'.repeat(80_000) }]],
     ['a', [{ type: 'text', text: 'ok' }]],

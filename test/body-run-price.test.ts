@@ -5,8 +5,7 @@
  * block, in the adaptive middle through the shard path and in the head and
  * recent windows through their merge, and the strategy counts that block as
  * the parts it joins: in the plan, in the emission and eviction checks, and
- * in the render stats, which the calibration sample reads. (A body with other
- * blocks sends them where they sat, and they count with their shards.) The store's own
+ * in the render stats, which the calibration sample reads. The store's own
  * estimate of the joined block would put all of it at the rate its first
  * 2,000 characters set, so where the shards' densities differ it comes to
  * another count: over the parts here when the first shard is the denser, and
@@ -145,11 +144,6 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
   });
 
   it("raw in the adaptive middle, with an image at the body's end: the run sends it where it sat, and is counted as every part", async () => {
-    // Ingress keeps the image in its place, at the end of the last shard, and
-    // the middle's shard path sends every block of a raw shard, so it sends
-    // what the plan priced. With no depth strip: at the default 30,000 tokens
-    // the last shard is the message that crosses the depth, so the estimate,
-    // as the strip, would price its image as the placeholder.
     const given: ContentBlock[] = [{ type: 'text', text: DENSE + PROSE }, IMAGE];
     const o = await open(given, { ...WINDOWS['raw in the adaptive middle'].config, imageStripDepthTokens: 0 });
     try {
@@ -204,9 +198,6 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
   });
 
   it("raw in the adaptive middle, with an emitter that counts more: the run is counted as the plan priced its shards", async () => {
-    // estimateTokens prices nothing the plan counts, with no summaries yet,
-    // and the middle's run takes each shard's price from the plan, as the
-    // windows do, so doubling it changes neither the run's count nor what fits.
     class DoubleCountingEmitter extends AutobiographicalStrategy {
       protected override estimateTokens(content: ContentBlock[]): number {
         return 2 * super.estimateTokens(content);

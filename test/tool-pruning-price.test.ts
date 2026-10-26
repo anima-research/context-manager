@@ -42,9 +42,6 @@ class SeedableStrategy extends AutobiographicalStrategy {
     return this.prunedForSend(store, msg);
   }
 }
-/** Ingress as bodies were stored before each block was kept in place: the
- *  text joined into one block, cut across the shards, and the other blocks on
- *  the first shard after its text, with no seam declared. */
 class LegacyIngressStrategy extends SeedableStrategy {
   override chunkIngressMessage(participant: string, content: ContentBlock[]) {
     return legacyIngress(super.chunkIngressMessage(participant, content), content);
@@ -236,11 +233,6 @@ describe('tool pruning, priced as sent', () => {
   }
 
   it('counts a result whose call is on the first shard of a sharded message stored before blocks were kept in place', async () => {
-    // Such a message holds its non-text blocks on its first shard, so the
-    // call and its result aren't adjacent in the store: more shards come
-    // between them than pairing repair looks ahead over. The count follows
-    // calls, not adjacency, and the head and recent windows join a body's
-    // shards, so the result answers its call and takes a slot.
     const { cm } = await open({ adaptiveResolution: true, targetChunkTokens: 100, toolResultMaxLastN: 1 }, undefined, LegacyIngressStrategy);
     cm.addMessage('u', text('look these up'));
     cm.addMessage('a', [{ type: 'text', text: `thinking aloud ${PROSE}` }, call('call-1')]);
@@ -265,8 +257,6 @@ describe('tool pruning, priced as sent', () => {
     const shards = cm.getAllMessages().filter((m) => m.bodyGroupId);
     const holding = shards.flatMap((m, k) => (m.content.some((b) => b.type === 'tool_use') ? [k] : []));
     assert.ok(holding.length === 2 && holding[0] !== holding[1], `premise: the two calls are on different shards (${JSON.stringify(holding)})`);
-    // Answered in the other order: within one message, the call whose result
-    // comes first is the older, so with one kept it's call-2's that goes.
     cm.addMessage('u', [result('call-2', 'short two'), result('call-1', 'short one')]);
     cm.addMessage('a', text('ok'));
     cm.addMessage('u', text('next'));

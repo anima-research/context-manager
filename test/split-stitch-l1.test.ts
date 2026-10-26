@@ -88,20 +88,17 @@ async function build(membrane: unknown, opts: { split?: boolean; placeholder?: b
     ...(opts.preimages ? { persistMintPreimages: true } : {}),
   } as never);
   const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: membrane as never });
-  // Compression waits for the host's tool definitions once history holds tool blocks.
   if (opts.toolRound) manager.setToolDefinitions([{ name: 'look', description: 'look', inputSchema: { type: 'object', properties: {} } }] as never);
   const n = opts.n ?? 4;
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
     if (opts.toolRound && i === 1) { ids.push(manager.addMessage('Claude', [text(`raw-${i} ` + 'substantive '.repeat(12)), { type: 'tool_use', id: 'tu-1', name: 'look', input: {} } as ContentBlock])); continue; }
-    // A result after a long text, which ingress keeps on the message's last shard.
     if (opts.shardedResult && i === 2) { ids.push(manager.addMessage('User', [text(`raw-${i} ` + 'substantive '.repeat(200)), { type: 'tool_result', toolUseId: 'tu-1', content: [text('the-result')] } as unknown as ContentBlock])); continue; }
     if (opts.toolRound && i === 2) { ids.push(manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu-1', content: [text('result')] } as unknown as ContentBlock, text(`raw-${i} ` + 'substantive '.repeat(12))])); continue; }
     if (i === 2 && (opts.participant2 || opts.spoof2)) { ids.push(manager.addMessage(opts.participant2 ?? 'User', [text(`raw-${i} ${opts.spoof2 ?? ''}` + 'substantive '.repeat(12))])); continue; }
     ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(12))]));
   }
   const all = managerContext(manager).messageStore.getAll();
-  // A sharded message's id is its first shard's; the chunk holds every shard.
   const targetMessages = opts.shardedResult ? all : all.filter((m) => ids.includes(m.id));
   const target: Chunk = { index: 7, startIndex: 0, endIndex: n, messages: targetMessages, tokens: 100, compressed: false };
   return { manager, strategy, ids, target };
@@ -215,7 +212,6 @@ describe('split-stitch L1 fallback', () => {
     const fx = await build(membrane, { split: true, placeholder: true, n: 4, toolRound: true, shardedResult: true });
     assert.ok(fx.target.messages.length > 5, `premise: the result's message is stored as shards (${fx.target.messages.length} messages)`);
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    // A piece is a request for part of the chunk: fewer than its four messages.
     const labels = (c: NormalizedRequest) => texts(c).filter((t) => /^raw-\d+ /.test(t)).map((t) => t.split(' ')[0]);
     const withCall = calls.filter((c) => labels(c).includes('raw-1') && labels(c).length < 4);
     assert.ok(withCall.length > 0, `premise: the rung sends a piece carrying the call (${withCall.length})`);

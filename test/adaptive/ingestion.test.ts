@@ -338,7 +338,6 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
       strategy,
       membrane: mock as any,
     });
-    // A reply that thinks, writes a long text, then calls a tool.
     const given: ContentBlock[] = [
       { type: 'thinking', thinking: 'let me look', signature: 'SIG' } as any,
       { type: 'text', text: 'paragraph. '.repeat(2000) },
@@ -371,7 +370,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
     content.reduce((n, b) => n + (b.type === 'text' ? b.text.length : 0), 0);
 
   it('two text blocks, a seam inside the second: both blocks come back, with their own boundary', () => {
-    // No line break anywhere, so the chunker cuts at its 2,000-character target.
     const given: ContentBlock[] = [{ type: 'text', text: 'first. '.repeat(100) }, { type: 'text', text: 'second. '.repeat(1500) }];
     const shards = shardsOf(given);
     assert.ok(shards.every((s, k) => k === 0 || s.continuesBlock === true), 'premise: no seam falls on the boundary between them');
@@ -380,9 +378,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it('two text blocks, a seam on the boundary between them: the seam declares it, and the blocks stay apart', () => {
-    // The first block's 1,854 characters end in a blank line and the second
-    // opens with a heading, the chunker's preferred seam, and the only one
-    // before the 2,000 characters it aims for.
     const given: ContentBlock[] = [
       { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
       { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
@@ -421,8 +416,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it('an image and an empty text block on a seam go on the shard after it, and the body joins back as given', () => {
-    // As the boundary case: the first block's 1,854 characters end in a blank
-    // line, and the heading after it is the chunker's seam.
     const given: ContentBlock[] = [
       { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
       image,
@@ -437,8 +430,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it("a cut text block's pieces are plain text, and a raw form is kept only where all its blocks land, unchanged, on one shard", () => {
-    // As a Responses reply: a reasoning item, a message item whose two text
-    // parts share its rawItem, then a function call with its own item.
     const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_1' } } as unknown as ContentBlock;
     const message = { type: 'message', id: 'msg_1' };
     const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_1' } } as unknown as ContentBlock;
@@ -459,8 +450,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it('a raw form whose blocks land whole on different shards is given up by each', () => {
-    // As the boundary case, twice: each block ends in a blank line and the
-    // heading after it is a seam, so each lands whole on a shard of its own.
     const item = { type: 'message', id: 'msg_3' };
     const given: ContentBlock[] = [
       { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n', rawItem: item } as unknown as ContentBlock,
@@ -485,9 +474,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it('a reasoning pairing whose members land whole on different shards is given up by both', () => {
-    // A reasoning item, plain text with no raw form, then the function call
-    // the reasoning led to: the reasoning lands on the first shard, the call
-    // on the last, each whole.
     const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_9' } } as unknown as ContentBlock;
     const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_9' } } as unknown as ContentBlock;
     const given: ContentBlock[] = [reasoning, { type: 'text', text: 'a plain long text. '.repeat(400) }, call];
@@ -499,8 +485,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it('a reasoning pairing whose members land whole on one shard keeps both items', () => {
-    // Plain text first, then a reasoning item and the function call it led
-    // to, both at the message's end, so both land on its last shard.
     const reasoning = { type: 'thinking', thinking: 'plan', signature: 'SIG', rawItem: { type: 'reasoning', id: 'rs_8' } } as unknown as ContentBlock;
     const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_8' } } as unknown as ContentBlock;
     const given: ContentBlock[] = [{ type: 'text', text: 'a plain long text. '.repeat(400) }, reasoning, call];
@@ -521,8 +505,6 @@ describe('chunkIngressMessage keeps each block in place', () => {
   });
 
   it("a body stored before blocks were kept in place joins as it always did: its other blocks first, then its text", () => {
-    // No shard declares continuesBlock: the text joined into one block, cut
-    // across the shards, and the other blocks on the first shard after its text.
     const legacy = [
       { content: [{ type: 'text', text: 'one ' } as ContentBlock, image] },
       { content: [{ type: 'text', text: 'two' } as ContentBlock] },
@@ -543,7 +525,6 @@ describe('continuesBlock is stored and checked', () => {
       membrane: makeMockMembrane() as any,
     });
     const manager = await open();
-    // The boundary case: the first seam falls between the two blocks, the later ones inside the second.
     manager.addMessage('User', [
       { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
       { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },
@@ -598,7 +579,6 @@ describe('continuesBlock is stored and checked', () => {
         strategy: new FirstDeclared({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 500 }),
         membrane: makeMockMembrane() as any,
       });
-      // The boundary case: the first seam falls between the two blocks, the later ones inside the second.
       const given: ContentBlock[] = [
         { type: 'text', text: 'first sentence here. '.repeat(88) + 'end.\n\n' },
         { type: 'text', text: '## Second\n\n' + 'second sentence. '.repeat(400) },

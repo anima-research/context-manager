@@ -535,9 +535,6 @@ describe('live image accounting', () => {
   });
 
   it("the strip counts a merged older body's images once, at its first shard, where they were stored, as the estimate does", () => {
-    // A body stored before blocks were kept in place has its images on its
-    // first shard, and mergeAdjacentBodyGroupRaw keeps them ahead of the
-    // merged text.
     const messages = [
       { id: 'a', sequence: 0, participant: 'User', content: [{ type: 'text', text: 'a' }, base64Image(), base64Image()] as ContentBlock[] },
       { id: 'b', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'b' }] as ContentBlock[] },
@@ -592,8 +589,6 @@ describe('live image accounting', () => {
   });
 
   it("the strip judges a joined body's image at the shard that holds it, though the entry starts at another", () => {
-    // A depth limit that reaches into the body: its first shard is beyond it,
-    // and its last shard, which holds the image, is within it.
     class Chunking extends FoldedWindow {
       merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
         return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
@@ -635,7 +630,6 @@ describe('live image accounting', () => {
       ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content });
     for (const asEstimated of [true, false]) {
       const strategy = new Chunking({ adaptiveResolution: true, imageStripDepthTokens: 2_000 } as never);
-      // As the middle joins s0 and s1 and the merge then joins the window's s2 to that run.
       const [run] = strategy.merge([entry(s0, 0), entry(s1, 1)], store, messages);
       const merged = strategy.merge([{ ...run!, index: 0 }, entry(s2, 1), entry(tail, 2)], store, messages);
       assert.deepEqual(merged[0]!.sourceMessageIds, ['s0', 's1', 's2'], 'premise: one entry, named by s0');
@@ -689,9 +683,6 @@ describe('live image accounting', () => {
         (this as unknown as { postProcessToolEntries(e: ContextEntry[]): void }).postProcessToolEntries(entries);
       }
     }
-    // A results message sharded with its results after a long text, sharing
-    // one raw form: the orphan result is dropped, and the kept one is copied
-    // to give the shared form up.
     const raw = '<function_results>both</function_results>';
     const orphan = { type: 'tool_result', toolUseId: 'gone', content: 'orphan', rawXml: raw } as unknown as ContentBlock;
     const kept = { type: 'tool_result', toolUseId: 'call', content: [base64Image(), { type: 'text', text: 'seen' }], rawXml: raw } as unknown as ContentBlock;
@@ -723,9 +714,6 @@ describe('live image accounting', () => {
         (this as unknown as { postProcessToolEntries(e: ContextEntry[]): void }).postProcessToolEntries(entries);
       }
     }
-    // A results message sharded with its results after a long text, sharing
-    // one raw form. One answers a call two messages back and is moved up to
-    // it; the one left behind is copied to give the shared form up.
     const raw = '<function_results>both</function_results>';
     const far = { type: 'tool_result', toolUseId: 'far', content: 'moved', rawXml: raw } as unknown as ContentBlock;
     const near = { type: 'tool_result', toolUseId: 'near', content: [base64Image(), { type: 'text', text: 'seen' }], rawXml: raw } as unknown as ContentBlock;
@@ -756,9 +744,6 @@ describe('live image accounting', () => {
         return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
       }
     }
-    // Two ingestions of one text share the group id. A run of the first's
-    // shards 0 to 3 is followed by the second's shard 2, whose index rises
-    // past the run's first shard but not past its last.
     const shard = (id: string, sequence: number, shardIndex: number) =>
       ({ id, sequence, participant: 'User', bodyGroupId: 'same', shardIndex, ...(shardIndex > 0 ? { continuesBlock: true } : {}), content: [{ type: 'text', text: id }] as ContentBlock[] });
     const messages = [shard('a0', 0, 0), shard('a1', 1, 1), shard('a2', 2, 2), shard('a3', 3, 3), shard('b0', 4, 0), shard('b1', 5, 1), shard('b2', 6, 2)];

@@ -179,7 +179,6 @@ export interface StoredMessageInternal {
   shardIndex?: number;
   /** See StoredMessage.shardCount */
   shardCount?: number;
-  /** See StoredMessage.continuesBlock */
   continuesBlock?: boolean;
   /** See StoredMessage.currentResolution */
   currentResolution?: number;

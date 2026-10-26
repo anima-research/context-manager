@@ -87,10 +87,7 @@ export function concatBodyGroups(
 }
 
 /**
- * The text of a shard's blocks, joined. This helper renders a body as text
- * alone: a body's other blocks (an image, a document, a tool call or result)
- * carry no text, so each is written as a placeholder naming its type. The
- * strategy's own render keeps every block (joinBodyContent).
+ * Extract text content from a message's content blocks.
  */
 function extractTextContent(blocks: ContentBlock[]): string {
   const out: string[] = [];

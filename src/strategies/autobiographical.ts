@@ -646,10 +646,9 @@ type StripReplay = {
   over: Readonly<CeilingKinds>;
 };
 
-/** A tool call the conversation answers: its message's place in the listing
- *  (a sharded message's first shard's), the place of the result that first
- *  answered it, and every result that answers it, by message and place in
- *  its content. */
+/** A tool call the conversation answers: its message's place in the listing,
+ *  the place of the result that first answered it, and every result that
+ *  answers it, by message and place in its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
 
 /**
@@ -673,8 +672,6 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        // A reply's calls are one turn: a sharded reply's sit on its shards
-        // where they were written, so each is placed at its body's first.
         opened.push([block.id, { toolName: block.name, call: { message: bodyStart((k) => messages[k], at), place: -1, results: [] } }]);
       } else if (block.type === 'tool_result') {
         const first = waiting.get(block.toolUseId)?.shift();
@@ -2634,8 +2631,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
     if (!this.config.adaptiveResolution) return null;
 
-    // The text the chunker cuts: the text blocks joined. Each block's place
-    // is the offset in it where the block starts.
     let combined = '';
     let textBlocks = 0;
     const placed: Array<{ block: ContentBlock; at: number }> = [];
@@ -2663,8 +2658,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sharded = chunkMessage(combined, chunkerOpts);
     if (!sharded.wasSharded) return null;
 
-    // Each shard's span of the joined text, in characters, as the chunker
-    // sliced it.
     const spans: Array<{ from: number; to: number }> = [];
     let cursor = 0;
     for (const shard of sharded.shards) {
@@ -2672,8 +2665,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       cursor += shard.content.length;
     }
     const last = spans.length - 1;
-    // The shard a block placed at `at` goes on: the one whose text it comes
-    // before, or the last at the end of the text.
     const shardAt = (at: number): number => {
       const k = spans.findIndex((span) => at < span.to);
       return k < 0 ? last : k;
@@ -2688,16 +2679,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (let k = shardAt(at); k <= last && spans[k]!.from < end; k++) {
         const from = Math.max(at, spans[k]!.from);
         const to = Math.min(end, spans[k]!.to);
-        // A piece of a cut block is plain text: the block's other fields,
-        // such as a raw replay form or a caller's cache_control, are true of
-        // the whole block, not of a piece.
         blocks[k]!.push(from === at && to === end ? block : { type: 'text', text: block.text.slice(from - at, to - at) });
       }
     }
-    // A raw form survives only where every block that shares it lands,
-    // unchanged, on one shard (raw-forms.ts).
     const placedBlocks = releaseRawFormsAcrossParts(content, blocks);
-    // A seam falls inside a text block when one starts before it and ends after.
     const insideText = (seam: number): boolean =>
       placed.some(({ block, at }) => block.type === 'text' && at < seam && seam < at + block.text.length);
 
@@ -10928,8 +10913,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (hasType(chunk.messages[i], 'tool_use')) {
               while (j + 1 < chunk.messages.length && hasType(chunk.messages[j + 1], 'tool_result')) j++;
             }
-            // Nor between a call and any message answering it, wherever their
-            // shards hold the tool_use and the tool_result (callPartedStarts).
             while (j + 1 < chunk.messages.length && parted[j]! >= 0) j++;
             return j;
           };
@@ -13207,9 +13190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const pse = this.postStripEstimates(store);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
     // A middle message's raw price, as the plan prices it and its refusal
-    // prices the pins that keep it raw (rawPinsDiagnostics): a shard's as any
-    // message's, since the shard path in step 5 cuts each raw shard as any
-    // raw message is cut.
+    // prices the pins that keep it raw (rawPinsDiagnostics).
     const middlePrice = (i: number): number => pse[i]! + this.cappedForSend(store, messages[i]!, msgCap).extra;
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
@@ -13261,19 +13242,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // structural repair refuses a compile to leave out. For a body split
       // into shards at ingress, its newest shard is all that must stay raw,
       // since the earlier shards can close into chunks and fold, unless the
-      // body holds a tool_result, on any of its shards (chunkIngressMessage
-      // keeps each block in place, so a result after a long text is on a
-      // later shard, and a body stored before then holds all its other
-      // blocks on its first), and a result whose call isn't raw just before
+      // body holds a tool_result: a result whose call isn't raw just before
       // it is blanked as an orphan (enforceToolPairing), without a refusal.
-      // So when the newest body
-      // holds a tool_result, the turn is the whole body and the call it
-      // answers, from the call's first shard that holds a tool_use or a
-      // thinking block, with the results between when parallel calls'
-      // results come one to a message (callStart), as holdBoundary counts it. A hold inside the head
-      // leaves every window's tail starting at the head's end, so a floor
-      // counted from the hold covers at least the tail, and nothing is named,
-      // as it should be. So does a newest turn that starts inside the head.
+      // A hold inside the head leaves every window's
+      // tail starting at the head's end, so a floor counted from the hold
+      // covers at least the tail, and nothing is named, as it should be. So
+      // does a newest turn that starts inside the head.
       let floorTokens = 0;
       if (messages.length > 0) {
         // A system change is no conversation message, so the newest one is
@@ -13400,11 +13374,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       if (headMessageIds.has(msg.id)) continue;
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      // This is the chunk's raw price (middlePrice), a shard's as any
-      // message's: the shard path in step 5 sends a run of a body's raw
-      // shards as one entry, each shard cut as any raw message is, and prices
-      // the entry as the shards it joins, each at this price. A shard the
-      // plan folds is priced as its summary.
+      // This is the chunk's raw price (middlePrice). A shard the plan folds is
+      // priced as its summary. The head and recent windows cut a shard as they
+      // emit it.
       const tokens = middlePrice(i);
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
@@ -13820,10 +13792,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Walk middle messages. Handle two cases:
     //  - bodyGroupId set: collect the consecutive shards of the same body (one
     //    ingestion; a later ingestion of the same text is another body, see
-    //    body-runs.ts), and emit each run of its raw shards as ONE entry, its
-    //    shards joined as every raw render joins a body (joinShards), and each
-    //    run of its folded shards as a recall pair. This preserves KV: the model
-    //    sees one continuous message instead of N turns.
+    //    body-runs.ts).
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
     const emittedAncestors = new Set<SummaryId>();
 
@@ -13870,8 +13839,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const shards = messages.slice(groupStart, i);
 
         // Walk shards in order, accumulating "runs":
-        //  - a 'raw' run is consecutive shards at L0; flushed as ONE message
-        //    of their joined blocks.
+        //  - a 'raw' run is consecutive shards at L0; flushed as ONE message.
         //  - a 'summary' run is consecutive shards under the same L_k
         //    ancestor; flushed as a Q+A recall pair (Context Manager
         //    question + summaryParticipant answer), emitted once per
@@ -13889,24 +13857,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!currentRun) return;
           if (currentRun.kind === 'raw') {
             const content = this.joinShards(currentRun.parts);
-            // The composite isn't cut as a whole, which would cut text the
-            // picker chose to keep raw: each shard is cut at maxMessageTokens
-            // as any raw message is (cappedForSend), as the windows cut it,
-            // so a shard reads the same in every region.
             const tokens = currentRun.tokens;
             if (totalTokens + tokens > prefixBudget) {
               throw emissionOverBudget(totalTokens + tokens);
             }
             entries.push({
               index: entries.length,
-              // Its first shard, as a window's merge names a composite, so a
-              // window's shards of the same body right after it join it
-              // (mergeAdjacentBodyGroupRaw) and the image strip places it.
               sourceMessageId: currentRun.ids[0],
-              // Composite provenance: every shard joined into this entry.
-              // Without this the coverage invariant reads the absorbed shards
-              // as missing (the body-group-shard false positive), as for
-              // mergeAdjacentBodyGroupRaw.
+              // Composite provenance: every shard whose text was concatenated
+              // into this entry. Without this the coverage invariant reads the
+              // absorbed shards as missing (the body-group-shard false
+              // positive) — same fix as mergeAdjacentBodyGroupRaw.
               sourceMessageIds: [...currentRun.ids],
               cacheLayoutKey: currentRun.ids.at(-1),
               sourceRelation: 'copy',
@@ -13937,9 +13898,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           currentRun = null;
         };
-        // A raw run sends each shard as any raw message is sent
-        // (cappedForSend), joined, and is priced as the parts it joins, each
-        // shard at the plan's price (postStripEstimates and the cut's extra).
         // The store's default estimator prices a text block at the rate its
         // first 2,000 characters set, so the joined block's own estimate
         // would put the whole run at that rate, and this entry and the plan
@@ -14062,11 +14020,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ----- 7. Post-process: merge consecutive raw entries from the same bodyGroup -----
     // Both head and tail emission paths emit shards as separate ContextEntries.
-    // The middle path joins each raw run of a body's shards into one composite
-    // entry, and head/tail don't. This pass joins them, a middle composite to
-    // the window's shards of its body next to it too, so a body's raw shards
-    // render as ONE API message whichever regions they fall into (preserves
-    // KV cache through region transitions).
+    // The middle path already merges consecutive same-bodyGroup raw shards into
+    // one composite entry, but head/tail don't. This pass closes that gap so
+    // a sharded message renders as ONE API message regardless of which region
+    // it falls into (preserves KV cache through region transitions).
     const merged = this.mergeAdjacentBodyGroupRaw(entries, store, messages);
 
     this.assertFullCoverage(merged, messages, {
@@ -14085,10 +14042,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // structural repair may rewrite tool blocks, but it must never erase that
     // turn. A body's shards merge into one entry, so any surviving shard of the
     // newest body proves the newest shard is present: a head or recent-window
-    // merge keeps its first shard's id as sourceMessageId, as a middle-region
-    // composite does, and either carries every shard's id in sourceMessageIds;
-    // the middle is where the newest body lands when its newest shard alone
-    // outgrows the recent window. Only that body's shards
+    // merge keeps its first shard's id as sourceMessageId, and a middle-region
+    // composite carries every shard's id in sourceMessageIds, which is where
+    // the newest body lands when its newest shard alone outgrows the recent
+    // window. Only that body's shards
     // count: an earlier ingestion of the same text shares the group id, and its
     // survival proves nothing about the newest turn.
     // A system change is no turn and always stays raw, so the newest turn is
@@ -15357,8 +15314,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  recall pair of each recall unit the reference's layout has after the
    *  raw unit before it and with a message still present, as the emission
    *  renders it (recallPairEntries). Raw messages are cut by cappedForSend;
-   *  a run of a body's raw shards in the middle, each cut by cappedForSend,
-   *  joins into one entry (joinShards), as the middle's shard path does, and
    *  shards in the head and recent windows join through
    *  mergeAdjacentBodyGroupRaw. */
   private kvUnifiedKeepEntries(
@@ -15441,7 +15396,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (msg.bodyGroupId) {
           const groupStart = i;
           i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k]!, groupStart) + 1;
-          // As the middle's emission sends a raw run (selectAdaptive's step 5).
           let run: { parts: Array<{ content: ContentBlock[]; continuesBlock?: boolean; home: MessageId }>; ids: string[] } | null = null;
           const flush = (): void => {
             if (!run) return;
@@ -15525,19 +15479,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Walk an entries array; for every run of consecutive entries that
    *  (a) have sourceRelation: 'copy' (raw, not a synthesized recall pair)
    *  (b) have sourceMessageId pointing to messages in the same bodyGroup
-   * merge them into one composite entry whose content is their body's
-   * blocks, joined as every raw render of a body joins it (joinShards,
-   * joinBodyContent). An entry can itself join a run of the body's shards:
-   * the adaptive middle sends a raw run of a body as one entry, which a
-   * window's shards next to it join. Other entries pass through.
+   * merge them into one composite entry. Other entries pass through.
    *
    * The merge prices nothing: the head and recent windows priced each shard
-   * as they emitted it, as the plan priced it, and so did the middle its
-   * run, so the budget and the render stats count a composite as the parts
-   * it joins, where the store's default estimator would price the joined
-   * text at its first 2,000 characters' rate. What re-estimates entries from
-   * their content after this, to place kv-unified's cache markers, report the
-   * fold diff or record the rendered layout, reads the joined text.
+   * as they emitted it, as the plan priced it, so the budget and the render
+   * stats count a composite as the parts it joins, where the store's default
+   * estimator would price the joined text at its first 2,000 characters'
+   * rate. What re-estimates entries from their content after this, to place
+   * kv-unified's cache markers, report the fold diff or record the rendered
+   * layout, reads the joined text.
    *
    * `messages` is the caller's `store.getAll()` listing; overrides should
    * forward it, since a filtered view re-lists the whole history per call.
@@ -15558,14 +15508,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Read the metadata off the full listing (the caller's, so a filtered
     // view is not listed twice) instead of one `store.get()` per raw entry:
     // each get re-fetched the record from chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
-    // store (2026-09-21 profile), for a few scalar fields. Only sharded
+    // store (2026-09-21 profile), for two scalar fields. Only sharded
     // messages carry a bodyGroupId, so the index stays small.
     const shardMeta = new Map<string, StoredMessage>();
     for (const m of messages) {
       if (m.bodyGroupId) shardMeta.set(m.id, m);
     }
-    // An entry's first and last shard: its own, or for an entry that joins a
-    // run of a body's shards, the run's ends.
     const firstShard = (entry: ContextEntry): StoredMessage | undefined =>
       entry.sourceRelation === 'copy' && entry.sourceMessageId ? shardMeta.get(entry.sourceMessageId) : undefined;
     const lastShard = (entry: ContextEntry): StoredMessage | undefined => {
@@ -15585,8 +15533,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Collect the run of consecutive raw entries of the same body. Another
       // ingestion of the same text shares the group id but restarts its
       // shard indices, and a window can start mid-body: the run ends where an
-      // index doesn't rise (see body-runs.ts), read from each entry's last
-      // shard to the next one's first.
+      // index doesn't rise (see body-runs.ts).
       let end = i;
       while (end + 1 < entries.length && continuesBody(lastShard(entries[end]!), firstShard(entries[end + 1]!))) end++;
       const run: ContextEntry[] = entries.slice(i, end + 1);
@@ -15617,13 +15564,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
-  /**
-   * A body's blocks from consecutive parts of it (joinBodyContent), each
-   * other block recorded as its part's (`home`, its shard), unless one is
-   * recorded already, as a run's blocks are when the merge joins it again:
-   * the image strip judges a block's images by the message that holds it
-   * (applyImageStripping), and a body's blocks can be on any of its shards.
-   */
   private joinShards(parts: ReadonlyArray<{ content: ContentBlock[]; continuesBlock?: boolean; home: MessageId }>): ContentBlock[] {
     for (const part of parts) {
       for (const block of part.content) {
@@ -17420,8 +17360,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const messagesToChunk = this.getCompressibleMessages(store, consumed);
     const livePosition = position;
-    // Where a close would part a call from its result (closingPartsCall),
-    // from the first message the walk asks about.
     const held = this.closesHeld(listing, messagesToChunk.length > 0 ? livePosition.get(messagesToChunk[0]!.id) ?? 0 : listing.length);
 
     let currentChunk: StoredMessage[] = [];
@@ -17494,8 +17432,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // subclass marks a semantic boundary between the running chunk's last
       // message and this one (e.g. a chat-topic transition). An undersized
       // boundary chunk is deliberate — a semantic boundary outranks the size
-      // target — but the chunker's minimum message count and the guard below
-      // against parting a call from its result still apply.
+      // target — but the chunker's minimum message count and the tool_use
+      // pairing guard below still apply.
       if (
         currentChunk.length >= 4 &&
         !this.closingPartsCall(currentChunk, held, livePosition) &&
@@ -17511,16 +17449,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         currentTokens >= this.config.targetChunkTokens &&
         currentChunk.length >= 4;
 
-      // Don't close a chunk where it would part a call from its result
-      // (closingPartsCall): on a message containing a tool_use block, nor
-      // anywhere between a call and a message answering it: on a later shard
-      // of that message when the result comes after a long text, or in a
-      // later message when parallel calls' results come one to a message.
-      // The Anthropic API rejects a request where a tool_use isn't
-      // immediately followed by its tool_result, so a compression request
-      // drops a tool_result whose call isn't in it (stripUnpairedToolBlocks),
-      // and the chunk holding the result would be summarized without it.
-      // Defer the close until the result rides along in the same chunk.
+      // Don't close a chunk on a message containing a tool_use block —
+      // the Anthropic API rejects a request where a tool_use
+      // isn't immediately followed by its tool_result. Defer the close
+      // so the result rides along in the same chunk.
       // The stripUnpairedToolBlocks runtime pass is a safety net for the
       // rare case where a tool_use is the very last message in the store.
       if (shouldClose && this.closingPartsCall(currentChunk, held, livePosition)) {
@@ -17580,9 +17512,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Returns true if the last message in the chunk-in-progress contains a
-   * `tool_use` block, whose `tool_result` comes in a later message or hasn't
-   * been written yet. closingPartsCall asks it, so the chunkers defer a close
-   * there until the result is pulled into the same chunk. See
+   * `tool_use` block. Used by `rebuildChunks` to defer chunk closure until
+   * the matching `tool_result` is pulled into the same chunk. See
    * `stripUnpairedToolBlocks` for the runtime safety net.
    */
   protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
@@ -17748,9 +17679,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!(maxLive > 0) && !(depthTokens > 0) && !(maxLiveBytes > 0)) return;
     const messages = store.getAll();
     const posById = this.positionIndex(messages);
-    // A block's images are its own message's: the entry's (at `pos`), or,
-    // where pairing repair moved a result into the entry or the entry joins a
-    // body's shards, the message the block came from (_blockHome).
     const homeOf = (block: ContentBlock, pos: number): number => {
       const from = this._blockHome.get(block);
       return from === undefined ? pos : posById.get(from) ?? -1;
@@ -17821,10 +17749,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Counting what the entries send: an entry with no resolvable position is
-    // stripped wherever a depth limit is set. An image is judged at its own
-    // message's position: the entry's, or, for a block that came from
-    // another message (_blockHome: a joined body's other shards, a result
-    // pairing repair moved), that message's.
+    // stripped wherever a depth limit is set.
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
 
     // The region each source position fell in when select() bucketed it. The
@@ -17855,14 +17780,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptImageBytes += blockBytes;
       return true;
     };
-    // Every image the entries carry, nested in a tool_result included, each
-    // at its own message's position, decided newest message first, as
-    // postStripEstimates counts them: a joined body's images
-    // on a later shard come before those on an earlier one, and a result
-    // pairing repair moved is counted at the message it came from. Each is
-    // decided as an occurrence, by its entry and its place among the entry's
-    // images in the order replaceImages meets them, so an image object that
-    // sits twice gets a verdict at each place.
     const images: Array<{ idx: number; nth: number; at: number; image: ContentBlock }> = [];
     for (const { idx, pos } of ordered) {
       let nth = 0;
@@ -17871,9 +17788,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const image of imagesIn([block])) images.push({ idx, nth: nth++, at: home, image });
       }
     }
-    // Stable, so images of one message keep the order the walk met them in:
-    // their order in the message, apart from a result pairing repair moved
-    // into another entry, whose images are met with that entry.
     images.sort((a, b) => b.at - a.at);
     const kept = new Map<number, boolean[]>();
     for (const { idx, nth, at, image } of images) {
@@ -17931,8 +17845,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * answer is how many, by message id (a message with none stripped is
    * absent). Undefined when the option is off or no limit is set.
    * postStripEstimates gives those images their verdicts, which
-   * applyImageStripping applies on every path while the option is on,
-   * judging each image at the shard that holds it in a joined body.
+   * applyImageStripping applies on every path while the option is on.
    */
   protected imageStripReplay(store: MessageStoreView): ReadonlyMap<MessageId, number> | undefined {
     return this.stripReplayAtLimits(store)?.out;
@@ -18041,11 +17954,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * verdict each gets is kept for the strip, which applies it
    * (applyImageStripping's asEstimated). A cut that leaves an image out, as an
    * override of `truncateContent` can, takes it off at its full price through
-   * the cut's extra, which every site that prices what's sent adds, apart
-   * from the recent window's size (getUnheldRecentWindowStart), since no
-   * window's size is measured after the cap (see cappedForSend). The strip
-   * depth is still measured over the stored messages, as getImageStripStart
-   * measures it.
+   * the cut's extra. The strip depth is still
+   * measured over the stored messages, as getImageStripStart measures it.
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
     return this.withToolPruning(store, () => this.postStripEstimatesHeld(store, this._toolPruningInUse!.pruning));
@@ -18657,37 +18567,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Timeline scans performed by holdBoundary (test instrumentation). */
   protected holdBoundaryScans = 0;
 
-  /**
-   * Whether the message holding position `at` holds a tool_result on any of
-   * its shards: a sharded message keeps each block where it sat
-   * (chunkIngressMessage), so a result after a long text is on a later shard.
-   */
   protected bodyHoldsToolResult(messages: readonly StoredMessage[], at: number): boolean {
     const { from, to } = bodyBoundsIn(messages, at);
     for (let k = from; k <= to; k++) if (this.hasToolResult(messages[k]!)) return true;
     return false;
   }
 
-  /**
-   * Where the call a result at `resultAt` answers starts to matter: for a
-   * result answering calls carried to it across the results before it
-   * (callRuns), as parallel calls' results come one to a message, where
-   * those calls start; otherwise the first shard of the body before the
-   * result's body that holds a tool_use or a thinking block (thinking or
-   * redacted_thinking), or that body's start when none does. The recent
-   * window's start, the smaller-window floor and the compression hold's
-   * boundary step back to it. A sharded call keeps each tool_use
-   * where it sat (chunkIngressMessage), which for a reply that ends in
-   * its calls is its last shard, so the earlier shards of a call with no
-   * thinking can fold while the shards holding the calls stay raw before
-   * their results. A call that thinks first keeps its thinking on its
-   * first shard and counts from there, so it keeps its thinking with it,
-   * as main's floor and hold counted a sharded call, from its body's
-   * start; so does a body stored before then, which holds the call on
-   * its first shard. The body is read as body-runs.ts reads it, so not
-   * over an earlier ingestion of the same text, which shares the group
-   * id.
-   */
   protected callStart(messages: readonly StoredMessage[], resultAt: number): number {
     const { from: resultBody, to: resultLast } = bodyBoundsIn(messages, resultAt);
     if (resultBody === 0) return resultAt;
@@ -18714,33 +18599,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return answers ? first : resultAt;
   }
 
-  /** Whether the message holding position `at` holds a tool_use on any of its shards. */
   protected bodyHoldsToolUse(messages: readonly StoredMessage[], at: number): boolean {
     const { from, to } = bodyBoundsIn(messages, at);
     for (let k = from; k <= to; k++) if (this.hasToolUse(messages[k]!)) return true;
     return false;
   }
 
-  /**
-   * For each position in `messages`, where the call starts that a boundary
-   * right after that position would part from a result of it, or from the
-   * rest of a message answering it, or -1 where a boundary there parts
-   * none, worked out in one pass (callRuns): for the whole listing, or
-   * exactly for the positions from `from` up to `until`.
-   */
   protected callPartedStarts(messages: readonly StoredMessage[], from = 0, until = messages.length): Int32Array {
     const n = messages.length;
     const starts = new Int32Array(n).fill(-1);
     const at = (k: number): StoredMessage | undefined => messages[k];
-    // From the message before `from`'s, which may leave calls open for it.
     let begin = n === 0 ? 0 : bodyStart(at, Math.min(from, n - 1));
     if (begin > 0) begin = bodyStart(at, begin - 1);
     while (begin > 0 && this.bodyHoldsToolResult(messages, begin)) begin = bodyStart(at, begin - 1);
     const mark = (from: number, to: number, start: number): void => {
       for (let p = from; p <= to; p++) if (starts[p]! < 0 || start < starts[p]!) starts[p] = start;
     };
-    // The calls still waiting for a result, from the earliest one's start;
-    // null when none is.
     let calls: { open: Set<string>; from: number; marked: number } | null = null;
     for (let from = begin; from < n && (from < until || (calls !== null && calls.from < until)); ) {
       const to = bodyEnd(n, at, from);
@@ -18784,26 +18658,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return starts;
   }
 
-  /**
-   * For each position in `messages`, whether a chunk ending there would
-   * part a call from its result: where a boundary falls between a call and
-   * a message answering it (callPartedStarts), and at the listing's end.
-   * The rule for a message holding a tool_use is lastMessageContainsToolUse,
-   * which closingPartsCall asks beside this.
-   *
-   * At the listing's end, what comes next isn't written yet. The chunkers
-   * run as each shard lands (onNewMessage), and the autobiographical one
-   * keeps each chunk it closes for good (its chunk records). So a close
-   * there waits as it would once the rest is written: inside a message still
-   * being written, which may yet hold a call or a result for the calls
-   * before it, and from the start of calls still waiting for a result
-   * (callRuns) while a message that may answer them hasn't come or is the
-   * one still being written. The walk after the write closes where the
-   * whole store allows. A body an interrupted write left short of its
-   * count holds a close only while nothing follows it. With `from`, the
-   * answer is exact from that position on (callRuns), so a walk that asks
-   * nothing before its first message pays only for the listing from there.
-   */
   protected closesHeld(messages: readonly StoredMessage[], from = 0): Uint8Array {
     const n = messages.length;
     const held = new Uint8Array(n);
@@ -18842,10 +18696,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Index where the hold region begins: the earliest held message, stepped
-   * back, when its message holds a tool_result on any of its shards, onto
-   * the call it answers, from the call's first shard that holds a tool_use
-   * or a thinking block (callStart). `store.length()` when nothing is held —
-   * and then without scanning the timeline.
+   * back onto the tool_use a held tool_result answers. `store.length()` when
+   * nothing is held — and then without scanning the timeline.
    */
   protected holdBoundary(store: MessageStoreView): number {
     const isHeld = store.isCompressionHeld;
@@ -18909,8 +18761,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Whether a chunk reaches the hold boundary: any of its messages is held,
-   * follows a held message, or is a shard of the call a held tool_result
-   * answers, from where holdBoundary starts it.
+   * follows a held message, or is the tool_use a held tool_result answers.
    * Only reachable for chunks that closed before the hold was placed; the
    * compression request would otherwise carry the provisional content (as
    * the chunk itself or as its lead-in context).
@@ -18929,21 +18780,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tokens += pse[i];
       if (tokens > this.config.recentWindowTokens) {
         let boundary = i + 1;
-        // Don't split a tool_use/tool_result pair: if the message at the
-        // boundary holds a tool_result, on any of its shards, include the call
-        // before it, from its first shard that holds a tool_use or a thinking
-        // block (callStart).
+        // Don't split a tool_use/tool_result pair: if the message at the boundary
+        // is a tool_result, include the preceding tool_use with it.
         if (boundary > 0 && boundary < messages.length && this.bodyHoldsToolResult(messages, boundary)) {
           boundary = this.callStart(messages, boundary);
         }
-        // Nor between a call and any of its results (callPartedStarts): step
-        // back once, to the start of the call the boundary would part from
-        // them, as when a call's text follows its tool_use on the shards
-        // after it, or parallel calls' results come in messages of their own.
-        // Only once: where that call's message also answers the call before
-        // it, the window doesn't follow the chain further back, since each
-        // step adds raw messages to the window and a long chain would take it
-        // back to the chain's start. That earlier call is parted as on main.
         if (boundary > 0) {
           const parted = this.callPartedStarts(messages, boundary - 1, boundary);
           if (parted[boundary - 1]! >= 0) boundary = parted[boundary - 1]!;
@@ -19143,13 +18984,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
-        // Nor anywhere between a call and a message answering it (on a later
-        // shard of that message when the result comes after a long text, or
-        // in a later message when parallel calls' results come one to a
-        // message): pull back to the call's start (callPartedStarts), and
-        // along a chain of calls, since the head only shrinks as it does.
-        // The pass starts where no run reaches back past (callRuns), so every
-        // step back lands where its answer is exact.
         if (boundary > startIdx) {
           const parted = this.callPartedStarts(messages, boundary - 1, boundary);
           while (boundary > startIdx && parted[boundary - 1]! >= 0) boundary = Math.max(startIdx, parted[boundary - 1]!);
@@ -19431,11 +19265,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < entries.length; i++) entries[i].index = i;
   }
 
-  /**
-   * `releaseEditedRawForms(before, kept)`, with each kept block's recorded
-   * home carried to the copy that gives up a raw form, so the image strip
-   * still judges its images at the message that holds them.
-   */
   private releasedKeepingHomes(before: ContentBlock[], kept: ContentBlock[]): ContentBlock[] {
     const out = releaseEditedRawForms(before, kept);
     if (out !== kept) {
@@ -19447,11 +19276,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
-  /** The stored message a block an entry holds came from, where that isn't
-   *  the entry's own source: a tool result pairing repair moved, from the
-   *  entry it came from (relocateOrDropMissingResults), where that entry has
-   *  an id; and a block of a body's shard, joined into one entry with the
-   *  body's other shards (joinShards). The image strip reads it. */
+  /** The message each tool result pairing repair moved was moved from, by
+   *  the block it placed (relocateOrDropMissingResults), where the entry it
+   *  came from has an id. */
   private readonly _blockHome = new WeakMap<ContentBlock, MessageId>();
 
   /**
@@ -19497,9 +19324,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
         const moved = releaseSharedRawFormsOnMove(real, source);
-        // Where it came from, for the image strip (applyImageStripping's
-        // asEstimated).
-        // A block joined from another of the body's shards keeps that shard.
         const home = this._blockHome.get(real) ?? src.sourceMessageId;
         if (home !== undefined) this._blockHome.set(moved, home);
         return moved;

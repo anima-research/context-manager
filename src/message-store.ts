@@ -638,8 +638,7 @@ export class MessageStore {
   refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
     const length = this.length();
     const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
-    // A body is one step of either walk, read whole: ingress sharding keeps
-    // each block where it sat, so its calls and results can be on any shard.
+    // A body is one step of either walk, read whole.
     const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
       const from = bodyStart(at, i);
       const to = bodyEnd(length, at, i);

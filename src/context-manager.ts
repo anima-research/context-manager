@@ -634,11 +634,6 @@ export class ContextManager {
         // Shards are written in index order, so the id returned (the first
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
-        // A body declares where its seams split a text block on every shard
-        // after the first or on none (joinBodyContent reads one that declares
-        // none as stored before blocks were kept in place). A first shard has
-        // no seam before it, and no join uses its declaration: a body's first
-        // shard is always the first part of a join (joinBodyContent).
         const undeclared = ordered.slice(1).filter((s) => s.continuesBlock === undefined).map((s) => s.shardIndex);
         if (undeclared.length !== 0 && undeclared.length !== ordered.length - 1) {
           throw new Error(

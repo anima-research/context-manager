@@ -322,7 +322,6 @@ describe('compression holds', () => {
     ]);
     const stored = manager.getAllMessages().slice(before);
     assert.ok(stored.length > 1, `setup: tool_use message was sharded (${stored.length})`);
-    // The call keeps its place at the end of its body, on its last shard.
     const useId = stored.find((m) => m.content.some((b) => b.type === 'tool_use'))!.id;
     assert.equal(useId, stored.at(-1)!.id, 'setup: the last shard holds the tool_use');
     manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu-1', content: PLACEHOLDER }],
@@ -334,8 +333,6 @@ describe('compression holds', () => {
     const s = strategy as unknown as S;
     assert.ok(prompts.length > 0 && s.summaries.length > 0, 'setup: earlier history compressed');
     assert.ok(!s.summaries.some((x) => x.sourceIds.includes(useId)), 'tool_use shard compressed without its held result');
-    // The hold starts at the shard that holds the call, so the call's earlier
-    // shards, text alone, can compress before it.
     assert.ok(s.summaries.some((x) => x.sourceIds.includes(stored[0]!.id)), "the call's first shard compressed");
     manager.close();
   });

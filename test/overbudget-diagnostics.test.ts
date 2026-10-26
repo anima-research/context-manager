@@ -782,9 +782,6 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  /** Ingress as bodies were stored before each block was kept in place: the
-   *  text joined into one block, cut across the shards, and the other blocks
-   *  on the first shard after its text, with no seam declared. */
   class LegacyIngress extends AutobiographicalStrategy {
     override chunkIngressMessage(participant: string, content: ContentBlock[]) {
       return legacyIngress(super.chunkIngressMessage(participant, content), content);

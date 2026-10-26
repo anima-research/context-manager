@@ -479,7 +479,6 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
 
   it('prices a marked message\'s parts each cut, as the plan sends a run of them', async () => {
     await withDir(async (dir) => {
-      // Parts of about 2,000 tokens, each over a cap of 300, which cuts each part in a run as it cuts any raw message.
       const { cm } = await open(dir, 'adaptive', 8000, { maxMessageTokens: 300 });
       await history(cm);
       const b = cm.addMessage('user', words('Bdoc', 6000));
@@ -500,7 +499,6 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       }
       assert.ok(raw, 'a refusal named the mark');
       assert.deepStrictEqual(raw.pins.map((p) => [p.pinId, p.parts]), [[mark, parts.length]]);
-      // Each part is priced cut, at 400 to 450 tokens: one part priced uncut (about 2,000) goes over, one part left out goes under.
       const tokens = raw.pins[0]!.tokens;
       assert.ok(tokens >= parts.length * 400 && tokens < parts.length * 450, `priced each part cut: ${tokens} for ${parts.length} parts`);
       await cm.close();
