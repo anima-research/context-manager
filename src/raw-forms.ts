@@ -321,20 +321,26 @@ export function releaseRawFormsAcrossParts(
   before: readonly ContentBlock[],
   parts: ContentBlock[][],
 ): ContentBlock[][] {
-  const partOf = new Map<ContentBlock, number>();
-  parts.forEach((part, k) => { for (const block of part) partOf.set(block, k); });
+  const partsOf = new Map<ContentBlock, Set<number>>();
+  parts.forEach((part, k) => {
+    for (const block of part) {
+      let of = partsOf.get(block);
+      if (!of) partsOf.set(block, (of = new Set()));
+      of.add(k);
+    }
+  });
   const released = new Set<string>();
   const landed = new Map<string, Set<number>>();
   for (const block of before) {
-    const k = partOf.get(block);
+    const of = partsOf.get(block);
     for (const key of rawFormKeys(block)) {
-      if (k === undefined) {
+      if (of === undefined) {
         released.add(key);
         continue;
       }
       let where = landed.get(key);
       if (!where) landed.set(key, (where = new Set()));
-      where.add(k);
+      for (const k of of) where.add(k);
     }
   }
   for (const [key, where] of landed) if (where.size > 1) released.add(key);

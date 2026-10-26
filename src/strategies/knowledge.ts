@@ -135,13 +135,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       }
       // Not between a call and its result: closing there would leave the
       // result with its call folded into the summary, and pairing repair
-      // drops a result whose call isn't before it. So when a summary ends at
-      // a call answered only later, the message answering it joins the
-      // summary's chunk, which the overlap guard then refuses, as on main.
-      // Each is asked on all its shards: a call can hold its tool_use on any
-      // of them, and the message answering it its tool_result, on a later
-      // shard when it comes after a long text. The size close below keeps
-      // the rest of that message in the chunk.
+      // drops a result whose call isn't before it.
       const summaryChanges = previous !== undefined
         && coveredBy.get(previous.id) !== coveredBy.get(msg.id)
         && !(this.bodyHoldsToolUse(all, position.get(previous.id)!) && this.bodyHoldsToolResult(all, at));
@@ -175,19 +169,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const maxTokens = this.getMaxChunkTokens(currentPhase ?? phase);
       const sizeExceeded = currentTokens >= maxTokens;
       // Same tool-pair boundary guard as the base chunker (rebuildChunks in
-      // AutobiographicalStrategy, closingPartsCall): never close a chunk
-      // whose LAST message contains a tool_use block, nor anywhere between a
-      // call and a message answering it, on a later shard when the result
-      // comes after a long text or in a later message when parallel calls'
-      // results come one to a message. Closing there would
-      // split the pair across chunks; a compression request drops the
-      // tool_result whose call isn't in it (stripUnpairedToolBlocks), and
-      // when the earlier chunk compresses first, pairing repair drops the raw
-      // orphan tool_result. Deferring the close pulls the tool_result into the
-      // same chunk. (A message holding only a tool_result inherits
-      // lastToolPhase, but the text-only shards before a result on a later
-      // shard classify as synthesis, so this defers phase closes there as
-      // well as sizeExceeded closes.)
+      // AutobiographicalStrategy): never close a chunk whose LAST message
+      // contains a tool_use block. Closing
+      // here would split the pair across chunks.
       const shouldClose =
         currentChunk.length >= 2 &&
         (phaseChanged || sizeExceeded) &&

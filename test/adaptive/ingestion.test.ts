@@ -474,6 +474,16 @@ describe('chunkIngressMessage keeps each block in place', () => {
     assert.equal(shards[1]!.continuesBlock, false, 'premise: the seam falls between the two parts');
   });
 
+  it('one block object that sits twice in a message, landing on two shards, gives up its raw form at both', () => {
+    const call = { type: 'tool_use', id: 'fc', name: 'search', input: {}, rawItem: { type: 'function_call', id: 'fc_7' } } as unknown as ContentBlock;
+    const given: ContentBlock[] = [call, { type: 'text', text: 'a plain long text. '.repeat(400) }, call];
+    const shards = shardsOf(given);
+    assert.ok(shards.length > 1 && shards[0]!.content[0]!.type === 'tool_use' && shards.at(-1)!.content.at(-1)!.type === 'tool_use',
+      'premise: the block leads the first shard and ends the last');
+    assert.equal((shards[0]!.content[0] as { rawItem?: unknown }).rawItem, undefined, 'the first shard\'s gives up its item');
+    assert.equal((shards.at(-1)!.content.at(-1) as { rawItem?: unknown }).rawItem, undefined, 'and so does the last shard\'s');
+  });
+
   it('a reasoning pairing whose members land whole on different shards is given up by both', () => {
     // A reasoning item, plain text with no raw form, then the function call
     // the reasoning led to: the reasoning lands on the first shard, the call

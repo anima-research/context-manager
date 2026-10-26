@@ -314,7 +314,7 @@ describe('a result that sits after text, on a later shard of its message', () =>
 });
 
 describe('the recent window at a result on a later shard of the store\'s first message', () => {
-  it('starts at the store\'s start: there is no call before it to step back to', async () => {
+  it('starts at its edge: there is no call before it to step back to', async () => {
     class Exposed extends AutobiographicalStrategy {
       recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
       estimates(store: unknown) { return this.postStripEstimates(store as never); }
@@ -332,7 +332,7 @@ describe('the recent window at a result on a later shard of the store\'s first m
       const store = (manager as unknown as { messageStore: unknown }).messageStore;
       const config = (strategy as unknown as { config: Record<string, number> }).config;
       config.recentWindowTokens = strategy.estimates(store).slice(resultAt).reduce((a, b) => a + b, 0);
-      assert.equal(strategy.recentStart(store), 0);
+      assert.equal(strategy.recentStart(store), resultAt);
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
@@ -664,18 +664,19 @@ describe("parallel calls' results, each in a message of its own", () => {
   const storeOf = (manager: ContextManager) => (manager as unknown as { messageStore: unknown }).messageStore;
 
   for (const [name, { inPlace }] of Object.entries(STRATEGIES)) {
-    it(`${name}: no chunk parts the call from any of its three results, written one by one`, async () => {
+    it(`${name}: the chunk holding the call holds its first result's message, and the later results, one to a message, close as before`, async () => {
       await withWrites(inPlace, parallel(3), async (manager, strategy) => {
         const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void };
         chunker.rebuildChunks(storeOf(manager));
         const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
         assert.ok(chunker.chunks.length >= 3 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
-        assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, 3, 'the chunk holding the call holds all three results');
+        const expected = name.startsWith('a boundary hint') ? 3 : 1;
+        assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, expected, 'the chunk holding the call holds the first result, and closes as before');
       });
     });
   }
 
-  it('autobiographical: a walk over a long run of unchunked messages at once, as when the recent window shrinks, keeps the call with its results', async () => {
+  it('autobiographical: a walk over a long run of unchunked messages at once, as when the recent window shrinks, keeps the call with its first result', async () => {
     await withWrites(AutobiographicalStrategy, parallel(3), async (manager, strategy) => {
       const chunker = strategy as unknown as { chunks: Array<{ messages: Array<{ content: ContentBlock[] }> }>; rebuildChunks(store: unknown): void; config: Record<string, number> };
       assert.equal(chunker.chunks.length, 0, 'premise: nothing was chunked while the window held everything');
@@ -683,7 +684,7 @@ describe("parallel calls' results, each in a message of its own", () => {
       chunker.rebuildChunks(storeOf(manager));
       const withCall = chunker.chunks.filter((c) => c.messages.some((m) => holds(m, 'tool_use')));
       assert.ok(chunker.chunks.length >= 3 && withCall.length === 1, `premise: the store chunks into several, one holding the tool_use (${chunker.chunks.length})`);
-      assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, 3, 'the chunk holding the call holds all three results');
+      assert.equal(withCall[0]!.messages.filter((m) => holds(m, 'tool_result')).length, 1, 'the chunk holding the call holds the first result');
     }, { recentWindowTokens: 1_000_000 });
   });
 
@@ -724,13 +725,13 @@ describe("parallel calls' results, each in a message of its own", () => {
     });
   });
 
-  it("the listing's end holds a close after a result while another call waits, and not once the last has come", async () => {
+  it("the listing's end holds a close after a call until its first result's message has come, and not after it while another call waits", async () => {
     await withWrites(Exposed, parallel(2), async (manager, strategy, first) => {
       const all = manager.getAllMessages();
+      const toCall = all.slice(0, first + 1);
       const toFirst = all.slice(0, first + 2);
-      const toLast = all.slice(0, first + 3);
-      assert.equal((strategy as Exposed).held(toFirst, 0)[first + 1], 1, 'after the first of two results');
-      assert.equal((strategy as Exposed).held(toLast, 0)[first + 2], 0, 'after the second of two');
+      assert.equal((strategy as Exposed).held(toCall, 0)[first], 1, 'after the call');
+      assert.equal((strategy as Exposed).held(toFirst, 0)[first + 1], 0, 'after the first of two results');
     });
   });
 
@@ -781,7 +782,7 @@ describe("parallel calls' results, each in a message of its own", () => {
     });
   });
 
-  it("in a chain of calls, each message answering the call before and making the next, the recent window's start steps back once and no further", async () => {
+  it("in a chain of calls, each message answering the call before and making the next, the recent window's start steps back one call past main's step and no further", async () => {
     const links = 5;
     const writes: Array<[string, ContentBlock[]]> = [['Claude', [text('start'), call('call-0')]]];
     for (let k = 1; k < links; k++) writes.push(['User', [result(`call-${k - 1}`, `answer ${k - 1}`), call(`call-${k}`)]]);
@@ -860,5 +861,251 @@ describe('a result whose call compresses first, end to end', () => {
         }, membrane);
       });
     }
+  }
+});
+
+describe('the recent window at a result whose call is not in the message before it', () => {
+  it('starts at its edge: there is no call there to step back to', async () => {
+    class Exposed extends AutobiographicalStrategy {
+      recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
+      estimates(store: unknown) { return this.postStripEstimates(store as never); }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-unanswered-'));
+    const strategy = new Exposed({ adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 1 });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    manager.setToolDefinitions(tools as never);
+    try {
+      manager.addMessage('User', [text('hi')]);
+      manager.addMessage('User', [text(prose('DOCUMENT', 12_000))]);
+      const resultAt = manager.getAllMessages().length;
+      manager.addMessage('User', [result('call-0', 'Sunny.')]);
+      manager.addMessage('Claude', [text('It is sunny.')]);
+      assert.ok(resultAt > 3, 'premise: the message before the result is stored as shards');
+      const store = (manager as unknown as { messageStore: unknown }).messageStore;
+      const config = (strategy as unknown as { config: Record<string, number> }).config;
+      config.recentWindowTokens = strategy.estimates(store).slice(resultAt).reduce((a, b) => a + b, 0);
+      assert.equal(strategy.recentStart(store), resultAt);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a message stored as shards that answers its own call, after a long plain message', () => {
+  class Exposed extends AutobiographicalStrategy {
+    recentStart(store: unknown) { return this.getRecentWindowStart(store as never); }
+    estimates(store: unknown) { return this.postStripEstimates(store as never); }
+    startOfCall(messages: unknown[], at: number) { return this.callStart(messages as never, at); }
+    hold(store: unknown) { return this.holdBoundary(store as never); }
+  }
+  const bundle = (): ContentBlock[] => [text(prose('OPEN', 3_000)), call('b1'), text(prose('MIDDLE', 3_000)), result('b1', 'Sunny.'), text(prose('CLOSE', 1_500))];
+  /** `[hi] [a 12,000-character document] [the bundle] [thanks]`; `bundle` is where the bundle's shards run. */
+  async function withBundle(
+    hold: boolean,
+    body: (strategy: Exposed, store: unknown, view: unknown, at: { from: number; to: number; callAt: number; resultAt: number }) => void,
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-own-call-'));
+    const strategy = new Exposed({ adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 1 });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    manager.setToolDefinitions(tools as never);
+    try {
+      manager.addMessage('User', [text('hi')]);
+      const document = manager.getAllMessages().length;
+      manager.addMessage('User', [text(prose('DOCUMENT', 12_000))]);
+      const from = manager.getAllMessages().length;
+      manager.addMessage('Claude', bundle(), undefined, undefined, hold ? { holdCompression: true } : undefined);
+      const to = manager.getAllMessages().length - 1;
+      manager.addMessage('User', [text('thanks')]);
+      const stored = manager.getAllMessages();
+      const callAt = stored.findIndex((m) => holds(m, 'tool_use'));
+      const resultAt = stored.findIndex((m) => holds(m, 'tool_result'));
+      assert.ok(from - document > 3 && from < callAt && callAt < resultAt && resultAt < to,
+        `premise: the document and the bundle are stored as shards, the call and its result on shards of their own inside the bundle (${document}, ${from}..${to}, call ${callAt}, result ${resultAt})`);
+      body(strategy, (manager as unknown as { messageStore: unknown }).messageStore,
+        (manager as unknown as { strategyMessageView(): unknown }).strategyMessageView(), { from, to, callAt, resultAt });
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("the recent window, its edge on any of the message's shards, starts in the message: at the call when the edge would part it from its result, else at the edge", async () => {
+    await withBundle(false, (strategy, store, _view, { from, to, callAt, resultAt }) => {
+      const config = (strategy as unknown as { config: Record<string, number> }).config;
+      const pse = strategy.estimates(store);
+      for (let edge = from + 1; edge <= to; edge++) {
+        config.recentWindowTokens = pse.slice(edge).reduce((a, b) => a + b, 0);
+        assert.equal(strategy.recentStart(store), edge > callAt && edge <= resultAt ? callAt : edge, `an edge on message ${edge}`);
+      }
+    });
+  });
+
+  it('the smaller-window floor counts the newest turn from the message itself', async () => {
+    await withBundle(false, (strategy, store, _view, { from }) => {
+      const messages = (store as { getAll(): unknown[] }).getAll();
+      assert.equal(strategy.startOfCall(messages, from), from);
+    });
+  });
+
+  it('a compression hold on the message starts at the message', async () => {
+    await withBundle(true, (strategy, _store, view, { from }) => {
+      assert.equal(strategy.hold(view), from);
+    });
+  });
+});
+
+describe("tool pruning counts a message's own result as no answer, whether the message is stored as shards or not", () => {
+  for (const [name, chars] of [['unsharded', 200], ['sharded', 6_000]] as const) {
+    it(`${name}: with toolResultMaxLastN 1, the earlier call's result is the one sent`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-pruning-'));
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 1_000_000, toolResultMaxLastN: 1,
+      });
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+      manager.setToolDefinitions(tools as never);
+      try {
+        manager.addMessage('User', [text('please check the weather')]);
+        manager.addMessage('Claude', [text('looking it up'), call('real')]);
+        manager.addMessage('User', [result('real', 'REAL-RESULT')]);
+        const before = manager.getAllMessages().length;
+        manager.addMessage('Claude', [text(prose('OPEN', chars)), call('own'), text(prose('MIDDLE', chars)), result('own', 'BUNDLE-RESULT'), text('done')]);
+        const shards = manager.getAllMessages().length - before;
+        manager.addMessage('User', [text('thanks')]);
+        assert.ok(name === 'sharded' ? shards > 2 : shards === 1, `premise: the message is stored as ${name === 'sharded' ? 'several shards' : 'one message'} (${shards})`);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        assert.ok(JSON.stringify(compiled.messages).includes('REAL-RESULT'), 'the earlier call\'s result is sent');
+      } finally {
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('a call held through its first result\'s message', () => {
+  async function withProvider(
+    Strategy: typeof AutobiographicalStrategy,
+    write: (manager: ContextManager) => void,
+    body: (manager: ContextManager, strategy: AutobiographicalStrategy, seen: { l1: number; sizeRefused: number; largest: number }) => Promise<void>,
+  ) {
+    const seen = { l1: 0, sizeRefused: 0, largest: 0 };
+    let store: { estimateTokens(m: unknown): number } | undefined;
+    const membrane = {
+      complete: async (req: { messages: Array<{ content: unknown }>; system?: unknown; tools?: unknown; config?: { maxTokens?: number } }) => {
+        const counted = (content: unknown) => store!.estimateTokens({ content } as never);
+        const tokens = req.messages.reduce((t, m) => t + counted(m.content), 0)
+          + (req.system ? counted([{ type: 'text', text: JSON.stringify(req.system) }]) : 0)
+          + (req.tools ? counted([{ type: 'text', text: JSON.stringify(req.tools) }]) : 0)
+          + (req.config?.maxTokens ?? 0);
+        const own = JSON.stringify(req).includes('form a new memory');
+        if (own) {
+          seen.l1++;
+          seen.largest = Math.max(seen.largest, tokens);
+        }
+        if (tokens > 200_000) {
+          if (own) seen.sizeRefused++;
+          throw Object.assign(new Error(`prompt is too long: ${tokens} tokens > 200000 maximum`), { type: 'context_length', httpStatus: 400, retryable: false });
+        }
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'Summary' }] };
+      },
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-first-result-'));
+    const strategy = new Strategy({
+      adaptiveResolution: true, autoTickOnNewMessage: false, targetChunkTokens: 400, headWindowTokens: 0, recentWindowTokens: 2_000,
+      compressionModel: 'm', minChunkCharsForLLM: 0, l1HoldbackChunks: 0, quarantineAlarmIntervalMs: 0,
+    });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: membrane as never });
+    store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+    manager.setToolDefinitions(tools as never);
+    try {
+      for (let k = 0; k < 6; k++) manager.addMessage(k % 2 ? 'Claude' : 'User', [text(`before ${k} ` + 'w '.repeat(300))]);
+      write(manager);
+      for (let k = 0; k < 30; k++) manager.addMessage(k % 2 ? 'User' : 'Claude', [text(`after ${k} ` + 'w '.repeat(300))]);
+      const queue = (strategy as unknown as { compressionQueue: number[] }).compressionQueue;
+      await manager.compile().catch(() => undefined);
+      for (let guard = 0; queue.length > 0 && guard < 400; guard++) await manager.tick();
+      await body(manager, strategy, seen);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const chunksOf = (strategy: AutobiographicalStrategy) =>
+    (strategy as unknown as { chunks: Array<{ compressed?: boolean; messages: Array<{ id: string; content: ContentBlock[] }> }> }).chunks;
+  const answeredWithCall = (strategy: AutobiographicalStrategy): string[] => {
+    const holding = chunksOf(strategy).find((c) => c.messages.some((m) => m.content.some((b) => b.type === 'tool_use')));
+    return (holding?.messages ?? []).flatMap((m) => m.content.filter((b) => b.type === 'tool_result').map((b) => (b as unknown as { toolUseId: string }).toolUseId));
+  };
+
+  for (const [name, { inPlace }] of Object.entries(STRATEGIES)) {
+    it(`${name}: a call whose first result sits on a later shard of a long message stays with that whole message`, async () => {
+      let message: string[] = [];
+      await withProvider(inPlace, (manager) => {
+        manager.addMessage('Claude', [text('looking it up'), call('call-0')]);
+        const from = manager.getAllMessages().length;
+        manager.addMessage('User', [text(prose('LONG', 12_000)), result('call-0', 'Sunny.'), text(prose('AFTER', 6_000))]);
+        message = manager.getAllMessages().slice(from).map((m) => m.id);
+      }, async (manager, strategy) => {
+        const stored = manager.getAllMessages();
+        const resultAt = stored.findIndex((m) => m.content.some((b) => b.type === 'tool_result'));
+        assert.ok((stored[resultAt]!.shardIndex ?? 0) > 0 && message.indexOf(stored[resultAt]!.id) < message.length - 2, 'premise: the result sits on a later shard of its message, with shards of text after it');
+        const holding = chunksOf(strategy).find((c) => c.messages.some((m) => m.content.some((b) => b.type === 'tool_use')));
+        const ids = new Set(holding?.messages.map((m) => m.id) ?? []);
+        assert.deepEqual(message.filter((id) => !ids.has(id)), [], 'the chunk holding the call holds every shard of the message after it');
+      });
+    });
+
+    it(`${name}: a message that makes calls in turn keeps each call with its own result, a result for an earlier message's call releasing none, and a chunk closes between one call's result and the next call`, async () => {
+      let message: ReturnType<ContextManager['getAllMessages']> = [];
+      await withProvider(inPlace, (manager) => {
+        manager.addMessage('Claude', [text('asking'), call('call-x')]);
+        manager.addMessage('User', [text('plain')]);
+        const from = manager.getAllMessages().length;
+        manager.addMessage('Claude', [
+          text('first'), call('call-a'), text(prose('A', 8_000)), result('call-a', 'a done'), text(prose('MID', 8_000)),
+          call('call-b'), text(prose('B', 8_000)), result('call-x', 'x done'), text(prose('XB', 8_000)),
+          call('call-c'), text(prose('C', 8_000)), result('call-c', 'c done'),
+          text(prose('CB', 8_000)), result('call-b', 'b done'), text('done'),
+        ]);
+        message = manager.getAllMessages().slice(from);
+      }, async (_manager, strategy) => {
+        const shardOf = (type: string, id: string) => message.findIndex((m) => m.content.some((b) => b.type === type && ((b as { id?: string }).id === id || (b as { toolUseId?: string }).toolUseId === id)));
+        const chunkOf = (k: number) => chunksOf(strategy).findIndex((c) => c.messages.some((m) => m.id === message[k]!.id));
+        const [callA, resultA, callB, resultX, callC, resultC, resultB] = [shardOf('tool_use', 'call-a'), shardOf('tool_result', 'call-a'), shardOf('tool_use', 'call-b'), shardOf('tool_result', 'call-x'), shardOf('tool_use', 'call-c'), shardOf('tool_result', 'call-c'), shardOf('tool_result', 'call-b')];
+        assert.ok(resultA - callA >= 2 && callB - resultA >= 2 && resultX - callB >= 2 && callC - resultX >= 2 && resultC - callC >= 2 && resultB - resultC >= 2, `premise: the blocks sit on shards apart (${[callA, resultA, callB, resultX, callC, resultC, resultB]})`);
+        assert.ok(message.every((_, k) => chunkOf(k) >= 0), 'premise: every shard of the message is in a chunk');
+        assert.equal(chunkOf(callA), chunkOf(resultA), 'call-a and its result share a chunk');
+        assert.equal(chunkOf(callB), chunkOf(resultB), "call-b and its result share a chunk, call-x's and call-c's results between them notwithstanding");
+        assert.equal(chunkOf(callC), chunkOf(resultC), 'call-c and its result share a chunk');
+        assert.notEqual(chunkOf(resultA), chunkOf(callB), "a chunk closes between call-a's result and call-b");
+      });
+    });
+
+    it(`${name}: a round's results in one message stored as shards, as agent-framework stores them, stay with their calls`, async () => {
+      const ids = Array.from({ length: 5 }, (_, k) => `call-${k}`);
+      await withProvider(inPlace, (manager) => {
+        manager.addMessage('Claude', [text('looking them up'), ...ids.map(call)]);
+        manager.addMessage('User', ids.flatMap((id) => [text(prose(`BEFORE-${id}`, 3_000)), result(id, `${id} answered`)]));
+      }, async (manager, strategy) => {
+        assert.ok(manager.getAllMessages().filter((m) => (m.shardIndex ?? 0) > 0 && m.content.some((b) => b.type === 'tool_result')).length > 1, 'premise: results sit on later shards of their message');
+        assert.deepEqual(answeredWithCall(strategy), ids, 'the chunk holding the calls holds every result');
+      });
+    });
+
+    it(`${name}: 40 parallel results, one to a message, too many for one request, close as before: every chunk compresses and the context compiles`, async () => {
+      const ids = Array.from({ length: 40 }, (_, k) => `call-${k}`);
+      await withProvider(inPlace, (manager) => {
+        manager.addMessage('Claude', [text('looking them up'), ...ids.map(call)]);
+        for (const id of ids) manager.addMessage('User', [result(id, `${id} answered ` + 'w '.repeat(12_000))]);
+      }, async (manager, strategy, seen) => {
+        assert.deepEqual(answeredWithCall(strategy), ['call-0'], 'the chunk holding the call holds its first result');
+        assert.ok(seen.l1 > 0, 'premise: the stand-in provider saw L1 requests');
+        assert.equal(seen.sizeRefused, 0, `no chunk's request is refused for its size (the largest was ~${seen.largest} tokens)`);
+        const chunks = chunksOf(strategy);
+        assert.ok(chunks.length > 0 && chunks.every((c) => c.compressed), `every chunk compresses (${chunks.filter((c) => c.compressed).length} of ${chunks.length})`);
+        for (const maxTokens of [100_000, 300_000]) await manager.compile({ maxTokens, reserveForResponse: 0 });
+      });
+    });
   }
 });

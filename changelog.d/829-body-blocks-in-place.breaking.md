@@ -27,7 +27,12 @@
     is `joinBodyContent(landed)`, with each stored copy carrying
     `continuesBlock`. connectome-host's Web UI (`coalesceAndFlatten`) merges
     every adjacent pair of text blocks across a body's shards, so it shows
-    two given text blocks as one. Its change is `joinBodyContent(shards)`.
+    two given text blocks as one. Its change is to carry `continuesBlock` on
+    its message type, to take a body's run as the shards that continue it
+    (`continuesBody`, pairwise in store order) rather than every adjacent
+    shard with an equal `bodyGroupId`, and to join each run with
+    `joinBodyContent`. The same text ingested twice in a row shares one
+    `bodyGroupId`, so grouped by that id the two bodies go to one join.
   - **Refused:** an override of `chunkIngressMessage` whose shards declare
     `continuesBlock` on some shards after the first and not others is
     refused before any shard is written. A first shard's declaration is
