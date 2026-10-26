@@ -75,10 +75,14 @@ interface Heard {
   window: MessageId[];
 }
 
-/** A strategy that keeps what each onPresented call was given, and every onNewMessage call. */
+/** A strategy that keeps what each onPresented call was given, every onNewMessage call, and each onRetracted call's rows and `undone`. */
 class Records extends PassthroughStrategy {
   heard: Heard[] = [];
   newMessages: MessageId[] = [];
+  retracted: Array<{ rows: MessageId[]; undone: boolean }> = [];
+  async onRetracted(rows: readonly StoredMessage[], _ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+    this.retracted.push({ rows: rows.map((m) => m.id), undone: info.undone });
+  }
   async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
     this.heard.push({
       rows: rows.map((m) => m.id),
@@ -163,7 +167,11 @@ describe('onPresented in presented mode', () => {
     cm.close();
   });
 
-  it('retractRows calls nothing, and a row presented again is heard again', async () => {
+  // retractRows called nothing on the strategy before onRetracted (#291
+  // CM-6): an undone row stayed inside what the strategy had folded of it.
+  // It now calls onRetracted once, and still nothing of onPresented's;
+  // on-retracted.test.ts holds that hook's own suite.
+  it('retractRows calls onRetracted once with undone, not onPresented, and a row presented again is heard again', async () => {
     const strategy = new Records();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
     cm.presentRows([]);
@@ -171,6 +179,7 @@ describe('onPresented in presented mode', () => {
     cm.presentRows([a]);
     cm.retractRows([a], { undone: true });
     assert.deepEqual(strategy.heard.map((h) => h.rows), [[a]]);
+    assert.deepEqual(strategy.retracted, [{ rows: [a], undone: true }]);
     cm.presentRows([a]);
     assert.deepEqual(strategy.heard.map((h) => h.rows), [[a], [a]]);
     assert.deepEqual(strategy.heard[1]!.window, [a]);

@@ -91,6 +91,12 @@ import type { MessageId, MessageStoreView, StoredMessage } from './types/index.j
 /** Whether a manager's window is the record (`legacy`) or its index (`presented`), on the branch its store is on. */
 export type WindowMode = 'legacy' | 'presented';
 
+/** A row that left the window: its id, and the ordinal it held there. */
+export interface LeftRow {
+  id: MessageId;
+  ordinal: number;
+}
+
 /**
  * The format the header names. An index whose header names another is
  * another version's, which this one reads as the record and never writes to.
@@ -619,13 +625,20 @@ export class WindowIndex {
    * record, the window is first written down as `present` writes it, and
    * the manager is in presented mode from then on: the rows taken out are
    * holes in the index that write-down began.
+   *
+   * Returns the rows taken out, with the ordinals they held, in window
+   * order. Each tombstone is one record, so a write can stop partway:
+   * `cutShort`, when given, hears the rows taken out before the write that
+   * threw, in window order, before the error is thrown on. A write-down that
+   * throws has taken nothing out.
    */
   retract(
     ids: readonly MessageId[],
     record: readonly StoredMessage[],
     positionOf: (id: MessageId) => number | undefined,
     undone: boolean,
-  ): void {
+    cutShort?: (left: LeftRow[]) => void,
+  ): LeftRow[] {
     const state = this.current();
     const legacy = !inEffect(state);
     const rows = namedBodies('retractRows', ids, record, positionOf, (id) => {
@@ -635,7 +648,7 @@ export class WindowIndex {
         throw new Error(`ContextManager.retractRows: no stored message has id ${id}, and the window holds none`);
       }
     }).flatMap((name) => name.rows);
-    if (rows.length === 0) return;
+    if (rows.length === 0) return [];
     // In legacy mode every row of the record is in the window. Otherwise a
     // row named must be; a shard that came with its first shard's id and
     // isn't (a body a presentation cut short, or a branch cut between its
@@ -646,10 +659,15 @@ export class WindowIndex {
     if (absent.length > 0) {
       throw new Error(`ContextManager.retractRows: ${absent.join(', ')} ${absent.length === 1 ? 'is' : 'are'} not in the window`);
     }
-    const tombstones = rows
-      .filter(inWindow)
-      .map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
-    this.write(legacy ? [...this.writeDown('retractRows', state, record), ...tombstones] : tombstones);
+    const leaving = rows.filter(inWindow);
+    // Written down first in legacy mode, so each row has the ordinal the
+    // write-down gave it before its tombstone takes it out.
+    if (legacy) this.write(this.writeDown('retractRows', state, record));
+    const held = this.current().ordinals;
+    const left = leaving.map((id): LeftRow => ({ id, ordinal: held.get(id)! }));
+    const tombstones = leaving.map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
+    this.writeLeaving(tombstones, left, cutShort);
+    return inWindowOrder(left);
   }
 
   /**
@@ -657,15 +675,44 @@ export class WindowIndex {
    * each of `ids` the window holds, as retract writes one, so no other
    * row's ordinal moves. An id the window doesn't hold is passed over. In
    * legacy mode it writes nothing: the window is the record, and a row
-   * removed from the record has left it already. Returns the ids taken out.
+   * removed from the record has left it already. Returns the rows taken
+   * out, with the ordinals they held, in window order; `cutShort` is as
+   * retract's.
    */
-  retractRemoved(ids: readonly MessageId[]): MessageId[] {
+  retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
     const state = this.current();
     if (!inEffect(state)) return [];
-    const leaving: MessageId[] = [];
-    for (const id of new Set(ids)) if (state.ordinals.has(id)) leaving.push(id);
-    this.write(leaving.map((id): IndexItem => ({ retract: id })));
-    return leaving;
+    const left: LeftRow[] = [];
+    for (const id of new Set(ids)) {
+      const ordinal = state.ordinals.get(id);
+      if (ordinal !== undefined) left.push({ id, ordinal });
+    }
+    this.writeLeaving(left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
+    return inWindowOrder(left);
+  }
+
+  /**
+   * Write `tombstones`, which take `left` out of the window. A write that
+   * throws partway tells `cutShort` the rows of `left` out of the window by
+   * then, in window order, and the error is thrown on.
+   */
+  private writeLeaving(tombstones: IndexItem[], left: readonly LeftRow[], cutShort?: (left: LeftRow[]) => void): void {
+    try {
+      this.write(tombstones);
+    } catch (error) {
+      if (cutShort) {
+        let out: LeftRow[] = [];
+        try {
+          const now = this.current().ordinals;
+          out = left.filter((row) => now.get(row.id) !== row.ordinal);
+        } catch {
+          // The index can't be read: the error thrown on says why, and the
+          // next read finds what left.
+        }
+        if (out.length > 0) cutShort(inWindowOrder(out));
+      }
+      throw error;
+    }
   }
 
   /**
@@ -753,6 +800,11 @@ export class WindowIndex {
     state.version = ++versions;
     state.presented = null;
   }
+}
+
+/** Rows that left the window, in the order the window held them. */
+function inWindowOrder(left: readonly LeftRow[]): LeftRow[] {
+  return [...left].sort((a, b) => a.ordinal - b.ordinal);
 }
 
 /** One name in a presentRows or retractRows call: the id given, and the rows it stands for, in record order. */

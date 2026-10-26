@@ -334,6 +334,56 @@ export interface ContextStrategy {
   onPresented?(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void>;
 
   /**
+   * React to rows leaving the agent's window, so that nothing the strategy
+   * keeps of them shows the agent a row it no longer holds. Called with the
+   * rows that left, in the order the window held them, every shard of a
+   * body, and a context whose view no longer holds them. The window leaves
+   * the record alone: a row that left is still stored unless it was removed.
+   *
+   * It is called once per call, before the call returns:
+   *
+   * - from ContextManager.retractRows, after the rows are out of the
+   *   window, with `undone` as the call gave it and `removed: false`. A row
+   *   the store no longer holds, taken out by its id (one removed through
+   *   another manager, which this one doesn't hear), isn't given: there is
+   *   no row to give, and a call that takes out only such rows calls
+   *   nothing. A retractRows in legacy mode writes the window down and then
+   *   takes the rows out, so it calls this as it would once a host presents.
+   * - once a host presents rows on the branch, from a removal through this
+   *   manager (removeMessage, removeMessages) of rows the window held, after
+   *   the row is out of the window, with the rows as they were before they
+   *   were removed, `removed: true` and `undone: false`.
+   *
+   * While the manager is in legacy mode its window is the record, and a
+   * removal takes the row out of both at once: nothing calls this, and a
+   * strategy that folded the row keeps what it folded, as it always has. A
+   * tombstone write that fails partway calls this with the rows it took out
+   * before the error is thrown or logged. A row presented again (a redo) is
+   * heard through onPresented, as a row new to the window, at its new place.
+   *
+   * A strategy that folds rows into summaries drops or folds again what
+   * covers these: a summary of a row that left shows the agent what it no
+   * longer holds, and once the row is presented again it would render
+   * twice, raw at its new place and folded at its old one.
+   *
+   * While the strategy isn't initialized, the calls wait until it is, and
+   * are then made in the order they came, before the rows presented
+   * meanwhile are heard. A row that has been presented again since is still
+   * given, since what the strategy kept of it is at its old place. A row
+   * the window of the branch the strategy initialized on holds at the
+   * ordinal it left, a branch made before it left, is left out, as is every
+   * row while that branch is in legacy mode, and a call left with no row
+   * isn't made. They wait for the manager's strategy, not for this
+   * instance, as onPresented's do.
+   *
+   * Fire and forget, as onPresented: a rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the rows,
+   * and doesn't reach the caller. The rows stay out of the window, and the
+   * strategy isn't offered them again.
+   */
+  onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void>;
+
+  /**
    * React to a new row in the agent's window, one row at a time: the older
    * form of onPresented, called only for a strategy without onPresented, at
    * the points onPresented says. While the manager is in legacy mode, that

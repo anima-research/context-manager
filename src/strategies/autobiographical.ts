@@ -2029,6 +2029,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _orphanWarned = false;
   /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
+  /**
+   * Chunks a row of which has left the window (onRetracted), the one being
+   * compressed among them: an L1 that lands for one is discarded, since it
+   * would cover that row where the window no longer holds it.
+   */
+  private _spanLeftWindow = new WeakSet<Chunk>();
 
   /**
    * Failures of one request in one domain, the first and seven more each
@@ -7500,6 +7506,145 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.windowGrew('onNewMessage', ctx);
   }
 
+  /**
+   * Rows left the window (ContextStrategy.onRetracted): an undone turn's
+   * rows, rows a host took out, or rows removed from the record once a host
+   * presents. Nothing this strategy keeps of them stays. A summary of a row
+   * that left shows the agent what it no longer holds, and a row presented
+   * again (a redo) enters the window at its end, where it would render raw
+   * beside the summary that still covers it at its old place.
+   *
+   * So each L1 with one of the rows among its sources is dropped, with
+   * every summary above it, as the open drops a summary whose sources are
+   * gone: a summary the drop leaves without its parent renders, and merges,
+   * again. Each chunk record holding one of the rows gives it up and is
+   * compressed again over the rows it keeps, as is the record of a dropped
+   * L1, and a record left with none goes: the rows of a dropped summary
+   * that are still in the window are folded again, never shown folded where
+   * they aren't. A queued merge of a dropped summary goes, and the chunks
+   * are rebuilt over the window, which queues their compression again. A
+   * compression or merge in flight over the rows writes nothing when it
+   * lands. Then, as for rows entering, the merge check runs and, with
+   * `autoTickOnNewMessage`, background compression starts.
+   *
+   * A row presented again is new to this strategy: onPresented chunks it at
+   * its place in the window. `info` changes none of this: an undone row, a
+   * row taken out and a removed row have each left. The manager doesn't
+   * call this for a removal in legacy mode, so a row removed there stays in
+   * what folded it, as it always has. The work is synchronous, so it is done
+   * when the manager's call returns, and written after the window's
+   * tombstones. A row that left and was presented again before this
+   * strategy heard it go, both while it initialized or across a crash
+   * between those writes, is still covered at its old place when the
+   * strategy opens, and the open's topology audit names the summary (under
+   * the default `topologyPolicy`, refusing the open).
+   */
+  async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, _info: { undone: boolean; removed: boolean }): Promise<void> {
+    this.requireLoadedBranch('onRetracted');
+    this.windowLost(new Set(rows.map((m) => m.id)), ctx);
+  }
+
+  private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
+    if (leaving.size === 0) return;
+    // The L1s holding a row that left among their sources, the L1 of each
+    // chunk record holding one, and every summary above one of those.
+    const dropped = new Set<string>();
+    for (const summary of this.summaries) {
+      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) dropped.add(summary.id);
+    }
+    for (const record of this.chunkRecords) {
+      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) dropped.add(record.summaryId);
+    }
+    for (let grew = dropped.size > 0; grew;) {
+      grew = false;
+      for (const summary of this.summaries) {
+        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
+          dropped.add(summary.id);
+          grew = true;
+        }
+      }
+    }
+
+    // Each record holding a row that left, or naming a dropped L1, is
+    // compressed again over the rows it keeps; one left with none goes.
+    const refolded: string[] = [];
+    const emptied: string[] = [];
+    const records: ChunkRecord[] = [];
+    for (const record of this.chunkRecords) {
+      const losing = record.sourceIds.some((id) => leaving.has(id));
+      if (!losing && !(record.summaryId && dropped.has(record.summaryId))) {
+        records.push(record);
+        continue;
+      }
+      const sourceIds = losing ? record.sourceIds.filter((id) => !leaving.has(id)) : record.sourceIds;
+      if (sourceIds.length === 0) {
+        emptied.push(record.id);
+        continue;
+      }
+      const { summaryId: _summaryId, ...rest } = record;
+      records.push({ ...rest, sourceIds, compressed: false });
+      refolded.push(record.id);
+    }
+
+    // The summaries kept, each pointer naming a dropped summary cleared, so
+    // a summary whose parent was dropped renders and merges again. A copy
+    // is changed, as the open changes one, never the summary in place.
+    const orphaned: string[] = [];
+    const summaries = dropped.size === 0 ? this.summaries : this.summaries.filter((summary) => !dropped.has(summary.id)).map((summary) => {
+      const pointers = (['parentId', 'mergedInto'] as const).filter((field) => {
+        const pointer = summary[field] as unknown;
+        return typeof pointer === 'string' && dropped.has(pointer);
+      });
+      if (pointers.length === 0) return summary;
+      const copy = { ...summary };
+      for (const field of pointers) delete copy[field];
+      orphaned.push(summary.id);
+      return copy;
+    });
+    const mergeQueue = dropped.size === 0 ? this.mergeQueue : this.mergeQueue.filter((merge) => !merge.sourceIds.some((id) => dropped.has(id)));
+
+    // Summaries first: should the records' write not follow, the open makes
+    // a record whose L1 it lacks compressible again.
+    if (dropped.size > 0) {
+      this.summaries = summaries;
+      this.store?.setStateJson(this.summariesStateId, this.summaries);
+    }
+    if (refolded.length > 0 || emptied.length > 0) {
+      this.chunkRecords = records;
+      this.store?.setStateJson(this.chunksStateId, this.chunkRecords);
+    }
+    if (mergeQueue.length !== this.mergeQueue.length) {
+      this.mergeQueue = mergeQueue;
+      this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+    }
+    if (dropped.size > 0 || refolded.length > 0 || emptied.length > 0) {
+      this.diag.warn(
+        `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
+          `[${[...dropped].join(', ')}] and cleared the parent of [${orphaned.join(', ')}]; chunk records to be ` +
+          `compressed again over the rows they keep [${refolded.join(', ')}], removed, keeping none [${emptied.join(', ')}]`,
+      );
+    }
+
+    // A drop can end an overlap the guard refused, so the queue build tests
+    // those chunks again, as after a load.
+    this._overlapBlocked.clear();
+    const work = this.pendingCompressionWork;
+    const inFlight = work && 'chunk' in work ? [work.chunk] : [];
+    for (const chunk of [...inFlight, ...this.chunks]) {
+      if (chunk.messages.some((m) => leaving.has(m.id))) this._spanLeftWindow.add(chunk);
+    }
+
+    this.rebuildChunks(ctx.messageStore);
+    if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
+      // A merge-quarantine record naming a dropped summary no longer stands.
+      this.sweepPaidOffMergeQuarantine();
+      this.checkMergeThreshold();
+    }
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
+    }
+  }
+
   private windowGrew(operation: string, ctx: StrategyContext): void {
     this.requireLoadedBranch(operation);
     this.rebuildChunks(ctx.messageStore);
@@ -11481,6 +11626,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // A row of its span left the window while the request was in flight
+      // (onRetracted): the summary would cover that row where the window no
+      // longer holds it. Discard it; the rebuild then queued the chunk's
+      // record again, over the rows it keeps.
+      if (this._spanLeftWindow.has(chunk)) {
+        this.diag.warn('[autobiographical] discarding L1: a row of its span left the window mid-request');
+        return;
+      }
+
       // Re-check the dedup guard AFTER the await: summary state may have
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
@@ -12664,6 +12818,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.warn(
           `executeMerge: ${parentedSince.length}/${sources.length} source(s) parented while the L${targetLevel} ` +
             `merge's call was out (${parentedSince.join(', ')}); its summary is not written`,
+        );
+        return false;
+      }
+      // A row under a source left the window while the call was out
+      // (onRetracted), which dropped the source: a merge of it would cover
+      // that row again. It writes nothing, and its queue entry went with the
+      // source.
+      const droppedSince = sources.filter((source) => !this.summaryById(source.id));
+      if (droppedSince.length > 0) {
+        this.diag.warn(
+          `executeMerge: ${droppedSince.length}/${sources.length} source(s) dropped while the L${targetLevel} ` +
+            `merge's call was out, a row under them having left the window (${droppedSince.map((source) => source.id).join(', ')}); ` +
+            `its summary is not written`,
         );
         return false;
       }
