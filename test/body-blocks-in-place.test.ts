@@ -1012,7 +1012,7 @@ describe('a call held through its first result\'s message', () => {
       });
     });
 
-    it(`${name}: a message that makes calls in turn keeps each call with its own result, a result for an earlier message's call releasing none, and a chunk closes between one call's result and the next call`, async () => {
+    it(`${name}: a message that makes calls in turn keeps each call with its own result, a result for an earlier message's call releasing none, and a chunk closes between call-a's result and call-b`, async () => {
       let message: ReturnType<ContextManager['getAllMessages']> = [];
       await withProvider(inPlace, (manager) => {
         manager.addMessage('Claude', [text('asking'), call('call-x')]);
@@ -1064,4 +1064,190 @@ describe('a call held through its first result\'s message', () => {
       });
     });
   }
+});
+
+describe('after a head-window reset, a long reply that thinks and makes a call', () => {
+  const MEMBRANE = { complete: async () => ({ stopReason: 'end_turn', content: [text('Summary.')] }) };
+  for (const headWindowTokens of [150, 300]) {
+    it(`goes out whole after the history from before the reset, its thinking with its call (head ${headWindowTokens})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-reset-'));
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true, targetChunkTokens: 100, headWindowTokens, recentWindowTokens: 300,
+        autoTickOnNewMessage: false, compressionModel: 'mock', minChunkCharsForLLM: 0, l1HoldbackChunks: 0,
+      });
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: MEMBRANE as never });
+      manager.setToolDefinitions(tools as never);
+      try {
+        for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`old ${i} ` + prose('OLD', 150))]);
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        await manager.resetHeadWindow('NEW TOPIC');
+        manager.addMessage('User', [text('go')]);
+        const from = manager.getAllMessages().length;
+        manager.addMessage('Claude', [
+          { type: 'thinking', thinking: 'thinking it through', signature: 'sig' } as unknown as ContentBlock,
+          text(prose('REPLY', 7_000)),
+          call('call-1'),
+        ]);
+        const shards = manager.getAllMessages().length - from;
+        manager.addMessage('User', [result('call-1', 'Sunny.')]);
+        assert.ok(shards >= 12, `premise: the reply is stored as 12 or more shards (${shards})`);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const blocksOf = (type: string) => compiled.messages.map((m, k) => (m.content.some((b) => b.type === type) ? k : -1)).filter((k) => k >= 0);
+        const reply = compiled.messages.map((m, k) => (m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('REPLY')) ? k : -1)).filter((k) => k >= 0);
+        const history = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('old 3')));
+        assert.equal(reply.length, 1, `the reply goes out in one entry (${reply.length})`);
+        assert.deepEqual([blocksOf('thinking'), blocksOf('tool_use')], [reply, reply], 'its thinking and its call in that entry');
+        assert.ok(history >= 0 && reply[0]! > history, 'after the history from before the reset');
+        const sent = compiled.messages[reply[0]!]!.content;
+        assert.deepEqual(sent.map((b) => b.type), ['thinking', 'text', 'tool_use'], 'its blocks in the order given');
+        assert.equal((sent[1] as { text: string }).text, prose('REPLY', 7_000), 'its text whole');
+        const stored = manager.getAllMessages();
+        const owned = (strategy as unknown as { ownedMessageIds(): Set<string> }).ownedMessageIds();
+        const headEnd = (strategy as unknown as { getHeadWindowEnd(s: unknown): number }).getHeadWindowEnd((manager as unknown as { messageStore: unknown }).messageStore);
+        const firstShard = stored.findIndex((m) => m.content.some((b) => b.type === 'thinking'));
+        assert.ok(headEnd <= firstShard && owned.has(stored[firstShard]!.id), `the head ends before the reply and a chunk owns its first shard, so none of it is left raw outside both (head ends at ${headEnd}, reply from ${firstShard})`);
+      } finally {
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('the head window\'s end beside a call and its result', () => {
+  const MEMBRANE = { complete: async () => ({ stopReason: 'end_turn', content: [text('Summary.')] }) };
+  async function withStore(options: Record<string, unknown>, body: (manager: ContextManager, strategy: AutobiographicalStrategy) => Promise<void>) {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-head-'));
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true, targetChunkTokens: 100, autoTickOnNewMessage: false, compressionModel: 'mock',
+      minChunkCharsForLLM: 0, l1HoldbackChunks: 0, ...options,
+    });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: MEMBRANE as never });
+    manager.setToolDefinitions(tools as never);
+    try {
+      await body(manager, strategy);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const entriesWith = (messages: Array<{ content: ContentBlock[] }>, test: (b: ContentBlock) => boolean) =>
+    messages.map((m, k) => (m.content.some(test) ? k : -1)).filter((k) => k >= 0);
+
+  for (const headWindowTokens of [150, 300]) {
+    it(`after a reset, a reply that thinks and makes three calls, answered one to a message, goes out whole after the history (head ${headWindowTokens})`, async () => {
+      await withStore({ headWindowTokens, recentWindowTokens: 200 }, async (manager) => {
+        for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`old ${i} ` + prose('OLD', 150))]);
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        await manager.resetHeadWindow('NEW TOPIC');
+        manager.addMessage('User', [text('go')]);
+        const from = manager.getAllMessages().length;
+        manager.addMessage('Claude', [
+          { type: 'thinking', thinking: 'thinking it through', signature: 'sig' } as unknown as ContentBlock,
+          text(prose('REPLY', 5_000)), call('c1'), call('c2'), call('c3'),
+        ]);
+        assert.ok(manager.getAllMessages().length - from > 4, 'premise: the reply is stored as shards');
+        for (const id of ['c1', 'c2', 'c3']) manager.addMessage('User', [result(id, prose(`R-${id}`, 600))]);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const reply = entriesWith(compiled.messages, (b) => b.type === 'text' && (b as { text: string }).text.includes('REPLY'));
+        const history = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('old 3')));
+        assert.equal(reply.length, 1, `the reply goes out in one entry (${reply.length})`);
+        assert.deepEqual(entriesWith(compiled.messages, (b) => b.type === 'tool_use'), reply, 'with its calls');
+        assert.ok(history >= 0 && reply[0]! > history, 'after the history from before the reset');
+        const sent = compiled.messages[reply[0]!]!.content;
+        assert.deepEqual(sent.map((b) => (b.type === 'tool_use' ? `tool_use:${(b as unknown as { id: string }).id}` : b.type)),
+          ['thinking', 'text', 'tool_use:c1', 'tool_use:c2', 'tool_use:c3'], 'its blocks in the order given');
+        assert.equal((sent[1] as { text: string }).text, prose('REPLY', 5_000), 'its text whole');
+      });
+    });
+  }
+
+  async function resetThenReply(manager: ContextManager, strategy: AutobiographicalStrategy, reply: ContentBlock[], results: string[], budgetThrough: (replyFrom: number, replyTo: number) => number) {
+    for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`old ${i} ` + prose('OLD', 150))]);
+    await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+    const headFrom = manager.getAllMessages().length;
+    await manager.resetHeadWindow('NEW TOPIC');
+    manager.addMessage('User', [text('go')]);
+    const replyFrom = manager.getAllMessages().length;
+    manager.addMessage('Claude', reply);
+    const replyTo = manager.getAllMessages().length - 1;
+    for (const id of results) manager.addMessage('User', [result(id, prose(`R-${id}`, 600))]);
+    const all = manager.getAllMessages();
+    const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+    (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
+      all.slice(headFrom, budgetThrough(replyFrom, replyTo) + 1).reduce((t, m) => t + store.estimateTokens(m), 0);
+    return { all, replyFrom, replyTo, compiled: await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }) };
+  }
+  const historyAt = (messages: Array<{ content: ContentBlock[] }>) =>
+    messages.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('old 3')));
+
+  it('after a reset, where the head\'s budget ends between parallel results of a reply that opens with text, the reply goes out whole after the history', async () => {
+    await withStore({ headWindowTokens: 100_000, recentWindowTokens: 300 }, async (manager, strategy) => {
+      const { all, replyFrom, replyTo, compiled } = await resetThenReply(manager, strategy,
+        [text(prose('REPLY', 5_000)), call('c1'), call('c2'), call('c3')],
+        ['c1', 'c2', 'c3'], (_from, to) => to + 1);
+      assert.ok(replyTo > replyFrom && !all[replyFrom]!.content.some((b) => b.type === 'tool_use'), 'premise: the reply\'s calls sit on a later shard than its first');
+      const reply = entriesWith(compiled.messages, (b) => b.type === 'text' && (b as { text: string }).text.includes('REPLY'));
+      assert.equal(reply.length, 1, `the reply goes out in one entry (${reply.length})`);
+      const sent = compiled.messages[reply[0]!]!.content;
+      assert.deepEqual(sent.map((b) => (b.type === 'tool_use' ? `tool_use:${(b as unknown as { id: string }).id}` : b.type)),
+        ['text', 'tool_use:c1', 'tool_use:c2', 'tool_use:c3'], 'its blocks in the order given');
+      assert.equal((sent[0] as { text: string }).text, prose('REPLY', 5_000), 'its text whole');
+      const history = historyAt(compiled.messages);
+      assert.ok(history >= 0 && reply[0]! > history, 'after the history from before the reset');
+      assert.ok(entriesWith(compiled.messages, (b) => b.type === 'tool_result').every((k) => k > reply[0]!), 'its results after it');
+    });
+  });
+
+  it('where the head\'s end steps back to a reply\'s start, the move to where chunks resume counts the reply\'s shards once', async () => {
+    await withStore({ headWindowTokens: 100_000, recentWindowTokens: 30 }, async (manager, strategy) => {
+      manager.addMessage('User', [text('start')]);
+      const replyFrom = manager.getAllMessages().length;
+      manager.addMessage('Claude', [text(prose('REPLY', 5_000)), call('c1')]);
+      const replyTo = manager.getAllMessages().length - 1;
+      manager.addMessage('User', [result('c1', prose('R-c1', 600))]);
+      const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+      const config = (strategy as unknown as { config: { headWindowTokens: number } }).config;
+      const throughResult = manager.getAllMessages().reduce((t, m) => t + store.estimateTokens(m), 0);
+      config.headWindowTokens = throughResult;
+      for (let i = 0; i < 6; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`later ${i} ` + prose('LATER', 400))]);
+      await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      const all = manager.getAllMessages();
+      const owned = (strategy as unknown as { ownedMessageIds(): Set<string> }).ownedMessageIds();
+      const firstOwned = all.findIndex((m) => owned.has(m.id));
+      assert.equal(firstOwned, replyTo + 2, 'premise: chunks begin right after the result, and none owns the reply');
+      const first = store.estimateTokens(all[0]) + store.estimateTokens(all[replyFrom]);
+      assert.ok(throughResult - first > 0.6 * throughResult, 'premise: the reply and its result after its first shard outweigh the head\'s new budget');
+      const throughReply = all.slice(0, replyTo + 1).reduce((t, m) => t + store.estimateTokens(m), 0);
+      const headEndAt = (budget: number) => {
+        config.headWindowTokens = budget;
+        return (strategy as unknown as { getHeadWindowEnd(s: unknown): number }).getHeadWindowEnd(store);
+      };
+      for (const share of [0.6, 0.4]) assert.ok(store.estimateTokens(all[0]) < share * throughResult && share * throughResult < throughReply, `premise: a budget of ${share} of the tokens through the result ends inside the reply`);
+      assert.equal(headEndAt(Math.floor(0.6 * throughResult)), firstOwned, 'the head ends where chunks resume, holding the reply and its result');
+      assert.equal(headEndAt(Math.floor(0.4 * throughResult)), replyFrom, 'past twice the budget the move gives up, and the head ends at the reply\'s start');
+    });
+  });
+
+  it('a long body that answers an earlier call and makes and answers its own stays in the head where the budget reaches past it', async () => {
+    await withStore({ headWindowTokens: 100_000, recentWindowTokens: 30 }, async (manager, strategy) => {
+      manager.addMessage('User', [text('start')]);
+      manager.addMessage('Claude', [text('calling a'), call('a')]);
+      manager.addMessage('User', [result('a', 'a done'), text(prose('B1', 1_500)), call('b'), result('b', 'b done'), text(prose('B2', 2_500))]);
+      const store = (manager as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+      const throughBody = manager.getAllMessages();
+      assert.ok(throughBody.length > 4, 'premise: the body is stored as shards');
+      (strategy as unknown as { config: { headWindowTokens: number } }).config.headWindowTokens =
+        throughBody.reduce((t, m) => t + store.estimateTokens(m), 0);
+      manager.addMessage('Claude', [text('ok ' + prose('OK', 200))]);
+      for (let round = 0; round < 2; round++) {
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const headEnd = (strategy as unknown as { getHeadWindowEnd(s: unknown): number }).getHeadWindowEnd(store);
+        const owned = (strategy as unknown as { ownedMessageIds(): Set<string> }).ownedMessageIds();
+        assert.equal(headEnd, throughBody.length, `compile ${round}: the head ends after the body, as the budget reaches`);
+        assert.ok(throughBody.every((m) => !owned.has(m.id)), `compile ${round}: no chunk owns a shard of it`);
+        for (let k = 0; k < 40; k++) await manager.tick();
+      }
+    });
+  });
 });

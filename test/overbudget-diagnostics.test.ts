@@ -782,6 +782,27 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  for (const recentWindowTokens of [100_000, 20, 5]) {
+    it(`counts a chain's newest turn from where the recent window starts, and names nothing when that turn is over (window ${recentWindowTokens})`, async () => {
+      await withManager(recentOnly(recentWindowTokens), async (manager) => {
+        for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(5) }]);
+        manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 'c0', name: 'read', input: {} }]);
+        manager.addMessage('user', [
+          { type: 'tool_result', toolUseId: 'c0', content: 'result ' + 'word '.repeat(190) },
+          { type: 'tool_use', id: 'c1', name: 'read', input: {} },
+        ] as ContentBlock[]);
+        manager.addMessage('agent', [
+          { type: 'tool_result', toolUseId: 'c1', content: 'short' },
+          { type: 'tool_use', id: 'c2', name: 'read', input: {} },
+        ] as ContentBlock[]);
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'c2', content: 'short' }]);
+        const error = await refusal(manager);
+        assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+        assert.deepEqual(error.clearedBy, [], 'the window keeps the message with the long result, so no smaller one clears this');
+      });
+    });
+  }
+
   class LegacyIngress extends AutobiographicalStrategy {
     override chunkIngressMessage(participant: string, content: ContentBlock[]) {
       return legacyIngress(super.chunkIngressMessage(participant, content), content);

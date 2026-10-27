@@ -10,10 +10,11 @@
   compile counts them. Two kinds of message still differ, and the doc names
   both: a message a summary covers comes back raw where the compile's plan
   sends the summary, and a sharded body whose shards the compile doesn't
-  send together comes back whole, as the windows join it. The adaptive
-  middle sends its shards' text alone, uncut, and a body across the middle
-  and a window, or across a reset head window's end, goes out in more than
-  one entry. After a head-window reset the head is sent before the history
+  send together comes back whole, as the windows join it: a body that
+  leaves no call waiting for a later result, across a reset head window's
+  end, goes out in more than one entry, and so can a reply that makes a
+  call, in a store whose chunks, made by an earlier version, own it from a
+  later shard. After a head-window reset the head is sent before the history
   from before the reset, and so is each system change stored before the
   head, so those messages render in the form the compile sends but aren't
   sent last. A render no longer releases a

@@ -243,7 +243,7 @@ describe('renderAsNewest', () => {
     });
   });
 
-  it("autobiographical: a body too big for the window's recent part comes back whole, as the windows join it, where this version's middle sends it in pieces", async () => {
+  it("autobiographical: a body too big for the window's recent part comes back whole, as the compile sends it", async () => {
     await withManager(sharding({ recentWindowTokens: 300 }), async (manager) => {
       const body = manager.addMessage('user', longText('BODY', 600));
       const lastShard = manager.getAllMessages().filter((m) => m.bodyGroupId !== undefined).at(-1)!.id;
@@ -253,16 +253,13 @@ describe('renderAsNewest', () => {
       assert.deepEqual(sent(forLastShard!), sent(forBody!), 'by any of its shards');
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
-      // The limit the doc names: the middle sends its shards' text as one
-      // entry and the recent window the rest as another.
-      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
-      assert.ok(pieces > 1, `the compile sends the body in ${pieces} pieces`);
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word'));
+      assert.equal(pieces.length, 1, `the compile sends the body in ${pieces.length} pieces`);
+      assert.deepEqual(sent(pieces[0]!.content), sent(forBody!), 'as the render gives it');
     });
   });
 
-  it("autobiographical: a body that starts in the head window and runs on past it comes back whole, where the compile sends it in pieces", async () => {
-    // Shards of about 100 tokens: the head's 150 holds the first, the recent
-    // window's 300 the last few, and the middle the rest.
+  it("autobiographical: a body that starts in the head window and runs on past it comes back whole, as the compile sends it", async () => {
     await withManager(sharding({ headWindowTokens: 150, recentWindowTokens: 300 }), async (manager) => {
       const body = manager.addMessage('user', longText('BODY', 600));
       const after = manager.addMessage('user', [{ type: 'text', text: 'after' }]);
@@ -270,8 +267,9 @@ describe('renderAsNewest', () => {
       assert.equal(textOf(forBody), textOf(longText('BODY', 600)), 'whole');
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
-      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
-      assert.ok(pieces > 1, `the compile sends its first shard in the head and the rest after it, in ${pieces} pieces`);
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word'));
+      assert.equal(pieces.length, 1, `the compile sends the body in ${pieces.length} pieces`);
+      assert.deepEqual(sent(pieces[0]!.content), sent(forBody!), 'as the render gives it');
     });
   });
 
@@ -685,11 +683,6 @@ describe('renderAsNewest', () => {
   });
 
   it('a compression hold, held or timed out, changes nothing a render gives', async () => {
-    // Shards of about 100 tokens: held, the body starts the protected recent
-    // window and the compile sends it whole; past the hold's deadline, the
-    // recent window's 300 tokens hold only its last shards, and the compile
-    // sends the rest from the middle. The render gives the body whole either
-    // way, as the windows join it.
     const clock = { t: 1_000 };
     const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
     const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: sharding({ recentWindowTokens: 300 }), now: () => clock.t });
@@ -703,8 +696,9 @@ describe('renderAsNewest', () => {
       assert.deepEqual(timedOut, held);
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(timedOut[1], sent(compiled.messages.at(-1)!.content));
-      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
-      assert.ok(pieces > 1, `released, the compile sends the body in ${pieces} pieces`);
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word'));
+      assert.equal(pieces.length, 1, `released, the compile sends the body in ${pieces.length} pieces`);
+      assert.deepEqual(sent(pieces[0]!.content), timedOut[0], 'as the render gives it');
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });

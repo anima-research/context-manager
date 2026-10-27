@@ -13133,7 +13133,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         while (newest > 0 && holdsSystemChange(messages[newest].content)) newest--;
         const newestBody = bodyStart((k) => messages[k], newest);
         const newestTurn = this.bodyHoldsToolResult(messages, newestBody)
-          ? this.callStart(messages, newestBody)
+          ? this.turnStart(messages, newestBody)
           : newest;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
@@ -18476,6 +18476,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return false;
   }
 
+  protected turnStart(messages: readonly StoredMessage[], at: number): number {
+    let start = at;
+    if (start > 0 && start < messages.length && this.bodyHoldsToolResult(messages, start)) {
+      start = this.callStart(messages, start);
+    }
+    if (start > 0) {
+      const parted = this.callPartedStarts(messages, start - 1, start);
+      if (parted[start - 1]! >= 0) start = parted[start - 1]!;
+    }
+    return start;
+  }
+
   protected callStart(messages: readonly StoredMessage[], resultAt: number): number {
     const { from: resultBody, to: resultLast } = bodyBoundsIn(messages, resultAt);
     if (resultBody === 0) return resultAt;
@@ -18500,6 +18512,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     return answers ? first : resultAt;
+  }
+
+  protected bodyLeavesCallOpen(messages: readonly StoredMessage[], at: number): boolean {
+    const { from, to } = bodyBoundsIn(messages, at);
+    const open = new Set<string>();
+    for (let k = from; k <= to; k++) {
+      for (const block of messages[k]!.content) {
+        if (block.type === 'tool_use') open.add((block as { id: string }).id);
+        else if (block.type === 'tool_result') open.delete((block as { toolUseId: string }).toolUseId);
+      }
+    }
+    return open.size > 0;
   }
 
   protected bodyHoldsToolUse(messages: readonly StoredMessage[], at: number): boolean {
@@ -18682,17 +18706,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = messages.length - 1; i >= 0; i--) {
       tokens += pse[i];
       if (tokens > this.config.recentWindowTokens) {
-        let boundary = i + 1;
-        // Don't split a tool_use/tool_result pair: if the message at the boundary
-        // is a tool_result, include the preceding tool_use with it.
-        if (boundary > 0 && boundary < messages.length && this.bodyHoldsToolResult(messages, boundary)) {
-          boundary = this.callStart(messages, boundary);
-        }
-        if (boundary > 0) {
-          const parted = this.callPartedStarts(messages, boundary - 1, boundary);
-          if (parted[boundary - 1]! >= 0) boundary = parted[boundary - 1]!;
-        }
-        return boundary;
+        return this.turnStart(messages, i + 1);
       }
     }
 
@@ -18887,10 +18901,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
         }
-        if (boundary > startIdx) {
-          const parted = this.callPartedStarts(messages, boundary - 1, boundary);
-          while (boundary > startIdx && parted[boundary - 1]! >= 0) boundary = Math.max(startIdx, parted[boundary - 1]!);
+        const stepped = boundary;
+        const parted = this.callPartedStarts(messages, startIdx, i);
+        for (let moved = true; moved && boundary > startIdx;) {
+          moved = false;
+          if (parted[boundary - 1]! >= 0) {
+            boundary = Math.max(startIdx, parted[boundary - 1]!);
+            moved = true;
+          }
+          const from = bodyStart((k) => messages[k], boundary);
+          if (from < boundary && from >= startIdx && this.bodyLeavesCallOpen(messages, boundary)) {
+            boundary = from;
+            moved = true;
+          }
         }
+        for (let k = boundary + 1; k <= stepped; k++) tokens -= store.estimateTokens(messages[k]);
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
     }
@@ -20107,11 +20132,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Both selects send raw every message the view holds that no summary
    * covers, whichever region holds it: the head window, the middle (the
    * history before a head window that was reset included) or the recent
-   * window. Each such message goes through `cappedForSend`, apart from a
-   * body's shards in the adaptive middle (below). The image pass decides by
-   * stored position, newest first, not by where a region puts an entry. So
-   * these steps give a message's form wherever the compile places it, and
-   * no id the view holds comes back as null. Two kinds of message differ.
+   * window. Each such message goes through `cappedForSend`. The image pass
+   * decides by stored position, newest first, not by where a region puts an
+   * entry. So these steps give a message's form wherever the compile places
+   * it, and no id the view holds comes back as null. Two kinds of message
+   * differ.
    * - A message a summary covers comes back raw, while the compile sends its
    *   summary where its plan folds it. Under the hierarchical select without
    *   `imageStripHysteresisRatio`, its images, rendered raw, also count
@@ -20119,12 +20144,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   compile, sending its summary, doesn't count them. The adaptive select,
    *   and every path under `imageStripHysteresisRatio`, count every stored
    *   message's images, folded or not, as the render does.
-   * - A body whose shards the compile doesn't send together. The adaptive
-   *   middle, kv-unified's included, sends a raw run of a body's shards as
-   *   their text alone, uncut. A body whose shards sit across the middle
-   *   and a window, or across a reset head window's end with the history
-   *   from before the reset between them, goes out in more than one entry.
-   *   Here such a body comes back whole, as the windows join it.
+   * - A body whose shards the compile doesn't send together. A body that
+   *   leaves no call waiting for a later result and whose shards sit across
+   *   a reset head window's end with the history from before the reset
+   *   between them goes out in more than one entry, and so can a reply that
+   *   makes a call, in a store whose chunks, made by an earlier version, own
+   *   it from a later shard. Here such a body comes back whole, as the
+   *   windows join it.
    *
    * The form is the compile's, but not always the place: after a head-window
    * reset, the head is sent ahead of the history from before the reset, and

@@ -168,10 +168,12 @@ export interface OverBudgetRawPin {
  *   the call the result answers where that call was made before the body, in
  *   the message before it or across parallel calls' results before it, from
  *   the call's first shard that holds a tool_use or a thinking block
- *   (thinking or redacted_thinking), which the result must follow raw. A smaller
- *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
- *   window into the middle, which folds once its chunks have closed and
- *   compression has summarized them.
+ *   (thinking or redacted_thinking), which the result must follow raw; and
+ *   where the message that made the call answers a call before it, as in a
+ *   chain, from that earlier call, as the recent window's start counts it.
+ *   A smaller `recentWindowTokens` (the hot `tailTokens`) moves the rest out
+ *   of the raw window into the middle, which folds once its chunks have
+ *   closed and compression has summarized them.
  *
  * Each list describes the refusal that was hit. Clearing it can bring the
  * next one: a smaller recent window can leave the picker waiting for
