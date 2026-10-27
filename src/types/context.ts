@@ -83,20 +83,29 @@ export interface PendingWork {
  *
  * @deprecated Context injection is deprecated
  * (anima-research/agent-framework#171). Injections are never stored: each
- * `compile()` splices them in fresh, re-anchored to the latest
- * user-participant message, so the rendered prefix changes at every
- * activation and prompt caches stop hitting past that point (head-only
- * hits on OpenAI Responses/Codex). After a mid-activation recompile the
- * anchor can also fall between a tool call and its result. Prefer content
- * that is stored once at its own position — system prompt for durable
- * instructions, ordinary messages for changing state. Still accepted by
- * `compile()` for now.
+ * `compile()` splices `beforeUser` and `afterUser` injections in fresh,
+ * re-anchored to the latest message whose participant is `user` (ignoring
+ * case), so the rendered prefix changes each time a newer one arrives and
+ * prompt caches stop hitting past that point (head-only hits on OpenAI
+ * Responses/Codex). After a mid-activation recompile a `beforeUser`
+ * injection can also land between a tool call and its result. `system`
+ * injections are not spliced: they come back in
+ * `CompileResult.systemInjections` for the caller's system prompt, and are
+ * passed again with every compile, so when one's content changes the system
+ * prompt itself changes, and the prompt cache misses from there, ahead of
+ * every message. Prefer content that is stored once at its own position —
+ * system prompt for durable instructions, ordinary messages for changing
+ * state. Still accepted by `compile()` for now.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
   namespace: string;
 
-  /** Where to inject in the message array */
+  /**
+   * Where to inject: `beforeUser` and `afterUser` go into the message array,
+   * placed as `compile()` describes, and `system` comes back in
+   * `CompileResult.systemInjections` instead.
+   */
   position: 'system' | 'beforeUser' | 'afterUser';
 
   /** Content blocks to inject (multimodal) */
@@ -130,7 +139,8 @@ export interface CompileResult {
   messages: NormalizedMessage[];
 
   /**
-   * System-position injections, grouped by namespace.
+   * The content blocks of the `system`-position injections, flattened in the
+   * order given; their namespaces aren't kept.
    * Caller should append these to the system prompt.
    * Separated because the system prompt is outside context-manager's scope.
    *
