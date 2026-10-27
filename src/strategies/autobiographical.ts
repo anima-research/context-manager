@@ -18542,12 +18542,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mark = (from: number, to: number, start: number): void => {
       for (let p = from; p <= to; p++) if (starts[p]! < 0 || start < starts[p]!) starts[p] = start;
     };
-    let calls: { open: Set<string>; from: number; marked: number } | null = null;
+    let calls: { open: Set<string>; from: number } | null = null;
     for (let from = begin; from < n && (from < until || (calls !== null && calls.from < until)); ) {
       const to = bodyEnd(n, at, from);
       const open = new Set<string>();
       let first = -1;
-      let ownMarked = -1;
       let answers = false;
       for (let k = from; k <= to; k++) {
         for (const b of messages[k]!.content) {
@@ -18560,8 +18559,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const id = (b as { toolUseId: string }).toolUseId;
             if (open.has(id)) {
               open.delete(id);
-              mark(Math.max(first, ownMarked + 1), k - 1, first);
-              ownMarked = Math.max(ownMarked, k - 1);
+              mark(first, k - 1, first);
             } else if (calls?.open.has(id)) {
               calls.open.delete(id);
               answers = true;
@@ -18570,15 +18568,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (answers && calls !== null) {
-        mark(Math.max(calls.from, calls.marked + 1), to - 1, calls.from);
-        calls.marked = Math.max(calls.marked, to - 1);
+        mark(calls.from, to - 1, calls.from);
         if (calls.open.size > 0) {
           for (const id of open) calls.open.add(id);
         } else {
-          calls = open.size > 0 ? { open, from: first, marked: first - 1 } : null;
+          calls = open.size > 0 ? { open, from: first } : null;
         }
       } else {
-        calls = open.size > 0 ? { open, from: first, marked: first - 1 } : null;
+        calls = open.size > 0 ? { open, from: first } : null;
       }
       from = to + 1;
     }
