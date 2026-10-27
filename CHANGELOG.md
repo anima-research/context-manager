@@ -12,6 +12,136 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.23.1 — 2026-10-27
+
+### Added
+
+- `ContextManager.previewContext`'s `opts` takes, beside `render` and
+  `thinkingBinding`, the other select options a compile takes:
+  `kvUnifiedImmutablePrefixHash` and `kvUnifiedContinuityRelaxation`. Its dry
+  select passes them on, so a kv-unified agent's preview runs with the prefix
+  hash and continuity relaxation its compile uses. `dryRun` is always set, and
+  `identity` isn't taken, since nothing in a preview reads it.
+
+- `recoverLiteralThinkingWrappedCompression` on `AutobiographicalConfig` (off
+  by default): for a model without native reasoning that writes a whole
+  compression or merge answer inside one closed literal `<thinking>…</thinking>`
+  (or `<think>…</think>`) text wrapper, the strategy keeps the prose inside it
+  as the memory, where it stripped the answer to nothing and went on to the
+  plain-prose retry. Only that shape is read differently: an answer of text
+  blocks alone, one wrapper around all of it, no tag in its body. Every other
+  answer is read exactly as with the option off, so the option never drops a
+  memory the default reading stores: the one shape it reads differently is
+  stored as the prose inside the wrapper (the default strips a `<thinking>`
+  wrapper to nothing and keeps a `<think>` one verbatim, tags included). The
+  drain script passes the option through from a recipe too. A recovered answer is stored as
+  its plain prose, with no replay carrier, as any text-only answer, and logs
+  `compression:literal-thinking-wrapper-recovered`, with the summary's id, once
+  the summary is stored.
+
+### Changed
+
+- A dry select, a preview's or a `dryRun` compile's, logs no
+  `[kv-continuity-relaxation]` line: neither the error-level line for a
+  relaxation applied nor the warning for one rejected as invalid or expired,
+  since a dry run isn't the live state. The committing compile still logs
+  each.
+
+### Fixed
+
+- `reportRealInputTokens(realTotal, overhead?)` takes what the request sent
+  besides the window, `{ system, tools }` (`RequestOverhead`), and prices it
+  into the estimate the provider's total is compared with (#323). The
+  provider counts the system prompt and the tool schemas and the compile
+  estimate doesn't, so a tool-heavy agent's multiplier learned its schemas
+  as a per-token rate and folded history the budget had room for, or sat at
+  1.00 rejecting every sample as out of band. A caller that passes nothing
+  gets the old comparison, plus the compile's message-position injections
+  (below).
+- With the overhead declared, three out-of-band calibration samples in a row
+  whose implied multipliers agree within 10% of the first are learned,
+  outright, at the clamp edge, instead of being rejected for good. At 1.00
+  the ratio and the implied multiplier are the same number, so a store whose
+  true ratio was past 1.8, where every pricing-epoch discard restarts, could
+  never learn. Undeclared samples are rejected as before, and the rejection
+  line says the caller may be leaving out the system prompt and tools it
+  sends.
+- The sample also counts the compile's message-position injections
+  (`beforeUser` and `afterUser`), which the request carries and the window
+  estimate doesn't: `ContextManager.compile` passes their content to the
+  select as `SelectOptions.messageInjections`, and the select prices it with
+  the window. Left out, an agent whose injections are large beside its window
+  learned them as a per-token rate, or, with the overhead declared, at the
+  clamp.
+- **Host operators:** a multiplier learned before the caller declared its
+  overhead holds that overhead. Inside the calibration band, the first two
+  samples that declare it replace the multiplier with their mean when they
+  agree within 10%, and the EMA steps as before when they don't; either way
+  the record then carries `declaredOverhead: true`, so later declared
+  samples step by the EMA. (Out of the band, the three-sample run above
+  applies.) The first of the two is held in memory, so a restart between
+  them costs one more sample. An undeclared sample that moves the multiplier
+  writes the record without the flag. A store whose multiplier, above 1,
+  puts every compile over budget gets no sample to move it, as before: to
+  unwedge it, seed the record as provisional on the stopped store, and the
+  refused compile drops it to 1: `setStateJson('<ns>/autobio:calibration',
+  { multiplier, at, pricing: <current epoch>, provisional: true })`.
+  `RequestOverhead` is exported from the package.
+
+- A store with no calibration record, or a record with no finite
+  multiplier, starts from a provisional 1, as a discard's restart does
+  (#328). Its first sample inside the calibration band sets the multiplier,
+  declared or not: one sample, without the two-sample hold. Learned, a 1
+  stepped a fifth of the way per undeclared sample (nine applied changes,
+  each a reprice of every message and summary, to reach a true 1.4), and
+  took two declared samples, the first held. Until that
+  sample, render stats report `calibration.provisional: true`. A record
+  from a newer pricing epoch, or a read of the record that throws, still
+  loads 1 as before, not provisional.
+
+- `renderAsNewest` gives `null` only for a message the next compile doesn't
+  send: one the view leaves out, or one before windowed passthrough's
+  anchor. Under the memory strategy it gave `null` for any message before
+  the recent window or in a head window followed by other messages, though
+  the compile sends those raw. So a batch bigger than the recent window
+  came back partly `null` while the next compile sent all of it, in order,
+  as its last messages (context-manager#275's review, R1-1). Each such
+  message now comes back in the form the compile sends it, cut by the
+  per-message cap and with the image limits counted over the batch as a
+  compile counts them. Two kinds of message still differ, and the doc names
+  both: a message a summary covers comes back raw where the compile's plan
+  sends the summary, and a sharded body whose shards the compile doesn't
+  send together comes back whole, as the windows join it. The adaptive
+  middle sends its shards' text alone, uncut, and a body across the middle
+  and a window, or across a reset head window's end, goes out in more than
+  one entry. After a head-window reset the head is sent before the history
+  from before the reset, and so is each system change stored before the
+  head, so those messages render in the form the compile sends but aren't
+  sent last. A render no longer releases a
+  compression hold that has timed out, since where a window starts no
+  longer changes what it gives; the next add, compile, tick or hold query
+  releases it, as each did before.
+- The doc says what else a render can't foresee. A batch's images can strip
+  older images a request already carries. Tool blocks come back as the cap
+  leaves them, while the memory strategy's hierarchical select leaves out a
+  newest message that holds a `tool_use` with no result after it and its
+  adaptive select refuses that compile, both drop a `tool_result` whose
+  call isn't sent before it, and the manager splits a message other than a
+  user's that holds a `tool_result` into several turns.
+- The doc says whom the render is for: a caller that appends messages it
+  has just stored to a compiled request, and one that renders messages its
+  stream has already sent, as `noteRequestSent` does over a whole turn's
+  rows.
+
+- `ContextManager.previewContext` returns `null` on the hierarchical path
+  (`adaptiveResolution` off) when its select succeeds, as its doc says it
+  does when the strategy has no fold plan to preview. It used to let through
+  the plain `Error` that `AutobiographicalStrategy.previewContext` throws there
+  ("previewContext requires adaptiveResolution; …"). A caller that matched
+  that error's text gets `null` instead. Over the budget, the hierarchical
+  path still returns an infeasible preview. `AutobiographicalStrategy`'s own
+  `previewContext` still throws there, with the same message.
+
 ## 0.23.0 — 2026-10-26
 
 ### Breaking

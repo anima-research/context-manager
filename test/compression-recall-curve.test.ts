@@ -504,6 +504,106 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('opt-in recovers a closed whole-response thinking wrapper at the L1 site', async () => {
+    const wrapped = '<thinking>\nI remember arriving in the field and being welcomed home.\n</thinking>';
+    const mock = flexibleMembrane([{ stop: 'end_turn', text: wrapped }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1, 'no plain-prose retry needed');
+    assert.equal(fx.target.compressed, true);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, 'I remember arriving in the field and being welcomed home.');
+    assert.equal(
+      produced?.responseContent,
+      undefined,
+      'a text-only answer stores no carrier; replay reads the unwrapped content',
+    );
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: an empty canonical answer, then a plain-prose retry that comes back whole-wrapped, stores the retry\'s prose', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'end_turn', text: '<thinking>an unclosed preamble, no memory' },
+      { stop: 'end_turn', text: '<thinking>\nThe retry\'s memory, wrapped whole.\n</thinking>' },
+    ]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 2, 'the canonical, then the plain-prose rung');
+    assert.equal(fx.target.compressed, true);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, "The retry's memory, wrapped whole.");
+    assert.equal(produced?.responseContent, undefined);
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: a recovery is logged once, with the stored summary\'s id, and a preamble strip logs none', async () => {
+    const recovered = (log: string) => readFileSync(log, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.event === 'compression:literal-thinking-wrapper-recovered');
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    const logs: string[] = [];
+    try {
+      for (const [text, expected] of [
+        ['<thinking>\nA memory wrapped whole.\n</thinking>', 1],
+        ['<thinking>a preamble</thinking>the memory after it', 0],
+      ] as const) {
+        const log = `${freshPath()}-recovery.jsonl`;
+        logs.push(log);
+        process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+        const mock = flexibleMembrane([{ stop: 'end_turn', text }]);
+        const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        fx.manager.close();
+        const events = recovered(log);
+        assert.equal(events.length, expected, text);
+        if (expected) {
+          assert.equal((events[0]!.metadata as Record<string, unknown>).summary_id, fx.target.summaryId);
+          assert.equal(events[0]!.operation, 'compress_l1');
+        }
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      for (const log of logs) rmSync(log, { force: true });
+    }
+  });
+
+  it('opt-in at L1: a mention of a thinking tag mid-content is content', async () => {
+    const text = 'I noticed the model printed </thinking> in its output, and we laughed about it.';
+    const mock = flexibleMembrane([{ stop: 'end_turn', text }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, text);
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: with native reasoning beside the text, a leading preamble is stripped as before and the prose after it kept', async () => {
+    const mock = flexibleMembrane([{ raw: {
+      stopReason: 'end_turn',
+      content: [
+        { type: 'thinking', thinking: 'native private reasoning', signature: 'signed' },
+        { type: 'text', text: '<thinking>pseudo preamble</thinking>the public memory body' },
+      ],
+      usage: { inputTokens: 100, outputTokens: 40 },
+    } }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, 'the public memory body');
+    fx.manager.close();
+  });
+
   it('canonical tool_use gets ONE no-tools retry before the curve plan burns (lena 2026-08-06)', async () => {
     // Curve variants vary the recall frontier, not the response mode — a
     // think-first model fails every variant identically. The retry must be

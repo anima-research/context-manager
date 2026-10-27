@@ -536,6 +536,14 @@ export interface SelectOptions {
     multiplier: number;
     expiresAt: number;
   };
+  /** The content of each injection the compile inserts among the selected
+   * entries after the select (`beforeUser` and `afterUser`), which the
+   * request carries and the select's window doesn't. A strategy whose
+   * calibration compares the provider's input total with the compile prices
+   * it there (AutobiographicalStrategy.reportRealInputTokens).
+   * ContextManager.compile fills it from its injections; `system` ones go
+   * into the caller's system prompt instead. */
+  messageInjections?: ReadonlyArray<ContentBlock[]>;
 }
 
 /**
@@ -854,6 +862,22 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/**
+ * What a request carried besides the compiled window and the compile's
+ * message-position injections (which the compile prices itself), as the
+ * caller sent it (see `AutobiographicalStrategy.reportRealInputTokens`). The
+ * provider counts it in the input total and the compile estimate doesn't, so
+ * a calibration sample that leaves it out learns it as a per-token rate.
+ * Passing it says this is everything the request sent besides those; a
+ * caller that can't see the request's head passes nothing.
+ */
+export interface RequestOverhead {
+  /** The system prompt the request sent. */
+  system?: string;
+  /** The tool definitions the request sent. */
+  tools?: ReadonlyArray<ToolDefinition>;
+}
+
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
 export interface CalibrationReset {
   /** The multiplier that was discarded. */
@@ -906,11 +930,16 @@ export interface RenderStats {
    * that isn't provisional was learned under that epoch's pricing, or under
    * an older epoch's and kept, re-stamped, because nothing this store holds
    * was repriced since; either way it's reported under the epoch in force.
+   * The exception is the 1 loaded beside a record from a newer pricing
+   * epoch, or a record the store can't read: neither is used, and that 1
+   * is neither learned nor provisional.
    * `provisional` is true while the multiplier is a guess, which the first
    * provider sample the calibration's band accepts replaces outright, rather
    * than stepping toward it (see
    * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
-   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * record without a stamp, the 1 a discard restarts from, or the 1 a store
+   * with no calibration record, or none with a multiplier to use other than
+   * a newer epoch's, starts from. A discard's 1 stays
    * provisional through a later epoch's load, which re-stamps it whatever
    * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
@@ -1466,6 +1495,16 @@ export interface AutobiographicalConfig {
    * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
    */
   compressionMaxTokens?: number;
+  /**
+   * Compatibility for models without native reasoning that write the whole
+   * memory inside one closed literal `<thinking>…</thinking>` or
+   * `<think>…</think>` text wrapper. When true, a compression or merge answer
+   * of text blocks alone that is exactly that shape, with no tag in its body,
+   * is stored as the prose inside it. Every other answer is read as with the
+   * option off. Default false. It applies to answers from then on; chunks
+   * already in quarantine stay there until their records are cleared.
+   */
+  recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per stored message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated; each shard of a
    *  message ingress split is cut on its own, before the shards that render

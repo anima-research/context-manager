@@ -82,6 +82,7 @@ export type {
   LayoutUnit,
   ThinkingStrip,
   // Strategy types
+  RequestOverhead,
   MessageStoreView,
   ContextLogView,
   StrategyContext,

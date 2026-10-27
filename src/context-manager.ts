@@ -1244,11 +1244,14 @@ export class ContextManager {
     const view = this.strategyMessageView();
 
     // Get selected entries from strategy
+    const messageInjections = (injections ?? [])
+      .filter((inj) => inj.position === 'beforeUser' || inj.position === 'afterUser')
+      .map((inj) => inj.content);
     const entries = this.strategy.select(
       view,
       this.contextLog.createView(),
       effectiveBudget,
-      opts
+      messageInjections.length > 0 ? { ...opts, messageInjections } : opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.

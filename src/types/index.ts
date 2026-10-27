@@ -81,6 +81,7 @@ export type {
   SummaryOverviewStrategy,
   RenderStats,
   CalibrationReset,
+  RequestOverhead,
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
   ImageCeilings,
