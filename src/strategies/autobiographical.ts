@@ -20148,9 +20148,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   leaves no call waiting for a later result and whose shards sit across
    *   a reset head window's end with the history from before the reset
    *   between them goes out in more than one entry, and so can a reply that
-   *   makes a call, in a store whose chunks, made by an earlier version, own
-   *   it from a later shard. Here such a body comes back whole, as the
-   *   windows join it.
+   *   makes a call, in a store whose chunks begin partway through it. Here
+   *   such a body comes back whole, as the windows join it.
    *
    * The form is the compile's, but not always the place: after a head-window
    * reset, the head is sent ahead of the history from before the reset, and

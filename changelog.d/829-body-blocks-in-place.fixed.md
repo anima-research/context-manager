@@ -3,22 +3,22 @@
   place, and its text blocks with their own boundaries, in one entry. After
   a head-window reset, a body that leaves no call waiting and runs across
   the head's end still goes out in pieces around the history from before the
-  reset, as before; so can a reply that makes a call in a store whose
-  chunks, made by an earlier version, own it from a later shard, until the
-  next reset. A text block cut across two shards comes back as one block of
-  plain text, as cut text always did. The head and recent windows sent the
-  body's other blocks ahead of its text and its text blocks as one, so a
-  reply's tool call went out before its text. The adaptive middle sent its
-  text alone, so a reply ending in a tool call lost the call and its result,
-  an image went unsent, and a tool result whose message was split went out
-  as the placeholder for a result that isn't shown. And a body whose shards
-  fell in the middle and a window went out as two or three entries, which
-  membrane's native formatter sends as one message with the body's text cut
-  where the regions meet, so each time the recent window's edge crossed one
-  of its seams the prompt was rewritten from that body on. The middle now
-  sends each raw shard as any raw message is sent, cut at `maxMessageTokens`
-  as the windows cut it and priced as the plan priced it, and the image
-  strip judges each image at the shard that holds it.
+  reset, as before, and so can a reply that makes a call, in a store whose
+  chunks begin partway through it, until the next reset. A text block cut
+  across two shards comes back as one block of plain text, as cut text
+  always did. The head and recent windows sent the body's other blocks ahead
+  of its text and its text blocks as one, so a reply's tool call went out
+  before its text. The adaptive middle sent its text alone, so a reply
+  ending in a tool call lost the call and its result, an image went unsent,
+  and a tool result whose message was split went out as the placeholder for
+  a result that isn't shown. And a body whose shards fell in the middle and
+  a window went out as two or three entries, which membrane's native
+  formatter sends as one message with the body's text cut where the regions
+  meet, so each time the recent window's edge crossed one of its seams the
+  prompt was rewritten from that body on. The middle now sends each raw
+  shard as any raw message is sent, cut at `maxMessageTokens` as the windows
+  cut it and priced as the plan priced it, and the image strip judges each
+  image at the shard that holds it.
 - A body stored before renders as it did wherever the head and recent
   windows hold it. In the middle it now sends its other blocks as the
   windows always did, ahead of its text, and across the middle and a window
