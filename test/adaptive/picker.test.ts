@@ -9,6 +9,7 @@ import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.
 import { OldestFirstStrategy } from '../../src/adaptive/strategies/oldest-first.js';
 import type { FoldingBudget } from '../../src/adaptive/folding-strategy.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
+import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 
 const BUDGET = (totalBudget: number, slack = 0.1): FoldingBudget => ({
   totalBudget,
@@ -800,6 +801,33 @@ for (const [name, make] of greedySolvers) {
     assert.equal(result.finalResolutions.get('a0'), 2, 'a0 rises through P');
   });
 
+  test(`picker (${name}): a solve that passed no chunk over is the only one, judged at the caller's line`, () => {
+    const { value, engines } = greedyEngines(() => runQuietly(make(), growingRaise(false), {
+      totalBudget: 196, targetBudget: 120, slack: 76 / 196, rejectionBudget: 200,
+    }));
+    assert.equal(value.result.finalTokens, 200);
+    assert.equal(engines, 1);
+  });
+
+  test(`picker (${name}): where the fewest-token plan is a solve's last, it is the solution with no replay`, () => {
+    const inputs = greedyStore([['a0', 'A']], [['A', 1, ['a0'], 30]]);
+    inputs.chunks[1]!.rawTokens = 100;
+    (inputs as { tailTokens: number }).tailTokens = 100;
+    const { value, engines } = greedyEngines(() => runQuietly(make(), inputs, { totalBudget: 100, targetBudget: 90, slack: 0.1 }));
+    assert.equal(value.result.finalTokens, 130);
+    assert.equal(value.result.finalResolutions.get('a0'), 1);
+    assert.equal(engines, 1);
+  });
+
+  test(`picker (${name}): where a solve's last plan only ties its fewest, the earlier plan is the solution`, () => {
+    const store = growingRaise(false);
+    const inputs = { ...store, summaries: new Map(store.summaries).set('P', { ...store.summaries.get('P')!, tokens: 30 }) };
+    const { value, engines } = greedyEngines(() => runQuietly(make(), inputs, { totalBudget: 100, targetBudget: 90, slack: 0.1 }));
+    assert.equal(value.result.finalTokens, 130);
+    assert.equal(value.result.finalResolutions.get('a0'), 1, 'a0 stays at A');
+    assert.equal(engines, 2);
+  });
+
   // Nothing is within 100: both solves start at 260 and the one that passes
   // over ends at 330. The solution is the fewest-token plan either passed
   // through, 260, the first solve's winning the tie, with the request that
@@ -849,11 +877,13 @@ test('picker (flat-profile): where no plan is within the line, the fewest-token 
     ]),
     headTokens: 0, tailTokens: 100, headChunkIds: new Set(), tailChunkIds: new Set(['b0']),
   };
-  const { result } = runQuietly(new FlatProfileStrategy(), inputs, { totalBudget: 150, targetBudget: 135, slack: 0.1 });
+  const { value: { result }, engines } = greedyEngines(() =>
+    runQuietly(new FlatProfileStrategy(), inputs, { totalBudget: 150, targetBudget: 135, slack: 0.1 }));
   assert.equal(result.finalTokens, 180);
   assert.equal(result.finalResolutions.get('a0'), 1, 'a0 stays at A');
   assert.equal(result.finalResolutions.get('c0'), 1, 'c0 rises through C');
   assert.deepEqual(result.produced, [{ level: 2, range: { firstChunkId: 's0', lastChunkId: 's0' } }]);
+  assert.equal(engines, 2);
 });
 
 // The two solves of the fixture above with P costing 30, as A does: passing
@@ -953,6 +983,23 @@ test('picker (flat-profile): passing over a chunk, a step takes the next chunk a
   assert.equal(result.finalTokens, 160);
   assert.deepEqual(unrealizable, []);
 });
+
+function greedyEngines<T>(run: () => T): { value: T; engines: number } {
+  const original = SummaryTree.prototype.renderableLevel;
+  const chunks = new Set<string>();
+  let reads = 0;
+  SummaryTree.prototype.renderableLevel = function (this: SummaryTree, chunkId, level) {
+    chunks.add(chunkId);
+    reads++;
+    return original.call(this, chunkId, level);
+  };
+  try {
+    const value = run();
+    return { value, engines: chunks.size === 0 ? 0 : reads / chunks.size };
+  } finally {
+    SummaryTree.prototype.renderableLevel = original;
+  }
+}
 
 // Run a picker with console.error caught, and return its
 // [picker-unrealizable] lines, if any.

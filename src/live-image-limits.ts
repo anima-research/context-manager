@@ -26,8 +26,8 @@ export const DEFAULT_IMAGE_CEILING = 500;
 
 /**
  * membrane's byte cap is 28 MiB of serialized messages unless
- * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise (membrane 0.5.87, 0.6.0 and 0.7.1,
- * the version this package's lockfile installs).
+ * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise (membrane 0.5.87, 0.6.0, 0.7.1
+ * and 0.8.0, the version this package's lockfile installs).
  * It checks a request when it builds it through `transformRequest`, which a
  * call's first request and each native tool-loop round go through; an
  * XML-mode continuation round doesn't, and of the provider adapters only the

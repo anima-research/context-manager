@@ -323,9 +323,12 @@ caller — `AutobiographicalStrategy.selectAdaptive` — routes each op via
 
 - `level === 1`: locate the chunks whose messages fall in `op.range` and
   ensure they are queued for L1 compression (`compressionQueue.push`).
-- `level >= 2`: gather unmerged L_{level-1} summaries whose source ranges
-  fall within `op.range` (deduped against entries already in
-  `mergeQueue`) and enqueue a single L_{level} merge over them.
+- `level >= 2`: queue the largest merge group of unmerged L_{level-1}
+  summaries, as the merge check groups the level's runs (`runGroups` in
+  `src/strategies/merge-runs.ts`), that holds one reaching into `op.range`
+  (sources already in `mergeQueue` left out). The group can reach past the
+  range, so a request naming one summary's own range queues the group that
+  holds it.
 
 The actual LLM work runs asynchronously on the next `tick()` (or the
 speculative drain kicked off from `onNewMessage`). The compile that

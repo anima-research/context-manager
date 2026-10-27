@@ -89,8 +89,7 @@ test('scaled boundary: L4 span at exactly base×k passes; one over is excluded',
   const p = probe(20000);
   const atLimit = [summary('ok', 0, base * k, 4)]; // span == 9000
   const overLimit = [summary('wide', 0, base * k + 1, 4)]; // span == 9001
-  // threshold 1 so the single candidate reaches the exclusion loop
-  // (unmerged.length < threshold short-circuits before it).
+  // threshold 1 so the single candidate reaches the exclusion loop.
   const warnsOk = captureWarns(() => {
     assert.ok(p.pick(atLimit, 1), 'span==limit must be pickable');
   });

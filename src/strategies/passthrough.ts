@@ -105,7 +105,7 @@ export class PassthroughStrategy implements ContextStrategy {
       throw new OverBudgetError({
         budget: maxTokens,
         actual: totalTokens,
-        stageId: 'passthrough-system-changes',
+        stage: 'Passthrough kept only its system changes',
         clearedBy: [],
         diagnostics: { headTokens: totalTokens, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
       });
@@ -135,7 +135,7 @@ export class PassthroughStrategy implements ContextStrategy {
       throw new OverBudgetError({
         budget: maxTokens,
         actual: changeTokens + newestTokens,
-        stageId: 'passthrough-changes-and-newest-message',
+        stage: 'Passthrough: its system changes and the newest conversation message',
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
         diagnostics: { headTokens: changeTokens, tailTokens: newestTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
       });

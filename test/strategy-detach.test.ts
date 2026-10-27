@@ -2768,7 +2768,7 @@ describe('a strategy let go of ends the provider calls its work has out (#241)',
         const before = calls.length;
         await manager.tick();
         assert.strictEqual(calls.length, before, "this instance took up the other's L1 rather than compressing the chunk");
-        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], "the merge the store's queue lacked is queued again");
+        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3+L1-4'], "the merge the store's queue lacked is queued again");
       } finally {
         for (const call of calls) call.release();
         other.close();
@@ -2791,7 +2791,7 @@ describe('a strategy let go of ends the provider calls its work has out (#241)',
         await otherTick;
         await tick;
         assert.strictEqual(calls.length, 5, 'it made no call of its own');
-        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], "the merge the store's queue lacked is queued again");
+        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3+L1-4'], "the merge the store's queue lacked is queued again");
       } finally {
         for (const call of calls) call.release();
         other.close();

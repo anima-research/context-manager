@@ -56,7 +56,7 @@ Since compression defers whenever history contains tool blocks but no tool defin
 
 Adding a new invariant is a per-turn check on `turn.snapshot` inside the existing loop. Adding a new workload shape is a separate `it()` calling `generateWorkload` with different parameters. Common extensions worth considering:
 
-- **L2/L3 disjointness.** Same overlap check extended to higher levels — relevant once `mergeThreshold` is brought back below 999.
+- **L2/L3 disjointness.** Same overlap check extended to higher levels — relevant once merges run: `mergeThreshold` brought back below 999, or an interior run, which merges at two whatever the threshold.
 - **Chunk-message-ID disjointness.** Two chunks shouldn't claim the same message ID, regardless of compression status.
 - **Compiled-output validity.** Run the per-turn `rawRequest` through `NativeFormatter` and assert no orphan `tool_use` / `tool_result` blocks. Currently this surfaces as the 5%-cap compile-error budget; a structural assertion would be tighter.
 - **Pinned-range stability.** Add pins without a `level` or `maxLevel` to the workload, with no pin that has one over the same messages, and assert pinned ranges never appear inside any summary's `sourceIds`. Under kv-stable and kv-unified with adaptive resolution, a `level` or `maxLevel` above 0 can let a pinned message be compressed.

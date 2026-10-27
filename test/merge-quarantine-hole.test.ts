@@ -310,8 +310,6 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     console.warn = () => {};
     try { strategy.clearMergeQuarantine(); } finally { console.warn = warn; }
     assert.equal(strategy.queue.length, 0, 'the clear does not queue the group');
-    // No merge forms at a level with fewer unmerged summaries than the
-    // threshold; new L1s bring it there, as in a live store.
     const unmergedL1s = strategy.all.filter((s) => s.level === 1 && !parented(s)).length;
     assert.ok(unmergedL1s < 3, `premise: fewer unmerged L1s than the threshold (${unmergedL1s})`);
     await arrive(manager, 3, 1000);
@@ -487,11 +485,8 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
   });
 
   it('leaves a summary at its level once its operator hold lifts, unless an unmerged summary of its level sits beside it', async () => {
-    // The same arrivals, holding the fourth L1 or the fifth: the merges that
-    // form around the fourth leave both its neighbours merged, and around the
-    // fifth they leave the one before it unmerged.
     const outcomes: Array<{ held: number; besideUnmerged: boolean; mergesOnceLifted: boolean }> = [];
-    for (const held of [3, 4]) {
+    for (const held of [1, 3]) {
       cleanup();
       const { membrane } = provider([]);
       const strategy = lane({ mergeThreshold: 99 });
@@ -512,8 +507,8 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
       manager.close();
     }
     assert.deepEqual(outcomes, [
+      { held: 1, besideUnmerged: true, mergesOnceLifted: true },
       { held: 3, besideUnmerged: false, mergesOnceLifted: false },
-      { held: 4, besideUnmerged: true, mergesOnceLifted: true },
     ]);
   });
 
@@ -824,7 +819,7 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
 
   it('leaves quarantined L1s out of a merge the picker asks for over their range', async () => {
     const { membrane } = provider([1]);
-    const strategy = lane({ mergeThreshold: 99 }); // no merge forms by itself
+    const strategy = lane({ mergeThreshold: 99 }); // no run grows to the threshold
     const manager = await ContextManager.open({ path: PATH, strategy, membrane: membrane as never });
     const ids = await arrive(manager, 12);
     const l1s = strategy.all.filter((s) => s.level === 1);
@@ -839,11 +834,14 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     try { await manager.tick(); } catch { /* refused */ } finally { console.warn = warn; console.error = error; }
     assert.deepEqual(strategy.quarantinedGroups(), [middle], 'premise: the middle group is quarantined');
 
+    const before = strategy.queue.filter((m) => m.level === 2).length;
     strategy.produceMerge(2, ids[0]!, ids[ids.length - 1]!);
     const queued = strategy.queue.filter((m) => m.level === 2);
-    assert.equal(queued.length, 1, 'the produce op queues one merge');
-    assert.ok(queued[0]!.sourceIds.length >= 2, 'over a run on one side of the hole');
-    assert.ok(!queued[0]!.sourceIds.some((id) => middle.includes(id)), 'that takes no quarantined L1');
+    assert.equal(queued.length, before + 1, 'the produce op queues one merge');
+    for (const merge of queued) {
+      assert.ok(merge.sourceIds.length >= 2, 'each over a run on one side of the hole');
+      assert.ok(!merge.sourceIds.some((id) => middle.includes(id)), 'and none takes a quarantined L1');
+    }
     manager.close();
   });
 });

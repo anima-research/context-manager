@@ -202,7 +202,7 @@ test('a quarantined oldest group does not block later history from merging', () 
   p.setSummaries([...oldest, ...later]);
   p.seedQuarantine(oldest.map((s) => s.id));
   const run = p.pick([...oldest, ...later], 6);
-  assert.deepEqual(run?.map((s) => s.id), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5']);
+  assert.deepEqual(run?.map((s) => s.id), ['n0', 'n1', 'n2', 'n3', 'n4']);
 });
 
 test('operator merge holds split the frontier like a hole', () => {

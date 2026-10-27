@@ -34,6 +34,13 @@
  * Pure: takes and returns plain state; the caller writes it.
  */
 
+import { isDeepStrictEqual } from 'node:util';
+import { mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn, type LevelRuns, type Placed } from '../strategies/merge-runs.js';
+import {
+  loadedChunkRecords, releaseUnsummarizedRecords, settleRepairLine, settleStoredSummaries, settlingRepaired,
+} from '../strategies/settle-summaries.js';
+import type { LoadRepairDropReason } from '../types/strategy.js';
+
 export interface RepairSummary {
   id: string;
   level: number;
@@ -57,6 +64,49 @@ export interface RepairInputs {
   /** Store listing in store order (ids; timestamps only for a date cutoff). */
   messages: ReadonlyArray<{ id: string; timestamp?: number | string | Date }>;
   resolutions?: Record<string, number> | null;
+  /**
+   * The persisted merge queue (`autobio:mergeQueue`). The strategy loads its
+   * valid entries at open and runs them in turn as it ticks, so a queued
+   * entry's sources are in no run, and the summary it will write is work
+   * that fills its place (merge-runs.ts).
+   */
+  mergeQueue?: ReadonlyArray<{ level: number; sourceIds: string[] }> | null;
+  /**
+   * The persisted merge-quarantine records (`autobio:merge-quarantine`). A
+   * record holds its sources out of merges as the strategy's
+   * mergeRecordHolds says (merge-runs.ts mergeRecordHoldsIn). An entry the
+   * strategy's loader can't read (no string key, or sources that aren't a
+   * list of ids) holds nothing, as the loader leaves it out; so does a queue
+   * entry whose sources aren't a list of ids.
+   */
+  mergeQuarantine?: ReadonlyArray<{ key: string; level: number; sourceIds: string[]; lastOutcome?: string }> | null;
+  /**
+   * The ids of the chunk records an active compression quarantine record
+   * names (the strategy's compressionQuarantineHolds, over the ids of each
+   * record's messages that still stand in the store, as the strategy builds
+   * and hashes the chunk). The rebuild projects every other uncompressed record as an
+   * L1 to come, since a drain compresses it before it picks merges, unless an
+   * L1 already holds a message of it; a named one stands as the quarantine
+   * leaves it, with no L1 there.
+   */
+  compressionQuarantined?: readonly string[] | null;
+}
+/**
+ * The run rule's settings that a resident's config holds and its store
+ * doesn't, defaulted as the strategy defaults them for an adaptive resident.
+ */
+export interface RepairRunsConfig {
+  mergeThreshold: number;
+  mergeMaxSourceSpanMessages: number;
+  mergeHoldSummaryIds: string[];
+  /** Whether the merge check reads every level (speculative production) or L1 and L2 only. */
+  speculativeProduction: boolean;
+}
+export const DEFAULT_RUNS_CONFIG: RepairRunsConfig = { mergeThreshold: 6, mergeMaxSourceSpanMessages: 1500, mergeHoldSummaryIds: [], speculativeProduction: true };
+
+function runsConfigOf(runs: Partial<RepairRunsConfig> = {}): RepairRunsConfig {
+  const given = Object.fromEntries(Object.entries(runs).filter(([, value]) => value !== undefined));
+  return { ...DEFAULT_RUNS_CONFIG, ...given };
 }
 export interface RepairOptions {
   /**
@@ -80,17 +130,22 @@ export interface RepairOptions {
    * region, and their ancestors, back to unparented L1s (`dissolvedForRebuild`,
    * `exposedL1Leaves`); the merge ladder then re-folds the region bottom-up
    * with real summarizer calls — run `drain-autobiographical` on the stopped
-   * store before restarting, or the resident pays the token spike live.
+   * store before restarting, or the resident pays the token spike live. It
+   * also gives a partner to each summary the plan would leave alone at its
+   * level (`partnered`, `strandedLeft`), on a store with nothing crossed too.
    */
   mode?: 'lossless' | 'compact' | 'rebuild';
   /**
    * rebuild only: crossed summaries whose span starts at or after this
    * message (an id, or an ISO date resolved to the first message at or after
-   * it) are rebuilt; older ones get the compact treatment, so regions that
-   * were repaired by hand are not re-summarized.
+   * it) are rebuilt; older ones get the compact treatment, and no tower
+   * starting before it is dissolved to give a summary a partner, so regions
+   * that were repaired by hand are not re-summarized.
    */
   rebuildSince?: string;
   maxIterations?: number;
+  /** rebuild: the resident's run settings, for the stray rule (DEFAULT_RUNS_CONFIG where left out). */
+  runs?: Partial<RepairRunsConfig>;
 }
 export interface Crossed {
   id: string;
@@ -121,10 +176,66 @@ export interface RepairPlan {
   dissolvedForRebuild: Array<{ id: string; level: number; leaves: number }>;
   /** rebuild: leaves now exposed at L1 until the ladder re-folds them. */
   exposedL1Leaves: number;
+  /**
+   * rebuild: what the plan gave a partner, each a summary the store as the
+   * plan leaves it, once the ladder has re-folded it, would hold alone at its
+   * level by the strategy's run rule: one already stranded or a crossed
+   * summary's child (`stranded`), a run of the messages a crossed L1 releases
+   * (`released`, `id` the L1), which the chunker re-chunks where it stands,
+   * a chunk recorded and not yet compressed (`pending`, `id` its record), or
+   * a summary the re-fold makes (`refolded`, `id` its span), such as a
+   * dissolved tower's top made again. `dissolved` names the lowest summary of
+   * the tower dissolved for it.
+   */
+  partnered: Array<{ kind: 'stranded' | 'released' | 'pending' | 'refolded'; id: string; level: number; leaves: number; span: { first: string; last: string }; dissolved: string }>;
+  /**
+   * rebuild: what the plan leaves alone at its level, of the same kinds,
+   * each with why: it starts before `rebuildSince`; the only towers that
+   * could free a neighbour start before it; nothing of its level beside it
+   * can be freed to partner it (the store's edge, a message no summary
+   * covers, a lower-level summary, a summary with no stored parent, one whose
+   * parent isn't in the store, or one that stays held, too wide or queued
+   * once freed); the compact repair of crossed summaries before
+   * `rebuildSince`, which runs after the stray pass, left it alone (`left by
+   * the compact repair`); the run settings' mergeThreshold is below 2, where
+   * the ladder forms no merge it can write (#285), so freeing a neighbour
+   * would partner nothing; a side that would partner it has a tower
+   * holding a stale generation, an L1 no chunk record names over messages a
+   * record naming another L1 holds (`stale` names them); or it is a stale
+   * generation itself (`stale` names it).
+   */
+  strandedLeft: Array<{ kind: 'stranded' | 'released' | 'pending' | 'refolded'; id: string; level: number; leaves: number; span: { first: string; last: string }; reason: 'before rebuildSince' | 'neighbours before rebuildSince' | 'no neighbour to free' | 'left by the compact repair' | 'no merge forms below a threshold of 2' | 'a neighbour\'s tower holds a stale generation' | 'a stale generation'; stale?: string[] }>;
   /** rebuild with rebuildSince: where the cutoff landed and how the crossed set split. */
   rebuildSince?: { id: string; position: number; rebuilt: number; compacted: number };
   /** Crossed summaries the plan could not resolve (empty on success). */
   remaining: Crossed[];
+  /**
+   * What the loader's settling repaired in the stored state before the plan
+   * read it (settle-summaries.ts). The plan reads, and the apply writes, the
+   * store as the loader keeps it, so the apply stores these repairs, as the
+   * loader would at its next open. `line` is the loader's own line for them,
+   * absent when nothing was repaired; `dropped` is each summary dropped with
+   * text in it, with why; `storedIds` is every summary id the stored state
+   * held, dropped ones included, which the summary-id counter must stay past
+   * (summaryIdCounterPast); `releasedRecords` counts the compressed chunk
+   * records made compressible again, since the L1 they named was dropped.
+   */
+  settled: {
+    line?: string;
+    dropped: Array<{ id: string; level: number | null; tokens: number | null; reason: LoadRepairDropReason }>;
+    storedIds: string[];
+    /** Chunk records the loader leaves out: no id, or no list of message ids. */
+    filteredRecords: number;
+    releasedRecords: number;
+  };
+  /**
+   * What settling the plan's own store once more changed (`line` as the
+   * loader logs it; chunk records the loader would leave out or release):
+   * nothing, unless the planner wrote something the loader repairs, a
+   * planner fault the script prints.
+   */
+  resettled: { line?: string; filteredRecords: number; releasedRecords: number };
+  /** The store the apply writes: the plan's, as the loader keeps it (resettled), one summary per id, with its chunk records and resolutions. */
   result: { summaries: RepairSummary[]; records: RepairRecord[]; resolutions: Record<string, number> };
 }
 
@@ -141,6 +252,88 @@ const setParent = (s: RepairSummary, id: string | undefined): void => {
   if (id === undefined) { delete s.mergedInto; delete s.parentId; return; }
   if ('parentId' in s && s.mergedInto === undefined) s.parentId = id; else s.mergedInto = id;
 };
+
+export function listedPositions(inputs: Pick<RepairInputs, 'messages'>): Map<string, number> {
+  return new Map(inputs.messages.map((m, i) => [String(m.id), i] as const));
+}
+
+type Projected = RepairSummary & { projected?: true };
+
+const isIdList = (ids: unknown): ids is string[] => Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id.length > 0);
+
+function leafIds(byId: ReadonlyMap<string, RepairSummary>, s: RepairSummary, trail = new Set<string>()): string[] {
+  if ((s.level ?? 1) <= 1) return [...(s.sourceIds ?? [])];
+  if (trail.has(s.id)) return [];
+  trail.add(s.id);
+  const out: string[] = [];
+  for (const id of s.sourceIds ?? []) { const c = byId.get(id); if (c) for (const leaf of leafIds(byId, c, trail)) out.push(leaf); }
+  return out;
+}
+
+function firstListed(position: ReadonlyMap<string, number>, ids: readonly string[]): string | undefined {
+  let best: string | undefined;
+  for (const id of ids) { const at = position.get(id); if (at !== undefined && (best === undefined || at < position.get(best)!)) best = id; }
+  return best;
+}
+
+export function strandedInSummaries<S extends RepairSummary>(
+  summaries: readonly S[],
+  inputs: Pick<RepairInputs, 'mergeQueue' | 'mergeQuarantine'>,
+  position: ReadonlyMap<string, number>,
+  config: RepairRunsConfig,
+  queue: 'stored' | 'drained' = 'stored',
+  planning = false,
+): Placed<S>[] {
+  return [...runsInSummaries(summaries, inputs, position, config, queue, planning).values()].flatMap(({ runs }) => strandedIn(runs));
+}
+
+function runsInSummaries<S extends RepairSummary>(
+  summaries: readonly S[],
+  inputs: Pick<RepairInputs, 'mergeQueue' | 'mergeQuarantine'>,
+  position: ReadonlyMap<string, number>,
+  config: RepairRunsConfig,
+  queue: 'stored' | 'drained',
+  planning = false,
+): Map<number, LevelRuns<S>> {
+  const byId = new Map(summaries.map((s) => [s.id, s] as const));
+  const held = heldIn(byId, inputs, position, config);
+  const queued = new Set<string>();
+  if (queue === 'stored') {
+    for (const m of inputs.mergeQueue ?? []) {
+      if (m != null && isIdList(m.sourceIds) && queuedMergeRuns<S>(m, byId, (s) => parentOf(s), position, held)) for (const id of m.sourceIds) queued.add(id);
+    }
+  }
+  let top = 2;
+  if (config.speculativeProduction) for (const s of summaries) top = Math.max(top, s.level ?? 1);
+  return mergeRunsByLevel<S>({
+    summaries, parentOf: (s: S) => parentOf(s), queued, position, held, pending: [],
+    spanBase: config.mergeMaxSourceSpanMessages, mergeK: config.mergeThreshold, planning,
+  }, top);
+}
+
+function heldIn<S extends RepairSummary>(
+  byId: ReadonlyMap<string, S>,
+  inputs: Pick<RepairInputs, 'mergeQuarantine'>,
+  position: ReadonlyMap<string, number>,
+  config: RepairRunsConfig,
+): Set<string> {
+  const held = new Set(config.mergeHoldSummaryIds);
+  const byKey = new Map<string, NonNullable<RepairInputs['mergeQuarantine']>[number]>();
+  for (const record of inputs.mergeQuarantine ?? []) {
+    if (record == null || typeof record.key !== 'string' || !isIdList(record.sourceIds)) continue;
+    byKey.set(record.key, record);
+  }
+  for (const record of byKey.values()) {
+    if (mergeRecordHoldsIn(record, (id) => byId.get(id), parentOf, position)) for (const id of record.sourceIds) held.add(id);
+  }
+  return held;
+}
+
+export function strandedInStore(inputs: RepairInputs, runs: Partial<RepairRunsConfig> = {}): Array<{ id: string; level: number }> {
+  const summaries = settleStoredSummaries<RepairSummary>(inputs.summaries, loadedChunkRecords<RepairRecord>(inputs.records)).summaries;
+  return strandedInSummaries(summaries, inputs, listedPositions(inputs), runsConfigOf(runs))
+    .map(({ s }) => ({ id: s.id, level: s.level ?? 1 }));
+}
 
 function view(summaries: RepairSummary[], records: RepairRecord[], storeOrder: Map<string, number>): View {
   const byId = new Map(summaries.map((s) => [s.id, s] as const));
@@ -198,17 +391,50 @@ function runsOf(ps: number[]): number[][] {
   return runs;
 }
 
+export function loadedAsWritten(
+  written: { summaries: readonly unknown[]; records: readonly unknown[] },
+  loaded: { summaries: unknown; records: unknown },
+): { summariesChanged: boolean; recordsChanged: boolean; appendedRecords: number } {
+  const plain = (x: unknown): unknown => (x === undefined ? null : JSON.parse(JSON.stringify(x)));
+  const records = Array.isArray(loaded.records) ? loaded.records : [];
+  const head = records.slice(0, written.records.length);
+  const recordsChanged = records.length < written.records.length || !isDeepStrictEqual(plain(head), plain(written.records));
+  return {
+    summariesChanged: !isDeepStrictEqual(plain(loaded.summaries), plain(written.summaries)),
+    recordsChanged,
+    appendedRecords: recordsChanged ? 0 : records.length - written.records.length,
+  };
+}
+
 export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions = {}): RepairPlan {
-  const summaries: RepairSummary[] = structuredClone(inputs.summaries);
-  let records: RepairRecord[] = structuredClone(inputs.records);
+  if (options.mode === 'rebuild' && options.releaseHead) {
+    throw new Error('releaseHead with mode rebuild: release the head in a pass of its own (lossless or compact), then rebuild');
+  }
+  const loaded = loadedChunkRecords<RepairRecord>(structuredClone(inputs.records));
+  const settled = settleStoredSummaries<RepairSummary>(structuredClone(inputs.summaries), loaded);
+  const summaries: RepairSummary[] = settled.summaries;
+  const releasedRecords = releaseUnsummarizedRecords(loaded, summaries);
+  let records: RepairRecord[] = releasedRecords.records;
   const resolutions: Record<string, number> = { ...(inputs.resolutions ?? {}) };
   const storeOrder = new Map(inputs.messages.map((m, i) => [String(m.id), i] as const));
   const plan: RepairPlan = {
     iterations: 0, before: [], adopted: [], detached: [], rehomed: [], splitL1: [], dissolved: [], released: [], rangeChanges: [],
     resolutionsClamped: 0, resolutionsCleared: 0, proseGapLeaves: 0, depthLostLeaves: 0, dissolvedForRebuild: [], exposedL1Leaves: 0,
-    remaining: [], result: { summaries, records, resolutions },
+    partnered: [], strandedLeft: [], remaining: [], resettled: { filteredRecords: 0, releasedRecords: 0 }, result: { summaries, records, resolutions },
+    settled: {
+      ...(settlingRepaired(settled) ? { line: settleRepairLine(settled) } : {}),
+      dropped: settled.storedIds.flatMap((id) => {
+        const drop = settled.textDrops.get(id);
+        if (!drop) return [];
+        const num = (value: unknown): number | null => (typeof value === 'number' ? value : null);
+        return [{ id, level: num(drop.summary.level), tokens: num(drop.summary.tokens), reason: drop.reason }];
+      }),
+      storedIds: settled.storedIds,
+      filteredRecords: inputs.records.length - loaded.length,
+      releasedRecords: releasedRecords.released,
+    },
   };
-  const depthBefore = leafDepths(view(inputs.summaries as RepairSummary[], inputs.records as RepairRecord[], storeOrder));
+  const depthBefore = leafDepths(view(summaries, records, storeOrder));
   const originalRange = new Map(summaries.map((s) => [s.id, { ...s.sourceRange }] as const));
   const touched = new Set<string>();
   const detachedIds = new Set<string>();
@@ -262,6 +488,8 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     touched.add(parent.id);
   };
 
+  const handled = new Set<string>();
+  let finalStrays: (() => void) | undefined;
   if (rebuild) {
     // Dissolve each crossed summary (level ≥ 2) and its ancestors, so its
     // children and the owners of its holes become roots. A child run that is
@@ -272,52 +500,251 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     // ladder re-folds the affected regions bottom-up with real summaries.
     // Crossed L1s are handled by the ordinary split below.
     v = view(summaries, records, storeOrder);
-    let crossed = crossedOf(v, alive()).filter((c) => c.level >= 2);
+    const allCrossed = crossedOf(v, alive());
+    let crossed = allCrossed.filter((c) => c.level >= 2);
+    const startsAfter = (first: string): boolean => cutoffStorePos === undefined || (storeOrder.get(first) ?? -1) >= cutoffStorePos;
     if (cutoffStorePos !== undefined) {
-      const startsAfter = (c: Crossed): boolean => (storeOrder.get(c.span.first) ?? -1) >= cutoffStorePos!;
-      const rebuilt = crossed.filter(startsAfter);
+      const rebuilt = crossed.filter((c) => startsAfter(c.span.first));
       plan.rebuildSince = { id: String(inputs.messages[cutoffStorePos].id), position: cutoffStorePos, rebuilt: rebuilt.length, compacted: crossed.length - rebuilt.length };
       crossed = rebuilt;
     }
-    if (crossed.length > 0) {
-      plan.iterations = 1;
-      const dissolve = new Set<string>();
-      const closeUp = (id: string): void => {
-        let cur = v.byId.get(id);
-        const trail = new Set<string>();
-        while (cur && !trail.has(cur.id)) { trail.add(cur.id); const p = parentOf(cur); if (!p || !v.byId.has(p)) break; dissolve.add(p); cur = v.byId.get(p); }
+    const dissolve = new Set<string>();
+    const closeUp = (id: string): void => {
+      let cur = v.byId.get(id);
+      const trail = new Set<string>();
+      while (cur && !trail.has(cur.id)) { trail.add(cur.id); const p = parentOf(cur); if (!p || !v.byId.has(p)) break; dissolve.add(p); cur = v.byId.get(p); }
+    };
+    for (const c of crossed) { dissolve.add(c.id); closeUp(c.id); }
+
+    const kept = new Map<string, string[]>();
+    const released: Array<RepairSummary & { releasedFrom: string }> = [];
+    for (const c of allCrossed.filter((x) => x.level === 1)) {
+      const s = v.byId.get(c.id)!;
+      const [keep, ...rest] = runsOf(positions(v, s)).sort((a, b) => b.length - a.length || a[0] - b[0]);
+      kept.set(s.id, keep.map((p) => v.byPosition[p]));
+      rest.forEach((r, i) => {
+        const ids = r.map((p) => v.byPosition[p]);
+        released.push({ id: `${s.id}#released-${i}`, level: 1, sourceIds: ids, sourceRange: { first: ids[0], last: ids[ids.length - 1] }, releasedFrom: s.id });
+      });
+    }
+
+    const quarantined = new Set(inputs.compressionQuarantined ?? []);
+    const pending = (): Array<RepairSummary & { pendingFrom: string }> => {
+      const underL1 = new Set<string>();
+      for (const s of alive()) if (s.level === 1 && isIdList(s.sourceIds)) for (const id of s.sourceIds) underL1.add(id);
+      const out: Array<RepairSummary & { pendingFrom: string }> = [];
+      for (const r of records) {
+        if (r.compressed || quarantined.has(r.id) || !isIdList(r.sourceIds)) continue;
+        const ids = r.sourceIds.filter((id) => storeOrder.has(id));
+        if (ids.length === 0 || ids.some((id) => underL1.has(id))) continue;
+        for (const id of ids) underL1.add(id);
+        out.push({ id: `${r.id}#pending`, level: 1, sourceIds: ids, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! }, pendingFrom: r.id });
+      }
+      return out;
+    };
+
+    const planned = (): RepairSummary[] => {
+      const out: RepairSummary[] = [];
+      for (const s of alive()) {
+        if (dissolve.has(s.id)) continue;
+        const parent = parentOf(s);
+        const keep = kept.get(s.id);
+        if ((parent === undefined || !dissolve.has(parent)) && !keep) { out.push(s); continue; }
+        const copy: RepairSummary = { ...s, ...(keep ? { sourceIds: keep, sourceRange: { first: keep[0], last: keep[keep.length - 1] } } : {}) };
+        if (parent !== undefined && dissolve.has(parent)) { delete copy.mergedInto; delete copy.parentId; }
+        out.push(copy);
+      }
+      return [...out, ...released, ...pending()];
+    };
+    const runsConfig = runsConfigOf(options.runs);
+    const position = listedPositions(inputs);
+    const messageAt = (at: number): string => String(inputs.messages[at]?.id);
+    const refolded = (state: RepairSummary[]): Projected[] => {
+      const out: Projected[] = state.map((s) => ({ ...s }));
+      const byId = new Map(out.map((s) => [s.id, s] as const));
+      let made = 0;
+      const land = (level: number, group: readonly Projected[]): void => {
+        const spans = group.map((s) => placeOf(s, position)!);
+        const parent: Projected = {
+          id: `#refold-${made++}`, level, sourceIds: group.map((s) => s.id), projected: true,
+          sourceRange: { first: messageAt(Math.min(...spans.map((x) => x[0]))), last: messageAt(Math.max(...spans.map((x) => x[1]))) },
+        };
+        out.push(parent);
+        byId.set(parent.id, parent);
+        for (const s of group) byId.get(s.id)!.mergedInto = parent.id;
       };
-      for (const c of crossed) { dissolve.add(c.id); closeUp(c.id); }
-      // Partners: for each crossed summary's child runs, ensure a neighbour.
-      const owners = ownerAtLevel();
-      const willBeRoot = (id: string): boolean => {
-        const s = v.byId.get(id);
-        if (!s) return false;
-        const p = parentOf(s);
-        return p === undefined || dissolve.has(p);
-      };
-      for (const c of crossed) {
-        const s = v.byId.get(c.id)!;
-        const childLevel = s.level - 1;
-        const spans = s.sourceIds.map((childId) => { const ch = v.byId.get(childId); const ps = ch ? positions(v, ch) : []; return { childId, min: ps[0], max: ps[ps.length - 1], count: ps.length }; })
-          .filter((x) => x.count > 0).sort((a, b) => a.min - b.min);
-        const runs: Array<typeof spans> = [];
-        let run: typeof spans = []; let end = -Infinity;
-        for (const x of spans) { if (run.length && x.min !== end + 1) { runs.push(run); run = []; } run.push(x); end = Math.max(end, x.max); }
-        if (run.length) runs.push(run);
-        const atLevel = owners.get(childLevel) ?? new Map<number, string>();
-        for (const r of runs) {
-          if (r.length >= 2) continue; // merges by itself once its parent is gone
-          const lo = r[0].min - 1, hi = r[r.length - 1].max + 1;
-          const sides = [lo, hi].map((p) => atLevel.get(p)).filter((id): id is string => id !== undefined && id !== s.id);
-          if (sides.some((id) => willBeRoot(id))) continue; // an unparented neighbour (or a sibling child of S) is a partner
-          if (sides.length === 0) continue; // store edge or unowned: nothing to fold with; stays a root
-          // Free the smaller neighbour by dissolving its parent chain.
-          const pick = sides.map((id) => ({ id, leaves: positions(v, v.byId.get(id)!).length })).sort((a, b) => a.leaves - b.leaves)[0].id;
-          const parent = parentOf(v.byId.get(pick)!);
-          if (parent && v.byId.has(parent)) { dissolve.add(parent); closeUp(parent); }
+      const held = heldIn(byId, inputs, position, runsConfig);
+      for (const m of inputs.mergeQueue ?? []) {
+        if (m != null && isIdList(m.sourceIds) && queuedMergeRuns(m, byId, parentOf, position, held)) {
+          land(m.level, m.sourceIds.map((id) => byId.get(id)!));
         }
       }
+      if (!(runsConfig.mergeThreshold >= 2)) return out;
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const [level, { runs }] of runsInSummaries(out, inputs, position, runsConfig, 'drained', true)) {
+          for (const run of runs) {
+            for (const group of runGroups(run, runsConfig.mergeThreshold)) {
+              land(level + 1, group);
+              grew = true;
+            }
+          }
+          if (grew) break;
+        }
+      }
+      return out;
+    };
+    interface Projection { state: Projected[]; byId: Map<string, Projected>; l1At: Map<string, Projected> }
+    const project = (): Projection => {
+      const state = refolded(planned());
+      const byId = new Map(state.map((s) => [s.id, s] as const));
+      const l1At = new Map<string, Projected>();
+      for (const s of state) if ((s.level ?? 1) === 1) for (const id of s.sourceIds) if (!l1At.has(id)) l1At.set(id, s);
+      return { state, byId, l1At };
+    };
+    const ownerAt = ({ byId, l1At }: Projection, level: number, at: number): Projected | undefined => {
+      const id = inputs.messages[at]?.id;
+      let cur = id === undefined ? undefined : l1At.get(String(id));
+      const trail = new Set<string>();
+      while (cur && (cur.level ?? 1) < level && !trail.has(cur.id)) { trail.add(cur.id); const p = parentOf(cur); cur = p ? byId.get(p) : undefined; }
+      return cur && (cur.level ?? 1) === level ? cur : undefined;
+    };
+    const strayKey = (x: Placed<Projected>): string => `${x.s.level ?? 1}:${x.first}:${x.last}`;
+    const straysOf = (state: Projected[]): Placed<Projected>[] => strandedInSummaries(state, inputs, position, runsConfig, 'drained', true);
+    const staleL1 = new Set<string>();
+    {
+      const named = new Set<string>();
+      const heldBy = new Map<string, string>();
+      for (const r of records) {
+        if (!r.compressed || !r.summaryId || !isIdList(r.sourceIds)) continue;
+        named.add(r.summaryId);
+        for (const id of r.sourceIds) heldBy.set(id, r.summaryId);
+      }
+      for (const s of alive()) {
+        if (s.level !== 1 || named.has(s.id) || !isIdList(s.sourceIds)) continue;
+        if (s.sourceIds.some((id) => { const by = heldBy.get(id); return by !== undefined && by !== s.id; })) staleL1.add(s.id);
+      }
+    }
+    const partner = (now: Projection, stray: Placed<Projected>): string | 'no neighbour to free' | 'neighbours before rebuildSince' | { stale: string[] } => {
+      const level = stray.s.level ?? 1;
+      const sides: Array<{ chain: string[]; leaves: number; cut: boolean }> = [];
+      const staleSides: Array<{ chain: string[]; stale: string[] }> = [];
+      for (const at of [stray.first - 1, stray.last + 1]) {
+        const n = ownerAt(now, level, at);
+        const chain: string[] = [];
+        let cur = n ? now.byId.get(parentOf(n) ?? '') : undefined;
+        const trail = new Set<string>();
+        while (cur && !cur.projected && !trail.has(cur.id)) { trail.add(cur.id); chain.push(cur.id); cur = now.byId.get(parentOf(cur) ?? ''); }
+        if (chain.length === 0) continue;
+        const stale: string[] = [];
+        const seen = new Set<string>();
+        const under = (id: string): void => {
+          const s = now.byId.get(id);
+          if (!s || seen.has(id)) return;
+          seen.add(id);
+          if (staleL1.has(id)) stale.push(id);
+          for (const c of s.sourceIds ?? []) under(c);
+        };
+        under(chain[chain.length - 1]!);
+        if (stale.length > 0) { staleSides.push({ chain, stale }); continue; }
+        const leaves = leafIds(now.byId, now.byId.get(chain[chain.length - 1])!);
+        sides.push({ chain, leaves: leaves.length, cut: !startsAfter(firstListed(position, leaves) ?? '') });
+      }
+      const ownSet = new Set(leafIds(now.byId, stray.s).map((id) => position.get(id)).filter((p): p is number => p !== undefined));
+      const own = [...ownSet];
+      const ownLo = own.reduce((lo, p) => Math.min(lo, p), Infinity);
+      const ownHi = own.reduce((hi, p) => Math.max(hi, p), -Infinity);
+      const partners = (chain: readonly string[]): boolean => {
+        const added = chain.filter((id) => !dissolve.has(id));
+        for (const id of added) dissolve.add(id);
+        const state = refolded(planned());
+        const byId = new Map(state.map((s) => [s.id, s] as const));
+        const covered = new Set<number>();
+        for (const s of state) {
+          if ((s.level ?? 1) <= level) continue;
+          const at = placeOf(s, position);
+          if (at && (at[1] < ownLo || at[0] > ownHi)) continue;
+          for (const leaf of leafIds(byId, s)) {
+            const p = position.get(leaf);
+            if (p !== undefined && ownSet.has(p)) covered.add(p);
+          }
+        }
+        let ok = own.length > 0 && own.every((p) => covered.has(p));
+        if (!ok) {
+          const runs = runsInSummaries(state, inputs, position, runsConfig, 'drained', true).get(level)?.runs ?? [];
+          const run = runs.find((r) => r.members.some((m) => m.first === stray.first && m.last === stray.last));
+          ok = run !== undefined && run.members.length >= 2;
+        }
+        if (ok) ok = !straysOf(state).some((x) => strayKey(x) === strayKey(stray));
+        for (const id of added) dissolve.delete(id);
+        return ok;
+      };
+      sides.sort((a, b) => a.leaves - b.leaves || a.chain.length - b.chain.length);
+      const taken = sides.find((side) => !side.cut && partners(side.chain));
+      if (!taken) {
+        if (sides.some((side) => side.cut && partners(side.chain))) return 'neighbours before rebuildSince';
+        const blocked = staleSides.filter((side) => partners(side.chain));
+        return blocked.length > 0 ? { stale: [...new Set(blocked.flatMap((side) => side.stale))] } : 'no neighbour to free';
+      }
+      for (const id of taken.chain) { dissolve.add(id); closeUp(id); }
+      return taken.chain[0]!;
+    };
+    const entryOf = ({ byId }: Projection, x: Placed<Projected>) => {
+      const s = x.s as Projected & { releasedFrom?: string; pendingFrom?: string };
+      const span = { first: messageAt(x.first), last: messageAt(x.last) };
+      const kind = s.projected ? 'refolded' as const : s.releasedFrom ? 'released' as const : s.pendingFrom ? 'pending' as const : 'stranded' as const;
+      const leaves = s.releasedFrom || s.pendingFrom ? s.sourceIds.length : leafIds(byId, s).length;
+      return { kind, id: kind === 'refolded' ? `${span.first}..${span.last}` : s.releasedFrom ?? s.pendingFrom ?? s.id, level: s.level ?? 1, leaves, span };
+    };
+    const leftKeys = new Map<(typeof plan.strandedLeft)[number], string>();
+    for (let now = project(), more = true; more;) {
+      more = false;
+      for (const x of straysOf(now.state)) {
+        if (handled.has(strayKey(x))) continue;
+        handled.add(strayKey(x));
+        const entry = entryOf(now, x);
+        const left = (reason: (typeof plan.strandedLeft)[number]['reason']): void => {
+          const listed = { ...entry, reason };
+          plan.strandedLeft.push(listed);
+          leftKeys.set(listed, strayKey(x));
+        };
+        if (!startsAfter(entry.span.first)) { left('before rebuildSince'); continue; }
+        if (!(runsConfig.mergeThreshold >= 2)) { left('no merge forms below a threshold of 2'); continue; }
+        if (staleL1.has(x.s.id)) {
+          const listed = { ...entry, reason: 'a stale generation' as const, stale: [x.s.id] };
+          plan.strandedLeft.push(listed);
+          leftKeys.set(listed, strayKey(x));
+          continue;
+        }
+        const freed = partner(now, x);
+        if (typeof freed === 'object') {
+          const listed = { ...entry, reason: 'a neighbour\'s tower holds a stale generation' as const, stale: freed.stale };
+          plan.strandedLeft.push(listed);
+          leftKeys.set(listed, strayKey(x));
+          continue;
+        }
+        if (freed === 'no neighbour to free' || freed === 'neighbours before rebuildSince') { left(freed); continue; }
+        const taken = { ...entry, dissolved: freed };
+        plan.partnered.push(taken);
+        now = project();
+        more = true;
+        break;
+      }
+    }
+    finalStrays = () => {
+      const now = project();
+      const strays = straysOf(now.state);
+      const current = new Set(strays.map(strayKey));
+      plan.strandedLeft = plan.strandedLeft.filter((listed) => current.has(leftKeys.get(listed)!));
+      const listed = new Set(plan.strandedLeft.map((x) => leftKeys.get(x)!));
+      for (const x of strays) {
+        if (listed.has(strayKey(x))) continue;
+        const entry = entryOf(now, x);
+        plan.strandedLeft.push({ ...entry, reason: startsAfter(entry.span.first) ? 'left by the compact repair' : 'before rebuildSince' });
+      }
+    };
+    if (dissolve.size > 0) {
+      plan.iterations = 1;
       for (const id of dissolve) {
         const s = v.byId.get(id);
         if (!s) continue;
@@ -606,8 +1033,18 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
   const depthAfter = leafDepths(v);
   for (const [leaf, d] of depthBefore) { const a = depthAfter.get(leaf) ?? 0; if (a < d) plan.depthLostLeaves++; }
   plan.proseGapLeaves = plan.adopted.reduce((n, a) => n + a.leaves, 0) + plan.rehomed.reduce((n, r) => n + r.leaves, 0);
-  plan.remaining = crossedOf(v, alive());
-  plan.result = { summaries, records, resolutions };
+  finalStrays?.();
+  const keptRecords = loadedChunkRecords<RepairRecord>(structuredClone(records));
+  const again = settleStoredSummaries<RepairSummary>(structuredClone(summaries), keptRecords);
+  const againRecords = releaseUnsummarizedRecords(keptRecords, again.summaries);
+  const written = view(again.summaries, againRecords.records, storeOrder);
+  plan.remaining = crossedOf(written, again.summaries);
+  plan.resettled = {
+    ...(settlingRepaired(again) ? { line: settleRepairLine(again) } : {}),
+    filteredRecords: records.length - keptRecords.length,
+    releasedRecords: againRecords.released,
+  };
+  plan.result = { summaries: again.summaries, records: againRecords.records, resolutions };
   return plan;
 }
 

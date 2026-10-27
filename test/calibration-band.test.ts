@@ -14,7 +14,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
-import { assertStage } from './fixtures/over-budget-hook.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'calibration-band-'));
@@ -740,11 +739,7 @@ describe('estimator calibration band', () => {
     control.cm.close();
     const controlReopened = await openSharded('picker-control', false);
     assert.equal(controlReopened.cm.previewContext(tight)!.fits, false);
-    await assert.rejects(controlReopened.cm.compile(tight), (err: unknown) => {
-      assert.match(String((err as Error).message), /Adaptive picker exhausted/);
-      assertStage(err, 'picker-exhausted');
-      return true;
-    });
+    await assert.rejects(controlReopened.cm.compile(tight), /Adaptive picker exhausted/);
     controlReopened.cm.close();
 
     const first = await openSharded('picker', true);

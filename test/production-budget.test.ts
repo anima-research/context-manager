@@ -241,6 +241,42 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     manager.close();
   });
 
+  it('a target whose exhausted plan is within the line its compile refuses above is not called unreachable', async () => {
+    const grace = 0.02;
+    const planAt = async (target: number): Promise<string[]> => {
+      cleanup();
+      warnings = [];
+      const strategy = makeStrategy({
+        recentWindowTokens: 100_000,
+        productionBudgetTokens: target,
+        overBudgetGraceRatio: grace,
+      });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      addConversation(manager, 10);
+      await manager.compile({ maxTokens: 50_000, reserveForResponse: 200 });
+      manager.close();
+      return warnings.filter((w) => w.includes('production target'));
+    };
+    const tiny = await planAt(100);
+    const plan = Number(/plan for it is (\d+) tokens/.exec(tiny.join(' '))?.[1]);
+    assert.ok(plan > 100, `expected the plan's size in ${JSON.stringify(tiny)}`);
+    let target = Math.ceil(plan / (1 + grace));
+    while (Math.floor((target - 1) * (1 + grace)) >= plan) target--;
+    while (Math.floor(target * (1 + grace)) < plan) target++;
+    assert.equal(Math.floor(target * (1 + grace)), plan, `no target has its line at ${plan}`);
+    assert.ok(target < plan);
+
+    const onLine = await planAt(target);
+    assert.equal(onLine.length, 1, `expected one line, got: ${JSON.stringify(onLine)}`);
+    assert.ok(!onLine[0]!.includes('unreachable'), onLine[0]);
+    assert.ok(onLine[0]!.includes(`plan for it is ${plan} tokens`), onLine[0]);
+    assert.ok(onLine[0]!.includes(`within the ${plan} tokens`), onLine[0]);
+
+    const overLine = await planAt(target - 1);
+    assert.equal(overLine.length, 1, `expected one line, got: ${JSON.stringify(overLine)}`);
+    assert.ok(overLine[0]!.includes('unreachable'), overLine[0]);
+  });
+
   it('speculative demand does not punch through the L1 holdback window', async () => {
     const strategy = makeStrategy({ recentWindowTokens: 5, targetChunkTokens: 20 });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });

@@ -12,6 +12,275 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.23.0 — 2026-10-26
+
+### Breaking
+
+- **Callers that construct a `Membrane` and pass it to context-manager:**
+  context-manager now depends on `@animalabs/membrane` `^0.8.0` (was
+  `^0.7.1`). If your own membrane stays on 0.7, npm installs a second copy
+  for context-manager, and TypeScript refuses your `Membrane` where
+  context-manager takes one ("Property 'abortOutcome' is missing …",
+  TS2741). JavaScript isn't refused, but every call context-manager makes
+  then hands context-manager's own membrane 0.8 formatter to your 0.7
+  `Membrane`, a mix this release's tests don't cover.
+  - **Migration:** take `@animalabs/membrane` `^0.8.0` alongside this
+    release, so context-manager shares your copy. agent-framework passes
+    its own `Membrane` to context-manager, so a host using agent-framework
+    takes this release together with an agent-framework that depends on
+    membrane `^0.8.0`.
+  - **Unchanged:** context-manager's own code. This change moves only its
+    membrane range.
+
+### Added
+
+- `getStrandedSummaries()` lists the summaries no merge can take as the store
+  stands: each summary left alone at its level, in a run of one that is
+  neither the newest nor waiting, with its level, its tokens and the holes of
+  its level or below beside it (a quarantined chunk or merge, by its record's
+  key, or an operator hold), and their tokens together. A stray beside a hole
+  may merge once the hole fills, with what lands there. It reads the newest
+  run as the merge check
+  does, so a summary alone in the last run of its level isn't listed until
+  something of its level lands past it. Its cost grows with the store, since
+  it places every message, so it suits an audit rather than every request,
+  and `getCompressionDebt()`, which a host reads on every provider call,
+  doesn't call it. When it can't read what it needs, it
+  returns no list and says why. `audit-topology` prints each stray with what
+  heals it (#334).
+- `repair-topology --mode rebuild` gives a partner, where it can free one, to
+  each summary the store would leave alone at its level once re-folded: a
+  crossed summary's child, the messages it releases from a crossed L1 (which
+  the chunker re-chunks where they stand), a summary already stranded, and a
+  summary the re-fold would make alone, such as a dissolved tower's top. It
+  dissolves the tower over one neighbour of that level, the side whose tower
+  holds fewer leaves, passing over a side whose neighbour would still be held,
+  too wide or queued, or whose tower holds a stale generation (an L1 no
+  chunk record names, over messages another L1's record holds), which stays
+  where it is and is named where that side would partner the stray; a
+  stray that is itself a stale generation gets no partner. It does this on a store with nothing crossed too, so a
+  rebuild heals the strays it can. It projects the re-fold as a drain lands
+  it, queued merges first and then the lowest level first, and reads a run
+  with a summary of a higher level after it as one that can't grow, since
+  what the live end makes forms past that summary. It plans over the summaries as
+  the strategy's loader keeps them, and `--apply` writes that store with
+  the plan's changes; the open that verifies it fails the script (exit 2)
+  if it changes or drops anything written, and counts the chunk records it
+  appends. The
+  rule reads the resident's settings,
+  which the store doesn't hold, so the script takes them as flags
+  (`--merge-threshold`, `--merge-max-span` and `--merge-hold`, each also as
+  `--flag=value`, and `--no-speculative-production`) and prints the values it
+  used; `audit-topology` takes the same flags for its stray list. The plan
+  lists each partner as `partner …`, and each summary it can't partner as
+  `STILL STRANDED …` with why. With `--rebuild-since`, no tower that starts
+  before the cutoff is dissolved to give a summary a partner.
+- `drain-autobiographical` lands the store as the rebuild's plan projected
+  it. It picks merges bottom up: none while a chunk or a merge is queued,
+  then the lowest level's group, so a group beside a released chunk's
+  summary or a lower merge's is picked once that summary has landed. And it
+  reads runs as the planner does, so a run with a summary of a higher level
+  after it merges as one that can't grow. Its start line prints the run
+  settings its strategy merges by (`runs`), the holdback among them, and
+  each line says whether merge picks wait for queued work
+  (`mergesUnpicked`); it finishes only once none do. Its finish line says
+  why it stopped (`stopped`: drained, max-steps, tick-error or
+  debt-unreadable), and run again with the same flags it goes on from the
+  store as it stands; a resident restarted on a store it leaves unfinished
+  finishes by its own rules and can leave strays the audit lists;
+  its usage names `--recipe`, `--tools-log` and `--clear-merge-quarantine`.
+  A strategy subclass can
+  merge the same way by overriding the protected `landsAsPlanned()`.
+
+### Fixed
+
+- A run of summaries that can't grow, cut off from the newest end of its
+  level by a hole such as a chunk the summarizer refused, a quarantined merge
+  or an operator hold, now merges in groups that leave no summary of it alone
+  (#334). Seven at the default `mergeThreshold` of 6 merge as four and three.
+  The first six used to merge and leave the seventh alone at its level for
+  good, which could strand a summary above it too. Such a run also merges at
+  two whatever else is unmerged at its level. It used to wait until
+  `mergeThreshold` summaries were unmerged anywhere at the level, which above
+  L2 could take a long time. As before, a run is cut off when another run of
+  its level comes after it, or a held summary of its level ends after it.
+- The newest run of a level, and a run waiting for a retried chunk or merge to
+  fill the hole after it, now take one fewer than `mergeThreshold` where
+  taking `mergeThreshold` would leave a single summary behind (seven at 6
+  merge five and leave two to grow), and merge whole where one fewer would be
+  a group of one (three at a threshold of 2). So a run read as one that grows
+  that then doesn't, such as the newest run of a level with a summary of a
+  higher level after it, leaves none or two or more of it, never one alone.
+- A picker's request for a merge at L2 and up (`enqueueMergeForRange`, which
+  subclasses can call) now queues the largest of the merge check's groups,
+  the shorter rest of a run that grows counted as one, that holds a summary
+  reaching into the requested range, and the group can reach past the range.
+  So a request naming one summary's own range, as `flat-profile` and
+  `oldest-first` make, queues the group that holds it (#338). It used to take
+  only the summaries reaching into the range, then the first `mergeThreshold`
+  of their longest run: one summary's range queued nothing, and a range over
+  part of a run could leave a remainder alone.
+- The L1 holdback (`l1HoldbackChunks`) now keeps back the chunks whose
+  messages come last in the store, not the last chunk records. A chunk cut
+  later over messages a rebuild released is a late record among older
+  messages: it was held back as the newest, and with no new message, as in a
+  drain, it never compressed.
+- `getCompressionDebt()`'s `pendingChunks` left out the last chunk record,
+  whatever `l1HoldbackChunks` was. With a holdback of 2 or more, each chunk
+  kept back beyond the first counted as pending, and aged the report
+  towards "degraded" while it waited for a newer chunk to close; at 0, the
+  newest closed chunk, queued at close, didn't count while it waited; and a
+  kept-back chunk a fold demanded, queued all the same, didn't count. It now
+  leaves out the chunks the holdback keeps back, by the same ranking, unless
+  a fold demanded one: those residents report fewer pending chunks at a
+  holdback of 2 or more and one more at 0, and the report's state follows,
+  so at 0 the newest chunk's age counts towards "degraded". A drain for
+  such a resident can finish, unless a chunk is kept from compression by a
+  held message or an overlap block, which counts as before; and at 0 it
+  doesn't finish with that chunk uncompressed. KnowledgeStrategy, whose chunker queues every chunk at
+  close, keeps nothing back, so its report counts its newest closed chunk
+  while it waits.
+- `drain-autobiographical` ended with an uncaught error at a tick that threw,
+  such as one whose provider call failed, and printed no finish line. It now
+  ends there with a finish line that says what is left and the error
+  (`tickError`), and exits 1.
+- A store holding a run these rules group differently, such as an interior
+  pair that waited for the level-wide count, merges it at its next merge
+  check, which rewrites the request once from where the merged summary
+  renders, if the plan uses it. A summary already left alone stays alone
+  until what stands beside it lets it merge, or a rebuild gives it
+  partners. Where the old split left a summary
+  beside an operator hold, the held summary could join it once the hold
+  lifted; the even split leaves none, so a summary whose hold lifts there
+  stays alone at its level, as `mergeHoldSummaryIds` allows. A
+  `mergeThreshold` below 2 queues what it did before (#285).
+- As before, a live store can still leave a summary alone by timing around a
+  hole: a run merges beside a chunk that hasn't compressed yet, after a
+  restart or a quarantine's clear, and is then cut off from that chunk's
+  summary; or a newest run of one stands before a chunk quarantined later or
+  a hold placed later. Such a summary costs its tokens until what stands
+  beside it lets it merge, or a rebuild;
+  `getStrandedSummaries()` lists it, and `repair-topology --mode rebuild`
+  gives it partners.
+
+- `flat-profile` and `oldest-first` no longer solve a second time where the
+  second solve can't change the plan. In 0.22.1, when a solve that passes over
+  ended over the hard budget, the solver solved again taking only the oldest
+  chunk. A solve that passed no chunk over had already made exactly that rule's
+  moves, so the second solve repeated it move for move, about doubling the
+  planner's work for such compiles, those the plan check lets through within
+  `overBudgetGraceRatio` included, and for the shadow pick at
+  `productionBudgetTokens` when it hasn't converged. Such a solve's own plan is
+  now judged at the line the compile refuses above, and the solver doesn't
+  solve again. Where a solve's fewest-token plan is its last, that plan is no
+  longer replayed. Plans, token counts and summary requests are unchanged.
+- 0.22.1's entry said that fallback returns the plan the store got before. It
+  returns the oldest-only rule's plan from the levels the store carries. That
+  is the plan the store got before the upgrade only at the first compile after
+  it.
+- The `productionBudgetTokens` warning calls the target unreachable only when
+  the solver's plan is over the line a compile at that budget refuses above
+  (`overBudgetGraceRatio`). Within that line, where the plan check lets such a
+  compile through, it says the plan is over the soft target but within the
+  line. Both forms say the solver can fold no further with the summaries the
+  store has now.
+
+## 0.22.1 — 2026-10-26
+
+### Fixed
+
+- Under `foldingStrategy: 'kv-unified'`, a level pin (`pinAtLevel`, or `pinRange` and `markDocument` with `level`) no longer makes every compile fail while no summary supplies its level over a pinned message (#193). Until compression and merging produce that level, the message is held at the deepest level below it that a summary over it does supply, raw when none does, and it moves to the pinned level once that exists. Compiles that refused with `kv-unified constraints are infeasible …` for such a pin now go through, with the range held finer than pinned until its level exists, so it can take more of the budget than the pin asked for. Where the range at the level it's held at takes the compile past its budget and `overBudgetGraceRatio`, the compile is refused as over budget. A pin placed while its range is in the recent window no longer starts refusing once the range leaves it, and a stored pin whose level no summary supplies any more, such as one whose summary the load repair dropped, is held the same way, where releases from 0.15.0 refused it as infeasible whatever the budget. A compile that finds a pin held logs `autobio: kv-unified holds pin …`, naming the pin, its level and the level its messages are held at, and a later compile that finds it no longer held, or gone, logs that too. The log follows the loaded branch, so after an open or a branch switch a pin that is still held is logged again. A message of system changes stays raw under any pin, as before, so it is neither held nor logged. A level pin and a lock at another level on a message in the folded middle are still refused, as before, even while the pinned level doesn't exist.
+
+- Docs: `ContextManager.compile()`'s doc said it may block if the strategy
+  has pending work, and the docs of `ContextManager.isReady()`,
+  `ReadinessState.ready` and `ContextStrategy.checkReadiness()` described
+  readiness as whether `compile()` would block or could proceed. At 0.22.0
+  as now, `compile()` awaits nothing: it doesn't wait for the strategy's
+  background work, and compiles from what's there. The docs now say so, and
+  say that readiness is only whether that work is pending. Nothing a caller
+  meets at run time changes.
+
+- `flat-profile`, the default folding solver, and `oldest-first` now raise the
+  oldest chunk at a level that can rise, passing over a chunk with no summary
+  above it. They tried only the oldest chunk. So a summary no merge could take
+  as the store stood, such as an operator-held L1, a quarantined merge's
+  sources or a summary stranded beside a hole, stopped every raise at its
+  level. Once that held at every level, a compile the younger chunks'
+  summaries fit was refused ("Adaptive picker exhausted"). The first compile
+  after upgrading can plan differently, which rewrites the request once, from
+  the first unit that changes, on a store where the oldest chunk at a level
+  the solve tries can't rise while a younger one can, and the plan that passes
+  over fits: one holding such a summary, or a chunk not yet summarized behind
+  newer summaries. Under `oldest-first` that includes ordinary stores, whose
+  oldest chunk reaches the top of its lineage. Other stores that compile today
+  are planned as before.
+- When a solve that passes over ends over the hard budget, the solver solves
+  again taking only the oldest chunk, as before this release, and returns that
+  plan wherever the compile accepts it (within the budget and its
+  `overBudgetGraceRatio`), which is the plan the store got before. So where
+  the plan that passes over doesn't fit, a store that compiled before still
+  compiles, with the same plan. Otherwise it returns the plan with the fewest
+  tokens that either solve passed through, with that solve's request for a
+  missing summary, and the compile refuses it if it is over. A raise folds
+  only the group's unprotected leaves, and the summary takes their place, so
+  where the rest of the group was pinned, locked or in the head or tail, a
+  raise could grow the plan and take a solve over a budget that a plan on its
+  way, or its start, had fit.
+
+- kv-stable: the ideal cut no longer flaps a deep group at a band boundary.
+  Two changes, measured together on a long-lived resident with `[fold-diff]`
+  (2026-10-07..09: the group at the L2↔L3 boundary went L3→L2→L3 seven times
+  in three days, each direction re-reading ~300k tokens; a fold confined to
+  the seam cost ~97k) and on a carried-growth replay (1,296 base-6 leaves at
+  50 raw / 100 recall, one appended leaf per turn, a summary every six, every
+  frontier carried; 120 turns at target 1600 / W 2150: no deep group is ever
+  raised, total re-read 20,000 against 22,500 on the previous release and
+  25,900 with the new walk but seeding off):
+  - **Phase C** (spend headroom by un-folding toward the target) walks chunks
+    youngest-first by **position**, whatever their level, and restarts from
+    the youngest after every accepted un-fold, so the youngest group steps
+    down L2→L1→raw before any older group is tried. It used to walk deepest
+    level first (`for level = max..1 { youngest-first }`), which raised the
+    youngest L3 group — the one right after the deep band — before any L1 at
+    the seam.
+  - **The ideal cut is seeded from the carried frontier**: phases A/B only
+    deepen what is carried (same salience-then-oldest, level-by-level order)
+    and only phase C un-folds. The from-scratch cut re-decided every band
+    boundary from the current balance of production and growth, so a deep
+    group was raised when a new mid-level summary landed and re-deepened when
+    growth crossed W — and the dead-band hold could not keep it, because its
+    relevance-gap check compared against that moving ideal. An inverted
+    carried profile (a chunk deeper than an older unprotected chunk) is still
+    lowered to the older level so the quality-gap self-heal keeps working.
+    An older chunk is weighed only against younger chunks at or above the
+    next level its group can render at, so one already at its group's
+    deepest level (lineage top, or a pin-max-level on a group-mate), or
+    whose lineage skips past the younger chunk's level, is no evidence of
+    inversion — without that, a seeded plan could alternate between two
+    frontiers on an imperfect tree, or lower a whole younger band on every
+    compile. A chunk whose group has a raw-zone, pinned or locked member of
+    its own lineage is part of a boundary-cut fold, which a from-scratch cut
+    makes too, and isn't lowered — lowering it moved the plan once on
+    unchanged inputs.
+    Seeding doesn't apply to bootstrap.
+  - **Cost, stated:** keeping monotone over-depth IS the hysteresis, and the
+    quality-gap check cannot see it (relevance loss only scores depth past
+    the age cap, and the seeded ideal keeps the carried depth). Depth the
+    budget once forced persists until the seam runs out of headroom; on the
+    replay the seeded plan's loss exceeded the from-scratch ceiling on 217 of
+    400 turns. Where the carried frontier is under the expand threshold, as
+    after a budget raise, and the seeded plan would pay at least 90% of a
+    from-scratch re-cut's re-read anyway, or a re-read where the re-cut pays
+    none, the from-scratch cut is taken instead, so a large raise is not
+    spent keeping a tight-budget allocation. Past the trust region, a release
+    is adopted as any ideal past it is: its newest part that fits within the
+    trust region, with the depth further back kept, or the whole cut where the
+    infeasible or quality-gap override applies. A shed, a hold in the dead band
+    and a fold at the seam keep the seeded plan, and a seeded plan that
+    re-reads nothing is kept without building the re-cut.
+  Accept rule, group consistency, protections and the phase A/B fold order
+  are unchanged. `kv-unified` is untouched.
+
 ## 0.22.0 — 2026-10-24
 
 ### Breaking

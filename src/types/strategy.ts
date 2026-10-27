@@ -8,7 +8,6 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
-import type { ContextObserver } from '../observer.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 import type { WindowMode } from '../window-index.js';
 
@@ -171,12 +170,6 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
-  /**
-   * The host's observer (`ContextManagerConfig.observer`), already isolated:
-   * a strategy reports its compression refusals and calibration samples to it
-   * and needs no guard of its own. Absent when the host gave none.
-   */
-  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
@@ -225,27 +218,40 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
-   * What the next compile renders for each of `ids`, messages just stored
-   * and so among the newest of the window, in the order given, before the
-   * manager leaves out any thinking under `SelectOptions.thinkingBinding`. Each comes back
-   * cut by the per-message cap, and as one message where the compile joins a
-   * body's shards into one; the strategy makes every image decision it makes
-   * there: its count, depth and byte limits, counted newest-first over the
-   * view from the oldest of these messages to its newest, as a compile
-   * counts them. It's for a caller that appends messages it has just stored
-   * to a compiled request without recompiling, such as a turn's mid-turn
-   * injections, so that what it appends is what the next compile renders. A
-   * later compile can still strip an image of theirs as newer ones arrive.
+   * What the next compile sends for each of `ids`, in the order given,
+   * before the manager leaves out any thinking under
+   * `SelectOptions.thinkingBinding`. Each comes back in the form the compile
+   * sends it, wherever the compile places it: cut by the per-message cap, as
+   * one message where the compile joins a body's shards into one, and with
+   * every image decision the strategy makes there: its count, depth and byte
+   * limits, counted newest-first over the view from the oldest of these
+   * messages to its newest, as a compile counts them. It's for a caller that
+   * works from a compiled request without recompiling. One appends messages
+   * it has just stored, such as a turn's mid-turn injections, so that what it
+   * appends is what the next compile sends. Another renders messages its
+   * stream has already sent, such as the rows `ContextManager.noteRequestSent`
+   * digests over a whole turn, so that the next compile can tell which of
+   * them it sends as they were sent. A later compile can still strip
+   * an image of theirs as newer ones arrive, and their images can strip
+   * older images the request already carried, so the request they're
+   * appended to can still differ from the next compile before them.
    *
-   * `store` is the view a compile reads. An id comes back as null when the
-   * next compile doesn't send that message as one of its newest: the view
-   * leaves it out, such as by its filter, or the compile sends it elsewhere,
-   * such as a body too big for the window's recent part. What the next
-   * compile decides from its budget isn't foreseen, since a render has none:
-   * windowed passthrough's re-anchor, or its refusal of a newest message
-   * bigger than the budget; the memory strategy's refusal of a recent window
-   * over budget, or the adaptive select's drop of a provisional calibration
-   * that puts it over budget.
+   * The form isn't the place. Where the compile sends one of these messages
+   * before others, such as the memory strategy's head window a reset hasn't
+   * filled, which the history from before the reset follows, a request they
+   * are appended to differs from the next compile there, however they're
+   * rendered.
+   *
+   * `store` is the view a compile reads. An id comes back as null only when
+   * the next compile doesn't send that message: the view leaves it out, such
+   * as by its filter, or windowed passthrough's anchor is past it. What the
+   * next compile decides from its budget or its plan isn't foreseen, since a
+   * render has neither: windowed passthrough's re-anchor, or its refusal of a
+   * newest message bigger than the budget; the memory strategy's refusal of
+   * a recent window over budget, the adaptive select's drop of a provisional
+   * calibration that puts it over budget, or a plan that sends a summary in
+   * place of a message it covers, which comes back raw. A strategy's own doc
+   * names any other place where its compile sends a message otherwise.
    *
    * What comes back is made of the stored arrays and blocks, as a compile's
    * messages are, so a caller that edits what comes back copies it first.
@@ -1922,7 +1928,18 @@ export interface AutobiographicalConfig {
 
   /** Enable hierarchical 3-level compression. Set to false for single-level legacy compression. */
   hierarchical?: boolean;
-  /** Number of unmerged summaries before merging to the next level (default: 6) */
+  /**
+   * How many summaries the newest run of a level holds before they merge
+   * into one at the next level (default: 6), one fewer where that would
+   * leave a single summary behind, or the whole run where one fewer would be
+   * a group of one (three at a threshold of 2). An older run that can't grow, cut off by
+   * a hole or a hold, merges once it holds two, in groups as even as they
+   * can be that leave none of it alone; one whose hole a retried chunk or
+   * merge will fill grows as the newest does. A demand from the picker
+   * queues one of these groups too, a growing run's shorter rest included.
+   * Below 2, the merge check queues the oldest run's first `mergeThreshold`
+   * and a demand the longest in-range run's, which the merge refuses (#285).
+   */
   mergeThreshold?: number;
   /**
    * Bounded retry policy for L_n merges whose LLM response was rejected by
@@ -1938,9 +1955,8 @@ export interface AutobiographicalConfig {
    * Operator merge holds: summary ids that are never offered as merge
    * sources (a held summary that hasn't merged stays on the frontier, and
    * no summary above it forms). Held ids split the frontier into runs like
-   * a hole, so later history still merges around them. They still count as
-   * unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every
-   * held summary toward its level's `mergeThreshold`. The run of
+   * a hole, so later history still merges around them. A held L1 still
+   * counts as unmerged toward `maxSpeculativeL1s`. The run of
    * same-level summaries just before a held one can't grow past it, so it
    * merges as a run between two summaries does, which can be at two, below
    * `mergeThreshold`. Lifting a hold doesn't undo
@@ -2287,9 +2303,9 @@ export interface AutobiographicalConfig {
    * a compression hold over its sources. Chunks still form and queue, and
    * queued chunks don't count toward the cap.
    *
-   * With no L1 merge queued, the cap holds nothing. No merge forms below
-   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
-   * them rise to the threshold. Unmerged L1s that can never merge count
+   * With no L1 merge queued, the cap holds nothing. The newest run of L1s
+   * merges only once it holds `mergeThreshold`, so under a cap below
+   * `mergeThreshold - 1` it still rises to the threshold. Unmerged L1s that can never merge count
    * toward the cap without holding production. Under `hierarchical: false`
    * tick runs no merge, so the cap holds nothing.
    *
@@ -2394,9 +2410,11 @@ export interface AutobiographicalConfig {
    * fold-storm, a single KV invalidation ("produce first, fold once").
    * If the shadow pick runs out of folds and produce requests with its plan
    * still over the target's soft line, the compile warns, giving the plan's
-   * size and the line above which a compile at the target is refused with
-   * OverBudgetError: lowering the live budget to the target fails only while
-   * the plan is over that line. Shadow demand is
+   * size and the line above which the plan check of a compile at the target
+   * refuses it with OverBudgetError, and calls the target unreachable with
+   * the summaries the store has then only when the plan is over that line:
+   * the plan check refuses a compile at the target only while it is, though
+   * a later stage can refuse it as at any budget. Shadow demand is
    * speculative and never bypasses the `l1HoldbackChunks` window. Must be
    * positive; no effect unless lower than the live compile budget.
    */
@@ -2471,7 +2489,8 @@ export type LegacySummaryLevel = 1 | 2 | 3;
 /**
  * A summary entry in the hierarchical memory pyramid.
  * L1: compressed from raw message chunks.
- * L_{k>1}: merged from mergeThreshold L_{k-1}s.
+ * L_{k>1}: merged from a run of L_{k-1}s: a group from the oldest end of
+ * the newest run, or a group of two or more from an older run.
  */
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */

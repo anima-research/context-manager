@@ -1,10 +1,11 @@
 /**
- * `renderAsNewest`: what the next compile sends for messages just stored as
- * the newest of the window, for a caller that appends them to a compiled
+ * `renderAsNewest`: what the next compile sends for messages just stored,
+ * wherever it places them, for a caller that appends them to a compiled
  * request without recompiling (agent-framework's mid-turn injections). Most
- * cases compare the rendering with the next compile's newest messages; the
- * rest check the answers that aren't renderings (null, undefined, a
- * refusal), or what a render leaves behind for the compiles after it.
+ * cases compare the rendering with what the next compile sends for the same
+ * messages; the rest check the answers that aren't renderings (null,
+ * undefined, a refusal), the places the doc names where a compile sends
+ * otherwise, or what a render leaves behind for the compiles after it.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -68,6 +69,9 @@ async function renderedAndSent(manager: ContextManager, ids: string[]): Promise<
 
 const textOf = (content: unknown): string =>
   (content as ContentBlock[]).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+/** The content of each message the compile sends whose text starts with `label`. */
+const sentHolding = (compiled: { messages: Array<{ content: unknown }> }, label: string): unknown[] =>
+  compiled.messages.filter((m) => textOf(m.content).startsWith(label)).map((m) => sent(m.content as unknown[]));
 const imagesIn = (content: unknown): number => (content as ContentBlock[]).filter((b) => b.type === 'image').length;
 
 describe('renderAsNewest', () => {
@@ -239,29 +243,35 @@ describe('renderAsNewest', () => {
     });
   });
 
-  it("autobiographical: a body too big for the window's recent part comes back as null", async () => {
+  it("autobiographical: a body too big for the window's recent part comes back whole, as the windows join it, where this version's middle sends it in pieces", async () => {
     await withManager(sharding({ recentWindowTokens: 300 }), async (manager) => {
       const body = manager.addMessage('user', longText('BODY', 600));
       const lastShard = manager.getAllMessages().filter((m) => m.bodyGroupId !== undefined).at(-1)!.id;
       const after = manager.addMessage('user', [{ type: 'text', text: 'after' }]);
       const [forBody, forLastShard, forAfter] = manager.renderAsNewest([body, lastShard, after])!;
-      assert.equal(forBody, null, 'the compile sends some of its shards from the middle');
-      assert.equal(forLastShard, null, 'by any of its shards');
+      assert.equal(textOf(forBody), textOf(longText('BODY', 600)), 'whole');
+      assert.deepEqual(sent(forLastShard!), sent(forBody!), 'by any of its shards');
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
+      // The limit the doc names: the middle sends its shards' text as one
+      // entry and the recent window the rest as another.
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
+      assert.ok(pieces > 1, `the compile sends the body in ${pieces} pieces`);
     });
   });
 
-  it("autobiographical: a body that starts in the head window and runs on past it comes back as null", async () => {
+  it("autobiographical: a body that starts in the head window and runs on past it comes back whole, where the compile sends it in pieces", async () => {
     // Shards of about 100 tokens: the head's 150 holds the first, the recent
     // window's 300 the last few, and the middle the rest.
     await withManager(sharding({ headWindowTokens: 150, recentWindowTokens: 300 }), async (manager) => {
       const body = manager.addMessage('user', longText('BODY', 600));
       const after = manager.addMessage('user', [{ type: 'text', text: 'after' }]);
       const [forBody, forAfter] = manager.renderAsNewest([body, after])!;
-      assert.equal(forBody, null, 'the compile sends its first shard in the head and others from the middle');
+      assert.equal(textOf(forBody), textOf(longText('BODY', 600)), 'whole');
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
+      assert.ok(pieces > 1, `the compile sends its first shard in the head and the rest after it, in ${pieces} pieces`);
     });
   });
 
@@ -350,20 +360,22 @@ describe('renderAsNewest', () => {
     });
   });
 
-  it("autobiographical: after the head window's start is reset, messages it holds come back as null, since the history before it follows them", async () => {
-    const strategy = memory({ headWindowTokens: 1_000_000, recentWindowTokens: 100 });
+  it("autobiographical: after the head window's start is reset, messages it holds render as the compile sends them, though the history before it follows them", async () => {
+    const strategy = memory({ headWindowTokens: 1_000_000, recentWindowTokens: 100, maxMessageTokens: 50 });
     await withManager(strategy, async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'before the reset' }]);
       const a = manager.addMessage('user', [{ type: 'text', text: 'a' }]);
       strategy.resetHeadWindow(a);
-      const b = manager.addMessage('user', [{ type: 'text', text: 'b' }]);
-      assert.deepEqual(manager.renderAsNewest([a, b]), [null, null]);
+      const b = manager.addMessage('user', longText('b', 300));
+      const rendered = manager.renderAsNewest([a, b])!.map((content) => sent(content!));
       const compiled = await manager.compile(BUDGET);
-      assert.deepEqual(compiled.messages.slice(-3).map((m) => textOf(m.content)), ['a', 'b', 'before the reset'], 'the compile sends the history after the head');
+      assert.deepEqual(compiled.messages.slice(-3).map((m) => textOf(m.content).slice(0, 16)), ['a', textOf(rendered[1]).slice(0, 16), 'before the reset'], 'the compile sends the history after the head');
+      assert.deepEqual(rendered, [...sentHolding(compiled, 'a'), ...sentHolding(compiled, 'b ')]);
+      assert.ok(textOf(rendered[1]).length < textOf(longText('b', 300)).length, 'the cap cut it, as the head cuts it');
     });
   });
 
-  it('autobiographical: a head message with a middle after it comes back as null', async () => {
+  it('autobiographical: a head message with a middle after it renders as the compile sends it there', async () => {
     // Messages of about 90 tokens: the head's 150 holds the first, the
     // recent window's 150 the last, and the middle the five between.
     await withManager(memory({ headWindowTokens: 150, recentWindowTokens: 150 }), async (manager) => {
@@ -371,13 +383,14 @@ describe('renderAsNewest', () => {
       for (let i = 0; i < 5; i++) manager.addMessage('user', longText(`MID${i}`, 60));
       const last = manager.addMessage('user', longText('LAST', 60));
       const [forHead, forLast] = manager.renderAsNewest([head, last])!;
-      assert.equal(forHead, null);
       const compiled = await manager.compile(BUDGET);
+      assert.deepEqual([sent(forHead!)], sentHolding(compiled, 'HEAD'));
+      assert.equal(textOf(compiled.messages[0]!.content).slice(0, 4), 'HEAD', 'the premise: it leads the compile');
       assert.deepEqual(sent(forLast!), sent(compiled.messages.at(-1)!.content));
     });
   });
 
-  it("autobiographical: after the head window's start is reset, a message past the head renders as the next compile sends it", async () => {
+  it("autobiographical: after the head window's start is reset, a head message and one past the head each render as the compile sends them", async () => {
     const strategy = memory({ headWindowTokens: 150, recentWindowTokens: 150 });
     await withManager(strategy, async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'before the reset' }]);
@@ -386,8 +399,8 @@ describe('renderAsNewest', () => {
       for (let i = 0; i < 3; i++) manager.addMessage('user', longText(`M${i}`, 60));
       const last = manager.addMessage('user', longText('LAST', 60));
       const [forA, forLast] = manager.renderAsNewest([a, last])!;
-      assert.equal(forA, null, 'the head is followed by the middle and the history before it');
       const compiled = await manager.compile(BUDGET);
+      assert.deepEqual([sent(forA!)], sentHolding(compiled, 'A '), 'as the head sends it, with the middle and the history before it after');
       assert.deepEqual(sent(forLast!), sent(compiled.messages.at(-1)!.content));
     });
   });
@@ -432,6 +445,129 @@ describe('renderAsNewest', () => {
     });
   });
 
+  // context-manager#275's review, R1-1: a batch bigger than the recent
+  // window has its older messages before the window's start, where the next
+  // compile still sends them raw, in order, as its last messages.
+  const KV_UNIFIED = {
+    policy: {
+      alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+      cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25, continuityLambda: 1,
+      continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+      continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+    },
+    tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000,
+    adoptEpsilon: 0, treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+  };
+  const SELECTS = {
+    hierarchical: memory,
+    adaptive: sharding,
+    'kv-unified': (options: Record<string, unknown>) => sharding({ foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } }, ...options }),
+  };
+  for (const [name, make] of Object.entries(SELECTS)) {
+    it(`autobiographical, ${name} select: a batch bigger than the recent window renders whole, as the next compile sends it (R1-1)`, async () => {
+      await withManager(make({ recentWindowTokens: 4000 }), async (manager) => {
+        for (let i = 0; i < 6; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', longText(`hist${i}`, 40));
+        await manager.compile(BUDGET);
+        const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`screenshot${i}`)));
+        const { rendered, next } = await renderedAndSent(manager, ids);
+        assert.deepEqual(rendered, next);
+        assert.deepEqual(rendered.map(textOf), ['screenshot1', 'screenshot2', 'screenshot3', 'screenshot4']);
+      });
+    });
+  }
+
+  it('autobiographical: images past the count before the recent window, counted with the batch, as the next compile counts them', async () => {
+    await withManager(sharding({ recentWindowTokens: 4000, maxLiveImages: 6 }), async (manager) => {
+      for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', longText(`hist${i}`, 40));
+      await manager.compile(BUDGET);
+      const ids = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => manager.addMessage('user', imageMessage(`shot${i}`)));
+      const { rendered, next } = await renderedAndSent(manager, ids);
+      assert.deepEqual(rendered, next);
+      assert.equal(rendered.map(imagesIn).join(''), '00111111', 'the two oldest stripped');
+    });
+  });
+
+  for (const [name, make] of Object.entries({ hierarchical: memory, adaptive: sharding })) {
+    it(`autobiographical, ${name} select: a message past the cap before the recent window comes back cut, as the next compile sends it`, async () => {
+      // Chunks big enough that the long message isn't sharded.
+      await withManager(make({ recentWindowTokens: 300, maxMessageTokens: 50, targetChunkTokens: 2000 }), async (manager) => {
+        manager.addMessage('user', [{ type: 'text', text: 'before' }]);
+        const long = manager.addMessage('user', longText('LONG', 120));
+        assert.equal(manager.getAllMessages().filter((m) => m.bodyGroupId !== undefined).length, 0, 'the premise: nothing is sharded');
+        const after = [1, 2, 3].map((i) => manager.addMessage('user', longText(`after${i}`, 60)));
+        const { rendered, next } = await renderedAndSent(manager, [long, ...after]);
+        assert.deepEqual(rendered, next);
+        assert.ok(textOf(rendered[0]).length < textOf(longText('LONG', 120)).length, 'the cap cut it');
+      });
+    });
+  }
+
+  it('autobiographical, adaptive select: images past the count, counted newest-first across the batch', async () => {
+    await withManager(sharding({ maxLiveImages: 2 }), async (manager) => {
+      manager.addMessage('user', imageMessage('older', 1));
+      const first = manager.addMessage('user', imageMessage('first', 2));
+      const second = manager.addMessage('user', imageMessage('second', 2));
+      const { rendered, next } = await renderedAndSent(manager, [first, second]);
+      assert.deepEqual(rendered, next);
+      assert.deepEqual(rendered.map(imagesIn), [0, 2]);
+    });
+  });
+
+  it('autobiographical, adaptive select: images the hysteresis rule trims, as the next compile trims them', async () => {
+    await withManager(sharding({ maxLiveImages: 6, imageStripHysteresisRatio: 0.5 }), async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'start' }]);
+      await manager.compile(BUDGET);
+      const ids: string[] = [];
+      for (let i = 1; i <= 8; i++) ids.push(manager.addMessage('user', imageMessage(`new-${i}`, 1)));
+      const { rendered, next } = await renderedAndSent(manager, ids);
+      assert.deepEqual(rendered, next);
+      assert.equal(rendered.map(imagesIn).join(''), '00001111', 'the rule trimmed past the count, to the newest 4');
+    });
+  });
+
+  it('autobiographical: a trailing tool_use comes back as the cap leaves it, though the compile leaves it out (R1-3)', async () => {
+    await withManager(memory({}), async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'hi' }]);
+      const call: ContentBlock[] = [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't-1', name: 'look', input: {} } as ContentBlock];
+      const id = manager.addMessage('assistant', call);
+      const [rendered] = manager.renderAsNewest([id])!;
+      assert.deepEqual(sent(rendered!), sent(call));
+      const compiled = await manager.compile(BUDGET);
+      assert.equal(sentHolding(compiled, 'calling').length, 0, 'the compile leaves out a newest call with no result after it');
+    });
+  });
+
+  it('autobiographical, adaptive select: a trailing tool_use comes back as the cap leaves it, though the compile refuses (R1-3)', async () => {
+    await withManager(sharding({}), async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'hi' }]);
+      const call: ContentBlock[] = [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't-1', name: 'look', input: {} } as ContentBlock];
+      const id = manager.addMessage('assistant', call);
+      const [rendered] = manager.renderAsNewest([id])!;
+      assert.deepEqual(sent(rendered!), sent(call));
+      await assert.rejects(manager.compile(BUDGET), /did not retain the newest turn/);
+    });
+  });
+
+  it("autobiographical: after a head-window reset, a body across the head's end comes back whole, where the compile sends it in pieces with the history between", async () => {
+    // Shards of about 100 tokens: the head's 150 holds the first, the
+    // recent window's 300 the last few, and the history from before the
+    // reset comes between them.
+    const strategy = sharding({ headWindowTokens: 150, recentWindowTokens: 300 });
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'before the reset' }]);
+      const body = manager.addMessage('user', longText('BODY', 600));
+      strategy.resetHeadWindow(body);
+      const [forBody] = manager.renderAsNewest([body])!;
+      assert.equal(textOf(forBody), textOf(longText('BODY', 600)), 'whole');
+      const compiled = await manager.compile(BUDGET);
+      const texts = compiled.messages.map((m) => textOf(m.content));
+      const first = texts.findIndex((t) => t.includes('word'));
+      const history = texts.indexOf('before the reset');
+      assert.ok(first >= 0 && history > first && texts.slice(history).some((t) => t.includes('word')),
+        `the compile sends part of the body, then the history, then more of the body: ${JSON.stringify(texts.map((t) => t.slice(0, 12)))}`);
+    });
+  });
+
   it('windowed passthrough: a message before the anchor comes back as null', async () => {
     await withManager(windowed({}), async (manager) => {
       const ids = Array.from({ length: 10 }, (_, i) => manager.addMessage('user', longText(`M${i}`, 60)));
@@ -461,24 +597,114 @@ describe('renderAsNewest', () => {
     });
   });
 
-  it('a compression hold that has timed out reads as released, as the next compile reads it', async () => {
+  it('autobiographical, hierarchical select: a message a summary covers comes back raw, and its images count toward older messages, where the compile sends its summary', async () => {
+    // The head's 2,500 tokens hold the first message alone, since the image
+    // message after it carries about 3,000 tokens of text; the recent
+    // window's 300 holds the last three; compression folds the middle's
+    // oldest chunks, the image message first.
+    const membrane = {
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock summary] ' + 'x '.repeat(20) }], usage: { input_tokens: 100, output_tokens: 25 } }),
+    } as never;
+    const strategy = memory({ headWindowTokens: 2500, recentWindowTokens: 300, maxLiveImages: 1, compressionModel: 'mock', targetChunkTokens: 100 });
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane });
+    try {
+      const head = manager.addMessage('user', imageMessage('HEADIMG', 1));
+      const covered = manager.addMessage('user', [...imageMessage('MIDIMG', 1), ...longText('MIDTEXT', 2000)]);
+      for (let i = 0; i < 6; i++) manager.addMessage('user', longText(`MID${i}`, 60));
+      for (let i = 0; i < 3; i++) manager.addMessage('user', longText(`TAIL${i}`, 60));
+      await manager.compile(BUDGET);
+      for (let k = 0; k < 200 && !manager.isReady(); k++) await manager.tick();
+      const compiled = await manager.compile(BUDGET);
+      const texts = compiled.messages.map((m) => textOf(m.content));
+      assert.ok(!texts.some((t) => t.includes('MIDIMG')) && texts.some((t) => t.includes('[mock summary]')), `the premise: the compile sends a summary for the image message: ${JSON.stringify(texts.map((t) => t.slice(0, 16)))}`);
+      assert.equal(textOf(compiled.messages[0]!.content), 'HEADIMG', 'the premise: the head window sends the first message raw');
+      const [forHead, forCovered] = manager.renderAsNewest([head, covered])!;
+      assert.equal(textOf(forCovered).slice(0, 6), 'MIDIMG', 'the covered message comes back raw');
+      assert.equal(imagesIn(forHead), 0, "rendered, the covered message's image takes the one slot");
+      assert.equal(imagesIn(sentHolding(compiled, 'HEADIMG')[0]), 1, 'the compile, sending its summary, keeps the head image');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('autobiographical, adaptive select: a message a summary covers counts its images as the compile does', async () => {
+    const membrane = {
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock summary] ' + 'x '.repeat(20) }], usage: { input_tokens: 100, output_tokens: 25 } }),
+    } as never;
+    const strategy = memory({ hierarchical: false, adaptiveResolution: true, headWindowTokens: 2500, recentWindowTokens: 300, maxLiveImages: 1, compressionModel: 'mock', targetChunkTokens: 100 });
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane });
+    try {
+      const head = manager.addMessage('user', imageMessage('HEADIMG', 1));
+      const covered = manager.addMessage('user', [...imageMessage('MIDIMG', 1), ...longText('MIDTEXT', 2000)]);
+      for (let i = 0; i < 6; i++) manager.addMessage('user', longText(`MID${i}`, 60));
+      for (let i = 0; i < 3; i++) manager.addMessage('user', longText(`TAIL${i}`, 60));
+      await manager.compile(BUDGET);
+      for (let k = 0; k < 200 && !manager.isReady(); k++) await manager.tick();
+      const compiled = await manager.compile({ maxTokens: 4000, reserveForResponse: 0 });
+      const texts = compiled.messages.map((m) => textOf(m.content));
+      assert.ok(!texts.some((t) => t.includes('MIDIMG')) && texts.some((t) => t.includes('[mock summary]')), `the premise: the compile sends a summary for the image message: ${JSON.stringify(texts.map((t) => t.slice(0, 16)))}`);
+      const sentHead = compiled.messages.filter((m) => textOf(m.content).includes('HEADIMG')).map((m) => m.content);
+      assert.equal(sentHead.length, 1, `the premise: the compile sends the head message once: ${JSON.stringify(texts.map((t) => t.slice(0, 24)))}`);
+      const [forHead, forCovered] = manager.renderAsNewest([head, covered])!;
+      assert.equal(textOf(forCovered).slice(0, 6), 'MIDIMG', 'the covered message comes back raw');
+      assert.equal(imagesIn(forHead), imagesIn(sentHead[0]), 'the render and the compile keep the same images of the head message');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a render releases no compression hold that has timed out, and the next compile does', async () => {
+    class Counting extends AutobiographicalStrategy {
+      released = 0;
+      override onCompressionHoldsReleased(ctx: Parameters<AutobiographicalStrategy['onCompressionHoldsReleased']>[0]): void {
+        this.released++;
+        super.onCompressionHoldsReleased(ctx);
+      }
+    }
+    const strategy = new Counting({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    const clock = { t: 1_000 };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, now: () => clock.t });
+    try {
+      const id = manager.addMessage('user', [{ type: 'text', text: 'held' }], undefined, undefined, { holdCompression: { timeoutMs: 100 } });
+      clock.t = 1_200;
+      manager.renderAsNewest([id]);
+      assert.equal(strategy.released, 0, 'the render released nothing');
+      await manager.compile(BUDGET);
+      assert.equal(strategy.released, 1, 'the compile released the timed-out hold');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a compression hold, held or timed out, changes nothing a render gives', async () => {
     // Shards of about 100 tokens: held, the body starts the protected recent
-    // window and renders whole; released, the recent window's 300 tokens
-    // hold only its last shards, and the compile sends the rest from the
-    // middle. The render comes after the hold's deadline, with no other
-    // manager call between, so nothing else has released it.
+    // window and the compile sends it whole; past the hold's deadline, the
+    // recent window's 300 tokens hold only its last shards, and the compile
+    // sends the rest from the middle. The render gives the body whole either
+    // way, as the windows join it.
     const clock = { t: 1_000 };
     const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
     const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: sharding({ recentWindowTokens: 300 }), now: () => clock.t });
     try {
       const body = manager.addMessage('user', longText('BODY', 600), undefined, undefined, { holdCompression: { timeoutMs: 100 } });
       const after = manager.addMessage('user', [{ type: 'text', text: 'after' }]);
-      assert.notEqual(manager.renderAsNewest([body])![0], null, 'held, the body is in the recent window');
+      const held = manager.renderAsNewest([body, after])!.map((content) => sent(content!));
+      assert.deepEqual(held, (await manager.compile(BUDGET, undefined, { dryRun: true })).messages.slice(-2).map((m) => sent(m.content)), 'held, as the compile sends it');
       clock.t = 1_200;
-      const [forBody, forAfter] = manager.renderAsNewest([body, after])!;
-      assert.equal(forBody, null, 'released, some of its shards go to the middle');
+      const timedOut = manager.renderAsNewest([body, after])!.map((content) => sent(content!));
+      assert.deepEqual(timedOut, held);
       const compiled = await manager.compile(BUDGET);
-      assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
+      assert.deepEqual(timedOut[1], sent(compiled.messages.at(-1)!.content));
+      const pieces = compiled.messages.filter((m) => textOf(m.content).includes('word')).length;
+      assert.ok(pieces > 1, `released, the compile sends the body in ${pieces} pieces`);
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
