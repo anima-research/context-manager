@@ -2953,11 +2953,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Damage in the quarantine is named once per load: this load's reads name
     // what they find, on whatever store, namespace and branch it binds to. So
     // is a debt report's failure: a failure that lasts across a branch switch
-    // the manager makes (its switchBranch, a fork, setStrategy,
-    // reinitializeOnStoreBranch) is logged again for the new load, and the
-    // new load logs no recovery from a failure only an earlier one met. A
-    // host that moves the store's branch itself leaves this load in place
-    // until the manager initializes it again (reinitializeOnStoreBranch).
+    // the manager makes (its switchBranch, a fork, setStrategy) is logged
+    // again for the new load, and the new load logs no recovery from a
+    // failure only an earlier one met. A host that moves the store's branch
+    // itself leaves this load in place until the manager initializes it again
+    // (setStrategy(getStrategy())).
     this.namedDroppedQuarantineKeys.clear();
     this.namedUnlistedQuarantineState.clear();
     this.compressionDebtFailureLogged = null;
