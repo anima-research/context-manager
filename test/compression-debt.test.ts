@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { format } from 'node:util';
 
-import { AutobiographicalStrategy } from '../src/index.js';
+import { AutobiographicalStrategy, KnowledgeStrategy } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { SummaryEntry } from '../src/types/index.js';
 
@@ -98,6 +98,42 @@ describe('getCompressionDebt', () => {
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.pendingChunks, 0, 'trailing uncompressed chunk excluded');
     assert.equal(d.state, 'healthy');
+  });
+
+  it('the chunks the holdback keeps back are life, not debt, however many it keeps', () => {
+    const kept = new Probe({ hierarchical: true, autoTickOnNewMessage: false, l1HoldbackChunks: 2 });
+    const chunks = () => [chunk({ compressed: true }), chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR }), chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR })];
+    kept.setChunks(chunks());
+    const d = kept.getCompressionDebt(NOW);
+    assert.equal(d.pendingChunks, 0);
+    assert.equal(d.state, 'healthy');
+    const one = fresh();
+    one.setChunks(chunks());
+    assert.equal(one.getCompressionDebt(NOW).pendingChunks, 1);
+    assert.equal(one.getCompressionDebt(NOW).state, 'degraded');
+  });
+
+  it('at a holdback of 0 the newest closed chunk is debt while it waits, as nothing keeps it back', () => {
+    const zero = new Probe({ hierarchical: true, autoTickOnNewMessage: false, l1HoldbackChunks: 0 });
+    zero.setChunks([chunk({ compressed: true }), chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR })]);
+    assert.equal(zero.getCompressionDebt(NOW).pendingChunks, 1);
+    assert.equal(zero.getCompressionDebt(NOW).state, 'degraded');
+  });
+
+  it('KnowledgeStrategy keeps nothing back, since its chunker queues every chunk at close, so its newest closed chunk is debt while it waits', () => {
+    const k = new KnowledgeStrategy({ autoTickOnNewMessage: false } as never);
+    (k as unknown as { chunks: Chunk[] }).chunks = [chunk({ compressed: true }), chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR })];
+    assert.equal(k.getCompressionDebt(NOW).pendingChunks, 1);
+  });
+
+  it('a kept-back chunk a fold demanded is debt, since it is queued all the same', () => {
+    const s = fresh();
+    const demanded = { ...chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR }), messages: [{ id: 'm-last', timestamp: NOW - 2 * HOUR }] } as unknown as Chunk;
+    s.setChunks([chunk({ compressed: true }), demanded]);
+    assert.equal(s.getCompressionDebt(NOW).pendingChunks, 0, 'premise: kept back, it is no debt');
+    (s as unknown as { _demandedL1Chunks: Set<string> })._demandedL1Chunks.add('m-last');
+    assert.equal(s.getCompressionDebt(NOW).pendingChunks, 1);
+    assert.equal(s.getCompressionDebt(NOW).state, 'degraded');
   });
 
   it('a closed chunk pending under an hour is healthy; over an hour is degraded', () => {

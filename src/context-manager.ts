@@ -33,7 +33,6 @@ import type {
   TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
   RequestIdentity,
-  ThinkingBinding,
   SelectOptions,
   PreviewResult,
   HotContextSettingsStatus,
@@ -47,6 +46,7 @@ import {
   isHotConfigurableStrategy,
 } from './types/index.js';
 import { isStateExistsFor } from './state-registration.js';
+import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -1757,23 +1757,32 @@ export class ContextManager {
   }
 
   /**
-   * What the next compile sends for each of `ids`, messages this manager has
-   * just stored, rendered as the newest of the window (see
-   * `ContextStrategy.renderAsNewest`), before any thinking the thinking
-   * binding leaves out (`SelectOptions.thinkingBinding`). Give each message by the id
+   * What the next compile sends for each of `ids`, messages this manager
+   * stores, such as ones it has just stored or the rows a stream has sent
+   * (`noteRequestSent`), in the form the compile sends each, wherever it
+   * places it (see `ContextStrategy.renderAsNewest`), before any thinking
+   * the thinking binding leaves out (`SelectOptions.thinkingBinding`). Give
+   * each message by the id
    * `addMessage` returned. For a body stored as shards that's its first
    * shard's, which stands for the whole body where the compile joins its
    * shards; where the compile sends each shard on its own, an id gives back
    * its own shard.
    * Undefined when the strategy has no such hook, so a caller appends the
-   * content as stored. An id comes back as null when the next compile
-   * doesn't send that message as one of its newest, such as one the view
-   * filter leaves out. It throws for an id no stored message has, before
+   * content as stored. An id comes back as null only when the next compile
+   * doesn't send that message, such as one the view filter leaves out. A
+   * strategy's own doc names where its compile still sends a message
+   * otherwise than its render, as the memory strategy's does for a message
+   * a summary covers and a body whose shards it doesn't send together.
+   * Tool blocks come back as the per-message cap leaves them, so for a
+   * message that holds them the compile can send something else, as the
+   * strategy's doc says; and the manager sends a message other than a
+   * user's that holds a `tool_result` as several turns
+   * (`splitMixedToolMessages`), where the render gives one array. It throws
+   * for an id no stored message has, before
    * the strategy has initialized, and where the strategy's select would
    * throw first, as the autobiographical strategy does on a branch it
-   * hasn't loaded. Like a compile, it releases compression holds that have
-   * timed out before it renders, so it reads the holds the next compile
-   * will.
+   * hasn't loaded. It releases no compression hold: where a message's
+   * window starts doesn't change the form it's rendered in.
    */
   renderAsNewest(ids: readonly MessageId[]): Array<ContentBlock[] | null> | undefined {
     this.requireInitialized('renderAsNewest');
@@ -1786,7 +1795,6 @@ export class ContextManager {
       );
     }
     if (typeof this.strategy.renderAsNewest !== 'function') return undefined;
-    this.expireCompressionHolds();
     return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
   }
 
@@ -1822,11 +1830,10 @@ export class ContextManager {
    * participant goes as the user's, and a bundled tool cycle as each of its
    * parts (`splitMixedToolMessages`). So one it renders as null, or that the
    * next compile renders otherwise, matches nothing there, and what follows
-   * goes without its thinking; a note that renders rows this way releases
-   * compression holds that have timed out, as `renderAsNewest` does.
-   * Without `renderAsNewest`, a row is its stored content, and a body stored
-   * as shards matches nothing, and so does an id the store doesn't hold, as
-   * after a removal.
+   * goes without its thinking. Rendering them releases no compression hold,
+   * as `renderAsNewest` releases none. Without `renderAsNewest`, a row is
+   * its stored content, and a body stored as shards matches nothing, and so
+   * does an id the store doesn't hold, as after a removal.
    *
    * Returns false and writes nothing when `compileId` isn't the compile that
    * wrote the branch's record, as for a stream whose note arrives after
@@ -1944,15 +1951,22 @@ export class ContextManager {
   /**
    * Non-committing preview of the layout at a hypothetical budget and/or
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
-   * Returns null when the active strategy has no fold plan to preview.
-   * `opts.thinkingBinding` previews a compile with that option: a binding
-   * one prices a summary's carriers as such a compile renders them (see
+   * Returns null when the active strategy has no fold plan to preview: one
+   * without `previewContext`, or `AutobiographicalStrategy`'s hierarchical
+   * path when its select succeeds, where the strategy's own method throws
+   * `NoFoldPlanToPreviewError` (over the budget, that path still returns an
+   * infeasible preview). `opts` takes the select options a compile takes and
+   * passes them to the dry select, all but `dryRun`, which is always set, and
+   * `identity`, which nothing in a preview reads. Unlike `compile`, it doesn't
+   * refuse a binding option without its participant or identity up front.
+   * `opts.thinkingBinding` previews a compile with that option: a binding one
+   * prices a summary's carriers as such a compile renders them (see
    * `SelectOptions.thinkingBinding`); without it, as configured.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -1961,17 +1975,22 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
-      ) => PreviewResult;
+        opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+      ) => PreviewResult | null;
     };
     if (typeof s.previewContext !== 'function') return null;
-    return s.previewContext(
-      this.strategyMessageView(),
-      this.contextLog.createView(),
-      budget,
-      overrides,
-      opts,
-    );
+    try {
+      return s.previewContext(
+        this.strategyMessageView(),
+        this.contextLog.createView(),
+        budget,
+        overrides,
+        opts,
+      );
+    } catch (err) {
+      if (err instanceof NoFoldPlanToPreviewError) return null;
+      throw err;
+    }
   }
 
   // ==========================================================================

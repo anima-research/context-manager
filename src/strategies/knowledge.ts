@@ -64,6 +64,10 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     return false;
   }
 
+  protected heldBackChunks(): Set<number> {
+    return new Set();
+  }
+
   protected rebuildChunks(store: MessageStoreView): void {
     const messagesToChunk = this.getCompressibleMessages(store);
     const all = store.getAll();

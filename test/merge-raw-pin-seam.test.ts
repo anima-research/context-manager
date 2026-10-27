@@ -185,8 +185,8 @@ const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recu
 
 /** A Probe on a real store holding m-0..m-99 as real messages, with message 40 pinned raw
  *  (or, with `pin` false, owned by the fourth chunk). */
-async function openAroundRawPin(path: string, membrane: unknown, pin = true) {
-  const p = new Probe(config);
+async function openAroundRawPin(path: string, membrane: unknown, pin = true, settings: typeof config = config) {
+  const p = new Probe(settings);
   const manager = await ContextManager.open({ path, strategy: p, membrane: membrane as never });
   const all: string[] = [];
   for (let i = 0; i < 100; i++) all.push(manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i}` }]));
@@ -213,13 +213,11 @@ describe('merges that would cross a raw pin', () => {
     manager.close();
   });
 
-  test('a demand range whose endpoint no chunk owns bounds the sources it takes', async () => {
-    // m-5 is in the unowned head end. The range m-5..m-35 takes the three L1s
-    // over m-10..m-39; read as the whole store, it would take all six.
+  test('a demand range whose endpoint no chunk owns bounds the group it takes', async () => {
     const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) };
-    const { manager, p, all } = await openAroundRawPin(STORES[4], membrane, false);
-    p.demand(2, all[5], all[35]);
-    assert.deepEqual(p.queue().map((m) => m.sourceIds), [['L1-0', 'L1-1', 'L1-2']]);
+    const { manager, p, all } = await openAroundRawPin(STORES[4], membrane, false, { ...config, mergeThreshold: 3 });
+    p.demand(2, all[45], all[95]);
+    assert.deepEqual(p.queue().map((m) => m.sourceIds), [['L1-3', 'L1-4', 'L1-5']]);
     manager.close();
   });
 

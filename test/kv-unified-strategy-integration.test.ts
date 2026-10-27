@@ -1094,3 +1094,36 @@ test('latent demand is joint unless the recipe says individual', async () => {
   assert.equal(await modeOf({ ...KV_UNIFIED }), 'joint');
   assert.equal(await modeOf({ ...KV_UNIFIED, latentDemandMode: 'individual' }), 'individual');
 });
+
+test('a dry select logs no continuity-relaxation line, and a committing compile logs each', async () => {
+  const lines: string[] = [];
+  const { error, warn } = console;
+  const capture = (level: string, pass: (...args: unknown[]) => void) => (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === 'string' && first.startsWith('[kv-continuity-relaxation]')) lines.push(`${level} ${first}`);
+    else pass(...args);
+  };
+  console.error = capture('error', error);
+  console.warn = capture('warn', warn);
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  try {
+    for (const [i, text] of ['one', 'two', 'three'].entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    const valid = { kvUnifiedContinuityRelaxation: { reason: 'infrastructure' as const, multiplier: 0.5, expiresAt: Date.now() + 60_000 } };
+    const expired = { kvUnifiedContinuityRelaxation: { reason: 'infrastructure' as const, multiplier: 0.5, expiresAt: Date.now() - 1 } };
+    assert.ok(manager.previewContext(budget, undefined, valid), 'premise: the preview ran');
+    manager.previewContext(budget, undefined, expired);
+    await manager.compile(budget, undefined, { ...valid, dryRun: true });
+    await manager.compile(budget, undefined, { ...expired, dryRun: true });
+    assert.deepEqual(lines, [], 'neither a preview nor a dryRun compile logs a line');
+    await manager.compile(budget, undefined, valid);
+    await manager.compile(budget, undefined, expired);
+    assert.equal(lines.length, 2, `one line for each committing compile: ${JSON.stringify(lines)}`);
+    assert.match(lines[0]!, /^error \[kv-continuity-relaxation\] reason=infrastructure multiplier=0\.5 expiresAt=/);
+    assert.match(lines[1]!, /^warn \[kv-continuity-relaxation\] invalid or expired input; continuity remains at 1 ns=default$/);
+  } finally {
+    manager.close();
+    console.error = error;
+    console.warn = warn;
+  }
+});

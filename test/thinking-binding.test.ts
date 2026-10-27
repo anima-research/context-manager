@@ -379,6 +379,48 @@ describe('thinking binding: compile', () => {
     }
   });
 
+  it('under the memory strategy, a stream whose noted rows pass the recent window keeps its replies\u2019 thinking where the next compile holds them raw', async () => {
+    // Three rounds, each a reply calling a tool and a long result, then the
+    // last reply: the turn's rows pass a 300-token recent window, so its
+    // first rounds sit before the window, where the next compile, with room
+    // for everything and no summaries, still sends them raw. Each note
+    // renders every row so far, and a row rendered as the compile sends it
+    // vouches for what the stream sent.
+    for (const select of ['hierarchical', 'adaptive'] as const) {
+      cleanup();
+      const strategy = new AutobiographicalStrategy({
+        autoTickOnNewMessage: false, headWindowTokens: 0, recentWindowTokens: 300,
+        ...(select === 'adaptive' ? { adaptiveResolution: true, targetChunkTokens: 10_000 } : {}),
+      });
+      const manager = await ContextManager.open({ path: STORE, strategy });
+      manager.addMessage('User', [text('U1')]);
+      await manager.compile(BIG, undefined, BIND_DROP);
+      const rows: MessageId[] = [];
+      const replies: MessageId[] = [];
+      for (let i = 1; i <= 3; i++) {
+        const reply = manager.addMessage('Claude', [thought(i), text(`A${i}`), toolUse(`t${i}`)]);
+        replies.push(reply);
+        rows.push(reply, manager.addMessage('User', [toolResult(`t${i}`, `zz-result-${i} ` + 'w '.repeat(400))]));
+        assert.equal(note(manager, rows, identity()), true, `${select}: round ${i} noted`);
+      }
+      const last = manager.addMessage('Claude', [thought(4), text('A4')]);
+      replies.push(last);
+      rows.push(last);
+      note(manager, rows, identity());
+      assert.ok(tokensOfNewest(manager, rows.length - 1) > 300, `${select}: setup: the rows after A1 pass the recent window`);
+      manager.addMessage('User', [text('U2')]);
+      const next = await manager.compile(BIG, undefined, BIND_DROP);
+      const byText = thinkingByText(next);
+      for (let i = 1; i <= 4; i++) {
+        const label = Object.keys(byText).find((k) => k === `A${i}`);
+        assert.ok(label, `${select}: setup: the next compile sends A${i} raw (${Object.keys(byText).join(', ')})`);
+        assert.equal(byText[label!], true, `${select}: A${i} keeps its thinking`);
+      }
+      assert.equal(next.thinkingStrip, undefined, select);
+      await manager.close();
+    }
+  });
+
   it('with no renderAsNewest, a noted body stored as shards matches nothing', async () => {
     cleanup();
     class Sharding extends PassthroughStrategy {

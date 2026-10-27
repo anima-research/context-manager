@@ -35,10 +35,17 @@ import type {
   SelectOptions,
   PreviewResult,
   RenderedSummaryInfo,
-  ThinkingBinding,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
+import {
+  adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
+  type LevelRuns, type PendingFill, type StoreRunsInput,
+} from './merge-runs.js';
+import {
+  hasSummaryText, isIdList, isReadableRange, loadedChunkRecords, releasedRecordsLine, releaseUnsummarizedRecords,
+  settleRepairLine, settleStoredSummaries, settlingRepaired, summaryIdCounterPast,
+} from './settle-summaries.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
@@ -221,6 +228,24 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
     `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
     'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
     'Fix: fix what the cause names; compression then resumes by itself.',
+  ].join('\n');
+}
+
+function strandedSummariesFailedMessage(cause: unknown): string {
+  return [
+    'The stranded-summaries read failed.',
+    `Cause: ${causeText(cause)}`,
+    "Effect: it can't say which summaries no merge can take. Merging itself may be running normally.",
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
+  ].join('\n');
+}
+
+function strandedNoStoreMessage(): string {
+  return [
+    'Stranded summaries were not listed.',
+    'Cause: no store is open.',
+    "Effect: the list can't name the quarantined chunks a stray stands beside, so it gives no list rather than send every stray to a rebuild.",
+    'Fix: open the store, then read the list.',
   ].join('\n');
 }
 
@@ -1367,6 +1392,139 @@ function isUsableQuarantineRecord(record: unknown): record is CompressionRefusal
     typeof (record as { chunkSourceHash?: unknown }).chunkSourceHash === 'string';
 }
 
+/**
+ * The active quarantine, replayed from the ledger (and the legacy snapshot
+ * before it). An entry is made only from a usable record
+ * (isUsableQuarantineRecord) and a usable generation (isUsableGenerationId),
+ * whichever event or snapshot carries them, and an exhaustion's record must
+ * carry the exhaustion's own key, which clears, alerts and checkpoints go
+ * by. An entry left out that way is no longer in the quarantine, so it no
+ * longer holds its chunk back: a chunk no other entry holds is tried again.
+ * The key of each ledger entry left out for that reason, and not in the
+ * quarantine through another event, goes into `dropped`, for the caller to
+ * name. A checkpoint, known by its kind, replaces what came before it with
+ * its list. One that holds no list holds no entry, so it replaces what came
+ * before it with nothing, and it goes into `unlisted` by its index in the
+ * ledger. Reading past it instead would bring back the legacy snapshot's
+ * records whose clears the checkpoint writer's redaction removed. The
+ * legacy snapshot is only read: the code that wrote it, replaced by the
+ * ledger the day it arrived, gave every record its chunk hash, so a record
+ * there without one is skipped as a keyless one always was.
+ */
+function projectCompressionQuarantineEvents(
+  events: CompressionQuarantineEvent[],
+  legacyRecords: CompressionRefusalQuarantineRecord[] = [],
+  dropped?: Set<string>,
+  unlisted?: Set<string>,
+): Map<string, ActiveCompressionQuarantine> {
+  const active = new Map<string, ActiveCompressionQuarantine>();
+  const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
+  for (const record of legacyRecords) {
+    if (!isUsableQuarantineRecord(record)) continue;
+    active.set(record.key, {
+      generationId: `legacy:${record.key}`,
+      record,
+      outcomes: [],
+      // The legacy implementation emitted its alert immediately after the
+      // snapshot write. Treat it as accounted to avoid surprise replay.
+      sentAlertKeys: new Set([record.key]),
+    });
+  }
+  for (const [index, event] of events.entries()) {
+    if (!event) continue;
+    // A checkpoint is known by its kind; its key isn't read.
+    if (event.kind === 'checkpoint') {
+      active.clear();
+      if (!Array.isArray(event.active)) {
+        unlisted?.add(`the ledger's checkpoint at index ${index}`);
+        continue;
+      }
+      for (const item of event.active) {
+        if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
+          const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
+          if (typeof key === 'string') dropped?.add(key);
+          continue;
+        }
+        active.set(item.record.key, {
+          generationId: item.generationId,
+          record: item.record,
+          outcomes: outcomeList(item.outcomes),
+          ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
+          sentAlertKeys: new Set(Array.isArray(item.sentAlertKeys) ? item.sentAlertKeys : []),
+        });
+      }
+      continue;
+    }
+    if (typeof event.key !== 'string') continue;
+    if (event.kind === 'claim') {
+      const generationId = event.eventId;
+      if (!generationId) continue;
+      legacyClaims.set(generationId, {
+        generationId,
+        record: event.record,
+        outcomes: [],
+        sentAlertKeys: new Set(),
+      });
+      continue;
+    }
+    if (event.kind === 'exhausted') {
+      // An exhaustion carries its record, or (in the format before the
+      // record moved onto it) targets the claim that does.
+      const own = Boolean(event.record);
+      const record = own
+        ? event.record
+        : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
+      const generationId = own ? event.eventId : event.targetClaimId;
+      if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
+        dropped?.add(event.key);
+        continue;
+      }
+      active.set(event.key, {
+        generationId,
+        record,
+        outcomes: outcomeList(event.outcomes),
+        sentAlertKeys: new Set<string>(),
+      });
+      continue;
+    }
+    const current = active.get(event.key);
+    if (!current || current.generationId !== event.targetClaimId) continue;
+    if (event.kind === 'clear') {
+      active.delete(event.key);
+    } else if (event.kind === 'alert_pending' && event.eventId) {
+      current.pendingAlert = { eventId: event.eventId, alertKey: event.alertKey };
+    } else if (event.kind === 'alert_sent') {
+      current.sentAlertKeys.add(event.alertKey);
+      if (current.pendingAlert?.eventId === event.pendingEventId) current.pendingAlert = undefined;
+    }
+  }
+  // A key a damaged event named can stand in the quarantine through an
+  // earlier or later usable one; only keys left out of it are named.
+  if (dropped) for (const key of dropped) if (active.has(key)) dropped.delete(key);
+  return active;
+}
+
+export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
+  holds(messageIds: readonly string[]): boolean;
+  dropped: string[];
+  unlisted: string[];
+} {
+  const dropped = new Set<string>();
+  const unlisted = new Set<string>();
+  const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
+  if (ledgerHoldsNoList) unlisted.add('the ledger');
+  if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
+  if (ledgerHoldsNoList && Array.isArray(legacy)) for (const record of legacy) if (isUsableQuarantineRecord(record)) dropped.add(record.key);
+  const active = projectCompressionQuarantineEvents(
+    Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
+    !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
+    dropped,
+    unlisted,
+  );
+  const hashes = new Set([...active.values()].map((entry) => entry.record.chunkSourceHash));
+  return { holds: (messageIds) => hashes.has(sha256Json([...messageIds])), dropped: [...dropped], unlisted: [...unlisted] };
+}
+
 /** A quarantine entry's outcomes as read back from the ledger: the objects in a list that carry a string `outcome`, and nothing else. */
 function outcomeList(value: unknown): CompressionRefusalOutcomeRecord[] {
   return Array.isArray(value)
@@ -1475,33 +1633,6 @@ interface KvUnifiedRebuilt {
 
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
-}
-
-/**
- * Sources as readers iterate them: a non-empty list of ids. Every index is
- * read, since `every` skips an empty slot of a sparse array, which the store
- * can't write.
- */
-function isIdList(ids: unknown): ids is string[] {
-  if (!Array.isArray(ids) || ids.length === 0) return false;
-  for (let i = 0; i < ids.length; i++) {
-    const id: unknown = ids[i];
-    if (typeof id !== 'string' || id.length === 0) return false;
-  }
-  return true;
-}
-
-/** A range as readers dereference it: its first and last message ids. */
-function isReadableRange(range: unknown): range is { first: string; last: string } {
-  const ends = range as { first?: unknown; last?: unknown } | null | undefined;
-  const first = ends?.first;
-  const last = ends?.last;
-  return typeof first === 'string' && first.length > 0 && typeof last === 'string' && last.length > 0;
-}
-
-/** Text a recall or a merge can carry. */
-function hasSummaryText(summary: SummaryEntry): boolean {
-  return typeof summary.content === 'string' && summary.content.trim().length > 0;
 }
 
 /**
@@ -1891,6 +2022,28 @@ function imageGroup(block: ContentBlock): unknown {
 }
 
 /**
+ * A summary getStrandedSummaries lists: alone in a run at its level that is
+ * neither the newest nor waiting (merge-runs.ts), so no merge can take it as
+ * the store stands (#334). `beside` names each hole of its level or below
+ * that parts it from the summaries of its level, looking past lower-level
+ * summaries on each side: a quarantined chunk (`compression-quarantine`, the
+ * quarantine record's key), the sources a quarantined merge holds
+ * (`merge-quarantine`, the record's key) or an operator hold (`hold`, the
+ * held summary's id), every one that stands at the first place on each side
+ * holding any (a summary both held and in one or more quarantined merges is
+ * named as each), with its `side` and the `level` of what it holds (0 for a
+ * chunk). It is empty when no such hole lies between it and the summaries
+ * beside it, as when what stands there is a summary of its level that
+ * already has a parent.
+ */
+export interface StrandedSummary {
+  id: string;
+  level: number;
+  tokens: number;
+  beside: Array<{ kind: 'compression-quarantine' | 'merge-quarantine' | 'hold'; id: string; side: 'before' | 'after'; level: number }>;
+}
+
+/**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
  * Recent context stays untouched.
@@ -1991,6 +2144,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _orphanWarned = false;
   /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
+  private mergePicksDeferred = false;
 
   /**
    * Failures of one request in one domain, the first and seven more each
@@ -2390,10 +2544,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Non-committing "what would the context look like at these settings".
+   * On the hierarchical path, which has no fold plan to preview, it throws
+   * `NoFoldPlanToPreviewError` when the select succeeds, and
+   * `ContextManager.previewContext` returns null for it; an over-budget
+   * select there is still reported as an infeasible preview.
    *
-   * Runs a dry-run select at `budget`, optionally with a scoped config swap for
-   * knobs that are otherwise recipe-and-restart only (tail, head window, chunk
-   * size, merge threshold, folding strategy...). Commits nothing: no resolution
+   * Runs a dry-run select at `budget`, with the select options it is given
+   * (`opts`, all but `dryRun`, which is always set, and `identity`, which
+   * nothing here reads), optionally with a scoped config swap for knobs that
+   * are otherwise recipe-and-restart only (tail, head window, chunk size,
+   * merge threshold, folding strategy...). Commits nothing: no resolution
    * persistence, no compression enqueue, no transition bookkeeping.
    *
    * Two things this deliberately does NOT do:
@@ -2414,7 +2574,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
@@ -2449,7 +2609,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       let rendered: ContextEntry[] | undefined;
       try {
-        const out = this.select(store, log, budget, { dryRun: true, thinkingBinding: opts?.thinkingBinding });
+        const { render: _render, ...selectOptions } = opts ?? {};
+        const out = this.select(store, log, budget, { ...selectOptions, dryRun: true });
         // Only retained on request: these are full rendered entries and can be
         // megabytes on a large store.
         if (opts?.render) rendered = out;
@@ -2489,12 +2650,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Cast on read: control-flow narrowing still has this pinned to
       // `undefined` from the reset above, but selectAdaptive fills it in.
       const preview = this._lastPreview as PreviewResult | undefined;
-      if (!preview) {
-        // selectHierarchical path: no picker, so no fold plan to preview.
-        throw new Error(
-          'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
-        );
-      }
+      // The hierarchical path has no picker, so no fold plan to preview.
+      if (!preview) throw new NoFoldPlanToPreviewError();
       // Segment breakdown for the hypothetical compile, which select() kept
       // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
@@ -2899,6 +3056,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.summaries = [];
     this.summaryIdCounter = 0;
     this.mergeQueue = [];
+    this.mergePicksDeferred = false;
     this.mergeQuarantine.clear();
     this.headWindowStartId = null;
     this._cachedHeadStartIndex = null;
@@ -3148,6 +3306,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.summaries = [];
       this.summaryIdCounter = 0;
       this.mergeQueue = [];
+      this.mergePicksDeferred = false;
       this.mergeQuarantine.clear();
       this.pins = [];
       this.pinIdCounter = 0;
@@ -3158,237 +3317,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     if (this.chunkPersistenceEnabled) {
-      const records = this.store.getStateJson(this.chunksStateId);
-      this.chunkRecords = (Array.isArray(records) ? (records as ChunkRecord[]) : [])
-        .filter(r => r && typeof r.id === 'string' && Array.isArray(r.sourceIds) && r.sourceIds.length > 0);
+      this.chunkRecords = loadedChunkRecords<ChunkRecord>(this.store.getStateJson(this.chunksStateId));
       this.chunkIdCounter = this.chunkRecords.reduce((max, r) => {
         const n = Number(r.id.replace(/^c-/, ''));
         return Number.isFinite(n) && n >= max ? n + 1 : max;
       }, 0);
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
-    const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
-    // Readers need a summary's text, its sources as a list of ids, and its
-    // range as two ids: the adaptive picker's L1 index iterates every L1's
-    // sources, recall dereferences the range's ends, and empty text can't be
-    // recalled or merged. One null `sourceIds` threw on every compile.
-    //
-    // Copies of one id are one summary. Before setMergedInto resolved its
-    // log slot by id, a merge could be written over a neighbour's slot,
-    // leaving duplicates whose merge state diverged. The summary keeps the
-    // text of a non-empty copy, preferring one whose pointer names a stored
-    // summary above it that lists it, and its first copy's position; its
-    // parent is resolved across all its copies below.
-    const copiesById = new Map<string, SummaryEntry[]>();
-    let malformed = 0;
-    for (const summary of loaded) {
-      if (!summary || typeof summary !== 'object') { malformed++; continue; }
-      const copies = copiesById.get(summary.id);
-      if (copies) copies.push(summary);
-      else copiesById.set(summary.id, [summary]);
-    }
-    const dupes = loaded.length - malformed - copiesById.size;
+    const loaded = Array.isArray(summaries) ? (summaries as unknown[]) : [];
+    const settled = settleStoredSummaries<SummaryEntry>(loaded, this.chunkRecords);
     // The counter starts past every summary id the store holds, dropped ones
     // included, and is stored when that raises it, before any repair below
     // removes a summary: no later open then mints a number the store has
     // used. A store whose counter an older version wrote can trail its ids.
     const counter = this.store.getStateJson(this.counterStateId);
-    const pastIds = [...copiesById.keys()].reduce((past, id) => {
-      const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
-      return Number.isFinite(n) && n >= past ? n + 1 : past;
-    }, 0);
+    const pastIds = summaryIdCounterPast(settled.storedIds);
     const storedCounter = typeof counter === 'number' ? counter : 0;
     this.summaryIdCounter = Math.max(storedCounter, pastIds);
     if (this.summaryIdCounter > storedCounter) {
       this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
       this.diag.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
     }
-
-    // A compressed chunk record names its L1 and holds the ordered message
-    // ids it gives that L1: the ids compression read, unless a repair has
-    // retargeted the record since. An uncompressed record proves nothing
-    // about a summary.
-    const chunkSources = new Map<string, string[]>();
-    for (const record of this.chunkRecords) {
-      if (record.compressed && record.summaryId && isIdList(record.sourceIds) &&
-          !chunkSources.has(record.summaryId)) {
-        chunkSources.set(record.summaryId, record.sourceIds);
-      }
-    }
-    const byId = new Map<string, SummaryEntry>();
-    const emptyIds: string[] = [];
-    const unreadableIds: string[] = [];
-    const rebuiltIds: string[] = [];
-    // Each dropped summary that holds text, as it was when dropped, with why:
-    // what the load-repair report names (loadRepairReport).
-    const textDrops = new Map<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>();
-    const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
-      typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
-        (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
-      );
-    for (const [id, copies] of copiesById) {
-      const withText = copies.filter(hasSummaryText);
-      let summary = withText.find((copy) => namesParent(copy, copy.parentId) || namesParent(copy, copy.mergedInto)) ?? withText[0];
-      if (!summary) { emptyIds.push(id); continue; }
-      if (summary.level === 1) {
-        // An L1's own sources, else its compressed chunk record's, else a
-        // copy's. Its range is their ends, which every L1 writer sets.
-        const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
-        if (!ids) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
-        const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
-        if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
-          summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
-          rebuiltIds.push(id);
-        }
-      } else if (!(isIdList(summary.sourceIds) && isReadableRange(summary.sourceRange))) {
-        // Above L1 a range's ends are message ids that the sources don't
-        // name, so sources and range come together from one copy.
-        const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
-        if (!donor) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
-        summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
-        rebuiltIds.push(id);
-      }
-      byId.set(id, summary);
-    }
-
-    // A summary above L1 is kept only while every summary it names is kept
-    // and sits below it, whatever removed one and whenever: earlier versions
-    // dropped empty summaries without their parents, and a parent naming a
-    // missing summary covers messages that are rendered, or compressed again,
-    // without it. A merge reads summaries below the one it writes, so a
-    // summary that lists one at its own level or above wasn't written from
-    // it, and two such summaries can list each other, each covering the
-    // other's messages. Repeat to a fixed point. Dropping costs the
-    // ancestors' text; their surviving sources merge again.
-    // A drop's reason comes from its sources' levels as loaded, so it doesn't
-    // depend on which summary the pass reaches first.
-    const ancestorIds: string[] = [];
-    const misplacedIds: string[] = [];
-    const loadedLevel = new Map([...copiesById].map(([id, copies]) => [id, (byId.get(id) ?? copies[0]!).level]));
-    const notBelow = (summary: SummaryEntry) =>
-      summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
-    const dropMissingAndMisplaced = (): void => {
-      for (let changed = true; changed;) {
-        changed = false;
-        for (const [id, summary] of byId) {
-          if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
-          byId.delete(id);
-          const misplaced = notBelow(summary);
-          (misplaced ? misplacedIds : ancestorIds).push(id);
-          textDrops.set(id, { summary, reason: misplaced ? 'names-not-below' : 'names-missing' });
-          changed = true;
-        }
-      }
-    };
-    dropMissingAndMisplaced();
-
-    // A summary has one parent: the first of its own pointers, then its other
-    // copies' (`parentId` before the older `mergedInto` in each, as readers
-    // take them), that names a kept summary above it listing it among its
-    // sources. A parent sits above its summary, so no two summaries can be
-    // each other's parent. Without such a pointer, the parent is the kept
-    // summary one level up that lists the summary, when exactly one does: a
-    // pointer can name a summary further up, such as a grandparent, or
-    // nothing, while the parent that covers the summary lists it, and
-    // clearing the pointer would render the summary beside that parent.
-    // `mergedInto`, which this strategy writes and its frontier reads, is set
-    // to the parent, and so is a `parentId` naming anything else, so every
-    // reader sees the one parent that renders the summary. With no parent,
-    // every pointer that isn't null is cleared, so the summary renders and
-    // merges again. A null pointer counts as none.
-    //
-    // A summary that lists one it isn't the parent of is dropped, and the
-    // summaries naming it go with it, as for any dropped summary. A summary
-    // above L1 covers the messages of each summary it lists, so a summary two
-    // kept summaries list has its messages covered twice, and hierarchical
-    // mode, which shows summaries that have no parent, renders both. Two
-    // instances on one store each write a merge of the same run where neither
-    // sees the other's pointers when it checks, as before merges read the
-    // store's summaries, or where a merge stopped between its summary and its
-    // pointers: the run's pointers name the merge written last, and the other
-    // is dropped. Where a crash split the pointers between the two, each
-    // lists a source whose parent is the other, so both are dropped. A
-    // summary that two list and whose pointers name neither has no parent, so
-    // both are dropped and it merges again. Each summary's parent is chosen
-    // before any of these drops, so what is dropped doesn't depend on which
-    // summary the pass reaches first. The cost: when the pass drops a
-    // summary's chosen parent for listing another summary, the summary's
-    // other listers go too, though one of them could have been its parent,
-    // and the summary merges again.
-    const reparentedIds: string[] = [];
-    const clearedIds: string[] = [];
-    const notParentIds: string[] = [];
-    const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
-      const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
-      return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
-    };
-    const listedBy = new Map<string, SummaryEntry[]>();
-    for (const summary of byId.values()) {
-      if (summary.level === 1) continue;
-      for (const sourceId of new Set(summary.sourceIds)) {
-        const listers = listedBy.get(sourceId);
-        if (listers) listers.push(summary);
-        else listedBy.set(sourceId, [summary]);
-      }
-    }
-    const parentOf = new Map<string, string | undefined>();
-    for (const summary of byId.values()) {
-      const pointers = [summary, ...copiesById.get(summary.id)!]
-        .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
-      const listers = (listedBy.get(summary.id) ?? []).filter((lister) => lister.level === summary.level + 1);
-      parentOf.set(summary.id, pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
-        (listers.length === 1 ? listers[0]!.id : undefined));
-    }
-    for (const [id, summary] of byId) {
-      if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
-        byId.delete(id);
-        notParentIds.push(id);
-        textDrops.set(id, { summary, reason: 'names-non-child' });
-      }
-    }
-    dropMissingAndMisplaced();
-    this.summaries = [...byId.values()].map((summary) => {
-      // A parent chosen above is the one kept summary that still lists this
-      // one; where the drops took it, nothing kept lists this one.
-      const chosen = parentOf.get(summary.id);
-      const parent = chosen !== undefined && byId.has(chosen) ? chosen : undefined;
-      let repaired = summary;
-      const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
-      if (parent === undefined) {
-        for (const field of ['parentId', 'mergedInto'] as const) {
-          const own = summary[field] as unknown;
-          if (own === undefined || own === null) continue;
-          delete edit()[field];
-        }
-        if (repaired !== summary) clearedIds.push(summary.id);
-        return repaired;
-      }
-      if (summary.mergedInto !== parent) edit().mergedInto = parent;
-      const ownParentId = summary.parentId as unknown;
-      if (ownParentId !== undefined && ownParentId !== null && ownParentId !== parent) edit().parentId = parent;
-      if (repaired !== summary) reparentedIds.push(summary.id);
-      return repaired;
-    });
-    const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
-    const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
-    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
-        reparentedIds.length > 0 || clearedIds.length > 0) {
+    this.summaries = settled.summaries;
+    if (settlingRepaired(settled)) {
       // Read before the write, which moves the branch's sequence past the
       // summaries as they were. A repair that dropped only empty summaries,
       // or none, lost no text and has no report: its line below says it all.
-      const report = textDrops.size > 0
-        ? this.loadRepairReport(this.store, [...copiesById.keys()], textDrops, emptyIds.length)
+      const report = settled.textDrops.size > 0
+        ? this.loadRepairReport(this.store, settled.storedIds, settled.textDrops, settled.emptyIds.length)
         : undefined;
       this.store.setStateJson(this.summariesStateId, this.summaries);
-      this.diag.warn(
-        `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
-          `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
-          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}], ` +
-          `naming one it isn't the parent of [${notParentIds.join(', ')}]; ` +
-          `rebuilt sources or range of ` +
-          `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
-          `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
-      );
+      this.diag.warn(`[autobiographical] ${settleRepairLine(settled)}`);
       if (report) this.deliverLoadRepair(report);
     }
 
@@ -3396,21 +3355,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // that chunk compressible again instead of leaving it permanently marked
     // complete with no summary behind it.
     if (this.chunkPersistenceEnabled && this.chunkRecords.length > 0) {
-      const validL1Ids = new Set(this.summaries.filter(s => s.level === 1).map(s => s.id));
-      let repairedChunkRecords = 0;
-      this.chunkRecords = this.chunkRecords.map((record) => {
-        if (!record.compressed || (record.summaryId && validL1Ids.has(record.summaryId))) {
-          return record;
-        }
-        repairedChunkRecords++;
-        const { summaryId: _dropped, ...rest } = record;
-        return { ...rest, compressed: false };
-      });
-      if (repairedChunkRecords > 0) {
+      const { records, released } = releaseUnsummarizedRecords(this.chunkRecords, this.summaries);
+      this.chunkRecords = records;
+      if (released > 0) {
         this.store.setStateJson(this.chunksStateId, this.chunkRecords);
-        this.diag.warn(
-          `[autobiographical] repaired ${repairedChunkRecords} chunk record(s) with missing L1 summaries`,
-        );
+        this.diag.warn(`[autobiographical] ${releasedRecordsLine(released)}`);
       }
     }
 
@@ -3455,8 +3404,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // A queued merge is kept only while it is an entry whose sources are kept
     // summaries, as for a summary above L1.
+    const keptIds = new Set(this.summaries.map((summary) => summary.id));
     const validMergeQueue = this.mergeQueue.filter(
-      merge => merge && isIdList(merge.sourceIds) && merge.sourceIds.every((sourceId) => byId.has(sourceId)),
+      merge => merge && isIdList(merge.sourceIds) && merge.sourceIds.every((sourceId) => keptIds.has(sourceId)),
     );
     if (validMergeQueue.length !== this.mergeQueue.length) {
       const removed = this.mergeQueue.length - validMergeQueue.length;
@@ -4788,118 +4738,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The active quarantine, replayed from the ledger (and the legacy snapshot
-   * before it). An entry is made only from a usable record
-   * (isUsableQuarantineRecord) and a usable generation (isUsableGenerationId),
-   * whichever event or snapshot carries them, and an exhaustion's record must
-   * carry the exhaustion's own key, which clears, alerts and checkpoints go
-   * by. An entry left out that way is no longer in the quarantine, so it no
-   * longer holds its chunk back: a chunk no other entry holds is tried again.
-   * The key of each ledger entry left out for that reason, and not in the
-   * quarantine through another event, goes into `dropped`, for the caller to
-   * name. A checkpoint, known by its kind, replaces what came before it with
-   * its list. One that holds no list holds no entry, so it replaces what came
-   * before it with nothing, and it goes into `unlisted` by its index in the
-   * ledger. Reading past it instead would bring back the legacy snapshot's
-   * records whose clears the checkpoint writer's redaction removed. The
-   * legacy snapshot is only read: the code that wrote it, replaced by the
-   * ledger the day it arrived, gave every record its chunk hash, so a record
-   * there without one is skipped as a keyless one always was.
-   */
-  private projectCompressionQuarantineEvents(
-    events: CompressionQuarantineEvent[],
-    legacyRecords: CompressionRefusalQuarantineRecord[] = [],
-    dropped?: Set<string>,
-    unlisted?: Set<string>,
-  ): Map<string, ActiveCompressionQuarantine> {
-    const active = new Map<string, ActiveCompressionQuarantine>();
-    const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
-    for (const record of legacyRecords) {
-      if (!isUsableQuarantineRecord(record)) continue;
-      active.set(record.key, {
-        generationId: `legacy:${record.key}`,
-        record,
-        outcomes: [],
-        // The legacy implementation emitted its alert immediately after the
-        // snapshot write. Treat it as accounted to avoid surprise replay.
-        sentAlertKeys: new Set([record.key]),
-      });
-    }
-    for (const [index, event] of events.entries()) {
-      if (!event) continue;
-      // A checkpoint is known by its kind; its key isn't read.
-      if (event.kind === 'checkpoint') {
-        active.clear();
-        if (!Array.isArray(event.active)) {
-          unlisted?.add(`the ledger's checkpoint at index ${index}`);
-          continue;
-        }
-        for (const item of event.active) {
-          if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
-            const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
-            if (typeof key === 'string') dropped?.add(key);
-            continue;
-          }
-          active.set(item.record.key, {
-            generationId: item.generationId,
-            record: item.record,
-            outcomes: outcomeList(item.outcomes),
-            ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
-            sentAlertKeys: new Set(Array.isArray(item.sentAlertKeys) ? item.sentAlertKeys : []),
-          });
-        }
-        continue;
-      }
-      if (typeof event.key !== 'string') continue;
-      if (event.kind === 'claim') {
-        const generationId = event.eventId;
-        if (!generationId) continue;
-        legacyClaims.set(generationId, {
-          generationId,
-          record: event.record,
-          outcomes: [],
-          sentAlertKeys: new Set(),
-        });
-        continue;
-      }
-      if (event.kind === 'exhausted') {
-        // An exhaustion carries its record, or (in the format before the
-        // record moved onto it) targets the claim that does.
-        const own = Boolean(event.record);
-        const record = own
-          ? event.record
-          : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
-        const generationId = own ? event.eventId : event.targetClaimId;
-        if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
-          dropped?.add(event.key);
-          continue;
-        }
-        active.set(event.key, {
-          generationId,
-          record,
-          outcomes: outcomeList(event.outcomes),
-          sentAlertKeys: new Set<string>(),
-        });
-        continue;
-      }
-      const current = active.get(event.key);
-      if (!current || current.generationId !== event.targetClaimId) continue;
-      if (event.kind === 'clear') {
-        active.delete(event.key);
-      } else if (event.kind === 'alert_pending' && event.eventId) {
-        current.pendingAlert = { eventId: event.eventId, alertKey: event.alertKey };
-      } else if (event.kind === 'alert_sent') {
-        current.sentAlertKeys.add(event.alertKey);
-        if (current.pendingAlert?.eventId === event.pendingEventId) current.pendingAlert = undefined;
-      }
-    }
-    // A key a damaged event named can stand in the quarantine through an
-    // earlier or later usable one; only keys left out of it are named.
-    if (dropped) for (const key of dropped) if (active.has(key)) dropped.delete(key);
-    return active;
-  }
-
-  /**
    * The quarantine, read from the store. A ledger or legacy snapshot whose
    * value isn't a list holds no entry the strategy can use, so it's read as
    * holding nothing, as a ledger that isn't a list always was, and named
@@ -4918,7 +4756,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
     if (ledgerHoldsNoList) unlisted.add('the ledger');
     if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
-    const active = this.projectCompressionQuarantineEvents(
+    const active = projectCompressionQuarantineEvents(
       Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
       !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
       dropped,
@@ -6500,10 +6338,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * valid groups too.
    */
   protected mergeRecordHolds(record: MergeQuarantineRecord, position: ReadonlyMap<MessageId, number>): boolean {
-    if (record.lastOutcome === 'topology_violation') return false;
-    if (!mergeRecordStands(record, (id) => this.summaryById(id))) return false;
-    const sources = record.sourceIds.map((id) => this.summaryById(id)!);
-    return this.mergeTopologyProblem(record.level, sources, position) === null;
+    return mergeRecordHoldsIn(record, (id) => this.summaryById(id), getSummaryParentId, position,
+      (level, sources, at) => this.mergeTopologyProblem(level, sources, at));
   }
 
   /**
@@ -6512,6 +6348,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[]; attempts?: number } | undefined {
     this.requireBranchMutation('dequeueMerge');
     const merge = this.mergeQueue.shift();
+    if (merge && this.landsAsPlanned()) this.mergePicksDeferred = true;
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
     return merge;
   }
@@ -6708,24 +6545,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sources: readonly SummaryEntry[],
     position: ReadonlyMap<MessageId, number>,
   ): SummaryEntry[][] {
-    const placed: Array<{ s: SummaryEntry; first: number; last: number }> = [];
-    for (const s of sources) {
-      const a = position.get(s.sourceRange.first);
-      const b = position.get(s.sourceRange.last);
-      if (a === undefined || b === undefined) continue;
-      placed.push({ s, first: Math.min(a, b), last: Math.max(a, b) });
-    }
-    placed.sort((x, y) => x.first - y.first);
-    const runs: SummaryEntry[][] = [];
-    let run: SummaryEntry[] = [];
-    let end = -Infinity;
-    for (const p of placed) {
-      if (run.length > 0 && p.first !== end + 1) { runs.push(run); run = []; }
-      run.push(p.s);
-      end = Math.max(end, p.last);
-    }
-    if (run.length > 0) runs.push(run);
-    return runs;
+    return adjacentRuns(sources, position);
   }
 
   /** Why this group must not be merged into an L{targetLevel}, or null when it may. */
@@ -6734,22 +6554,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sources: readonly SummaryEntry[],
     position: ReadonlyMap<MessageId, number>,
   ): string | null {
-    if (sources.length < 2) return `${sources.length} source(s); a merge needs at least two`;
-    const wrongLevel = sources.filter((s) => s.level !== targetLevel - 1);
-    if (wrongLevel.length > 0) {
-      return `source level mismatch: ${wrongLevel.map((s) => `${s.id}=L${s.level}`).join(',')} for an L${targetLevel} merge`;
-    }
-    const unplaced = sources.filter((s) =>
-      position.get(s.sourceRange.first) === undefined || position.get(s.sourceRange.last) === undefined);
-    if (unplaced.length > 0) {
-      return `source position unresolved (range endpoints neither in the store listing nor owned by a chunk): ${unplaced.map((s) => s.id).join(',')}`;
-    }
-    const runs = this.contiguousSourceRuns(sources, position);
-    if (runs.length !== 1) {
-      return `sources are not adjacent in store order: ` +
-        runs.map((r) => `[${r.map((s) => `${s.id}(${s.sourceRange.first}..${s.sourceRange.last})`).join(',')}]`).join(' | ');
-    }
-    return null;
+    return mergeGroupProblem(targetLevel, sources, position, (group, at) => this.contiguousSourceRuns(group, at));
   }
 
   /** The merge is never executed: no model call, the group stays unmerged,
@@ -6899,24 +6704,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.mergeQueue.length === 0) return;
     const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
-    const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
-      if (merge.sourceIds.length < 2) return false;
-      let previousEnd: number | null = null;
-      for (const sourceId of merge.sourceIds) {
-        const source = byId.get(sourceId);
-        if (
-          !source ||
-          source.level !== merge.level - 1 ||
-          getSummaryParentId(source)
-        ) return false;
-        const first = position.get(source.sourceRange.first);
-        const last = position.get(source.sourceRange.last);
-        if (first === undefined || last === undefined || last < first) return false;
-        if (previousEnd !== null && first !== previousEnd + 1) return false;
-        previousEnd = last;
-      }
-      return true;
-    };
+    const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean =>
+      queuedMergeRuns(merge, byId, getSummaryParentId, position);
     const before = this.mergeQueue.length;
     this.mergeQueue = this.mergeQueue.filter(valid);
     if (this.mergeQueue.length === before) return;
@@ -7138,12 +6927,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    it up.
    *
    *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
-   *    range. We gather unmerged L_{n-1} summaries by
-   *    `enqueueMergeForRange`'s rule (a source counts when either of its
-   *    ends lies in the range; with a range end that has no position, every
-   *    source counts), de-duplicated against entries already in
-   *    `mergeQueue`, and enqueue a merge over the first `mergeThreshold` of
-   *    their longest contiguous run. The merge fires on the next `tick()`.
+   *    range, which `enqueueMergeForRange` queues. The merge fires on the
+   *    next `tick()`.
    *
    * The handler is conservative: it never enqueues a singleton or empty
    * merge, and it never re-enqueues an id that's already pending. That
@@ -7213,8 +6998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (ch) candidates.add(ch);
       }
     }
-    const holdback = this.config.l1HoldbackChunks ?? 1;
-    const holdbackCutoff = this.chunks.length - holdback;
+    const heldBack = opts?.speculative ? this.heldBackChunks(this.config.l1HoldbackChunks ?? 1) : new Set<number>();
     let pushed = false;
     for (const chunk of candidates) {
       if (chunk.compressed) continue;
@@ -7225,8 +7009,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // chunk demanded, and it must not punch through the holdback window
         // that protects the newest closed chunks while they're in motion.
         if (
-          holdback > 0 &&
-          chunk.index >= holdbackCutoff &&
+          heldBack.has(chunk.index) &&
           !(lastId !== undefined && this._demandedL1Chunks.has(lastId))
         ) {
           continue;
@@ -7245,15 +7028,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (pushed) this.orderCompressionQueue();
   }
 
-  /**
-   * Enqueue an L_{targetLevel} merge over unmerged L_{targetLevel-1}
-   * summaries whose source ranges reach into [firstMsgId..lastMsgId]: a
-   * source counts when either of its ends lies in the range. With a range
-   * end neither in the store listing nor owned by a chunk, which has no
-   * position, every source counts.
-   * No-op if fewer than 2 viable sources are available (a singleton merge
-   * would just rename a summary without consolidating).
-   */
   protected enqueueMergeForRange(
     targetLevel: number,
     firstMsgId: MessageId,
@@ -7261,6 +7035,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): void {
     this.requireBranchMutation('enqueueMergeForRange');
     const sourceLevel = targetLevel - 1;
+    const N = this.config.mergeThreshold ?? 6;
 
     // IDs already enqueued at this target level.
     const queuedAtLevel = new Set<string>();
@@ -7283,6 +7058,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const [lo, hi] = firstSeq <= lastSeq ? [firstSeq, lastSeq] : [lastSeq, firstSeq];
       return s >= lo && s <= hi;
     };
+    const reaches = (s: SummaryEntry): boolean => inRange(s.sourceRange.first) || inRange(s.sourceRange.last);
 
     const held = this.mergeHeldSourceIds(messageOrder);
     const sources: SummaryEntry[] = [];
@@ -7291,10 +7067,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (getSummaryParentId(s)) continue;
       if (queuedAtLevel.has(s.id)) continue;
       if (held.has(s.id)) continue;
-      if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
+      if (!reaches(s)) continue;
       sources.push(s);
     }
-    if (sources.length < 2) return;
+    if (sources.length < 2 && N < 2) return;
+
+    if (N >= 2) {
+      const unmerged = this.summaries.filter((s) => s.level === sourceLevel && !getSummaryParentId(s) && !queuedAtLevel.has(s.id));
+      const { runs } = runsAtLevel(this.mergeRunsInput(messageOrder), sourceLevel, unmerged);
+      let best: SummaryEntry[] | undefined;
+      for (const run of runs) {
+        for (const group of runGroups(run, N, true)) {
+          if (group.length >= 2 && group.length > (best?.length ?? 1) && group.some(reaches)) best = group;
+        }
+      }
+      if (best) {
+        this.enqueueMerge({ level: targetLevel as SummaryLevel, sourceIds: best.map((s) => s.id) });
+        return;
+      }
+      if (sources.length >= 2 && !this.contiguousSourceRuns(sources, messageOrder).some((r) => r.length >= 2)) {
+        this.diag.warn(
+          `[autobiographical] demand L${targetLevel} merge over ${sources.length} source(s) in ` +
+            `${firstMsgId}..${lastMsgId} has no contiguous pair; nothing enqueued`,
+        );
+      }
+      return;
+    }
 
     // The demand path used to take whatever unmerged sources fell inside the
     // range, holes included (issue #95): a source whose neighbour's L1 had
@@ -7317,7 +7115,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `${run.map((s) => s.id).join(',')}; ${left.join(',')} wait for contiguous neighbours`,
       );
     }
-    const N = this.config.mergeThreshold ?? 6;
     const toMerge = run.slice(0, N);
     this.enqueueMerge({
       level: targetLevel as SummaryLevel,
@@ -7508,9 +7305,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * head, on a hold over its sources, or through calls that fail and retry.
    *
    * With no L1 merge queued, no merge the cap could wait for is coming, so it
-   * holds nothing (issue #240). Threshold selection forms no merge below
-   * `mergeThreshold` unmerged L1s, which a cap below `mergeThreshold - 1`
-   * stopped short of.
+   * holds nothing (issue #240).
    * L1s that can't merge count toward the cap: a pruned source, the wide-span
    * quarantine, a lone interior summary, or a held one (mergeHeldSourceIds: an
    * operator hold, or a group a merge-quarantine record holds out of merges).
@@ -7747,6 +7542,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
       if (!quarantineSkipped) return;
+    }
+
+    if (this.mergePicksDeferred) {
+      this.mergePicksDeferred = false;
+      this.checkMergeThreshold();
     }
 
     // Priority 2: Execute pending merges (hierarchical only)
@@ -8126,9 +7926,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * an invisible failure. This method makes the interest visible.
    *
    * States:
-   * - `healthy`  — no quarantines; no closed chunk has waited > 1h.
-   * - `degraded` — any quarantine record exists, or the oldest closed-but-
-   *                uncompressed chunk has waited > 1h.
+   * - `healthy`  — no quarantines; no pending chunk has waited > 1h.
+   * - `degraded` — any quarantine record exists, or the oldest pending
+   *                chunk has waited > 1h.
+   *
+   * A pending chunk is a closed chunk still uncompressed, but for the chunks
+   * the L1 holdback keeps back (`l1HoldbackChunks`, heldBackChunks), unless a
+   * fold demanded one, which the holdback then no longer keeps from the
+   * queue. A chunk the rebuild keeps out of the queue for a held message or
+   * an overlap block is pending unless the holdback keeps it back, as before:
+   * nothing queues it while that lasts. `pendingChunks` counts them, and
+   * their ages decide the state above.
    * - `critical` — the oldest pending chunk has waited > 6h AND there is a
    *                quarantine or a 5+ chunk backlog: the organ is not
    *                recovering on its own; an operator is needed. Also while
@@ -8170,8 +7978,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * it logs a failure it meets, and no recovery from a failure that only an
    * earlier load met.
    *
-   * The OPEN frontier chunk (still accumulating messages) is not debt and
-   * is excluded. Ages derive from the newest message inside the oldest
+   * The open frontier (messages still accumulating, never a chunk record)
+   * and the chunks the holdback keeps back are not debt and are excluded.
+   * Ages derive from the newest message inside the oldest
    * pending chunk — chunk records carry no timestamps of their own.
    * It changes nothing but its note of the failure it last logged and what
    * its read of the ledger names once per load, with that read's warn line,
@@ -8211,8 +8020,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
     try {
-      // Exclude the trailing open chunk: it is life, not debt.
-      const closed = this.chunks.filter((c, i) => !(i === this.chunks.length - 1 && !c.compressed));
+      const liveEdge = this.heldBackChunks(this.config.l1HoldbackChunks ?? 1);
+      const keptBack = (c: Chunk, i: number): boolean => {
+        if (c.compressed || !liveEdge.has(i)) return false;
+        const lastId = c.messages[c.messages.length - 1]?.id;
+        return !(lastId !== undefined && this._demandedL1Chunks.has(lastId));
+      };
+      const closed = this.chunks.filter((c, i) => !keptBack(c, i));
       const pending = closed.filter((c) => !c.compressed);
       // Chronicle timestamps may be µs; normalize to ms defensively.
       const toMs = (t: number): number => (t > 1e14 ? t / 1000 : t);
@@ -8317,6 +8131,116 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         topologyRefusals: null,
       };
     }
+  }
+
+  /**
+   * The summaries no merge can take as the store stands (#334), and their
+   * tokens together: at each level the merge check reads, a summary alone in
+   * a run that is neither the newest nor waiting (merge-runs.ts), so the
+   * grouping never offers it. Each names the holes beside it (StrandedSummary).
+   * A summary no run holds, because its source positions are unresolved or its
+   * span is too wide for its level, is frontier debt, which the merge check
+   * warns about once, and isn't listed. A stray beside a hole may merge once
+   * the hole fills: at its own level with what lands there, as an interior
+   * pair if nothing else does, or, for a hole below its level, only if what
+   * lands there merges up beside it. One that stays, or that has no hole
+   * beside it, needs
+   * `repair-topology --mode rebuild` to give it partners. It reads the
+   * compression quarantine ledger afresh to name the quarantined chunks a
+   * stray stands beside.
+   *
+   * Its cost grows with the store, since it places every message, where
+   * getCompressionDebt places none: read it when the list is wanted, such as
+   * in an audit, rather than on every request. When the ledger can't be
+   * read, or no store is open, or the list itself fails, `summaries` and
+   * `tokens` are null and `error` says why. Never throws.
+   */
+  getStrandedSummaries(): { summaries: StrandedSummary[]; tokens: number } | { summaries: null; tokens: null; error: string } {
+    let quarantined: ReadonlyMap<string, ActiveCompressionQuarantine>;
+    if (!this.store) return { summaries: null, tokens: null, error: strandedNoStoreMessage() };
+    try {
+      quarantined = this.readCompressionQuarantineProjection();
+    } catch (error) {
+      return { summaries: null, tokens: null, error: compressionQuarantineUnreadableMessage(error) };
+    }
+    try {
+      const summaries = this.strandedSummaries(quarantined);
+      return { summaries, tokens: summaries.reduce((n, x) => n + x.tokens, 0) };
+    } catch (thrown) {
+      return { summaries: null, tokens: null, error: strandedSummariesFailedMessage(thrown) };
+    }
+  }
+
+  private strandedSummaries(quarantined: ReadonlyMap<string, ActiveCompressionQuarantine>): StrandedSummary[] {
+    const order = this.mergePositionIndex();
+    const byId = new Map(this.summaries.map((s) => [s.id, s] as const));
+    const held = this.mergeHeldSourceIds(order);
+    const queued = new Set<string>();
+    for (const m of this.mergeQueue) if (queuedMergeRuns(m, byId, getSummaryParentId, order, held)) for (const id of m.sourceIds) queued.add(id);
+    const input = { ...this.mergeRunsInput(order), queued, planning: false };
+    let top = 2;
+    if (this.config.speculativeProduction) for (const s of this.summaries) top = Math.max(top, s.level ?? 1);
+    const strays: Array<{ s: SummaryEntry; first: number; last: number }> = [];
+    for (const { runs } of mergeRunsByLevel(input, top).values()) strays.push(...strandedIn(runs));
+    if (strays.length === 0) return [];
+
+    const holes: Array<{ first: number; last: number; level: number; beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> = [];
+    if (quarantined.size > 0) {
+      const byHash = new Map(this.chunks.filter((chunk) => !chunk.compressed)
+        .map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk] as const));
+      for (const [key, active] of quarantined) {
+        const hash = (active as { record?: { chunkSourceHash?: unknown } }).record?.chunkSourceHash;
+        const chunk = typeof hash === 'string' ? byHash.get(hash) : undefined;
+        let first = Infinity;
+        let last = -Infinity;
+        for (const { id } of chunk?.messages ?? []) {
+          const at = order.get(id);
+          if (at === undefined) continue;
+          first = Math.min(first, at);
+          last = Math.max(last, at);
+        }
+        if (first <= last) holes.push({ first, last, level: 0, beside: { kind: 'compression-quarantine', id: key } });
+      }
+    }
+    const operatorHeld = new Set(this.config.mergeHoldSummaryIds ?? []);
+    const holding = [...this.mergeQuarantine.values()].filter((record) => this.mergeRecordHolds(record, order));
+    for (const id of input.held) {
+      const held = this.summaryById(id);
+      if (!held || getSummaryParentId(held) || typeof held.level !== 'number') continue;
+      const at = placeOf(held, order);
+      if (!at) continue;
+      if (operatorHeld.has(id)) holes.push({ first: at[0], last: at[1], level: held.level, beside: { kind: 'hold', id } });
+      for (const record of holding) {
+        if (record.sourceIds.includes(id)) holes.push({ first: at[0], last: at[1], level: held.level, beside: { kind: 'merge-quarantine', id: record.key } });
+      }
+    }
+    const from = new Map<number, { to: number; level: number }>();
+    const to = new Map<number, { from: number; level: number }>();
+    for (const s of this.summaries) {
+      if (getSummaryParentId(s)) continue;
+      const at = placeOf(s, order);
+      if (!at) continue;
+      const level = typeof s.level === 'number' ? s.level : Number.POSITIVE_INFINITY;
+      from.set(at[0], { to: at[1], level });
+      to.set(at[1], { from: at[0], level });
+    }
+    const out: StrandedSummary[] = [];
+    for (const { s, first, last } of strays) {
+      const level = s.level ?? 1;
+      const walk = (start: number, step: 1 | -1): StrandedSummary['beside'] => {
+        let at = start;
+        for (;;) {
+          const here = holes.filter((h) => h.level <= level && h.first <= at && at <= h.last);
+          if (here.length > 0) return here.map((h) => ({ ...h.beside, side: step === 1 ? 'after' : 'before', level: h.level }));
+          const lower = step === 1 ? from.get(at) : to.get(at);
+          if (!lower || lower.level >= level) return [];
+          at = (step === 1 ? (lower as { to: number }).to : (lower as { from: number }).from) + step;
+        }
+      };
+      const beside = [...walk(first - 1, -1), ...walk(last + 1, 1)];
+      out.push({ id: s.id, level, tokens: s.tokens ?? 0, beside });
+    }
+    return out;
   }
 
   /** Logs a debt report that couldn't read something, once: when one first fails,
@@ -11533,9 +11457,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Check if unmerged summary counts exceed the merge threshold.
-   * Enqueues merge operations if so.
-   *
    * Skips L1s/L2s that are already in a pending merge — without this guard,
    * each new summary above threshold re-enqueues a merge for the same
    * already-eligible siblings, producing N near-identical higher-level
@@ -11556,8 +11477,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * record-owned material is a different representation and cannot be folded
    * into this parent); exclude candidates whose OWN span exceeds the
    * level-scaled `mergeMaxSourceSpanMessages` limit (replay-era wide-span
-   * summaries would bridge anything they join); merge the oldest run that
-   * still has `threshold` members.
+   * summaries would bridge anything they join).
    */
 
   /**
@@ -11627,109 +11547,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return spans;
   }
 
+  protected mergeRunsInput(position: Map<MessageId, number> = this.mergePositionIndex()): StoreRunsInput<SummaryEntry> {
+    const queued = new Set<string>();
+    for (const m of this.mergeQueue) for (const id of m.sourceIds) queued.add(id);
+    return {
+      summaries: this.summaries,
+      parentOf: getSummaryParentId,
+      queued,
+      position,
+      held: this.mergeHeldSourceIds(position),
+      pending: this.pendingRetrySpans(position).map(([first, last, level]): PendingFill => ({ first, last, level })),
+      spanBase: this.config.mergeMaxSourceSpanMessages ?? 1500,
+      mergeK: this.config.mergeThreshold ?? 6,
+      planning: this.landsAsPlanned(),
+    };
+  }
+
   protected contiguousMergeCandidates(
     unmerged: SummaryEntry[],
     threshold: number,
   ): SummaryEntry[] | null {
-    if (unmerged.length < threshold) return null;
+    if (unmerged.length === 0) return null;
     // Store order, not chunk-record order: a chunk minted late over an early
     // message (issue #122's head ratchet) is adjacent to the frontier in
     // record order and to the chronicle's opening in store order.
-    const messageOrder = this.mergePositionIndex();
-    const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
-    const mergeK = this.config.mergeThreshold ?? 6;
-    const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
-    // Held summaries (mergeHeldSourceIds: operator holds, and the sources a
-    // merge-quarantine record holds out) leave a hole: the runs split there
-    // and merge on each side, while the klaxon names a quarantined merge's
-    // record and the debt report lists operator holds. `heldEnd` is the last
-    // position a held summary reaches: a run that ends before it can't grow
-    // past the hole.
-    const held = this.mergeHeldSourceIds(messageOrder);
-    let heldEnd = -Infinity;
-    const heldFirsts: number[] = [];
-    for (const s of unmerged) {
-      const first = messageOrder.get(s.sourceRange.first);
-      const last = messageOrder.get(s.sourceRange.last);
-      if (first === undefined || last === undefined) {
-        // Pruned/missing source messages: the candidate can NEVER merge.
-        // This was a silent drop (rev-5 review: "frontier debt, no log").
-        this.warnMergeExclusion(
-          s.id,
-          `L${s.level} ${s.id}: source position unresolved (pruned or hidden source messages?) — permanently unmergeable, frontier debt`,
-        );
-        continue;
-      }
-      if (held.has(s.id)) {
-        heldEnd = Math.max(heldEnd, first, last);
-        heldFirsts.push(Math.min(first, last));
-        continue;
-      }
-      // Wide-span quarantine, scaled by level. Legitimate spans grow ~k× per
-      // level, so a FLAT limit silently forbids all consolidation above the
-      // level where it matches a healthy node's span: mythos 2026-08 — every
-      // L4 spans 3.0k–6.9k messages > 1500, so an L5 was structurally
-      // impossible at any store state and the fold floor sat ~23k above
-      // where one L5 puts it. The damage signature this guard exists for
-      // (replay-era bridge summaries, 2026-07-12) is "wide FOR ITS LEVEL",
-      // not absolute width. Limits for L1–L3 are unchanged from the flat
-      // default; L4 gets base×k, L5 base×k², …
-      const spanLimit = spanBase * Math.pow(mergeK, Math.max(0, (s.level ?? 1) - 3));
-      const span = Math.abs(last - first);
-      if (span > spanLimit) {
-        this.warnMergeExclusion(
-          s.id,
-          `L${s.level} ${s.id}: wide-span quarantine — span ${span} msgs > limit ${spanLimit} (base ${spanBase} × ${mergeK}^${Math.max(0, (s.level ?? 1) - 3)})`,
-        );
-        continue;
-      }
-      withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
-    }
-    withPos.sort((a, b) => a.first - b.first);
-
-    // Split into strictly contiguous live runs. Deleted messages do not occupy
-    // positions in `messageOrder`, so this still bridges true tombstones; a
-    // run splits wherever a listed message stands between two sources, owned
-    // by another summary or by none (mergePositionIndex). A hole that
-    // work put back after a failure will fill at this level (pendingRetrySpans)
-    // isn't stranded: the run before it waits, as the newest run does. A run
-    // can grow only up to the next run or the first held summary after it,
-    // whichever comes first, so it waits only for a retry pending before that.
-    let retrySpans: Array<[number, number, number]> | undefined;
-    const retryPendingIn = (from: number, to: number, level: number): boolean => {
-      retrySpans ??= this.pendingRetrySpans(messageOrder);
-      return retrySpans.some(([first, last, filled]) => filled <= level && first <= to && last >= from);
-    };
-    heldFirsts.sort((a, b) => a - b);
-    const waitsFor = (end: number, next: number, level: number): boolean => {
-      const bound = Math.min(next, heldFirsts.find((p) => p > end) ?? Infinity) - 1;
-      return bound > end && retryPendingIn(end + 1, bound, level);
-    };
-    const runs: Array<typeof withPos> = [];
-    const waiting: boolean[] = [];
-    let run: typeof withPos = [];
-    let runEnd = -Infinity;
-    for (const x of withPos) {
-      if (run.length > 0 && x.first !== runEnd + 1) {
-        runs.push(run);
-        waiting.push(waitsFor(runEnd, x.first, x.s.level ?? 1));
-        run = [];
-        runEnd = -Infinity;
-      }
-      run.push(x);
-      runEnd = Math.max(runEnd, x.last);
-    }
-    if (run.length > 0) {
-      runs.push(run);
-      // The newest run waits for no retry, unless a held summary follows it.
-      waiting.push(heldEnd > runEnd && waitsFor(runEnd, Infinity, run[0]!.s.level ?? 1));
-    }
-    if (runs.length === 0) return null;
-    // A run that ends before a held summary can't grow past the hole, so it
-    // isn't the newest: an empty run after it keeps it interior, and it
-    // consolidates at two as an interior run does. `runEnd` is still the last
-    // run's end.
-    if (heldEnd > runEnd) runs.push([]);
+    const level = unmerged[0]!.level ?? 1;
+    const { runs, excluded }: LevelRuns<SummaryEntry> = runsAtLevel(this.mergeRunsInput(), level, unmerged);
+    for (const { id, detail } of excluded) this.warnMergeExclusion(id, detail);
+    if (threshold < 2) return runs.length > 0 ? runs[0]!.members.slice(0, threshold).map((x) => x.s) : null;
 
     // ONLY THE NEWEST RUN CAN GROW (2026-07-12 starvation fix). Summaries are
     // produced at the live end, so an INTERIOR run is stranded: it can never
@@ -11749,18 +11594,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // L1 merge is queued to bring the count back down (speculativeCapHolds),
     // so the retry that fills the hole comes once the count is back under
     // the cap or no L1 merge is left queued.
-    for (let i = 0; i < runs.length; i++) {
-      const r = runs[i]!;
-      const isNewest = i === runs.length - 1;
-      if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
-      if (!isNewest && !waiting[i] && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
+    for (const run of runs) {
+      const [group] = runGroups(run, threshold);
+      if (group) return group;
     }
     return null;
+  }
+
+  /**
+   * Whether merge checks land the store as a rebuild's plan projected it
+   * (src/repair/topology.ts). Off here. drain-autobiographical turns it on,
+   * since a drain exists to re-fold the store a rebuild left as the plan
+   * projected. While it is on:
+   * - **Picks wait and go bottom up:** a merge check picks nothing while a
+   *   chunk waits in the compression queue or a merge waits in the merge
+   *   queue, and then queues only the lowest level's group. A group picked
+   *   before what lands beside it, a released chunk's summary or a lower
+   *   merge's, leaves that summary alone. tick runs the merge check it put
+   *   off once both queues are empty, whether the last entry landed or was
+   *   skipped, and the merge that lands runs the next.
+   * - **Runs are read as the planner reads them:** a run with a summary of a
+   *   higher level starting after it can't grow (merge-runs.ts cantGrowPast),
+   *   so it merges as an interior run, as the plan projected. Off, the
+   *   level's last run reads as the newest, and a run of seven takes five
+   *   and leaves two to wait for growth that won't come beside them.
+   */
+  protected landsAsPlanned(): boolean {
+    return false;
+  }
+
+  protected get mergePicksWaiting(): boolean {
+    return this.mergePicksDeferred || (this.landsAsPlanned() && (this.compressionQueue.length > 0 || this.mergeQueue.length > 0));
   }
 
   protected checkMergeThreshold(): void {
     this.requireBranchMutation('checkMergeThreshold');
     phaseChannel.report('merge-threshold'); // liveness-watchdog phase
+    const bottomUp = this.landsAsPlanned();
+    if (bottomUp && (this.compressionQueue.length > 0 || this.mergeQueue.length > 0)) {
+      this.mergePicksDeferred = true;
+      return;
+    }
+    this.mergePicksDeferred = false;
     if (this.config.speculativeProduction) {
       this.checkMergeThresholdRecursive();
       return;
@@ -11787,6 +11662,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         level: 2,
         sourceIds: l1Run.map(s => s.id),
       });
+      if (bottomUp && this.mergeQueue.length > 0) return;
     }
 
     // Check L2 → L3
@@ -11806,8 +11682,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Bottom-up speculative pre-producer (design doc §3.5 / §7.2).
    *
    * Recursive variant of `checkMergeThreshold` for the unbounded L_n
-   * design. Walks every level present in the archive; for any level k
-   * with ≥ N orphans (no parent), enqueues an L_{k+1} merge. After that
+   * design. Walks every level present in the archive. After that
    * L_{k+1} is produced and `executeMerge` calls this again, the recursion
    * naturally cascades: 6 L1s → 1 L2; 6 L2s → 1 L3; 6 L3s → 1 L4; ...
    *
@@ -11848,6 +11723,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           level: level + 1,
           sourceIds: run.map(s => s.id),
         });
+        if (this.landsAsPlanned() && this.mergeQueue.length > 0) return;
       }
     }
   }
@@ -15697,7 +15573,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Validate the audited transition input at the last possible boundary.
-   * Any malformed, unknown, or expired relaxation restores the normal weight. */
+   * Any malformed, unknown, or expired relaxation restores the normal weight.
+   * A dry run logs neither line, since a preview isn't the live state. */
   protected kvUnifiedContinuityMultiplier(
     relaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
   ): number {
@@ -15714,13 +15591,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       Number.isFinite(relaxation.expiresAt) &&
       (relaxation.multiplier === 1 || relaxation.expiresAt > Date.now());
     if (!validReason || !validMultiplier || !active) {
-      this.diag.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
+      if (!this._dryRunSelect) this.diag.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
       return 1;
     }
-    this.diag.error(
-      `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
-      `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
-    );
+    if (!this._dryRunSelect) {
+      this.diag.error(
+        `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
+        `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
+      );
+    }
     return relaxation.multiplier;
   }
 
@@ -17476,17 +17355,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // window. Demand overrides: a picker `produce` op (enqueueL1ForRange)
     // marks the chunk demanded, and demanded chunks are never held back —
     // when folding actually NEEDS the L1, production must not be blocked.
-    const holdback = this.config.l1HoldbackChunks ?? 1;
-    if (holdback > 0 && this.chunks.length > 0) {
-      const cutoff = this.chunks.length - holdback;
+    const heldBack = this.heldBackChunks(this.config.l1HoldbackChunks ?? 1);
+    if (heldBack.size > 0) {
       this.compressionQueue = this.compressionQueue.filter((idx) => {
-        if (idx < cutoff) return true;
+        if (!heldBack.has(idx)) return true;
         const ch = this.chunks[idx];
         const lastId = ch?.messages[ch.messages.length - 1]?.id;
         return lastId !== undefined && this._demandedL1Chunks.has(lastId);
       });
     }
     this.orderCompressionQueue();
+  }
+
+  protected heldBackChunks(holdback: number): Set<number> {
+    if (!(holdback > 0)) return new Set();
+    const order = this._storeOrder;
+    const listed = order.size > 0;
+    const edge: Array<{ index: number; at: number }> = [];
+    for (let pos = 0; pos < this.chunks.length; pos++) {
+      const messages = this.chunks[pos]!.messages;
+      let at = pos;
+      if (listed) {
+        at = -1;
+        const first = messages[0];
+        const last = messages[messages.length - 1];
+        if (first) { const p = order.get(first.id) ?? Number.MAX_SAFE_INTEGER; if (p > at) at = p; }
+        if (last && last !== first) { const p = order.get(last.id) ?? Number.MAX_SAFE_INTEGER; if (p > at) at = p; }
+      }
+      let i = edge.length;
+      while (i > 0 && edge[i - 1]!.at <= at) i--;
+      if (i < holdback) {
+        edge.splice(i, 0, { index: pos, at });
+        if (edge.length > holdback) edge.pop();
+      }
+    }
+    return new Set(edge.map((x) => x.index));
   }
 
   /**
@@ -20186,56 +20089,77 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for the
-   * messages it sends last and as they stand, over the view's suffix from the
-   * batch's oldest message to its newest: each stored copy cut as
-   * `cappedForSend` cuts it, a body's shards joined by
-   * `mergeAdjacentBodyGroupRaw` under adaptive resolution (the hierarchical
-   * select sends each shard as its own message), then `applyImageStripping`,
-   * so a message stored after the batch counts toward the images as in a
-   * compile. The tool pass that comes between them (postProcessToolEntries)
-   * is left out: it pairs by the window around these messages. What sending
-   * prunes from a message's tool blocks reaches it through `cappedForSend`.
+   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for a
+   * message it sends raw, over the view's suffix from the batch's oldest
+   * message to its newest: each stored copy cut as `cappedForSend` cuts it, a
+   * body's shards joined by `mergeAdjacentBodyGroupRaw` under adaptive
+   * resolution (the hierarchical select sends each shard as its own message),
+   * then `applyImageStripping`, so a message stored after the batch counts
+   * toward the images as in a compile. The tool pass that comes between them
+   * (postProcessToolEntries) is left out: it pairs by the window around these
+   * messages, so the hierarchical select leaves out a newest message that
+   * holds a `tool_use` with no result after it, and the adaptive select
+   * refuses that compile, where the render gives the message as the cap
+   * leaves it; and both drop a `tool_result` whose call isn't sent before
+   * it. What sending prunes from a message's tool blocks reaches the render
+   * through `cappedForSend`.
    *
-   * Those messages are the recent window's, and the head window's too when
-   * no message comes between the two: a compile places the middle's
-   * messages, and the history before a head window that was reset, after
-   * the head. The hierarchical select can also place summaries there, which
-   * are text and change no image decision. A message before them comes back
-   * as null.
+   * Both selects send raw every message the view holds that no summary
+   * covers, whichever region holds it: the head window, the middle (the
+   * history before a head window that was reset included) or the recent
+   * window. Each such message goes through `cappedForSend`, apart from a
+   * body's shards in the adaptive middle (below). The image pass decides by
+   * stored position, newest first, not by where a region puts an entry. So
+   * these steps give a message's form wherever the compile places it, and
+   * no id the view holds comes back as null. Two kinds of message differ.
+   * - A message a summary covers comes back raw, while the compile sends its
+   *   summary where its plan folds it. Under the hierarchical select without
+   *   `imageStripHysteresisRatio`, its images, rendered raw, also count
+   *   toward the image limits of the messages older than it, where the
+   *   compile, sending its summary, doesn't count them. The adaptive select,
+   *   and every path under `imageStripHysteresisRatio`, count every stored
+   *   message's images, folded or not, as the render does.
+   * - A body whose shards the compile doesn't send together. The adaptive
+   *   middle, kv-unified's included, sends a raw run of a body's shards as
+   *   their text alone, uncut. A body whose shards sit across the middle
+   *   and a window, or across a reset head window's end with the history
+   *   from before the reset between them, goes out in more than one entry.
+   *   Here such a body comes back whole, as the windows join it.
    *
-   * It takes a compile's steps before its windows as a dry select takes
-   * them: it rebuilds the chunks, then, under adaptive resolution, loads the
-   * calibration, and it puts back what a dry select puts back, so it prices
-   * as the next compile will and leaves what that compile reads as it found
-   * it.
+   * The form is the compile's, but not always the place: after a head-window
+   * reset, the head is sent ahead of the history from before the reset, and
+   * so is each system change stored before the head (headPositions), so
+   * those messages aren't sent last.
+   *
+   * Under adaptive resolution it loads the calibration as a dry select
+   * does, so the store's estimates, by which the image depth is measured,
+   * are the ones the next compile measures with. It doesn't rebuild the
+   * chunks, as a compile does before placing its windows, since nothing
+   * that decides what it gives reads them. (The image pass computes the
+   * window bounds they move, but decides nothing by them.) It puts back
+   * what a dry select puts back, so it leaves what the next compile reads
+   * as it found it.
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.requireLoadedBranch('renderAsNewest');
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
     try {
-      this.rebuildChunks(store);
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
       const messages = store.getAll();
       const posById = this.positionIndex(messages);
-      const headStart = this.getHeadWindowStartIndex(store);
-      const headEnd = this.getHeadWindowEnd(store);
-      const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-      const start = headStart === 0 && headEnd === tailStart ? 0 : tailStart;
       const msgCap = this.config.maxMessageTokens;
       // As selectPath chooses: only the adaptive select joins a body's
       // shards, so only there does an id stand for its whole body.
       const joins = this.config.adaptiveResolution;
       // Each id's whole body, read back by its first shard's id, which the
-      // merge keeps; one that starts before the suffix has none.
+      // merge keeps. An id the view leaves out has none.
       const firstOf = new Map<MessageId, MessageId>();
       let from = messages.length;
       for (const id of ids) {
         const at = posById.get(id);
         if (at === undefined) continue;
         const body = joins ? bodyBoundsIn(messages, at) : { from: at, to: at };
-        if (body.from < start) continue;
         firstOf.set(id, messages[body.from]!.id);
         from = Math.min(from, body.from);
       }
