@@ -19,7 +19,9 @@
     `joinBodyContent(shards)`. A caller that merged adjacent text blocks
     across shards gets one block where two text blocks were given, and on
     moving to `joinBodyContent` shows a body stored before in the windows'
-    order rather than in its shards' order.
+    order rather than in its shards' order. `joinBodyContent` and
+    `continuesBlock` require this release or later, so raise the dependency
+    floor with the change.
   - **Two such callers:** agent-framework's `asCompiled`, which carries a
     deferred write's drained copy as later compiles render it, joins as the
     windows did, so for a body stored this way it puts the other blocks

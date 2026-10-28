@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy } from '../src/index.js';
+import type { StoredMessage } from '../src/index.js';
 import { legacyIngress } from './_harness/legacy-ingress.js';
 
 const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as unknown as ContentBlock;
@@ -1106,6 +1107,80 @@ describe('after a head-window reset, a long reply that thinks and makes a call',
         const headEnd = (strategy as unknown as { getHeadWindowEnd(s: unknown): number }).getHeadWindowEnd((manager as unknown as { messageStore: unknown }).messageStore);
         const firstShard = stored.findIndex((m) => m.content.some((b) => b.type === 'thinking'));
         assert.ok(headEnd <= firstShard && owned.has(stored[firstShard]!.id), `the head ends before the reply and a chunk owns its first shard, so none of it is left raw outside both (head ends at ${headEnd}, reply from ${firstShard})`);
+      } finally {
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const headWindowTokens of [450, 900]) {
+    it(`in a store whose chunks begin partway through it, as 0.23.x's do, goes out in two pieces around the history, split where the chunks begin (head ${headWindowTokens})`, async () => {
+      // 0.23.1's head end (the token boundary, one message back past a call, then the anchor)
+      // and its chunk closes (no close right after a message with a call, and no other hold).
+      class Released extends LegacyIngress {
+        released = true;
+        protected override closesHeld(messages: readonly StoredMessage[], from?: number): Uint8Array {
+          return this.released ? new Uint8Array(messages.length) : super.closesHeld(messages, from);
+        }
+        protected override headWindowEndFrom(store: { estimateTokens(m: StoredMessage): number }, messages: StoredMessage[], startIdx: number): number {
+          const self = this as unknown as {
+            config: { headWindowTokens: number };
+            anchorHeadToCoverage(s: unknown, m: StoredMessage[], b: number, t: number): number;
+          };
+          if (!this.released) return super.headWindowEndFrom(store as never, messages, startIdx);
+          if (self.config.headWindowTokens <= 0) return 0;
+          let tokens = 0;
+          for (let i = startIdx; i < messages.length; i++) {
+            tokens += store.estimateTokens(messages[i]!);
+            if (tokens > self.config.headWindowTokens) {
+              let boundary = i;
+              if (boundary > startIdx && this.hasToolUse(messages[boundary - 1]!)) boundary--;
+              return self.anchorHeadToCoverage(store, messages, boundary, tokens);
+            }
+          }
+          return messages.length;
+        }
+      }
+      const dir = mkdtempSync(join(tmpdir(), 'cm-body-blocks-reset-'));
+      const strategy = new Released({
+        adaptiveResolution: true, targetChunkTokens: 100, headWindowTokens, recentWindowTokens: 300,
+        autoTickOnNewMessage: false, compressionModel: 'mock', minChunkCharsForLLM: 0, l1HoldbackChunks: 0,
+      });
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: MEMBRANE as never });
+      manager.setToolDefinitions(tools as never);
+      try {
+        for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`old ${i} ` + prose('OLD', 150))]);
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        await manager.resetHeadWindow('NEW TOPIC');
+        manager.addMessage('User', [text('go')]);
+        manager.addMessage('Claude', [
+          { type: 'thinking', thinking: 'thinking it through', signature: 'sig' } as unknown as ContentBlock,
+          text(prose('REPLY', 7_000)),
+          call('call-1'),
+        ]);
+        manager.addMessage('User', [result('call-1', 'Sunny.')]);
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        strategy.released = false;
+        const stored = manager.getAllMessages();
+        const group = stored.find((m) => m.content.some((b) => b.type === 'thinking'))!.bodyGroupId;
+        const shards = stored.map((m, k) => (m.bodyGroupId === group ? k : -1)).filter((k) => k >= 0);
+        const owned = (strategy as unknown as { ownedMessageIds(): Set<string> }).ownedMessageIds();
+        const split = shards.find((k) => owned.has(stored[k]!.id));
+        assert.ok(split !== undefined && split > shards[0]!, `premise: chunks begin partway through the reply (reply ${shards[0]}..${shards.at(-1)}, first owned ${split})`);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const replyAt = compiled.messages.map((m, k) => (m.content.some((b) => b.type === 'thinking' || b.type === 'tool_use' || (b.type === 'text' && (b as { text: string }).text.includes('REPLY'))) ? k : -1)).filter((k) => k >= 0);
+        const history = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('old 3')));
+        const resultAt = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_result'));
+        assert.equal(replyAt.length, 2, `the reply goes out in two entries (${replyAt.length})`);
+        assert.ok(replyAt[0]! < history && history < replyAt[1]!, 'one before the history from before the reset and one after it');
+        assert.deepEqual(compiled.messages[replyAt[0]!]!.content.map((b) => b.type), ['thinking', 'tool_use', 'text'], 'the first holds its thinking and its call, which a body stored before keeps on its first shard');
+        assert.equal(resultAt, replyAt[0]! + 1, 'its result right after the call');
+        assert.deepEqual(compiled.messages[replyAt[1]!]!.content.map((b) => b.type), ['text'], 'the second holds the rest of its text');
+        const textOf = (k: number) => compiled.messages[k]!.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+        const before = stored.slice(shards[0], split).flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+        assert.equal(textOf(replyAt[0]!), before, 'the head holds the text of the shards before the first one a chunk owns');
+        assert.equal(textOf(replyAt[0]!) + textOf(replyAt[1]!), prose('REPLY', 7_000), 'its text whole across the two');
       } finally {
         await manager.close();
         rmSync(dir, { recursive: true, force: true });
