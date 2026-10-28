@@ -715,12 +715,44 @@ export interface SelectOptions {
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
   /** Audited, expiring continuity relaxation for disruptive transitions.
-   * Invalid or expired values fail closed to normal continuity weight. */
+   * Invalid or expired values fail closed to normal continuity weight. A
+   * committing select logs the relaxation it applies, or that it rejected
+   * one; a dry select logs neither, since a dry run isn't the live state. */
   kvUnifiedContinuityRelaxation?: {
     reason: 'surgery' | 'budget-transition' | 'infrastructure';
     multiplier: number;
     expiresAt: number;
   };
+  /** The content of each injection the compile inserts among the selected
+   * entries after the select (`beforeUser` and `afterUser`), which the
+   * request carries and the select's window doesn't. A strategy whose
+   * calibration compares the provider's input total with the compile prices
+   * it there (AutobiographicalStrategy.reportRealInputTokens).
+   * ContextManager.compile fills it from its injections; `system` ones go
+   * into the caller's system prompt instead. */
+  messageInjections?: ReadonlyArray<ContentBlock[]>;
+  /** The overhead of the request the compile is for: the system prompt and
+   * tool definitions it sends besides the window and its message-position
+   * injections. Its system prompt is the one the request sends, with the
+   * system-position injections passed to this compile appended: the compile
+   * hands those back unchanged (`systemInjections`) and prices none of them.
+   * AutobiographicalStrategy prices it, and the message injections, for
+   * `RenderStats.request`, and selects exactly as it would without it. An
+   * overhead whose tool definitions can't be serialised as JSON is refused
+   * before anything is selected. */
+  requestOverhead?: RequestOverhead;
+}
+
+/**
+ * `AutobiographicalStrategy.previewContext` on the hierarchical path, whose
+ * select succeeded but which has no fold plan to preview.
+ * `ContextManager.previewContext` returns null for it.
+ */
+export class NoFoldPlanToPreviewError extends Error {
+  constructor() {
+    super('previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview');
+    this.name = 'NoFoldPlanToPreviewError';
+  }
 }
 
 /**
@@ -1093,6 +1125,25 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/**
+ * A request's overhead: what it carries besides the compiled window and the
+ * compile's message-position injections (which the compile prices itself).
+ * A compile takes the overhead its request will send
+ * (`SelectOptions.requestOverhead`) and reports its price
+ * (`RenderStats.request`); a calibration sample takes the overhead the
+ * request sent (see `AutobiographicalStrategy.reportRealInputTokens`). The
+ * provider counts it in the input total and the compile estimate doesn't, so
+ * a calibration sample that leaves it out learns it as a per-token rate.
+ * Passing it says this is everything the request sends besides those; a
+ * caller that can't see the request's overhead passes nothing.
+ */
+export interface RequestOverhead {
+  /** The system prompt the request sends. */
+  system?: string;
+  /** The tool definitions the request sends. */
+  tools?: ReadonlyArray<ToolDefinition>;
+}
+
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
 export interface CalibrationReset {
   /** The multiplier that was discarded. */
@@ -1145,11 +1196,16 @@ export interface RenderStats {
    * that isn't provisional was learned under that epoch's pricing, or under
    * an older epoch's and kept, re-stamped, because nothing this store holds
    * was repriced since; either way it's reported under the epoch in force.
+   * The exception is the 1 loaded beside a record from a newer pricing
+   * epoch, or a record the store can't read: neither is used, and that 1
+   * is neither learned nor provisional.
    * `provisional` is true while the multiplier is a guess, which the first
    * provider sample the calibration's band accepts replaces outright, rather
    * than stepping toward it (see
    * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
-   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * record without a stamp, the 1 a discard restarts from, or the 1 a store
+   * with no calibration record, or none with a multiplier to use other than
+   * a newer epoch's, starts from. A discard's 1 stays
    * provisional through a later epoch's load, which re-stamps it whatever
    * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
@@ -1167,7 +1223,29 @@ export interface RenderStats {
     pricingEpoch: number;
     provisional?: true;
     reset?: CalibrationReset;
+    /** The largest multiplier the strategy applies: it applies none above
+     *  it. AutobiographicalStrategy reports it whenever it reports
+     *  `calibration`. */
+    ceiling?: number;
   };
+
+  /**
+   * What the request carries besides the rendered context, in the units of
+   * `total` at this compile's multiplier and priced as a calibration sample
+   * prices it (`AutobiographicalStrategy.reportRealInputTokens`):
+   * `overheadTokens` for `SelectOptions.requestOverhead`, and
+   * `injectedTokens` for the compile's message-position injections
+   * (`SelectOptions.messageInjections`), 0 when it has none. Present only when
+   * the select was given an overhead, so a compile without one has no price
+   * here rather than a price of 0. The overhead's price is the store's
+   * estimate of the system prompt and of the tool definitions as JSON
+   * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * System-position injections are priced only as part of that system
+   * prompt: the compile hands the ones it was passed back unchanged
+   * (`systemInjections`) for the caller to append, so the overhead's system
+   * prompt is the one sent, with them appended.
+   */
+  request?: { overheadTokens: number; injectedTokens: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
@@ -1707,6 +1785,16 @@ export interface AutobiographicalConfig {
    * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
    */
   compressionMaxTokens?: number;
+  /**
+   * Compatibility for models without native reasoning that write the whole
+   * memory inside one closed literal `<thinking>…</thinking>` or
+   * `<think>…</think>` text wrapper. When true, a compression or merge answer
+   * of text blocks alone that is exactly that shape, with no tag in its body,
+   * is stored as the prose inside it. Every other answer is read as with the
+   * option off. Default false. It applies to answers from then on; chunks
+   * already in quarantine stay there until their records are cleared.
+   */
+  recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated. A value that
    *  isn't a positive number, such as 0 or NaN, means no limit. */

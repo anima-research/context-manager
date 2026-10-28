@@ -210,8 +210,10 @@ export interface CompileResult {
    * This compile's render stats, as its select tallied them while emitting
    * entries: the same accounting `getRenderStats()` gives a live compile.
    * They describe the selection rather than the exact request: injections
-   * merged in afterwards aren't counted, an entry that mixes tool calls and
-   * results counts once though the compile splits it into several messages,
+   * merged in afterwards aren't counted in its buckets or `total` (`request`
+   * prices them when the compile is given the request's overhead), an entry
+   * that mixes tool calls and results counts once though the compile splits
+   * it into several messages,
    * and the select's last structural passes, which can trim an orphaned tool
    * call or add a stub tool result, aren't counted either. A live compile's
    * are the object `ContextManager.getRenderStats()` then returns, so treat

@@ -95,11 +95,14 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
 
 describe('estimator calibration band', () => {
   it('a multiplier pinned at the ceiling comes back down once the raw estimate is honest', async () => {
+    const first = await openManager('pinned');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.8, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('pinned');
-    await cm.compile(BUDGET);
-    internals._calibration = 1.8;
-    internals.applyCalibration();
     await cm.compile(BUDGET); // arms one sample; estimate is in calibrated units (raw × 1.8)
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1.8, null], 'premise: the seeded record loads as learned');
     const est = internals._lastCompileEstimate;
     assert.ok(est > 0);
     // The provider bills exactly the raw estimate: real/est = 1/1.8 ≈ 0.56.
@@ -120,8 +123,14 @@ describe('estimator calibration band', () => {
   });
 
   it('an in-band ratio is learned from as before', async () => {
+    const first = await openManager('inband');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('inband');
     await cm.compile(BUDGET);
+    assert.equal(internals._calibrationProvisional, null, 'premise: the seeded record loads as learned');
     const est = internals._lastCompileEstimate;
     strategy.reportRealInputTokens(est * 1.5);
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
@@ -195,13 +204,29 @@ describe('estimator calibration band', () => {
       await reopened.cm.compile(BUDGET);
       assert.equal(reopened.internals._calibration, 1);
       assert.deepEqual(reopened.cm.getRenderStats()!.calibration,
-        { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH }, 'no reset either');
+        { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, ceiling: 1.8 }, 'no reset either');
       assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), future);
       reopened.cm.close();
     } finally {
       console.warn = warn;
     }
     assert.deepEqual(warned.filter((l) => l.includes('[estimator-calibration]')), []);
+  });
+
+  it('a record from a newer pricing epoch with no multiplier this binary can read is left alone too', async () => {
+    const first = await openManager('newer-epoch-unreadable');
+    await first.cm.compile(BUDGET);
+    const future = { multipliers: { default: 1.4 }, at: 123, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH + 1 };
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('newer-epoch-unreadable');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const ema = (internals as unknown as { _calibrationEma: number | null })._calibrationEma;
+    assert.ok(ema !== null && Math.abs(ema - 1.002) < 0.001, `premise: the sample reached the EMA, got ${ema}`);
+    assert.deepStrictEqual(internals.store!.getStateJson(internals.calibrationStateId), future, 'a first sample that only confirms the 1 writes nothing over it');
+    cm.close();
   });
 
   it('a multiplier learned under the current pricing epoch survives reopen', async () => {
@@ -272,7 +297,7 @@ describe('estimator calibration band', () => {
     const reopened = await openManager('kept');
     await reopened.cm.compile(BUDGET);
     assert.equal(reopened.internals._calibration, 0.6);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.6, pricingEpoch: epoch });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.6, pricingEpoch: epoch, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
     assert.equal(saved.multiplier, 0.6);
     assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
@@ -356,7 +381,7 @@ describe('estimator calibration band', () => {
     first.cm.close();
     const reopened = await openManager('provisional-kept');
     await reopened.cm.compile(BUDGET);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { pricing?: number; provisional?: boolean };
     assert.deepEqual([saved.pricing, saved.provisional], [epoch, true], 're-stamped, still provisional');
     reopened.cm.close();
@@ -375,7 +400,7 @@ describe('estimator calibration band', () => {
     first.cm.close();
     const reopened = await openManager('provisional-generated', { generatedImage: true });
     const { lines } = await calibrationWarnings(() => reopened.cm.compile(BUDGET));
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: epoch, provisional: true, reset, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { pricing?: number; provisional?: boolean; reset?: unknown };
     assert.deepEqual([saved.pricing, saved.provisional, saved.reset], [epoch, true, reset], 're-stamped, still provisional, its reset kept');
     assert.deepEqual(lines, [
@@ -401,10 +426,89 @@ describe('estimator calibration band', () => {
     reopened.cm.close();
   });
 
-  it('a store with no calibration history reports its multiplier and no reset', async () => {
+  it('a store with no calibration history reports a provisional 1 and no reset', async () => {
     const { cm } = await openManager('no-history');
     await cm.compile(BUDGET);
-    assert.deepEqual(cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    assert.deepStrictEqual(cm.getRenderStats()!.calibration,
+      { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, provisional: true, ceiling: 1.8 });
+    cm.close();
+  });
+
+  it('a store with no calibration record loads a provisional 1: the first sample the band accepts sets it, and stamps the record', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const { cm, strategy, internals } = await openManager('fresh-provisional');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }]);
+    assert.equal(internals.store!.getStateJson(internals.calibrationStateId), null, 'the load writes nothing');
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 3);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }], 'a sample the band rejects leaves it provisional');
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+    assert.ok(Math.abs(internals._calibration - 1.4) < 1e-9, `set by the sample, got ${internals._calibration}`);
+    assert.equal(internals._calibrationProvisional, null);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as
+      { multiplier?: number; pricing?: number; provisional?: boolean; reset?: unknown };
+    assert.deepStrictEqual([saved.multiplier, saved.pricing, saved.provisional, saved.reset], [1.4, epoch, undefined, undefined]);
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
+    assert.ok(internals._calibration > 1.4 && internals._calibration < 1.6, `stepped, not replaced: ${internals._calibration}`);
+    cm.close();
+  });
+
+  it("a store with no calibration record whose first sample falls inside the dead band confirms its 1, and stamps the record", async () => {
+    const { cm, strategy, internals } = await openManager('fresh-confirm');
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; pricing?: number; provisional?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.pricing, saved.provisional], [1, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, undefined]);
+    cm.close();
+  });
+
+  it('a store with no calibration record is still provisional after a restart before its first sample', async () => {
+    const first = await openManager('fresh-restart');
+    await first.cm.compile(BUDGET);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('fresh-restart');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual(internals._calibrationProvisional, { fromEpoch: null });
+    assert.equal(internals.store!.getStateJson(internals.calibrationStateId), null);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 0.8);
+    assert.ok(Math.abs(internals._calibration - 0.8) < 1e-9, `set by the sample, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a record with no multiplier to use loads as no record: a provisional 1', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    for (const [i, record] of ([{ at: 1, pricing: epoch }, { multiplier: '1.4', at: 1, pricing: epoch }, { multiplier: null, at: 1, pricing: epoch }, 7] as unknown[]).entries()) {
+      const name = `fresh-unusable-${i}`;
+      const first = await openManager(name);
+      await first.cm.compile(BUDGET);
+      first.internals.store!.setStateJson(first.internals.calibrationStateId, record);
+      first.cm.close();
+      const { cm, internals } = await openManager(name);
+      await cm.compile(BUDGET);
+      assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }], JSON.stringify(record));
+      cm.close();
+    }
+  });
+
+  it('a calibration read that throws loads 1, not provisional, as before: the record it could not read may hold one worth keeping', async () => {
+    const { cm, internals } = await openManager('fresh-unreadable');
+    const store = internals.store as unknown as { getStateJson(id: string): unknown };
+    const read = store.getStateJson;
+    let refused = 0;
+    store.getStateJson = (id: string) => {
+      if (id === internals.calibrationStateId) { refused++; throw new Error('unreadable'); }
+      return read.call(store, id);
+    };
+    try {
+      await cm.compile(BUDGET);
+    } finally {
+      store.getStateJson = read;
+    }
+    assert.ok(refused > 0, 'premise: the load read the record, and the read threw');
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
     cm.close();
   });
 
@@ -449,7 +553,7 @@ describe('estimator calibration band', () => {
     const reopened = await openManager('unstamped', ST);
     const { lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
     assert.equal(reopened.internals._calibration, 0.94);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch, provisional: true });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch, provisional: true, ceiling: 1.8 });
     assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), unstamped,
       'the load writes nothing: the stamp is the first sample\'s to give');
     assert.equal(lines.length, 1, 'the load says once that the multiplier is provisional');
@@ -462,13 +566,13 @@ describe('estimator calibration band', () => {
       { multiplier?: number; pricing?: number; reset?: unknown };
     assert.deepEqual([stampedRecord.multiplier, stampedRecord.pricing, stampedRecord.reset], [0.94, epoch, undefined]);
     await reopened.cm.compile(tight);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch, ceiling: 1.8 });
     reopened.cm.close();
     // The next open finds a current-epoch record: no warning, nothing provisional.
     const again = await openManager('unstamped', ST);
     const second = await calibrationWarnings(() => again.cm.compile(BUDGET));
     assert.deepEqual(second.lines, []);
-    assert.deepEqual(again.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch });
+    assert.deepEqual(again.cm.getRenderStats()!.calibration, { multiplier: 0.94, pricingEpoch: epoch, ceiling: 1.8 });
     again.cm.close();
   });
 
@@ -536,7 +640,7 @@ describe('estimator calibration band', () => {
     assert.deepEqual([saved.multiplier, saved.pricing, saved.reset], [0.9, epoch, undefined], 'stamped, no reset: nothing was discarded');
     // From here the EMA steps as it always did.
     await reopened.cm.compile(BUDGET);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.9, pricingEpoch: epoch });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.9, pricingEpoch: epoch, ceiling: 1.8 });
     reopened.strategy.reportRealInputTokens(reopened.internals._lastCompileEstimate * 1.2); // observed 1.08
     assert.ok(reopened.internals._calibration > 0.9 && reopened.internals._calibration < 1.0,
       `stepped, not replaced: ${reopened.internals._calibration}`);
@@ -596,8 +700,13 @@ describe('estimator calibration band', () => {
     assert.equal(reopened.internals._calibration, 1, 'put back after the dry compile too');
     // The real compile: refused at 1.45, dropped, resolved at 1; the drop is
     // logged and persisted, and visible as the reset.
-    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight));
+    const overhead = { system: 'You are a resident. '.repeat(60) };
+    const atOne = await openManager('fallback-overhead-price');
+    const overheadAtOne = (await atOne.cm.compile(BUDGET, undefined, { requestOverhead: overhead })).renderStats!.request!.overheadTokens;
+    atOne.cm.close();
+    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight, undefined, { requestOverhead: overhead }));
     assert.equal(live.renderStats, reopened.cm.getRenderStats(), "the live result's stats are the retry's, the getter's");
+    assert.equal(live.renderStats!.request!.overheadTokens, overheadAtOne, 'the retry prices the overhead at the multiplier it dropped to');
     assert.equal(live.renderStats!.total.messages, live.messages.length);
     assert.equal(reopened.internals._calibration, 1);
     const cal = reopened.cm.getRenderStats()!.calibration!;
@@ -634,6 +743,34 @@ describe('estimator calibration band', () => {
       { multiplier?: number; pricing?: number; reset?: unknown };
     assert.deepEqual([untouched.multiplier, untouched.pricing, untouched.reset], [0.94, undefined, undefined], 'the record is untouched');
     belowReopened.cm.close();
+  });
+
+  it('dropping a provisional multiplier to 1 drops its declared mark in memory as on disk, for a seeded record that carries both', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const tight = await tightBudget('drop-declared-probe', 1.2);
+    const first = await openManager('drop-declared');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.45, at: 1, pricing: epoch, provisional: true, declaredOverhead: true });
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('drop-declared');
+    const declared = () => (internals as unknown as { _calibrationDeclared: boolean })._calibrationDeclared;
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'premise: loaded, marked');
+    const dry = await calibrationWarnings(() => cm.compile(tight, undefined, { dryRun: true }));
+    assert.equal(dry.result.renderStats!.calibration!.multiplier, 1, 'premise: the dry compile dropped it');
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'put back after the dry compile that dropped it');
+    await calibrationWarnings(() => cm.compile(tight));
+    assert.equal(internals._calibration, 1);
+    assert.equal(cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 1.45, 'premise: the seeded 1.45 was loaded and dropped');
+    assert.equal(declared(), false);
+    const dropped = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepStrictEqual([dropped.multiplier, dropped.provisional, dropped.declaredOverhead], [1, true, undefined], 'the record the drop writes');
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.provisional, saved.declaredOverhead], [1, undefined, undefined],
+      'an undeclared sample confirming the 1 writes the record, with no mark either');
+    cm.close();
   });
 
   it('a discard\'s provisional 1 survives a restart until a sample confirms it', async () => {
@@ -863,7 +1000,7 @@ describe('estimator calibration band', () => {
     const reopened = await openManager('no-cap-kept');
     await reopened.cm.compile(BUDGET);
     assert.equal(reopened.internals._calibration, 1.3);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1.3, pricingEpoch: epoch });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1.3, pricingEpoch: epoch, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
     assert.deepEqual([saved.multiplier, saved.pricing], [1.3, epoch], 're-stamped under the current epoch');
     reopened.cm.close();
@@ -988,7 +1125,7 @@ describe('estimator calibration band', () => {
     first.cm.close();
     const reopened = await openManager('kept-reset');
     await reopened.cm.compile(BUDGET);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.8, pricingEpoch: epoch, reset });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.8, pricingEpoch: epoch, reset, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as
       { multiplier?: number; pricing?: number; reset?: unknown };
     assert.deepEqual([saved.multiplier, saved.pricing, saved.reset], [0.8, epoch, reset]);
@@ -1007,7 +1144,7 @@ describe('estimator calibration band', () => {
     const reopened = await openManager('stamped-thinking', { stampedThinking: true });
     await reopened.cm.compile(BUDGET);
     assert.equal(reopened.internals._calibration, 0.7);
-    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch });
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch, ceiling: 1.8 });
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
     assert.equal(saved.multiplier, 0.7);
     assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
@@ -1127,7 +1264,7 @@ describe('estimator calibration band', () => {
       }
       await reset.cm.compile(BUDGET);
       assert.equal(reset.internals._calibration, 0.7, `${how}: the real load kept it`);
-      assert.deepEqual(reset.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch }, `${how}: no reset`);
+      assert.deepEqual(reset.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch, ceiling: 1.8 }, `${how}: no reset`);
       const restamped = reset.internals.store!.getStateJson(reset.internals.calibrationStateId) as
         { multiplier?: number; pricing?: number; reset?: unknown };
       assert.deepEqual([restamped.multiplier, restamped.pricing, restamped.reset], [0.7, epoch, undefined]);
@@ -1165,9 +1302,14 @@ describe('estimator calibration band', () => {
   });
 
   it('a drift inside 2% is not applied; once the EMA passes 2% it is', async () => {
+    const first = await openManager('deadband');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('deadband');
     await cm.compile(BUDGET);
-    assert.equal(internals._calibration, 1);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null], 'premise: the seeded record loads as learned');
     // real/est = 1.01 every compile: the EMA creeps toward 1.01 and never
     // leaves the band, so nothing is repriced between compiles.
     for (let i = 0; i < 12; i++) {

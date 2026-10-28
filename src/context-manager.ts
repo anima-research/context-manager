@@ -34,7 +34,6 @@ import type {
   TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
   RequestIdentity,
-  ThinkingBinding,
   SelectOptions,
   PreviewResult,
   HotContextSettingsStatus,
@@ -51,6 +50,7 @@ import {
 } from './types/index.js';
 import type { DerivationManifestOptions } from './types/index.js';
 import { isStateExistsFor } from './state-registration.js';
+import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -2216,11 +2216,14 @@ export class ContextManager {
     const view = this.strategyMessageView();
 
     // Get selected entries from strategy
+    const messageInjections = (injections ?? [])
+      .filter((inj) => inj.position === 'beforeUser' || inj.position === 'afterUser')
+      .map((inj) => inj.content);
     const entries = this.strategy.select(
       view,
       this.contextLog.createView(),
       effectiveBudget,
-      opts
+      messageInjections.length > 0 ? { ...opts, messageInjections } : opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
@@ -2955,15 +2958,22 @@ export class ContextManager {
   /**
    * Non-committing preview of the layout at a hypothetical budget and/or
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
-   * Returns null when the active strategy has no fold plan to preview.
-   * `opts.thinkingBinding` previews a compile with that option: a binding
-   * one prices a summary's carriers as such a compile renders them (see
+   * Returns null when the active strategy has no fold plan to preview: one
+   * without `previewContext`, or `AutobiographicalStrategy`'s hierarchical
+   * path when its select succeeds, where the strategy's own method throws
+   * `NoFoldPlanToPreviewError` (over the budget, that path still returns an
+   * infeasible preview). `opts` takes the select options a compile takes and
+   * passes them to the dry select, all but `dryRun`, which is always set, and
+   * `identity`, which nothing in a preview reads. Unlike `compile`, it doesn't
+   * refuse a binding option without its participant or identity up front.
+   * `opts.thinkingBinding` previews a compile with that option: a binding one
+   * prices a summary's carriers as such a compile renders them (see
    * `SelectOptions.thinkingBinding`); without it, as configured.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -2972,17 +2982,22 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
-      ) => PreviewResult;
+        opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+      ) => PreviewResult | null;
     };
     if (typeof s.previewContext !== 'function') return null;
-    return s.previewContext(
-      this.strategyMessageView(),
-      this.contextLog.createView(),
-      budget,
-      overrides,
-      opts,
-    );
+    try {
+      return s.previewContext(
+        this.strategyMessageView(),
+        this.contextLog.createView(),
+        budget,
+        overrides,
+        opts,
+      );
+    } catch (err) {
+      if (err instanceof NoFoldPlanToPreviewError) return null;
+      throw err;
+    }
   }
 
   // ==========================================================================
