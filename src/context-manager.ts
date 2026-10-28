@@ -257,6 +257,14 @@ export interface DeriveContextOptions {
    * which takes a row's id, finds that boundary itself.
    */
   atSequence?: number;
+  /**
+   * The derived manager's view (see ContextManagerBaseConfig.viewFilter).
+   * Default: the parent's. A host whose forks see what their parent sees and
+   * their own rows besides (agent-framework's shared forks, whose stored
+   * context injections carry the fork's name) passes the composed predicate
+   * here, so the first compile already reads through it.
+   */
+  viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
 }
 
@@ -2025,7 +2033,7 @@ export class ContextManager {
       this.strategyNamespace,
       options.membrane ?? this.membrane,
       options.debugLogContext ?? this.debugLogContext,
-      this.viewFilter,
+      options.viewFilter ?? this.viewFilter,
       auxiliaryStores,
     );
     // At the head the child's branch took the window's chain head as it was,

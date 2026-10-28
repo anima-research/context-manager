@@ -181,6 +181,28 @@ describe('ContextManager.derive', () => {
     assert.equal(child.getAllMessages().some((m) => m.id === parentOnly), false);
   });
 
+  it('takes a view of its own, or keeps the parent\'s', { skip }, async () => {
+    // A host whose forks see what their parent sees and their own rows besides
+    // (agent-framework's shared forks, #291) hands derive the composed view;
+    // without one, the child reads through the parent's filter, as before.
+    const secret = (m: { metadata?: unknown }) => (m.metadata as { secret?: boolean } | undefined)?.secret === true;
+    const { parent } = await foldedParent({ viewFilter: (m: { metadata?: unknown }) => !secret(m) });
+    parent.addMessage('User', [{ type: 'text', text: 'SECRET ROW' }], { secret: true });
+    await settle(parent);
+    const texts = async (manager: ContextManager) =>
+      (await manager.compile(BUDGET)).messages.map((m) => JSON.stringify(m.content));
+    assert.ok(!(await texts(parent)).some((t) => t.includes('SECRET ROW')), 'the premise: the parent\'s view leaves the row out');
+
+    const inherits = await parent.derive({ branch: 'dendrite/inherits', strategy: folding() });
+    managers.push(inherits);
+    assert.ok(!(await texts(inherits)).some((t) => t.includes('SECRET ROW')), 'no view given: the child reads through the parent\'s');
+
+    const own = await parent.derive({ branch: 'dendrite/own', strategy: folding(), viewFilter: () => true });
+    managers.push(own);
+    assert.ok((await texts(own)).some((t) => t.includes('SECRET ROW')), 'its own view: the child sees what the parent\'s filter hid');
+    assert.ok(!(await texts(parent)).some((t) => t.includes('SECRET ROW')), 'and the parent\'s view is untouched');
+  });
+
   it('shares the inherited messages in memory instead of copying them', { skip }, async () => {
     const { parent, ids } = await foldedParent();
     const before = parent.getAllMessages();
