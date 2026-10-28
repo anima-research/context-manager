@@ -9,8 +9,10 @@
  * parent's rendering when it reuses the solve, and creating a child does
  * not re-read the store.
  *
- * Needs branch-bound store handles (`JsStore.view`). On a Chronicle build
- * without them every derivation test is skipped, by name, with the reason.
+ * Needs branch-bound store handles (`JsStore.view`) and branches forked with
+ * selected states (`createBranchWithStates`, `createBranchAtWithStates`). On
+ * a Chronicle build without them every test that derives is skipped, by
+ * name, with the reason; the refusal on such a build runs everywhere.
  */
 
 import { describe, it, afterEach } from 'node:test';
@@ -30,8 +32,11 @@ import {
 
 type ViewStore = JsStore & { view(branch: string): JsStore };
 
-const supported = typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function';
-const skip = supported ? false : 'installed @animalabs/chronicle has no JsStore.view (branch-bound handles)';
+const derivable = JsStore.prototype as unknown as Record<'view' | 'createBranchWithStates' | 'createBranchAtWithStates', unknown>;
+const supported = typeof derivable.view === 'function'
+  && typeof derivable.createBranchWithStates === 'function'
+  && typeof derivable.createBranchAtWithStates === 'function';
+const skip = supported ? false : 'installed @animalabs/chronicle has no JsStore.view or no selective forks (branch-bound handles)';
 
 /** Enough turns that the budget below cannot hold them raw: the parent must fold. */
 const HISTORY = 60;
@@ -201,6 +206,25 @@ describe('ContextManager.derive', () => {
     managers.push(own);
     assert.ok((await texts(own)).some((t) => t.includes('SECRET ROW')), 'its own view: the child sees what the parent\'s filter hid');
     assert.ok(!(await texts(parent)).some((t) => t.includes('SECRET ROW')), 'and the parent\'s view is untouched');
+
+    const plain = (m: { metadata?: unknown }) => (m.metadata as { plain?: boolean } | undefined)?.plain === true;
+    parent.addMessage('User', [{ type: 'text', text: 'PLAIN ROW' }], { plain: true });
+    const selective = await parent.derive({ branch: 'dendrite/selective', strategy: folding(), viewFilter: (m) => !plain(m) });
+    managers.push(selective);
+    const seen = await texts(selective);
+    assert.ok(seen.some((t) => t.includes('SECRET ROW')) && !seen.some((t) => t.includes('PLAIN ROW')), 'its own view in place of the parent\'s: what it admits and what it leaves out are its own');
+    assert.ok((await texts(parent)).some((t) => t.includes('PLAIN ROW')), 'the parent still shows the row the child leaves out');
+
+    const reopened = await ContextManager.reopenDerived({
+      store: parent.getStore(),
+      derivation: selective.getDerivation()!,
+      strategy: folding(),
+      membrane: mockMembrane() as never,
+      viewFilter: (m) => !plain(m),
+    });
+    managers.push(reopened);
+    const seenAgain = await texts(reopened);
+    assert.ok(seenAgain.some((t) => t.includes('SECRET ROW')) && !seenAgain.some((t) => t.includes('PLAIN ROW')), 'reopened with the view it read through, the child sees what it saw');
   });
 
   it('shares the inherited messages in memory instead of copying them', { skip }, async () => {
@@ -287,6 +311,131 @@ describe('ContextManager.derive', () => {
     );
   });
 
+  it('hands a reusing child the markers the parent placed, with the cache keys they were placed for', { skip }, async () => {
+    const { parent, strategy } = await foldedParent();
+    const childStrategy = folding();
+    await parent.derive({ branch: 'dendrite/marks', strategy: childStrategy });
+    type Marks = { _prevCacheKeys?: string[]; placedMarks: WeakMap<readonly string[], unknown> };
+    const p = strategy as unknown as Marks;
+    const c = childStrategy as unknown as Marks;
+    assert.ok(p._prevCacheKeys && p.placedMarks.get(p._prevCacheKeys), 'the premise: the parent placed markers on its last compile');
+    assert.notEqual(c._prevCacheKeys, p._prevCacheKeys, 'the child holds its own copy of the keys');
+    assert.deepEqual(c.placedMarks.get(c._prevCacheKeys!), p.placedMarks.get(p._prevCacheKeys!), 'and the markers placed for them');
+  });
+
+  it('carries the manager\'s thinking-binding record, so a reusing child keeps the thinking the parent keeps', { skip }, async () => {
+    const parent = await ContextManager.open({ path: storePath(), strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(parent);
+    const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    const identity = { system: 'system-1', tools: 'tools-1', model: 'model-1', request: 'request-1' };
+    const bind = { thinkingBinding: { binds: true, dropBlock: false, participant: 'Claude' }, identity } as never;
+    parent.addMessage('User', [{ type: 'text', text: 'Hello.' }]);
+    await parent.compile(big, undefined, bind);
+    const reply = parent.addMessage('Claude', [
+      { type: 'thinking', thinking: 'reasoning '.repeat(20), signature: 'sig-0123456789abcdef' } as never,
+      { type: 'text', text: 'Hi.' },
+    ]);
+    const { compileId } = parent.getStore().getStateJson('default/thinking-binding') as { compileId: string };
+    assert.ok(parent.noteRequestSent([reply], identity as never, compileId), 'the parent notes its reply');
+    parent.addMessage('User', [{ type: 'text', text: 'Again.' }]);
+    const child = await parent.derive({ branch: 'dendrite/thinking', strategy: folding() });
+    const fromChild = await child.compile(big, undefined, bind);
+    const fromParent = await parent.compile(big, undefined, bind);
+    assert.ok(JSON.stringify(fromParent.messages).includes('"thinking"'), 'the parent keeps the reply\'s thinking');
+    assert.equal(JSON.stringify(fromChild.messages), JSON.stringify(fromParent.messages), 'and so does the child');
+    assert.ok(child.getDerivation()!.inherited.stateIds.includes('default/thinking-binding'), 'the record says it inherited the binding record');
+  });
+
+  it('carries a tail and pace moved by hot settings, so the child chunks and compiles as the parent would', { skip }, async () => {
+    const { parent } = await foldedParent();
+    parent.updateHotContextSettings({ tailTokens: 600, transitionPaceTokens: 300 });
+    for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(HISTORY + i));
+    await settle(parent);
+    await parent.compile(BUDGET);
+    const child = await parent.derive({ branch: 'dendrite/hot', strategy: folding() });
+    const chunks = 'default/autobio:chunks';
+    assert.equal(
+      JSON.stringify(child.getStore().getStateJson(chunks)),
+      JSON.stringify(parent.getStore().getStateJson(chunks)),
+      'the child chunks nothing the parent keeps in its tail',
+    );
+    assert.deepEqual(child.getHotContextSettings(), parent.getHotContextSettings());
+    const fromChild = await child.compile(BUDGET);
+    const fromParent = await parent.compile(BUDGET);
+    assert.equal(JSON.stringify(fromChild.messages), JSON.stringify(fromParent.messages));
+  });
+
+  it('gives a child no runtime pace where its parent had none, as the parent recorded it', { skip }, async () => {
+    const { parent, strategy } = await foldedParent();
+    parent.updateHotContextSettings({ tailTokens: 600 });
+    await parent.compile(BUDGET);
+    const childStrategy = folding();
+    childStrategy.updateHotContextSettings({ transitionPaceTokens: 450 });
+    const child = await parent.derive({ branch: 'dendrite/no-pace', strategy: childStrategy });
+    const pace = (s: unknown) => (s as { runtimeTransitionPaceTokens?: number }).runtimeTransitionPaceTokens;
+    assert.equal(pace(strategy), undefined, 'the premise: the parent runs at its implicit pace');
+    assert.equal(pace(childStrategy), undefined);
+    assert.deepEqual(child.getHotContextSettings(), parent.getHotContextSettings());
+  });
+
+  it('hands an accepted kv-unified receipt to a reusing child, and a fresh child clears only its own', { skip }, async () => {
+    const kv = () => new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      foldingStrategy: 'kv-unified',
+      headWindowTokens: 0,
+      recentWindowTokens: 100,
+      kvUnified: {
+        policy: {
+          alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+          cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25, continuityLambda: 1,
+          continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+          continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+        },
+        tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000,
+        adoptEpsilon: 0, treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+      },
+    } as never);
+    type Kv = {
+      kvUnifiedReceipts: { head: unknown };
+      kvUnifiedPendingMarkerUnitIndices: number[];
+      beginKvUnifiedSubmission(s: { submissionId: string; requestHash: string; layoutHash: string }): void;
+      reportKvUnifiedAccepted(r: unknown): void;
+    };
+    const big = { maxTokens: 10_000, reserveForResponse: 0 };
+    const prefix = { kvUnifiedImmutablePrefixHash: 'immutable-v1' };
+    const parentStrategy = kv();
+    const parent = await ContextManager.open({ path: storePath(), strategy: parentStrategy, membrane: mockMembrane() as never });
+    managers.push(parent);
+    for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    await parent.compile(big, undefined, prefix);
+    const p = parentStrategy as unknown as Kv;
+    p.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    p.reportKvUnifiedAccepted({
+      submissionId: 's1',
+      acceptedAt: 1,
+      wireReceipt: {
+        requestHash: 'wire1',
+        markers: p.kvUnifiedPendingMarkerUnitIndices.map((_, ordinal) => ({ ordinal, prefixHash: `prefix-${ordinal}`, estimatedOffset: ordinal + 1 })),
+      },
+    });
+    const receipt = 'default/kvunified:presentation-receipt';
+    const accepted = JSON.stringify(parent.getStore().getStateJson(receipt));
+    assert.ok(p.kvUnifiedReceipts.head !== null && accepted !== 'null', 'the parent holds an accepted receipt');
+
+    const reuse = kv();
+    const child = await parent.derive({ branch: 'dendrite/kv', strategy: reuse });
+    assert.equal(JSON.stringify(child.getStore().getStateJson(receipt)), accepted, 'the receipt arrives through the store');
+    assert.deepEqual((reuse as unknown as Kv).kvUnifiedReceipts.head, p.kvUnifiedReceipts.head);
+    const fromChild = await child.compile(big, undefined, prefix);
+    const fromParent = await parent.compile(big, undefined, prefix);
+    assert.equal(JSON.stringify(fromChild.messages), JSON.stringify(fromParent.messages), 'messages and cache markers alike');
+
+    const fresh = await parent.derive({ branch: 'dendrite/kv-fresh', strategy: kv(), solve: 'fresh' });
+    assert.equal(fresh.getStore().getStateJson(receipt), null, 'a fresh child clears its own receipt');
+    assert.equal(JSON.stringify(parent.getStore().getStateJson(receipt)), accepted, 'and the parent keeps its');
+    assert.equal(JSON.stringify(child.getStore().getStateJson(receipt)), accepted, 'and so does the reusing child');
+  });
+
   it('nothing the child does — folding included — alters any parent state', { skip }, async () => {
     const { parent, strategy } = await foldedParent();
     const root = parent.getStore();
@@ -332,9 +481,13 @@ describe('ContextManager.derive', () => {
     const { parent, strategy } = await foldedParent();
     const root = parent.getStore();
     const ledger = 'default/autobio:compression-refusal-quarantine-events';
+    const progress = 'default/autobio:compression-family-progress';
     const queue = 'default/autobio:mergeQueue';
-    // Give the parent a ledger entry and a queued merge to NOT inherit.
+    // Give the parent a ledger entry, a family's progress toward one, and a
+    // queued merge to NOT inherit.
     root.appendToStateJson(ledger, { kind: 'checkpoint', at: 1, note: 'parent-only' });
+    const onTheWay = [{ familyKey: 'parent-only-family', chunkSourceHash: 'h', outcomes: [] }];
+    root.setStateJson(progress, onTheWay);
     const sentinel = [{ level: 2, sourceIds: ['parent-only-a', 'parent-only-b'] }];
     root.setStateJson(queue, sentinel);
 
@@ -342,6 +495,7 @@ describe('ContextManager.derive', () => {
     const child = await parent.derive({ branch: 'dendrite/child', strategy: childStrategy });
     const view = child.getStore();
     assert.equal(view.getStateLen(ledger) ?? 0, 0, 'the refusal ledger is the parent\'s own history');
+    assert.deepEqual((view.getStateJson(progress) as unknown[] | null) ?? [], [], 'and so is its families\' progress toward it');
     assert.notDeepEqual(view.getStateJson(queue), sentinel, 'the merge queue is rebuilt from inherited memory, not carried');
     assert.equal(
       (childStrategy as unknown as { summaries: unknown[] }).summaries.length,
@@ -357,6 +511,8 @@ describe('ContextManager.derive', () => {
     const withRefusals = await parent.derive({ branch: 'dendrite/reader', strategy: folding(), inherit: { refusals: true } });
     assert.equal(withRefusals.getStore().getStateLen(ledger), 1, 'the parent\'s refusal is known to the child');
     assert.ok(withRefusals.getDerivation()!.inherited.stateIds.includes(ledger));
+    assert.deepEqual(withRefusals.getStore().getStateJson(progress), onTheWay, 'with the families\' progress toward it, half of the same record');
+    assert.ok(withRefusals.getDerivation()!.inherited.stateIds.includes(progress));
     assert.notDeepEqual(withRefusals.getStore().getStateJson(queue), sentinel, 'the queue is still rebuilt, not carried');
   });
 
@@ -483,19 +639,75 @@ describe('ContextManager.derive', () => {
     });
     assert.deepEqual(past.getAllMessages().map((m) => m.id), ids.slice(0, 10));
     assert.equal(past.getDerivation()!.atSequence, cut);
+    assert.equal(past.getDerivation()!.solve, 'reuse');
+    const pastFolding = folding();
+    await parent.derive({ branch: 'dendrite/past-folding', strategy: pastFolding, atSequence: cut });
+    assert.equal((pastFolding as unknown as { _prevCacheKeys?: string[] })._prevCacheKeys, undefined, 'nothing the parent holds in memory describes that point, so nothing is handed over');
     past.addMessage('User', turn(400, 'Alternate'));
     assert.equal(parent.getAllMessages().length, HISTORY, 'the original stays inspectable and unchanged');
   });
 
-  it('says so plainly when the store cannot bind a handle to a branch', async () => {
+  it('says so plainly, and makes no branch, when the store cannot bind a handle to a branch or fork one with selected states', async () => {
+    for (const missing of ['view', 'createBranchWithStates', 'createBranchAtWithStates']) {
+      const parent = await ContextManager.open({ path: storePath(), strategy: new PassthroughStrategy() });
+      managers.push(parent);
+      Object.defineProperty(parent.getStore(), missing, { value: undefined, configurable: true });
+      assert.equal(ContextManager.supportsDerivation(parent.getStore()), false, missing);
+      await assert.rejects(
+        parent.derive({ branch: 'x', strategy: new PassthroughStrategy() }),
+        ContextDerivationUnsupportedError,
+        missing,
+      );
+      assert.deepEqual(parent.listBranches().map((b) => b.name), ['main'], missing);
+    }
+  });
+
+  it('removes its branch and lets the child go when the child fails to start, so the name derives again', { skip }, async () => {
     const parent = await ContextManager.open({ path: storePath(), strategy: new PassthroughStrategy() });
     managers.push(parent);
-    Object.defineProperty(parent.getStore(), 'view', { value: undefined, configurable: true });
-    assert.equal(ContextManager.supportsDerivation(parent.getStore()), false);
-    await assert.rejects(
-      parent.derive({ branch: 'x', strategy: new PassthroughStrategy() }),
-      ContextDerivationUnsupportedError,
-    );
+    const ids = [parent.addMessage('User', turn(0)), parent.addMessage('Claude', turn(1))];
+    class FailingToStart extends PassthroughStrategy {
+      detached = 0;
+      async initialize(): Promise<void> { throw new Error('child initialize failed'); }
+      detach(): void { this.detached++; }
+    }
+    const failing = new FailingToStart();
+    await assert.rejects(parent.derive({ branch: 'dendrite/again', strategy: failing }), /child initialize failed/);
+    assert.deepEqual(parent.listBranches().map((b) => b.name), ['main']);
+    assert.equal(failing.detached, 1, 'the failed child\'s strategy is let go');
+    const child = await parent.derive({ branch: 'dendrite/again', strategy: new PassthroughStrategy() });
+    managers.push(child);
+    assert.deepEqual(child.getAllMessages().map((m) => m.id), ids);
+
+    await assert.rejects(parent.derive({ branch: 'dendrite/again', strategy: new PassthroughStrategy() }));
+    assert.deepEqual(parent.listBranches().map((b) => b.name).sort(), ['dendrite/again', 'main'], 'a name already taken: the branch that has it stays');
+    assert.deepEqual(child.getAllMessages().map((m) => m.id), ids);
+  });
+
+  it('leaves alone a branch made under its name while the child was starting', { skip }, async () => {
+    const parent = await ContextManager.open({ path: storePath(), strategy: new PassthroughStrategy() });
+    managers.push(parent);
+    parent.addMessage('User', turn(0));
+    const root = parent.getStore();
+    class Replaced extends PassthroughStrategy {
+      async initialize(): Promise<void> {
+        root.deleteBranch('dendrite/replaced');
+        root.createBranch('dendrite/replaced');
+        throw new Error('child initialize failed');
+      }
+    }
+    await assert.rejects(parent.derive({ branch: 'dendrite/replaced', strategy: new Replaced() }), /child initialize failed/);
+    assert.ok(parent.listBranches().some((b) => b.name === 'dendrite/replaced'), 'the branch made meanwhile stays');
+  });
+
+  it('removes its branch when the child fails after it starts, as when taking over the frontier throws', { skip }, async () => {
+    const { parent } = await foldedParent();
+    const failing = folding();
+    failing.adoptRenderingFrontier = () => { throw new Error('adoption failed'); };
+    await assert.rejects(parent.derive({ branch: 'dendrite/adopt', strategy: failing }), /adoption failed/);
+    assert.deepEqual(parent.listBranches().map((b) => b.name), ['main']);
+    const child = await parent.derive({ branch: 'dendrite/adopt', strategy: folding() });
+    managers.push(child);
   });
 });
 

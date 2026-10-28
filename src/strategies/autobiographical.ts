@@ -2031,6 +2031,8 @@ export interface AutobiographicalRenderingFrontier {
   strategy: 'autobiographical';
   /** Previous compile's per-entry cache identities (marker placement). */
   prevCacheKeys?: string[];
+  /** The markers that compile placed, which the next compile's measured slot reads. */
+  prevPlacedMarks?: { first: number; band: boolean; marks: readonly number[] };
   /** The live tail size, which hot settings may have moved off the config value. */
   recentWindowTokens?: number;
   runtimeTransitionPaceTokens?: number;
@@ -2784,15 +2786,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * empty on the child's branch: the merge queue, which `initialize`
    * rebuilds from the inherited summaries, and — unless `refusals` is
    * asked for — the compression-refusal ledger, which records this
-   * instance's own refusals and alerts. Ids the configuration never
-   * registered are ignored by the store.
+   * instance's own refusals and alerts, and the request families' ladder
+   * progress, which a family's exhaustion turns into a ledger entry. Ids
+   * the configuration never registered are ignored by the store.
    */
   derivationManifest(namespace: string, options: DerivationManifestOptions = {}): DerivationManifest {
     const ns = namespace;
     return {
       stateIds: [
         ...(options.refusals
-          ? [`${ns}/autobio:compression-refusal-quarantine-events`, `${ns}/autobio:compression-refusal-quarantine`]
+          ? [
+              `${ns}/autobio:compression-refusal-quarantine-events`,
+              `${ns}/autobio:compression-refusal-quarantine`,
+              `${ns}/autobio:compression-family-progress`,
+            ]
           : []),
         `${ns}/autobio:summaries`,
         `${ns}/autobio:chunks`,
@@ -2819,11 +2826,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   exportRenderingFrontier(): AutobiographicalRenderingFrontier {
     this.requireLoadedBranch('exportRenderingFrontier');
+    const placed = this._prevCacheKeys ? this.placedMarks.get(this._prevCacheKeys) : undefined;
     return {
       strategy: 'autobiographical',
       // Strings are immutable; the array is copied so the two instances'
       // later compiles never share it.
       ...(this._prevCacheKeys ? { prevCacheKeys: [...this._prevCacheKeys] } : {}),
+      ...(placed ? { prevPlacedMarks: { ...placed, marks: [...placed.marks] } } : {}),
       recentWindowTokens: this.config.recentWindowTokens,
       ...(this.runtimeTransitionPaceTokens !== undefined
         ? { runtimeTransitionPaceTokens: this.runtimeTransitionPaceTokens }
@@ -2834,11 +2843,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
+  prepareFromRenderingFrontier(frontier: unknown): void {
+    const f = frontier as Partial<AutobiographicalRenderingFrontier> | null | undefined;
+    if (!f || f.strategy !== 'autobiographical') return;
+    if (typeof f.recentWindowTokens === 'number') this.config.recentWindowTokens = f.recentWindowTokens;
+    this.runtimeTransitionPaceTokens = f.runtimeTransitionPaceTokens;
+  }
+
   adoptRenderingFrontier(frontier: unknown): void {
     this.requireLoadedBranch('adoptRenderingFrontier');
     const f = frontier as Partial<AutobiographicalRenderingFrontier> | null | undefined;
     if (!f || f.strategy !== 'autobiographical') return;
     this._prevCacheKeys = Array.isArray(f.prevCacheKeys) ? [...f.prevCacheKeys] : undefined;
+    if (this._prevCacheKeys && f.prevPlacedMarks) {
+      this.placedMarks.set(this._prevCacheKeys, { ...f.prevPlacedMarks, marks: [...f.prevPlacedMarks.marks] });
+    }
     if (typeof f.recentWindowTokens === 'number') this.config.recentWindowTokens = f.recentWindowTokens;
     this.runtimeTransitionPaceTokens = f.runtimeTransitionPaceTokens;
     this.preparedWindowTokens = f.preparedWindowTokens;

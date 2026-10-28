@@ -69,7 +69,7 @@ import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } 
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
   UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
-  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
+  bindingStateId, refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
@@ -234,9 +234,15 @@ export interface DeriveContextOptions {
   membrane?: Membrane;
   /**
    * - `'reuse'` (default): keep the parent's rendering frontier — persisted
-   *   fold state arrives through the store, and the in-memory remainder is
-   *   handed from the parent's strategy to the child's — so the child's
-   *   first compile reproduces the parent's presentation and cache markers.
+   *   fold state arrives through the store, and, at the head, the in-memory
+   *   remainder is handed from the parent's strategy to the child's — so the
+   *   child's first compile reproduces the parent's presentation and cache
+   *   markers when it reads through the parent's view; with a view of its
+   *   own (`viewFilter`) the frontier is handed over all the same, and the
+   *   child renders what its view holds. Derived from an earlier point
+   *   (`atSequence`), the child keeps what was persisted by then and
+   *   nothing in memory, since the parent's in-memory frontier describes
+   *   its head.
    * - `'fresh'`: discard the inherited frontier and solve from scratch, e.g.
    *   at another budget. Presentation changes; the provider cache misses.
    */
@@ -258,11 +264,17 @@ export interface DeriveContextOptions {
    */
   atSequence?: number;
   /**
-   * The derived manager's view (see ContextManagerBaseConfig.viewFilter).
-   * Default: the parent's. A host whose forks see what their parent sees and
-   * their own rows besides (agent-framework's shared forks, whose stored
-   * context injections carry the fork's name) passes the composed predicate
-   * here, so the first compile already reads through it.
+   * The derived manager's view (see ContextManagerBaseConfig.viewFilter), in
+   * place of the parent's: it replaces the parent's exclusions rather than
+   * adding to them. Default: the parent's. The inherited memory was built
+   * under the parent's view, so this one keeps and leaves out what the
+   * parent's does of the history that memory covers, and may differ on rows
+   * the parent hasn't folded, such as those stored after the checkpoint. A
+   * host whose forks see what their parent sees and their own rows besides
+   * (agent-framework's shared forks, whose stored context injections carry
+   * the fork's name) passes the composed predicate here, so the first compile
+   * already reads through it. A predicate isn't part of the derivation
+   * record: reopening takes it again (ReopenDerivedOptions.viewFilter).
    */
   viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
@@ -280,8 +292,9 @@ export interface ContextDerivation {
   /** The states it inherited; anything else reads as empty on its branch. */
   inherited: { stateIds: string[]; statePrefixes: string[] };
   /**
-   * How the manager's slots are named — with `branch`, everything needed to
-   * reopen the derived context later (see {@link ContextManager.reopenDerived}).
+   * How the manager's slots are named — with `branch`, what the store needs
+   * to reopen the derived context later (see {@link ContextManager.reopenDerived}),
+   * which also takes the strategy and the view it read through.
    * `null` stands for "no namespace" so the record survives JSON.
    */
   slots: {
@@ -300,7 +313,10 @@ export interface ReopenDerivedOptions {
   strategy?: ContextStrategy;
   membrane?: Membrane;
   tokenEstimator?: (text: string) => number;
-  /** The same exclusion predicate the parent manager used, if it had one. */
+  /**
+   * The view the derived manager read through: the one given to `derive`,
+   * else the parent's exclusion predicate, if it had one.
+   */
   viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
 }
@@ -309,8 +325,9 @@ export interface ReopenDerivedOptions {
 export class ContextDerivationUnsupportedError extends Error {
   constructor() {
     super(
-      'Context derivation needs branch-bound store handles (JsStore.view), ' +
-        'which this @animalabs/chronicle build does not provide',
+      'Context derivation needs branch-bound store handles (JsStore.view) and branches forked with ' +
+        'selected states (createBranchWithStates, createBranchAtWithStates), which this ' +
+        '@animalabs/chronicle build does not provide',
     );
     this.name = 'ContextDerivationUnsupportedError';
   }
@@ -319,17 +336,17 @@ export class ContextDerivationUnsupportedError extends Error {
 /** Chronicle surface derivation depends on; absent on builds without views. */
 interface DerivableStore {
   view(branch: string): JsStore;
-  createBranchWithStates?(
+  createBranchWithStates(
     name: string,
     from: string | undefined | null,
     filter: { stateIds?: string[]; statePrefixes?: string[] },
-  ): unknown;
-  createBranchAtWithStates?(
+  ): { id: string };
+  createBranchAtWithStates(
     name: string,
     from: string,
     atSequence: number,
     filter: { stateIds?: string[]; statePrefixes?: string[] },
-  ): unknown;
+  ): { id: string };
 }
 
 /**
@@ -1906,9 +1923,12 @@ export class ContextManager {
   // Derivation: shared reads, separate writes
   // ==========================================================================
 
-  /** Whether `store` can bind handles to branches, which derivation requires. */
+  /** Whether `store` can bind handles to branches and fork a branch with selected states, which derivation requires. */
   static supportsDerivation(store: JsStore): boolean {
-    return typeof (store as unknown as Partial<DerivableStore>).view === 'function';
+    const derivable = store as unknown as Partial<DerivableStore>;
+    return typeof derivable.view === 'function'
+      && typeof derivable.createBranchWithStates === 'function'
+      && typeof derivable.createBranchAtWithStates === 'function';
   }
 
   /**
@@ -1929,23 +1949,24 @@ export class ContextManager {
    *
    * What is inherited is the set of states this manager owns: its message
    * slot, its auxiliary slots, its context log, its window index (see
-   * presentRows) and its strategy's states. Other states in the store are
-   * not carried onto the derived branch. The window is the parent's as of
-   * the checkpoint: at the head the child starts with the parent's window
-   * and its arrived-and-not-presented rows (getUnpresentedMessages), and
-   * from `atSequence` it starts with the window as it stood then, which
-   * names only rows stored by then. The cut is taken as given: a row stored
-   * by then and presented after it is in the child's record and not in its
-   * window. A row is presented at a write after its own, so a cut at a
-   * presented row's own sequence leaves that row out of the child's window
-   * too: give a presentation boundary (`currentSequence()` read after a
-   * presentRows) instead. A presentRows call that the store wrote as one
-   * record (see presentRows) is in the child's window whole or not at all.
-   * A cut between a sharded body's presentations, one record per shard on a
-   * chronicle without the batched form, leaves the body partly in the
-   * child's window, and the child's presentRows of the body completes it.
-   * A parent that hadn't presented a row by the checkpoint has no window
-   * written, and the child is in legacy mode.
+   * presentRows), its thinking-binding record and its strategy's states.
+   * Other states in the store are not carried onto the derived branch.
+   * The window is the parent's as of the checkpoint: at the head the child
+   * starts with the parent's window and its arrived-and-not-presented rows
+   * (getUnpresentedMessages), and from `atSequence` it starts with the
+   * window as it stood then, which names only rows stored by then. The cut
+   * is taken as given: a row stored by then and presented after it is in
+   * the child's record and not in its window. A row is presented at a
+   * write after its own, so a cut at a presented row's own sequence leaves
+   * that row out of the child's window too: give a presentation boundary
+   * (`currentSequence()` read after a presentRows) instead. A presentRows
+   * call that the store wrote as one record (see presentRows) is in the
+   * child's window whole or not at all. A cut between a sharded body's
+   * presentations, one record per shard on a chronicle without the batched
+   * form, leaves the body partly in the child's window, and the child's
+   * presentRows of the body completes it. A parent that hadn't presented a
+   * row by the checkpoint has no window written, and the child is in
+   * legacy mode.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.
@@ -1968,6 +1989,7 @@ export class ContextManager {
       MessageStore.registrationFor(this.slots.messageNamespace).id,
       ...this.slots.auxiliaryNamespaces.map((ns) => MessageStore.registrationFor(ns).id),
       ContextLog.stateIdFor(this.slots.contextNamespace),
+      bindingStateId(this.strategyNamespace),
       // The window: the manager's, not the strategy's, so it is listed here
       // whatever a strategy's manifest names. A parent still in legacy mode
       // has none written, and the child is in legacy mode too, its window the
@@ -1997,78 +2019,91 @@ export class ContextManager {
         ? this.strategy.exportRenderingFrontier()
         : undefined;
 
-    if (atHead) {
-      if (typeof source.createBranchWithStates === 'function') {
-        source.createBranchWithStates(options.branch, parentBranch, filter);
-      } else {
-        this.store.createBranch(options.branch, parentBranch);
+    const branch = options.branch;
+    const created = atHead
+      ? source.createBranchWithStates(branch, parentBranch, filter)
+      : source.createBranchAtWithStates(branch, parentBranch, atSequence, filter);
+    let derived: ContextManager | undefined;
+    try {
+      const view = source.view(branch);
+
+      const coldStore = (namespace: string | undefined) =>
+        new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
+      const messageStore = atHead
+        ? this.messageStore.deriveOnto(view)
+        : coldStore(this.slots.messageNamespace);
+      const auxiliaryStores = this.auxiliaryStores.map((aux, i) =>
+        atHead ? aux.deriveOnto(view) : coldStore(this.slots.auxiliaryNamespaces[i]),
+      );
+      // ---- End of the synchronous section. ----
+
+      const contextLog = new ContextLog(view, {
+        estimator: this.slots.tokenEstimator,
+        namespace: this.slots.contextNamespace,
+      });
+      derived = new ContextManager(
+        view,
+        messageStore,
+        contextLog,
+        options.strategy,
+        false, // the app owns the store; a derived manager never closes it
+        this.strategyNamespace,
+        options.membrane ?? this.membrane,
+        options.debugLogContext ?? this.debugLogContext,
+        options.viewFilter ?? this.viewFilter,
+        auxiliaryStores,
+      );
+      // At the head the child's branch took the window's chain head as it was,
+      // so the child starts from the parent's reading of it, as its message
+      // store starts from the parent's listing. The reading is taken only
+      // while it is current and is of the record the child's chain ends at;
+      // otherwise the child reads its own branch when it first asks.
+      if (atHead) derived.windowIndex.seedFrom(this.windowIndex);
+      derived.now = this.now;
+      derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
+      derived.toolDefinitions = this.toolDefinitions;
+      derived.systemPrompt = this.systemPrompt;
+      derived.derivation = {
+        parentBranch,
+        branch,
+        atSequence,
+        solve,
+        inherited: filter,
+        slots: {
+          messageNamespace: this.slots.messageNamespace ?? null,
+          contextNamespace: this.slots.contextNamespace ?? null,
+          auxiliaryNamespaces: this.slots.auxiliaryNamespaces.map((ns) => ns ?? null),
+        },
+      };
+
+      if (frontier !== undefined && isRenderingFrontierStrategy(derived.strategy)) {
+        derived.strategy.prepareFromRenderingFrontier?.(frontier);
       }
-    } else if (typeof source.createBranchAtWithStates === 'function') {
-      source.createBranchAtWithStates(options.branch, parentBranch, atSequence, filter);
-    } else {
-      this.store.createBranchAt(options.branch, parentBranch, atSequence);
-    }
-    const view = source.view(options.branch);
+      await derived.initializeStrategy(observeStoreBranch(view));
 
-    const coldStore = (namespace: string | undefined) =>
-      new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
-    const messageStore = atHead
-      ? this.messageStore.deriveOnto(view)
-      : coldStore(this.slots.messageNamespace);
-    const auxiliaryStores = this.auxiliaryStores.map((aux, i) =>
-      atHead ? aux.deriveOnto(view) : coldStore(this.slots.auxiliaryNamespaces[i]),
-    );
-    // ---- End of the synchronous section. ----
-
-    const contextLog = new ContextLog(view, {
-      estimator: this.slots.tokenEstimator,
-      namespace: this.slots.contextNamespace,
-    });
-    const derived = new ContextManager(
-      view,
-      messageStore,
-      contextLog,
-      options.strategy,
-      false, // the app owns the store; a derived manager never closes it
-      this.strategyNamespace,
-      options.membrane ?? this.membrane,
-      options.debugLogContext ?? this.debugLogContext,
-      options.viewFilter ?? this.viewFilter,
-      auxiliaryStores,
-    );
-    // At the head the child's branch took the window's chain head as it was,
-    // so the child starts from the parent's reading of it, as its message
-    // store starts from the parent's listing. The reading is taken only
-    // while it is current and is of the record the child's chain ends at;
-    // otherwise the child reads its own branch when it first asks.
-    if (atHead) derived.windowIndex.seedFrom(this.windowIndex);
-    derived.now = this.now;
-    derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
-    derived.toolDefinitions = this.toolDefinitions;
-    derived.systemPrompt = this.systemPrompt;
-    derived.derivation = {
-      parentBranch,
-      branch: options.branch,
-      atSequence,
-      solve,
-      inherited: filter,
-      slots: {
-        messageNamespace: this.slots.messageNamespace ?? null,
-        contextNamespace: this.slots.contextNamespace ?? null,
-        auxiliaryNamespaces: this.slots.auxiliaryNamespaces.map((ns) => ns ?? null),
-      },
-    };
-
-    await derived.initializeStrategy(observeStoreBranch(view));
-
-    if (isRenderingFrontierStrategy(derived.strategy)) {
-      if (solve === 'fresh') {
-        derived.strategy.discardRenderingFrontier();
-      } else if (frontier !== undefined) {
-        derived.strategy.adoptRenderingFrontier(frontier);
+      if (isRenderingFrontierStrategy(derived.strategy)) {
+        if (solve === 'fresh') {
+          derived.strategy.discardRenderingFrontier();
+        } else if (frontier !== undefined) {
+          derived.strategy.adoptRenderingFrontier(frontier);
+        }
       }
+      return derived;
+    } catch (error) {
+      try {
+        derived?.close();
+      } catch (cleanup) {
+        logThrown(`[context-manager] derive of '${branch}' failed, and closing the child failed too:`, cleanup, this.diag);
+      }
+      try {
+        if (this.store.listBranches().some((b) => b.name === branch && b.id === created.id)) {
+          this.store.deleteBranch(branch);
+        }
+      } catch (cleanup) {
+        logThrown(`[context-manager] derive of '${branch}' failed, and removing its branch failed too:`, cleanup, this.diag);
+      }
+      throw error;
     }
-    return derived;
   }
 
   /** How this manager was derived, or null if it was opened directly. */

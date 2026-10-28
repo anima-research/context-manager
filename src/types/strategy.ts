@@ -878,6 +878,15 @@ export function isHotConfigurableStrategy(s: ContextStrategy): s is HotConfigura
 export interface RenderingFrontierStrategy extends ContextStrategy {
   /** Snapshot the in-memory frontier. Must not alias mutable strategy state. */
   exportRenderingFrontier(): unknown;
+  /**
+   * Take a frontier's settings (the parent's tail and runtime pace, as the
+   * frontier recorded them) before initialize, so a child reusing the
+   * parent's head chunks under the parent's live settings from its first
+   * initialize: hot settings aren't persisted, and initialize writes chunk
+   * records by the tail. Optional: a strategy without hot settings has
+   * nothing to apply.
+   */
+  prepareFromRenderingFrontier?(frontier: unknown): void;
   /** Take over a frontier exported by another instance. Called after initialize. */
   adoptRenderingFrontier(frontier: unknown): void;
   /**
@@ -896,6 +905,20 @@ export interface DerivationManifest {
   statePrefixes: string[];
 }
 
+/** Per-derivation choices a manifest may honour. */
+export interface DerivationManifestOptions {
+  /**
+   * Also inherit the parent's refusal ledger — what it declined to compress
+   * and why — with whatever a strategy keeps on the way to it, such as
+   * progress toward a refusal. Off by default: a task fork is free of its
+   * parent's refusals. A fork that stands in for the parent's attention
+   * wants them, so it is not asked the thing the parent said no to without
+   * knowing. Inherited entries are the parent's; the child's own refusals
+   * append after them on its branch, and nothing reaches the parent.
+   */
+  refusals?: boolean;
+}
+
 /**
  * Strategy that names which of its persisted states a derived context
  * inherits (see `ContextManager.derive`). Without this, every state under
@@ -905,19 +928,6 @@ export interface DerivationManifest {
  * rest empty on the child's branch — a queue to be rebuilt from inherited
  * state, a ledger of the parent's own refusals.
  */
-/** Per-derivation choices a manifest may honour. */
-export interface DerivationManifestOptions {
-  /**
-   * Also inherit the parent's refusal ledger — what it declined to compress
-   * and why. Off by default: a task fork is free of its parent's refusals.
-   * A fork that stands in for the parent's attention wants them, so it is
-   * not asked the thing the parent said no to without knowing. Inherited
-   * entries are the parent's; the child's own refusals append after them
-   * on its branch, and nothing reaches the parent.
-   */
-  refusals?: boolean;
-}
-
 export interface DerivationManifestStrategy extends ContextStrategy {
   derivationManifest(namespace: string, options?: DerivationManifestOptions): DerivationManifest;
 }
