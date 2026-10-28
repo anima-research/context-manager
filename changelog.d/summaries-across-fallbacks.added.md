@@ -1,0 +1,1 @@
+- `getStats()` returned `chunksTotal`, `chunksCompressed`, `compressionCount`, `l1`, `l2`, `l3` and `pendingMerges`, and now also returns `acrossFallbacks`, the number of committing compiles since the strategy loaded its branch whose select with the summaries over a window's raw messages left out failed as a dry run, so the compile selected as before.

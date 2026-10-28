@@ -2593,13 +2593,19 @@ describe('OverBudgetError.clearedBy', () => {
           const inside = indices.filter((i) => (where === 'head' ? i < headEnd : i >= recentStart)).length;
           assert.equal(inside, whole ? 4 : 3, `the window holds ${whole ? 'the whole chunk' : 'three of its four messages'}`);
           assert.deepEqual(error.clearedBy, whole ? [] : ['compression']);
-          // The premise: its L1 makes the plan smaller only when part of the chunk lies outside the window.
           const big = { maxTokens: 2_000_000_000, reserveForResponse: 20 };
-          const before = manager.previewContext(big)!.finalTokens;
+          const planAt = (budget: { maxTokens: number; reserveForResponse: number }): number => manager.previewContext(budget)!.finalTokens;
+          const before = planAt(big);
+          const tight = { maxTokens: Math.floor(before / 2) + 20, reserveForResponse: 20 };
+          const tightBefore = planAt(tight);
           strategy.seedShortL1('L1-in-window', inWindow);
-          const after = manager.previewContext(big)!.finalTokens;
-          if (whole) assert.equal(after, before, 'its L1 folded nothing');
-          else assert.ok(after < before, `the plan went from ${before} to ${after} tokens`);
+          const tightAfter = planAt(tight);
+          if (whole) {
+            assert.equal(planAt(big), before, 'its L1 folded nothing');
+            assert.equal(tightAfter, tightBefore, 'its L1 folded nothing at the tight budget either');
+          } else {
+            assert.ok(tightAfter < tightBefore, `at the tight budget its L1 shrank the plan, from ${tightBefore} to ${tightAfter} tokens`);
+          }
         });
       });
     }
