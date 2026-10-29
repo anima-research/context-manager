@@ -3318,6 +3318,27 @@ export class ContextManager {
   }
 
   /**
+   * The transition summary resetHeadWindow() would write of the head window
+   * as it stands, storing nothing: the strategy's generateTransitionSummary
+   * over the manager's own strategy context. Refuses as resetHeadWindow()
+   * does — not initialized, a strategy that can't reset its head window —
+   * and when the manager is re-initialized or its branch moves while the
+   * summary is written. A host that checks its own conditions between this
+   * call and resetHeadWindow(summary) (an idle agent, no turn alive, nothing
+   * moved) stores a transition only when they hold, and gives the summary
+   * back otherwise (connectome-host's bare /newtopic).
+   */
+  async generateTransitionSummary(): Promise<string> {
+    const attempt = this.requireInitialized('generateTransitionSummary');
+    if (!isResettableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support head window reset');
+    }
+    const summary = await this.strategy.generateTransitionSummary(this.createStrategyContext());
+    this.requireInitialized('generateTransitionSummary', attempt);
+    return summary;
+  }
+
+  /**
    * Trigger background maintenance work.
    * Call this periodically to allow strategies to do compression, etc.
    */
