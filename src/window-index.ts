@@ -173,6 +173,8 @@ interface IndexState {
   ordinals: Map<MessageId, number>;
   /** Rows of an undone turn, out of the window until presented again. */
   undone: Set<MessageId>;
+  /** Rows a tombstone took out of the window, undone or not, and no presentation has put back since. */
+  left: Set<MessageId>;
   /** Changes whenever the window does, so a listing built from an earlier one is rebuilt. */
   version: number;
   /** `rows` without its holes, once asked for. */
@@ -201,6 +203,7 @@ function emptyState(branchId: unknown, revision: number | null): IndexState {
     at: [],
     ordinals: new Map(),
     undone: new Set(),
+    left: new Set(),
     version: ++versions,
     presented: null,
     header: null,
@@ -252,6 +255,7 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
       state.ordinals.set(fields.id, ordinal);
     }
     state.undone.delete(fields.id);
+    state.left.delete(fields.id);
     return true;
   }
   if (typeof fields.retract === 'string') {
@@ -262,6 +266,7 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
     }
     if (fields.undone === true) state.undone.add(fields.retract);
     else state.undone.delete(fields.retract);
+    state.left.add(fields.retract);
     return true;
   }
   if (typeof fields.v === 'number') {
@@ -453,6 +458,21 @@ export class WindowIndex {
   isUndone(id: MessageId): boolean {
     const state = this.current();
     return inEffect(state) && state.undone.has(id);
+  }
+
+  /**
+   * The rows a tombstone took out of the window and no presentation has
+   * put back since, undone or not, from one reading of the index: rows a
+   * host took out, and rows removed from the record once taken out by
+   * their ids. Null in legacy mode. A row removed in legacy mode, before
+   * the write-down, was never in the index, and isn't one; neither is a
+   * row removed through another manager that no retract has taken out
+   * yet, which keeps its ordinal (see ordinalOf). Read it at once: a later
+   * write changes it.
+   */
+  left(): ReadonlySet<MessageId> | null {
+    const state = this.current();
+    return inEffect(state) ? state.left : null;
   }
 
   /**
@@ -863,6 +883,7 @@ export class WindowIndex {
       at: [...state.at],
       ordinals: new Map(state.ordinals),
       undone: new Set(state.undone),
+      left: new Set(state.left),
       version: ++versions,
       // Never changed in place (a write sets it to null), so both can read it.
       presented: state.presented,

@@ -119,6 +119,18 @@ export interface WindowIndexView {
   ordinalFrom(sequence: Sequence): number | undefined;
   /** The sequence of the first row in the window at `ordinal` or after, before the view filter; undefined when none is, and in legacy mode. */
   sequenceFrom(ordinal: number): Sequence | undefined;
+  /**
+   * The rows that left the window and haven't been presented again since,
+   * from one reading of the index: rows a host took out (retractRows), and
+   * rows removed from the record once they were taken out, by a removal
+   * through the manager or by their ids. Null in legacy mode. A row
+   * removed before the window was written down was never in it, and isn't
+   * one. A strategy that folds rows reads it at its open to let go of what
+   * covers a row that left while no strategy of its kind heard it go
+   * (onRetracted). Optional: a view a caller builds by hand may not have
+   * it, which a strategy reads as no row having left.
+   */
+  left?(): ReadonlySet<MessageId> | null;
 }
 
 /**

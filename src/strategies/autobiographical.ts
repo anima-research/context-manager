@@ -3113,6 +3113,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.rebuildChunks(ctx.messageStore);
       if (abortIfStale()) return;
+      this.releaseRowsThatLeft(ctx);
+      if (abortIfStale()) return;
       if (!this.config.auditOnly) this.sanitizePersistedMergeQueue(ctx.messageStore);
       if (abortIfStale()) return;
       this.demoteSplitSummaries(messages, ctx);
@@ -7466,9 +7468,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * called: what covered it at its old place goes all the same, and a chunk
    * record that holds it in a run of window rows with a row of its own that
    * didn't leave, one made over it at its new place, keeps it (and is
-   * compressed again). Should this strategy never hear it go (the process
-   * stopped between the window's tombstone and these writes), the next open
-   * demotes the summary the row's new place leaves non-contiguous
+   * compressed again). Should this strategy never hear a row go (the
+   * process stopped between the window's tombstone and these writes, or a
+   * manager whose strategy has no onRetracted took it out), the next open
+   * in presented mode repairs it: it lets go of what covers a row still
+   * out of the window, as this does (releaseRowsThatLeft), and demotes the
+   * summary the new place of a row presented again leaves non-contiguous
    * (demoteSplitSummaries).
    *
    * `undone` and `removed` change none of this: an undone row, a row taken
@@ -7490,42 +7495,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
     if (leaving.size === 0) return;
-    // The L1s holding a row that left among their sources, the L1 of each
-    // chunk record holding one, and (in unfold) every summary above them.
-    const seeds = new Set<string>();
-    for (const summary of this.summaries) {
-      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
-    }
-    for (const record of this.chunkRecords) {
-      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
-    }
-
-    // A row that left and is in the window again, presented again before
-    // this was heard, stays in a record that holds it beside a row of its
-    // own that didn't leave: that record was made over it where it stands.
-    const view = ctx.messageStore;
-    const back = [...leaving].filter((id) => view.get(id) !== null);
-    let staying: (record: ChunkRecord) => ReadonlySet<MessageId> = () => new Set();
-    if (back.length > 0) {
-      const position = this.positionIndex(view.getAll());
-      const returned = new Set(back);
-      staying = (record) => {
-        const kept = new Set<MessageId>();
-        const runs = windowRuns(record.sourceIds, position);
-        for (const run of runs) {
-          if (run.some((id) => !leaving.has(id))) for (const id of run) if (returned.has(id)) kept.add(id);
-        }
-        return kept;
-      };
-    }
-
-    // Each record holding a row that left, or naming a dropped L1, is
-    // compressed again over the rows it keeps; one left with none goes.
-    const unfolded = this.unfold(seeds, (record) => {
-      if (!record.sourceIds.some((id) => leaving.has(id))) return undefined;
-      const kept = staying(record);
-      return record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id));
-    });
+    const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
     if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
       this.diag.warn(
         `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
@@ -7552,6 +7522,96 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
       this.driveSpeculativeDrain(ctx);
     }
+  }
+
+  /**
+   * Load-time repair, once a host presents (`ctx.window` in presented
+   * mode), of what covers a row that left the window and is out of it
+   * still (WindowIndexView.left) when this strategy never heard it go:
+   * the process stopped between the window's tombstone and the strategy's
+   * own writes, or a manager whose strategy has no onRetracted took it out.
+   * Such a row would otherwise render inside its summary, which shows the
+   * agent a row its window no longer holds. What covers it goes as
+   * onRetracted lets it go (unfoldRowsThatLeft): each L1 over it, with
+   * every summary above it, and each chunk record holding it gives it up
+   * and is compressed again over the rows it keeps. A row presented again
+   * since is in the window, and the summary over it at its old place is
+   * demoteSplitSummaries'. A row removed before the window was written
+   * down was never in it, and what folded it stays, as it always has in
+   * legacy mode. An audit-only open writes nothing, and repairs nothing
+   * here; the topology policy doesn't change it, as it doesn't change
+   * onRetracted.
+   */
+  private releaseRowsThatLeft(ctx: StrategyContext): void {
+    if (ctx.window?.mode() !== 'presented' || this.config.auditOnly) return;
+    const left = ctx.window.left?.();
+    if (!left || left.size === 0) return;
+    const leaving = new Set<MessageId>();
+    for (const summary of this.summaries) {
+      if (summary.level === 1) for (const id of summary.sourceIds) if (left.has(id)) leaving.add(id);
+    }
+    for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) leaving.add(id);
+    if (leaving.size === 0) return;
+    const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
+    this.diag.warn(
+      `[autobiographical] ${leaving.size} row(s) out of the window are still folded (they left while no strategy that folds ` +
+        `heard them go): letting go of [${[...leaving].join(', ')}]; dropped the summaries covering them ` +
+        `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
+        `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
+    );
+    this.rebuildChunks(ctx.messageStore);
+  }
+
+  /**
+   * Let go of what covers the rows `leaving` names, rows that left the
+   * window (windowLost, releaseRowsThatLeft): each L1 holding one among
+   * its sources, the L1 of each chunk record holding one, and (in unfold)
+   * every summary above them, go; each such record is compressed again
+   * over the rows it keeps, and one left with none goes. A row that left
+   * and is in the window again, presented again before this strategy heard
+   * it go, stays in a record that holds it beside a row of its own that
+   * didn't leave: that record was made over it where it stands. The
+   * chunks aren't rebuilt here.
+   */
+  private unfoldRowsThatLeft(
+    leaving: ReadonlySet<MessageId>,
+    view: MessageStoreView,
+  ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
+    // The L1s holding a row that left among their sources, the L1 of each
+    // chunk record holding one, and (in unfold) every summary above them.
+    const seeds = new Set<string>();
+    for (const summary of this.summaries) {
+      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
+    }
+    for (const record of this.chunkRecords) {
+      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
+    }
+
+    // A row that left and is in the window again, presented again before
+    // this was heard, stays in a record that holds it beside a row of its
+    // own that didn't leave: that record was made over it where it stands.
+    const back = [...leaving].filter((id) => view.get(id) !== null);
+    let staying: (record: ChunkRecord) => ReadonlySet<MessageId> = () => new Set();
+    if (back.length > 0) {
+      const position = this.positionIndex(view.getAll());
+      const returned = new Set(back);
+      staying = (record) => {
+        const kept = new Set<MessageId>();
+        const runs = windowRuns(record.sourceIds, position);
+        for (const run of runs) {
+          if (run.some((id) => !leaving.has(id))) for (const id of run) if (returned.has(id)) kept.add(id);
+        }
+        return kept;
+      };
+    }
+
+    // Each record holding a row that left, or naming a dropped L1, is
+    // compressed again over the rows it keeps; one left with none goes.
+    return this.unfold(seeds, (record) => {
+      if (!record.sourceIds.some((id) => leaving.has(id))) return undefined;
+      const kept = staying(record);
+      return record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id));
+    });
   }
 
   /**

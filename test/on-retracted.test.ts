@@ -770,6 +770,57 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     }
   });
 
+  // House review of #350, code finding 3: a row that left the window while
+  // no folding strategy heard it, and stays out, is let go of at the next
+  // open, as onRetracted would have let go of it.
+  it('a folded row taken out that no folding strategy heard go, and still out: the open lets go of what covers it', async () => {
+    for (const heard of [false, true]) {
+      const path = freshPath();
+      const { cm, strategy, ids } = await folding(path);
+      await drain(cm);
+      const row = ids[3]!;
+      const covering = internals(strategy).summaries.filter((s) => leavesOf(cm, s.id).includes(row)).map((s) => s.id);
+      assert.ok(covering.length > 0, 'premise: the row is folded');
+      if (heard) {
+        // The control: the folding strategy hears the row go.
+        await linesDuring(async () => cm.retractRows([row], { undone: true }));
+        cm.close();
+      } else {
+        cm.close();
+        // Through a strategy without the hook, as a crash between the
+        // window's tombstone and the folding strategy's own writes leaves the store.
+        const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+        plain.retractRows([row], { undone: true });
+        plain.close();
+      }
+      const label = heard ? 'control' : 'probe';
+      const next = autobiographical();
+      let reopened!: ContextManager;
+      const lines = await linesDuring(async () => {
+        reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+      });
+      assert.equal(reopened.windowStatusOf(row), 'undone', `${label}: setup: the row is out of the window`);
+      const result = await reopened.compile(BIG);
+      assert.ok(!renderedRows(reopened, result).includes(row), `${label}: the compile omits the row that left`);
+      rendersWindowOnce(reopened, result, label);
+      assert.ok(!coveredRows(reopened, next).has(row), `${label}: no summary covers the row that left`);
+      assert.ok(internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row)), `${label}: no chunk record holds the row`);
+      if (!heard) {
+        assert.ok(lines.some((line) => line.includes('out of the window') && line.includes(row)), lines.join('\n'));
+        for (const id of covering) assert.equal(reopened.getSummary(id), null, `${id}, over the row that left, is dropped`);
+      }
+      await drain(reopened);
+      rendersWindowOnce(reopened, await reopened.compile(BIG), `${label}, drained`);
+      reopened.close();
+      // The repair was written: the next open finds nothing to let go of.
+      const again = await linesDuring(async () => {
+        const open = await ContextManager.open({ path, namespace: 'agent', strategy: autobiographical(), membrane: mockMembrane().membrane });
+        open.close();
+      });
+      assert.ok(!again.some((line) => line.includes('out of the window')), again.join('\n'));
+    }
+  });
+
   it('a row presented again that the open chunked at its new place keeps that place when its retraction is heard', async () => {
     const { cm, strategy, ids } = await folding();
     await drain(cm);

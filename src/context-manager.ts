@@ -559,6 +559,7 @@ export class ContextManager {
     return {
       mode: () => index.mode(),
       ordinals: () => index.ordinals(),
+      left: () => index.left(),
       length: () => index.length(),
       ordinalFrom: (sequence) => index.ordinalFrom(sequence, record()),
       sequenceFrom: (ordinal) => index.sequenceFrom(ordinal, record()),
