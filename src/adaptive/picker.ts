@@ -143,7 +143,11 @@ export interface OverBudgetRawPin {
  *   adaptive picker already folds through that L1, unless the selector is
  *   the hierarchical one with chunk persistence on and `tick` would adopt
  *   an L1 that matches the chunk exactly, which ends the raw fallback the
- *   selector renders for an uncompressed chunk. It assumes the manager has
+ *   selector renders for an uncompressed chunk. Such a chunk doesn't count
+ *   where the select that refused sent that L1's messages raw in its place,
+ *   as it can where the L1, or a summary above it, costs more than the
+ *   messages under it: it does so whether or not `tick` adopts the L1, so
+ *   adopting it frees nothing. It assumes the manager has
  *   a membrane to run compression. For the adaptive picker's refusals, its
  *   plan must also still have summaries to produce. For a hierarchical
  *   refusal in the middle, between the head and the recent window, the work

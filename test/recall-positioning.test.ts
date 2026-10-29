@@ -32,6 +32,8 @@ function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
 
+const said = (turn: string): string => `${turn} ` + 'words of the turn as it was first said '.repeat(16);
+
 class TestableStrategy extends AutobiographicalStrategy {
   /** Seed an L1 against a specific source-message id. */
   seedL1Against(content: string, firstMsgId: string, lastMsgId: string): SummaryEntry {
@@ -87,9 +89,9 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
 
     // Three "old" messages whose summaries we'll test, plus one message
     // big enough to dominate the recent window so the older three fall out.
-    const m1 = manager.addMessage('user', textBlock('first'));
-    const m2 = manager.addMessage('user', textBlock('second'));
-    const m3 = manager.addMessage('user', textBlock('third'));
+    const m1 = manager.addMessage('user', textBlock(said('first')));
+    const m2 = manager.addMessage('user', textBlock(said('second')));
+    const m3 = manager.addMessage('user', textBlock(said('third')));
     manager.addMessage('user', textBlock('latest message ' + 'X'.repeat(50)));
 
     // Seed three summaries. Seed in the *opposite* order from chronological
@@ -127,7 +129,7 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('foo'));
+    const m1 = manager.addMessage('user', textBlock(said('foo')));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
     const seeded = strategy.seedL1Against('content', m1, m1);
 
@@ -149,8 +151,8 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('foo'));
-    const m2 = manager.addMessage('user', textBlock('bar'));
+    const m1 = manager.addMessage('user', textBlock(said('foo')));
+    const m2 = manager.addMessage('user', textBlock(said('bar')));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
     const seeded = strategy.seedL1Against('content', m1, m2);
 
@@ -171,9 +173,9 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('a'));
-    const m2 = manager.addMessage('user', textBlock('b'));
-    const m3 = manager.addMessage('user', textBlock('c'));
+    const m1 = manager.addMessage('user', textBlock(said('a')));
+    const m2 = manager.addMessage('user', textBlock(said('b')));
+    const m3 = manager.addMessage('user', textBlock(said('c')));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
     strategy.seedL1Against('A', m1, m1);
     strategy.seedL1Against('B', m2, m2);
@@ -201,9 +203,9 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('a'));
-    const m2 = manager.addMessage('user', textBlock('b'));
-    const m3 = manager.addMessage('user', textBlock('c'));
+    const m1 = manager.addMessage('user', textBlock(said('a')));
+    const m2 = manager.addMessage('user', textBlock(said('b')));
+    const m3 = manager.addMessage('user', textBlock(said('c')));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
 
     // Each summary is ~400 chars (~100 tokens). Three pairs ≈ 300+ tokens of recall.
@@ -214,7 +216,7 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
 
     await assert.rejects(
       manager.compile({ maxTokens: 250, reserveForResponse: 0 }),
-      (err: unknown) => (err as Error).name === 'OverBudgetError',
+      (err: unknown) => (err as Error).name === 'OverBudgetError' && /attempted representation level=L1/.test((err as Error).message),
     );
     manager.close();
   });
@@ -233,9 +235,9 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('a'));
-    const m2 = manager.addMessage('user', textBlock('b'));
-    const m3 = manager.addMessage('user', textBlock('c'));
+    const m1 = manager.addMessage('user', textBlock(said('a')));
+    const m2 = manager.addMessage('user', textBlock(said('b')));
+    const m3 = manager.addMessage('user', textBlock(said('c')));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
 
     const big = 'X'.repeat(400);

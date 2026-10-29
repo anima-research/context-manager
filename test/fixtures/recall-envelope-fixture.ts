@@ -131,10 +131,11 @@ export async function renderHierarchicalFixture(
     });
     const manager = await ContextManager.open({ path, strategy });
 
-    const zz1 = manager.addMessage('user', textContent('zz-turn-one'));
-    const zz2 = manager.addMessage('user', textContent('zz-turn-two'));
-    const zz3 = manager.addMessage('user', textContent('zz-turn-three'));
-    const zz4 = manager.addMessage('user', textContent('zz-turn-four'));
+    const said = (turn: string): ContentBlock[] => textContent(`${turn} ` + 'words of the turn as it was first said '.repeat(8));
+    const zz1 = manager.addMessage('user', said('zz-turn-one'));
+    const zz2 = manager.addMessage('user', said('zz-turn-two'));
+    const zz3 = manager.addMessage('user', said('zz-turn-three'));
+    const zz4 = manager.addMessage('user', said('zz-turn-four'));
     manager.addMessage('user', textContent('zz-turn-latest ' + 'Z'.repeat(60)));
 
     // Two L1s merged away under the L2: anti-redundancy hides a merged L1,

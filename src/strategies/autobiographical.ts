@@ -8324,13 +8324,191 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return across;
   }
 
-  private summariesNotAcross(across: ReadonlySet<SummaryId>): SummaryEntry[] {
-    if (across.size === 0) return this.summaries;
-    return this.summaries.flatMap((s) => {
+  private summariesNotAcross(across: ReadonlySet<SummaryId>, from: SummaryEntry[] = this.summaries): SummaryEntry[] {
+    if (across.size === 0) return from;
+    return from.flatMap((s) => {
       if (across.has(s.id)) return [];
       const parentId = getSummaryParentId(s);
       return [parentId !== undefined && across.has(parentId as SummaryId) ? { ...s, parentId: undefined, mergedInto: undefined } : s];
     });
+  }
+
+  private dearerSummaries(
+    store: MessageStoreView,
+    messages: readonly StoredMessage[],
+    notAcross: SummaryEntry[],
+    msgCap: number,
+    sentAt: (position: number) => number,
+  ): Set<SummaryId> {
+    const leftOut = new Set<SummaryId>();
+    if (this.config.positionedRecallPairs === false) return leftOut;
+    const position = this.positionIndex(messages);
+    const inMiddle = (p: number): boolean => Number.isFinite(sentAt(p));
+    const byId = new Map(notAcross.map((s) => [s.id as SummaryId, s]));
+    const sends = (s: SummaryEntry | undefined): s is SummaryEntry => !!s?.content?.trim();
+
+    const leafCache = new Map<SummaryId, number[] | null>();
+    const leavesOf = (s: SummaryEntry): number[] | null => {
+      const cached = leafCache.get(s.id as SummaryId);
+      if (cached !== undefined) return cached;
+      const ids = new Set<MessageId>();
+      this.expandSummaryToLeafMessageIds(s, byId, ids);
+      let at: number[] | null = [];
+      for (const id of ids) {
+        const p = position.get(id);
+        if (p === undefined || !inMiddle(p)) { at = null; break; }
+        at.push(p);
+      }
+      leafCache.set(s.id as SummaryId, at);
+      return at;
+    };
+
+    let holders: Map<number, SummaryId[]> | undefined;
+    const holdersOf = (p: number): readonly SummaryId[] => {
+      if (!holders) {
+        holders = new Map();
+        for (const s of notAcross) {
+          const ids = new Set<MessageId>();
+          this.expandSummaryToLeafMessageIds(s, byId, ids);
+          for (const id of ids) {
+            const at = position.get(id);
+            if (at === undefined) continue;
+            const held = holders.get(at);
+            if (held) held.push(s.id as SummaryId);
+            else holders.set(at, [s.id as SummaryId]);
+          }
+        }
+      }
+      return holders.get(p) ?? [];
+    };
+    const subtree = (s: SummaryEntry, into = new Set<SummaryId>()): Set<SummaryId> => {
+      if (into.has(s.id as SummaryId)) return into;
+      into.add(s.id as SummaryId);
+      if (s.sourceLevel > 0) {
+        for (const id of s.sourceIds) {
+          const child = byId.get(id as SummaryId);
+          if (child) subtree(child, into);
+        }
+      }
+      return into;
+    };
+    const alone = (s: SummaryEntry): boolean => {
+      const own = subtree(s);
+      return leavesOf(s)!.every((p) => holdersOf(p).every((h) => own.has(h)));
+    };
+    const partsAt = new Map<number, ContentBlock[][]>();
+    const partsOf = (p: number): ContentBlock[][] => {
+      let parts = partsAt.get(p);
+      if (!parts) {
+        parts = cycleParts(messages[p]!.content);
+        if (parts.length === 0) parts = [[]];
+        partsAt.set(p, parts);
+      }
+      return parts;
+    };
+    let callsAt: Map<string, number[]> | undefined;
+    let resultsAt: Map<number, Array<readonly [string, ContentBlock]>> | undefined;
+    let around: Int32Array | undefined;
+    const scanTools = (): void => {
+      if (around) return;
+      const calls = new Map<string, number[]>();
+      const held = new Map<number, Array<readonly [string, ContentBlock]>>();
+      for (let p = 0; p < messages.length; p++) {
+        for (const b of messages[p]!.content) {
+          if (b.type === 'tool_use') {
+            const at = calls.get(b.id);
+            if (at) at.push(p);
+            else calls.set(b.id, [p]);
+          } else if (b.type === 'tool_result') {
+            const at = held.get(p);
+            if (at) at.push([b.toolUseId, b]);
+            else held.set(p, [[b.toolUseId, b]]);
+          }
+        }
+      }
+      for (const at of calls.values()) at.sort((a, b) => sentAt(a) - sentAt(b) || a - b);
+      const n = messages.length;
+      const counts = new Int32Array(n + 1);
+      for (const [r, here] of held) {
+        for (const [id] of here) {
+          const c = calls.get(id)?.[0];
+          if (c === undefined) continue;
+          const from = sentAt(c);
+          const to = sentAt(r);
+          const lo = from === -Infinity ? 0 : from === Infinity ? n : from + 1;
+          const hi = to === Infinity ? n : to === -Infinity ? 0 : to;
+          if (lo < hi) {
+            counts[lo] = counts[lo]! + 1;
+            counts[hi] = counts[hi]! - 1;
+          }
+        }
+      }
+      for (let p = 1; p <= n; p++) counts[p] = counts[p]! + counts[p - 1]!;
+      callsAt = calls;
+      resultsAt = held;
+      around = counts;
+    };
+    const straddled = (leaves: ReadonlySet<number>): boolean => {
+      scanTools();
+      for (const r of leaves) {
+        if (around![r]! > 0) return true;
+        for (const [id, block] of resultsAt!.get(r) ?? []) {
+          const c = callsAt!.get(id)?.find((x) => !leaves.has(x));
+          if (c === undefined) continue;
+          const answers = c === r - 1 && partsOf(r)[0]!.includes(block)
+            && partsOf(c).slice(0, -1).every((part) => !part.some((b) => b.type === 'tool_use' && b.id === id));
+          if (sentAt(c) < r && !answers) return true;
+        }
+      }
+      return false;
+    };
+    const shaped = (s: SummaryEntry): boolean => {
+      const leaves = new Set(leavesOf(s)!);
+      if (straddled(leaves)) return false;
+      const goesRaw = (q: number): boolean => leaves.has(q) || (inMiddle(q) && holdersOf(q).length === 0);
+      const callIds = (unit: readonly ContentBlock[]): string[] => unit.flatMap((b) => (b.type === 'tool_use' ? [b.id] : []));
+      const resultIds = (unit: readonly ContentBlock[]): string[] => unit.flatMap((b) => (b.type === 'tool_result' ? [b.toolUseId] : []));
+      for (const p of leaves) {
+        const parts = partsOf(p);
+        for (let k = 0; k < parts.length; k++) {
+          const results = resultIds(parts[k]!);
+          if (results.length > 0) {
+            if (k === 0) {
+              const before = messages[p - 1];
+              if (!before || !goesRaw(p - 1)) return false;
+            }
+            const calls = new Set(callIds(k > 0 ? parts[k - 1]! : partsOf(p - 1)[partsOf(p - 1).length - 1]!));
+            if (new Set(results).size !== results.length || !results.every((id) => calls.has(id))) return false;
+          }
+          const calls = callIds(parts[k]!);
+          if (calls.length > 0) {
+            if (k === parts.length - 1) {
+              const after = messages[p + 1];
+              if (!after || !goesRaw(p + 1)) return false;
+            }
+            const answered = new Set(resultIds(k < parts.length - 1 ? parts[k + 1]! : partsOf(p + 1)[0]!));
+            if (!calls.every((id) => answered.has(id))) return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    const whole = (s: SummaryEntry): boolean =>
+      s.sourceLevel === 0 || s.sourceIds.every((id) => {
+        const child = byId.get(id as SummaryId);
+        return child?.mergedInto === s.id && whole(child);
+      });
+
+    for (const s of notAcross) {
+      if (s.mergedInto || !sends(s)) continue;
+      const leaves = leavesOf(s);
+      if (!leaves || !whole(s)) continue;
+      if (!(this.weighedRawPrice(store, leaves.map((p) => messages[p]!), msgCap) < this.weighedPairPrice(s, msgCap))) continue;
+      if (!alone(s) || !shaped(s)) continue;
+      for (const id of subtree(s)) leftOut.add(id);
+    }
+    return leftOut;
   }
 
   /**
@@ -13222,11 +13400,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * set as it reads the whole, except a compression in flight with nothing
    * recorded beside it, which counts whatever the prefix holds, since nothing
    * says what it folds.
+   *
+   * `leftOut`, when given, holds the summaries the refusing hierarchical
+   * select sent as their messages raw (dearerSummaries). A chunk an L1 in
+   * memory already covers doesn't count where its exact L1 in memory is
+   * among them.
    */
   protected compressionWorkQueued(
     store: MessageStoreView,
     path: 'adaptive' | 'hierarchical',
     within?: ReadonlySet<MessageId>,
+    leftOut?: ReadonlySet<SummaryId>,
   ): boolean {
     // Work frees room only where its summary folds a message the selection
     // can fold now: both selectors keep the head and recent windows raw, and
@@ -13306,10 +13490,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
     const coveredByL1 = new Set<string>();
     const exactL1 = new Set<string>();
+    const leftOutExact = new Set<string>();
     for (const summary of this.summaries) {
       if (summary.level !== 1 || !Array.isArray(summary.sourceIds)) continue;
       for (const id of summary.sourceIds) coveredByL1.add(id);
       exactL1.add(summary.sourceIds.join(':'));
+      if (leftOut?.has(summary.id as SummaryId)) leftOutExact.add(summary.sourceIds.join(':'));
     }
     // tick adopts an exact L1 the store holds too (findExactL1).
     const persisted = this.store?.getStateJson(this.summariesStateId);
@@ -13333,7 +13519,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunk === undefined || chunk.compressed || this.chunkHasHeldMessage(chunk, held)) continue;
       const adoptable = exactL1.has(this.chunkKey(chunk));
       if (chunk.messages.some((m) => coveredByL1.has(m.id))) {
-        if (adoptionShrinks && adoptable && !foldsNothing(chunk)) return true;
+        if (adoptionShrinks && adoptable && !leftOutExact.has(this.chunkKey(chunk)) && !foldsNothing(chunk)) return true;
         continue;
       }
       if (adoptable || this.thinChunkChars(chunk) !== undefined) {
@@ -16484,6 +16670,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return this.estimateTokens([{ type: 'text', text: question }]) + this.recallAnswerCost(s).cost;
   }
 
+  private weighedPairPrice(s: SummaryEntry, msgCap: number): number {
+    const header = this.estimateTokens([{ type: 'text', text: this.buildRecallHeader(s) }]);
+    if (msgCap > 0) {
+      const rendered = this.renderSummaryAnswer(s, msgCap);
+      if (rendered.refs.some((ref) => ref.partial)) return header + this.estimateTokens(rendered.content);
+    }
+    return header + this.recallAnswerCost(s).estimate;
+  }
+
+  private weighedRawPrice(store: MessageStoreView, messages: readonly StoredMessage[], msgCap: number): number {
+    let price = 0;
+    for (const msg of messages) {
+      const sent = store.estimateTokens(this.prunedForSend(store, msg)) + this.cappedForSend(store, msg, msgCap).extra;
+      price += Math.max(store.estimateTokens(msg), sent);
+    }
+    return price;
+  }
+
   private recallLabel(summaries: readonly SummaryEntry[]): string {
     const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
     return label.replace(/\{tools\}/g, () => this.recallToolsText(summaries));
@@ -16852,7 +17056,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stage: 'Hierarchical emission overran the budget',
         budget: graceLimit,
         actual: refused.actual,
-        clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [],
+        clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix, leftOut) ? ['compression'] : [],
         diagnostics: {
           middleCountUnit: refused.unit,
           deepestLevelKind: 'attempted',
@@ -16879,12 +17083,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Without adaptive resolution no selector reads a pin's level bound, so
     // every pinned position resolves to raw (resolvedPinBounds).
     const pinnedPositionsSet = this.forceRawPinPositions(messages);
-    const listed = this.summariesNotAcross(
+    const notAcross = this.summariesNotAcross(
       this.summariesAcross(messages, (i) => headIds.has(messages[i].id) || i >= effectiveRecentStart, (i) => pinnedPositionsSet.has(i)),
     );
+    const sentAt = (i: number): number => (headIds.has(messages[i]!.id) ? -Infinity : i < effectiveRecentStart ? i : Infinity);
+    const leftOut = this.dearerSummaries(store, messages, notAcross, msgCap, sentAt);
+    const listed = this.summariesNotAcross(leftOut, notAcross);
 
     // Get anti-redundant summaries
-    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(excludeIds, listed);
+    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(excludeIds, notAcross);
 
     // Budget carryover: L3 → L2 → L1
     const l3Budget = this.config.l3BudgetTokens ?? 30000;
@@ -16962,7 +17169,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let l2RepairsSkipped = 0;
       let l3RepairsSkipped = 0;
       // L2s excluded by anti-redundancy: unmerged, not in shownL2.
-      for (const s of listed) {
+      for (const s of notAcross) {
         if (s.level !== 2 || s.mergedInto || shownL2Ids.has(s.id)) continue;
         if (s.sourceIds.every(id => selectedIds.has(id))) continue; // truly redundant
         if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
@@ -16974,7 +17181,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // L3s excluded by anti-redundancy — after L2 repair, so a repaired L2
       // counts as selected coverage for its parent L3.
-      for (const s of listed) {
+      for (const s of notAcross) {
         if (s.level !== 3 || s.mergedInto || shownL3Ids.has(s.id)) continue;
         if (s.sourceIds.every(id => selectedIds.has(id))) continue;
         if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
@@ -16992,6 +17199,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `from interrupted merges). Continuing with coverage completion.`,
         );
       }
+    }
+    for (let i = selectedSummaries.length - 1; i >= 0; i--) {
+      if (leftOut.has(selectedSummaries[i]!.id as SummaryId)) selectedSummaries.splice(i, 1);
     }
 
     // Emit summaries + pinned messages between head and recent windows.

@@ -83,11 +83,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   }
 
   /** An L1 over the given messages, as a compression writes one, merged into `parent` when one is given. */
-  seedL1(id: string, sourceIds: string[], parent?: string): void {
+  seedL1(id: string, sourceIds: string[], parent?: string, content = 'summary '.repeat(100)): void {
     this.pushSummary({
       id, level: 1, sourceLevel: 0, sourceIds,
       sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
-      content: 'summary '.repeat(100), tokens: 200, created: 0,
+      content, tokens: Math.ceil(content.length / 4), created: 0,
       ...(parent ? { mergedInto: parent } : {}),
     });
   }
@@ -162,12 +162,12 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   }
 
   /** An L1 over the given messages that only the store holds, as another instance over the same store writes one. */
-  seedStoredL1(id: string, sourceIds: string[]): void {
+  seedStoredL1(id: string, sourceIds: string[], content = 'summary '.repeat(100)): void {
     const persisted = this.store?.getStateJson(this.summariesStateId);
     this.store?.setStateJson(this.summariesStateId, [...(Array.isArray(persisted) ? persisted : []), {
       id, level: 1, sourceLevel: 0, sourceIds,
       sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
-      content: 'summary '.repeat(100), tokens: 200, created: 0,
+      content, tokens: Math.ceil(content.length / 4), created: 0,
     }]);
   }
 
@@ -224,7 +224,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
    *  arguments as passed, so this file also builds against code whose count takes no prefix. */
   countedWithin: ReadonlySet<string> | undefined;
 
+  /** The arguments the last count was given, for countsCompressionWork to pass the rest of them on. */
+  private countedArgs: Parameters<AutobiographicalStrategy['compressionWorkQueued']> | undefined;
+
   protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
+    this.countedArgs = args;
     this.countedView = args[0];
     this.countedWithin = (args as unknown[])[2] as ReadonlySet<string> | undefined;
     return super.compressionWorkQueued(...args);
@@ -249,10 +253,12 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return this.getCompressibleMessages(this.countedView).every((m) => within.has(m.id));
   }
 
-  /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
+  /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read,
+   *  with what else that refusal passed it past its prefix. */
   countsCompressionWork(): boolean {
-    assert.ok(this.countedView, 'a refusal has counted');
-    return super.compressionWorkQueued(this.countedView, 'hierarchical');
+    assert.ok(this.countedView && this.countedArgs, 'a refusal has counted');
+    const [, , , ...rest] = this.countedArgs;
+    return super.compressionWorkQueued(this.countedView, 'hierarchical', undefined, ...rest);
   }
 
   /**
@@ -469,6 +475,8 @@ async function refusal(
 /** A budget whose grace window (300) holds the seeded combined recall pair (288) but not the raw message after it, so the raw-message fallback is what refuses. */
 const PAIR_FITS = { maxTokens: 260, reserveForResponse: 20 };
 
+const CHEAP_L1 = 'what was said';
+
 /**
  * A hierarchical refusal whose prefix holds the whole middle. A refusal names compression only for work that folds a
  * message its refused prefix holds (compressionWorkQueued's `within`), so one whose prefix holds every message the
@@ -585,7 +593,7 @@ describe('OverBudgetError diagnostics', () => {
       });
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
-          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
         const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.equal(error.diagnostics.middleChunkCount, 1);
@@ -1389,7 +1397,7 @@ describe('OverBudgetError.clearedBy', () => {
       const { strategy, calls, membrane, drive } = quarantining();
       await withManager(strategy, async (manager) => {
         const queued = await drive(manager);
-        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1));
         else strategy.setMinChunkChars(100_000);
         assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
         // The premise: tick settles each one without a model call, though the quarantine holds it.
@@ -1399,6 +1407,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, before, 'no model call');
         assert.equal(strategy.summaryIds().length, summaries + queued.length, `an L1 for each chunk, ${settle === 'adopts' ? 'adopted' : 'a stub'}`);
+        if (settle === 'adopts') assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-'))), 'the premise: an adopted L1 goes out');
       }, { membrane });
     });
   }
@@ -1407,8 +1416,10 @@ describe('OverBudgetError.clearedBy', () => {
     const { strategy, calls, membrane, drive } = quarantining();
     await withManager(strategy, async (manager) => {
       const queued = await drive(manager);
-      queued.forEach((ids, i) => strategy.seedL1(`L1-memory-${i}`, ids));
+      queued.forEach((ids, i) => strategy.seedL1(`L1-memory-${i}`, ids, undefined, CHEAP_L1));
       assert.deepEqual(strategy.queuedChunkIds(), queued, 'the quarantined chunks are still queued');
+      const wide = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(wide.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-memory-'))), 'the premise: the seeded L1s go out');
       assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
       // The premise: tick adopts each chunk's L1 without a model call, though the quarantine holds it.
       const before = calls.n;
@@ -1543,7 +1554,7 @@ describe('OverBudgetError.clearedBy', () => {
     await withManager(strategy, async (manager) => {
       const queued = await drive(manager);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
-      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
+      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!, CHEAP_L1);
       assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       // The premise: tick skips the quarantined chunks without a model call or a throw, and adopts the last one's L1.
       const before = calls.n;
@@ -1552,6 +1563,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
       assert.equal(calls.n, before, 'no model call');
       assert.equal(strategy.summaryIds().length, summaries + 1, 'the last chunk adopted its L1');
+      assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-last'))), 'the premise: the adopted L1 goes out');
     }, { membrane });
   });
 
@@ -1565,7 +1577,7 @@ describe('OverBudgetError.clearedBy', () => {
       }
       const queued = await settledQueue(manager, strategy);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
-      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
+      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!, CHEAP_L1);
       assert.deepEqual((await refusalOfWholeMiddle(manager)).clearedBy, ['compression']);
       // The premise: tick defers the others without a model call or a throw, and adopts the last one's L1.
       const summaries = strategy.summaryIds().length;
@@ -1573,6 +1585,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
       assert.equal(calls.n, 0, 'no model call');
       assert.equal(strategy.summaryIds().length, summaries + 1, 'the last chunk adopted its L1');
+      assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-last'))), 'the premise: the adopted L1 goes out');
     }, { membrane: countingMembrane(calls) });
   });
 
@@ -1617,13 +1630,14 @@ describe('OverBudgetError.clearedBy', () => {
           manager.addMessage('user', [{ type: 'tool_result', toolUseId: `zz-call-${i}`, content: 'zz result' } as ContentBlock, words]);
         }
         const queued = await settledQueue(manager, strategy);
-        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1));
         assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
         // The premise: with no tools declared, tick settles every queued chunk without a model call.
         for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');
         assert.equal(strategy.summaryIds().length, queued.length, `an L1 for each chunk, ${settle === 'adopts' ? 'adopted' : 'a stub'}`);
+        if (settle === 'adopts') assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-'))), 'the premise: an adopted L1 goes out');
       }, { membrane: countingMembrane(calls) });
     });
   }
@@ -2084,7 +2098,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       queued.forEach((ids, i) => {
         strategy.seedL1(`L1-part-${i}`, [ids[0]!]);
-        strategy.seedStoredL1(`L1-stored-${i}`, ids);
+        strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1);
       });
       assert.ok(!strategy.summaryIds().some((id) => id.startsWith('L1-stored-')), 'no exact L1 is in memory');
       const error = await refusal(manager);
@@ -2093,6 +2107,7 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
       for (let i = 0; i < queued.length; i++) assert.ok(strategy.summaryIds().includes(`L1-stored-${i}`), `tick adopted L1-stored-${i}`);
+      assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-'))), 'the premise: an adopted L1 goes out');
     }, { membrane: true });
   });
 
@@ -2104,7 +2119,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       queued.forEach((ids, i) => {
         strategy.seedL1(`L1-part-${i}`, [ids[0]!]);
-        strategy.seedStoredL1(`L1-stored-${i}`, ids);
+        strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1);
       });
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
@@ -2118,7 +2133,7 @@ describe('OverBudgetError.clearedBy', () => {
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const queued = await settledQueue(manager, strategy);
-        queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1));
         assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
@@ -2126,6 +2141,7 @@ describe('OverBudgetError.clearedBy', () => {
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
+        assert.ok((await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-stored-'))), 'the premise: an adopted L1 goes out');
       }, { membrane: true });
     });
   }
@@ -2148,7 +2164,7 @@ describe('OverBudgetError.clearedBy', () => {
       const strategy = queuedChunks();
       strategy.persistChunks = persistChunks;
       await withManager(strategy, async (manager) => {
-        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
         const queued = await settledQueue(manager, strategy);
         queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
         const error = await refusal(manager);
@@ -2260,12 +2276,13 @@ describe('OverBudgetError.clearedBy', () => {
       });
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
-          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
         strategy.seedL1('L1-a', [ids[0]!]);
         strategy.seedL1('L1-b', [ids[1]!]);
         strategy.queueMergeOf(['L1-a', 'L1-b']);
         if (held) manager.holdCompression([ids[1]!], { timeoutMs: 60_000 });
         const error = await refusal(manager);
+        assert.match(error.message, /attempted representation level=L1/, 'the premise: a recall pair refuses');
         assert.deepEqual(error.clearedBy, !held && modelled ? ['compression'] : []);
         if (held) manager.releaseCompression([ids[1]!]);
       });
@@ -2403,7 +2420,7 @@ describe('OverBudgetError.clearedBy', () => {
         });
         await withManager(strategy, async (manager) => {
           const ids = Array.from({ length: 2 }, (_, i) =>
-            manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+            manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
           strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
           if (work === 'running') strategy.startCompressing();
           // A merge whose source in memory covers a message the compile can fold.
@@ -2467,7 +2484,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.holdBlocksMerges = true;
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
-          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
         // A merge whose source in memory covers a message the compile can fold, so only the hold stops it.
         strategy.queueMergeOf(['L1-diagnostic']);
@@ -2476,6 +2493,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.match(error.message, /^Hierarchical emission overran the budget/);
         assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages',
           'the pair, or with the combined pair fitting, the raw message after it, refuses');
+        if (positionedRecallPairs) assert.match(error.message, /attempted representation level=L1/, 'the premise: the recall pair refuses');
         assert.deepEqual(error.clearedBy, [], 'tick stops at a blocked merge until the hold is released');
       });
     });
@@ -2680,13 +2698,15 @@ describe('OverBudgetError.clearedBy', () => {
     await withManager(strategy, async (manager) => {
       for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const queued = await settledQueue(manager, strategy);
-      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids, undefined, CHEAP_L1));
       pinChunks(manager, queued);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, []);
       // The premise: adopting the exact L1s leaves the render as it was, where unpinned chunks' adoption shrinks it.
-      const before = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
+      const wide = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(wide.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-exact-'))), 'the premise: the seeded L1s go out beside the pinned messages');
+      const before = wide.messages.length;
       await adoptAll(manager, strategy);
       const after = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
       assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
@@ -2804,8 +2824,10 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const queued = await settledQueue(manager, strategy);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
-      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids, undefined, CHEAP_L1));
       pinChunks(manager, queued.slice(0, 1));
+      const wide = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(wide.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-exact-'))), 'the premise: the seeded L1s go out');
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, ['compression']);
@@ -2818,8 +2840,83 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const queued = await settledQueue(manager, strategy);
       assert.ok(queued.length >= 2, 'two chunks or more are queued');
-      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids, CHEAP_L1));
       pinChunks(manager, queued.slice(0, 1));
+      const error = await refusalOfWholeMiddle(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('names compression on the hierarchical path for a chunk with a pinned message whose exact L1 in memory costs more than the messages the compile can fold, though less than all of them, since the select keeps that L1 rather than sending its messages raw in its place', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(i % 2 ? 400 : 30) }]);
+      const queued = await settledQueue(manager, strategy);
+      const chunk = queued[0]!;
+      const byId = new Map(manager.getAllMessages().map((m) => [m.id, m]));
+      const long = (id: string) => JSON.stringify(byId.get(id)!.content).length > 1000;
+      const pinned = chunk.filter(long);
+      const rest = chunk.filter((id) => !long(id));
+      assert.ok(pinned.length > 0 && rest.length > 0, `premise: the first queued chunk holds short messages and long ones (${chunk.length})`);
+      for (const id of pinned) manager.pinRange(id, id);
+      const content = 'summary '.repeat(100);
+      queued.forEach((ids, i) => strategy.seedL1(`L1-memory-${i}`, ids, undefined, i === 0 ? content : 'summary '.repeat(1000)));
+      const store = (manager as unknown as { createStrategyContext(): { messageStore: { estimateTokens(m: unknown): number } } }).createStrategyContext().messageStore;
+      const raw = (ids: string[]) => ids.reduce((sum, x) => sum + store.estimateTokens(byId.get(x)), 0);
+      const pair = store.estimateTokens({ content: [{ type: 'text', text: `[Recall L1-memory-0] ${content}` }] });
+      assert.ok(raw(rest) * 1.5 < pair && pair * 1.5 < raw(chunk), `premise: the L1 (${pair}) costs well over the unpinned messages (${raw(rest)}) and well under all of them (${raw(chunk)})`);
+      for (const ids of queued.slice(1)) assert.ok(store.estimateTokens({ content: [{ type: 'text', text: 'summary '.repeat(1000) }] }) > 1.5 * raw(ids), 'premise: every other chunk\'s L1 costs well over its messages');
+      const sent = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(sent.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id === 'L1-memory-0')), 'premise: the select keeps the L1: it goes out at a budget that fits it');
+      const error = await refusalOfWholeMiddle(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('names nothing on the hierarchical path for chunks whose exact L1 in memory costs more than their messages, since the select leaves that L1 out after adoption as before', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      pinChunks(manager, queued.slice(0, 1));
+      const byId = new Map(manager.getAllMessages().map((m) => [m.id, m]));
+      const store = (manager as unknown as { createStrategyContext(): { messageStore: { estimateTokens(m: unknown): number } } }).createStrategyContext().messageStore;
+      const raw = (ids: string[]) => ids.reduce((sum, x) => sum + store.estimateTokens(byId.get(x)), 0);
+      const pair = store.estimateTokens({ content: [{ type: 'text', text: `[Recall L1-exact-1] ${'summary '.repeat(100)}` }] });
+      assert.ok(pair > raw(queued[1]!), `premise: the unpinned chunk's L1 (${pair}) costs more than its messages (${raw(queued[1]!)})`);
+      const before = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(!before.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id === 'L1-exact-1')), 'premise: the select sends that L1\'s messages raw in its place, at a budget that fits it');
+      const error = await refusalOfWholeMiddle(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, []);
+      await adoptAll(manager, strategy);
+      const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
+      assert.ok(!compiled.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id.startsWith('L1-'))), 'no adopted L1 goes out');
+      assert.deepEqual(compiled.messages, before.messages, 'adoption leaves the render as it was');
+    }, { membrane: true });
+  });
+
+  it('names compression on the hierarchical path for a chunk whose exact L1 in memory costs more than its messages, where the select keeps that L1 since another summary holds one of them', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2 && queued[1]!.length >= 2, 'two chunks or more are queued, the second of two messages or more');
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      strategy.seedL1('L1-overlap', [queued[1]![0]!]);
+      pinChunks(manager, queued.slice(0, 1));
+      const byId = new Map(manager.getAllMessages().map((m) => [m.id, m]));
+      const store = (manager as unknown as { createStrategyContext(): { messageStore: { estimateTokens(m: unknown): number } } }).createStrategyContext().messageStore;
+      const raw = (ids: string[]) => ids.reduce((sum, x) => sum + store.estimateTokens(byId.get(x)), 0);
+      const pair = store.estimateTokens({ content: [{ type: 'text', text: `[Recall L1-exact-1] ${'summary '.repeat(100)}` }] });
+      assert.ok(pair > raw(queued[1]!), `premise: the L1 (${pair}) costs more than its messages (${raw(queued[1]!)})`);
+      const sent = await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(sent.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id === 'L1-exact-1')), 'premise: the select keeps the L1: it goes out at a budget that fits it');
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
       assert.deepEqual(error.clearedBy, ['compression']);
@@ -3142,6 +3239,8 @@ describe('OverBudgetError in the hierarchical middle', () => {
   });
   const say = (manager: ContextManager, i: number): string =>
     manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+  const sayCovered = (manager: ContextManager, i: number): string =>
+    manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
   /** The input budget whose grace window (0.25) holds `tokens` and nothing more than a token or so past it. */
   const holding = (tokens: number) => ({ maxTokens: Math.ceil(tokens / 1.25) + 20, reserveForResponse: 20 });
   const unit = (error: OverBudgetError) => Reflect.get(error.diagnostics, 'middleCountUnit');
@@ -3155,10 +3254,11 @@ describe('OverBudgetError in the hierarchical middle', () => {
       for (const positionedRecallPairs of [true, false]) {
         const strategy = middleStrategy({ positionedRecallPairs, ...sameQuestion, ...(after === 'the recent window' ? { recentWindowTokens: 50 } : {}) });
         await withManager(strategy, async (manager) => {
-          const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+          const covered = after === 'nothing' ? 3 : after === 'a raw message' ? 1 : 2;
+          const ids = Array.from({ length: 3 }, (_, i) => (i < covered ? sayCovered : say)(manager, i));
           // One message raw after the pair, or in the recent window, or none. The L1's 200 tokens are past the
           // 80-token input budget, so selection passes it over, and coverage completion includes it.
-          strategy.seedPyramid(after === 'nothing' ? ids : after === 'a raw message' ? ids.slice(0, 1) : ids.slice(0, 2), 1);
+          strategy.seedPyramid(ids.slice(0, covered), 1);
           refusals.push(await refusal(manager));
         });
       }
@@ -3180,7 +3280,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
       let error!: OverBudgetError;
       let head!: OverBudgetError;
       await withManager(strategy, async (manager) => {
-        const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 3 }, (_, i) => (i === 1 ? sayCovered : say)(manager, i));
         strategy.seedPyramid([ids[1]!], 1);
         head = await refusal(manager, undefined, { maxTokens: 30, reserveForResponse: 20 });
         error = await refusal(manager, undefined, budget);
@@ -3220,7 +3320,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
     it(`names compression ${positionedRecallPairs ? 'at a positioned pair' : 'at the combined pair'} only for work that folds a message before it or in it`, async () => {
       const strategy = middleStrategy({ positionedRecallPairs, targetChunkTokens: 40 });
       await withManager(strategy, async (manager) => {
-        const ids = Array.from({ length: 12 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 12 }, (_, i) => (i < 2 ? sayCovered : say)(manager, i));
         // An L1 over m0 alone, which no chunk matches, so the chunk that holds m0 is covered and isn't work.
         // Selection takes it, and its pair, first in the middle, refuses.
         strategy.seedUndercountedL1('L1-first', [ids[0]!]);
@@ -3243,7 +3343,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
   it('names nothing at a positioned pair for a merge of summaries after it', async () => {
     const strategy = middleStrategy({ positionedRecallPairs: true });
     await withManager(strategy, async (manager) => {
-      const ids = Array.from({ length: 4 }, (_, i) => say(manager, i));
+      const ids = Array.from({ length: 4 }, (_, i) => (i === 1 ? say : sayCovered)(manager, i));
       // The pair over m0 comes first and refuses; m1 is raw; two L1s after it are queued to merge.
       strategy.seedUndercountedL1('L1-first', [ids[0]!]);
       strategy.seedUndercountedL1('L1-later', [ids[2]!]);
@@ -3410,12 +3510,14 @@ describe('OverBudgetError in the hierarchical middle', () => {
       const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
       const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
       try {
-        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 2 }, (_, i) => sayCovered(manager, i));
         strategy.seedPyramid(ids, 1);
-        await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        const compiled = await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        assert.ok(compiled.provenance!.messages.some((m) => m.kind === 'summary'), 'the premise: the recall pair goes out');
         outcomes.push(undefined);
       } catch (error) {
         assert.ok(error instanceof OverBudgetError, String(error));
+        assert.match(error.message, /attempted representation level=L1/, 'the premise: the recall pair refuses');
         outcomes.push(error.actual);
       } finally {
         await manager.close();
@@ -3433,12 +3535,13 @@ describe('OverBudgetError in the hierarchical middle', () => {
       const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
       const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
       try {
-        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 2 }, (_, i) => sayCovered(manager, i));
         strategy.seedPyramid(ids, 1);
         await manager.compile({ maxTokens: 260, reserveForResponse: 20 }, undefined, { dryRun: true }).catch(() => undefined);
         assert.equal(Reflect.get(strategy, '_storeView'), null, 'a dry compile leaves no view bound');
         try {
-          await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+          const compiled = await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+          assert.ok(compiled.provenance!.messages.some((m) => m.kind === 'summary'), 'the premise: the recall pair goes out');
         } finally {
           assert.equal(Reflect.get(strategy, '_storeView'), null, 'nor does a committing one, so a mint request prices as before');
         }
@@ -3456,6 +3559,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
       assert.equal(await outcome(positionedRecallPairs), undefined, 'the premise: at the default rate the pair fits');
       const refused = await outcome(positionedRecallPairs, twice);
       assert.ok(refused, `${positionedRecallPairs ? 'positioned' : 'combined'}: refused at the store's rate`);
+      if (positionedRecallPairs) assert.match(refused.message, /attempted representation level=L1/, 'the premise: the recall pair refuses');
       assert.ok(refused.actual > 300, String(refused.actual));
     }
   });

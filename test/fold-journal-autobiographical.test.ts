@@ -29,6 +29,7 @@ class SeedableStrategy extends AutobiographicalStrategy {
 const OMISSION_MARKER = '[content omitted: this message reached its token limit]';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t }];
+const said = (turn: string): ContentBlock[] => text(`${turn} ` + 'words of the turn as it was first said '.repeat(8));
 const BUDGET = { maxTokens: 100_000, reserveForResponse: 0 };
 
 async function withStore<T>(run: (path: string) => Promise<T>): Promise<T> {
@@ -44,10 +45,10 @@ async function setup(path: string, options: AutobiographicalOptions = {}) {
   const strategy = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8, ...options });
   const cm = await ContextManager.open({ path, strategy });
   const ids = [
-    cm.addMessage('user', text('zz-turn-one')),
-    cm.addMessage('user', text('zz-turn-two')),
-    cm.addMessage('user', text('zz-turn-three')),
-    cm.addMessage('user', text('zz-turn-four')),
+    cm.addMessage('user', said('zz-turn-one')),
+    cm.addMessage('user', said('zz-turn-two')),
+    cm.addMessage('user', said('zz-turn-three')),
+    cm.addMessage('user', said('zz-turn-four')),
     cm.addMessage('user', text('zz-turn-latest ' + 'Z'.repeat(60))),
   ];
   return { cm, strategy, ids };
