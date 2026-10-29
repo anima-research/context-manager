@@ -7495,6 +7495,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
     if (leaving.size === 0) return;
+    // The chunk in flight over a row that left, and each chunk holding one,
+    // are marked first, before any write: should a write below fail, a
+    // compression in flight over the row still writes nothing when it lands.
+    const work = this.pendingCompressionWork;
+    const inFlight = work && 'chunk' in work ? [work.chunk] : [];
+    for (const chunk of [...inFlight, ...this.chunks]) {
+      if (chunk.messages.some((m) => leaving.has(m.id))) this._spanLeftWindow.add(chunk);
+    }
     const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
     if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
       this.diag.warn(
@@ -7507,12 +7515,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A drop can end an overlap the guard refused, so the queue build tests
     // those chunks again, as after a load.
     this._overlapBlocked.clear();
-    const work = this.pendingCompressionWork;
-    const inFlight = work && 'chunk' in work ? [work.chunk] : [];
-    for (const chunk of [...inFlight, ...this.chunks]) {
-      if (chunk.messages.some((m) => leaving.has(m.id))) this._spanLeftWindow.add(chunk);
-    }
-
     this.rebuildChunks(ctx.messageStore);
     if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
       // A merge-quarantine record naming a dropped summary no longer stands.

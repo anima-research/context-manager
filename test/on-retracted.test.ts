@@ -636,6 +636,48 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     cm.close();
   });
 
+  // House review of #350, code finding 5: the chunk in flight is marked
+  // before the strategy writes what it lets go of, so a failed write there
+  // still keeps the L1 that lands over the row from being written.
+  it('an L1 in flight over a row that leaves is discarded even when a state write of the retraction fails', async () => {
+    for (const failing of [true, false]) {
+      const label = failing ? 'probe' : 'control';
+      const { cm, strategy, mock } = await folding();
+      const { gate, open } = gated();
+      let started!: () => void;
+      const out = new Promise<void>((resolve) => { started = resolve; });
+      mock.hold = { matches: (input) => !isMerge(input), gate, started };
+      const ticking = cm.tick();
+      await out;
+      const work = internals(strategy).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const leaving = work.chunk.messages.map((m) => m.id)[1]!;
+      const store = cm.getStore() as unknown as { setStateJson: (...args: unknown[]) => unknown };
+      const real = store.setStateJson;
+      let calls = 0;
+      if (failing) {
+        store.setStateJson = function (this: unknown, ...args: unknown[]) {
+          if (calls++ === 0) throw new Error('zz-state-write-failed');
+          return real.apply(this, args);
+        };
+      }
+      const lines = await linesDuring(async () => {
+        try {
+          cm.retractRows([leaving], { undone: true });
+        } finally {
+          if (failing) delete (store as { setStateJson?: unknown }).setStateJson;
+        }
+        await settle();
+        open();
+        await ticking;
+      });
+      if (failing) assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz-state-write-failed')), lines.join('\n'));
+      assert.ok(!coveredRows(cm, strategy).has(leaving), `${label}: the L1 in flight over the row that left was not written`);
+      assert.ok(lines.some((line) => line.includes('discarding L1: a row of its span left the window mid-request')), `${label}: ${lines.join('\n')}`);
+      cm.close();
+    }
+  });
+
   it('a merge in flight over a summary a retraction drops writes nothing', async () => {
     const { cm, strategy, mock } = await folding();
     const { gate, open } = gated();
