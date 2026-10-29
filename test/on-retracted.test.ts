@@ -135,6 +135,18 @@ class Gated extends Records {
   }
 }
 
+/** A strategy with no row hook (neither onPresented, onNewMessage nor onRetracted), whose initialize waits for `gate`, once one is set. */
+class Unhooked extends PassthroughStrategy {
+  gate: Promise<void> | undefined;
+  constructor() {
+    super();
+    (this as { onNewMessage?: unknown }).onNewMessage = undefined;
+  }
+  async initialize(_ctx: StrategyContext): Promise<void> {
+    await this.gate;
+  }
+}
+
 describe('onRetracted', () => {
   it('retractRows calls it once, after the rows are out and before it returns, in window order, undone as given', async () => {
     const strategy = new Records();
@@ -359,6 +371,34 @@ describe('onRetracted', () => {
     assert.deepEqual(strategy.retracted, [], 'a never left the window of this branch');
     await settle();
     cm.close();
+  });
+
+  // House review of #350, code finding 1 (retracted half): the calls wait for
+  // the manager's strategy, not for the instance initializing, so they wait
+  // while a strategy without onRetracted initializes too.
+  it('a call made while a strategy without the hook initializes reaches the strategy set in its place, after its own initialize', async () => {
+    for (const hooked of [false, true]) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      cm.presentRows([]);
+      const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      cm.presentRows([a, b]);
+      const { gate, open } = gated();
+      const initializing = hooked ? new Gated() : new Unhooked();
+      initializing.gate = gate;
+      const first = cm.setStrategy(initializing);
+      cm.retractRows([a], { undone: true });
+      const replacement = new Records();
+      await cm.setStrategy(replacement);
+      open();
+      await assert.rejects(first, /supersed/i);
+      assert.deepEqual(
+        replacement.retracted.map((l) => [l.rows, l.info]),
+        [[[a], { undone: true, removed: false, ids: [a] }]],
+        `${hooked ? 'control' : 'probe'}: the replacement is told the row left, after its initialize`,
+      );
+      await settle();
+      cm.close();
+    }
   });
 
   for (const [name, make] of [
@@ -701,6 +741,33 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       open.close();
     });
     assert.ok(!again.some((line) => line.includes('the window holds the leaves of')), again.join('\n'));
+  });
+
+  it('a folded row taken out while a strategy with no row hook initializes: the folding strategy set in its place lets go of it', async () => {
+    for (const hooked of [false, true]) {
+      const { cm, strategy, ids } = await folding();
+      await drain(cm);
+      const row = ids[3]!;
+      assert.ok(coveredRows(cm, strategy).has(row), 'premise: the row is folded');
+      const { gate, open } = gated();
+      const initializing = hooked ? new Gated() : new Unhooked();
+      initializing.gate = gate;
+      const next = autobiographical();
+      await linesDuring(async () => {
+        const first = cm.setStrategy(initializing);
+        cm.retractRows([row], { undone: true });
+        const replaced = cm.setStrategy(next);
+        open();
+        await assert.rejects(first, /supersed/i);
+        await replaced;
+      });
+      const label = hooked ? 'control' : 'probe';
+      assert.ok(!coveredRows(cm, next).has(row), `${label}: no summary covers the row that left`);
+      const result = await cm.compile(BIG);
+      assert.ok(!renderedRows(cm, result).includes(row), `${label}: the compile omits the row that left`);
+      rendersWindowOnce(cm, result, label);
+      cm.close();
+    }
   });
 
   it('a row presented again that the open chunked at its new place keeps that place when its retraction is heard', async () => {

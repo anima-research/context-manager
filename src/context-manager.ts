@@ -3577,8 +3577,10 @@ export class ContextManager {
    * each row in turn through onNewMessage. After close() nothing reaches
    * the strategy: a close() from a listener lets the write it interrupted
    * finish, and that write's remaining shards are stored unheard. While the
-   * strategy isn't initialized the rows wait for it (deliverPresentedUnheard);
-   * an add, the legacy caller, requires an initialized strategy.
+   * strategy isn't initialized the rows wait for the manager's strategy,
+   * whether or not the one initializing has a row hook
+   * (deliverPresentedUnheard); an add, the legacy caller, requires an
+   * initialized strategy.
    *
    * Each row's onNewMessage call is checked as a call of its own, so a hook
    * that closes the manager, sets a strategy or starts an initialization
@@ -3599,12 +3601,16 @@ export class ContextManager {
    * value that can't be formatted.
    */
   private notifyPresented(rows: readonly StoredMessage[]): void {
-    const strategy = this.strategy;
-    if (rows.length === 0 || this.closed || (!strategy.onPresented && !strategy.onNewMessage)) return;
+    if (rows.length === 0 || this.closed) return;
+    // The rows wait for the manager's strategy, whichever instance that is
+    // once it is initialized, so they wait while one without a row hook
+    // initializes too: a replacement set meanwhile hears them.
     if (this.initializedAttempt !== this.initializationAttempt) {
       for (const row of rows) this.presentedUnheard.push(row.id);
       return;
     }
+    const strategy = this.strategy;
+    if (!strategy.onPresented && !strategy.onNewMessage) return;
     const ctx = this.createStrategyContext();
     if (strategy.onPresented) {
       const failed = (err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag);
@@ -3639,7 +3645,8 @@ export class ContextManager {
    * every row that left and the rows among them the manager can give, as
    * notifyPresented tells it of rows entering. Nothing reaches a strategy
    * without the hook, nor anything after close(). While the strategy isn't
-   * initialized the call waits for it (deliverRetractedUnheard), with the
+   * initialized the call waits for the manager's strategy, whether or not
+   * the one initializing has the hook (deliverRetractedUnheard), with the
    * ordinal each row left, which decides at delivery whether the row left
    * the window of the branch the strategy initialized on. Fire and forget
    * (#288): a throw before the hook returns, or a rejection, is logged,
@@ -3647,12 +3654,15 @@ export class ContextManager {
    * around the call, the context it builds among it, does.
    */
   private notifyRetracted(left: readonly RetractedRow[], info: Retraction): void {
-    const strategy = this.strategy;
-    if (left.length === 0 || this.closed || !strategy.onRetracted) return;
+    if (left.length === 0 || this.closed) return;
+    // As notifyPresented's rows, the call waits for the manager's strategy,
+    // whether or not the one initializing has the hook.
     if (this.initializedAttempt !== this.initializationAttempt) {
       this.retractedUnheard.push({ left: [...left], info });
       return;
     }
+    const strategy = this.strategy;
+    if (!strategy.onRetracted) return;
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
     const ids = left.map((l) => l.id);
     const ctx = this.createStrategyContext();

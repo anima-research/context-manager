@@ -104,6 +104,26 @@ class ShardingRecords extends Records {
   }
 }
 
+/** Records whose initialize waits for `gate`, once one is set. */
+class GatedRecords extends Records {
+  gate: Promise<void> | undefined;
+  async initialize(_ctx: StrategyContext): Promise<void> {
+    await this.gate;
+  }
+}
+
+/** A strategy with neither onPresented nor onNewMessage, whose initialize waits for `gate`, once one is set. */
+class Unhooked extends PassthroughStrategy {
+  gate: Promise<void> | undefined;
+  constructor() {
+    super();
+    (this as { onNewMessage?: unknown }).onNewMessage = undefined;
+  }
+  async initialize(_ctx: StrategyContext): Promise<void> {
+    await this.gate;
+  }
+}
+
 /** A host strategy that knows only onNewMessage. */
 class HearsNewMessages extends PassthroughStrategy {
   heard: Array<{ id: MessageId; window: MessageId[] }> = [];
@@ -317,6 +337,30 @@ describe('onPresented in presented mode', () => {
     );
     await settle();
     cm.close();
+  });
+
+  // House review of #350, code finding 1 (presented half): the rows wait for
+  // the manager's strategy, not for the instance initializing, so they wait
+  // while a strategy with no row hook initializes too.
+  it('rows presented while a strategy with no row hook initializes reach the strategy set in its place, after its own initialize', async () => {
+    for (const hooked of [false, true]) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      cm.presentRows([]);
+      const a = cm.addMessage('alice', [text('a')]);
+      const { gate, open } = gated();
+      // The control's initializing strategy has the hook; the probe's has neither row hook.
+      const initializing = hooked ? new GatedRecords() : new Unhooked();
+      initializing.gate = gate;
+      const first = cm.setStrategy(initializing);
+      cm.presentRows([a]);
+      const replacement = new Records();
+      await cm.setStrategy(replacement);
+      open();
+      await assert.rejects(first, /supersed/i);
+      assert.deepEqual(replacement.heard.map((h) => h.rows), [[a]], `${hooked ? 'control' : 'probe'}: the replacement hears the row once, after its initialize`);
+      await settle();
+      cm.close();
+    }
   });
 
   for (const [name, make] of [
