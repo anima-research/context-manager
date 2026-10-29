@@ -1167,6 +1167,14 @@ class MergeHoldDiscard extends Error {
   override name = 'MergeHoldDiscard';
 }
 
+class SummariesAcrossWindows extends Error {
+  override name = 'SummariesAcrossWindows';
+}
+
+function describeFailure(err: unknown): string {
+  return boundFailureLogText(err instanceof Error ? `${err.name}: ${err.message}` : String(err), 300);
+}
+
 /**
  * The split-stitch rung waits for its call window (at most
  * compressionSplitMaxCallsPer10Min calls in ten minutes, per strategy
@@ -3059,6 +3067,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionQueue = [];
     this.compressionQueueGeneration++;
     this._compressionCount = 0;
+    this._acrossFallbacks = 0;
     this._drainProgress = 0;
     this._demandedL1Chunks.clear();
     this.chunkRecords = [];
@@ -6534,11 +6543,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
   private summaryById(id: string): SummaryEntry | undefined {
+    return this.summaryIndex().get(id);
+  }
+
+  /** The summaries by id, built again when the summary list changes. */
+  private summaryIndex(): ReadonlyMap<string, SummaryEntry> {
     const cached = this._summaryIndex;
     if (!cached || cached.source !== this.summaries || cached.length !== this.summaries.length) {
       this._summaryIndex = { source: this.summaries, length: this.summaries.length, byId: new Map(this.summaries.map((s) => [s.id, s] as const)) };
     }
-    return this._summaryIndex!.byId.get(id);
+    return this._summaryIndex!.byId;
   }
 
   /**
@@ -7890,25 +7904,161 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
+    const dryRun = opts?.dryRun === true;
     if (this.config.adaptiveResolution) {
+      const adaptive = (dry: boolean): ContextEntry[] => this.selectAdaptive(store, budget, dry === dryRun ? opts : { ...opts, dryRun: dry });
       try {
-        return this.selectAdaptive(store, budget, opts);
+        return this.selectByWindowRule(store, adaptive, dryRun);
       } catch (err) {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
         // it (#179, the startup wedge). Any other refusal stands.
-        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, dryRun)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
         // its own (previewContext reads _lastPreview).
         this._lastPreview = undefined;
-        return this.selectAdaptive(store, budget, opts);
+        return this.selectByWindowRule(store, adaptive, dryRun);
       }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
-    return this.selectHierarchical(store, budget);
+    return this.selectByWindowRule(store, () => this.selectHierarchical(store, budget), dryRun);
+  }
+
+  private acrossMode: 'ask' | 'leave' | 'take' = 'take';
+  private leftOutAcross = 0;
+  private _acrossFallbacks = 0;
+
+  private selectByWindowRule(store: MessageStoreView, select: (dryRun: boolean) => ContextEntry[], dryRun: boolean): ContextEntry[] {
+    const run = (mode: 'ask' | 'leave' | 'take', dry: boolean): ContextEntry[] => {
+      this.acrossMode = mode;
+      try {
+        return select(dry);
+      } finally {
+        this.acrossMode = 'take';
+      }
+    };
+    try {
+      return run('ask', dryRun);
+    } catch (err) {
+      if (!(err instanceof SummariesAcrossWindows)) throw err;
+    }
+    const leftOut = this.leftOutAcross;
+    const restore = this.saveDryRunState(store);
+    const dryBefore = this._dryRunSelect;
+    this._dryRunSelect = true;
+    this._lastPreview = undefined;
+    let probe: ContextEntry[] | undefined;
+    let failed: string | undefined;
+    try {
+      probe = run('leave', true);
+      if ((this._lastPreview as PreviewResult | undefined)?.fits === false) failed = 'its plan is over the budget';
+    } catch (err) {
+      failed = describeFailure(err);
+    } finally {
+      this._dryRunSelect = dryBefore;
+    }
+    if (dryRun && failed === undefined) return probe!;
+    restore();
+    this._lastPreview = undefined;
+    if (failed === undefined) {
+      try {
+        return run('leave', dryRun);
+      } catch (err) {
+        if (err instanceof OverBudgetError || err instanceof UncoveredDropError) {
+          this.diag.warn(
+            `[autobiographical] the select that leaves out the ${leftOut} summaries over messages a window sends raw or over the partner of a tool call or result that this leaves raw ` +
+              `refused (${describeFailure(err)}) after a dry run of it fit: ` +
+              'a dry run and a live run of one select disagree, which is a defect',
+          );
+        }
+        throw err;
+      }
+    }
+    const entries = run('take', dryRun);
+    if (!dryRun) {
+      this._acrossFallbacks++;
+      this.diag.warn(
+        `[autobiographical] the select that leaves out the ${leftOut} summaries over messages a window sends raw or over the partner of a tool call or result that this leaves raw ` +
+          `failed in a dry run (${failed}), so this compile selects as before, and can send messages twice`,
+      );
+    }
+    return entries;
+  }
+
+  protected summariesAcross(
+    messages: readonly StoredMessage[],
+    sentRaw: (position: number) => boolean,
+    keptRaw: (position: number) => boolean,
+  ): Set<SummaryId> {
+    if (this.acrossMode === 'take') return new Set();
+    const position = this.positionIndex(messages);
+    const byId = this.summaryIndex();
+    const leavesAt = new Map<SummaryId, number[]>();
+    const holders = new Map<number, SummaryId[]>();
+    for (const s of this.summaries) {
+      const leaves = new Set<MessageId>();
+      this.expandSummaryToLeafMessageIds(s, byId, leaves);
+      const at: number[] = [];
+      for (const id of leaves) {
+        const p = position.get(id);
+        if (p === undefined) continue;
+        at.push(p);
+        const held = holders.get(p);
+        if (held) held.push(s.id);
+        else holders.set(p, [s.id]);
+      }
+      leavesAt.set(s.id, at);
+    }
+    const across = new Set<SummaryId>();
+    const leftOutL1s: SummaryId[] = [];
+    const leaveOut = (id: SummaryId): void => {
+      if (across.has(id)) return;
+      across.add(id);
+      if (byId.get(id)?.level === 1) leftOutL1s.push(id);
+    };
+    for (const [id, at] of leavesAt) if (at.some(sentRaw)) leaveOut(id);
+    if (leftOutL1s.length > 0) {
+      const partners = new Map<number, number[]>();
+      const link = (a: number, b: number): void => {
+        const list = partners.get(a);
+        if (list) list.push(b);
+        else partners.set(a, [b]);
+      };
+      for (const calls of answeredToolCalls(messages).values()) {
+        for (const call of calls) {
+          for (const result of call.results) {
+            const at = position.get(result.message);
+            if (at === undefined || at === call.message) continue;
+            link(call.message, at);
+            link(at, call.message);
+          }
+        }
+      }
+      for (let next = leftOutL1s.pop(); next !== undefined; next = leftOutL1s.pop()) {
+        for (const p of leavesAt.get(next) ?? []) {
+          if (sentRaw(p)) continue;
+          for (const q of partners.get(p) ?? []) {
+            if (sentRaw(q) || keptRaw(q)) continue;
+            for (const holder of holders.get(q) ?? []) leaveOut(holder);
+          }
+        }
+      }
+    }
+    this.leftOutAcross = across.size;
+    if (across.size > 0 && this.acrossMode === 'ask') throw new SummariesAcrossWindows();
+    return across;
+  }
+
+  private summariesNotAcross(across: ReadonlySet<SummaryId>): SummaryEntry[] {
+    if (across.size === 0) return this.summaries;
+    return this.summaries.flatMap((s) => {
+      if (across.has(s.id)) return [];
+      const parentId = getSummaryParentId(s);
+      return [parentId !== undefined && across.has(parentId as SummaryId) ? { ...s, parentId: undefined, mergedInto: undefined } : s];
+    });
   }
 
   /**
@@ -7916,7 +8066,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getStats(): {
     chunksTotal: number; chunksCompressed: number; compressionCount: number;
-    l1: number; l2: number; l3: number; pendingMerges: number;
+    l1: number; l2: number; l3: number; pendingMerges: number; acrossFallbacks: number;
   } {
     this.requireLoadedBranch('getStats');
     return {
@@ -7927,6 +8077,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       l2: this.summaries.filter(s => s.level === 2 && !s.mergedInto).length,
       l3: this.summaries.filter(s => s.level === 3 && !s.mergedInto).length,
       pendingMerges: this.mergeQueue.length,
+      acrossFallbacks: this._acrossFallbacks,
     };
   }
 
@@ -8948,13 +9099,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Matches moltbot's gradient exclusion algorithm (worker.ts:293-447).
    */
-  protected getAntiRedundantSummaries(excludeMessageIds?: Set<string>): {
+  protected getAntiRedundantSummaries(excludeMessageIds?: Set<string>, summaries: readonly SummaryEntry[] = this.summaries): {
     shownL1: SummaryEntry[];
     shownL2: SummaryEntry[];
     shownL3: SummaryEntry[];
   } {
     // Step 1: All unmerged L1s, excluding those whose sourceIds overlap with exclusion set
-    let candidateL1 = this.summaries.filter(s => s.level === 1 && !s.mergedInto);
+    let candidateL1 = summaries.filter(s => s.level === 1 && !s.mergedInto);
     if (excludeMessageIds && excludeMessageIds.size > 0) {
       candidateL1 = candidateL1.filter(
         s => !s.sourceIds.some(id => excludeMessageIds.has(id))
@@ -8964,14 +9115,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const shownL1Ids = new Set(shownL1.map(s => s.id));
 
     // Step 2: Unmerged L2s, excluding those whose ALL source L1s are shown
-    const candidateL2 = this.summaries.filter(s => s.level === 2 && !s.mergedInto);
+    const candidateL2 = summaries.filter(s => s.level === 2 && !s.mergedInto);
     const shownL2 = candidateL2.filter(
       s => !s.sourceIds.every(l1Id => shownL1Ids.has(l1Id))
     );
     const shownL2Ids = new Set(shownL2.map(s => s.id));
 
     // Step 3: Unmerged L3s, excluding those whose ALL source L2s are shown
-    const candidateL3 = this.summaries.filter(s => s.level === 3 && !s.mergedInto);
+    const candidateL3 = summaries.filter(s => s.level === 3 && !s.mergedInto);
     const shownL3 = candidateL3.filter(
       s => !s.sourceIds.every(l2Id => shownL2Ids.has(l2Id))
     );
@@ -13273,10 +13424,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // once and reused.
     const pinBounds = this.resolvedPinBounds(messages);
 
+    const across = this.summariesAcross(
+      messages,
+      (i) => headMessageIds.has(messages[i].id) || i >= effectiveRecentStart,
+      (i) => {
+        const bound = pinBounds.get(i);
+        return bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound);
+      },
+    );
+    const listed = this.summariesNotAcross(across);
+
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
     const summariesById = new Map<string, SummaryEntry>();
-    for (const s of this.summaries) summariesById.set(s.id, s);
+    for (const s of listed) summariesById.set(s.id, s);
 
     // Fold-path fallback (2026-08-04). Chunk records are the PRODUCTION
     // ledger, not the coverage authority: a released or boundary-drifted
@@ -13315,7 +13476,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // its summary. The head and recent windows cut a shard as they emit it.
       const tokens = middlePrice(i);
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
-      const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
+      const ownL1 = ch?.summaryId ?? l1ByMessage.get(msg.id);
+      const l1Id = ownL1 !== undefined && across.has(ownL1) ? undefined : ownL1;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -13362,7 +13524,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ----- 3. Build summaries map and recall-pair tokens -----
     const summariesMap = new Map<SummaryId, SummaryEntry>();
     const recallPairTokens = new Map<SummaryId, number>();
-    for (const s of this.summaries) {
+    for (const s of listed) {
       summariesMap.set(s.id, s);
       // Recall pair priced at its TRUE render cost (label + the full answer
       // content INCLUDING reasoning carriers). The old `s.tokens + 20`
@@ -16378,9 +16540,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const excludeIds = new Set<string>();
     for (let i = headStart; i < headEnd; i++) excludeIds.add(messages[i].id);
     for (let i = recentStart; i < messages.length; i++) excludeIds.add(messages[i].id);
+    const headIds = new Set(head.map((i) => messages[i].id));
+    // Without adaptive resolution no selector reads a pin's level bound, so
+    // every pinned position resolves to raw (resolvedPinBounds).
+    const pinnedPositionsSet = this.forceRawPinPositions(messages);
+    const listed = this.summariesNotAcross(
+      this.summariesAcross(messages, (i) => headIds.has(messages[i].id) || i >= effectiveRecentStart, (i) => pinnedPositionsSet.has(i)),
+    );
 
     // Get anti-redundant summaries
-    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(excludeIds);
+    const { shownL3, shownL2, shownL1 } = this.getAntiRedundantSummaries(excludeIds, listed);
 
     // Budget carryover: L3 → L2 → L1
     const l3Budget = this.config.l3BudgetTokens ?? 30000;
@@ -16458,7 +16627,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let l2RepairsSkipped = 0;
       let l3RepairsSkipped = 0;
       // L2s excluded by anti-redundancy: unmerged, not in shownL2.
-      for (const s of this.summaries) {
+      for (const s of listed) {
         if (s.level !== 2 || s.mergedInto || shownL2Ids.has(s.id)) continue;
         if (s.sourceIds.every(id => selectedIds.has(id))) continue; // truly redundant
         if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
@@ -16470,7 +16639,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // L3s excluded by anti-redundancy — after L2 repair, so a repaired L2
       // counts as selected coverage for its parent L3.
-      for (const s of this.summaries) {
+      for (const s of listed) {
         if (s.level !== 3 || s.mergedInto || shownL3Ids.has(s.id)) continue;
         if (s.sourceIds.every(id => selectedIds.has(id))) continue;
         if (this.isOverBudget(totalTokens + totalSummaryTokens + s.tokens, maxTokens)) continue;
@@ -16501,9 +16670,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
     const positionOf = this.positionIndex(messages);
-    // Without adaptive resolution no selector reads a pin's level bound, so
-    // every pinned position resolves to raw (resolvedPinBounds).
-    const pinnedPositionsSet = this.forceRawPinPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -16572,7 +16738,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      them raw until compression catches up — same freshness contract as
     //      the fallback: summaries may lag, but no message ever disappears.
     {
-      const sumById = new Map(this.summaries.map(s => [s.id, s]));
+      const sumById = new Map(listed.map(s => [s.id, s]));
       const leafCache = new Map<string, string[]>();
       const leavesOf = (s: SummaryEntry): string[] => {
         const cached = leafCache.get(s.id);
@@ -16595,7 +16761,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Highest-level live claimer per leaf (coarsest representation is the
       // cheapest way to restore coverage). Empty summaries represent nothing.
       const claimedBy = new Map<string, SummaryEntry>();
-      for (const s of this.summaries) {
+      for (const s of listed) {
         if (s.mergedInto) continue;
         if (!s.content || !s.content.trim()) continue;
         for (const leaf of leavesOf(s)) {
