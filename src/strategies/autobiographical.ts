@@ -1274,7 +1274,8 @@ export class StoreTopologyError extends Error {
           `L${v.level} ${v.id} (${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
           `${v.holeOwners.length ? ` owned by ${v.holeOwners.join('/')}` : ''})`).join('; ') +
         (violations.length > 8 ? `; +${violations.length - 8} more` : '') +
-        `. Repair the store or set topologyPolicy: 'report' to open it for inspection.`,
+        `. Repair the store, or open it with topologyPolicy: 'report' and auditOnly: true to inspect it as it stands` +
+        ` (a 'report' open without auditOnly runs the load-time repairs).`,
     );
     this.name = 'StoreTopologyError';
   }
@@ -6907,7 +6908,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * In legacy mode the window is the record and its rows never move, so a
    * non-contiguous summary there is a store the gate refuses, as it always
    * has; under `'report'` the gate records it for inspection, and an
-   * audit-only open writes nothing, so neither is repaired here.
+   * audit-only open leaves what the audit names as it found it, so neither
+   * is repaired here. (auditOnly turns off this repair and the other
+   * presentation-shaped ones, releaseRowsThatLeft among them; it is not a
+   * promise that an open writes nothing at all.)
    */
   private demoteSplitSummaries(messages: readonly StoredMessage[], ctx: StrategyContext): void {
     if (ctx.window?.mode() !== 'presented' || this.config.auditOnly || this.resolvedTopologyPolicy() !== 'reject') return;
@@ -7557,9 +7561,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * since is in the window, and the summary over it at its old place is
    * demoteSplitSummaries'. A row removed before the window was written
    * down was never in it, and what folded it stays, as it always has in
-   * legacy mode. An audit-only open writes nothing, and repairs nothing
-   * here; the topology policy doesn't change it, as it doesn't change
-   * onRetracted.
+   * legacy mode. An audit-only open doesn't repair this either: it leaves
+   * the rows that left under what covers them, for inspection. The
+   * topology policy doesn't change it, as it doesn't change onRetracted.
    */
   private releaseRowsThatLeft(ctx: StrategyContext): void {
     if (ctx.window?.mode() !== 'presented' || this.config.auditOnly) return;

@@ -935,8 +935,11 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
   // no folding strategy heard it, and stays out, is let go of at the next
   // open, as onRetracted would have let go of it.
   it('a folded row taken out that no folding strategy heard go, and still out: the open lets go of what covers it', async () => {
-    for (const heard of [false, true]) {
+    // House follow-up, item 2: a plain retraction reaches the repair as an
+    // undone one does (`left` holds both).
+    for (const [heard, undone] of [[false, true], [true, true], [false, false], [true, false]] as const) {
       const path = freshPath();
+      const take = undone ? { undone: true as const } : undefined;
       const { cm, strategy, ids } = await folding(path);
       await drain(cm);
       const row = ids[3]!;
@@ -944,23 +947,23 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       assert.ok(covering.length > 0, 'premise: the row is folded');
       if (heard) {
         // The control: the folding strategy hears the row go.
-        await linesDuring(async () => cm.retractRows([row], { undone: true }));
+        await linesDuring(async () => cm.retractRows([row], take));
         cm.close();
       } else {
         cm.close();
         // Through a strategy without the hook, as a crash between the
         // window's tombstone and the folding strategy's own writes leaves the store.
         const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
-        plain.retractRows([row], { undone: true });
+        plain.retractRows([row], take);
         plain.close();
       }
-      const label = heard ? 'control' : 'probe';
+      const label = `${heard ? 'control' : 'probe'}, ${undone ? 'undone' : 'plain'}`;
       const next = autobiographical();
       let reopened!: ContextManager;
       const lines = await linesDuring(async () => {
         reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
       });
-      assert.equal(reopened.windowStatusOf(row), 'undone', `${label}: setup: the row is out of the window`);
+      assert.equal(reopened.windowStatusOf(row), undone ? 'undone' : 'out', `${label}: setup: the row is out of the window`);
       const result = await reopened.compile(BIG);
       assert.ok(!renderedRows(reopened, result).includes(row), `${label}: the compile omits the row that left`);
       rendersWindowOnce(reopened, result, label);

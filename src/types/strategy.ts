@@ -337,8 +337,9 @@ export interface ContextStrategy {
    * enters it when this manager stores it: the call comes from inside the
    * write that stored it, one row at a time, after a holdCompression hold
    * is placed, and its synchronous part runs before addMessage returns.
-   * Once a host presents rows on the branch, a stored row isn't heard until
-   * it is presented: the call comes from presentRows, once per call, after
+   * Once a host presents rows on the branch, or takes a row out of its
+   * window by name (retractRows ends legacy mode too), a stored row isn't
+   * heard until it is presented: the call comes from presentRows, once per call, after
    * the rows are in the window and before presentRows returns. A row
    * presented again after retractRows is heard again. A row from an
    * auxiliary slot is heard only when a host presents it; in legacy mode it

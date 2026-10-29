@@ -50,13 +50,15 @@
  *   before it leaves the window, as a position in the store's own listing
  *   shifts when a row is removed.
  *
- * Until a host presents anything on a branch, the manager is in legacy
- * mode: there is no index, and the window is the record itself, live, as it
- * always was, so every compile sends byte for byte the messages it sent
- * before this module existed. (Its provenance differs: the rendered layout
- * says what its members count, RenderedLayout.keyedBy.) A host's first
- * presentation writes the index down as the window stands then (every row
- * of the record, in record order, then the header) and the manager is in
+ * Until a host presents anything on a branch, or takes a row out of its
+ * window by name (retractRows), the manager is in legacy mode: there is no
+ * index, and the window is the record itself, live, as it always was, so
+ * every compile sends byte for byte the messages it sent before this module
+ * existed. (Its provenance differs: the rendered layout says what its
+ * members count, RenderedLayout.keyedBy.) A host's first presentation, or
+ * its first naming retraction, writes the index down as the window stands
+ * then (every row of the record, in record order, then the header; a
+ * retraction's tombstones follow in the same write) and the manager is in
  * presented mode on that branch from then on.
  *
  * Each write to the index is one record, at one sequence: the write-down,
