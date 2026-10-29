@@ -77,6 +77,27 @@ async function tickUntil(manager: ContextManager, done: () => boolean): Promise<
   for (let i = 0; i < 30 && !done(); i++) await manager.tick();
 }
 
+async function logged(run: () => Promise<void>): Promise<{ warnings: string[]; errors: string[] }> {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  const { warn, error } = console;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await run();
+  } finally {
+    console.warn = warn;
+    console.error = error;
+  }
+  return { warnings, errors };
+}
+const DROPPED = /skipping stale queue entry, whose merge check found: \S/;
+const REFUSED = /\[merge-topology\] ⛔ refused/;
+const droppedWithWarning = ({ warnings, errors }: { warnings: string[]; errors: string[] }): void => {
+  assert.ok(warnings.some((line) => DROPPED.test(line)), 'a warning names what the merge check found');
+  assert.ok(!errors.some((line) => REFUSED.test(line)), 'no operator error');
+};
+
 describe('removed messages (#321)', () => {
   it('a message removed while its chunk waits is in neither the request nor the summary\'s sources', async () => {
     const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
@@ -580,7 +601,7 @@ describe('removed messages (#321)', () => {
       assert.deepStrictEqual(queue.map((m) => contents(m.sourceIds)), ['MEM[1]+MEM[2]'], 'premise: MEM[1] and MEM[2] are queued');
       for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
-      await manager.tick();
+      droppedWithWarning(await logged(() => manager.tick()));
       assert.strictEqual(quarantine.size, 0, 'no merge refused');
       assert.ok(!queue.some((m) => contents(m.sourceIds).includes('MEM[2]')), 'the entry with MEM[2] is gone from the queue');
       assert.ok(queue.some((m) => contents(m.sourceIds).startsWith('MEM[1]+MEM[3]')), 'MEM[1] is offered with MEM[3]');
@@ -602,11 +623,30 @@ describe('removed messages (#321)', () => {
       queue.push({ level: 2, sourceIds: [byContent('MEM[1]'), byContent('MEM[2]'), byContent('MEM[4]')], attempts: 0 });
       for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
       const sent = requests.length;
-      await manager.tick();
+      droppedWithWarning(await logged(() => manager.tick()));
       assert.strictEqual(requests.length, sent, 'no merge request sent');
       assert.deepStrictEqual(queue, [], 'the entry left the queue');
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
       assert.strictEqual(quarantine.size, 0, 'no merge refused');
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a queued merge whose source still has a message in the view is refused as crossed, not dropped, when its sources aren\'t adjacent', async () => {
+    const { manager, strategy, ids, path, requests } = await fourSummaries();
+    try {
+      const byContent = (content: string) => strategy.all().find((s) => s.content === content)!.id;
+      const queue = (strategy as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[]; attempts: number }> }).mergeQueue;
+      queue.push({ level: 2, sourceIds: [byContent('MEM[1]'), byContent('MEM[2]'), byContent('MEM[4]')], attempts: 0 });
+      for (const i of [4, 5]) manager.removeMessage(ids[i]! as never);
+      const sent = requests.length;
+      const { errors } = await logged(() => manager.tick());
+      assert.strictEqual(requests.length, sent, 'no merge request sent');
+      const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, { lastOutcome: string }> }).mergeQuarantine;
+      assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), ['topology_violation'], 'MEM[1] and MEM[4] with MEM[3] between them is refused');
+      assert.ok(errors.some((line) => REFUSED.test(line)), 'the refusal is an operator error');
     } finally {
       await manager.close();
       rmSync(path, { recursive: true, force: true });
@@ -620,7 +660,9 @@ describe('removed messages (#321)', () => {
       assert.ok((strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.length > 0, 'premise: a merge is queued');
       for (const id of ids) manager.removeMessage(id as never);
       const sent = requests.length;
-      for (let i = 0; i < 3; i++) await manager.tick();
+      droppedWithWarning(await logged(async () => {
+        for (let i = 0; i < 3; i++) await manager.tick();
+      }));
       assert.strictEqual(requests.length, sent, 'no merge request sent');
       assert.deepStrictEqual((strategy as unknown as { mergeQueue: unknown[] }).mergeQueue, [], 'the entry left the queue');
       assert.deepStrictEqual(strategy.all().filter((s) => s.level === 2).map((s) => s.content), [], 'no L2 written');
@@ -877,7 +919,7 @@ describe('removed messages (#321)', () => {
       const damaged = strategy.all().find((s) => s.level === 2 && s.sourceIds.some((id) => strategy.all().find((x) => x.id === id)?.content === 'MEM[1]'))!;
       damaged.sourceIds = [damaged.sourceIds[0]!, 'no-such-child'];
       const sent = requests.length;
-      await manager.tick();
+      droppedWithWarning(await logged(() => manager.tick()));
       assert.strictEqual(requests.length, sent, 'no merge request sent');
       assert.deepStrictEqual(queue, [], 'the entry left the queue');
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
@@ -912,7 +954,7 @@ describe('removed messages (#321)', () => {
         const queue = (strategy as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[]; attempts: number }> }).mergeQueue;
         queue.push({ level: 3, sourceIds: [emptied.id, other.id], attempts: 0 });
         const sent = requests.length;
-        await manager.tick();
+        droppedWithWarning(await logged(() => manager.tick()));
         assert.strictEqual(requests.length, sent, 'no merge request sent');
         assert.deepStrictEqual(queue, [], 'the entry left the queue');
         const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
@@ -952,12 +994,14 @@ describe('removed messages (#321)', () => {
           : damage === 'is listed twice in the entry' ? [emptied.id, emptied.id, other.id] : [emptied.id, other.id];
         queue.push({ level: 3, sourceIds, attempts: 0 });
         const sent = requests.length;
-        await manager.tick();
+        const log = await logged(() => manager.tick());
         assert.strictEqual(requests.length, sent, 'no merge request sent');
         const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, { lastOutcome: string }> }).mergeQuarantine;
         const dropped = damage !== 'has no message under it and a stored range with no ends';
         assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), dropped ? [] : ['topology_violation']);
         if (dropped) assert.deepStrictEqual(queue, [], 'the entry left the queue');
+        if (dropped) droppedWithWarning(log);
+        else assert.ok(log.errors.some((line) => REFUSED.test(line)), 'the refusal is an operator error');
       } finally {
         await manager.close();
         rmSync(path, { recursive: true, force: true });
