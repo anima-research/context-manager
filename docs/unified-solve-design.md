@@ -797,6 +797,14 @@ itself the main hazard; do not design from those numbers. After rev 6:
   system and tools blocks by construction. Caveat recorded: with the system
   slot moved, an idle expiry kills the tools entry together with the window;
   irrelevant with keepalives on, remember if they are ever off.
+- **That's a compile's own request.** On the native tool loop's later calls in
+  the same turn, a membrane that floats under `cm-owned` marks the newest
+  round: in a free slot, with the message before the round's calling turn too
+  when two or more are free, or in the earliest message marker's slot when all
+  four are in use (context-manager#168). Within one tool loop membrane changes
+  nothing before the turn's opening, so the taken marker's prefix lies inside
+  the newest marker's. Once one of the compile's calls is accepted, a later
+  call's receipt leaves the cache reference as that call set it (§5).
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
@@ -904,7 +912,10 @@ prefix; **stale imported block-level markers are rejected at a named
 normalization boundary before request construction** (CM cannot optimize a
 slot budget containing hidden markers; the loud data-defect behavior stays
 in `membrane-system` mode); the raw request carries at most the provider
-limit; membrane returns the exact wire receipt.
+limit; membrane returns the exact wire receipt. These rules, and formatter
+parity's and the wire receipt's below, hold for a compile's own request: on
+the native tool loop's later calls, a membrane that floats under `cm-owned`
+adds markers of its own (§5A.3).
 
 **Formatter parity** — the same normalized policy applies to native
 Anthropic, Anthropic XML/prefill, Bedrock (incl. its ttl rewrite), context-

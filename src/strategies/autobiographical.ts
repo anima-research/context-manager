@@ -2366,7 +2366,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     immutablePrefixHash?: string;
     markerUnitIndices: number[];
     render?: CacheRenderRecord;
+    begun?: number;
+    accepted?: true;
   } | null = null;
+  private kvUnifiedPendingDraft: { begun?: number; accepted?: true } | null = null;
   private kvUnifiedPendingLayout: RenderLayout | null = null;
   private kvUnifiedPendingMarkerUnitIndices: number[] = [];
   private kvUnifiedPendingImmutablePrefixHash: string | null = null;
@@ -2929,6 +2932,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.requireBranchMutation('discardRenderingFrontier');
       this.kvUnifiedReceipts = new KvUnifiedReceiptChain();
       this.kvUnifiedDraft = null;
+      this.kvUnifiedPendingDraft = null;
       this.kvUnifiedPendingLayout = null;
       this.kvUnifiedPendingMarkerUnitIndices = [];
       this.kvUnifiedPendingImmutablePrefixHash = null;
@@ -3671,6 +3675,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
           : new KvUnifiedReceiptChain();
         this.kvUnifiedDraft = null;
+        this.kvUnifiedPendingDraft = null;
         this.kvUnifiedPendingLayout = null;
         this.kvUnifiedPendingMarkerUnitIndices = [];
         this.kvUnifiedPendingImmutablePrefixHash = null;
@@ -14803,6 +14808,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `provider call); superseded by ${args.submissionId}`,
       );
     }
+    this.kvUnifiedDraft.begun = (this.kvUnifiedDraft.begun ?? 0) + 1;
+    this.kvUnifiedPendingDraft = this.kvUnifiedDraft;
     this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
     this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
     this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;
@@ -14831,8 +14838,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedReceipts.accept(args.submissionId, args.acceptedAt ?? Date.now(), null);
       return;
     }
+    const draft = this.kvUnifiedPendingDraft;
     let cache: ProviderCacheReference | null = null;
-    if (
+    if (draft?.accepted) {
+      // Under `cm-owned`, membrane's tool-loop float changes a later call's
+      // markers (context-manager#168).
+      cache = this.kvUnifiedReceipts.cache;
+    } else if (
       args.wireReceipt &&
       this.kvUnifiedPendingLayout &&
       this.kvUnifiedPendingImmutablePrefixHash &&
@@ -14855,6 +14867,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       args.wireReceipt.markers.length > 0 &&
       this.kvUnifiedPendingLayout &&
       this.kvUnifiedPendingImmutablePrefixHash &&
+      draft?.begun === 1 &&
       !this.kvUnifiedMarkerMismatchReported
     ) {
       // The request carried markers, but not one for each layout boundary its
@@ -14870,12 +14883,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `(logged once per strategy)`,
       );
     }
+    if (draft) draft.accepted = true;
     this.kvUnifiedReceipts.accept(
       args.submissionId,
       args.acceptedAt ?? Date.now(),
       cache,
       args.wireReceipt,
     );
+    this.kvUnifiedPendingDraft = null;
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
@@ -14913,6 +14928,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // acceptance that threw once the chain had settled its submission, that
     // submission's, which the next begin replaces.
     if (!inFlight) return;
+    this.kvUnifiedPendingDraft = null;
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
@@ -15442,6 +15458,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * and without the float every tool round re-paid the whole appended
    * suffix at full input price — the qa-ops 2026-08-20 8M-token incident).
    *
+   * kv-unified, which hosts send with membrane's `cacheMarkers: 'cm-owned'`,
+   * holds all four slots on a compile's own request. On the native tool
+   * loop's later calls, a membrane that floats under `cm-owned` puts its
+   * marker on the newest round, in the earliest message marker's slot when
+   * all four are in use (context-manager#168): the one case where membrane
+   * takes one of ours.
+   *
    * An earlier revision of this comment justified the 3-cap with "membrane
    * marks the system block whenever prompt caching is on" — membrane has
    * not done that unconditionally for some time, which is exactly how a
@@ -15504,7 +15527,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const historyEnd = firstTail - 1; // last non-tail entry
 
     if (this.config.foldingStrategy === 'kv-unified') {
-      // CM owns all four slots in kv-unified mode. Place three history
+      // CM owns all four slots of a compile's own request in kv-unified
+      // mode. Place three history
       // breakpoints at the nearest legal rendered-token boundaries to
       // 33%/66%/100%, plus one at the end of the tail. There is deliberately
       // no separate early/system marker: every history prefix already
