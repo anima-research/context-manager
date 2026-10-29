@@ -540,7 +540,7 @@ describe('AutobiographicalStrategy — persistence', () => {
           const parents = texts.filter(value => value === 'parent of the good one').length;
           // Adaptive resolution may render the parent's L1 in its place.
           if ('adaptiveResolution' in options) assert.ok(parents <= 1, JSON.stringify(texts));
-          else assert.equal(parents, 1);
+          else assert.equal(parents, 0, JSON.stringify(texts));
         }
         assert.ok(!strategy.getSummariesView().some((s) => s.id === 'L1-lost'), 'the record is dropped on load');
         assert.ok(!strategy.readPersistedSummaries().some((s) => s.id === 'L1-lost'), 'and the drop is persisted, with nothing else to repair');
