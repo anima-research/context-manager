@@ -48,13 +48,13 @@ import {
   isDerivationManifestStrategy,
 } from './types/index.js';
 import type { DerivationManifestOptions } from './types/index.js';
-import { isStateExistsFor } from './state-registration.js';
+import { isStateExistsFor, registerStateIfAbsent } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
-import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
-import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
+import { MalformedContentError, audienceDeclarations, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
+import { audienceMessageStoreView, contentForReader, filterMessageStoreView, hasAudience, mergeMessageStoreViews, messageForReader, type ContentBlockWithAudience } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -174,6 +174,52 @@ interface ContextManagerBaseConfig {
    */
   viewFilter?: (message: StoredMessage) => boolean;
   /**
+   * The reader this manager compiles for. A content block may declare an
+   * `audience`, the readers it is for; the strategy-facing view keeps a block
+   * with no `audience` or one whose `audience` names this reader, without the
+   * field, and leaves out a message whose every block is for someone else.
+   * Unset, the view keeps no block that declares an `audience`: a block meant
+   * for someone is no one's to see until the manager says whom it compiles
+   * for. Applied after `viewFilter`. A store whose blocks declare no
+   * `audience` reads as without it, except that the namespace's record of its
+   * reader (below) is a state write, so messages stored after it is first
+   * written on a branch (by an open, a switch, a fork, a derive or a
+   * setStrategy) carry sequence numbers one higher. Direct accessors
+   * (getMessage/getAllMessages/query) return messages as stored. Each
+   * reader's summaries and context log are kept under its manager's
+   * `namespace`, so managers over one message slot compiling for different
+   * readers each need a namespace of their own: the namespace records the
+   * first `viewReader` it's opened with as its strategy starts, in
+   * `<namespace>/reader`; an empty namespace, an omitted one and `'default'`
+   * share `default/reader`, since an omitted namespace shares its context log
+   * with the empty one and its strategy state with `'default'`. The record
+   * stays if that start fails, since the start may have written that reader's
+   * material, so only that reader can open the namespace again (an open with
+   * no reader, as for inspection, isn't refused); to bind it to another
+   * reader on purpose, set that state to null through the store
+   * (`store.setStateJson('<namespace>/reader', null)`, or `'default/reader'`
+   * for those three) on each branch it should open on, since the record is
+   * branch state, which counts as never claimed, or give the reader a
+   * namespace of its own; an open, a fork or a derive (each refused before
+   * it writes anything), a switch to a branch or a setStrategy that would
+   * compile it for another is refused. An open with none is allowed, as for
+   * inspection, and if it compresses, its summaries hold no block that has
+   * an `audience`, and the namespace's reader compiles from them as written;
+   * summaries written before a reader claims the namespace are kept, and
+   * that reader's compiles use them as written. An `audience` is read on a
+   * message's own blocks, other than tool calls, tool results, system
+   * changes and inline media (which the store keeps as a blob), and never in
+   * a context entry or a compile's injection; a write that puts one anywhere
+   * else, or one that isn't a list of reader names, is refused, and so is a
+   * compile given one in an injection or in `messageInjections`, or a
+   * preview given one in `messageInjections`. A message holding a block with
+   * an `audience` is stored whole, never split into shards at ingress. The
+   * view holds through the manager: a strategy whose `select` or
+   * `previewContext` is called directly reads whatever view and options its
+   * caller hands it.
+   */
+  viewReader?: string;
+  /**
    * Additional message slots merged (read-only) into the strategy-facing
    * view, ordered with this manager's own messages by chronicle sequence —
    * which is branch-global across slots, so the interleaving is
@@ -186,6 +232,61 @@ interface ContextManagerBaseConfig {
    * `viewFilter`, when also set, applies to the merged view.
    */
   auxiliaryMessageViews?: Array<{ namespace?: string }>;
+}
+
+function viewReaderStateId(namespace: string): string {
+  return `${namespace || 'default'}/reader`;
+}
+
+function isViewReaderRegistered(store: JsStore, namespace: string): boolean {
+  const id = viewReaderStateId(namespace);
+  return store.listStates().some((state) => state.id === id);
+}
+
+function recordedViewReader(store: JsStore, namespace: string, by = 'ContextManager.reopenDerived'): string | undefined {
+  if (!isViewReaderRegistered(store, namespace)) return undefined;
+  const recorded = store.getStateJson(viewReaderStateId(namespace)) as unknown;
+  if (recorded === null || recorded === undefined) return undefined;
+  if (typeof recorded !== 'string' || recorded === '') {
+    throw new Error(`${by}: namespace "${namespace}" records its reader as ${JSON.stringify(recorded)}, not a reader's name`);
+  }
+  return recorded;
+}
+
+function refuseInjectedAudience(
+  what: string,
+  injections: readonly ContextInjection[] | undefined,
+  messageInjections: ReadonlyArray<ContentBlock[]> | undefined,
+): void {
+  const places = [
+    ...(injections ?? []).flatMap((injection, i) => audienceDeclarations(injection.content, `injections[${i}].content`)),
+    ...(messageInjections ?? []).flatMap((content, i) => audienceDeclarations(content, `opts.messageInjections[${i}]`)),
+  ];
+  if (places.length > 0) {
+    throw new MalformedContentError(
+      what,
+      places.map((place) => `${place} has an audience; an injection goes into the request as given, and no view reads an audience there`),
+    );
+  }
+}
+
+function refuseOtherViewReader(store: JsStore, namespace: string, reader: string, by: string): void {
+  const recorded = recordedViewReader(store, namespace, by);
+  if (recorded !== undefined && recorded !== reader) {
+    throw new Error(
+      `${by}: namespace "${namespace}" compiles for reader ${JSON.stringify(recorded)}, not ${JSON.stringify(reader)}: ` +
+        "its summaries and context log hold that reader's view, so another reader's would read them. " +
+        'Give each reader a namespace of its own.',
+    );
+  }
+}
+
+function claimViewReader(store: JsStore, namespace: string, reader: string, by = 'ContextManager.open'): void {
+  refuseOtherViewReader(store, namespace, reader, by);
+  const id = viewReaderStateId(namespace);
+  registerStateIfAbsent(store, { id, strategy: 'snapshot' });
+  const recorded = store.getStateJson(id) as unknown;
+  if (recorded === null || recorded === undefined) store.setStateJson(id, reader);
 }
 
 /**
@@ -293,7 +394,10 @@ export interface ContextDerivation {
   };
 }
 
-/** Options for {@link ContextManager.reopenDerived}. */
+/**
+ * Options for {@link ContextManager.reopenDerived}, which compiles for the
+ * reader the derived branch recorded (`viewReader`), if it recorded one.
+ */
 export interface ReopenDerivedOptions {
   /** Any handle on the store that holds the derived branch. */
   store: JsStore;
@@ -412,6 +516,7 @@ export class ContextManager {
   private readonly diag: Diagnostics = namespaceDiagnostics(() => this.strategyNamespace);
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
+  private viewReader?: string;
   /**
    * Compression holds (see holdCompression). Transient by design: never
    * persisted, so a restart can never leave compression permanently stalled.
@@ -460,6 +565,7 @@ export class ContextManager {
     debugLogContext = false,
     viewFilter?: (message: StoredMessage) => boolean,
     auxiliaryStores: MessageStore[] = [],
+    viewReader?: string,
   ) {
     this.store = store;
     this.messageStore = messageStore;
@@ -470,6 +576,7 @@ export class ContextManager {
     this.membrane = membrane;
     this.debugLogContext = debugLogContext;
     this.viewFilter = viewFilter;
+    this.viewReader = viewReader;
     this.auxiliaryStores = auxiliaryStores;
     this.foldJournal = new FoldJournal(store, strategyNamespace);
 
@@ -482,19 +589,25 @@ export class ContextManager {
    * every strategy read passes (compile, preview, render stats, and the
    * tick/onNewMessage StrategyContext). Composition order: merge auxiliary
    * slots into the timeline first, then apply the exclusion filter, so a
-   * filter sees (and can exclude from) the merged world.
+   * filter sees (and can exclude from) the merged world, then show the
+   * reader only the blocks meant for it.
    */
   private strategyMessageView() {
     let view = this.mergedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    view = audienceMessageStoreView(view, this.viewReader, { mayHold: () => this.mayHoldAudience() });
     // Live predicate (strategies capture views across long drains). Every
     // view built above is a fresh object, so this never leaks into a store.
     const holds = this.compressionHolds;
     view.isCompressionHeld = (id: MessageId) => holds.has(id);
     view.hasCompressionHolds = () => holds.size > 0;
     return view;
+  }
+
+  private mayHoldAudience(): boolean {
+    return this.messageStore.mayHoldAudience() || this.auxiliaryStores.some((store) => store.mayHoldAudience());
   }
 
   /** This manager's messages merged with its auxiliary slots, before the view filter. */
@@ -557,6 +670,8 @@ export class ContextManager {
     if (config.isolate && !config.namespace) {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
     }
+    if (config.viewReader === '') throw new Error('ContextManager.open: viewReader is empty; name the reader the manager compiles for, or leave it unset');
+    if (config.viewReader !== undefined) refuseOtherViewReader(store, config.namespace ?? 'default', config.viewReader, 'ContextManager.open');
     const messageNamespace = config.isolate ? config.namespace : undefined;
     const messageSlot = MessageStore.registrationFor(messageNamespace).id;
     // The slot's lines name its namespace where it has one, as the store's own
@@ -663,6 +778,7 @@ export class ContextManager {
       config.debugLogContext ?? false,
       config.viewFilter,
       auxiliaryStores,
+      config.viewReader,
     );
     if (config.now) manager.now = config.now;
     manager.slots = {
@@ -677,7 +793,7 @@ export class ContextManager {
     };
 
     try {
-      await manager.initializeStrategy();
+      await manager.initializeStrategy(undefined, undefined, 'ContextManager.open');
     } catch (error) {
       // open() fails with the manager unreturned, so nothing could close()
       // it: the strategy is let go of here, as close() would.
@@ -697,7 +813,8 @@ export class ContextManager {
    * If the configured strategy implements `chunkIngressMessage` and returns
    * a non-null sharding decision, the message is stored as multiple records
    * sharing a `bodyGroupId` (per the adaptive-resolution design §3.6). The
-   * returned MessageId is the first shard's id.
+   * returned MessageId is the first shard's id. A message holding a block
+   * with an `audience` is stored whole, and the strategy isn't asked.
    *
    * `options.holdCompression` places a compression hold (see
    * holdCompression) on the new message BEFORE the strategy's onNewMessage
@@ -706,7 +823,7 @@ export class ContextManager {
    */
   addMessage(
     participant: string,
-    content: ContentBlock[],
+    content: ContentBlockWithAudience[],
     metadata?: MessageMetadata,
     causedBy?: MessageId[],
     options?: AddMessageOptions
@@ -762,7 +879,7 @@ export class ContextManager {
         content: ContentBlock[]
       ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
     };
-    if (typeof strategyAny.chunkIngressMessage === 'function') {
+    if (typeof strategyAny.chunkIngressMessage === 'function' && !hasAudience(content)) {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
         // Every shard declares its group's size, so a group an interrupted
@@ -853,7 +970,7 @@ export class ContextManager {
    * that must reach compressed memory, hold the message (holdCompression /
    * addMessage `holdCompression`) until after the edit.
    */
-  editMessage(messageId: MessageId, content: ContentBlock[]): void {
+  editMessage(messageId: MessageId, content: ContentBlockWithAudience[]): void {
     this.requireInitialized('editMessage');
     this.write(() => this.messageStore.edit(messageId, content));
     // Propagation handled by event listener
@@ -1238,9 +1355,18 @@ export class ContextManager {
   }
 
   private async selectBranch(name: string, created: boolean): Promise<void> {
+    const from = this.store.currentBranch().name;
     this.store.switchBranch(name);
+    if (this.viewReader !== undefined) {
+      try {
+        claimViewReader(this.store, this.strategyNamespace, this.viewReader, created ? 'ContextManager.fork' : 'ContextManager.switchBranch');
+      } catch (error) {
+        this.store.switchBranch(from);
+        throw error;
+      }
+    }
     const requested = markStoreBranchSwitch(this.store);
-    await this.initializeStrategy(requested, { branch: requested.name, created });
+    await this.initializeStrategy(requested, { branch: requested.name, created }, created ? 'ContextManager.fork' : 'ContextManager.switchBranch');
   }
 
   /**
@@ -1265,6 +1391,7 @@ export class ContextManager {
   async fork(name?: string): Promise<string> {
     this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
+    if (this.viewReader !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.viewReader, 'ContextManager.fork');
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
@@ -1301,8 +1428,17 @@ export class ContextManager {
    * derived manager holds a handle bound to its own branch.
    *
    * What is inherited is the set of states this manager owns: its message
-   * slot, its auxiliary slots, its context log, its thinking-binding record
-   * and its strategy's states.
+   * slot, its auxiliary slots, its context log, its thinking-binding record,
+   * the namespace's record of its reader (`viewReader`), and its strategy's
+   * states. The derived manager compiles for this manager's reader. The
+   * child records its parent's `viewReader`; a child of a manager with no
+   * `viewReader` records what the parent's head records, a reader or none,
+   * whatever the checkpoint recorded. A head that records another reader
+   * refuses a derive by a manager with a reader, and a record that isn't a
+   * reader's name refuses any derive, before the child's branch is written.
+   * A child of a manager opened with no reader compiles for none, and
+   * {@link ContextManager.reopenDerived} compiles it for the reader its
+   * branch records.
    * Other states in the store are not carried onto the derived branch.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
@@ -1315,6 +1451,8 @@ export class ContextManager {
     if (!ContextManager.supportsDerivation(this.store)) {
       throw new ContextDerivationUnsupportedError();
     }
+    if (this.viewReader !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.viewReader, 'ContextManager.derive');
+    const reader = this.viewReader ?? recordedViewReader(this.store, this.strategyNamespace, 'ContextManager.derive');
     const source = this.store as unknown as JsStore & DerivableStore;
     const solve = options.solve ?? 'reuse';
     const parentBranch = this.store.currentBranch().name;
@@ -1327,6 +1465,7 @@ export class ContextManager {
       ...this.slots.auxiliaryNamespaces.map((ns) => MessageStore.registrationFor(ns).id),
       ContextLog.stateIdFor(this.slots.contextNamespace),
       bindingStateId(this.strategyNamespace),
+      ...(isViewReaderRegistered(this.store, this.strategyNamespace) ? [viewReaderStateId(this.strategyNamespace)] : []),
       // Authoring-request preimages are keyed by hash in one store-wide
       // tree; inherited so the child can still resolve a memory's origin.
       // Ignored by the store when the tree was never created.
@@ -1373,6 +1512,13 @@ export class ContextManager {
         estimator: this.slots.tokenEstimator,
         namespace: this.slots.contextNamespace,
       });
+      const readerStateId = viewReaderStateId(this.strategyNamespace);
+      if (reader !== undefined) {
+        registerStateIfAbsent(view, { id: readerStateId, strategy: 'snapshot' });
+        if (view.getStateJson(readerStateId) !== reader) view.setStateJson(readerStateId, reader);
+      } else if (isViewReaderRegistered(view, this.strategyNamespace) && view.getStateJson(readerStateId) != null) {
+        view.setStateJson(readerStateId, null);
+      }
       derived = new ContextManager(
         view,
         messageStore,
@@ -1384,6 +1530,7 @@ export class ContextManager {
         options.debugLogContext ?? this.debugLogContext,
         options.viewFilter ?? this.viewFilter,
         auxiliaryStores,
+        this.viewReader,
       );
       derived.now = this.now;
       derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
@@ -1405,7 +1552,7 @@ export class ContextManager {
       if (frontier !== undefined && isRenderingFrontierStrategy(derived.strategy)) {
         derived.strategy.prepareFromRenderingFrontier?.(frontier);
       }
-      await derived.initializeStrategy(observeStoreBranch(view));
+      await derived.initializeStrategy(observeStoreBranch(view), undefined, 'ContextManager.derive');
 
       if (isRenderingFrontierStrategy(derived.strategy)) {
         if (solve === 'fresh') {
@@ -1450,6 +1597,7 @@ export class ContextManager {
     const { derivation } = options;
     const view = (options.store as unknown as DerivableStore).view(derivation.branch);
     const namespace = derivation.slots.contextNamespace ?? undefined;
+    const viewReader = recordedViewReader(view, namespace ?? 'default');
     const manager = await ContextManager.open({
       store: view,
       ...(namespace !== undefined ? { namespace } : {}),
@@ -1466,6 +1614,7 @@ export class ContextManager {
       ...(options.membrane ? { membrane: options.membrane } : {}),
       ...(options.tokenEstimator ? { tokenEstimator: options.tokenEstimator } : {}),
       ...(options.viewFilter ? { viewFilter: options.viewFilter } : {}),
+      ...(viewReader !== undefined ? { viewReader } : {}),
       ...(options.debugLogContext !== undefined ? { debugLogContext: options.debugLogContext } : {}),
     });
     manager.derivation = structuredClone(derivation);
@@ -1542,6 +1691,11 @@ export class ContextManager {
    * - "afterUser": inserted after the last user message, or at the end when
    *   the messages hold none
    *
+   * An injection's block that declares an `audience`, at its top level or in
+   * a tool result's content, is refused (MalformedContentError) before
+   * anything is selected, and so is one in `opts.messageInjections`: no view
+   * reads an audience there.
+   *
    * With `opts.thinkingBinding.binds`, it then leaves out the thinking a
    * model that binds thinking can no longer take, injections placed (see
    * `SelectOptions.thinkingBinding`).
@@ -1557,6 +1711,7 @@ export class ContextManager {
     // Before anything is selected or committed: a compile refused here leaves
     // nothing behind.
     if (opts?.thinkingBinding?.binds === true) refuseUnboundBinding(opts);
+    refuseInjectedAudience('ContextManager.compile refused its injections', injections, opts?.messageInjections);
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -1597,14 +1752,16 @@ export class ContextManager {
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
-    // Raw bodies are judged as stored: the view filter can hide a shard of a
-    // body from the strategy, but the body's identity (shard 0, the id
-    // addMessage returned) and its membership are the stored group's. The
-    // layout stays on the filtered view the strategy rendered. Attribution
-    // reads only around the messages the raw entries name, and a lookup
-    // asks for a sequence, not the message (#273).
-    const storedView = this.viewFilter ? this.mergedMessageView() : view;
-    const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
+    // Raw bodies are judged as stored, as this reader sees the store: the
+    // view filter can hide a shard of a body from the strategy, but the
+    // body's identity (shard 0, the id addMessage returned) and its
+    // membership are the stored group's; a block whose audience leaves this
+    // reader out is no part of its body. The layout stays on the filtered
+    // view the strategy rendered. Attribution reads only around the
+    // messages the raw entries name, and a lookup asks for a sequence, not
+    // the message (#273).
+    const storedView = audienceMessageStoreView(this.mergedMessageView(), this.viewReader, { keepEmptied: true, mayHold: () => this.mayHoldAudience() });
+    const storedMessages = storedView.getAll();
     const sequenceOf = storedView.sequenceOf
       ? (id: MessageId) => storedView.sequenceOf!(id)
       : (id: MessageId) => storedView.get(id)?.sequence;
@@ -2109,7 +2266,9 @@ export class ContextManager {
    * shards; where the compile sends each shard on its own, an id gives back
    * its own shard.
    * Undefined when the strategy has no such hook, so a caller appends the
-   * content as stored. An id comes back as null only when the next compile
+   * content as this manager's reader sees it (`contentForReader` with its
+   * `viewReader`), which is the content as stored where no block declares
+   * an `audience`. An id comes back as null only when the next compile
    * doesn't send that message, such as one the view filter leaves out. A
    * strategy's own doc names where its compile still sends a message
    * otherwise than its render, as the memory strategy's does for a message
@@ -2173,8 +2332,9 @@ export class ContextManager {
    * next compile renders otherwise, matches nothing there, and what follows
    * goes without its thinking. Rendering them releases no compression hold,
    * as `renderAsNewest` releases none. Without `renderAsNewest`, a row is
-   * its stored content, and a body stored as shards matches nothing, and so
-   * does an id the store doesn't hold, as after a removal.
+   * its stored content as this manager's reader sees it, and a body stored
+   * as shards matches nothing, and so does an id the store doesn't hold, as
+   * after a removal.
    *
    * Returns false and writes nothing when `compileId` isn't the compile that
    * wrote the branch's record, as for a stream whose note arrives after
@@ -2221,9 +2381,9 @@ export class ContextManager {
         continued.push(UNVOUCHED);
         continue;
       }
-      // With no renderAsNewest, a row is its stored content, which for a body
-      // stored as shards is only its first shard's.
-      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? stored.content : null) : rendered[next];
+      // With no renderAsNewest, a row is its stored content as the reader
+      // sees it, which for a body stored as shards is only its first shard's.
+      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? contentForReader(stored.content, this.viewReader) : null) : rendered[next];
       next++;
       if (content === null || content === undefined) {
         continued.push(UNVOUCHED);
@@ -2307,7 +2467,9 @@ export class ContextManager {
    * `markDocument` return them) that the dry select reads as absent: the
    * preview answers what a compile would do were they unpinned. Nothing is
    * unpinned or written, and the option adds no log call; an id no pin has
-   * is ignored, and no compile takes the option.
+   * is ignored, and no compile takes the option. A block in
+   * `opts.messageInjections` that declares an `audience` is refused
+   * (MalformedContentError), as `compile` refuses one.
    */
   previewContext(
     budget: TokenBudget,
@@ -2315,6 +2477,7 @@ export class ContextManager {
     opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
+    refuseInjectedAudience('ContextManager.previewContext refused its injections', undefined, opts?.messageInjections);
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
@@ -2566,9 +2729,11 @@ export class ContextManager {
   private async initializeStrategy(
     expectedBranch?: StoreBranchGeneration,
     selection?: { branch: string; created: boolean },
+    by = 'ContextManager.setStrategy',
   ): Promise<void> {
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
+    if (this.viewReader !== undefined) claimViewReader(this.store, this.strategyNamespace, this.viewReader, by);
     const strategy = this.strategy;
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
@@ -2767,9 +2932,11 @@ export class ContextManager {
       // thrown value that can't be formatted.
       const failed = (err: unknown) =>
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
+      const seen = messageForReader(message, this.viewReader);
+      if (seen === null) return;
       const ctx = this.createStrategyContext();
       try {
-        Promise.resolve(this.strategy.onNewMessage(message, ctx)).catch(failed);
+        Promise.resolve(this.strategy.onNewMessage(seen, ctx)).catch(failed);
       } catch (err) {
         failed(err);
       }
@@ -2777,6 +2944,12 @@ export class ContextManager {
   }
 
   private handleMessageEdit(messageId: MessageId, newContent: ContentBlock[]): void {
+    const seen = contentForReader(newContent, this.viewReader);
+    if (seen === null) {
+      this.removeCopiesOf(messageId);
+      return;
+    }
+    newContent = seen;
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 
@@ -2809,6 +2982,10 @@ export class ContextManager {
       }
       this.notifyHoldsReleased();
     }
+    this.removeCopiesOf(messageId);
+  }
+
+  private removeCopiesOf(messageId: MessageId): void {
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 

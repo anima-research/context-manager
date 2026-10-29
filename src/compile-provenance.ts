@@ -7,12 +7,13 @@
  * its source ids, a summary is an entry naming its summaries, and a message
  * of the strategy's view represented by neither was not rendered (omitted).
  *
- * Completeness of a raw copy is judged against the stored body: a copy is
- * complete only when every shard of the body is present and every block
- * arrived unaltered (no truncation, no stripped image, no block removed by a
- * structural repair).
+ * Completeness of a raw copy is judged against the stored body as the
+ * manager's reader sees it: a copy is complete only when every shard of the
+ * body is present and every block arrived unaltered (no truncation, no
+ * stripped image, no block removed by a structural repair).
  */
 
+import { isEmptiedForReader } from './message-view.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { bodyBoundsIn } from './body-runs.js';
 import type {
@@ -197,7 +198,7 @@ export function attributeEntries(
       && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
   };
   const allShards = (state: BodyState): boolean =>
-    wholeGroup(state) && state.members.every((m) => state.present.has(m.id));
+    wholeGroup(state) && state.members.every((m) => state.present.has(m.id) || isEmptiedForReader(m));
   const complete = (state: BodyState): boolean => state.contentOk && allShards(state);
   const rawComplete = new Map<MessageId, boolean>();
   for (const state of bodies.values()) {

@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
 import { attributeEntries as attributeIn, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
+import { audienceMessageStoreView } from '../src/message-view.js';
 import type { ContextEntry, ContextLogView, MessageStoreView, StoredMessage, TokenBudget } from '../src/index.js';
 
 /** Attribution over `stored`, resolving an id to its sequence among those messages, as a store's lookup does. */
@@ -66,6 +67,24 @@ describe('coversStoredContent', () => {
 });
 
 describe('attributeEntries', () => {
+  it('counts a shard every block of which is another reader\'s as no part of this reader\'s body, and no other empty shard', () => {
+    const g = { bodyGroupId: 'g2' };
+    const s0 = msg('e0', 1, [{ type: 'text', text: 'for bob', audience: ['bob'] } as ContentBlock], { ...g, shardIndex: 0 });
+    const s1 = msg('e1', 2, [text('the reader\'s part')], { ...g, shardIndex: 1 });
+    const stored: StoredMessage[] = [s0, s1];
+    const view = audienceMessageStoreView({
+      getAll: () => stored, get: (id) => stored.find((m) => m.id === id) ?? null, getFrom: (i) => stored.slice(i),
+      getTail: (n) => stored.slice(-n), length: () => stored.length, estimateTokens: () => 1,
+    }, 'ann', { keepEmptied: true });
+    const result = attributeEntries([copy(s1)], view.getAll());
+    const source = result.sources[0]!;
+    assert.ok(source.kind === 'raw');
+    assert.deepEqual(source.bodies[0], { messageId: 'e0', sequence: 1, complete: true });
+    const plainEmpty = attributeEntries([copy(s1)], [msg('e0', 1, [], { ...g, shardIndex: 0 }), s1]).sources[0]!;
+    assert.ok(plainEmpty.kind === 'raw');
+    assert.deepEqual(plainEmpty.bodies[0], { messageId: 'e0', sequence: 1, complete: false, missing: ['shards'] }, 'an empty shard the view didn\'t empty still counts');
+  });
+
   it('marks a body complete only when every shard renders raw and unaltered', () => {
     const g = { bodyGroupId: 'g1' };
     const s0 = msg('s0', 1, [text('part one ')], { ...g, shardIndex: 0 });
