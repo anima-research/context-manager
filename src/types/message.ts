@@ -107,6 +107,18 @@ export interface StoredMessage {
   shardCount?: number;
 
   /**
+   * Whether the seam before this shard falls inside one of the body's text
+   * blocks, so that this shard's first block continues the previous shard's
+   * last. Declared on every shard after the first of a body written with each
+   * of its blocks in place (each shard holds its slice of the body's blocks,
+   * in order); a render joins the two text blocks only at such a seam
+   * (`joinBodyContent`). Absent on bodies written before it was recorded,
+   * whose shards hold the body's text joined into one block and all its
+   * other blocks on the first shard.
+   */
+  continuesBlock?: boolean;
+
+  /**
    * Current display resolution for this chunk:
    *  - 0  = render raw content
    *  - k>0 = render the L_k summary that covers this chunk
@@ -167,6 +179,7 @@ export interface StoredMessageInternal {
   shardIndex?: number;
   /** See StoredMessage.shardCount */
   shardCount?: number;
+  continuesBlock?: boolean;
   /** See StoredMessage.currentResolution */
   currentResolution?: number;
   /** See StoredMessage.lockedByAgent */

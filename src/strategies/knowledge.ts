@@ -73,6 +73,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     const all = store.getAll();
     const position = this.positionIndex(all);
     const changes = systemChangePositions(all);
+    const held = this.closesHeld(all, messagesToChunk.length > 0 ? position.get(messagesToChunk[0]!.id) ?? 0 : all.length);
     // The walk below is in store order, so one cursor finds the changes
     // stored between each message and the one before it.
     let nextChange = 0;
@@ -136,12 +137,10 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       }
       // Not between a call and its result: closing there would leave the
       // result with its call folded into the summary, and pairing repair
-      // drops a result whose call isn't before it. So when a summary ends at
-      // a call answered only later, the result joins the summary's chunk,
-      // which the overlap guard then refuses, as on main.
+      // drops a result whose call isn't before it.
       const summaryChanges = previous !== undefined
         && coveredBy.get(previous.id) !== coveredBy.get(msg.id)
-        && !(this.hasToolUse(previous) && this.hasToolResult(msg));
+        && !(this.bodyHoldsToolUse(all, position.get(previous.id)!) && this.bodyHoldsToolResult(all, at));
       if (previous && (changeBefore || summaryChanges)) {
         // The compressible stream skips a system change, which stays raw. A
         // chunk across it would summarize both sides as one, rendered at its
@@ -173,18 +172,12 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const sizeExceeded = currentTokens >= maxTokens;
       // Same tool-pair boundary guard as the base chunker (rebuildChunks in
       // AutobiographicalStrategy): never close a chunk whose LAST message
-      // contains a tool_use block — its matching tool_result lives in the
-      // immediately-following message (the one about to be pushed). Closing
-      // here would split the pair across chunks; when the earlier chunk
-      // compresses first, the raw orphan tool_result renders unpaired and
-      // the Anthropic API rejects the request. Deferring the close by one
-      // iteration pulls the tool_result into the same chunk. (Phase never
-      // changes between a tool_use and its tool_result — the result inherits
-      // lastToolPhase — so this defers sizeExceeded closes in practice.)
+      // contains a tool_use block. Closing
+      // here would split the pair across chunks.
       const shouldClose =
         currentChunk.length >= 2 &&
         (phaseChanged || sizeExceeded) &&
-        !this.lastMessageContainsToolUse(currentChunk);
+        !this.closingPartsCall(currentChunk, held, position);
 
       if (shouldClose) closeAt(i);
 

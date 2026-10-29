@@ -300,3 +300,51 @@ export function releaseSharedRawFormsOnMove(
   if (item && pairingsOf(source).some((pairing) => pairing.includes(item))) shared.add(item);
   return shared.size === 0 ? moved : withoutRawForms(moved, shared);
 }
+
+export function releaseRawFormsAcrossParts(
+  before: readonly ContentBlock[],
+  parts: ContentBlock[][],
+): ContentBlock[][] {
+  const partsOf = new Map<ContentBlock, Set<number>>();
+  parts.forEach((part, k) => {
+    for (const block of part) {
+      let of = partsOf.get(block);
+      if (!of) partsOf.set(block, (of = new Set()));
+      of.add(k);
+    }
+  });
+  const released = new Set<string>();
+  const landed = new Map<string, Set<number>>();
+  for (const block of before) {
+    const of = partsOf.get(block);
+    for (const key of rawFormKeys(block)) {
+      if (of === undefined) {
+        released.add(key);
+        continue;
+      }
+      let where = landed.get(key);
+      if (!where) landed.set(key, (where = new Set()));
+      for (const k of of) where.add(k);
+    }
+  }
+  for (const [key, where] of landed) if (where.size > 1) released.add(key);
+  for (const pairing of pairingsOf(before)) {
+    const where = new Set<number>();
+    for (const key of pairing) for (const k of landed.get(key) ?? []) where.add(k);
+    if (where.size > 1) for (const key of pairing) released.add(key);
+  }
+  if (released.size === 0) return parts;
+  releasePairings(before, released);
+  let changed = false;
+  const result = parts.map((part) => {
+    let partChanged = false;
+    const next = part.map((block) => {
+      const out = withoutRawForms(block, released);
+      if (out !== block) partChanged = true;
+      return out;
+    });
+    if (partChanged) changed = true;
+    return partChanged ? next : part;
+  });
+  return changed ? result : parts;
+}

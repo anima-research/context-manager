@@ -169,7 +169,6 @@ describe('a system change, written and priced', () => {
     const cm = await open(new PassthroughStrategy());
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Summarize this and look it up.')]);
-    // Ingress sharding puts a message's non-text blocks on its body's first shard.
     const first = store.append('Claude', [text('part one '), toolUse('t1')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 0, shardCount: 2 });
     store.append('Claude', [text('part two')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${first.id} holds a tool_use \\(t1\\) with no result between it and this change`));
@@ -182,7 +181,6 @@ describe('a system change, written and priced', () => {
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Weather in Oslo and Bergen?')]);
     const call = cm.addMessage('Claude', [toolUse('a'), toolUse('b')]);
-    // Ingress sharding puts a message's results on its first shard, its long text after.
     store.append('User', [toolResult('a')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 0, shardCount: 2 });
     store.append('User', [text('a long note beside the result')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${call} holds a tool_use \\(b\\) with no result between it and this change`));
@@ -621,6 +619,28 @@ describe('the autobiographical strategy and a system change', () => {
     const blocks = compiled.messages.flatMap((m) => m.content as Array<{ type: string; id?: string; toolUseId?: string; content?: unknown }>);
     assert.ok(blocks.some((b) => b.type === 'tool_use' && b.id === 't1'), "the call's tool_use is sent");
     assert.ok(blocks.some((b) => b.type === 'tool_result' && b.toolUseId === 't1' && b.content === 'read it'), 'the result is sent with its content');
+  });
+
+  it('KnowledgeStrategy: a summary ending at an unanswered call doesn\'t part the call from a result after a long text, on a later shard of its message', async () => {
+    const { requests, membrane } = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0, autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0, summaryParticipant: 'Claude', mergeThreshold: 1000, adaptiveResolution: true,
+    });
+    const cm = await open(strategy, membrane);
+    for (let i = 0; i < 9; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
+    const use = cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
+    for (let r = 0, before = -1; r < 200 && requests.length !== before; r++) { before = requests.length; await cm.tick(); await cm.tick(); }
+    const chunks = (): Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> =>
+      (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string; content: ContentBlock[] }>; compressed: boolean }> }).chunks;
+    assert.ok(chunks().some((c) => c.compressed && c.messages.at(-1)!.id === use), 'setup: a summary ends at the call');
+    const before = cm.getAllMessages().length;
+    cm.addMessage('User', [text(`NOTE ${'word '.repeat(400)}`), { type: 'tool_result', toolUseId: 't1', content: 'read it' } as ContentBlock]);
+    const shards = cm.getAllMessages().slice(before);
+    const result = shards.findIndex((m) => m.content.some((b) => b.type === 'tool_result'));
+    assert.ok(shards.length > 2 && result === shards.length - 1, `setup: the result is on the last of the message's shards (${result + 1} of ${shards.length})`);
+    await cm.compile(BIG);
+    assert.ok(chunks().some((c) => c.messages.some((m) => m.id === use) && c.messages.some((m) => m.id === shards[result]!.id)), 'the call and its result share a chunk');
   });
 
   it('KnowledgeStrategy: a summary ending at a call that a plain message follows still closes there', async () => {

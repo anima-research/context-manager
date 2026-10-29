@@ -766,13 +766,23 @@ export interface IngressChunkResult {
   bodyGroupId: string;
   /**
    * The shards in source order. Each becomes a separate StoredMessage.
-   * Concatenating the shards' text content must reproduce the original
-   * message body byte-for-byte.
+   * Joining the shards' content (`joinBodyContent`) must reproduce the
+   * original message's blocks, apart from a text block a seam cut and a raw
+   * replay form no one shard holds whole. A cut block comes back as one
+   * plain text block, without the fields (such as cache_control or a raw
+   * replay form) that were the whole block's, and a raw form whose blocks
+   * don't all sit unchanged on one shard is given up, with its reasoning
+   * pairing, as is a raw form whose reasoning pairing's members land on
+   * different shards (raw-forms.ts). An opaque carrier keeps its raw item,
+   * which is its whole content, and every other block keeps its raw form.
    */
   shards: Array<{
     content: ContentBlock[];
     /** Order within the bodyGroup, starting at 0. */
     shardIndex: number;
+    /** See StoredMessage.continuesBlock: declared on every shard after the
+     *  first by a chunker that keeps each block in place. */
+    continuesBlock?: boolean;
   }>;
 }
 
@@ -1629,9 +1639,11 @@ export interface AutobiographicalConfig {
    * already in quarantine stay there until their records are cleared.
    */
   recoverLiteralThinkingWrappedCompression?: boolean;
-  /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. A value that
-   *  isn't a positive number, such as 0 or NaN, means no limit. */
+  /** Maximum tokens per stored message in compiled output. Messages exceeding
+   *  this limit have their text/tool_result content truncated; each shard of a
+   *  message ingress split is cut on its own, before the shards that render
+   *  together are joined. A value that isn't a positive number, such as 0 or
+   *  NaN, means no limit. */
   maxMessageTokens: number;
 
   /**

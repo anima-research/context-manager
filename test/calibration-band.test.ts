@@ -12,7 +12,7 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
+import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
@@ -820,25 +820,11 @@ describe('estimator calibration band', () => {
     // The picker's over-budget throw is dry-run-guarded (a preview reports
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
-    // signature ("Adaptive picker exhausted ...") is this path. It needs the
-    // picker over and the emitter under, so that the picker's refusal is the
-    // only one the preview can fall back at. The strategy's own prices don't
-    // give that for a body of text, since the middle counts a body's raw
-    // shards as the plan does, so the emitter here counts less by
-    // construction: an estimateTokens that halves its answer, which in this
-    // fixture, with no summaries yet, prices the raw run the middle sends and
-    // nothing the plan counts. A small recent window keeps the sharded body in
-    // the middle, where no summary exists yet to fold it.
-    class HalfCountingEmitter extends AutobiographicalStrategy {
-      protected override estimateTokens(content: ContentBlock[]): number {
-        return Math.ceil(super.estimateTokens(content) / 2);
-      }
-    }
     const BODY = `${'the quick brown fox jumps over the lazy dog and keeps running. '.repeat(45)}` +
       JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ id: i, key: `k_${i}`, value: [i, i * 2, i * 3], flag: i % 2 === 0 })));
     const openSharded = async (name: string, seed: boolean) => {
       const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
-      const strategy = new HalfCountingEmitter({
+      const strategy = new AutobiographicalStrategy({
         targetChunkTokens: 1_000, headWindowTokens: 0, recentWindowTokens: 1_000,
         compressionModel: 'mock', adaptiveResolution: true,
       });
@@ -853,18 +839,14 @@ describe('estimator calibration band', () => {
     const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const reserve = 500;
 
-    // Size the budget from the store: the plan at 1.0 (P) and what the
-    // emitter commits at 1.0 (E). The rejection budget must take P (fits at
-    // 1.0) and 1.45·E (emission under at 1.45) but not 1.45·P (the picker
-    // refuses at 1.45).
     const probe = await openSharded('picker-probe', true);
     assert.ok(probe.cm.getAllMessages().filter((m) => m.bodyGroupId).length >= 3, 'the body is sharded');
     const P = probe.cm.previewContext(BUDGET)!.finalTokens;
     await probe.cm.compile(BUDGET);
     const E = probe.cm.getRenderStats()!.planVsActual!.actual;
     probe.cm.close();
-    assert.ok(P > E * 1.1, `the fixture plans over what it emits: plan ${P}, emitted ${E}`);
-    const rejection = Math.ceil(Math.max(P, 1.45 * E) * 1.02);
+    assert.equal(E, P, `the emission commits what the plan counts: plan ${P}, emitted ${E}`);
+    const rejection = Math.ceil(P * 1.02);
     assert.ok(rejection < 1.45 * P, `the picker refuses at 1.45: budget ${rejection}, plan ${Math.ceil(1.45 * P)}`);
     const tight = { maxTokens: rejection + reserve, reserveForResponse: reserve };
 

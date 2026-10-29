@@ -750,6 +750,26 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
+  it('a thinking-led reply long enough to shard keeps its thinking when the host notes it, its shards holding its blocks in place', async () => {
+    cleanup();
+    const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, targetChunkTokens: 50, autoTickOnNewMessage: false, headWindowTokens: 0 });
+    const manager = await ContextManager.open({ path: STORE, strategy });
+    manager.addMessage('User', [text('U1')]);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const before = manager.getAllMessages().length;
+    const a1 = manager.addMessage('Claude', [thought(1), text('zz-long ' + 'w '.repeat(1_500))]);
+    const stored = manager.getAllMessages().slice(before);
+    assert.ok(stored.length > 1, 'setup: the reply was stored as shards');
+    assert.deepEqual(stored[0]!.content[0], thought(1), 'setup: its thinking leads its first shard');
+    assert.equal(note(manager, [a1], identity()), true, 'setup: the host noted the reply');
+    manager.addMessage('User', [text('U2')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    const reply = next.messages.find((m) => m.participant === 'Claude')!;
+    assert.deepEqual(reply.content.filter(isThinking), [thought(1)], 'the sharded reply keeps its thinking');
+    assert.equal(next.thinkingStrip, undefined);
+    await manager.close();
+  });
+
   it('a shorter or empty record doesn\u2019t make older messages look stored since', async () => {
     cleanup();
     const manager = await open();

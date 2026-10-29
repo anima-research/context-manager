@@ -534,9 +534,7 @@ describe('live image accounting', () => {
     assert.equal(stateOf(entries, 'tail'), 'image');
   });
 
-  it("the strip counts a merged body's images once, at its first shard, where the chunker puts them, as the estimate does", () => {
-    // chunkIngressMessage puts a body's images on its first shard, and
-    // mergeAdjacentBodyGroupRaw keeps them ahead of the merged text.
+  it("the strip counts a merged older body's images once, at its first shard, where they were stored, as the estimate does", () => {
     const messages = [
       { id: 'a', sequence: 0, participant: 'User', content: [{ type: 'text', text: 'a' }, base64Image(), base64Image()] as ContentBlock[] },
       { id: 'b', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'b' }] as ContentBlock[] },
@@ -558,7 +556,7 @@ describe('live image accounting', () => {
     assert.deepEqual(entries[0]!.content.map((b) => b.type), ['image', 'text', 'text']);
   });
 
-  it("the real chunker and merge put a body's images on its first shard, ahead of its text, where the strip and the estimate count them alike", () => {
+  it("the real chunker and merge keep a body's images where they sat, on its last shard, where the strip and the estimate count them alike", () => {
     class Chunking extends FoldedWindow {
       merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
         return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
@@ -566,10 +564,12 @@ describe('live image accounting', () => {
     }
     const strategy = new Chunking({ adaptiveResolution: true, targetChunkTokens: 20, maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
     const decision = strategy.chunkIngressMessage('User', [{ type: 'text', text: 'word '.repeat(200) }, base64Image(), base64Image()]);
-    assert.ok(decision && decision.shards.length > 1, 'the body is sharded');
+    assert.ok(decision && decision.shards.length > 2, 'the body is sharded');
     const shards = decision.shards.map((s, k) => ({
       id: `s${k}`, sequence: k, participant: 'User', content: s.content, bodyGroupId: decision.bodyGroupId, shardIndex: s.shardIndex,
+      ...(s.continuesBlock !== undefined ? { continuesBlock: s.continuesBlock } : {}),
     }));
+    const last = shards.length - 1;
     const tail = { id: 'tail', sequence: shards.length, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] };
     const messages = [...shards, tail];
     const store = viewOf(messages);
@@ -578,36 +578,181 @@ describe('live image accounting', () => {
     const merged = strategy.merge(entries, store, messages);
     const body = merged.find((e) => (e.sourceMessageIds?.length ?? 0) > 1);
     assert.ok(body, 'the shards merge into one entry');
-    assert.deepEqual(body.content.map((b) => b.type).slice(0, 2), ['image', 'image'], "the first shard's images, ahead of the text");
+    assert.deepEqual(body.content.map((b) => b.type), ['text', 'image', 'image'], 'the text, then both images, as given');
     strategy.strip(merged, store);
-    const firstShardText = (shards[0]!.content[0] as { text: string }).text;
-    assert.equal(estimates[0], Math.ceil(firstShardText.length / 4) + 1600 + 14,
-      "two live slots: the estimate prices the tail's image and the body's first live, at the first shard, and its second at the placeholder");
-    assert.deepEqual(body.content.map((b) => b.type).slice(0, 2), ['image', 'text'], 'and the strip keeps the same one');
+    const lastShardText = (shards[last]!.content[0] as { text: string }).text;
+    assert.equal(estimates[0], Math.ceil((shards[0]!.content[0] as { text: string }).text.length / 4), 'the first shard holds text alone');
+    assert.equal(estimates[last], Math.ceil(lastShardText.length / 4) + 1600 + 14,
+      "two live slots: the estimate prices the tail's image and the body's first live, at the last shard, and its second at the placeholder");
+    assert.deepEqual(body.content.map((b) => b.type), ['text', 'image', 'text'], 'and the strip, judging them at that shard, keeps the same one');
     assert.equal(stateOf(merged, 'tail'), 'image');
   });
 
-  it("the strip counts the images on a body's first shard where the middle region's composite sends the body's text only, as the estimate does", () => {
-    const messages = [
-      { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
-      { id: 's0', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'shard zero ' }, base64Image()] as ContentBlock[] },
-      { id: 's1', sequence: 2, participant: 'User', content: [{ type: 'text', text: 'shard one' }] as ContentBlock[] },
-      { id: 'tail', sequence: 3, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] },
+  it("the strip judges a joined body's image at the shard that holds it, though the entry starts at another", () => {
+    class Chunking extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+    }
+    const shards = [
+      { id: 's0', sequence: 0, participant: 'User', content: [{ type: 'text', text: 'x'.repeat(4_000) }] as ContentBlock[], bodyGroupId: 'bg', shardIndex: 0 },
+      { id: 's1', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'y'.repeat(400) }, base64Image()] as ContentBlock[], bodyGroupId: 'bg', shardIndex: 1, continuesBlock: true },
     ];
+    const tail = { id: 'tail', sequence: 2, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [...shards, tail];
     const store = viewOf(messages);
-    const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
-    const estimates = strategy.estimates(store);
-    // The middle region renders a raw run of a body's shards as one entry of
-    // their text (selectAdaptive): it names both shards and sends no image.
-    const entries: ContextEntry[] = [
-      { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
-      { index: 1, sourceMessageIds: ['s0', 's1'], sourceRelation: 'copy', participant: 'User', content: [{ type: 'text', text: 'shard zero shard one' }] },
-      { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[3]!.content },
-    ];
-    strategy.strip(entries, store);
-    assert.equal(estimates[0], 15, "the estimate gives the first shard's image the second live slot and prices the head's at the placeholder");
-    assert.equal(stateOf(entries, 'head'), 'stripped', 'and the strip does the same');
-    assert.equal(stateOf(entries, 'tail'), 'image');
+    for (const asEstimated of [true, false]) {
+      const strategy = new Chunking({ adaptiveResolution: true, imageStripDepthTokens: 2_000 } as never);
+      const estimates = strategy.estimates(store);
+      assert.equal(estimates[1], 100 + 1600, 'premise: the estimate keeps the image, at its own shard');
+      const entries: ContextEntry[] = messages.map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content }));
+      const merged = strategy.merge(entries, store, messages);
+      assert.equal(merged[0]!.sourceMessageId, 's0', 'premise: the joined entry is placed at its first shard');
+      strategy.strip(merged, store, asEstimated);
+      assert.deepEqual(merged[0]!.content.map((b) => b.type), ['text', 'image'], `the strip keeps it too (asEstimated ${asEstimated})`);
+    }
+  });
+
+  it("a joined body's image keeps its shard's home through a second join, though the entry it lands in starts at another", () => {
+    class Chunking extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+    }
+    const g = { bodyGroupId: 'bg2', participant: 'User' };
+    const s0 = { id: 's0', sequence: 0, ...g, shardIndex: 0, content: [{ type: 'text', text: 'x'.repeat(4_000) }] as ContentBlock[] };
+    const s1 = { id: 's1', sequence: 1, ...g, shardIndex: 1, continuesBlock: true, content: [{ type: 'text', text: 'y'.repeat(400) }, base64Image()] as ContentBlock[] };
+    const s2 = { id: 's2', sequence: 2, ...g, shardIndex: 2, continuesBlock: true, content: [{ type: 'text', text: 'z'.repeat(100) }] as ContentBlock[] };
+    const tail = { id: 'tail', sequence: 3, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [s0, s1, s2, tail];
+    const store = viewOf(messages);
+    const entry = (m: (typeof messages)[number], index: number): ContextEntry =>
+      ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content });
+    for (const asEstimated of [true, false]) {
+      const strategy = new Chunking({ adaptiveResolution: true, imageStripDepthTokens: 2_000 } as never);
+      const [run] = strategy.merge([entry(s0, 0), entry(s1, 1)], store, messages);
+      const merged = strategy.merge([{ ...run!, index: 0 }, entry(s2, 1), entry(tail, 2)], store, messages);
+      assert.deepEqual(merged[0]!.sourceMessageIds, ['s0', 's1', 's2'], 'premise: one entry, named by s0');
+      strategy.strip(merged, store, asEstimated);
+      assert.ok(merged[0]!.content.some((b) => b.type === 'image'), `s1's image is judged at s1, within the depth (asEstimated ${asEstimated})`);
+    }
+  });
+
+  it("the counting strip spends a live slot on a joined body's newest shard first, as the estimate does", () => {
+    class Chunking extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+    }
+    const g = { bodyGroupId: 'bg3', participant: 'User' };
+    const older = { type: 'image', source: { type: 'base64', data: 'OLDER', mediaType: 'image/png' }, tokenEstimate: 1600 } as ContentBlock;
+    const newer = { type: 'image', source: { type: 'base64', data: 'NEWER', mediaType: 'image/png' }, tokenEstimate: 1600 } as ContentBlock;
+    const s0 = { id: 's0', sequence: 0, ...g, shardIndex: 0, content: [{ type: 'text', text: 'first part' }, older] as ContentBlock[] };
+    const s1 = { id: 's1', sequence: 1, ...g, shardIndex: 1, continuesBlock: true, content: [{ type: 'text', text: 'second part' }, newer] as ContentBlock[] };
+    const tail = { id: 'tail', sequence: 2, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [s0, s1, tail];
+    const store = viewOf(messages);
+    for (const asEstimated of [true, false]) {
+      const strategy = new Chunking({ adaptiveResolution: true, maxLiveImages: 1, imageStripDepthTokens: 0 } as never);
+      const entries: ContextEntry[] = messages.map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content }));
+      const merged = strategy.merge(entries, store, messages);
+      strategy.strip(merged, store, asEstimated);
+      const sent = merged[0]!.content.filter((b) => b.type === 'image').map((b) => (b as { source: { data: string } }).source.data);
+      assert.deepEqual(sent, ['NEWER'], `the newer shard's image takes the one live slot (asEstimated ${asEstimated})`);
+    }
+  });
+
+  it('the counting strip decides an image object that sits twice at each of its places', () => {
+    const shared = base64Image();
+    const m = { id: 'm', sequence: 0, participant: 'User', content: [shared, { type: 'text', text: 'between' }, shared] as ContentBlock[] };
+    const tail = { id: 'tail', sequence: 1, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [m, tail];
+    const store = viewOf(messages);
+    const strategy = new FoldedWindow({ maxLiveImages: 1, imageStripDepthTokens: 0 } as never);
+    const entries: ContextEntry[] = messages.map((msg, index) => ({ index, sourceMessageId: msg.id, sourceRelation: 'copy', participant: msg.participant, content: msg.content }));
+    strategy.strip(entries, store, false);
+    assert.deepEqual(entries[0]!.content.map((b) => b.type), ['image', 'text', 'text'], 'one live slot: the first place keeps the image, the second gets the placeholder');
+  });
+
+  it("pairing repair's copy of a result keeps the shard it came from, for the strip", () => {
+    class Repairing extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+      repair(entries: ContextEntry[]): void {
+        (this as unknown as { postProcessToolEntries(e: ContextEntry[]): void }).postProcessToolEntries(entries);
+      }
+    }
+    const raw = '<function_results>both</function_results>';
+    const orphan = { type: 'tool_result', toolUseId: 'gone', content: 'orphan', rawXml: raw } as unknown as ContentBlock;
+    const kept = { type: 'tool_result', toolUseId: 'call', content: [base64Image(), { type: 'text', text: 'seen' }], rawXml: raw } as unknown as ContentBlock;
+    const callMsg = { id: 'c', sequence: 0, participant: 'Claude', content: [{ type: 'tool_use', id: 'call', name: 'look', input: {} }] as ContentBlock[] };
+    const g = { bodyGroupId: 'bg4', participant: 'User' };
+    const s0 = { id: 's0', sequence: 1, ...g, shardIndex: 0, content: [{ type: 'text', text: 'x'.repeat(4_000) }] as ContentBlock[] };
+    const s1 = { id: 's1', sequence: 2, ...g, shardIndex: 1, continuesBlock: false, content: [orphan, kept] as ContentBlock[] };
+    const tail = { id: 'tail', sequence: 3, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [callMsg, s0, s1, tail];
+    const store = viewOf(messages);
+    const strategy = new Repairing({ adaptiveResolution: true, imageStripDepthTokens: 2_000 } as never);
+    const entries: ContextEntry[] = messages.map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content }));
+    const merged = strategy.merge(entries, store, messages);
+    strategy.repair(merged);
+    const body = merged.find((e) => e.sourceMessageId === 's0')!;
+    const result = body.content.find((b) => b.type === 'tool_result') as { toolUseId: string; rawXml?: string };
+    assert.equal(result.toolUseId, 'call', 'premise: the orphan is dropped');
+    assert.equal(result.rawXml, undefined, 'premise: the kept result is a copy that gave the shared form up');
+    strategy.strip(merged, store);
+    assert.ok(JSON.stringify(body.content).includes('"type":"image"'), "the copy's image is judged at s1, within the depth");
+  });
+
+  it("a result left behind when pairing repair moves its neighbour keeps the shard it came from, for the strip", () => {
+    class Repairing extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+      repair(entries: ContextEntry[]): void {
+        (this as unknown as { postProcessToolEntries(e: ContextEntry[]): void }).postProcessToolEntries(entries);
+      }
+    }
+    const raw = '<function_results>both</function_results>';
+    const far = { type: 'tool_result', toolUseId: 'far', content: 'moved', rawXml: raw } as unknown as ContentBlock;
+    const near = { type: 'tool_result', toolUseId: 'near', content: [base64Image(), { type: 'text', text: 'seen' }], rawXml: raw } as unknown as ContentBlock;
+    const farCall = { id: 'c1', sequence: 0, participant: 'Claude', content: [{ type: 'tool_use', id: 'far', name: 'look', input: {} }] as ContentBlock[] };
+    const between = { id: 'u', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'meanwhile' }] as ContentBlock[] };
+    const nearCall = { id: 'c2', sequence: 2, participant: 'Claude', content: [{ type: 'tool_use', id: 'near', name: 'look', input: {} }] as ContentBlock[] };
+    const g = { bodyGroupId: 'bg5', participant: 'User' };
+    const s0 = { id: 's0', sequence: 3, ...g, shardIndex: 0, content: [{ type: 'text', text: 'x'.repeat(4_000) }] as ContentBlock[] };
+    const s1 = { id: 's1', sequence: 4, ...g, shardIndex: 1, continuesBlock: false, content: [far, near] as ContentBlock[] };
+    const tail = { id: 'tail', sequence: 5, participant: 'Claude', content: [{ type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [farCall, between, nearCall, s0, s1, tail];
+    const store = viewOf(messages);
+    const strategy = new Repairing({ adaptiveResolution: true, imageStripDepthTokens: 2_000 } as never);
+    const entries: ContextEntry[] = messages.map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content }));
+    const merged = strategy.merge(entries, store, messages);
+    strategy.repair(merged);
+    const body = merged.find((e) => e.sourceMessageId === 's0')!;
+    const left = body.content.filter((b) => b.type === 'tool_result') as Array<{ toolUseId: string; rawXml?: string }>;
+    assert.deepEqual(left.map((b) => b.toolUseId), ['near'], 'premise: the far result was moved out of the body');
+    assert.equal(left[0]!.rawXml, undefined, 'premise: the result left behind is a copy that gave the shared form up');
+    strategy.strip(merged, store);
+    assert.ok(JSON.stringify(body.content).includes('"type":"image"'), "the copy's image is judged at s1, within the depth");
+  });
+
+  it('the merge reads continuity from an entry\'s last shard: another copy of the body after a run is kept apart', () => {
+    class Chunking extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+    }
+    const shard = (id: string, sequence: number, shardIndex: number) =>
+      ({ id, sequence, participant: 'User', bodyGroupId: 'same', shardIndex, ...(shardIndex > 0 ? { continuesBlock: true } : {}), content: [{ type: 'text', text: id }] as ContentBlock[] });
+    const messages = [shard('a0', 0, 0), shard('a1', 1, 1), shard('a2', 2, 2), shard('a3', 3, 3), shard('b0', 4, 0), shard('b1', 5, 1), shard('b2', 6, 2)];
+    const store = viewOf(messages);
+    const strategy = new Chunking({ adaptiveResolution: true } as never);
+    const run: ContextEntry = { index: 0, sourceMessageId: 'a0', sourceMessageIds: ['a0', 'a1', 'a2', 'a3'], sourceRelation: 'copy', participant: 'User', content: [{ type: 'text', text: 'a0a1a2a3' }] };
+    const next: ContextEntry = { index: 1, sourceMessageId: 'b2', sourceRelation: 'copy', participant: 'User', content: messages[6]!.content };
+    const merged = strategy.merge([run, next], store, messages);
+    assert.equal(merged.length, 2, 'the second copy\'s shard is not joined to the first copy\'s run');
   });
 
   it("the strip counts only the images it sends where its caller prices them at full, as the hierarchical selection does", () => {

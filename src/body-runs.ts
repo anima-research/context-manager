@@ -17,6 +17,8 @@
  * it here, rather than matching the group id.
  */
 
+import type { ContentBlock } from '@animalabs/membrane';
+
 /** The fields that place a stored message in a body. */
 export interface BodyShard {
   bodyGroupId?: string | undefined;
@@ -67,4 +69,60 @@ export function bodyBounds(length: number, at: At, index: number): { from: numbe
 /** The body holding `messages[index]`, as positions in `messages`. */
 export function bodyBoundsIn(messages: readonly (BodyShard | null | undefined)[], index: number): { from: number; to: number } {
   return bodyBounds(messages.length, (i) => messages[i], index);
+}
+
+/** One part of a body to join: a shard, or a render that already joins a run
+ *  of its shards, with the first shard's `continuesBlock`. */
+export interface BodyPart<Block extends { type: string } = ContentBlock> {
+  content: readonly Block[];
+  continuesBlock?: boolean | undefined;
+}
+
+/**
+ * A body's blocks, from consecutive parts of it in store order: its shards,
+ * or renders that each join a run of them. This is how every raw render of a
+ * body joins it, so a body reads the same wherever its shards render.
+ *
+ * A body written with each block in place declares `continuesBlock` on every
+ * shard after the first, and comes back as given: the parts' blocks in order,
+ * with a part's first text block joined to the previous part's last where the
+ * seam between them split that block, so the text blocks keep the boundaries
+ * they were given with too. A block a seam cut comes back as plain text, as
+ * ingress stored its pieces.
+ *
+ * A body written before then holds its text joined into one block, cut
+ * across its shards, and its other blocks on its first shard after that
+ * shard's text. Joined as stored, its thinking and its calls would come
+ * after its first slice of text, and where those blocks sat wasn't kept, so
+ * it is joined as it always was: every other block first, then the text as
+ * one block. A single part is its own content, as before.
+ */
+export function joinBodyContent<Block extends { type: string }>(parts: readonly BodyPart<Block>[]): Block[] {
+  if (parts.length === 1) return [...parts[0]!.content];
+  if (parts.slice(1).some((part) => part.continuesBlock === undefined)) {
+    const others: Block[] = [];
+    const text: string[] = [];
+    for (const part of parts) {
+      for (const block of part.content) {
+        if (block.type === 'text') text.push((block as unknown as { text: string }).text);
+        else others.push(block);
+      }
+    }
+    return [...others, { type: 'text', text: text.join('') } as unknown as Block];
+  }
+  const out: Block[] = [];
+  for (const [k, part] of parts.entries()) {
+    const first = part.content[0];
+    const last = out.at(-1);
+    if (k > 0 && part.continuesBlock && first?.type === 'text' && last?.type === 'text') {
+      out[out.length - 1] = {
+        ...last,
+        text: (last as unknown as { text: string }).text + (first as unknown as { text: string }).text,
+      } as Block;
+      out.push(...part.content.slice(1));
+    } else {
+      out.push(...part.content);
+    }
+  }
+  return out;
 }
