@@ -35,7 +35,7 @@
  */
 
 import { isDeepStrictEqual } from 'node:util';
-import { mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn, type LevelRuns, type Placed } from '../strategies/merge-runs.js';
+import { mergeRecordHoldsIn, mergeRunsByLevel, placeOf, placeRangeEnds, queuedMergeRuns, runGroups, strandedIn, type LevelRuns, type Placed } from '../strategies/merge-runs.js';
 import {
   loadedChunkRecords, releaseUnsummarizedRecords, settleRepairLine, settleStoredSummaries, settlingRepaired,
 } from '../strategies/settle-summaries.js';
@@ -257,6 +257,21 @@ export function listedPositions(inputs: Pick<RepairInputs, 'messages'>): Map<str
   return new Map(inputs.messages.map((m, i) => [String(m.id), i] as const));
 }
 
+export function summaryPositions(
+  inputs: Pick<RepairInputs, 'messages'>,
+  summaries: readonly RepairSummary[],
+  records: readonly RepairRecord[],
+): Map<string, number> {
+  const listed = listedPositions(inputs);
+  const position = new Map(listed);
+  const byId = new Map(summaries.map((s) => [s.id, s] as const));
+  const live = new Set<string>();
+  for (const r of records) if (r.summaryId && byId.has(r.summaryId)) live.add(r.summaryId);
+  const l1s = summaries.filter((s) => s.level === 1 && (live.size === 0 || live.has(s.id)));
+  placeRangeEnds(position, listed, l1s, byId, parentOf, (s) => leafIds(byId, s));
+  return position;
+}
+
 type Projected = RepairSummary & { projected?: true };
 
 const isIdList = (ids: unknown): ids is string[] => Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id.length > 0);
@@ -330,8 +345,9 @@ function heldIn<S extends RepairSummary>(
 }
 
 export function strandedInStore(inputs: RepairInputs, runs: Partial<RepairRunsConfig> = {}): Array<{ id: string; level: number }> {
-  const summaries = settleStoredSummaries<RepairSummary>(inputs.summaries, loadedChunkRecords<RepairRecord>(inputs.records)).summaries;
-  return strandedInSummaries(summaries, inputs, listedPositions(inputs), runsConfigOf(runs))
+  const records = loadedChunkRecords<RepairRecord>(inputs.records);
+  const summaries = settleStoredSummaries<RepairSummary>(inputs.summaries, records).summaries;
+  return strandedInSummaries(summaries, inputs, summaryPositions(inputs, summaries, records), runsConfigOf(runs))
     .map(({ s }) => ({ id: s.id, level: s.level ?? 1 }));
 }
 
@@ -558,13 +574,15 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     };
     const runsConfig = runsConfigOf(options.runs);
     const position = listedPositions(inputs);
+    const placedIn = (state: readonly RepairSummary[]): Map<string, number> => summaryPositions(inputs, state, records);
     const messageAt = (at: number): string => String(inputs.messages[at]?.id);
     const refolded = (state: RepairSummary[]): Projected[] => {
+      const placed = placedIn(state);
       const out: Projected[] = state.map((s) => ({ ...s }));
       const byId = new Map(out.map((s) => [s.id, s] as const));
       let made = 0;
       const land = (level: number, group: readonly Projected[]): void => {
-        const spans = group.map((s) => placeOf(s, position)!);
+        const spans = group.map((s) => placeOf(s, placed)!);
         const parent: Projected = {
           id: `#refold-${made++}`, level, sourceIds: group.map((s) => s.id), projected: true,
           sourceRange: { first: messageAt(Math.min(...spans.map((x) => x[0]))), last: messageAt(Math.max(...spans.map((x) => x[1]))) },
@@ -573,16 +591,16 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
         byId.set(parent.id, parent);
         for (const s of group) byId.get(s.id)!.mergedInto = parent.id;
       };
-      const held = heldIn(byId, inputs, position, runsConfig);
+      const held = heldIn(byId, inputs, placed, runsConfig);
       for (const m of inputs.mergeQueue ?? []) {
-        if (m != null && isIdList(m.sourceIds) && queuedMergeRuns(m, byId, parentOf, position, held)) {
+        if (m != null && isIdList(m.sourceIds) && queuedMergeRuns(m, byId, parentOf, placed, held)) {
           land(m.level, m.sourceIds.map((id) => byId.get(id)!));
         }
       }
       if (!(runsConfig.mergeThreshold >= 2)) return out;
       for (let grew = true; grew;) {
         grew = false;
-        for (const [level, { runs }] of runsInSummaries(out, inputs, position, runsConfig, 'drained', true)) {
+        for (const [level, { runs }] of runsInSummaries(out, inputs, placed, runsConfig, 'drained', true)) {
           for (const run of runs) {
             for (const group of runGroups(run, runsConfig.mergeThreshold)) {
               land(level + 1, group);
@@ -610,7 +628,7 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       return cur && (cur.level ?? 1) === level ? cur : undefined;
     };
     const strayKey = (x: Placed<Projected>): string => `${x.s.level ?? 1}:${x.first}:${x.last}`;
-    const straysOf = (state: Projected[]): Placed<Projected>[] => strandedInSummaries(state, inputs, position, runsConfig, 'drained', true);
+    const straysOf = (state: Projected[]): Placed<Projected>[] => strandedInSummaries(state, inputs, placedIn(state), runsConfig, 'drained', true);
     const staleL1 = new Set<string>();
     {
       const named = new Set<string>();
@@ -658,11 +676,12 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
         const added = chain.filter((id) => !dissolve.has(id));
         for (const id of added) dissolve.add(id);
         const state = refolded(planned());
+        const placed = placedIn(state);
         const byId = new Map(state.map((s) => [s.id, s] as const));
         const covered = new Set<number>();
         for (const s of state) {
           if ((s.level ?? 1) <= level) continue;
-          const at = placeOf(s, position);
+          const at = placeOf(s, placed);
           if (at && (at[1] < ownLo || at[0] > ownHi)) continue;
           for (const leaf of leafIds(byId, s)) {
             const p = position.get(leaf);
@@ -671,7 +690,7 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
         }
         let ok = own.length > 0 && own.every((p) => covered.has(p));
         if (!ok) {
-          const runs = runsInSummaries(state, inputs, position, runsConfig, 'drained', true).get(level)?.runs ?? [];
+          const runs = runsInSummaries(state, inputs, placed, runsConfig, 'drained', true).get(level)?.runs ?? [];
           const run = runs.find((r) => r.members.some((m) => m.first === stray.first && m.last === stray.last));
           ok = run !== undefined && run.members.length >= 2;
         }

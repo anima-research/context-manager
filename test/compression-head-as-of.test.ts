@@ -284,36 +284,20 @@ describe('the head a compression or merge request gives is the head as of the hi
     await manager.close();
   });
 
-  it("a chunk whose first message has left the store starts at its first message still there, and gets that message's head", async () => {
-    const { manager, strategy, ctx, captured, at } = await build(2);
-    const kept = ctx.messageStore.getAll()[at.OPEN7!]!;
-    const gone = { ...kept, id: 'not-in-the-store', content: text(body('GONE')) };
-    await strategy.runCompress({ index: 950, startIndex: at.OPEN6!, endIndex: at.OPEN8!, messages: [gone, kept], tokens: 100, compressed: false }, ctx);
-    const req = captured[0]!;
-    for (const m of ['OPEN0', 'OPEN1', 'OPEN2']) assert.equal(countIn(req, `${m} `), 1, `${m}: the opening is the head as of OPEN7`);
-    assert.equal(countIn(req, 'TOPIC_TWO'), 0, "the live head isn't sent");
-    assert.equal(countIn(req, 'TWO0'), 0);
-    await manager.close();
-  });
-
-  it('a chunk with no message left in the store gets no head and recalls nothing: nothing in the store says when its history happened', async () => {
+  it('a chunk holding a message that has left the store sends nothing (#321), whether or not it has a message left; history with none left gets no head', async () => {
     const { manager, strategy, ctx, captured, at } = await build(2);
     assert.deepEqual(strategy.asOf(ctx, -1), { start: at.T2!, end: at.T2! });
     const kept = ctx.messageStore.getAll()[at.OPEN7!]!;
     const gone = { ...kept, id: 'not-in-the-store', content: text(body('GONE')) };
-    const ids = ctx.messageStore.getAll().map((m) => m.id);
-    const earlier = summary('L1-841', [ids[at.OPEN3!]!, ids[at.OPEN4!]!]);
-    strategy.seed(earlier);
-    await strategy.runCompress({ index: 950, startIndex: at.OPEN6!, endIndex: at.OPEN7!, messages: [gone], tokens: 100, compressed: false }, ctx);
-    const req = captured[0]!;
-    assert.equal(countIn(req, 'TOPIC_TWO'), 0, "the live head isn't sent");
-    assert.equal(countIn(req, 'TWO0'), 0);
-    assert.equal(countIn(req, 'OPEN0 '), 0, 'nor any other head');
-    assert.equal(countIn(req, `authored ${earlier.id}`), 0, 'and nothing is recalled: its place is unknown');
+    await strategy.runCompress({ index: 950, startIndex: at.OPEN6!, endIndex: at.OPEN8!, messages: [gone, kept], tokens: 100, compressed: false }, ctx);
+    await strategy.runCompress({ index: 951, startIndex: at.OPEN6!, endIndex: at.OPEN7!, messages: [gone], tokens: 100, compressed: false }, ctx);
+    assert.equal(captured.length, 0);
+    await strategy.runCompress({ index: 952, startIndex: at.OPEN7!, endIndex: at.OPEN8!, messages: [kept], tokens: 100, compressed: false }, ctx);
+    assert.equal(captured.length, 1, 'premise: the same chunk without the gone message is sent');
     await manager.close();
   });
 
-  it('a chunk whose first message a host removes while it waits in the queue still recalls the summaries before it', async () => {
+  it('a chunk whose first message a host removes while it waits in the queue is rebuilt without it, and still recalls the summaries before it', async () => {
     // Twelve equal messages in chunks of four; the first message of the second chunk is removed during the first
     // chunk's compression, as a delete arriving then would (agent-framework's Discord module removes stored rows).
     let manager!: ContextManager;
@@ -335,7 +319,8 @@ describe('the head a compression or merge request gives is the head as of the hi
     for (let i = 0; i < 20 && captured.length < 2; i++) await manager.tick();
     assert.ok(captured.length >= 2, 'premise: the second chunk was compressed');
     const req = captured[1]!;
-    assert.equal(countIn(req, 'M4 '), 1, 'premise: the queued chunk still holds the removed message');
+    assert.equal(countIn(req, 'M4 '), 0, 'the removed message is not sent');
+    assert.equal(countIn(req, 'M5 '), 1, 'premise: what remains of the second chunk is');
     assert.equal(countIn(req, 'MEMORY_1'), 1, "the first chunk's summary, before it, is recalled");
     await manager.close();
   });

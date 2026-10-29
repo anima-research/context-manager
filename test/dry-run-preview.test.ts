@@ -493,7 +493,7 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           self._storeView = {};
           self._storeOrder = new Map();
           self._storeOrderSource = [];
-          self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
+          self._cachedHeadStartIndex = { id: 'zz', listing: [], result: 0 };
           self._ownedIdsCache = { key: 'zz', ids: new Set() };
           if (this.throwAfter) throw new Error('zz-after-writing');
         }
