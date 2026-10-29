@@ -956,6 +956,43 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     }
   });
 
+  // House review of #350, code finding 7: a record that keeps a row that
+  // came back holds its rows in window order, as windowRuns reads them, not
+  // in the order the record held them before.
+  it('a record that keeps a row presented again after a later row of its own holds its rows in window order', async () => {
+    const { cm, strategy, ids } = await folding();
+    await drain(cm);
+    const record = internals(strategy).chunkRecords.find((r) => r.compressed && r.sourceIds.length >= 3);
+    assert.ok(record, 'premise: a compressed record over three rows or more');
+    const rows = [...record.sourceIds];
+    const back = rows[1]!;
+    // The record's rows end the window; the folding strategy hears the rest go.
+    const after = ids.slice(ids.indexOf(rows[rows.length - 1]!) + 1);
+    await linesDuring(async () => cm.retractRows(after, { undone: true }));
+    assert.deepEqual(cm.getPresentedMessages().slice(-rows.length).map((m) => m.id), rows, 'premise: the record\'s rows end the window');
+    const next = autobiographical();
+    await linesDuring(async () => {
+      const initialized = cm.setStrategy(next);
+      cm.retractRows([back], { undone: true });
+      cm.presentRows([back]);
+      await initialized;
+    });
+    const windowOrder = [...rows.filter((id) => id !== back), back];
+    assert.deepEqual(cm.getPresentedMessages().slice(-rows.length).map((m) => m.id), windowOrder, 'setup: the row came back after the record\'s last row');
+    const kept = internals(next).chunkRecords.find((r) => r.id === record.id);
+    assert.ok(kept, 'the record keeps the row, in one run of the window with rows of its own');
+    assert.deepEqual(kept.sourceIds, windowOrder, 'the record holds its rows in window order');
+    // Rows after it, so the recent window no longer holds it back from folding.
+    for (let i = TAGS; i < TAGS + 8; i++) cm.presentRows([cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))])]);
+    await linesDuring(async () => drain(cm));
+    const l1 = internals(next).summaries.find((s) => s.level === 1 && s.sourceIds.includes(back));
+    assert.ok(l1, 'the record was folded again');
+    assert.deepEqual(l1.sourceIds, windowOrder, 'the L1 folded again over them lists them in window order');
+    rendersWindowOnce(cm, await cm.compile(BIG), 'drained');
+    assert.deepEqual(next.getTopologyViolations(), []);
+    cm.close();
+  });
+
   it('a row presented again that the open chunked at its new place keeps that place when its retraction is heard', async () => {
     const { cm, strategy, ids } = await folding();
     await drain(cm);

@@ -7611,6 +7611,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // own that didn't leave: that record was made over it where it stands.
     const back = [...leaving].filter((id) => view.get(id) !== null);
     let staying: (record: ChunkRecord) => ReadonlySet<MessageId> = () => new Set();
+    let inWindowOrder = (ids: MessageId[]): MessageId[] => ids;
     if (back.length > 0) {
       const position = this.positionIndex(view.getAll());
       const returned = new Set(back);
@@ -7622,6 +7623,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         return kept;
       };
+      // A record that keeps a row that came back holds its rows as the
+      // window does, as windowRuns took them: the row stands after the rows
+      // of its run that it followed in the window, wherever the record held
+      // it before. A record with a row the view doesn't list (hidden by the
+      // view filter) keeps its own order.
+      inWindowOrder = (ids) =>
+        ids.some((id) => returned.has(id)) && ids.every((id) => position.has(id))
+          ? [...ids].sort((a, b) => position.get(a)! - position.get(b)!)
+          : ids;
     }
 
     // Each record holding a row that left, or naming a dropped L1, is
@@ -7629,7 +7639,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return this.unfold(seeds, (record) => {
       if (!record.sourceIds.some((id) => leaving.has(id))) return undefined;
       const kept = staying(record);
-      return record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id));
+      return inWindowOrder(record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id)));
     });
   }
 
