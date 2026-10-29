@@ -63,8 +63,9 @@
  * the rows one presentRows call presents, and the tombstones of one call,
  * appended in one by chronicle's appendManyToStateJsonWithIdentity (the
  * identity-stamped batched append, chronicle 0.6.0 on, which this package's
- * range requires: on a store handle without it, a write of several items
- * throws, writing nothing). The store keeps or loses such a record whole:
+ * range requires: a store handle without it is refused when the index is
+ * made, at the manager's open, derive or reopenDerived, before any record
+ * changes, in either mode). The store keeps or loses such a record whole:
  * a write the store refuses writes nothing, and after any throw the index
  * is read again from the store, so its reading is what the store holds,
  * whatever the failure left.
@@ -931,9 +932,10 @@ export class WindowIndex {
    * are single keeps its MANIFEST at version 1, as one presenting a row at a
    * time to an empty record does.
    *
-   * A write of several items on a store handle without the batched append
-   * (a chronicle before 0.6.0, which this package's range doesn't admit)
-   * throws before it writes anything, the state's registration included
+   * A store handle without the batched append (a chronicle before 0.6.0,
+   * which this package's range doesn't admit) is refused when the index is
+   * made (the constructor); a write of several items asks again, and would
+   * throw before it writes anything, the state's registration included
    * (requireBatchedIdentityAppend). After any throw from the store, the
    * index is read again from it, which says what was written.
    */

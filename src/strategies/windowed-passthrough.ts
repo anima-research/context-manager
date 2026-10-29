@@ -136,8 +136,9 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * outward only explicitly ({@link setAnchor}, e.g. to the start of the
  * oldest active tune-out).
  *
- * **Sequence or ordinal.** In legacy mode, until a host presents a row on
- * the branch, the window is the record, in record order, and the anchor is
+ * **Sequence or ordinal.** In legacy mode, until the window is written down
+ * on the branch (a host's first presentRows, or a retractRows that names a
+ * row), the window is the record, in record order, and the anchor is
  * a sequence: the window is every row stored at it or after. Once rows are
  * presented, the window is the agent's window index, in the order rows
  * were presented, and the anchor is an index ordinal (agent-framework

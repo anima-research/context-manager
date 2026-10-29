@@ -167,8 +167,11 @@ interface ContextManagerBaseConfig {
    * earlier — autobiographical summaries written while a message was still
    * visible — is neither invalidated nor re-filtered when a predicate is
    * introduced on an existing store or tightened later; a summary whose
-   * sources are now hidden stays loadable and selectable. `removeMessage`
-   * has the same property. To excise content that may already have been
+   * sources are now hidden stays loadable and selectable. In legacy mode
+   * `removeMessage` has the same property. Once a host presents rows, a
+   * removal takes the row out of the window too, and the strategy is told
+   * (ContextStrategy.onRetracted): a strategy that folds rows, such as the
+   * autobiographical one, lets go of what covers it. To excise content that may already have been
    * folded into memory, branch the chronicle before it entered (strategy
    * state follows the branch); do not reach for a filter. Predicates keyed
    * on ingestion-time stamps that never change (tune-out's
@@ -256,11 +259,15 @@ export interface DeriveContextOptions {
    *
    * Once the parent's host presents rows (see presentRows), give a
    * presentation boundary here, such as `currentSequence()` read after a
-   * presentRows, not a row's own sequence: a row enters the window at a
-   * write after its own, so a cut at a presented row's own sequence holds
-   * the row in the child's record but not in its window, and the child
-   * lists it among its arrived rows (getUnpresentedMessages). branchAt,
-   * which takes a row's id, finds that boundary itself.
+   * presentRows, not a row's own sequence: a row stored after the window
+   * was written down enters it at a write after its own, so a cut at its
+   * own sequence holds the row in the child's record but not in its
+   * window, and the child lists it among its arrived rows
+   * (getUnpresentedMessages). A row stored before the write-down was in the
+   * window from its own write: a cut at its sequence, before the
+   * write-down, leaves the child in legacy mode, its window the record,
+   * which holds the row. branchAt, which takes a row's id, finds the
+   * boundary itself.
    */
   atSequence?: number;
   /**
@@ -391,7 +398,11 @@ export class InitializationSupersededError extends Error {
  * setStrategy(). So do compression holds (holdCompression,
  * releaseCompression) and request settings (setToolDefinitions,
  * setSystemPrompt): they live in memory, and the strategy hears of a released
- * hold only once an attempt succeeds.
+ * hold only once an attempt succeeds. So do the window's writes (presentRows,
+ * retractRows, retractRemoved, retractAbsentRows), which require only an open
+ * manager: they change the window the strategy reads, and the strategy
+ * hears of the rows they move once an attempt succeeds
+ * (ContextStrategy.onPresented, onRetracted).
  *
  * The fence governs operations that start while an attempt is pending or
  * failed. Work already in flight when a transition begins, and a superseded
@@ -1340,9 +1351,10 @@ export class ContextManager {
    * appendManyToStateJsonWithIdentity, the identity-stamped batched append
    * of chronicle 0.6.0, which this package requires): the store keeps or
    * loses the call whole, and a call the store refuses has presented
-   * nothing (after any throw the window is read again from the store). On
-   * a store handle without the batched append, a call that writes several
-   * rows throws, presenting nothing. The call is then
+   * nothing (after any throw the window is read again from the store). A
+   * store handle without the batched append is refused when the manager is
+   * made over it (open, derive, reopenDerived), before any record changes,
+   * so no call meets one. The call is then
    * one presentation point: branchAt of any row it presented cuts after all
    * of them (see branchAt), so a host that wants a cut at one row, such as
    * an agent's own row, presents it in a call of its own, which is one
@@ -1473,9 +1485,8 @@ export class ContextManager {
    * strategy lets go of what it folded of it too. A call's tombstones are
    * one record, as presentRows's rows are, so a call the store refuses has
    * taken nothing out and told nothing (in legacy mode the write-down is a
-   * record of its own, before them). On a store handle without the batched
-   * append (see presentRows), a call that writes several items throws,
-   * taking nothing out.
+   * record of its own, before them). A store handle without the batched
+   * append is refused at open (see presentRows).
    */
   retractRows(ids: readonly MessageId[], options?: { undone?: boolean }): void {
     this.requireOpen('retractRows');
@@ -1670,7 +1681,8 @@ export class ContextManager {
    *
    * It looks the row up by its sequence (MessageStoreView.sequenceOf), as
    * the window's other reads do, rather than reading it whole, and writes
-   * nothing.
+   * nothing. Only for an undone turn's row does it read the merged record's
+   * listing, to find the shards of the row's body before it.
    */
   windowStatusOf(id: MessageId): WindowStatus {
     const merged = this.mergedMessageView();
@@ -1738,11 +1750,13 @@ export class ContextManager {
    * The newest store sequence among the rows in the window, before the view
    * filter, the record's newest row's in legacy mode; undefined when the
    * window holds none. It is the sequence a row was stored at, not where
-   * the window reached: a row is presented by a later write than its own,
-   * and the window can hold an older row presented after a newer one. The
-   * write that presented a row is where branchAt cuts for it; for a place
-   * in the record that follows a presentation, as derive's `atSequence`
-   * needs, read currentSequence() after the presentRows. For where the
+   * the window reached: a row stored after the window was written down is
+   * presented by a later write than its own, and the window can hold an
+   * older row presented after a newer one. The write that presented such a
+   * row is where branchAt cuts for it (a row the write-down entered it cuts
+   * at its own sequence); for a place in the record that follows a
+   * presentation, as derive's `atSequence` needs, read currentSequence()
+   * after the presentRows. For where the
    * window reached, compare ordinals (indexLength, ordinalOf).
    */
   newestWindowSequence(): number | undefined {
@@ -1963,17 +1977,22 @@ export class ContextManager {
    * (getUnpresentedMessages), and from `atSequence` it starts with the
    * window as it stood then, which names only rows stored by then. The cut
    * is taken as given: a row stored by then and presented after it is in
-   * the child's record and not in its window. A row is presented at a
-   * write after its own, so a cut at a presented row's own sequence leaves
-   * that row out of the child's window too: give a presentation boundary
-   * (`currentSequence()` read after a presentRows) instead. A presentRows
+   * the child's record and not in its window. A row stored after the
+   * parent's window was written down is presented at a write after its
+   * own, so a cut at its own sequence leaves it out of the child's window
+   * too: give a presentation boundary (`currentSequence()` read after a
+   * presentRows) instead. A row stored before the write-down was in the
+   * window from its own write, as every row is in legacy mode: a cut at its
+   * sequence comes before the write-down, so the child is in legacy mode,
+   * and its window, the record up to the cut, holds the row. A presentRows
    * call that the store wrote as one record (see presentRows) is in the
    * child's window whole or not at all. A cut between a sharded body's
    * presentations, in an index a pre-release build wrote one record per
    * shard (see presentRows), leaves the body partly in the child's window,
-   * and the child's presentRows of the body completes it. A parent that hadn't presented a
-   * row by the checkpoint has no window written, and the child is in
-   * legacy mode.
+   * and the child's presentRows of the body completes it. A parent that hadn't written
+   * its window down by the checkpoint (its first presentRows, presentRows([])
+   * among them, or a retractRows that names a row) has no window written,
+   * and the child is in legacy mode.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
    * persisted, as after a restart.
@@ -2623,8 +2642,12 @@ export class ContextManager {
    * A layout counts its members by store sequence while the window is the
    * record, and by window-index ordinal once rows are presented on its
    * branch (RenderedLayout.keyedBy). The journal never compares one with the
-   * other, so the first compile accepted after the first presentRows on a
-   * branch writes a baseline there, and the receipts before it stay listed.
+   * other: an acceptance whose layout counts something other than what the
+   * branch's newest record counts writes a baseline there, and the receipts
+   * before it stay listed. That is the first acceptance on a branch of a
+   * compile made after its first presentRows, and again any acceptance
+   * that switches back, such as one of a compile made before the first
+   * presentRows and accepted after a compile made after it.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,

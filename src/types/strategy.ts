@@ -91,12 +91,13 @@ export interface ContextLogView {
  * or a retracted row doesn't shift. Every read asks the index on the branch
  * the store is on, so a view held across a branch switch follows it.
  *
- * In legacy mode, until a host presents a row on the branch, the window is
- * the record and there are no ordinals: a strategy keeps its places by
- * sequence there, as it always has.
+ * In legacy mode, until the window is written down on the branch (a host's
+ * first presentRows, presentRows([]) among them, or a retractRows that
+ * names a row), the window is the record and there are no ordinals: a
+ * strategy keeps its places by sequence there, as it always has.
  */
 export interface WindowIndexView {
-  /** `'legacy'` while the window is the record, `'presented'` once a host has presented rows on the branch. */
+  /** `'legacy'` while the window is the record, `'presented'` once it is written down on the branch (the first presentRows, or a retractRows that names a row), even while it holds no row. */
   mode(): WindowMode;
   /**
    * The ordinal of every row in the window, from one reading of the index;
@@ -137,7 +138,13 @@ export interface WindowIndexView {
  * Context provided to strategy methods.
  */
 export interface StrategyContext {
-  /** Read-only view of message store */
+  /**
+   * Read-only view of the rows the strategy reads: the agent's window over
+   * the merged record (the manager's slot and its auxiliary slots), with
+   * the view filter applied. In legacy mode the window is the merged record
+   * itself; once a host presents rows, it is the rows presented, in the
+   * order they were presented (ContextManager.presentRows).
+   */
   messageStore: MessageStoreView;
   /**
    * The agent's window index (optional: a context a caller builds by hand

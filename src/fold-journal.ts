@@ -1223,8 +1223,10 @@ export class FoldJournal {
     const key = branchKey(branch.ref);
     const id = branch.newest.id;
     if (branch.newest.format !== null && branch.newest.format !== format) {
-      // Expected once per branch, at the first acceptance after a host
-      // presents rows there: a warning, not an unreadable record.
+      // Expected at the first acceptance after a host presents rows on the
+      // branch, and at any later one that switches back (a compile made
+      // before the first presentation, accepted after one made after it):
+      // a warning, not an unreadable record.
       const said = `switch ${id} ${format}`;
       if (!index.warned.has(said)) {
         index.warned.add(said);
