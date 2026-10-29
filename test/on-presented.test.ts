@@ -420,6 +420,21 @@ class ShardingReacts extends Reacts {
   }
 }
 
+/** A strategy that knows only onNewMessage, with no initialize, whose first row's hook runs `onFirst`. */
+class SwitchesOnFirst extends PassthroughStrategy {
+  heard: Array<{ id: MessageId; window: MessageId[] }> = [];
+  onFirst: (() => void) | undefined;
+  async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
+    this.heard.push({ id: message.id, window: ctx.messageStore.getAll().map((m) => m.id) });
+    if (this.heard.length === 1) this.onFirst?.();
+  }
+}
+
+/** SwitchesOnFirst with an initialize that awaits nothing but returns a promise all the same. */
+class SwitchesOnFirstAfterAwait extends SwitchesOnFirst {
+  async initialize(_ctx: StrategyContext): Promise<void> {}
+}
+
 /** A gate for an initialize, and the function that opens it. */
 function gated(): { gate: Promise<void>; open: () => void } {
   let open!: () => void;
@@ -487,6 +502,38 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
     await settle();
     assert.deepEqual(first.heard, [a]);
     cm.close();
+  });
+
+  // House review of #350, code finding 8: an initialization that finishes
+  // before the hook returns (a strategy with no initialize) still stops the
+  // calls for the rows after it, which are heard as rows that waited for it
+  // are: those in the window of the branch it initialized on.
+  it("a hook whose switchBranch() initializes before it returns: the rest are heard only where the branch's window holds them", async () => {
+    for (const synchronous of [true, false]) {
+      const label = synchronous ? 'probe' : 'control';
+      let cm!: ContextManager;
+      let switched: Promise<void> | undefined;
+      let earlier = '';
+      const strategy = synchronous ? new SwitchesOnFirst() : new SwitchesOnFirstAfterAwait();
+      strategy.onFirst = () => { switched = cm.switchBranch(earlier); };
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const store = cm.getStore();
+      // A branch made before the rows: its window lacks them.
+      earlier = store.createBranchAt('zz-earlier', cm.currentBranch().name, store.currentSequence()).name;
+      const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+      cm.presentRows([a, b, c]);
+      await switched;
+      assert.equal(cm.currentBranch().name, earlier, 'setup: the hook switched to the earlier branch');
+      assert.deepEqual(cm.getPresentedMessages(), [], "setup: the earlier branch's window lacks the rows");
+      assert.deepEqual(
+        strategy.heard,
+        [{ id: a, window: [a, b, c] }],
+        `${label}: no call is made for a row on a branch whose window lacks it`,
+      );
+      await settle();
+      cm.close();
+    }
   });
 
   it('a hook that starts its own strategy initializing again: the rest wait for it and reach it once it has', async () => {

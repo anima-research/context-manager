@@ -3590,9 +3590,12 @@ export class ContextManager {
    * Each row's onNewMessage call is checked as a call of its own, so a hook
    * that closes the manager, sets a strategy or starts an initialization
    * (a setStrategy() or switchBranch() called before its first await) stops
-   * the calls after it. The rows it hasn't been given go where a call made then
-   * sends them: nowhere after close(), to wait for the initialization, or
-   * to a replacement that has none. The strategy it let go hears no more.
+   * the calls after it, even when that initialization finished before the
+   * hook returned. The rows it hasn't been given go nowhere after close(),
+   * and otherwise wait for the initialization (deferPresented): once it has
+   * finished they are heard where the window of the branch it initialized
+   * on holds them, at once for a strategy with no initialize. The strategy
+   * it let go hears no more.
    *
    * Fire and forget: the write doesn't wait for the strategy, and the
    * strategy's failure isn't the write's (#288). A hook that isn't async can
@@ -3627,11 +3630,18 @@ export class ContextManager {
       }
       return;
     }
+    // The initialization the calls are made under, and the window the rows
+    // entered, before any hook runs.
+    const attempt = this.initializationAttempt;
+    const legacy = this.windowIndex.mode() === 'legacy';
     for (let i = 0; i < rows.length; i++) {
-      if (i > 0 && (this.closed || this.strategy !== strategy || this.initializedAttempt !== this.initializationAttempt)) {
-        // The previous row's hook closed the manager, set a strategy or started
-        // an initialization: the rest go as a call made now sends them.
-        this.notifyPresented(rows.slice(i));
+      if (i > 0 && (this.closed || this.strategy !== strategy || this.initializationAttempt !== attempt)) {
+        // The previous row's hook closed the manager, set a strategy or
+        // started an initialization, which may have finished before the hook
+        // returned (a strategy with no initialize): the rest wait for it as
+        // rows presented while it ran do, and are heard once it has, those
+        // the window of the branch it initialized on holds.
+        this.deferPresented(rows.slice(i), legacy);
         return;
       }
       const message = rows[i]!;
@@ -3643,6 +3653,18 @@ export class ContextManager {
         failed(err);
       }
     }
+  }
+
+  /**
+   * Rows whose onNewMessage calls a hook stopped (notifyPresented): they
+   * wait for the initialization it started, as rows presented while it runs
+   * do, and are given at once if it has finished, which delivers only those
+   * the window of the branch it initialized on holds. Nothing after close().
+   */
+  private deferPresented(rows: readonly StoredMessage[], legacy: boolean): void {
+    if (this.closed) return;
+    for (const row of rows) this.presentedUnheard.push({ id: row.id, legacy });
+    if (this.initializedAttempt === this.initializationAttempt) this.deliverPresentedUnheard();
   }
 
   /**

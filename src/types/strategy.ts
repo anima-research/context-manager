@@ -445,9 +445,11 @@ export interface ContextStrategy {
    * is made only if the manager is still open, with this strategy
    * initialized: a call that closes the manager, sets a strategy, or starts
    * an initialization (a setStrategy() or switchBranch() called before its
-   * first await) stops the calls for the rows after it. Those rows wait for the
-   * initialization, as onPresented's do, and so reach a replacement after
-   * its initialize; after close() nothing hears them.
+   * first await) stops the calls for the rows after it, even one that
+   * finishes before the call returns (a strategy with no initialize). Those
+   * rows wait for the initialization, as onPresented's do, and so reach a
+   * replacement after its initialize, those the window of the branch it
+   * initialized on holds; after close() nothing hears them.
    *
    * The manager doesn't wait for the promise. A rejection, or a throw before
    * it returns, is logged through the manager's diagnostics, naming the
