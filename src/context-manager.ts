@@ -463,8 +463,12 @@ export class ContextManager {
   private foldJournal: FoldJournal;
   /** The rows this manager's agent has been shown, in order (see window-index.ts). */
   private windowIndex: WindowIndex;
-  /** Rows presented while the strategy wasn't initialized, for it to hear once it is (notifyPresented). */
-  private presentedUnheard: MessageId[] = [];
+  /**
+   * Rows that entered the window while the strategy wasn't initialized, for
+   * it to hear once it is (notifyPresented), each with whether it entered
+   * a legacy window, where the add itself entered it.
+   */
+  private presentedUnheard: Array<{ id: MessageId; legacy: boolean }> = [];
   /** Calls of onRetracted made while the strategy wasn't initialized, in order, for it to hear once it is (notifyRetracted). */
   private retractedUnheard: Array<{ left: RetractedRow[]; info: Retraction }> = [];
   /**
@@ -3606,7 +3610,8 @@ export class ContextManager {
     // once it is initialized, so they wait while one without a row hook
     // initializes too: a replacement set meanwhile hears them.
     if (this.initializedAttempt !== this.initializationAttempt) {
-      for (const row of rows) this.presentedUnheard.push(row.id);
+      const legacy = this.windowIndex.mode() === 'legacy';
+      for (const row of rows) this.presentedUnheard.push({ id: row.id, legacy });
       return;
     }
     const strategy = this.strategy;
@@ -3705,21 +3710,29 @@ export class ContextManager {
   }
 
   /**
-   * Once the strategy is initialized, the rows presented while it wasn't
-   * that are still in the window, in window order. A branch the strategy
-   * initialized on holds only its own index's rows: a row presented on
-   * another branch, or a branch still in legacy mode, has no ordinal there.
-   * Nothing here fails the initialization that ran it: a failure of the
-   * manager's own work is logged, and the strategy's next rebuild reads the
-   * window.
+   * Once the strategy is initialized, the rows that entered the window
+   * while it wasn't that are still in the window of the branch it
+   * initialized on, in window order. Once a host presents there, that is
+   * the rows its index holds, however each entered: a row presented on
+   * another branch has no ordinal there. While that branch is in legacy
+   * mode its window is its record, and the rows given are those an add
+   * entered into a legacy window (a sharded add's later shards, after a
+   * hook of an earlier one started the initialization) that the record
+   * holds; a row presented on a branch whose index was written down isn't
+   * given there. Nothing here fails the initialization that ran it: a
+   * failure of the manager's own work is logged, and the strategy's next
+   * rebuild reads the window.
    */
   private deliverPresentedUnheard(): void {
-    const unheard = new Set(this.presentedUnheard);
+    const presented = this.windowIndex.mode() === 'presented';
+    const unheard = new Set(this.presentedUnheard.filter((row) => presented || row.legacy).map((row) => row.id));
     this.presentedUnheard = [];
     try {
+      // The window's listing: the index's rows once a host presents, the
+      // merged record in legacy mode.
       const rows = this.presentedMessageView()
         .getAll()
-        .filter((m) => unheard.has(m.id) && this.windowIndex.ordinalOf(m.id) !== undefined);
+        .filter((m) => unheard.has(m.id));
       this.notifyPresented(rows);
     } catch (err) {
       logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; its next rebuild reads them:', err, this.diag);

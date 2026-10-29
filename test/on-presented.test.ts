@@ -412,6 +412,14 @@ class Reacts extends PassthroughStrategy {
   }
 }
 
+/** Reacts, storing a message of two or more blocks as one shard per block. */
+class ShardingReacts extends Reacts {
+  chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+    if (content.length < 2) return null;
+    return { bodyGroupId: 'zz-doc', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+  }
+}
+
 /** A gate for an initialize, and the function that opens it. */
 function gated(): { gate: Promise<void>; open: () => void } {
   let open!: () => void;
@@ -512,6 +520,33 @@ describe('onPresented in legacy mode', () => {
     assert.deepEqual(strategy.newMessages, []);
     await settle();
     cm.close();
+  });
+
+  // House review of #350, code finding 2: in legacy mode there is no index,
+  // so the rows waiting on an initialization have no ordinal; they wait all
+  // the same, and reach the replacement once it has initialized.
+  it("a sharded add whose first shard's hook sets a strategy that initializes: the later shards reach it after its initialize", async () => {
+    for (const waits of [true, false]) {
+      let cm!: ContextManager;
+      const { gate, open } = gated();
+      // The probe's replacement waits in its initialize; the control's has none.
+      const next = waits ? new Reacts() : new HearsNewMessages();
+      if (next instanceof Reacts) next.gate = gate;
+      let replaced!: Promise<void>;
+      const first = new ShardingReacts(() => { replaced = cm.setStrategy(next); });
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: first });
+      cm.addMessage('alice', [text('x'), text('y'), text('z')]);
+      const shards = cm.getPresentedMessages().map((m) => m.id);
+      assert.equal(shards.length, 3, 'setup: the add stored three shards');
+      assert.equal(cm.windowMode(), 'legacy');
+      assert.deepEqual(first.heard, [shards[0]], 'the strategy the hook replaced heard only the first shard');
+      open();
+      await replaced;
+      const heard = next instanceof Reacts ? next.heard : next.heard.map((h) => h.id);
+      assert.deepEqual(heard, shards.slice(1), `${waits ? 'probe' : 'control'}: the replacement hears the later shards, in order`);
+      await settle();
+      cm.close();
+    }
   });
 });
 

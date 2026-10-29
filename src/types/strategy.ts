@@ -328,7 +328,11 @@ export interface ContextStrategy {
    * calls nothing. While the strategy isn't initialized (it is initializing,
    * or its last initialization failed), the calls from presentRows wait until
    * it is, and then one call carries the rows still in the window, in
-   * window order, each once. They wait for the manager's strategy, not for
+   * window order, each once. So do the calls for an add's later shards in
+   * legacy mode, when a hook of an earlier shard started an initialization:
+   * the rows the record still holds are carried, if the branch the
+   * strategy initialized on is still in legacy mode, and the rows its
+   * window holds, if a host presented there meanwhile. They wait for the manager's strategy, not for
    * this instance: a strategy set with setStrategy() while rows wait hears
    * them after its own initialize, though that initialize read a window
    * that held them.
