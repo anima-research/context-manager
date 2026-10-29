@@ -1905,7 +1905,10 @@ export interface AutobiographicalConfig {
    * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
    * defaults to `'report'`: those stores are known to carry gaps.
    * Independent of this policy, a merge that WOULD mint a crossed node is
-   * never executed: it is refused into the merge quarantine.
+   * never executed: it is refused into the merge quarantine, unless one of
+   * its sources had messages and has none left in the view: then it is
+   * dropped, with a warning naming what the check found, and its other
+   * sources are offered again.
    */
   topologyPolicy?: 'reject' | 'report';
   /**
