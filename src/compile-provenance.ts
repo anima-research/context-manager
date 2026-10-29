@@ -123,7 +123,9 @@ function storedBodyFinder(
  * still belongs to its body, whose head is shard 0 whether or not it was
  * visible. A body is presented whole, so its shards are consecutive in
  * either order, but for one a presentation cut short left partly in the
- * window and a later presentRows completed after other rows entered: its
+ * window (in an index a pre-release build wrote one record per row: see
+ * ContextManager.presentRows) and a later presentRows completed after
+ * other rows entered: its
  * shards are then two runs in `stored`, each read as a body of its own and
  * neither complete. `positionOf` resolves an id among those same messages
  * to its position in `stored` (undefined when none has it).

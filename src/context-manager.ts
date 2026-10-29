@@ -1331,21 +1331,24 @@ export class ContextManager {
    * named twice, or a later shard of a body named without its first, unless
    * the window holds every shard before it (below).
    *
-   * A call's rows go in as one record, at one sequence, where the store can
-   * append several items in one (chronicle's
-   * appendManyToStateJsonWithIdentity): the store keeps or loses the call
-   * whole, and a call the store refuses has presented nothing (after any
-   * throw the window is read again from the store). The call is then
+   * A call's rows go in as one record, at one sequence (chronicle's
+   * appendManyToStateJsonWithIdentity, the identity-stamped batched append
+   * of chronicle 0.6.0, which this package requires): the store keeps or
+   * loses the call whole, and a call the store refuses has presented
+   * nothing (after any throw the window is read again from the store). On
+   * a store handle without the batched append, a call that writes several
+   * rows throws, presenting nothing. The call is then
    * one presentation point: branchAt of any row it presented cuts after all
    * of them (see branchAt), so a host that wants a cut at one row, such as
    * an agent's own row, presents it in a call of its own, which is one
    * record as a single row always was.
    *
-   * On a chronicle without the batched form, each row presented is one
-   * record, so a call cut short (it threw partway, or the process died
-   * before the store synced) can leave a body's first shards in the window
-   * and the rest out; so can a branch or a derive cut between its shards'
-   * presentations, there or in an index such a chronicle wrote. Such a body
+   * Pre-release builds of the window index, before batched writes, wrote
+   * each row presented as one record (no release did), so in an index they
+   * wrote a call cut short (it threw partway, or the process died before
+   * the store synced) can have left a body's first shards in the window and
+   * the rest out; so can a branch or a derive cut between its shards'
+   * presentations there. Such a body
    * is completed, not refused: naming it, by its first shard's id or by the
    * first shard the window lacks, which getUnpresentedMessages lists with
    * the shards after it, presents only the shards it lacks, at the end of
@@ -1356,7 +1359,7 @@ export class ContextManager {
    *
    * A body the window holds the other way round, its first shard out and a
    * later one in (a retractRows cut short after the first shard's
-   * tombstone, on such a chronicle), can't be completed where it stands:
+   * tombstone, in such an index), can't be completed where it stands:
    * its head would follow its own later shards. Naming it by its first
    * shard's id takes those shards out and presents the body whole at the
    * end, in body order, in the one write: they take new ordinals, and the
@@ -1371,15 +1374,15 @@ export class ContextManager {
    * rows it names), and from then on the window grows only by presentation.
    * A host that presents starts each agent's window at boot, before
    * anything arrives mid-turn, with presentRows([]). The write-down is one
-   * record where the store batches, and the first batch a store records
-   * moves its MANIFEST to format version 2, which chronicle releases from
-   * before batched appends refuse to open. On a chronicle without the
-   * batched form it is one record per stored row, and it switches the mode
-   * only with its last, the header, so one cut short (the call threw
-   * partway, or the process died before the store synced) leaves the
-   * manager in legacy mode, its window still the whole record, and the
-   * next presentRows or retractRows, the boot call presentRows([]) among
-   * them, finishes the write-down before it does its own work.
+   * record, and the first batch a store records moves its MANIFEST to
+   * format version 2, which chronicle releases from before batched appends
+   * refuse to open. It switches the mode with its last item, the header, so
+   * a write-down a pre-release build cut short, one record per stored row
+   * (the call threw partway, or the process died before the store synced),
+   * leaves the manager in legacy mode, its window still the whole record,
+   * and the next presentRows or retractRows, the boot call presentRows([])
+   * among them, finishes the write-down, in one record, before it does its
+   * own work.
    *
    * On a branch whose window index another version wrote in a format this
    * one doesn't read, the window is the record (with a warning when the
@@ -1390,9 +1393,10 @@ export class ContextManager {
    * returns, fire and forget: its failure is logged, and the rows stay
    * presented. The first call, which writes the legacy window down, enters
    * no new row, so the strategy hears nothing: it heard each row as it was
-   * stored. A call cut short by a throw tells the strategy the rows that
-   * left and entered before it, then throws; a call that completes a body
-   * tells it only the shards that entered then.
+   * stored. A call the store refuses tells it nothing; a call that throws
+   * after the store kept part of it tells the strategy the rows that left
+   * and entered before it, then throws; a call that completes a body tells
+   * it only the shards that entered then.
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
@@ -1462,12 +1466,11 @@ export class ContextManager {
    * has no row to give: it is told by its id alone, in a call of its own
    * with `removed`, after the call for the rows the store holds, so a
    * strategy lets go of what it folded of it too. A call's tombstones are
-   * one record where the store batches, as presentRows's rows are, so a
-   * call the store refuses has taken nothing out (in legacy mode the
-   * write-down is a record of its own, before them). On a chronicle
-   * without the batched form each row taken out is one record, so a call
-   * cut short by a failed write tells the strategy the rows it took out
-   * before it, then throws.
+   * one record, as presentRows's rows are, so a call the store refuses has
+   * taken nothing out and told nothing (in legacy mode the write-down is a
+   * record of its own, before them). On a store handle without the batched
+   * append (see presentRows), a call that writes several items throws,
+   * taking nothing out.
    */
   retractRows(ids: readonly MessageId[], options?: { undone?: boolean }): void {
     this.requireOpen('retractRows');
@@ -1532,12 +1535,9 @@ export class ContextManager {
    * out of the window and before this returns: by their ids alone, since
    * the store holds no row of them to give, so a strategy that folded them
    * lets go of what it folded, as the manager that removed them did. It is
-   * fire and forget, as retractRows's call. The tombstones are one record
-   * where the store batches, and a write the store refuses has taken
-   * nothing out and told nothing; on a chronicle without the batched form
-   * each is one record, so a write that fails partway tells the strategy
-   * the rows it took out before it, then throws, and those rows stay out;
-   * a later call passes over them. A closed manager refuses it.
+   * fire and forget, as retractRows's call. The tombstones are one record,
+   * and a write the store refuses has taken nothing out and told nothing:
+   * a later call takes the rows out. A closed manager refuses it.
    */
   retractRemoved(ids: readonly MessageId[]): MessageId[] {
     this.requireOpen('retractRemoved');
@@ -1607,8 +1607,9 @@ export class ContextManager {
    * `'legacy'` until the first presentRows or retractRows on the store's
    * branch has written the window down whole, while the window is the
    * merged record itself; `'presented'` after, even while the window holds
-   * no row. A write-down cut short leaves it `'legacy'` (see presentRows),
-   * as does an index in another version's format.
+   * no row. A write-down a pre-release build cut short leaves it
+   * `'legacy'` (see presentRows), as does an index in another version's
+   * format.
    */
   windowMode(): WindowMode {
     return this.windowIndex.mode();
@@ -1654,7 +1655,8 @@ export class ContextManager {
    * - `'out'`: stored and not in the window: arrived and not presented, or
    *   taken out without `undone`. These are the rows getUnpresentedMessages
    *   lists, so an undone turn's shard is `'out'` while a shard of its body
-   *   before it is in the window (a redo cut short), since the rest of the
+   *   before it is in the window (a redo cut short, in an index written one
+   *   record per row: see presentRows), since the rest of the
    *   body is due. A shard with no earlier shard of its body in the window
    *   reads as its own tombstone left it, `'undone'` or `'out'`, whatever
    *   the shards after it: a retract cut short after a body's first
@@ -1762,13 +1764,13 @@ export class ContextManager {
    * presented. A row the window doesn't hold, and every row in legacy mode,
    * is cut at its own sequence, as before.
    *
-   * Where the store batches, one presentRows call is one record, so it is
-   * one presentation point: a row it presented is cut after the whole call,
-   * and the new branch's window holds the rows presented with it after it
-   * too, since the store cuts only between records. A row presented in a
-   * call of its own, as a host presents an agent's own rows, is cut exactly
-   * there. On a chronicle without the batched form each row presented is
-   * one record, and the cut takes no row presented after the row's body.
+   * One presentRows call is one record, so it is one presentation point: a
+   * row it presented is cut after the whole call, and the new branch's
+   * window holds the rows presented with it after it too, since the store
+   * cuts only between records. A row presented in a call of its own, as a
+   * host presents an agent's own rows, is cut exactly there. In an index a
+   * pre-release build wrote one record per row (see presentRows), the cut
+   * takes no row presented after the row's body.
    *
    * A row the window holds from the write-down (the first presentRows on
    * the branch, which writes the window down as the record stood) was in
@@ -1811,7 +1813,7 @@ export class ContextManager {
    * first shard's id is cut there; its body's last shard's own for a body
    * the write-down presented; and the latest write that presented a shard
    * of its body for any other row the window holds, which is the record of
-   * the whole presentRows call where the store batches (see branchAt). The
+   * the whole presentRows call (see branchAt). The
    * row can be in this manager's slot or an auxiliary one.
    * Throws `Message not found: <id>`, as branchAt does, for a row no merged
    * slot holds. It writes nothing.
@@ -1828,11 +1830,11 @@ export class ContextManager {
   /**
    * The sequence branchAt cuts at for `message`: its own, unless the window
    * holds it, and then the latest write that presented a shard of its body.
-   * Where the store batches (WindowIndex.write), that write is the record of
-   * the whole presentRows call that presented it, so the cut keeps every
-   * row the call presented: a batch is one presentation point. On a
-   * chronicle without the batched form each presented row is one record,
-   * so the cut takes no row presented after the body's last shard. A body
+   * That write (WindowIndex.write) is the record of the whole presentRows
+   * call that presented it, so the cut keeps every row the call presented:
+   * a batch is one presentation point. In an index a pre-release build
+   * wrote one record per row, the cut takes no row presented after the
+   * body's last shard. A body
    * the write-down presented, every shard of it, is cut at its last shard's
    * own sequence instead: it was in the window from its own write.
    */
@@ -1962,9 +1964,9 @@ export class ContextManager {
    * (`currentSequence()` read after a presentRows) instead. A presentRows
    * call that the store wrote as one record (see presentRows) is in the
    * child's window whole or not at all. A cut between a sharded body's
-   * presentations, one record per shard on a chronicle without the batched
-   * form, leaves the body partly in the child's window, and the child's
-   * presentRows of the body completes it. A parent that hadn't presented a
+   * presentations, in an index a pre-release build wrote one record per
+   * shard (see presentRows), leaves the body partly in the child's window,
+   * and the child's presentRows of the body completes it. A parent that hadn't presented a
    * row by the checkpoint has no window written, and the child is in
    * legacy mode.
    * Compression holds, and compression work in flight here, are not

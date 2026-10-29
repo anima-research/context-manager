@@ -72,10 +72,11 @@ class Records extends PassthroughStrategy {
 
 /**
  * Makes the `failing`-th append to the index from now on throw, as a full disk
- * would; returns the undo. A write is cut short partway only where each
- * item is one record, on a chronicle without the batched identity append,
- * so the window index writes so while this is installed
- * (perItemIndexWrites); window-batches.test.ts has the batched form.
+ * would; returns the undo. A write is cut short partway only in an index
+ * written one record per item, as pre-release builds wrote it before
+ * batched writes, so the window index is written so while this is
+ * installed (perItemIndexWrites); window-batches.test.ts has the batched
+ * form, which the store keeps or loses whole.
  */
 function failAppend(cm: ContextManager, failing: number, stateId = INDEX): () => void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };

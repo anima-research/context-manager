@@ -187,10 +187,11 @@ function indexItems(cm: ContextManager): Array<Record<string, unknown>> {
 
 /**
  * Makes the `failing`-th append to the window index from now on throw, as a
- * full disk would; returns the undo. A write is cut short partway only
- * where each item is one record, on a chronicle without the batched
- * identity append, so the index writes so while this is installed
- * (perItemIndexWrites); window-batches.test.ts has the batched form.
+ * full disk would; returns the undo. A write is cut short partway only in
+ * an index written one record per item, as pre-release builds wrote it
+ * before batched writes, so the index is written so while this is
+ * installed (perItemIndexWrites); window-batches.test.ts has the batched
+ * form, which the store keeps or loses whole.
  */
 function failIndexAppend(cm: ContextManager, failing: number): () => void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
@@ -723,9 +724,9 @@ describe('a body partly in the window', () => {
     const doc = parent.addMessage('User', [text('p0 '), text('p1 '), text('p2 ')]);
     const [, p1, p2] = parent.getAllMessages().filter((m) => m.bodyGroupId === 'zz-doc').map((m) => m.id);
     const before = parent.getStore().currentSequence();
-    // One record per shard, as a chronicle without the batched identity
-    // append writes them (where it has it, the call is one record, and a cut
-    // takes the body whole or not at all: window-batches.test.ts): two
+    // One record per shard, as pre-release builds wrote them before
+    // batched writes (batched, the call is one record, and a cut takes the
+    // body whole or not at all: window-batches.test.ts): two
     // records on, the first two shards are in the window and the third
     // isn't.
     const batched = perItemIndexWrites(parent.getStore());

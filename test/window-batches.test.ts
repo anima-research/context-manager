@@ -2,28 +2,32 @@
  * Batched window writes (agent-framework #291, src/window-index.ts,
  * WindowIndex.write).
  *
- * - Where chronicle has the identity-stamped batched append, a write-down,
- *   the rows of one presentRows call and the tombstones of one call are one
- *   record each, at one sequence. A single row is one record through the
+ * - Through chronicle's identity-stamped batched append, which
+ *   context-manager requires (chronicle ^0.6.0), a write-down, the rows of
+ *   one presentRows call and the tombstones of one call are one record
+ *   each, at one sequence. A single row is one record through the
  *   single form, as before, and a store whose window writes are all single
  *   keeps its MANIFEST at version 1; the first batch moves it to version 2.
- * - The window is the same either way: the index's items (apart from the
- *   record each names), its ordinals, the presented and unpresented
- *   listings, each row's status and the compile, over a write-down of many
- *   rows and a workload of presentations, retracts, removals and a redo,
- *   before and after a reopen.
+ * - The window is the same as one an index written one record per item
+ *   gives (pre-release builds wrote one so, before batched writes): the
+ *   index's items (apart from the record each names), its ordinals, the
+ *   presented and unpresented listings, each row's status and the compile,
+ *   over a write-down of many rows and a workload of presentations,
+ *   retracts, removals and a redo, before and after a reopen.
  * - A batch is one presentation point: branchAt of any row a call presented
  *   cuts after the whole call, and a derive at a sequence takes the call
  *   whole or not at all, so a body presented in one call is never split.
  * - A batch that throws writes nothing: a write-down leaves legacy mode as
  *   it was, a presentation enters no row and tells the strategy nothing, a
  *   retract takes nothing out, and the next call writes the whole of it.
- * - A write-down a chronicle without batches left cut short is finished in
- *   one record.
+ * - A write-down an index written one record per item left cut short is
+ *   finished in one record.
+ * - A store handle without the batched append is refused: a write of
+ *   several items throws, writing nothing, and a single row is written as
+ *   before.
  *
- * test/_harness/index-writes.ts hides the batched form on a store handle to
- * run the other path; with a chronicle that lacks it, the tests of what
- * only the batched form does are skipped and the rest run on that path.
+ * test/_harness/index-writes.ts stands in for the batched append on a
+ * store handle, one record per item, to write such an index.
  */
 
 import { describe, it, after } from 'node:test';
@@ -34,7 +38,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, windowIndexStateId } from '../src/index.js';
 import type { CompileResult, MessageId, StoredMessage } from '../src/index.js';
-import { batchesIndexWrites, perItemIndexWrites, skipWithoutBatches } from './_harness/index-writes.js';
+import { batchesIndexWrites, perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-window-batches';
 let storeSeq = 0;
@@ -52,7 +56,7 @@ after(() => {
 
 const skipWithoutViews =
   typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function'
-    ? skipWithoutBatches
+    ? false
     : 'installed @animalabs/chronicle has no JsStore.view (branch-bound handles)';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -125,7 +129,7 @@ function failNextBatch(cm: ContextManager): () => void {
 }
 
 describe('one record per write', () => {
-  it('a write-down, one presentRows call and one retract call are one record each; a single row is one record, as before', { skip: skipWithoutBatches }, async () => {
+  it('a write-down, one presentRows call and one retract call are one record each; a single row is one record, as before', async () => {
     const path = freshPath();
     const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new Sharding() });
     assert.ok(batchesIndexWrites(cm.getStore()), 'setup: the store appends a batch as one record');
@@ -173,7 +177,7 @@ describe('one record per write', () => {
     assert.equal(manifestVersion(path), 2, 'the first batch moved the MANIFEST to version 2');
   });
 
-  it('a store whose window writes are all single rows keeps its MANIFEST at version 1', { skip: skipWithoutBatches }, async () => {
+  it('a store whose window writes are all single rows keeps its MANIFEST at version 1', async () => {
     const path = freshPath();
     const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]); // an empty record's write-down is its header alone
@@ -205,8 +209,9 @@ function labelOf(message: StoredMessage): string {
  * The same workload on a fresh store: many rows (some bodies stored as
  * shards) written down, then rows presented out of record order, an undone
  * turn's rows and others taken out, a range removed, a row removed through
- * another manager and repaired, and a redo. With `perItem`, the index
- * writes one record per item, as a chronicle without batches does.
+ * another manager and repaired, and a redo. With `perItem`, the index is
+ * written one record per item, as pre-release builds wrote it
+ * (perItemIndexWrites).
  * Returns what the window says, by label, and how many records wrote it.
  */
 async function workload(rows: number, perItem: boolean) {
@@ -280,7 +285,7 @@ async function workload(rows: number, perItem: boolean) {
 }
 
 describe('the window is the same, batched or one record per item', () => {
-  it('a write-down of many rows and a workload over it give the same items, ordinals, listings, statuses and compile, before and after a reopen', { skip: skipWithoutBatches, timeout: 600_000 }, async () => {
+  it('a write-down of many rows and a workload over it give the same items, ordinals, listings, statuses and compile, before and after a reopen', { timeout: 600_000 }, async () => {
     const ROWS = 600;
     const batched = await workload(ROWS, false);
     const perItem = await workload(ROWS, true);
@@ -300,7 +305,7 @@ describe('the window is the same, batched or one record per item', () => {
 });
 
 describe('a batch is one presentation point', () => {
-  it('branchAt of any row one call presented cuts after the whole call; a row presented in a call of its own is cut there', { skip: skipWithoutBatches }, async () => {
+  it('branchAt of any row one call presented cuts after the whole call; a row presented in a call of its own is cut there', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Sharding() });
     const u = cm.addMessage('User', [text('u')]);
     cm.presentRows([]);
@@ -365,7 +370,7 @@ describe('a batch is one presentation point', () => {
 });
 
 describe('a batch that throws writes nothing', () => {
-  it('a write-down leaves legacy mode as it was, and the next call writes it whole in one record', { skip: skipWithoutBatches }, async () => {
+  it('a write-down leaves legacy mode as it was, and the next call writes it whole in one record', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));
     const restore = failNextBatch(cm);
@@ -385,7 +390,7 @@ describe('a batch that throws writes nothing', () => {
     cm.close();
   });
 
-  it('a presentation enters no row and tells the strategy nothing; a retract takes nothing out; the next call writes it whole', { skip: skipWithoutBatches }, async () => {
+  it('a presentation enters no row and tells the strategy nothing; a retract takes nothing out; the next call writes it whole', async () => {
     const strategy = new Hearing();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
     cm.presentRows([]);
@@ -423,7 +428,7 @@ describe('a batch that throws writes nothing', () => {
     cm.close();
   });
 
-  it('a repair takes nothing out, and the next call takes every row out', { skip: skipWithoutBatches }, async () => {
+  it('a repair takes nothing out, and the next call takes every row out', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]);
     const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));
@@ -446,8 +451,8 @@ describe('a batch that throws writes nothing', () => {
   });
 });
 
-describe('an index a chronicle without batches wrote', () => {
-  it('a write-down it cut short is finished in one record, and the rows it wrote keep their ordinals', { skip: skipWithoutBatches }, async () => {
+describe('an index written one record per item', () => {
+  it('a write-down it cut short is finished in one record, and the rows it wrote keep their ordinals', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     const rows = ['a', 'b', 'c', 'd', 'e'].map((t) => cm.addMessage('User', [text(t)]));
     const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
@@ -472,6 +477,56 @@ describe('an index a chronicle without batches wrote', () => {
     assert.equal(recordsFrom(cm, 2), 1, 'the rest of the write-down, and its header, are one record');
     assert.deepEqual(rows.map((id) => cm.ordinalOf(id)), [0, 1, 2, 3, 4]);
     assert.equal(cm.windowMode(), 'presented');
+    cm.close();
+  });
+});
+
+describe('a store handle without the batched append', () => {
+  it('is refused at a write of several items, which writes nothing; a single row is written as before', async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('User', [text(t)])) as [MessageId, MessageId];
+    const handle = cm.getStore() as unknown as Record<string, unknown>;
+    // A handle as a chronicle before 0.6.0 gives one.
+    const older = () => {
+      handle.appendManyToStateJsonWithIdentity = undefined;
+      return () => {
+        delete handle.appendManyToStateJsonWithIdentity;
+      };
+    };
+    const refused = /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install @animalabs\/chronicle \^0\.6\.0/;
+
+    let restore = older();
+    const head = cm.getStore().currentSequence();
+    try {
+      assert.throws(() => cm.presentRows([]), refused, 'the write-down is several items');
+      assert.throws(() => cm.retractRows([a]), refused, 'and so is the one before a retract in legacy mode');
+    } finally {
+      restore();
+    }
+    assert.equal(cm.getStore().currentSequence(), head, 'nothing is written, not even the index state\'s registration');
+    assert.equal(cm.windowMode(), 'legacy');
+    assert.deepEqual(indexItems(cm), []);
+    assert.equal(cm.getPresentedMessages(), cm.getAllMessages(), 'the window is still the record');
+
+    cm.presentRows([]);
+    assert.deepEqual(indexItems(cm).map((item) => item.id ?? item.v), [a, b, 1], 'with the batched append back, the write-down is whole');
+    const [c, d, e] = ['c', 'd', 'e'].map((t) => cm.addMessage('Other', [text(t)])) as [MessageId, MessageId, MessageId];
+    strategy.presented.length = 0;
+    restore = older();
+    try {
+      const next = cm.indexLength();
+      assert.deepEqual(cm.presentRows([c]), [next], 'a single row goes through the single form');
+      assert.throws(() => cm.presentRows([d, e]), refused);
+      assert.deepEqual([cm.windowStatusOf(d), cm.windowStatusOf(e)], ['out', 'out'], 'neither row entered');
+      assert.equal(cm.indexLength(), next + 1);
+      assert.throws(() => cm.retractRows([a, b]), refused);
+      assert.deepEqual([cm.windowStatusOf(a), cm.windowStatusOf(b)], ['in', 'in'], 'nothing taken out');
+    } finally {
+      restore();
+    }
+    assert.deepEqual(strategy.presented, [[c]], 'the strategy heard only the row that entered');
+    assert.deepEqual(strategy.retracted, []);
     cm.close();
   });
 });

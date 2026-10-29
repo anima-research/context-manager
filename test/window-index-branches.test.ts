@@ -26,7 +26,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, windowIndexStateId } from '../src/index.js';
 import type { CompileResult, DerivationManifest, MessageId } from '../src/index.js';
-import { batchesIndexWrites, perItemIndexWrites, skipWithoutBatches } from './_harness/index-writes.js';
+import { batchesIndexWrites, perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-window-index-branches';
 let storeSeq = 0;
@@ -98,8 +98,8 @@ function branchPoint(cm: ContextManager, branch: string): number | undefined {
 /**
  * Runs `presentRows([])` with the `failing`-th append to the window index
  * throwing, as a full disk would. A write-down is cut short partway only
- * where each item is one record, on a chronicle without the batched
- * identity append, so it writes so here (perItemIndexWrites).
+ * in an index written one record per item, as pre-release builds wrote it
+ * before batched writes, so it is written so here (perItemIndexWrites).
  */
 function cutShortWriteDown(cm: ContextManager, failing: number): void {
   const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
@@ -318,8 +318,8 @@ describe('branchAt and the window', () => {
    * a and c stored by the agent and presented in one call, b stored between
    * them by another writer and presented at the next boundary; then the
    * branch cut at b, and the one cut at a, switched to. With `perItem`, the
-   * index writes one record per row, as on a chronicle without the batched
-   * identity append.
+   * index is written one record per row, as pre-release builds wrote it
+   * before batched writes (perItemIndexWrites).
    */
   async function cutsAfterOneCall(perItem: boolean) {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
@@ -350,7 +350,7 @@ describe('branchAt and the window', () => {
     return { cm, a, b, c, cuts: { a: branchPoint(cm, atA)!, b: branchPoint(cm, atB)!, c: branchPoint(cm, atC)! } };
   }
 
-  it('cuts at the write that presented a row, so the new branch\'s window holds it', { skip: skipWithoutBatches }, async () => {
+  it('cuts at the write that presented a row, so the new branch\'s window holds it', async () => {
     const { cm, a, b, c, cuts } = await cutsAfterOneCall(false);
     assert.ok(batchesIndexWrites(cm.getStore()), 'setup: the store appends a batch as one record');
     // a entered the window in one call with c, and that call is one record:
@@ -367,7 +367,7 @@ describe('branchAt and the window', () => {
     cm.close();
   });
 
-  it('on a chronicle without batched appends, each row presented is a write of its own, and the cut at one takes no row presented after it', async () => {
+  it('in an index written one record per row, each row presented is a write of its own, and the cut at one takes no row presented after it', async () => {
     const { cm, a, b, c, cuts } = await cutsAfterOneCall(true);
     // a entered the window before c and b had: those are in the branch's
     // record, arrived and not presented.

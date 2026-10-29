@@ -1,9 +1,11 @@
 // Measures the window's write-down, the first presentRows on a branch, which
 // writes every stored row into the window index (src/window-index.ts): one
-// record per row, as on a chronicle without the batched identity append,
-// against one record for the whole write-down. It also checks that the two
-// leave the same window: the same index items, apart from the record each
-// names, the same ordinals and the same presented rows.
+// record for the whole write-down, as context-manager writes it, against one
+// record per row, as pre-release builds wrote it before batched writes (a
+// stand-in for the batched append below writes it so; context-manager has
+// no such path). It also checks that the two leave the same window: the
+// same index items, apart from the record each names, the same ordinals and
+// the same presented rows.
 //
 //   npm run build && node bench/window/write-down-bench.mjs [sizes...]
 //
@@ -47,8 +49,16 @@ async function run(size, perRow) {
     const legacyReopenMs = ms(t);
     const before = logMb(path);
 
-    // A chronicle without the batched form: one record per item.
-    if (perRow) cm.getStore().appendManyToStateJsonWithIdentity = undefined;
+    // One record per item, as before batched writes: a stand-in for the
+    // batched append on this handle. Its ordinal matches no reading, so the
+    // index reads the items back from the store.
+    if (perRow) {
+      cm.getStore().appendManyToStateJsonWithIdentity = function (stateId, items, idField, sequenceField) {
+        let record;
+        for (const item of items) record = this.appendToStateJsonWithIdentity(stateId, item, idField, sequenceField);
+        return { record, firstOrdinal: -1 };
+      };
+    }
     t = process.hrtime.bigint();
     cm.presentRows([]);
     const writeDownMs = ms(t);
