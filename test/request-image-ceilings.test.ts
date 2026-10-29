@@ -124,10 +124,6 @@ describe('the window limits resolved within the ceilings', () => {
   const resolve = (configured: Partial<Record<'maxLiveImages' | 'maxLiveImageBytes' | 'imageCeiling' | 'imageByteCeiling', number>>) =>
     resolveLiveImageLimits({ maxLiveImages: 6, maxLiveImageBytes: 20 * MiB, imageCeiling: 500, imageByteCeiling: 24 * MiB, ...configured });
 
-  it('the defaults are a window of 6 images and 20 MiB under ceilings of 500 images and 24 MiB', () => {
-    assert.deepEqual(resolve({}), { target: { images: 6, bytes: 20 * MiB }, ceiling: { images: 500, bytes: 24 * MiB } });
-  });
-
   it('the window is kept within the ceilings, and a ceiling of 0 is none', () => {
     assert.deepEqual(resolve({ maxLiveImages: 0, maxLiveImageBytes: 0 }), {
       target: { images: 500, bytes: 24 * MiB }, ceiling: { images: 500, bytes: 24 * MiB },

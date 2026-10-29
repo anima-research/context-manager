@@ -336,15 +336,17 @@ describe('a compile whose select with those summaries left out does not fit, as 
   }
 
   for (const select of Object.keys(SELECTS) as Array<keyof typeof SELECTS>) {
-    it(`${select}: warns and counts the compile, while a preview at that budget does neither and says it fits`, async (t) => {
+    it(`${select}: warns and counts the compile${select === 'hierarchical' ? '' : ', while a preview at that budget does neither and says it fits'}`, async (t) => {
       const lines = capture(t);
       const { manager, strategy } = await seeded(select, 'head');
       lines.length = 0;
       const fallbacks = strategy.getStats().acrossFallbacks;
-      const preview = select === 'hierarchical' ? undefined : manager.previewContext({ maxTokens: 600, reserveForResponse: 0 });
-      assert.strictEqual(strategy.getStats().acrossFallbacks, fallbacks, 'a preview counts nothing');
-      assert.deepStrictEqual(lines.filter((l) => l.includes(FALLBACK)), [], 'a preview warns nothing');
-      if (select !== 'hierarchical') assert.strictEqual(preview?.fits, true, 'the preview says what the compile does: it fits');
+      if (select !== 'hierarchical') {
+        const preview = manager.previewContext({ maxTokens: 600, reserveForResponse: 0 });
+        assert.strictEqual(strategy.getStats().acrossFallbacks, fallbacks, 'a preview counts nothing');
+        assert.deepStrictEqual(lines.filter((l) => l.includes(FALLBACK)), [], 'a preview warns nothing');
+        assert.strictEqual(preview?.fits, true, 'the preview says what the compile does: it fits');
+      }
       await manager.compile({ maxTokens: 600, reserveForResponse: 0 });
       assert.strictEqual(strategy.getStats().acrossFallbacks, fallbacks + 1, 'the compile counts');
       assert.strictEqual(lines.filter((l) => l.includes(FALLBACK) && l.includes('can send messages twice')).length, 1, 'the compile warns once');

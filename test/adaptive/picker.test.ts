@@ -801,14 +801,6 @@ for (const [name, make] of greedySolvers) {
     assert.equal(result.finalResolutions.get('a0'), 2, 'a0 rises through P');
   });
 
-  test(`picker (${name}): a solve that passed no chunk over is the only one, judged at the caller's line`, () => {
-    const { value, engines } = greedyEngines(() => runQuietly(make(), growingRaise(false), {
-      totalBudget: 196, targetBudget: 120, slack: 76 / 196, rejectionBudget: 200,
-    }));
-    assert.equal(value.result.finalTokens, 200);
-    assert.equal(engines, 1);
-  });
-
   test(`picker (${name}): where the fewest-token plan is a solve's last, it is the solution with no replay`, () => {
     const inputs = greedyStore([['a0', 'A']], [['A', 1, ['a0'], 30]]);
     inputs.chunks[1]!.rawTokens = 100;

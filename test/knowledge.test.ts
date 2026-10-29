@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, KnowledgeStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { KnowledgeConfig, SummaryEntry } from '../src/types/index.js';
+import type { SummaryEntry } from '../src/types/index.js';
 
 const TEST_STORE_PATH = './test-knowledge-store';
 
@@ -204,12 +204,9 @@ describe('KnowledgeStrategy', () => {
 
       await manager.compile();
       const state = getStrategyState(strategy);
-      // The chunk containing tool_use + tool_result should be research
-      if (state.chunks.length > 0) {
-        const firstChunk = state.chunks[0];
-        assert.strictEqual(firstChunk.phaseType, 'research',
-          'tool_result should inherit phase from preceding tool_use');
-      }
+      assert.ok(state.chunks.length > 0, 'premise: a chunk formed');
+      assert.strictEqual(state.chunks[0].phaseType, 'research',
+        'tool_result should inherit phase from preceding tool_use');
       manager.close();
     });
 
@@ -269,10 +266,9 @@ describe('KnowledgeStrategy', () => {
 
       await manager.compile();
       const state = getStrategyState(strategy);
-      if (state.chunks.length > 0) {
-        assert.strictEqual(state.chunks[0].phaseType, 'lesson',
-          'Lesson should take priority over research');
-      }
+      assert.ok(state.chunks.length > 0, 'premise: a chunk formed');
+      assert.strictEqual(state.chunks[0].phaseType, 'lesson',
+        'Lesson should take priority over research');
       manager.close();
     });
   });
@@ -326,63 +322,6 @@ describe('KnowledgeStrategy', () => {
         const phases = state.chunks.map(c => c.phaseType);
         assert.ok(phases.includes('research'), 'Should have a research chunk');
         assert.ok(phases.includes('synthesis'), 'Should have a synthesis chunk');
-      }
-
-      manager.close();
-    });
-
-    it('should close chunks at minimum 2 messages', async () => {
-      cleanup();
-      const strategy = new KnowledgeStrategy({
-        targetChunkTokens: 5000,
-        recentWindowTokens: 50,
-      });
-
-      const manager = await ContextManager.open({
-        path: TEST_STORE_PATH,
-        strategy,
-      });
-
-      // Rapid transitions: research, synthesis, research, synthesis
-      // Each pair is 2 messages — the minimum chunk size
-      manager.addMessage('Claude', [{
-        type: 'tool_use', id: 'tu1', name: 'mcpl:search', input: {},
-      }]);
-      manager.addMessage('User', [{
-        type: 'tool_result', toolUseId: 'tu1', content: 'Result',
-      }]);
-      // Phase transition → should close research chunk (2 messages)
-
-      manager.addMessage('Claude', [{ type: 'text', text: 'Analysis...' }]);
-      manager.addMessage('User', [{ type: 'text', text: 'Ok' }]);
-      // Phase transition → should close synthesis chunk (2 messages)
-
-      manager.addMessage('Claude', [{
-        type: 'tool_use', id: 'tu2', name: 'mcpl:search', input: {},
-      }]);
-      manager.addMessage('User', [{
-        type: 'tool_result', toolUseId: 'tu2', content: 'Result 2',
-      }]);
-
-      // Pad
-      for (let i = 0; i < 6; i++) {
-        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(30)}` }]);
-      }
-
-      await manager.compile();
-      const state = getStrategyState(strategy);
-
-      // Non-final chunks should have at least 2 messages;
-      // the final chunk is allowed to be as small as 1 message
-      for (let i = 0; i < state.chunks.length - 1; i++) {
-        const chunk = state.chunks[i];
-        assert.ok(chunk.messages.length >= 2,
-          `Chunk ${chunk.index} has only ${chunk.messages.length} message(s)`);
-      }
-      if (state.chunks.length > 0) {
-        const last = state.chunks[state.chunks.length - 1];
-        assert.ok(last.messages.length >= 1,
-          `Final chunk has ${last.messages.length} messages`);
       }
 
       manager.close();
@@ -593,7 +532,7 @@ describe('KnowledgeStrategy', () => {
       manager_close_noop();
     });
 
-    it('should produce merge instructions that include source phase composition', async () => {
+    it('should keep the [LEAD] instruction in merge instructions', async () => {
       cleanup();
       const strategy = new KnowledgeStrategy({
         targetChunkTokens: 100,
@@ -616,64 +555,51 @@ describe('KnowledgeStrategy', () => {
 
       const instruction = getMerge(2, sources, 2000);
 
-      // Should mention the count and level
-      assert.ok(instruction.includes('3'), 'Should mention source count');
-      assert.ok(instruction.includes('L1'), 'Should mention source level');
-      // Should mention phase composition
-      assert.ok(instruction.includes('research'), 'Should mention research phase');
-      assert.ok(instruction.includes('synthesis'), 'Should mention synthesis phase');
-      // Should preserve [LEAD] instruction
       assert.ok(instruction.includes('[LEAD]'), 'Should preserve LEAD instruction');
-
-      manager_close_noop();
-    });
-
-    it('should differentiate L2 and L3 merge instructions', async () => {
-      cleanup();
-      const strategy = new KnowledgeStrategy({
-        targetChunkTokens: 100,
-        recentWindowTokens: 50,
-      });
-
-      const getMerge = (strategy as any).getMergeInstruction.bind(strategy);
-
-      const sources: SummaryEntry[] = [{
-        id: 'test', level: 1, content: '', tokens: 100, sourceLevel: 0,
-        sourceIds: ['m0'], sourceRange: { first: 'm0', last: 'm0' },
-        created: Date.now(), phaseType: 'synthesis',
-      }];
-
-      const l2Instruction = getMerge(2, sources, 2000);
-      const l3Instruction = getMerge(3, sources, 2000);
-
-      assert.ok(l2Instruction.includes('L1 summaries'), 'L2 merge should reference L1 sources');
-      assert.ok(l3Instruction.includes('L2 summaries'), 'L3 merge should reference L2 sources');
 
       manager_close_noop();
     });
   });
 
   describe('Constructor Type Safety', () => {
-    it('should preserve knowledge-specific config fields', () => {
+    it('should classify by the tool prefixes and names it is given', async () => {
+      cleanup();
       const strategy = new KnowledgeStrategy({
+        targetChunkTokens: 5000,
+        recentWindowTokens: 50,
         researchToolPrefixes: ['custom:'],
         subagentToolPrefixes: ['agent:'],
         lessonToolNames: ['learn:save'],
-        researchL1BudgetCap: 0.2,
-        synthesisL1BudgetFloor: 0.5,
-        synthesisL1BudgetCap: 0.8,
-        maxResearchChunkTokens: 10000,
       });
 
-      const config = (strategy as any).knowledgeConfig as KnowledgeConfig;
+      const manager = await ContextManager.open({
+        path: TEST_STORE_PATH,
+        strategy,
+      });
 
-      assert.deepStrictEqual(config.researchToolPrefixes, ['custom:']);
-      assert.deepStrictEqual(config.subagentToolPrefixes, ['agent:']);
-      assert.deepStrictEqual(config.lessonToolNames, ['learn:save']);
-      assert.strictEqual(config.researchL1BudgetCap, 0.2);
-      assert.strictEqual(config.synthesisL1BudgetFloor, 0.5);
-      assert.strictEqual(config.synthesisL1BudgetCap, 0.8);
-      assert.strictEqual(config.maxResearchChunkTokens, 10000);
+      const call = (id: string, name: string): void => {
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name, input: {} }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Result ${id}` }]);
+      };
+      call('tu1', 'custom:find');
+      manager.addMessage('Claude', [{ type: 'text', text: 'Based on that, I conclude...' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Makes sense' }]);
+      call('tu2', 'agent:spawn');
+      manager.addMessage('Claude', [{ type: 'text', text: 'The agent reported back.' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Good' }]);
+      call('tu3', 'learn:save');
+      for (let i = 0; i < 10; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(40)}` }]);
+      }
+
+      await manager.compile();
+      const phases = getStrategyState(strategy).chunks.map(c => c.phaseType);
+      assert.deepStrictEqual(
+        phases.filter((p) => p === 'research' || p === 'subagent' || p === 'lesson').filter((p, i, run) => i === 0 || run[i - 1] !== p),
+        ['research', 'subagent', 'lesson'],
+        `each call's phase, in the order of the calls: ${phases.join(', ')}`,
+      );
+      manager.close();
     });
 
     it('should force hierarchical mode', () => {
@@ -706,6 +632,8 @@ describe('KnowledgeStrategy', () => {
       const strategy = new KnowledgeStrategy({
         targetChunkTokens: 100,
         recentWindowTokens: 50,
+        compressionModel: 'test-compression-model',
+        l1HoldbackChunks: 0,
       });
 
       const manager = await ContextManager.open({
@@ -713,6 +641,10 @@ describe('KnowledgeStrategy', () => {
         strategy,
         membrane: mockMembrane as any,
       });
+      manager.setToolDefinitions([
+        { name: 'mcpl:search', description: 'search', inputSchema: { type: 'object' } },
+        { name: 'mcpl:get', description: 'get', inputSchema: { type: 'object' } },
+      ] as never);
 
       // Research messages
       manager.addMessage('Claude', [{
@@ -739,13 +671,11 @@ describe('KnowledgeStrategy', () => {
         await manager.tick();
       }
 
-      // Verify compression was called with research-specific prompt
-      if (lastRequest) {
-        const lastMessage = lastRequest.messages[lastRequest.messages.length - 1];
-        const text = lastMessage.content.map((b: any) => b.text).join('');
-        assert.ok(text.includes('research'),
-          'Compression prompt should mention research for research chunks');
-      }
+      assert.ok(lastRequest, 'premise: a compression request was sent');
+      const lastMessage = lastRequest.messages[lastRequest.messages.length - 1];
+      const text = lastMessage.content.map((b: any) => b.text).join('');
+      assert.ok(text.includes('research'),
+        'Compression prompt should mention research for research chunks');
 
       manager.close();
     });

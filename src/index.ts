@@ -70,6 +70,7 @@ export type {
   ContextEntry,
   TokenBudget,
   PendingWork,
+  WaitingWork,
   BranchInfo,
   ContextInjection,
   CompileResult,

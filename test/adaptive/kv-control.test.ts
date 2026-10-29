@@ -67,13 +67,11 @@ test('flat zone and pins are never folded', () => {
   assert.ok(r.foldEvents > 0, 'fixture should force folding');
 
   // foldDepthCap must report 0 for the pin and for the flat zone, at any age.
-  const tree = new SummaryTree(inputs);
   const flat = new Set<string>([ch.chunks[89].id]);
   assert.equal(foldDepthCap(ch.chunks[3], 89, new Set(), 6, 6), 0, 'pinned chunk cap 0');
   assert.equal(foldDepthCap(ch.chunks[89], 89, flat, 6, 6), 0, 'flat-zone chunk cap 0');
   // An old un-pinned chunk should be allowed to fold.
   assert.ok(foldDepthCap(ch.chunks[10], 89, new Set(), 6, 6) >= 1, 'old chunk foldable');
-  void tree;
 });
 
 test('W is the only hard wall: escalates instead of exceeding it', () => {

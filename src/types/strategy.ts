@@ -138,13 +138,20 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether the strategy has no background work pending. compile() doesn't
-   *  wait for that work either way: it compiles from what's there. */
+  /** Whether the strategy has no background work pending, other than work
+   *  that waits on something only the host can give, such as its tool
+   *  definitions: `waitingOn` names that. compile() doesn't wait for either:
+   *  it compiles from what's there. */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
   /** Description of pending work */
   description?: string;
+  /** Set while some background work waits on the host, ready or not:
+   *  'tools' until it declares its tool definitions. */
+  waitingOn?: 'tools';
+  /** Description of the work waiting on the host, when `waitingOn` is set */
+  waitingDescription?: string;
 }
 
 /**
@@ -262,8 +269,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Whether the strategy has background work pending, with its info if so.
-   * compile() doesn't wait for it.
+   * Whether the strategy has background work pending, with its info if so,
+   * and what waits on the host. compile() doesn't wait for it.
    */
   checkReadiness(): ReadinessState;
 
@@ -2192,14 +2199,15 @@ export interface AutobiographicalConfig {
    * renders raw: a result is replaced once the conversation holds N newer
    * answered calls of its tool, folded ones included, so folding never
    * brings a replaced result back. A result answers the earliest call with
-   * its id, in an earlier message, that no result has answered yet; a
-   * further result for an answered call goes with that call. Calls are
-   * ordered by the message that made them, and calls made in one message by
-   * where their results are stored, as the render sends them unless pairing
-   * repair moves some. A result is replaced before `maxMessageTokens` cuts its
-   * message, and the plan and the render stats price it as its marker. A
-   * fractional limit keeps its whole part. A limit that isn't a number of 0
-   * or more, such as a null from a caller outside TypeScript, sets no limit.
+   * its id before it, in its own message or an earlier one, that no result
+   * has answered yet; a further result for an answered call goes with that
+   * call. Calls are ordered by the message that made them, and calls made in
+   * one message by where their results are stored, as the render sends them
+   * unless pairing repair moves some. A result is replaced before
+   * `maxMessageTokens` cuts its message, and the plan and the render stats
+   * price it as its marker. A fractional limit keeps its whole part. A limit
+   * that isn't a number of 0 or more, such as a null from a caller outside
+   * TypeScript, sets no limit.
    * The stored message, which chunking and compression read, is unchanged.
    *
    * Two shapes accepted:

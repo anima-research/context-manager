@@ -44,7 +44,6 @@ import {
 import {
   CAPPED_RENDER_CASE_NAMES,
   combinedSharedBudgetCases,
-  combinedSharedBudgetPrices,
   renderCappedCase,
   renderCombinedSharedBudgetCase,
   type CappedRenderCaseName,
@@ -243,8 +242,8 @@ function assertSharedBudgetShape(answer: RenderedMessage, testCase: CombinedShar
     return;
   }
 
-  const { firstSummary, separator } = combinedSharedBudgetPrices();
-  const proseBudget = testCase.maxMessageTokens - firstSummary - separator;
+  const charge = (prose: string): number => Math.ceil(prose.length / 4);
+  const proseBudget = testCase.maxMessageTokens - charge(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE) - charge(COMBINED_RECALL_SEPARATOR_TEXT);
   assert.match(bodies[1], TRUNCATION_MARKER, `${label}: summary two must carry the truncation marker`);
   const emittedProse = bodies[1].replace(TRAILING_TRUNCATION_MARKER, '');
   assert.ok(

@@ -99,8 +99,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       if (s.level === 1) for (const id of s.sourceIds) coveredBy.set(id, s.id);
     }
 
-    this.chunks = [];
-    this.compressionQueue = [];
+    this.resetChunks();
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;

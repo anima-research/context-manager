@@ -15,9 +15,10 @@ npm run typecheck
 node scripts/verify-kv-unified-offline.mjs
 ```
 
-The offline runner excludes only `test/autobiographical.test.ts`, which creates
-a real Anthropic provider. The combined source previously passed 954 tests in
-121 files, with zero failures or cancellations under Node 22.22.3. The final
+The offline runner then excluded only `test/autobiographical.test.ts`, which
+created a real Anthropic provider and has since been removed. The combined
+source previously passed 954 tests in 121 files, with zero failures or
+cancellations under Node 22.22.3. The final
 publish copy was freshly built and typechecked, and passed 46 focused tests
 (including changelog checks) with zero failures or cancellations. Its 208
 TypeScript/build input files and emitted runtime JavaScript match the validated

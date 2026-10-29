@@ -2272,6 +2272,31 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
+  it('names nothing for a queued merge of real summaries on a Fable summarizer before the host declares its tools, which tick leaves waiting, and compression once it has', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      hierarchical: true,
+      positionedRecallPairs: true,
+      targetChunkTokens: 100_000,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      compressionModel: 'claude-fable-5-1',
+    });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      strategy.seedL1('L1-a', [ids[0]!]);
+      strategy.seedL1('L1-b', [ids[1]!]);
+      strategy.queueMergeOf(['L1-a', 'L1-b']);
+      assert.deepEqual((await refusal(manager)).clearedBy, [], 'with no tools declared, the merge waits');
+      manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, it counts');
+    });
+  });
+
   it('counts no queued merge with hierarchical merging off, since tick runs merges only with it on', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,

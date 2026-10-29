@@ -37,12 +37,14 @@ test('reusable buckets keep numeric/string identities separate and reset each ge
   const buckets = new PackedBuckets(100);
   for (let pass = 0; pass < 100; pass++) {
     buckets.begin(2500);
-    assert.equal(buckets.group(17), 0);
-    assert.equal(buckets.group('17'), 1);
-    assert.equal(buckets.group(17), 0);
-    assert.equal(buckets.group(-1), 2);
+    const numeric = buckets.group(17);
+    const text = buckets.group('17');
+    assert.notEqual(text, numeric, 'a string key is not its number');
+    assert.equal(buckets.group(17), numeric, 'a repeat lookup is the same group');
+    const negative = buckets.group(-1);
+    assert.ok(negative !== numeric && negative !== text);
     for (let i = 1000; i < 3500; i++) buckets.group(i);
-    assert.equal(buckets.count, 2503);
+    assert.equal(buckets.count, 3 + 2500, 'one group per distinct key of this generation');
   }
 });
 

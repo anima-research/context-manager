@@ -81,12 +81,8 @@ describe('tools-less summarizer deferral', () => {
       await drain(manager);
       assert.strictEqual(calls.length, 0, 'no summarizer call may be issued before the host pushes tools');
       manager.setToolDefinitions(TOOLS);
-      // Deferred chunks are not a queued work item; they are re-examined on the
-      // next ingestion/activation (exactly what a resident's first turn does).
       await drain(manager);
-      manager.addMessage('user', [t('one more line after the host pushed tools')]);
-      await drain(manager);
-      assert.ok(calls.length > 0, 'compression resumes once tools are pushed and the next message lands');
+      assert.ok(calls.length > 0, 'compression resumes once tools are pushed, with no new message');
       assert.ok(calls.every((c) => Array.isArray(c.tools) && (c.tools as unknown[]).length === TOOLS.length), 'every summarizer request declares the live tools');
       await manager.close();
     });
@@ -95,7 +91,8 @@ describe('tools-less summarizer deferral', () => {
   it('non-Fable summarizer + pure-chat chunks: still mints tools-less (baseline behaviour preserved)', async () => {
     const { manager, calls } = await openChatty('test-compression-model');
     await drain(manager);
-    assert.ok(calls.length > 0, 'tools-less compression proceeds on non-Fable summarizers');
+    assert.ok(calls.length > 0, 'compression proceeds on non-Fable summarizers');
+    assert.ok(calls.every((call) => !Array.isArray(call.tools) || call.tools.length === 0), `and its requests carry no tools: ${JSON.stringify(calls.map((call) => call.tools))}`);
     await manager.close();
   });
 });

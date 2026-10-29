@@ -161,6 +161,16 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches.
 
+CI's test step runs `bash scripts/test-each-file.sh`, which runs each compiled
+test file in a node process of its own, as many at once as node's
+`os.availableParallelism()` gives. `TEST_EACH_FILE_JOBS` sets that number
+instead: a whole number above 0, with no leading zero, and 1 runs the files
+one after another; empty or unset takes the default. Each file's output is
+printed under a line naming it, in the files' sorted order: the earliest file
+still running prints its output as it comes, and each later file's waits for
+its turn. So no two files' output mixes, and if a file never ends, the log
+shows what the earliest such file has written.
+
 Push-time CI (`ci.yml`) runs on every push to `main` and every PR. It
 typechecks, builds and tests once, on ubuntu at the engines floor (Node
 22.12.0). Every other leg, on ubuntu and macos, installs with `npm ci`, packs

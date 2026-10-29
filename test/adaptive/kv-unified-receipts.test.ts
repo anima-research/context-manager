@@ -199,11 +199,10 @@ test('decoding validates persisted runs before expanding them', () => {
   bad([{ value: null, ids: ['1', -Number.MAX_SAFE_INTEGER] }], /malformed gap-coded/);
   bad([{ value: null, ids: ['1', -(MAX_DECODED_LEAVES + 1)] }], /expand to more than/);
   bad([{ value: null, ids: ['1', -1_000_000] }, { value: null, ids: ['5000000', -1_100_000] }], /expand to more than/);
-  // The bound counts literal ids too, and is checked before anything is expanded.
-  assert.equal(decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c'] }], 3).length, 3);
-  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c', 'd'] }], 3), /expand to more than 3 leaves/);
-  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['1', -2] }, { value: null, ids: ['x'] }], 3), /expand to more than 3 leaves/);
-  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['x'] }, { value: null, ids: ['1', 5, -2] }], 3), /expand to more than 3 leaves/);
+  assert.equal(decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c'] }], 3).length, 3, 'literal ids up to the bound decode');
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c', 'd'] }], 3), /expand to more than 3 leaves/, 'literal ids count toward the bound');
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['1', -2] }, { value: null, ids: ['x'] }], 3), /expand to more than 3 leaves/, 'a literal after a gap counts too');
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['x'] }, { value: null, ids: ['1', 5, -2] }], 3), /expand to more than 3 leaves/, 'literals and gaps count together across runs');
   bad([{ value: null, ids: ['1', '1'] }], /duplicate leaf id 1/);
   bad([{ value: null, ids: ['2', -1] }, { value: leaf('x', 1), ids: ['3'] }], /duplicate leaf id 3/);
 });

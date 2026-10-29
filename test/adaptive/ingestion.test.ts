@@ -106,7 +106,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
-  it('flag on: compile renders bodyGroup as ONE entry with byte-faithful body (no folding)', async () => {
+  it('flag on: a large body in the recent window is sent byte for byte, unfolded', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
       compressionModel: 'mock',      adaptiveResolution: true,
@@ -126,13 +126,9 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.addMessage('User', [{ type: 'text', text: bigBody }]);
 
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 1000 });
-    // Note: the doc lands in the tail window (no compression triggered).
-    // Tail uses newest-first eviction; the bodyGroup may render as a single
-    // entry OR as separate shards depending on tail emission. The current
-    // selectAdaptive only does bodyGroup-aware emission for the MIDDLE,
-    // not for the tail. So with everything in tail, we see N shards.
-    // For this test, we just verify compile produced output.
-    assert.ok(compiled.messages.length > 0, 'compile should produce output');
+    const sent = compiled.messages.flatMap((m) => m.content).map((b) => (b.type === 'text' ? b.text : '')).join('');
+    assert.ok(sent.includes(bigBody), 'the body reaches the request whole, in order');
+    assert.equal(mock.callCount, 0, 'premise: nothing was compressed');
     manager.close();
   });
 

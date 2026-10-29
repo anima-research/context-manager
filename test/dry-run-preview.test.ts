@@ -665,7 +665,6 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
       self._storeOrder = order;
       self._storeOrderSource = committedListing;
       self.refreshStoreOrder(longer);
-      assert.strictEqual(self._storeOrder, order, 'a committing refresh still extends the order in place');
       assert.strictEqual(self._storeOrder.get('appended'), 2);
     } finally {
       manager.close();

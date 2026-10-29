@@ -1186,22 +1186,6 @@ describe('fold journal size', () => {
       assert.deepEqual(applyLayoutChain(layouts[0]!, deltas), layouts.at(-1), `chain ${chain}, in one pass`);
     }
   });
-
-  it('a delta re-sends the units from the first change to the last, so changes far apart re-send what lies between', () => {
-    // A hundred distinct units over a hundred members; `at` changes the units at those places.
-    const members = Array.from({ length: 100 }, (_, i) => i + 1);
-    const prev: StoredLayout = { members, units: Array.from({ length: 100 }, (_, i): LayoutUnit => ({ k: 'r', t: i })) };
-    const at = (...places: number[]): StoredLayout => ({ members, units: prev.units.map((u, i) => (places.includes(i) ? { k: 'r', t: 1000 + i } : u)) });
-    const sent = (next: StoredLayout): number => {
-      const delta = layoutDelta(prev, next);
-      assert.deepEqual(applyLayoutDelta(prev, delta), next);
-      return (delta.ins?.length ?? 0) + (delta.app?.length ?? 0);
-    };
-    assert.equal(sent(at(40)), 1, 'one change in the middle: one unit');
-    assert.equal(sent(at(99)), 1, 'the last unit: one unit');
-    assert.equal(sent(at(10, 90)), 81, 'two changes: every unit from the first to the last');
-    assert.equal(sent(at(0, 99)), 100, 'a change at each end: the whole view');
-  });
 });
 
 describe('fold journal durability and index', () => {

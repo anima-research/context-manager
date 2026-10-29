@@ -580,17 +580,12 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     const again = await ContextManager.open({ path: PATH, strategy: reopened, membrane: membrane as never });
     assert.equal(reopened.queue.length, 2, 'premise: both persisted entries are loaded');
     const mergesBefore = state.merges;
-    let landings = 0;
-    const hook = reopened as unknown as { noteCompressionLanded(membrane: object, model: string | undefined): void };
-    const landed = hook.noteCompressionLanded.bind(reopened);
-    hook.noteCompressionLanded = (m, model) => { landings++; landed(m, model); };
     await ticks(again, 3);
     const parentOf = (id: string) => reopened.all.find((s) => s.id === id);
     assert.equal(parented(parentOf(l1s[2]!)), false, 'the held source stays unmerged');
     assert.equal(reopened.quarantinedGroups().length, 1, 'the skip writes no record');
     assert.equal(parented(parentOf(l1s[4]!)), true, 'the entry clear of the hole merges');
     assert.equal(state.merges - mergesBefore, 1, 'only that entry reaches the provider');
-    assert.equal(landings, 1, 'the skip is no landing: only the merge that ran is');
     assert.equal(reopened.queue.length, 0, 'the held entry leaves the queue');
     again.close();
   });

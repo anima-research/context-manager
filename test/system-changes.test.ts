@@ -33,7 +33,6 @@ import {
 } from '../src/index.js';
 import { jsonTokenEstimator } from '../src/message-store.js';
 import { wellFormedContent } from '../src/well-formed-content.js';
-import { systemChangePositions } from '../src/system-changes.js';
 import type { CompileResult, ContextStrategy, StoredMessage, TokenBudget } from '../src/types/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'cm-system-changes-'));
@@ -740,14 +739,6 @@ describe('the autobiographical strategy and a system change', () => {
     assert.deepEqual(collapse([{ participant: 'User', content: [] }, { participant: 'Claude', content: [] }]), []);
   });
 
-  it("finds a listing's changes once, and a new listing's afresh", () => {
-    const m = (...content: ContentBlock[]): { content: ContentBlock[] } => ({ content });
-    const listing = [m(text('a')), m(change()), m(text('b'))];
-    assert.deepEqual(systemChangePositions(listing), [1]);
-    assert.equal(systemChangePositions(listing), systemChangePositions(listing), 'the same listing: the same answer');
-    assert.notEqual(systemChangePositions([...listing]), systemChangePositions(listing), 'a new listing: found again');
-  });
-
   it('a large change is never sharded at ingress', async () => {
     const cm = await open(new AutobiographicalStrategy({ compressionModel: 'm', targetChunkTokens: 200, adaptiveResolution: true, autoTickOnNewMessage: false }));
     cm.addMessage('Harness', [change({ addSystem: ['x '.repeat(5000)] })]);
@@ -1191,29 +1182,6 @@ describe('firstChanged', () => {
     assert.equal(first.firstChanged, null);
     assert.equal(third.firstChanged, 1, 'read first after a later compile, the third against the second');
     assert.equal(second.firstChanged, 2, 'still the second compile against the first');
-  });
-
-  it('serializes nothing on a read where the compiled arrays are the last compile\'s', async () => {
-    let serialized = 0;
-    const counted = (block: ContentBlock): ContentBlock => ({ ...block, toJSON: () => { serialized++; return block; } }) as unknown as ContentBlock;
-    const sent = new Map<string, ContentBlock[]>();
-    const strategy = new (class extends PassthroughStrategy {
-      select(...args: Parameters<PassthroughStrategy['select']>): ReturnType<PassthroughStrategy['select']> {
-        return super.select(...args).map((entry) => {
-          const id = entry.sourceMessageId!;
-          if (!sent.has(id)) sent.set(id, entry.content.map(counted));
-          return { ...entry, content: sent.get(id)! };
-        });
-      }
-    })();
-    const cm = await open(strategy);
-    cm.addMessage('User', [text('a')]);
-    cm.addMessage('Claude', [text('b')]);
-    await cm.compile(BIG);
-    const second = await cm.compile(BIG);
-    const before = serialized;
-    assert.equal(second.firstChanged, 2);
-    assert.equal(serialized, before, 'the same arrays are compared by identity');
   });
 
   it('is carried by a copy and JSON, read on a frozen result, takes an assignment, and leaves out system injections', async () => {

@@ -554,6 +554,7 @@ describe('ContextManager.derive', () => {
     assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/mira/autobio:summaries'));
     assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/mira/context'));
     assert.equal(child.getDerivation()!.inherited.stateIds.includes('agents/mira/autobio:mergeQueue'), false);
+    assert.deepEqual(child.getDerivation()!.inherited.stateIds.filter((id) => id.startsWith('agents/oren/')), []);
     assert.deepEqual(child.getDerivation()!.slots, {
       messageNamespace: null, // a resident's messages are in the shared slot
       contextNamespace: 'agents/mira',
@@ -635,11 +636,12 @@ describe('ContextManager.derive', () => {
       strategy: new PassthroughStrategy(),
       atSequence: cut,
     });
+    managers.push(past);
     assert.deepEqual(past.getAllMessages().map((m) => m.id), ids.slice(0, 10));
     assert.equal(past.getDerivation()!.atSequence, cut);
     assert.equal(past.getDerivation()!.solve, 'reuse');
     const pastFolding = folding();
-    await parent.derive({ branch: 'dendrite/past-folding', strategy: pastFolding, atSequence: cut });
+    managers.push(await parent.derive({ branch: 'dendrite/past-folding', strategy: pastFolding, atSequence: cut }));
     assert.equal((pastFolding as unknown as { _prevCacheKeys?: string[] })._prevCacheKeys, undefined, 'nothing the parent holds in memory describes that point, so nothing is handed over');
     past.addMessage('User', turn(400, 'Alternate'));
     assert.equal(parent.getAllMessages().length, HISTORY, 'the original stays inspectable and unchanged');

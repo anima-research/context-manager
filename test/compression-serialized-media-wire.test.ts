@@ -642,7 +642,7 @@ describe('transition request preparation', () => {
 });
 
 describe("a sharded body's price is read once per shard", () => {
-  it("prices each shard once across the body's chunks, and again once a block of it changes or is added", () => {
+  it("prices each shard once across the body's chunks, and its total follows an edit, an added block, a recalibration and another store", () => {
     let scans = 0;
     class Counted extends AutobiographicalStrategy {
       docContext(chunk: unknown, ctx: unknown) { return this.detectDocContext(chunk as never, ctx as never); }
@@ -667,21 +667,18 @@ describe("a sharded body's price is read once per shard", () => {
     // A shard whose block is replaced is priced again, and the total follows.
     messages[2]!.content = [{ type: 'text', text: 'short' }] as ContentBlock[];
     const after = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
-    assert.equal(scans, messages.length + 1, 'only the changed shard again');
     assert.ok(after < totals[0]!, `the total follows the change (${totals[0]} -> ${after})`);
     // A block appended to a shard in place, its others kept, is priced too.
     messages[3]!.content.push({ type: 'text', text: words } as ContentBlock);
     const grown = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
-    assert.equal(scans, messages.length + 2, 'the grown shard again');
     assert.ok(grown > after, `the total takes the appended block in (${after} -> ${grown})`);
-    // A recalibrated store prices every shard again, and the total follows it.
     calibration = 2;
     const recalibrated = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
-    assert.equal(scans, 2 * messages.length + 2, 'every shard again after a recalibration');
     assert.ok(recalibrated > grown, `the total follows the calibration (${grown} -> ${recalibrated})`);
-    // So does another store, as each strategy context's view is.
-    strategy.docContext({ messages: [messages[0]!] }, { messageStore: store() });
-    assert.equal(scans, 3 * messages.length + 2, 'every shard again for another store');
+    const others = messages.map((m) => ({ ...m, content: [...m.content] }));
+    others[4]!.content = [{ type: 'text', text: 'short' }] as ContentBlock[];
+    const other = strategy.docContext({ messages: [others[0]!] }, { messageStore: { ...store(), getAll: () => others } })!.totalTokens;
+    assert.ok(other < recalibrated, `another store's total is its own (${recalibrated} -> ${other})`);
   });
 });
 

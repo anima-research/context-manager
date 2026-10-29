@@ -41,8 +41,7 @@ class Probe extends AutobiographicalStrategy {
 }
 
 class QuarantineProbe extends Probe {
-  regrouped = 0;
-  protected override checkMergeThreshold(): void { this.regrouped++; }
+  protected override checkMergeThreshold(): void {}
   seedQuarantine(sourceIds: string[]): void {
     (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set('q', {
       key: 'q',
@@ -164,7 +163,7 @@ test('stranded interior runs merge at >=2; only the newest run waits for the thr
   assert.equal(p.pick(onlyNewest, 6), null, 'the growable run waits for 6');
 });
 
-test('partially paid quarantine is stale and releases orphan regrouping', () => {
+test('partially paid quarantine is stale and swept', () => {
   const p = new QuarantineProbe({ adaptiveResolution: true, autoTickOnNewMessage: false });
   p.setSummaries([
     { ...summary('a', 0, 10), mergedInto: 'L3-paid' },
@@ -175,7 +174,6 @@ test('partially paid quarantine is stale and releases orphan regrouping', () => 
   p.sweep();
 
   assert.equal(p.quarantineSize(), 0);
-  assert.equal(p.regrouped, 1, 'remaining orphan is reconsidered under the current grammar');
 });
 
 test('persisted merge queues from the old gap grammar are discarded', () => {

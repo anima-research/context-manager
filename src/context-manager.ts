@@ -11,6 +11,7 @@ import type {
   ContextEntry,
   TokenBudget,
   PendingWork,
+  WaitingWork,
   BranchInfo,
   ContextStrategy,
   StrategyContext,
@@ -373,8 +374,8 @@ export class InitializationSupersededError extends Error {
  * Mutations and strategy operations require a completed initialization attempt.
  * Pending or failed attempts refuse that work. They also refuse the
  * strategy-state queries, whose answers could then belong to another branch or
- * be partial: isReady, getPendingWork, getHotContextSettings, previewContext,
- * listPins, searchSummaries, getSummary, getSummariesInRange,
+ * be partial: isReady, getPendingWork, getWaitingWork, getHotContextSettings,
+ * previewContext, listPins, searchSummaries, getSummary, getSummariesInRange,
  * getMaxSummaryLevel and getRenderStats. Raw message reads and branch
  * inspection remain available for recovery with switchBranch() or
  * setStrategy(). So do compression holds (holdCompression,
@@ -1507,8 +1508,9 @@ export class ContextManager {
 
   /**
    * Whether the strategy has no background work pending (its
-   * `checkReadiness()`). compile() doesn't wait for that work: it compiles
-   * from what's there.
+   * `checkReadiness()`), other than work that waits on the host, such as for
+   * its tool definitions, which getWaitingWork() names. compile() doesn't
+   * wait for that work: it compiles from what's there.
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
@@ -1529,6 +1531,18 @@ export class ContextManager {
       description: state.description ?? 'Background work pending',
       started: new Date(),
     };
+  }
+
+  /**
+   * Background work that waits on something only the host can give, such as
+   * its tool definitions, which `isReady()` and `getPendingWork()` don't
+   * count. Null when nothing waits.
+   */
+  getWaitingWork(): WaitingWork | null {
+    this.requireInitialized('getWaitingWork');
+    const state = this.strategy.checkReadiness();
+    if (state.waitingOn === undefined) return null;
+    return { waitingOn: state.waitingOn, description: state.waitingDescription ?? 'Background work waits on the host' };
   }
 
   /**
