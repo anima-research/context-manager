@@ -5848,6 +5848,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return exhaustion;
   }
 
+  /**
+   * Whether a row of the chunk's span left the window while its request was
+   * in flight (windowLost), logging so when it did. A ladder over such a
+   * span writes nothing when it lands: no L1, which would cover a row the
+   * window no longer holds, and, when it ends with no summary, no
+   * quarantine record for a chunk that is gone, since its record is
+   * compressed again over the rows it keeps.
+   */
+  private spanLeftWindowMidRequest(chunk: Chunk): boolean {
+    if (!this._spanLeftWindow.has(chunk)) return false;
+    this.diag.warn(
+      '[autobiographical] the ladder ended with no summary and quarantines nothing: a row of its span left the window ' +
+        'mid-request, and its chunk record is compressed again over the rows it keeps',
+    );
+    return true;
+  }
+
   /** A ladder ended with no summary on a family dropped while it ran: it writes no record. */
   private logCompressionFamilyDropped(chunk: Chunk, record: CompressionRefusalQuarantineRecord): void {
     this.diag.warn(
@@ -11660,6 +11677,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
             return;
           }
+          if (this.spanLeftWindowMidRequest(chunk)) return;
           const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           settleExhaustion(exhaustion);
@@ -11768,6 +11786,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // an empty assistant text block → Anthropic 400 "content must be non-empty".
       // Leave the chunk raw rather than poisoning memory with an empty summary.
       if (!summaryText.trim()) {
+        if (this.spanLeftWindowMidRequest(chunk)) return;
         this.diag.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — quarantining (chunk stays raw)`);
         // Durable accounting (cm #55): without it, an all-thinking chunk
         // that survived the prose retry was re-attempted on every

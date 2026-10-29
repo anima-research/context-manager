@@ -678,6 +678,56 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     }
   });
 
+  // House review of #350, code finding 6: a ladder in flight over a row
+  // that leaves, which ends with no summary, writes no quarantine record
+  // for the chunk the row left, as an L1 that lands writes no summary.
+  it('a ladder in flight over a row that leaves, which ends with no summary, quarantines nothing', async () => {
+    for (const [leaves, answer] of [[true, 'empty'], [false, 'empty'], [true, 'refused'], [false, 'refused']] as const) {
+      const label = `${leaves ? 'probe' : 'control'}, every answer ${answer}`;
+      const { gate, open } = gated();
+      let started!: () => void;
+      const out = new Promise<void>((resolve) => { started = resolve; });
+      let held = false;
+      // Every answer is empty text, which strips to nothing (the canonical's
+      // and the plain-prose retry's), or a refusal (every rung's, split-stitch's
+      // among them), so the ladder ends with no summary.
+      const membrane = {
+        complete: async () => {
+          if (!held) {
+            held = true;
+            started();
+            await gate;
+          }
+          return answer === 'empty'
+            ? { stopReason: 'end_turn', content: [{ type: 'text', text: '' }], usage: { input_tokens: 10, output_tokens: 1 } }
+            : { stopReason: 'refusal', content: [], usage: { input_tokens: 10, output_tokens: 0 } };
+        },
+      } as never;
+      const strategy = autobiographical();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'agent', strategy, membrane });
+      cm.presentRows([]);
+      for (let i = 0; i < TAGS; i++) cm.presentRows([cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))])]);
+      const ticking = cm.tick();
+      await out;
+      const work = internals(strategy).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const leaving = work.chunk.messages.map((m) => m.id)[1]!;
+      const lines = await linesDuring(async () => {
+        if (leaves) cm.retractRows([leaving], { undone: true });
+        open();
+        await ticking;
+      });
+      const status = strategy.getCompressionQuarantineStatus();
+      if (leaves) {
+        assert.equal(status.count, 0, `${label}: no quarantine record was written for the chunk the row left: ${lines.join('\n')}`);
+        assert.ok(lines.some((line) => line.includes('a row of its span left the window mid-request')), lines.join('\n'));
+      } else {
+        assert.ok(status.count > 0, `${label}: the ladder that ended with no summary quarantined its chunk: ${lines.join('\n')}`);
+      }
+      cm.close();
+    }
+  });
+
   it('a merge in flight over a summary a retraction drops writes nothing', async () => {
     const { cm, strategy, mock } = await folding();
     const { gate, open } = gated();
