@@ -365,6 +365,11 @@ export class WindowIndex {
   private built: { source: readonly StoredMessage[]; version: number; listing: StoredMessage[] } | null = null;
 
   constructor(private readonly store: JsStore, namespace: string, private readonly diag: Diagnostics) {
+    // Asked at open as well as at each write of several items, so an
+    // app-owned handle from a chronicle older than the range admits is
+    // refused before any record changes — not after a removal has already
+    // left its rows' ordinals issued with only a log line to say so.
+    requireBatchedIdentityAppend(store);
     this.namespace = namespace;
     this.stateId = windowIndexStateId(namespace);
   }
@@ -952,7 +957,7 @@ export class WindowIndex {
  * installed beside it. The index has no one-record-per-item path, which
  * would let a write stop partway: a write of several items there throws,
  * writing nothing. Asked at each such write, as stateHeadOffset is at each
- * read.
+ * read, and once at open (the WindowIndex constructor).
  */
 function requireBatchedIdentityAppend(store: JsStore): void {
   if (typeof (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity === 'function') return;

@@ -482,6 +482,24 @@ describe('an index written one record per item', () => {
 });
 
 describe('a store handle without the batched append', () => {
+  it('is refused at open, before any record changes', async () => {
+    // An app-owned store (the README allows passing one) from a chronicle
+    // before 0.6.0: the manager refuses it when it is opened, not later at a
+    // removal whose tombstones it could not write.
+    const store = JsStore.openOrCreate({ path: freshPath() });
+    try {
+      const handle = store as unknown as Record<string, unknown>;
+      handle.appendManyToStateJsonWithIdentity = undefined;
+      await assert.rejects(
+        ContextManager.open({ store, namespace: 'zz-agent', strategy: new Hearing() }),
+        /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install @animalabs\/chronicle \^0\.6\.0/,
+      );
+    } finally {
+      delete (store as unknown as Record<string, unknown>).appendManyToStateJsonWithIdentity;
+      store.close();
+    }
+  });
+
   it('is refused at a write of several items, which writes nothing; a single row is written as before', async () => {
     const strategy = new Hearing();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
