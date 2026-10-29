@@ -31,6 +31,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   AutobiographicalStrategy,
   ContextManager,
+  KnowledgeStrategy,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
 } from '../src/index.js';
@@ -818,6 +819,48 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
         open.close();
       });
       assert.ok(!again.some((line) => line.includes('out of the window')), again.join('\n'));
+    }
+  });
+
+  // House review of #350, code finding 4: KnowledgeStrategy keeps its
+  // compressed chunks by key across a rebuild, and kept one compressed under
+  // the summary the retraction dropped, so its rows were never folded again.
+  it('KnowledgeStrategy: rows that left and came back in the same order while it initialized are folded again, under no summary it dropped', async () => {
+    for (const heard of [false, true]) {
+      const label = heard ? 'control' : 'probe';
+      const mock = mockMembrane();
+      const strategy = new KnowledgeStrategy({ ...FOLDING, recentWindowTokens: 0 });
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'agent', strategy, membrane: mock.membrane });
+      cm.presentRows([]);
+      for (let i = 0; i < TAGS; i++) cm.presentRows([cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))])]);
+      await drain(cm);
+      const state = strategy as unknown as { chunks: Array<{ messages: StoredMessage[]; compressed: boolean; summaryId?: string }>; summaries: SummaryEntry[] };
+      const last = [...state.chunks].reverse().find((c) => c.compressed);
+      assert.ok(last && state.summaries.some((s) => s.id === last.summaryId), 'premise: the last chunk is folded');
+      const rows = last.messages.map((m) => m.id);
+      assert.deepEqual(cm.getPresentedMessages().slice(-rows.length).map((m) => m.id), rows, 'premise: its rows end the window');
+      await linesDuring(async () => {
+        if (heard) {
+          cm.retractRows(rows, { undone: true });
+          cm.presentRows(rows);
+        } else {
+          const initialized = cm.setStrategy(strategy);
+          cm.retractRows(rows, { undone: true });
+          cm.presentRows(rows);
+          await initialized;
+        }
+      });
+      const named = () => {
+        const kept = new Set(state.summaries.map((s) => s.id));
+        return state.chunks.filter((c) => c.compressed && !(c.summaryId && kept.has(c.summaryId))).map((c) => c.summaryId);
+      };
+      assert.deepEqual(named(), [], `${label}: no chunk is compressed under a summary the strategy dropped`);
+      rendersWindowOnce(cm, await cm.compile(BIG), label);
+      await linesDuring(async () => drain(cm));
+      for (const id of rows) assert.ok(coveredRows(cm, strategy).has(id), `${label}: TAG${rows.indexOf(id)} of the chunk is folded again`);
+      assert.deepEqual(named(), [], `${label}, drained: no chunk is compressed under a summary the strategy dropped`);
+      rendersWindowOnce(cm, await cm.compile(BIG), `${label}, drained`);
+      cm.close();
     }
   });
 

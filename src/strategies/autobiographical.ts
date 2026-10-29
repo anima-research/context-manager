@@ -18228,7 +18228,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const key = this.chunkKey(chunk);
     const existing = existingCompressed.get(key);
-    if (existing) {
+    // A chunk compressed before the rebuild stays compressed only while what
+    // covers it is kept: its summary, or, for one the dedup guard found
+    // covered by L1s under other boundaries, an L1 over each of its rows. A
+    // summary a retraction dropped (onRetracted) no longer covers the rows,
+    // which are folded again.
+    if (existing && (existing.summaryId !== undefined
+      ? this.summaryById(existing.summaryId) !== undefined
+      : chunk.messages.every((m) => this.l1ByMessageIndex().has(m.id)))) {
       chunk.compressed = true;
       chunk.summaryId = existing.summaryId;
     }
