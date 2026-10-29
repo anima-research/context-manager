@@ -3225,9 +3225,10 @@ export class ContextManager {
    * for). Once a host presents rows on the branch (presentRows), a stored
    * row enters the window only when presented, so the transition is
    * presented before the head window is reset to start at it, and the
-   * strategy hears it there (ContextStrategy.onPresented); in legacy mode
-   * it is in the window from its add, as before, and nothing more is
-   * written.
+   * strategy hears it there (ContextStrategy.onPresented), unless a host's
+   * listener of its add (onMessage) presented it already, which this then
+   * leaves as it stands; in legacy mode it is in the window from its add,
+   * as before, and nothing more is written.
    *
    * Returns the transition summary text used. A close() from a listener of
    * the transition message's add lets the add finish, and the call then
@@ -3271,8 +3272,9 @@ export class ContextManager {
     }
 
     // Once rows are presented, the head window can start only at a row the
-    // window holds: the transition enters it first, as a host's own row does.
-    if (this.windowIndex.mode() === 'presented') {
+    // window holds: the transition enters it first, as a host's own row does,
+    // unless a host's listener of the add presented it already.
+    if (this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined) {
       try {
         this.presentRows([msgId]);
       } catch (error) {

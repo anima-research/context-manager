@@ -558,6 +558,31 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
   });
 });
 
+// House review of #350, code finding 9: once rows are presented,
+// resetHeadWindow presents its transition, unless a host's listener of the
+// add has presented it already.
+describe('resetHeadWindow once a host presents', () => {
+  it("goes ahead when a listener of the transition's add presented it already", async () => {
+    for (const listens of [true, false]) {
+      const label = listens ? 'probe' : 'control';
+      const strategy = new AutobiographicalStrategy({ headWindowTokens: 200, recentWindowTokens: 100 });
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      // A host that presents each row it stores, as it is stored.
+      if (listens) cm.onMessage((event) => { if (event.type === 'add') cm.presentRows([event.message.id]); });
+      const a = cm.addMessage('alice', [text('a')]);
+      if (!listens) cm.presentRows([a]);
+      const summary = await cm.resetHeadWindow('zz-transition');
+      assert.equal(summary, 'zz-transition', `${label}: resetHeadWindow resolved`);
+      const window = cm.getPresentedMessages();
+      assert.equal(window.length, 2, `${label}: the window holds the transition once, after a`);
+      assert.ok((window[1]!.content[0] as { text: string }).text.includes('zz-transition'), label);
+      assert.equal(cm.getAllMessages().length, 2, `${label}: one transition message was stored`);
+      cm.close();
+    }
+  });
+});
+
 describe('onPresented in legacy mode', () => {
   it('a strategy with onPresented hears each row from inside the add, after its hold is placed, and not through onNewMessage', async () => {
     const strategy = new Records();
