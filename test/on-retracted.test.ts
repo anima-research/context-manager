@@ -255,6 +255,38 @@ describe('onRetracted', () => {
     main.close();
   });
 
+  // House review of #350, untested contract 1: after a hook closes the
+  // manager, nothing else the call would tell reaches the strategy.
+  it('a hook that closes the manager: the call for the rows the store no longer holds is not made, and the rows stay out', async () => {
+    let cm!: ContextManager;
+    class ClosesOnFirst extends Records {
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: Info): Promise<void> {
+        this.retracted.push({ rows: rows.map((m) => m.id), texts: [], info, window: [] });
+        if (this.retracted.length === 1) cm.close();
+      }
+    }
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const strategy = new ClosesOnFirst();
+    cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    writer.removeMessage(b);
+    const lines = await linesDuring(async () => {
+      cm.retractRows([a, b], { undone: true });
+      await settle();
+    });
+    assert.ok(cm.isClosed());
+    assert.deepEqual(strategy.retracted.map((l) => [l.rows, l.info]), [[[a], { undone: true, removed: false, ids: [a] }]],
+      "the call for b, which the store no longer holds, isn't made after close()");
+    assert.ok(!lines.some((line) => /failed/.test(line)), lines.join('\n'));
+    const reader = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    assert.equal(reader.ordinalOf(a), undefined, 'the retract finished: a is out');
+    assert.equal(reader.ordinalOf(b), undefined, 'and so is b');
+    reader.close();
+    writer.close();
+  });
+
   it('a synchronous throw or a rejection is logged, naming the rows, and the rows stay out', async () => {
     class Throws extends PassthroughStrategy {
       calls = 0;
@@ -491,13 +523,26 @@ function leavesOf(cm: ContextManager, id: string): MessageId[] {
 
 /** Each message id a compile renders, raw or inside a summary, as often as it renders it. */
 function renderedRows(cm: ContextManager, result: CompileResult): MessageId[] {
-  const raw: MessageId[] = [];
-  const summaries = new Set<string>();
+  return renderedIds(result, (id) => leavesOf(cm, id));
+}
+
+/**
+ * Each message id `result` renders, raw or inside a summary, as often as it
+ * renders it, a summary's leaves given by `leaves`. A summary counts once
+ * per rendering: a run of consecutive compiled messages naming it is one
+ * rendering (a summary can render as more than one message), and the same
+ * summary named again after a message that doesn't name it is another.
+ */
+function renderedIds(result: Pick<CompileResult, 'provenance'>, leaves: (summaryId: string) => MessageId[]): MessageId[] {
+  const rendered: MessageId[] = [];
+  let previous = new Set<string>();
   for (const part of result.provenance?.messages ?? []) {
-    if (part.kind === 'raw') raw.push(...part.bodies.map((b) => b.messageId));
-    if (part.kind === 'summary') for (const s of part.summaries) summaries.add(s.id);
+    const named = new Set<string>(part.kind === 'summary' ? part.summaries.map((s) => s.id) : []);
+    if (part.kind === 'raw') rendered.push(...part.bodies.map((b) => b.messageId));
+    for (const id of named) if (!previous.has(id)) rendered.push(...leaves(id));
+    previous = named;
   }
-  return [...raw, ...[...summaries].flatMap((id) => leavesOf(cm, id))];
+  return rendered;
 }
 
 /** The message ids some summary the strategy keeps covers. */
@@ -531,6 +576,29 @@ function rendersWindowOnce(cm: ContextManager, result: CompileResult, label: str
   assert.equal(new Set(rendered).size, rendered.length, `${label}: no row renders twice (raw and folded, or in two summaries)`);
   assert.deepEqual(new Set(rendered), new Set(cm.getPresentedMessages().map((m) => m.id)), `${label}: every row of the window renders, and nothing else`);
 }
+
+// House review of #350, untested contract 5: renderedRows counts a row as
+// often as the compile renders it, so a summary rendered twice, the outcome
+// retraction exists to prevent, counts its rows twice.
+describe('renderedRows, the helper these tests count renderings with', () => {
+  const leaves = (id: string): MessageId[] => ({ S: ['1', '2'], T: ['3'] } as Record<string, MessageId[]>)[id] ?? [];
+  const raw = (messageId: MessageId) => ({ kind: 'raw' as const, bodies: [{ messageId, sequence: 0, complete: true }] });
+  const summary = (...ids: string[]) => ({ kind: 'summary' as const, summaries: ids.map((id) => ({ id, level: 1 })) });
+  const of = (...messages: unknown[]) => ({ provenance: { messages } } as unknown as Pick<CompileResult, 'provenance'>);
+
+  it('counts a summary rendered over consecutive messages once', () => {
+    assert.deepEqual(renderedIds(of(summary('S'), summary('S'), raw('4')), leaves), ['1', '2', '4']);
+  });
+
+  it('counts a summary rendered twice, apart, twice', () => {
+    assert.deepEqual(renderedIds(of(summary('S'), raw('4'), summary('S')), leaves), ['1', '2', '4', '1', '2']);
+    assert.deepEqual(renderedIds(of(summary('S'), summary('T'), summary('S')), leaves), ['1', '2', '3', '1', '2']);
+  });
+
+  it('counts a row rendered raw and inside a summary at both', () => {
+    assert.deepEqual(renderedIds(of(raw('1'), summary('S')), leaves), ['1', '1', '2']);
+  });
+});
 
 describe('the autobiographical strategy lets go of rows that leave the window', () => {
   it('an undone turn folded into summaries: none covers it, the compile omits it, and redone it renders once', async () => {

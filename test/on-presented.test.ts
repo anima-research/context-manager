@@ -363,6 +363,40 @@ describe('onPresented in presented mode', () => {
     }
   });
 
+  // House review of #350, untested contract 3: a row the view filter leaves
+  // out is given to onPresented all the same, and the context neither lists
+  // it nor gives it a position.
+  it('a row the view filter leaves out is given all the same, and the view neither lists it nor gives it a position', async () => {
+    const seen: Array<{ rows: MessageId[]; window: MessageId[]; got: Array<MessageId | undefined>; positions: Array<number | undefined>; ordinals: Array<number | undefined> }> = [];
+    class Positions extends PassthroughStrategy {
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        const listing = ctx.messageStore.getAll();
+        const ordinals = ctx.window?.ordinals();
+        seen.push({
+          rows: rows.map((m) => m.id),
+          window: listing.map((m) => m.id),
+          got: rows.map((m) => ctx.messageStore.get(m.id)?.id),
+          // A position in the listing the strategy reads: positionOf where the view answers it.
+          positions: rows.map((m) => (ctx.messageStore.positionOf ? ctx.messageStore.positionOf(m.id) : undefined) ?? (listing.findIndex((l) => l.id === m.id) >= 0 ? listing.findIndex((l) => l.id === m.id) : undefined)),
+          ordinals: rows.map((m) => ordinals?.get(m.id)),
+        });
+      }
+    }
+    const hidden = (m: StoredMessage) => (m.content[0] as { text?: string }).text === 'hidden';
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Positions(), viewFilter: (m) => !hidden(m) });
+    cm.presentRows([]);
+    const a = cm.addMessage('alice', [text('a')]);
+    const h = cm.addMessage('bob', [text('hidden')]);
+    cm.presentRows([a, h]);
+    assert.deepEqual(seen, [{
+      rows: [a, h], window: [a], got: [a, undefined], positions: [0, undefined], ordinals: [cm.ordinalOf(a), cm.ordinalOf(h)],
+    }], 'the filtered row is given; the view neither lists it, gets it nor positions it; its ordinal counts the window before the filter');
+    assert.notEqual(cm.ordinalOf(h), undefined);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, h], 'the window before the filter holds both');
+    await settle();
+    cm.close();
+  });
+
   for (const [name, make] of [
     ['passthrough', () => new PassthroughStrategy()],
     ['windowed passthrough', () => new WindowedPassthroughStrategy()],
@@ -592,6 +626,32 @@ describe('onPresented in legacy mode', () => {
     assert.deepEqual(strategy.newMessages, []);
     await settle();
     cm.close();
+  });
+
+  // House review of #350, untested contract 1: a hook that closes the
+  // manager stops what the write it interrupted would tell the strategy.
+  it("a sharded add whose first shard's onPresented closes the manager: the later shards are stored and not heard", async () => {
+    let cm!: ContextManager;
+    class ClosesOnFirst extends ShardingRecords {
+      async onPresented(rows: readonly StoredMessage[], _ctx: StrategyContext): Promise<void> {
+        this.heard.push({ rows: rows.map((m) => m.id), held: [], window: [] });
+        if (this.heard.length === 1) cm.close();
+      }
+    }
+    const strategy = new ClosesOnFirst();
+    // An app-owned store, which stays open after close(), so the record can be read.
+    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+    const errors = await errorsDuring(async () => {
+      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+      cm.addMessage('alice', [text('x'), text('y'), text('z')]);
+      await settle();
+    });
+    assert.ok(cm.isClosed());
+    assert.equal(cm.getAllMessages().length, 3, 'the add finished: every shard is stored');
+    assert.equal(strategy.heard.length, 1, 'only the first shard was heard: after close() nothing reaches the strategy');
+    assert.equal(strategy.heard[0]!.rows.length, 1);
+    assert.deepEqual(errors.filter((args) => /fail|threw/i.test(args.map(String).join(' '))), [], 'nothing failed');
+    owner.close();
   });
 
   // House review of #350, code finding 2: in legacy mode there is no index,

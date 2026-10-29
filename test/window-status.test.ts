@@ -167,6 +167,23 @@ describe('windowStatusOf', () => {
     reopened.close();
   });
 
+  // House review of #350, untested contract 4: the status is read before
+  // the view filter, so a row the filter hides reads as the window holds it.
+  it('reads before the view filter: a hidden row the window holds is in, a hidden one not presented out, and in legacy mode every hidden row is in', async () => {
+    const hidden = (m: StoredMessage) => (m.content[0] as { text?: string }).text?.startsWith('hidden') === true;
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy(), viewFilter: (m) => !hidden(m) });
+    const [a, h0] = ['a', 'hidden0'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    assert.deepEqual(statuses(cm, [a, h0]), ['in', 'in'], 'legacy mode: the window is the record, before the filter');
+    cm.presentRows([]);
+    const [h1, h2] = ['hidden1', 'hidden2'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([h1]);
+    cm.retractRows([h0], { undone: true });
+    assert.deepEqual(statuses(cm, [a, h0, h1, h2]), ['in', 'undone', 'in', 'out']);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a'], 'premise: the filter hides the others from the compile');
+    assert.equal(cm.presentedLength(), 2, 'the window before the filter holds a and hidden1');
+    cm.close();
+  });
+
   it('a row removed through another manager on the slot is absent while that manager\'s ordinal for it stands', async () => {
     const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
     const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });

@@ -22,9 +22,13 @@
  *   retract takes nothing out, and the next call writes the whole of it.
  * - A write-down an index written one record per item left cut short is
  *   finished in one record.
- * - A store handle without the batched append is refused: a write of
- *   several items throws, writing nothing, and a single row is written as
- *   before.
+ * - A store handle without the batched append is refused at open, before
+ *   any record changes; a handle that loses it after open is refused at a
+ *   write of several items, which writes nothing, and a single row is
+ *   written as before.
+ * - A write the store kept and then threw on, or one an index written one
+ *   record per item cut short, tells the strategy what it did before the
+ *   error is thrown on; a refused repair batch tells it nothing.
  *
  * test/_harness/index-writes.ts stands in for the batched append on a
  * store handle, one record per item, to write such an index.
@@ -126,6 +130,65 @@ function failNextBatch(cm: ContextManager): () => void {
     if (own) store.appendManyToStateJsonWithIdentity = batched;
     else delete store.appendManyToStateJsonWithIdentity;
   };
+}
+
+/**
+ * Makes the next batched append to the window index write its record and
+ * then throw, as a failure after the store kept the write would; returns
+ * the undo.
+ */
+function keepThenThrowNextBatch(cm: ContextManager): () => void {
+  const store = cm.getStore() as unknown as Record<string, unknown>;
+  const own = Object.prototype.hasOwnProperty.call(store, 'appendManyToStateJsonWithIdentity');
+  const batched = store.appendManyToStateJsonWithIdentity as (this: unknown, id: string, ...rest: unknown[]) => unknown;
+  let failed = false;
+  store.appendManyToStateJsonWithIdentity = function (this: unknown, id: string, ...rest: unknown[]) {
+    const written = batched.call(this, id, ...rest);
+    if (id === INDEX && !failed) {
+      failed = true;
+      throw new Error('zz-index-batch-kept-then-failed');
+    }
+    return written;
+  };
+  return () => {
+    if (own) store.appendManyToStateJsonWithIdentity = batched;
+    else delete store.appendManyToStateJsonWithIdentity;
+  };
+}
+
+/**
+ * Makes the window index write one record per item (perItemIndexWrites),
+ * the `failing`-th of its appends from now on throwing, as a full disk
+ * would; returns the undo.
+ */
+function failItemAppend(cm: ContextManager, failing: number): () => void {
+  const store = cm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+  const append = store.appendToStateJsonWithIdentity;
+  const perItem = perItemIndexWrites(cm.getStore());
+  let appends = 0;
+  store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+    if (id === INDEX && ++appends === failing) throw new Error('zz-index-append-failed');
+    return append.call(this, id, ...rest);
+  };
+  return () => {
+    store.appendToStateJsonWithIdentity = append;
+    perItem();
+  };
+}
+
+/** Hearing that keeps each onRetracted call's ids too, and each hook's calls in one log. */
+class HearingIds extends Hearing {
+  retractedIds: MessageId[][] = [];
+  log: string[] = [];
+  async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+    this.log.push(`presented ${rows.map((m) => m.id).join(',')}`);
+    await super.onPresented(rows);
+  }
+  async onRetracted(rows: readonly StoredMessage[], _ctx?: unknown, info?: { ids: readonly MessageId[] }): Promise<void> {
+    this.retractedIds.push([...(info?.ids ?? [])]);
+    this.log.push(`retracted ${(info?.ids ?? []).join(',')}`);
+    await super.onRetracted(rows);
+  }
 }
 
 describe('one record per write', () => {
@@ -355,6 +418,11 @@ describe('a batch is one presentation point', () => {
     const before = parent.getStore().currentSequence();
     parent.presentRows([u, doc]);
     assert.equal(parent.getStore().currentSequence(), before + 1, 'setup: the call is one record');
+    // A later write, so both cuts below are in history, not at the head,
+    // which derive takes as a derive at the head (house #350, untested 8).
+    const v = parent.addMessage('User', [text('v')]);
+    parent.presentRows([v]);
+    assert.ok(parent.getStore().currentSequence() > before + 1, 'setup: the head is past the call');
 
     const without = await parent.derive({ branch: 'zz/before-call', strategy: new Sharding(), atSequence: before });
     assert.deepEqual(ids(without.getPresentedMessages()), []);
@@ -447,6 +515,112 @@ describe('a batch that throws writes nothing', () => {
     assert.deepEqual(rows.map((id) => cm.ordinalOf(id)), ordinals, 'every ordinal stays issued');
     assert.deepEqual(cm.retractAbsentRows(), [rows[0], rows[1]]);
     assert.deepEqual(rows.map((id) => cm.ordinalOf(id)), [undefined, undefined, ordinals[2]]);
+    cm.close();
+  });
+});
+
+// House review of #350, untested contract 6: a refused batch of a repair
+// tells the strategy nothing, for retractAbsentRows and retractRemoved alike.
+describe('a refused repair batch', () => {
+  for (const repair of ['retractAbsentRows', 'retractRemoved'] as const) {
+    it(`${repair}: takes nothing out and tells the strategy nothing; the next call takes every row out and tells it`, async () => {
+      const strategy = new HearingIds();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));
+      cm.presentRows(rows);
+      const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-other', strategy: new PassthroughStrategy() });
+      other.removeMessages(rows[0]!, rows[1]!);
+      other.close();
+      const ordinals = rows.map((id) => cm.ordinalOf(id));
+      const run = () => (repair === 'retractAbsentRows' ? cm.retractAbsentRows() : cm.retractRemoved(rows));
+      const restore = failNextBatch(cm);
+      try {
+        assert.throws(run, /zz-index-batch-failed/);
+      } finally {
+        restore();
+      }
+      assert.deepEqual(rows.map((id) => cm.ordinalOf(id)), ordinals, 'every ordinal stays issued');
+      assert.deepEqual(strategy.retractedIds, [], 'the strategy is told nothing');
+      assert.deepEqual(run(), [rows[0], rows[1]]);
+      assert.deepEqual(strategy.retractedIds, [[rows[0], rows[1]]], 'the next call tells it, by the rows\' ids');
+      cm.close();
+    });
+  }
+});
+
+// House review of #350, untested contract 2: a write that throws after the
+// store kept some or all of it tells the strategy what it did before the
+// error is thrown on.
+describe('a write cut short tells the strategy what it did', () => {
+  it('a batched presentRows the store kept and then threw on: the strategy hears every row, then the call throws', async () => {
+    const strategy = new HearingIds();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const rows = ['a', 'b'].map((t) => cm.addMessage('User', [text(t)]));
+    const restore = keepThenThrowNextBatch(cm);
+    try {
+      assert.throws(() => cm.presentRows(rows), /zz-index-batch-kept-then-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(rows.map((id) => cm.windowStatusOf(id)), ['in', 'in'], 'setup: the store kept the write');
+    assert.deepEqual(strategy.log, [`presented ${rows.join(',')}`], 'the strategy heard the rows that entered');
+    assert.throws(() => cm.presentRows(rows), /in the window already/, 'no later call presents them again');
+    cm.close();
+  });
+
+  it('a batched retractRows the store kept and then threw on: the strategy is told every row, then the call throws', async () => {
+    const strategy = new HearingIds();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const rows = ['a', 'b'].map((t) => cm.addMessage('User', [text(t)]));
+    cm.presentRows(rows);
+    strategy.log.length = 0;
+    const restore = keepThenThrowNextBatch(cm);
+    try {
+      assert.throws(() => cm.retractRows(rows, { undone: true }), /zz-index-batch-kept-then-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(rows.map((id) => cm.windowStatusOf(id)), ['undone', 'undone'], 'setup: the store kept the write');
+    assert.deepEqual(strategy.log, [`retracted ${rows.join(',')}`], 'the strategy was told the rows that left');
+    cm.close();
+  });
+
+  it('in an index written one record per item, a presentRows cut short: the strategy hears the rows that entered before it', async () => {
+    const strategy = new HearingIds();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));
+    const restore = failItemAppend(cm, 3);
+    try {
+      assert.throws(() => cm.presentRows(rows), /zz-index-append-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(rows.map((id) => cm.windowStatusOf(id)), ['in', 'in', 'out'], 'setup: the write stopped at c');
+    assert.deepEqual(strategy.log, [`presented ${rows.slice(0, 2).join(',')}`]);
+    cm.presentRows([rows[2]!]);
+    assert.deepEqual(strategy.log.slice(1), [`presented ${rows[2]}`], 'the next call presents the rest, and only it is heard');
+    cm.close();
+  });
+
+  it('in an index written one record per item, a retractRows cut short: the strategy is told the rows that left before it', async () => {
+    const strategy = new HearingIds();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));
+    cm.presentRows(rows);
+    strategy.log.length = 0;
+    const restore = failItemAppend(cm, 2);
+    try {
+      assert.throws(() => cm.retractRows(rows), /zz-index-append-failed/);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(rows.map((id) => cm.windowStatusOf(id)), ['out', 'in', 'in'], 'setup: the write stopped at b');
+    assert.deepEqual(strategy.log, [`retracted ${rows[0]}`]);
     cm.close();
   });
 });

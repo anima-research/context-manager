@@ -418,13 +418,26 @@ function coveredRows(cm: ContextManager, strategy: AutobiographicalStrategy): Se
 
 /** Each message id a compile renders, raw or inside a summary, as often as it renders it. */
 function renderedRows(cm: ContextManager, result: CompileResult): MessageId[] {
-  const raw: MessageId[] = [];
-  const summaries = new Set<string>();
+  return renderedIds(result, (id) => leavesOf(cm, id));
+}
+
+/**
+ * Each message id `result` renders, raw or inside a summary, as often as it
+ * renders it, a summary's leaves given by `leaves`. A summary counts once
+ * per rendering: a run of consecutive compiled messages naming it is one
+ * rendering (a summary can render as more than one message), and the same
+ * summary named again after a message that doesn't name it is another.
+ */
+function renderedIds(result: Pick<CompileResult, 'provenance'>, leaves: (summaryId: string) => MessageId[]): MessageId[] {
+  const rendered: MessageId[] = [];
+  let previous = new Set<string>();
   for (const part of result.provenance?.messages ?? []) {
-    if (part.kind === 'raw') raw.push(...part.bodies.map((b) => b.messageId));
-    if (part.kind === 'summary') for (const s of part.summaries) summaries.add(s.id);
+    const named = new Set<string>(part.kind === 'summary' ? part.summaries.map((s) => s.id) : []);
+    if (part.kind === 'raw') rendered.push(...part.bodies.map((b) => b.messageId));
+    for (const id of named) if (!previous.has(id)) rendered.push(...leaves(id));
+    previous = named;
   }
-  return [...raw, ...[...summaries].flatMap((id) => leavesOf(cm, id))];
+  return rendered;
 }
 
 /** Asserts the compile renders each row of the window once, and only those. */

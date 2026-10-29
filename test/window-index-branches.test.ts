@@ -244,6 +244,37 @@ describe('derive and the window', () => {
     parent.close();
   });
 
+  // House review of #350, untested contract 7 (and docs finding 3): once the
+  // parent has presented, a cut before its write-down leaves the child in
+  // legacy mode, its window the record up to the cut, which holds the rows
+  // the write-down later entered: each was in the window from its own write.
+  it('derived at a sequence before the parent\'s write-down, after the parent has presented, the child is in legacy mode and its window holds the rows stored by then', { skip }, async () => {
+    const parent = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Manifested() });
+    const a = parent.addMessage('alice', [text('a')]);
+    const b = parent.addMessage('bob', [text('b')]);
+    const own = parent.getMessage(b)!.sequence;
+    parent.presentRows([]);
+    const writtenDown = parent.getStore().currentSequence();
+    const c = parent.addMessage('carol', [text('c')]);
+    parent.presentRows([c]);
+    assert.equal(parent.windowMode(), 'presented');
+    assert.ok(own < writtenDown, 'setup: b was stored before the write-down');
+
+    const atRow = await parent.derive({ branch: 'zz/at-b', strategy: new Manifested(), atSequence: own });
+    assert.deepEqual(windowOf(atRow, [a, b, c]), {
+      mode: 'legacy', window: [a, b], unpresented: [], ordinals: [undefined, undefined, undefined], length: 0, newest: own,
+    }, 'a cut at the own sequence of a row the write-down entered holds it in the child\'s window, the record');
+    assert.deepEqual(texts(await atRow.compile(BIG)), ['a', 'b']);
+
+    const atWriteDown = await parent.derive({ branch: 'zz/at-write-down', strategy: new Manifested(), atSequence: writtenDown });
+    assert.equal(atWriteDown.windowMode(), 'presented', 'a cut at the write-down holds it');
+    assert.deepEqual(ids(atWriteDown.getPresentedMessages()), [a, b]);
+    assert.deepEqual(atWriteDown.getUnpresentedMessages(), []);
+    atRow.close();
+    atWriteDown.close();
+    parent.close();
+  });
+
   it('a parent in legacy mode derives a child in legacy mode, which the parent\'s first presentation doesn\'t reach', { skip }, async () => {
     const parent = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Manifested() });
     const a = parent.addMessage('alice', [text('a')]);

@@ -96,10 +96,22 @@ class Sharding extends Capturing {
   }
 }
 
+/**
+ * Whether the store has the namespace's window state registered. A state
+ * with no item reads as null whether or not it is registered, so a check of
+ * its value alone can't tell a registration at open from none (house #350,
+ * untested contract 9).
+ */
+function indexRegistered(cm: ContextManager, namespace: string): boolean {
+  return cm.getStore().listStates().some((state) => state.id === windowIndexStateId(namespace));
+}
+
 describe('the window in legacy mode', () => {
   it('is the record itself, read live, and nothing is written until a host presents', async () => {
     const strategy = new Capturing();
-    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const path = freshPath();
+    const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy });
+    assert.equal(indexRegistered(cm, 'zz-agent'), false, 'the open registers no window state');
     cm.addMessage('alice', [text('a')]);
     cm.addMessage('bob', [text('b')]);
     await cm.compile(BIG);
@@ -109,6 +121,7 @@ describe('the window in legacy mode', () => {
     assert.equal(cm.getPresentedMessages(), cm.getAllMessages());
     assert.equal(cm.windowMode(), 'legacy');
     assert.equal(cm.getStore().getStateJson(windowIndexStateId('zz-agent')), null, 'no index state is written');
+    assert.equal(indexRegistered(cm, 'zz-agent'), false, 'nor registered');
     assert.equal(cm.indexLength(), 0);
     assert.equal(cm.ordinalOf(cm.getAllMessages()[0]!.id), undefined);
     assert.deepEqual(cm.getUnpresentedMessages(), []);
@@ -119,7 +132,15 @@ describe('the window in legacy mode', () => {
     assert.equal(strategy.last().length, 3);
     assert.equal(cm.presentedLength(), 3);
     assert.equal(cm.getStore().getStateJson(windowIndexStateId('zz-agent')), null);
+    assert.equal(indexRegistered(cm, 'zz-agent'), false);
     cm.close();
+
+    // Nor does a reopen; the first presentation registers it.
+    const reopened = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new Capturing() });
+    assert.equal(indexRegistered(reopened, 'zz-agent'), false, 'a reopen in legacy mode registers no window state');
+    reopened.presentRows([]);
+    assert.equal(indexRegistered(reopened, 'zz-agent'), true, 'the first presentation registers it');
+    reopened.close();
   });
 
   it('a reader merging another slot keeps the live two-slot merge, and takes an index at its first presentation', async () => {
