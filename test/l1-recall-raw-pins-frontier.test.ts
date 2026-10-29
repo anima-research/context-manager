@@ -12,7 +12,7 @@
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeFormatter } from '@animalabs/membrane';
@@ -48,16 +48,11 @@ type Internals = {
   getHeadWindowEnd(store: unknown): number;
 };
 
-async function forest(
-  name: string,
-  overrides: Record<string, unknown> = {},
-  afterAdd?: (cm: ContextManager, ids: string[]) => void,
-  content: (i: number, text: string) => unknown[] = (_i, text) => [{ type: 'text', text }],
-  participant: (i: number) => string = (i) => (i % 2 ? 'Claude' : 'User'),
-  respond: (call: number) => unknown[] = (call) => [{ type: 'text', text: `Summary #${call}: ordinary events.` }],
-) {
-  const requests: any[] = [];
-  let calls = 0;
+const defaultContent = (_i: number, text: string): unknown[] => [{ type: 'text', text }];
+const defaultParticipant = (i: number): string => (i % 2 ? 'Claude' : 'User');
+const defaultRespond = (call: number): unknown[] => [{ type: 'text', text: `Summary #${call}: ordinary events.` }];
+
+function summarizer(respond: (call: number) => unknown[], requests: any[] = [], calls = 0) {
   // How the summarizer answers the next calls, in order; a memory once it's empty.
   const script: Array<'refusal' | 'tool_use' | 'thinking-wrapped'> = [];
   const membrane = { complete: async (req: unknown) => { requests.push(JSON.parse(JSON.stringify(req))); calls++;
@@ -69,10 +64,24 @@ async function forest(
     if (scripted === 'tool_use') return { stopReason: 'tool_use', content: [], usage: { inputTokens: 500, outputTokens: 10 } };
     const content = scripted === 'thinking-wrapped' ? [{ type: 'text', text: '<thinking>a draft</thinking>' }] : respond(calls);
     return { stopReason: 'end_turn', content, usage: { inputTokens: 500, outputTokens: 100 } }; } };
-  const strategy = new AutobiographicalStrategy({ compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0,
-    autoTickOnNewMessage: false, minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, adaptiveResolution: true,
-    ...overrides });
-  const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane: membrane as never });
+  return { membrane, script, requests, calls: () => calls };
+}
+
+const strategyFor = (overrides: Record<string, unknown>) => new AutobiographicalStrategy({ compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0,
+  autoTickOnNewMessage: false, minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, adaptiveResolution: true,
+  ...overrides });
+
+async function build(
+  name: string,
+  overrides: Record<string, unknown>,
+  afterAdd: ((cm: ContextManager, ids: string[]) => void) | undefined,
+  content: (i: number, text: string) => unknown[],
+  participant: (i: number) => string,
+  respond: (call: number) => unknown[],
+) {
+  const sum = summarizer(respond);
+  const strategy = strategyFor(overrides);
+  const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane: sum.membrane as never });
   const ids: string[] = [];
   const textOf = new Map<string, string>();
   for (let i = 0; i < 240; i++) {
@@ -82,9 +91,44 @@ async function forest(
     textOf.set(id, text);
     afterAdd?.(cm, ids);
   }
-  for (let r = 0; r < 200; r++) { await cm.compile(); await cm.tick(); if (calls > 150) break; }
+  for (let r = 0; r < 200; r++) { await cm.compile(); await cm.tick(); if (sum.calls() > 150) break; }
   const internals = strategy as unknown as Internals;
-  return { cm, strategy, internals, ids, textOf, requests, script };
+  return { cm, strategy, internals, ids, textOf, requests: sum.requests, script: sum.script, calls: sum.calls };
+}
+
+const heldBy = (strategy: AutobiographicalStrategy): unknown => {
+  const held = strategy as unknown as { summaries: unknown; chunkRecords: unknown; mergeQueue: unknown };
+  for (const field of ['summaries', 'chunkRecords', 'mergeQueue'] as const) assert.ok(Array.isArray(held[field]), `premise: the strategy holds ${field} as a list`);
+  return JSON.parse(JSON.stringify({ summaries: held.summaries, chunkRecords: held.chunkRecords, mergeQueue: held.mergeQueue }));
+};
+
+let plainForest: Promise<{ ids: string[]; textOf: Map<string, string>; requests: any[]; calls: number; held: unknown }> | undefined;
+
+async function forest(
+  name: string,
+  overrides: Record<string, unknown> = {},
+  afterAdd?: (cm: ContextManager, ids: string[]) => void,
+  content: (i: number, text: string) => unknown[] = defaultContent,
+  participant: (i: number) => string = defaultParticipant,
+  respond: (call: number) => unknown[] = defaultRespond,
+) {
+  const plain = Object.keys(overrides).length === 0 && afterAdd === undefined
+    && content === defaultContent && participant === defaultParticipant && respond === defaultRespond;
+  if (!plain) {
+    const built = await build(name, overrides, afterAdd, content, participant, respond);
+    return { cm: built.cm, strategy: built.strategy, internals: built.internals, ids: built.ids, textOf: built.textOf, requests: built.requests, script: built.script, calls: built.calls };
+  }
+  plainForest ??= build('plain-forest', {}, undefined, defaultContent, defaultParticipant, defaultRespond).then((built) => {
+    const held = heldBy(built.strategy);
+    built.cm.close();
+    return { ids: built.ids, textOf: built.textOf, requests: built.requests, calls: built.calls(), held };
+  });
+  const template = await plainForest;
+  cpSync(join(dir, 'plain-forest'), join(dir, name), { recursive: true });
+  const sum = summarizer(defaultRespond, JSON.parse(JSON.stringify(template.requests)), template.calls);
+  const strategy = strategyFor({});
+  const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane: sum.membrane as never });
+  return { cm, strategy, internals: strategy as unknown as Internals, ids: [...template.ids], textOf: new Map(template.textOf), requests: sum.requests, script: sum.script, calls: sum.calls };
 }
 
 const isL1Request = (request: any): boolean => textsOf(request).some((text) => text.includes(MARKER));
@@ -158,6 +202,20 @@ async function captureWarnings<T>(run: () => Promise<T>): Promise<{ result: T; w
 }
 
 describe('raw pins open only their own branch of the L1 recall frontier', () => {
+  it('a copy of the plain forest opens holding the summaries, chunk records and merge queue its build held, and its summarizer numbers its next call after the build\'s', async () => {
+    const { cm, strategy, requests, calls } = await forest('copy-of-build');
+    const template = await plainForest!;
+    assert.deepEqual(heldBy(strategy), template.held);
+    assert.equal(calls(), template.calls);
+    assert.deepEqual(requests, template.requests);
+    for (let i = 0; i < 20; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `NEW-${i} ${'word '.repeat(30)}` }]);
+    await cm.compile(); await cm.tick();
+    assert.ok(requests.slice(template.requests.length).some(isL1Request), 'premise: the tick sent an L1 request');
+    assert.deepEqual(requests.slice(0, template.requests.length), template.requests);
+    assert.ok(JSON.stringify(heldBy(strategy)).includes(`Summary #${template.calls + 1}:`), 'the first call after the copy is numbered after the build\'s');
+    cm.close();
+  });
+
   it('one pinned message deep in a merged summary adds at most its chunk raw', async () => {
     const { cm, internals, ids, textOf, requests } = await forest('one-pin');
     const levels: Record<number, number> = {};

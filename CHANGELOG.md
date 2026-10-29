@@ -12,6 +12,67 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.24.0 — 2026-10-29
+
+### Breaking
+
+- **Host authors who pass their own `JsStore`:** context-manager now asks `@animalabs/chronicle` `^0.5.0`, the release whose `JsStore` has the members below. A TypeScript host that opens its store with chronicle 0.4 and passes it to `ContextManager.open({ store })` fails to typecheck (TS2739: 0.4's `JsStore` lacks `view`, `pinnedBranch`, `createBranchWithStates`, `createBranchAtWithStates` and `stateHeadOffset`); take chronicle `^0.5.0` alongside. Run as JavaScript, such a store still opens, stores and compiles, `ContextManager.supportsDerivation(store)` returns `false` for it, and `derive(...)` on that `ContextManager` throws `ContextDerivationUnsupportedError`.
+
+### Added
+
+- `ContextManager.derive({ branch, strategy, solve?, atSequence?, inherit?, viewFilter? })` creates a second context manager from this one with shared reads and separate writes (agent-framework #232, "Dendrite"). The derived manager starts from the parent's state at a checkpoint — its messages and everything its strategy persists (summaries with their alternative resolutions, chunks, pins, locks, the carried fold frontier, the kv-unified receipt) and the manager's thinking-binding record — on a Chronicle branch of its own, read through a branch-bound store handle. No log record is copied, the materialized messages are the same objects in memory, and neither manager can alter what the other reads; the parent keeps running and the store's branch cursor is not touched. `getDerivation()` reports the parent branch, own branch, checkpoint and inherited states. Requires a Chronicle build with `JsStore.view` and selective forks (`ContextManager.supportsDerivation(store)`); otherwise `derive` throws `ContextDerivationUnsupportedError`. A derived context persists: `getDerivation()` returns a plain record (branches, checkpoint, inherited states, slot names) and `ContextManager.reopenDerived({ store, derivation, strategy })` reopens the context on its branch after a restart, to resume or to inspect it.
+- `solve: 'reuse'` (default) hands the in-memory remainder of the parent strategy's rendering frontier to the child's strategy, so a child that reads through the parent's view makes as its first compile the compile the parent would have made next, cache markers included. Derived at an earlier `atSequence`, the child keeps what was persisted by then, since what the parent holds in memory describes its head. `solve: 'fresh'` discards the inherited frontier on the child's branch and solves from scratch. With a view of its own (`viewFilter`), the frontier is handed over all the same and the child renders what its view holds. Strategies opt in through the new `RenderingFrontierStrategy` capability (`exportRenderingFrontier` / `adoptRenderingFrontier` / `discardRenderingFrontier`, with `isRenderingFrontierStrategy`, and an optional `prepareFromRenderingFrontier` that takes the frontier's tail and recorded runtime pace before the child initializes, since hot settings aren't persisted and initialize chunks by the tail); `AutobiographicalStrategy`, `KnowledgeStrategy` and `WindowedPassthroughStrategy` implement it.
+- `derive({ viewFilter })` gives the derived manager a view of its own in place of the parent's, which it replaces rather than adds to; without it the child reads through the parent's view. The inherited memory was built under the parent's view, so a view of its own keeps and leaves out what the parent's does of the history that memory covers, and may differ on rows the parent hasn't folded, such as those stored after the checkpoint. A predicate isn't part of the derivation record, so `reopenDerived` takes the view the child read through again as its own `viewFilter`.
+- `MessageStore.deriveOnto(view)` builds a store for the same slot on a branch-bound handle, seeded from the parent's materialized messages instead of re-reading the slot, and sharing the parent's blob resolve cache.
+- Strategies can declare which of their persisted states a derived context inherits through the new `DerivationManifestStrategy` capability (`derivationManifest(namespace, options?)`, with `isDerivationManifestStrategy`). Without it, every state under the strategy's namespace prefix is inherited. `AutobiographicalStrategy` (and `KnowledgeStrategy`) inherit summaries, chunk records, the id counter, pins, resolutions, locks, calibration, the kv-unified receipt and the merge quarantine, and leave the merge queue (rebuilt on initialize) and the compression-refusal ledger with the request families' ladder progress empty on the child's branch — unless `derive({ inherit: { refusals: true } })` asks for them; `WindowedPassthroughStrategy` inherits its anchor.
+
+- `previewContext`'s `opts.excludePins`: pin and document-mark ids, as
+  `pinRange` and `markDocument` return them, that the preview's dry select
+  reads as absent, so a caller can ask whether a compile would fit were they
+  unpinned without unpinning them. Nothing is unpinned or written, and the
+  option adds no log call; an id no pin has is ignored, and no compile
+  takes the option.
+
+- `recallEnvelope: 'bare'` fences each recall answer with `<cm-recall>` and `</cm-recall>` and no attributes, on every path `'xml'` takes, and the recall cap prices the bare pair. `'none'` and `'xml'` render as before.
+
+- `summaryContextLabel` and `recallHeaderTemplate` take a `{tools}` substitution: the names of the tools called in the rounds a summary stands in for, each once in order of first call, the first five and then "and K more", or "no tools" when the sources the store's view holds called none. In the combined pair of `positionedRecallPairs: false`, it lists the tools of every summary the pair holds. The names are read from the summary's source messages as the store's view holds them, the first time the summary is priced or rendered after the strategy loads its branch, and kept until the next load. A label or template without `{tools}` renders as before, and a pair is priced at the question it renders.
+
+- `SelectOptions.requestOverhead` and `RenderStats.request`: a compile given
+  its request's overhead, the system prompt and tool definitions it sends (the
+  existing `RequestOverhead`), reports what the request carries besides the
+  rendered context: `overheadTokens` for the overhead and `injectedTokens` for
+  the compile's message-position injections. Both are in the units of `total`
+  at the compile's multiplier, priced as a calibration sample prices them. A
+  compile given no overhead reports no `request`, and an overhead changes
+  nothing the compile selects. An overhead whose tool definitions can't be
+  serialised as JSON is refused before anything is selected. The overhead's
+  price is the store's estimate of the system prompt and of the tool
+  definitions as JSON, not the provider's count. This is the report #323
+  asked for in its second fix.
+- `RenderStats.calibration.ceiling`: the largest multiplier the strategy
+  applies, 1.8, reported with every calibration. It applies none above it,
+  as before.
+
+### Changed
+
+- `MessageStore.getAll()` keeps one caller-facing `StoredMessage` per materialized message instead of rebuilding every one after each write: an append converts only the new message, and an edit replaces only the edited one. Callers already had to treat the returned messages as immutable; the same objects are now returned across writes, and are shared with managers derived from this one.
+- An edit or removal made through a `MessageStore` whose cache was current no longer forces the next read to re-materialize the whole message slot. The write is applied to the cache and stamped, as appends already were. A write through a sibling instance still invalidates.
+
+### Fixed
+
+- `MessageStore` revalidates its materialized cache on the slot's revision from the store (`JsStore.stateHeadOffset`, chronicle with branch-bound handles) instead of a per-handle write counter plus an item-count check. Two stores over different handles to the same branch — a resident on the root handle and a hospital tool on `root.view('main')` — now see each other's edits: previously a count-preserving edit through the second handle left the first serving the old text until the count or last message changed (reported by Astra, 2026-10-07). On an older chronicle the per-handle counter remains the token.
+- A local `append` no longer re-certifies a message store's id index or materialized cache that was already stale before the append (another handle had removed or edited an earlier message); stale state is left stale and rebuilt on the next lookup. Previously a lookup by id after such an append could return the wrong message under the right id (reported by Astra, 2026-10-07).
+
+- A dry compile (`previewContext`, or `compile` with `dryRun`) puts back the
+  autobiographical strategy's memo of the messages its chunks and summaries
+  own, which the head window's boundary reads. The memo is keyed by counts,
+  so one the dry rebuild left behind could be read for the next compile's
+  chunks where they match its counts but were cut differently.
+
+- A calibration rise that ends the head window's count on a tool result, whose call is the message before it, no longer moves the call and its result out of the head while the messages from the head's start up to the next chunked message come to no more than twice `headWindowTokens`. The guard against out-of-order chunks counted that result twice, so the pair could leave the head and be chunked after messages that came later. Kept in the head, the pair takes up to twice `headWindowTokens`, so a store whose budget is just above its head and recent windows can be refused where it was sent before, and in a run such a refusal outlasted repeated compiles and the compression they queued, clearing once the store's budget was raised, its recent window lowered or its head reset. A store whose call and result a chunk already owns keeps them there.
+
+- Without adaptive resolution, a positioned recall pair (`positionedRecallPairs`, the default) is priced at the header it sends, `recallHeaderTemplate`, rather than at `summaryContextLabel`, which it doesn't send. The render stats count the header the pair sends, and so does the check that refuses a compile over its budget, so a compile near its budget can now be refused where it was sent before, or sent where it was refused.
+
 ## 0.23.1 — 2026-10-27
 
 ### Added

@@ -80,7 +80,7 @@ export const CAPPED_RENDER_CASE_NAMES = Object.keys(
  */
 export async function renderCappedCase(
   name: CappedRenderCaseName,
-  mode?: 'none' | 'xml',
+  mode?: 'none' | 'xml' | 'bare',
 ): Promise<FixtureRender> {
   const testCase: CappedRenderCase = CAPPED_RENDER_CASES[name];
   const options: AutobiographicalOptions = mode === undefined

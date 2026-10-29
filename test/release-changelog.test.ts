@@ -1,7 +1,3 @@
-// Black-box coverage of scripts/release-changelog.mjs: each case runs the
-// real script in a throwaway directory, so assembly, validation, and the
-// deletion of consumed fragments are all exercised exactly as `npm version`
-// would run them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -10,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +16,10 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(
   new URL("../../scripts/release-changelog.mjs", import.meta.url),
 );
+const script = (await import(new URL("../../scripts/release-changelog-run.mjs", import.meta.url).href)) as {
+  run: (dir: string, args: string[], env: Record<string, string | undefined>) => string;
+  ReleaseError: new (message: string) => Error;
+};
 
 const BASE_CHANGELOG = [
   "# Changelog",
@@ -63,6 +64,20 @@ function setup(f: Fixture): string {
 const VERSION_HOOK = { npm_command: "version", npm_lifecycle_event: "version" };
 
 function run(
+  dir: string,
+  { args = [], env = {} }: { args?: string[]; env?: Record<string, string | undefined> } = {},
+): { status: number; stdout: string; stderr: string } {
+  const merged: Record<string, string | undefined> = { ...process.env, ...VERSION_HOOK, ...env };
+  for (const name of Object.keys(merged)) if (merged[name] === undefined) delete merged[name];
+  try {
+    return { status: 0, stdout: `${script.run(dir, args, merged)}\n`, stderr: "" };
+  } catch (e) {
+    if (!(e instanceof script.ReleaseError)) throw e;
+    return { status: 1, stdout: "", stderr: `release-changelog: ${e.message}\n` };
+  }
+}
+
+function cli(
   dir: string,
   { args = [], env = {} }: { args?: string[]; env?: Record<string, string | undefined> } = {},
 ): { status: number; stdout: string; stderr: string } {
@@ -233,8 +248,9 @@ for (const [name, invocation, message] of invocations) {
 // does, but sets no npm_command; it released before #198, and still does.
 test("releases as the hook of a version command that sets no npm command, as `bun pm version` does", () => {
   const dir = setup({ fragments: { "a.fixed.md": "- Fixed thing.\n" } });
-  const r = run(dir, { env: { npm_command: undefined } });
+  const r = cli(dir, { env: { npm_command: undefined } });
   assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^CHANGELOG\.md: released '## 1\.1\.0 — \d{4}-\d{2}-\d{2}' from 1 fragment\(s\) plus the Unreleased section\.\n$/);
   assert.equal(section(changelog(dir), "1.1.0"), "### Fixed\n\n- Fixed thing.");
   assert.deepEqual(pending(dir), ["README.md"], "the folded fragment is deleted");
 });
@@ -244,17 +260,27 @@ test("releases as the hook of a version command that sets no npm command, as `bu
 test("refuses a version that already has a section with no npm command too, without touching anything", () => {
   const dir = setup({ version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } });
   const before = { changelog: changelog(dir), pending: pending(dir) };
-  const r = run(dir, { env: { npm_command: undefined } });
+  const r = cli(dir, { env: { npm_command: undefined } });
   assert.equal(r.status, 1, `expected refusal, got exit ${r.status}:\n${r.stdout}${r.stderr}`);
   assert.match(r.stderr, /^release-changelog: refused, and this script changed nothing: a '## 1\.0\.0' section already exists/);
   assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
   assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
 });
 
+test("the CLI exits 1 with the error when CHANGELOG.md can't be read, and deletes no fragment", () => {
+  const dir = setup({ fragments: { "a.fixed.md": "- x\n" } });
+  rmSync(join(dir, "CHANGELOG.md"));
+  const before = pending(dir);
+  const r = cli(dir);
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /ENOENT[^\n]*CHANGELOG\.md/);
+  assert.deepEqual(pending(dir), before);
+});
+
 test("--help wins over any other argument and changes nothing", () => {
   const dir = setup({});
   const before = { changelog: changelog(dir), pending: pending(dir) };
-  const r = run(dir, { args: ["--dry-run", "--help"] });
+  const r = cli(dir, { args: ["--dry-run", "--help"] });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^Usage: npm version <patch\|minor\|major>\n/);
   assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
@@ -288,3 +314,4 @@ for (const [name, fixture, message] of refusals) {
     assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
   });
 }
+

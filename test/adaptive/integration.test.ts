@@ -280,7 +280,7 @@ test('integration: stress — 1000 chunks, deep recursion via preProduceUpperLev
 
   const tailInfo = chronicle.computeHeadTail({ headTokens: 0, tailTokens: 500 });
   const picker = new Picker(new FlatProfileStrategy());
-  const start = Date.now();
+  const cpuBefore = process.cpuUsage();
   const result = picker.run(
     {
       chunks: chronicle.chunks,
@@ -290,9 +290,10 @@ test('integration: stress — 1000 chunks, deep recursion via preProduceUpperLev
     },
     BUDGET(10_000)
   );
-  const elapsed = Date.now() - start;
+  const cpu = process.cpuUsage(cpuBefore);
+  const cpuMs = (cpu.user + cpu.system) / 1000;
 
-  assert.ok(elapsed < 5000, `picker took ${elapsed}ms on 1000 chunks; should be < 5s`);
+  assert.ok(cpuMs < 5000, `picker used ${Math.round(cpuMs)}ms of CPU on 1000 chunks; should be < 5s`);
   assert.ok(result.moves <= 1000, `applied frontier changes at most one move per chunk, got ${result.moves}`);
   // Budget should be met or production requested
   assert.ok(result.budgetMet || result.produced.length > 0);

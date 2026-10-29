@@ -161,13 +161,16 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches.
 
-Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
-ubuntu and macos, installing with `npm ci`. The lockfile is committed and
-strict: `npm install` on npm >= 11 will quietly re-resolve platform packages
-missing from the lock, so only `npm ci` fails loudly on a lock that is broken
-or out of sync. If you change dependencies, commit the regenerated lock — and
-note that a lock regenerated over an existing `node_modules` tree records
-only your platform's native binaries, which is why CI installs on both.
+Push-time CI (`ci.yml`) runs on every push to `main` and every PR. It
+typechecks, builds and tests once, on ubuntu at the engines floor (Node
+22.12.0). Every other leg, on ubuntu and macos, installs with `npm ci`, packs
+the package, installs the tarball into an empty project and imports it. The
+lockfile is committed and strict: `npm install` on npm >= 11 will quietly
+re-resolve platform packages missing from the lock, so only `npm ci` fails
+loudly on a lock that is broken or out of sync. If you change dependencies,
+commit the regenerated lock — and note that a lock regenerated over an
+existing `node_modules` tree records only your platform's native binaries,
+which is why CI installs on both.
 
 `bench/` and `playground/` hold the harnesses for looking at real compression
 behavior rather than fixtures; `docs/` carries the design notes behind the

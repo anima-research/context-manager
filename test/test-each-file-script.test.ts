@@ -1,8 +1,8 @@
-// Black-box coverage of scripts/test-each-file.sh, which CI's Node 22 legs and
-// the release workflow's test job run in place of npm test. Each case runs the
-// real script in a throwaway directory whose dist/test holds fixture files, is
-// empty, or is missing, and checks its exit status, the verdict those jobs act
-// on: the release publishes only if it is 0.
+// Black-box coverage of scripts/test-each-file.sh, which CI's build-and-test
+// job and the release workflow's test job run in place of npm test. Each case
+// runs the real script in a throwaway directory whose dist/test holds fixture
+// files, is empty, or is missing, and checks its exit status, the verdict those
+// jobs act on: the release publishes only if it is 0.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -102,7 +102,7 @@ function runScript(files: Record<string, string> | undefined): Run {
         // The fixtures run on the node this test runs on.
         PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
         // node --test gives its children this, and the script must clear it:
-        // set here, every run with fixtures checks that, on every leg.
+        // set here, every run with fixtures checks that.
         NODE_TEST_CONTEXT: "child-v8",
       },
       encoding: "utf8",

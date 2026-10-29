@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Runs every compiled test file, dist/test/**/*.test.js, in a node process of
-# its own, one after another; run it after npm run build, from the
-# repository's root, as CI and the release workflow do. That is what node
-# --test runs in each child, but here nothing between the file and the log
-# reads its output. CI's Node 22 legs and the release workflow's test job run
-# the suite this way. On Node 22, node --test's parent can misread the results
-# a child sends it, and then loop forever, when a read of the child's output
-# ends right after a frame's four-byte length and that length's last byte is
-# 0xff (nodejs/node#62693). nodejs/node#62704 fixed that, first in 24.18.0 and
+# its own, one after another; run it after npm run build, from the repository's
+# root, as CI and the release workflow do. That is what node --test runs in
+# each child, but here nothing between the file and the log reads its output.
+# CI's build-and-test job and the release workflow's test job run the suite
+# this way. On Node 22, node --test's parent can misread the results a child
+# sends it, and then loop forever, when a read of the child's output ends right
+# after a frame's four-byte length and that length's last byte is 0xff
+# (nodejs/node#62693). nodejs/node#62704 fixed that, first in 24.18.0 and
 # 26.2.0, but no 22.x release has the fix, as of 22.23.4 (2026-10-21).
 #
 # Every compiled test file runs, so these jobs can run more files than npm

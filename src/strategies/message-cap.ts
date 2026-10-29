@@ -15,7 +15,7 @@ export { isEmptyTextBlock };
 /** Written once in a message the cap cuts, so it doesn't read as ending at
  *  the cut: where the first dropped text block that held anything was, or,
  *  in the autobiographical strategy's combined recall answer with
- *  `recallEnvelope: 'xml'`, after its last answer when the cap left
+ *  `recallEnvelope: 'xml'` or `'bare'`, after its last answer when the cap left
  *  summaries out. It stands alone for content of text blocks that hold
  *  nothing when the cap leaves one of them out, and as that combined answer
  *  when the cap admits none of its summaries, so neither comes back empty or

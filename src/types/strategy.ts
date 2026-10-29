@@ -1477,7 +1477,7 @@ export interface CompressionQuarantineSpan {
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
-export type RecallEnvelopeMode = 'none' | 'xml';
+export type RecallEnvelopeMode = 'none' | 'xml' | 'bare';
 
 /** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
 export type CarrierPolicy = 'full' | 'live-strip';
@@ -1685,7 +1685,18 @@ export interface AutobiographicalConfig {
    * Unset: every target uses `identityReminder` (unchanged behavior).
    */
   witnessedIdentityReminder?: string;
-  /** Label shown before summaries in compiled context */
+  /**
+   * Label shown before summaries in compiled context. `{tools}` in it is
+   * replaced by the names of the tools called in the rounds its summary
+   * stands in for (in the combined pair of `positionedRecallPairs: false`,
+   * every summary the pair holds): each name once, in order of first call,
+   * the first five and then "and K more", or "no tools" when the sources the
+   * view holds called none. The names are read from the summary's source
+   * messages as the store's view holds them, the first time the summary is
+   * priced or rendered after the strategy loads its branch, and kept until
+   * the next load, so a source removed, or hidden by `viewFilter`, after that
+   * read drops out of them at the next load.
+   */
   summaryContextLabel?: string;
 
   /**
@@ -1699,11 +1710,13 @@ export interface AutobiographicalConfig {
    *    a recalled memory is marked as explicitly as its start (instances have
    *    been observed reading past it into unrelated content). Attributes come
    *    from the summary record; one the record cannot answer for is omitted.
+   *  - `'bare'` — the same fence with no attributes, `<cm-recall>` …
+   *    `</cm-recall>`, on every path `'xml'` takes.
    *
    * The envelope is a collision-tolerant delimiter convention, not parseable
    * XML: answer text is model prose and is never entity-escaped.
    *
-   * Q-side labels are identical under both modes.
+   * The envelope never wraps a Q-side label.
    *
    * WHY THE DEFAULT IS OFF. Recall answers are built at one shared choke
    * point, and the presented window is not its only consumer: the same
@@ -2345,9 +2358,11 @@ export interface AutobiographicalConfig {
    *   {level} — summary level (1, 2, or 3)
    *   {first} — first source message id
    *   {last}  — last source message id
+   *   {tools} — the tools its summary's rounds called, as `summaryContextLabel` lists them
    * Default: '[Recall {id}]'.
    *
-   * Only used when `positionedRecallPairs` is true.
+   * Only used when `positionedRecallPairs` is true and `adaptiveResolution`
+   * is off.
    */
   recallHeaderTemplate?: string;
 

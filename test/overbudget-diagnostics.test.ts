@@ -3114,6 +3114,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
   /** The input budget whose grace window (0.25) holds `tokens` and nothing more than a token or so past it. */
   const holding = (tokens: number) => ({ maxTokens: Math.ceil(tokens / 1.25) + 20, reserveForResponse: 20 });
   const unit = (error: OverBudgetError) => Reflect.get(error.diagnostics, 'middleCountUnit');
+  const sameQuestion = { recallHeaderTemplate: 'What do you remember from earlier?' };
 
   // Under positionedRecallPairs: false the combined recall pair went out unguarded: past the grace window, what refused
   // was whatever came after it, or nothing did.
@@ -3121,7 +3122,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
     it(`refuses at the combined recall pair past the grace window, as at a positioned pair, with ${after} after it`, async () => {
       const refusals: OverBudgetError[] = [];
       for (const positionedRecallPairs of [true, false]) {
-        const strategy = middleStrategy({ positionedRecallPairs, ...(after === 'the recent window' ? { recentWindowTokens: 50 } : {}) });
+        const strategy = middleStrategy({ positionedRecallPairs, ...sameQuestion, ...(after === 'the recent window' ? { recentWindowTokens: 50 } : {}) });
         await withManager(strategy, async (manager) => {
           const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
           // One message raw after the pair, or in the recent window, or none. The L1's 200 tokens are past the
@@ -3244,7 +3245,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
 
   it('prices the combined pair at a carrier\'s measured tokens under carrierPolicy full, as a positioned pair is priced, and at its estimate under live-strip', async () => {
     const outcome = async (positionedRecallPairs: boolean, carrierPolicy: 'full' | 'live-strip') => {
-      const strategy = middleStrategy({ positionedRecallPairs, carrierPolicy });
+      const strategy = middleStrategy({ positionedRecallPairs, carrierPolicy, ...sameQuestion });
       let result: { refused?: OverBudgetError } = {};
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));

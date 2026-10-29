@@ -5,11 +5,13 @@ import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { format } from 'node:util';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
 import type { SummaryEntry } from '../src/types/index.js';
+import { main } from '../scripts/inspect-store-main.js';
 
 // inspect-store is mutation-free strategy inspection (room-225 lane 5, the
 // brosefo household incident): it never constructs a strategy or a
@@ -78,9 +80,25 @@ function snapshot(path: string): string {
 }
 
 /** The script run as a process: its exit code, and both streams whatever the code. */
-function run(args: string[]): { code: number; stdout: string; stderr: string } {
+function cli(args: string[]): { code: number; stdout: string; stderr: string } {
   const result = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   return { code: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+async function run(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  let stdout = '';
+  let stderr = '';
+  const saved = { log: console.log, info: console.info, error: console.error, warn: console.warn };
+  console.log = console.info = (...parts: unknown[]) => { stdout += `${format(...parts)}\n`; };
+  console.error = console.warn = (...parts: unknown[]) => { stderr += `${format(...parts)}\n`; };
+  try {
+    return { code: await main(args), stdout, stderr };
+  } catch (error) {
+    stderr += `${format('FATAL:', error)}\n`;
+    return { code: 1, stdout, stderr };
+  } finally {
+    Object.assign(console, saved);
+  }
 }
 
 describe('inspect-store', () => {
@@ -88,7 +106,7 @@ describe('inspect-store', () => {
     const path = await residentStore();
     const out = join(path, '..', 'out');
     const before = snapshot(path);
-    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out]);
+    const { code, stdout, stderr } = cli([path, '--namespace', 'agents/Ada', '--output', out]);
     assert.equal(code, 0);
     assert.doesNotMatch(stderr, /torn tail/, 'a cleanly closed store has no truncation to report');
     assert.match(stdout, /Summaries: 1 /);
@@ -104,7 +122,7 @@ describe('inspect-store', () => {
   it('a namespace without strategy state is reported, nothing is inspected, and no state is created for it', async () => {
     const path = await residentStore();
     const before = snapshot(path);
-    const { code, stderr } = run([path, '--namespace', 'agents/Nobody', '--output', join(path, '..', 'out-nobody')]);
+    const { code, stderr } = await run([path, '--namespace', 'agents/Nobody', '--output', join(path, '..', 'out-nobody')]);
     assert.equal(code, 2);
     assert.match(stderr, /namespace "agents\/Nobody" has no strategy state/);
     assert.match(stderr, /Namespaces with strategy state: agents\/Ada/);
@@ -114,7 +132,7 @@ describe('inspect-store', () => {
 
   it('accepts --ns as the old name of --namespace', async () => {
     const path = await residentStore();
-    const { code, stdout } = run([path, '--ns', 'agents/Ada', '--output', join(path, '..', 'out-ns')]);
+    const { code, stdout } = await run([path, '--ns', 'agents/Ada', '--output', join(path, '..', 'out-ns')]);
     assert.equal(code, 0);
     assert.match(stdout, /Overview \(agents\/Ada\)/);
   });
@@ -122,7 +140,7 @@ describe('inspect-store', () => {
   it('--sample-compile writes one compile at that budget, labelled a sample using tool defaults', async () => {
     const path = await residentStore();
     const out = join(path, '..', 'out-sample');
-    const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out, '--sample-compile', '20000']);
+    const { code, stderr } = await run([path, '--namespace', 'agents/Ada', '--output', out, '--sample-compile', '20000']);
     assert.equal(code, 0, stderr);
     assert.deepEqual(readdirSync(out).sort(), ['messages.md', 'sample-compile-20000.md', 'summary-lineage.md', 'summary-tree.md']);
     const sample = readFileSync(join(out, 'sample-compile-20000.md'), 'utf8');
@@ -135,7 +153,7 @@ describe('inspect-store', () => {
     const path = await switchedStore();
     const before = snapshot(path);
     const guess = join(path, '..', 'out-guess');
-    const refused = run([path, '--namespace', 'agents/Ada', '--output', guess]);
+    const refused = await run([path, '--namespace', 'agents/Ada', '--output', guess]);
     assert.equal(refused.code, 2);
     assert.match(refused.stderr, /both message slots registered, agents\/Ada\/messages \(isolated\) and messages \(shared\)/);
     assert.match(refused.stderr, /choose with --message-slot isolated or --message-slot shared/);
@@ -143,7 +161,7 @@ describe('inspect-store', () => {
     for (const slot of ['isolated', 'shared'] as const) {
       const other = slot === 'isolated' ? 'shared' : 'isolated';
       const out = join(path, '..', `out-${slot}`);
-      const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--message-slot', slot, '--output', out]);
+      const { code, stdout, stderr } = await run([path, '--namespace', 'agents/Ada', '--message-slot', slot, '--output', out]);
       assert.equal(code, 0, stderr);
       assert.ok(stdout.includes(`Messages: 3 (the ${slot} message slot ${SLOT_IDS[slot]})`), stdout);
       const listing = readFileSync(join(out, 'messages.md'), 'utf8');
@@ -159,7 +177,7 @@ describe('inspect-store', () => {
     for (const slot of ['isolated', 'shared'] as const) {
       const other = slot === 'isolated' ? 'shared' : 'isolated';
       const out = join(path, '..', `out-sample-${slot}`);
-      const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--message-slot', slot, '--output', out, '--sample-compile', '20000']);
+      const { code, stderr } = await run([path, '--namespace', 'agents/Ada', '--message-slot', slot, '--output', out, '--sample-compile', '20000']);
       assert.equal(code, 0, stderr);
       const sample = readFileSync(join(out, 'sample-compile-20000.md'), 'utf8');
       assert.ok(sample.includes(`from the ${slot} message slot ${SLOT_IDS[slot]}`), sample);
@@ -173,7 +191,7 @@ describe('inspect-store', () => {
     const before = snapshot(path);
     for (const extra of [[], ['--sample-compile', '20000']]) {
       const out = join(path, '..', `out-absent-${extra.length}`);
-      const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--message-slot', 'isolated', '--output', out, ...extra]);
+      const { code, stderr } = await run([path, '--namespace', 'agents/Ada', '--message-slot', 'isolated', '--output', out, ...extra]);
       assert.equal(code, 2);
       assert.match(stderr, /--message-slot isolated: agents\/Ada\/messages is not registered in this store; nothing was inspected\. The shared slot messages is\./);
       assert.equal(existsSync(out), false, 'nothing written');
@@ -181,7 +199,7 @@ describe('inspect-store', () => {
     assert.equal(snapshot(path), before, 'the isolated slot was not created');
   });
 
-  it('with no message slot, summaries are inspected, and a sample compile is refused before any output', () => {
+  it('with no message slot, summaries are inspected, and a sample compile is refused before any output', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'inspect-store-'));
     dirs.push(dir);
     const path = join(dir, 'store');
@@ -190,12 +208,12 @@ describe('inspect-store', () => {
     store.registerState({ id: 'agents/Ada/autobio:resolutions', strategy: 'snapshot' });
     store.close();
     const before = snapshot(path);
-    const refused = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out-sample'), '--sample-compile', '20000']);
+    const refused = cli([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out-sample'), '--sample-compile', '20000']);
     assert.equal(refused.code, 2);
     assert.match(refused.stderr, /--sample-compile: "agents\/Ada" has no message slot .* so there is no history to compile; nothing was inspected/);
     assert.equal(existsSync(join(dir, 'out-sample')), false, 'nothing written');
     assert.equal(snapshot(path), before, 'no message slot was registered');
-    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
+    const { code, stdout, stderr } = await run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
     assert.equal(code, 0);
     assert.match(stdout, /Messages: 0 \(no message slot\)/);
     // Registered and never written: chronicle reads such a state as null, which is "nothing stored yet", not damage.
@@ -234,22 +252,22 @@ describe('inspect-store', () => {
       ...['abc', '0', '1.5', '-5', '1e3', '0x10', '050'].map((value): [string[], RegExp] =>
         [['--sample-compile', value], new RegExp(`--sample-compile takes a positive whole number of tokens, not "${value}"`)]),
     ];
-    cases.forEach(([args, message], i) => {
+    for (const [i, [args, message]] of cases.entries()) {
       const out = join(path, '..', `out-malformed-${i}`);
       const given = args.map((arg) => (arg === 'OUT' ? out : arg));
-      const { code, stderr } = run([path, ...given, ...(args.includes('--output') ? [] : ['--output', out])]);
+      const { code, stderr } = await run([path, ...given, ...(args.includes('--output') ? [] : ['--output', out])]);
       assert.equal(code, 1, args.join(' '));
       assert.match(stderr, message, args.join(' '));
       assert.doesNotMatch(stderr, /torn tail/, `${args.join(' ')}: refused before the store was opened`);
       assert.equal(existsSync(out), false, `${args.join(' ')}: nothing written`);
-    });
-    const first = run(['--namespace', 'agents/Ada', path]);
+    }
+    const first = cli(['--namespace', 'agents/Ada', path]);
     assert.equal(first.code, 1);
     assert.match(first.stderr, /the store path comes first/);
     assert.deepEqual(readFileSync(log), torn, 'no case opened the store: its torn tail is still there');
     assert.equal(snapshot(path), before);
     // Checked before the store is even looked for.
-    const absent = run([join(path, '..', 'absent'), '--namespace', 'agents/Ada', '--ns']);
+    const absent = await run([join(path, '..', 'absent'), '--namespace', 'agents/Ada', '--ns']);
     assert.equal(absent.code, 1);
     assert.match(absent.stderr, /--ns needs a value/);
     assert.equal(existsSync(join(path, '..', 'absent')), false);
@@ -261,7 +279,7 @@ describe('inspect-store', () => {
     const log = join(path, 'records.log');
     const clean = readFileSync(log);
     appendFileSync(log, Buffer.from([1, 2, 3, 4, 5, 6, 7])); // a partial frame, as an append that didn't complete leaves
-    const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-torn')]);
+    const { code, stderr } = await run([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-torn')]);
     assert.equal(code, 0, stderr);
     assert.match(stderr, new RegExp(`truncated a torn tail from records\\.log: it dropped 7 bytes, and the log now ends at byte ${clean.length}\\.`));
     assert.deepEqual(readFileSync(log), clean, 'the open truncated the log back to its last valid record');
@@ -277,10 +295,11 @@ describe('inspect-store', () => {
     // truncating the log's tail, so the open fails having already truncated.
     const stateBin = join(path, 'state.bin');
     writeFileSync(stateBin, readFileSync(stateBin).fill(0, 0, 4)); // its magic
-    const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-failed')]);
+    const { code, stderr } = cli([path, '--namespace', 'agents/Ada', '--output', join(path, '..', 'out-failed')]);
     assert.equal(code, 1, stderr);
     assert.match(stderr, new RegExp(`truncated a torn tail from records\\.log: it dropped 7 bytes, and the log now ends at byte ${clean.length}\\.`));
     assert.ok(stderr.indexOf('torn tail') < stderr.indexOf('FATAL'), 'the report, then the failed open');
+    assert.match(stderr, /FATAL: Error: Invalid store format/, 'the failed open\'s error, after FATAL');
     assert.deepEqual(readFileSync(log), clean, 'the failed open had truncated the log');
   });
 
@@ -294,7 +313,7 @@ describe('inspect-store', () => {
     });
     for (let i = 0; i < 3; i++) manager.addMessage(i % 2 ? 'Ada' : 'User', [text(`zz isolated message ${i}`)]);
     manager.close();
-    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
+    const { code, stdout, stderr } = await run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
     assert.equal(code, 0, stderr);
     assert.ok(stdout.includes('Messages: 3 (the isolated message slot agents/Ada/messages)'), stdout);
     assert.match(readFileSync(join(dir, 'out', 'messages.md'), 'utf8'), /zz isolated message 2/);
@@ -309,7 +328,7 @@ describe('inspect-store', () => {
     store.setStateJson(resolutionsId, { [firstId]: 2, raw: 0, broken: 'x' });
     store.close();
     const out = join(path, '..', 'out-res');
-    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out]);
+    const { code, stdout, stderr } = await run([path, '--namespace', 'agents/Ada', '--output', out]);
     assert.equal(code, 0, stderr);
     assert.match(stdout, /Resolutions recorded: 1 \(1 unreadable entry not shown\)/, 'a level-0 entry is raw, not a resolution');
     assert.match(stdout, /Resolution distribution: \{"2":1\}/);
@@ -317,7 +336,7 @@ describe('inspect-store', () => {
     assert.match(readFileSync(join(out, 'messages.md'), 'utf8'), /\[000\] User .* res=L2: zz message 0/, 'the resolved message is labelled');
   });
 
-  it('reports a summaries state that is not a list, and a resolutions state that is not a map, rather than reading either as empty', () => {
+  it('reports a summaries state that is not a list, and a resolutions state that is not a map, rather than reading either as empty', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'inspect-store-'));
     dirs.push(dir);
     const path = join(dir, 'store');
@@ -327,7 +346,7 @@ describe('inspect-store', () => {
     store.registerState({ id: 'agents/Bad/autobio:resolutions', strategy: 'snapshot' });
     store.setStateJson('agents/Bad/autobio:resolutions', ['not', 'a map']);
     store.close();
-    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Bad', '--output', join(dir, 'out')]);
+    const { code, stdout, stderr } = await run([path, '--namespace', 'agents/Bad', '--output', join(dir, 'out')]);
     assert.equal(code, 0, stderr);
     assert.match(stderr, /agents\/Bad\/autobio:summaries holds a map, not a list of summaries/);
     assert.match(stdout, /Summaries: unreadable \(agents\/Bad\/autobio:summaries holds a map\)/);
@@ -340,18 +359,19 @@ describe('inspect-store', () => {
     const held = JsStore.open({ path });
     try {
       const out = join(path, '..', 'out-locked');
-      const { code, stderr } = run([path, '--namespace', 'agents/Ada', '--output', out]);
+      const { code, stderr } = cli([path, '--namespace', 'agents/Ada', '--output', out]);
       assert.equal(code, 1);
       assert.match(stderr, /is locked: a running resident \(or another process\) holds it open\. Stop it, or inspect a copy of the store\./);
       assert.equal(existsSync(out), false, 'not even the output directory');
     } finally { held.close(); }
   });
 
-  it('never creates a store that does not exist', () => {
+  it('never creates a store that does not exist', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'inspect-store-none-'));
     dirs.push(dir);
-    const { code } = run([join(dir, 'absent'), '--output', join(dir, 'out')]);
+    const { code, stderr } = await run([join(dir, 'absent'), '--output', join(dir, 'out')]);
     assert.equal(code, 1);
+    assert.match(stderr, /^Store not found: /);
     assert.equal(existsSync(join(dir, 'absent')), false);
   });
 });

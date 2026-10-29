@@ -24,15 +24,17 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { defaultTokenEstimator, AutobiographicalStrategy } from '../src/index.js';
+import { defaultTokenEstimator, AutobiographicalStrategy, type ContextManager } from '../src/index.js';
 import {
   buildRecallEnvelopeTags,
   recallEnvelopeAddedText,
   wrapRecallAnswerContent,
 } from '../src/recall-envelope.js';
 import { transformZeroRecallCompression } from '../src/surgery/zero-recall-compression.js';
-import type { SummaryEntry } from '../src/types/index.js';
+import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
 import {
+  HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
+  HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   renderAdaptiveFixture,
   renderHierarchicalFixture,
   type FixtureSummary,
@@ -186,6 +188,82 @@ describe('recallEnvelope: xml mode wraps every answer', () => {
   });
 });
 
+describe('recallEnvelope: bare mode fences every answer with the tag pair alone', () => {
+  const fenced = (text: string) => `<cm-recall>\n${text}\n</cm-recall>`;
+
+  it('on the hierarchical path, each answer is its plain text between <cm-recall> and </cm-recall>, questions unchanged', async () => {
+    const plain = await renderHierarchicalFixture();
+    const bare = await renderHierarchicalFixture({ recallEnvelope: 'bare' });
+    assert.equal(bare.messages.length, plain.messages.length);
+    const plainAnswers = recallAnswers(plain.messages);
+    const bareAnswers = recallAnswers(bare.messages);
+    assert.ok(bareAnswers.length >= 3, `premise: the fixture renders at least 3 recall pairs, got ${bareAnswers.length}`);
+    bareAnswers.forEach((answer, i) => assert.equal(textOf(answer), fenced(textOf(plainAnswers[i]!))));
+    assert.deepEqual(bare.messages.filter(isRecallQuestion).map(textOf), plain.messages.filter(isRecallQuestion).map(textOf));
+  });
+
+  it('on the adaptive path too, priced as it renders', async () => {
+    const seen: {
+      stats?: ReturnType<ContextManager['getRenderStats']>;
+      store?: { estimateTokens(message: StoredMessage): number };
+    } = {};
+    const plain = await renderAdaptiveFixture();
+    const bare = await renderAdaptiveFixture({ recallEnvelope: 'bare' }, undefined, undefined, undefined, undefined, (manager) => {
+      seen.stats = manager.getRenderStats();
+      seen.store = (manager as unknown as { messageStore: NonNullable<typeof seen.store> }).messageStore;
+    });
+    const { stats, store } = seen;
+    const plainAnswers = recallAnswers(plain.messages);
+    const bareAnswers = recallAnswers(bare.messages);
+    assert.ok(bareAnswers.length >= 4, `premise: the fixture renders at least 4 recall pairs, got ${bareAnswers.length}`);
+    bareAnswers.forEach((answer, i) => assert.equal(textOf(answer), fenced(textOf(plainAnswers[i]!))));
+    assert.ok(stats?.planVsActual, 'premise: an adaptive compile reports its plan');
+    assert.equal(stats.planVsActual.planned, stats.planVsActual.actual);
+    assert.ok(store, 'premise: the fixture handed over its store');
+    const sent = bare.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
+    assert.equal(stats.total.tokens, sent, 'the render stats count what is sent');
+  });
+
+  it('the combined pair fences each summary it holds with the bare pair', async () => {
+    const combined = await renderHierarchicalFixture({ positionedRecallPairs: false, recallEnvelope: 'bare' });
+    const [answer] = recallAnswers(combined.messages);
+    const text = textOf(answer!);
+    for (const prose of [HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, HIERARCHICAL_FIXTURE_PLAIN_PROSE, 'zz-memory-with-carriers']) {
+      assert.ok(text.includes(fenced(prose)), `${prose} sits between its own tag pair: ${text}`);
+    }
+    assert.equal(text.match(/<cm-recall>/g)?.length, 3, text);
+    assert.ok(!/<cm-recall [^>]*>/.test(text), 'no tag carries an attribute');
+  });
+
+  it('a price kept for one mode isn\'t served for another, as previewContext overriding recallEnvelope needs', () => {
+    class CostProbe extends AutobiographicalStrategy {
+      answerCost(s: SummaryEntry): number { return this.recallAnswerCost(s).estimate; }
+      withEnvelope(mode: 'none' | 'xml' | 'bare'): void {
+        const self = this as unknown as { config: Record<string, unknown> };
+        self.config = { ...self.config, recallEnvelope: mode };
+      }
+    }
+    const summary = fakeSummary();
+    const probe = new CostProbe({});
+    probe.answerCost(summary);
+    for (const mode of ['bare', 'xml', 'none'] as const) {
+      probe.withEnvelope(mode);
+      assert.equal(probe.answerCost(summary), new CostProbe({ recallEnvelope: mode }).answerCost(summary), mode);
+    }
+  });
+
+  it('prices the bare pair into the recall cap', () => {
+    const summaries = [
+      fakeSummary({ id: 'L1-11', sourceRange: { first: 'zz-msg-1', last: 'zz-msg-9' } }),
+      fakeSummary({ id: 'L2-12', level: 2, sourceRange: { first: 'zz-msg-1', last: 'zz-msg-40' } }),
+    ];
+    assert.equal(recallEnvelopeAddedText(summaries[0]!, 'bare'), '<cm-recall>\n\n</cm-recall>');
+    const none = new EnvelopeProbeStrategy({}).priceRecallLadder(summaries, 100_000);
+    const bare = new EnvelopeProbeStrategy({ recallEnvelope: 'bare' }).priceRecallLadder(summaries, 100_000);
+    assert.equal(bare.keptTokens - none.keptTokens, 2 * defaultTokenEstimator('<cm-recall>\n\n</cm-recall>'));
+  });
+});
+
 describe('recallEnvelope: the delimiter is a convention, not parseable XML', () => {
   it('passes XML-significant prose through unescaped', () => {
     const summary = fakeSummary({ content: 'a < b && c > d — even a literal </cm-recall> stays verbatim' });
@@ -218,7 +296,7 @@ describe('recallEnvelope: the delimiter is a convention, not parseable XML', () 
 describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
   it('removes the same minted pairs whether or not answers are enveloped', async () => {
     const results = [];
-    for (const mode of ['none', 'xml'] as const) {
+    for (const mode of ['none', 'xml', 'bare'] as const) {
       const rendered = await renderAdaptiveFixture({ recallEnvelope: mode });
       const ladders = rendered.compressionRequests.filter((messages) =>
         messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))),
@@ -234,15 +312,30 @@ describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
       });
     }
 
-    const [bare, enveloped] = results;
-    assert.deepEqual(enveloped.removed, bare.removed, 'the same recall ids must be removed in both modes');
-    assert.equal(enveloped.original, bare.original, 'both modes must present the same request shape');
-    assert.equal(
-      bare.original - bare.sent,
-      enveloped.original - enveloped.sent,
-      'identical pair-count drop in both modes',
-    );
-    assert.equal(bare.original - bare.sent, bare.removed.length * 2, 'each removal drops a Q and an A');
+    const [plain, ...envelopedModes] = results;
+    for (const enveloped of envelopedModes) {
+      assert.deepEqual(enveloped.removed, plain.removed, `${enveloped.mode}: the same recall ids must be removed`);
+      assert.equal(enveloped.original, plain.original, `${enveloped.mode}: the same request shape`);
+      assert.equal(
+        plain.original - plain.sent,
+        enveloped.original - enveloped.sent,
+        `${enveloped.mode}: identical pair-count drop`,
+      );
+    }
+    assert.equal(plain.original - plain.sent, plain.removed.length * 2, 'each removal drops a Q and an A');
+  });
+
+  it('under bare, every answer in a mint or merge request\'s recall ladder is fenced by the tag pair alone', async () => {
+    const rendered = await renderAdaptiveFixture({ recallEnvelope: 'bare' });
+    let answers = 0;
+    for (const request of rendered.compressionRequests) {
+      request.forEach((message, i) => {
+        if (!/^\[CM\] Recall memory /.test(textOf(message))) return;
+        answers++;
+        assert.match(textOf(request[i + 1]!), /^<cm-recall>\n[\s\S]*\n<\/cm-recall>$/);
+      });
+    }
+    assert.ok(answers > 0, 'premise: the fixture mints requests carrying a recall ladder');
   });
 });
 
@@ -252,15 +345,15 @@ describe('recallEnvelope: token accounting', () => {
       fakeSummary({ id: 'L1-11', sourceRange: { first: 'zz-msg-1', last: 'zz-msg-9' } }),
       fakeSummary({ id: 'L2-12', level: 2, sourceRange: { first: 'zz-msg-1', last: 'zz-msg-40' } }),
     ];
-    const bare = new EnvelopeProbeStrategy({}).priceRecallLadder(summaries, 100_000);
+    const plain = new EnvelopeProbeStrategy({}).priceRecallLadder(summaries, 100_000);
     const enveloped = new EnvelopeProbeStrategy({ recallEnvelope: 'xml' })
       .priceRecallLadder(summaries, 100_000);
 
-    assert.equal(bare.kept.length, 2, 'a generous budget keeps every summary in both modes');
+    assert.equal(plain.kept.length, 2, 'a generous budget keeps every summary in both modes');
     assert.equal(enveloped.kept.length, 2);
     assert.ok(
-      enveloped.keptTokens > bare.keptTokens,
-      `enabled mode must price higher: ${enveloped.keptTokens} !> ${bare.keptTokens}`,
+      enveloped.keptTokens > plain.keptTokens,
+      `enabled mode must price higher: ${enveloped.keptTokens} !> ${plain.keptTokens}`,
     );
 
     const envelopeTokens = summaries.reduce(
@@ -268,7 +361,7 @@ describe('recallEnvelope: token accounting', () => {
       0,
     );
     assert.equal(
-      enveloped.keptTokens - bare.keptTokens,
+      enveloped.keptTokens - plain.keptTokens,
       envelopeTokens,
       'the delta must be the envelope strings themselves, not a constant',
     );
@@ -279,9 +372,9 @@ describe('recallEnvelope: token accounting', () => {
     const summaries = Array.from({ length: 6 }, (_, i) =>
       fakeSummary({ id: `L1-${20 + i}`, sourceRange: { first: `zz-msg-${i}`, last: `zz-msg-${i + 1}` } }),
     );
-    const bareBudget = new EnvelopeProbeStrategy({}).priceRecallLadder(summaries, 100_000).keptTokens;
+    const plainBudget = new EnvelopeProbeStrategy({}).priceRecallLadder(summaries, 100_000).keptTokens;
     const enveloped = new EnvelopeProbeStrategy({ recallEnvelope: 'xml' })
-      .priceRecallLadder(summaries, bareBudget);
+      .priceRecallLadder(summaries, plainBudget);
 
     assert.ok(
       enveloped.kept.length < summaries.length,

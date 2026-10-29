@@ -110,15 +110,16 @@ function assertEnvelopeIntact(answer: RenderedMessage, label: string): void {
 }
 
 describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelope', () => {
-  for (const name of CAPPED_RENDER_CASE_NAMES) {
-    it(`${name}: every capped answer carries a whole envelope`, async () => {
-      const rendered = await renderCappedCase(name, 'xml');
+  for (const name of CAPPED_RENDER_CASE_NAMES) for (const mode of ['xml', 'bare'] as const) {
+    it(`${name}, ${mode}: every capped answer carries a whole envelope`, async () => {
+      const rendered = await renderCappedCase(name, mode);
       const answers = recallAnswers(rendered.messages);
       assert.ok(answers.length > 0, `${name}: the capped render must still emit recall pairs`);
       for (const [index, answer] of answers.entries()) {
         const label = `${name} answer ${index}`;
         // Every combined case here cuts the first of the fixture's three summaries.
         assertEnvelopeIntact(name.includes('Combined') ? withoutTrailingOmission(answer, label) : answer, label);
+        if (mode === 'bare') assert.ok(!/<cm-recall [^>]*>/.test(textOf(answer)), `${label}: a bare tag carries no attribute`);
       }
     });
   }

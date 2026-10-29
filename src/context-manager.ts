@@ -3012,11 +3012,16 @@ export class ContextManager {
    * `opts.thinkingBinding` previews a compile with that option: a binding one
    * prices a summary's carriers as such a compile renders them (see
    * `SelectOptions.thinkingBinding`); without it, as configured.
+   * `opts.excludePins` lists pin and document-mark ids (as `pinRange` and
+   * `markDocument` return them) that the dry select reads as absent: the
+   * preview answers what a compile would do were they unpinned. Nothing is
+   * unpinned or written, and the option adds no log call; an id no pin has
+   * is ignored, and no compile takes the option.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+    opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -3025,7 +3030,7 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+        opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
       ) => PreviewResult | null;
     };
     if (typeof s.previewContext !== 'function') return null;

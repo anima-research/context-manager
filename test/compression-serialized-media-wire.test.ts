@@ -523,19 +523,20 @@ describe('matcher coverage', () => {
   });
   it('fails a string that almost matches in linear time', () => {
     const timed = (text: string) => {
-      const started = performance.now();
+      const started = process.cpuUsage();
       const r = one(text);
-      return { n: r.n, ms: performance.now() - started };
+      const cpu = process.cpuUsage(started);
+      return { n: r.n, ms: (cpu.user + cpu.system) / 1000 };
     };
     // Counts at which overlapping choices took seconds, so a regression fails here rather than hanging.
     for (const [parameter, count] of [[';x="1"', 28], [';x=\\"1\\"', 18], [';x=\\\\\\"1\\\\\\"', 16], [';x=1', 200], [';x=\\u00411', 200]] as const) {
       const r = timed('data:a/b' + parameter.repeat(count) + ' end');
       assert.equal(r.n, 0, parameter);
-      assert.ok(r.ms < 1000, `${parameter}: ${r.ms} ms`);
+      assert.ok(r.ms < 1000, `${parameter}: ${r.ms} ms of CPU`);
     }
     const slashes = timed('data:a' + '\\u002F'.repeat(5000) + ' end');
     assert.equal(slashes.n, 0);
-    assert.ok(slashes.ms < 1000, `${slashes.ms} ms`);
+    assert.ok(slashes.ms < 1000, `${slashes.ms} ms of CPU`);
   });
   it('reads one slash in a type, and quoted parameter values that hold \\u escapes but no other backslash or quote', () => {
     const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
@@ -548,9 +549,11 @@ describe('matcher coverage', () => {
     }
   });
   it('names a type behind a long run of backslashes in linear time', () => {
-    const started = performance.now();
+    const started = process.cpuUsage();
     const r = one('data:a' + '\\'.repeat(100_000) + '/b;base64,' + 'A'.repeat(5000));
-    assert.ok(performance.now() - started < 1000);
+    const cpu = process.cpuUsage(started);
+    const ms = (cpu.user + cpu.system) / 1000;
+    assert.ok(ms < 1000, `${ms} ms of CPU`);
     assert.equal(r.text, '[embedded a/b data URL omitted from compression prompt: 5000 serialized payload characters]');
   });
   it("ends a payload before 'data' only when a data URL follows it", () => {
