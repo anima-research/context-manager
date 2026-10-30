@@ -160,7 +160,7 @@ export function attributeEntries(
 
   // Pass 1: which members each raw entry carries, and whether it carried
   // them unaltered.
-  let resultsByUse: ReadonlyMap<string, ContentBlock> | undefined;
+  let resultsByUse: ReadonlyMap<string, readonly ContentBlock[]> | undefined;
   const entryBodies: Array<BodyState[] | null> = [];
   for (const entry of entries) {
     if (!isRawEntry(entry)) {
@@ -369,12 +369,16 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
   return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
 }
 
-/** Every tool_result block of the compile, by the tool_use it answers. */
-function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string, ContentBlock> {
-  const out = new Map<string, ContentBlock>();
+/** Every tool_result block of the compile, by the id of the tool_use it
+ *  answers: a later call can reuse an id, so one id can have several. */
+function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string, readonly ContentBlock[]> {
+  const out = new Map<string, ContentBlock[]>();
   for (const entry of entries) {
     for (const block of entry.content) {
-      if (block.type === 'tool_result' && !out.has(block.toolUseId)) out.set(block.toolUseId, block);
+      if (block.type !== 'tool_result') continue;
+      const placed = out.get(block.toolUseId);
+      if (placed) placed.push(block);
+      else out.set(block.toolUseId, [block]);
     }
   }
   return out;
@@ -382,14 +386,15 @@ function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string,
 
 /**
  * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and each moved result reached the
- * request unaltered where the repair put it. A result altered there, or
- * missing from the request, does not carry it.
+ * when it carries the rest unaltered and, for each moved result, a result
+ * with its id in the request carries it unaltered. A result altered, or
+ * missing from the request, does not carry it, unless another result with
+ * its id carries the same content.
  */
 function carriesWithRelocated(
   entry: ContextEntry,
   sourceMessages: readonly StoredMessage[],
-  resultsByUse: ReadonlyMap<string, ContentBlock>,
+  resultsByUse: ReadonlyMap<string, readonly ContentBlock[]>,
 ): boolean {
   const moved = new Set(entry.relocatedResults);
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
@@ -398,8 +403,8 @@ function carriesWithRelocated(
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;
-      const placed = resultsByUse.get((block as { toolUseId: string }).toolUseId);
-      if (!placed || !covers(placed, block)) return false;
+      const placed = resultsByUse.get((block as { toolUseId: string }).toolUseId) ?? [];
+      if (!placed.some((result) => covers(result, block))) return false;
     }
   }
   return true;

@@ -559,6 +559,20 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
   });
 
+  it('credits the body with its result where a later call reuses an unanswered call\'s id and repair moves the result to the later call', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const n = msg('n', 2, [text('never mind')]);
+    const b = msg('b', 3, [use('x')]);
+    const r = msg('r', 5, [result('x', 'what the later call returned')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), copy(n), copy(b), recall, copy(r)]);
+    const results = entries.flatMap((e) => e.content).filter((block) => block.type === 'tool_result').map((block) => String((block as { content: unknown }).content));
+    assert.equal(results.length, 2, 'premise: a stub for the earlier call, and the moved result for the later one');
+    assert.equal(results[1], 'what the later call returned', 'premise: the later call goes with its own result');
+    const body = attributeEntries(entries, [a, n, b, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 5, complete: true });
+  });
+
   it('still reports missing content when the moved result was altered afterwards, or is not in the request', async () => {
     const u = msg('u', 1, [use('tu-1')]);
     const r = msg('r', 3, [result('tu-1', 'the real output')]);

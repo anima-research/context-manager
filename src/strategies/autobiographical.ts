@@ -683,17 +683,20 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
- * the earliest call with its id before it, in its own message or an earlier
- * one, that no result has answered yet; a result with no such call goes with
- * the call its id last answered, as a further result; a result with neither
- * answers none. Epoch 4's predicate reads the same calls, so it sees what the
- * count sees.
+ * the nearest call with its id before it, in its own message or an earlier
+ * one, at any distance; pairing repair (relocateOrDropMissingResults) pairs
+ * it with the same call where its look-ahead reaches. A later call can reuse
+ * an id, and the earlier call is then answered by no result after it. A
+ * result whose nearest call a result has already answered goes with that
+ * call, as a further result; a result with no call before it with its id
+ * answers none.
+ * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
   type Waiting = { toolName: string; call: AnsweredCall };
-  // Calls no result has answered yet, oldest first, by id, and the call
-  // each id's latest first answer went to.
-  const waiting = new Map<string, Waiting[]>();
+  // The latest call with each id while no result has answered it, and the
+  // call each id's latest first answer went to.
+  const waiting = new Map<string, Waiting>();
   const answeredLast = new Map<string, AnsweredCall>();
   const byTool = new Map<string, AnsweredCall[]>();
   let place = 0;
@@ -702,13 +705,12 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        let queue = waiting.get(block.id);
-        if (!queue) waiting.set(block.id, (queue = []));
-        queue.push({ toolName: block.name, call: { message: at, place: -1, results: [] } });
+        waiting.set(block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } });
       } else if (block.type === 'tool_result') {
-        const first = waiting.get(block.toolUseId)?.shift();
+        const first = waiting.get(block.toolUseId);
         let call: AnsweredCall | undefined;
         if (first) {
+          waiting.delete(block.toolUseId);
           call = first.call;
           call.place = place;
           answeredLast.set(block.toolUseId, call);
@@ -18241,9 +18243,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  repair keep each block's images in order, copying a block at most. A
    *  result the repair drops, such as a second one for a call, leaves its
    *  verdicts unused, so its images took slots the window could have used.
-   *  Two results for one call id in a single message share a group, which
-   *  pairing repair, taking ids to be unique, doesn't expect: where it moves
-   *  one, they can take each other's verdicts. A verdict whose image had
+   *  Two results for one call id in a single message share a group, and
+   *  pairing repair can send them apart: in a message holding its own tool
+   *  cycle, a result before a later call with its id goes up to an earlier
+   *  call, and the result after that call stays. They can then take each
+   *  other's verdicts. A verdict whose image had
    *  another payload (imagePayload) isn't this image's, so the image is
    *  replaced, as is one with no verdict at all, such as an entry with no
    *  source would send: both err under the budget. Only the same image in
@@ -19804,11 +19808,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     survives the repair;
    *   - otherwise emit a stub.
    *
-   * tool_use ids are unique, so the single result carrying a given id is
-   * unambiguously the answer to that use — relocating it cannot break any
-   * other pairing. Results for `missing` ids never sit at or before
-   * `afterIndex` (that entry's results are already matched), so the search
-   * starts at `afterIndex + 1`.
+   * A result answers the nearest call before it with its id
+   * (answeredToolCalls), and a later call can reuse an id: a provider that
+   * leaves a streamed call's id out can get the same id in every response.
+   * So the search for an id ends at the next call with it, from `afterIndex`
+   * on, leaving a result past that call to it. The entry at `afterIndex`
+   * holds no result for a `missing` id, since its results are already
+   * matched, so there the search can meet only a later call. A result with
+   * the id in an entry before `afterIndex` answers an earlier call.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],
@@ -19825,12 +19832,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       unit = next;
     }
     return missing.map(id => {
-      for (let j = afterIndex + 1; j < end; j++) {
+      for (let j = afterIndex; j < end; j++) {
         const src = entries[j];
         const bi = src.content.findIndex(
-          b => b.type === 'tool_result' && b.toolUseId === id,
+          b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
         );
         if (bi === -1) continue;
+        if (src.content[bi]!.type === 'tool_use') break;
         const source = src.content;
         const real = source[bi];
         const rest = source.filter((_, k) => k !== bi);
@@ -19860,14 +19868,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
    *    its message's id and its place in that message's content, with the
    *    marker its content becomes. The count is of calls. A result answers
-   *    the earliest call with its id before it, in its own message or an
-   *    earlier one, that no result has answered yet, the order pairing
-   *    repair's look-ahead pairs them in where it reaches: a result beyond
-   *    its reach still answers its call and keeps the slot, as a folded one
-   *    does. A result with no such call goes with the call its id last
-   *    answered, as a further result, and takes no slot. A result with
-   *    neither, before any call with its id, answers none and is left as it
-   *    is: pairing repair drops it. Each tool's answered calls are ordered by
+   *    the nearest call with its id before it, in its own message or an
+   *    earlier one (answeredToolCalls), the call pairing repair's look-ahead
+   *    pairs it with where it reaches: a result beyond its reach still
+   *    answers its call and keeps the slot, as a folded one does. A result
+   *    whose call a result has already answered goes with that call, as a
+   *    further result, and takes no slot. A result with no call before it
+   *    with its id answers none and is left as it is: pairing repair drops
+   *    it. Each tool's answered calls are ordered by
    *    their call's message, and calls made in one message by where the
    *    results that answer them are stored, the order the render sends a
    *    batch the repair leaves alone. All but the last N have every result
@@ -19883,11 +19891,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * content, since it can change in place. The store's listing is a new array
    * after each write, so a compile computes this once. A merged view lists
    * afresh at every read (mergeMessageStoreViews), so whatever prices every
-   * raw message holds the decision while it does (withToolPruning). Calls
-   * are matched by id, which pairing repair takes to be unique: where a host
-   * reuses an id, the repair can pair a result, or a further one, with a
-   * different call with that id than this count does, and so send more than
-   * N whole. A decision isn't changed once returned, by this method or an
+   * raw message holds the decision while it does (withToolPruning). A
+   * decision isn't changed once returned, by this method or an
    * override: a different decision is a new object, which is what the
    * prices kept per decision (postStripEstimates) rely on.
    */
