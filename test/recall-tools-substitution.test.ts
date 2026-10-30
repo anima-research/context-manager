@@ -39,10 +39,10 @@ function questions(messages: ReadonlyArray<{ participant: string; content: Conte
 }
 
 /** A store of rounds, each an agent turn calling the named tools and a turn of their results. */
-function addRounds(manager: ContextManager, rounds: string[][]): string[][] {
+function addRounds(manager: ContextManager, rounds: string[][], said = ''): string[][] {
   return rounds.map((names, r) => {
     const calls = names.map((name, k) => call(`tu-${r}-${k}`, name));
-    const asked = manager.addMessage('Claude', [{ type: 'text', text: `zz-round-${r}` }, ...calls]);
+    const asked = manager.addMessage('Claude', [{ type: 'text', text: `zz-round-${r}${said}` }, ...calls]);
     const answered = manager.addMessage('User', calls.length > 0
       ? names.map((_, k) => result(`tu-${r}-${k}`))
       : text(`zz-reply-${r}`));
@@ -55,10 +55,11 @@ async function positioned(
   path: string,
   options: AutobiographicalOptions,
   rounds: string[][],
+  said = '',
 ): Promise<{ manager: ContextManager; strategy: SeedableStrategy; ids: string[][] }> {
   const strategy = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8, ...options });
   const manager = await ContextManager.open({ path, strategy });
-  const ids = addRounds(manager, rounds);
+  const ids = addRounds(manager, rounds, said);
   manager.addMessage('User', text('zz-latest ' + 'Z'.repeat(60)));
   return { manager, strategy, ids };
 }
@@ -258,9 +259,10 @@ describe('{tools}: the tools a summary\'s rounds called', () => {
     await withStore(async (path) => {
       const { manager, strategy, ids } = await positioned(path,
         { recallHeaderTemplate: '[Recall {id}] ' + 'zz-long-header '.repeat(40) + '{tools}' },
-        [['read_file']]);
+        [['read_file']], ' ' + 'words of the round as it was first said '.repeat(40));
       strategy.seed(l1('L1-1', ids.flat()));
       const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      assert.equal(questions(compiled.messages).length, 1, 'the premise: the recall pair goes out');
       const store = (manager as unknown as { messageStore: { estimateTokens(message: StoredMessage): number } }).messageStore;
       const sent = compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
       assert.equal(manager.getRenderStats()!.total.tokens, sent);
