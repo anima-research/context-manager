@@ -940,6 +940,8 @@ const PVA_OPENING =
  * the line names, which follows its fields and the note (#239).
  */
 const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)? ns=default$`;
+// The floor beside the hard budget, and the queued relief (#415).
+const PVA_FLOOR = String.raw` floor=\d+ hardBudget=\d+ queuedRelief=\d+`;
 
 test('a kv-stable compile after a preview that solved with kv-unified logs no solveMs', async () => {
   // buildPicker's kv-stable branch leaves _lastKvUnified as the preview's pick
@@ -953,9 +955,9 @@ test('a kv-stable compile after a preview that solved with kv-unified logs no so
     manager.close();
   }, ['[picker-config-drift]']);
   assert.equal(lines.length, 2, `one line for each compile: ${JSON.stringify(lines)}`);
-  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+` + PVA_FLOOR + ' dryRun=true' + PVA_OVERRUN),
     'premise: the preview solved with kv-unified');
-  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_OVERRUN), 'the live kv-stable compile');
+  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_FLOOR + PVA_OVERRUN), 'the live kv-stable compile');
 });
 
 test('compileMs spans the select from its start, chunk rebuild included, and no more than the compile call', async () => {
@@ -993,7 +995,7 @@ test('a preview marks its plan-vs-actual line and its own stats dryRun, and a dr
   });
   assert.equal(preview!.stats?.planVsActual?.dryRun, true, "the preview's own stats are marked");
   assert.equal(lines.length, 3, `one line for each compile: ${JSON.stringify(lines)}`);
-  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+` + PVA_FLOOR + ' dryRun=true' + PVA_OVERRUN),
     "the preview's line");
 });
 

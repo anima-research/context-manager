@@ -70,7 +70,7 @@ import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
 import { KvUnifiedStrategy, ceilingMark, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
-import { heldLevelPin, type CanonicalSummaryForest } from '../adaptive/kv-unified.js';
+import { heldLevelPin, CanonicalSummaryForest } from '../adaptive/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
@@ -516,6 +516,9 @@ const COMPRESSION_MARKER =
   'about to compress. After them, write the memory in your own voice.';
 
 const RECALL_TOOLS_SHOWN = 5;
+
+/** Latest summaries at a level whose mean prices the next one there (expectedPairCost). */
+const EXPECTED_PAIR_SAMPLE = 12;
 
 /**
  * The interstitial text between two summaries in the legacy combined recall
@@ -6308,6 +6311,158 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Whether the head of the merge queue takes its turn before the L1 of
+   * `chunk` because it would take more off the floor (#415): the plan's
+   * cheapest form of the store, which an adaptive compile refuses once it
+   * passes the hard budget. The lane runs one call at a time, and L1 work
+   * otherwise always goes first, so an agent that closes chunks as fast as
+   * calls complete keeps a chunk queued at every tick and its merges never
+   * run: the pyramid stops deepening while unmerged L1s fill the middle
+   * (#412). An L1 takes its chunk's raw tokens down to one recall pair; a
+   * merge takes its sources' pairs down to one, which with the default
+   * summary target is several times as much. A merge that has failed (a
+   * transient failure, or an answer recordMergeRejection counted as an
+   * attempt), waits on a hold or on the host's tools, or would land as
+   * planned under a drain (landsAsPlanned) keeps its usual place.
+   */
+  private mergeTakesTurnByRelief(chunk: Chunk | undefined, store: MessageStoreView): boolean {
+    if (!chunk || !this.config.adaptiveResolution || !this.config.hierarchical || this.landsAsPlanned()) return false;
+    const head = this.mergeQueue[0];
+    if (!head) return false;
+    if ((head.attempts ?? 0) > 0 || head.hadRefusal) return false;
+    const key = mergeFailureKey(head);
+    if (this.mergeFailureOrder.has(key) || this.toolsDeferredMerge === key) return false;
+    if (this.mergeBlockedByHold(head.sourceIds, store)) return false;
+    const mergeRelief = this.mergeRelief(head);
+    return mergeRelief !== null && mergeRelief > this.chunkRelief(chunk);
+  }
+
+  /** Tokens an L1 of `chunk` would take off the floor: its raw tokens, less
+   *  the recall pair an L1 renders as. */
+  protected chunkRelief(chunk: Chunk, expected?: Map<number, number>): number {
+    return chunk.tokens - this.expectedPairCost(1, expected);
+  }
+
+  /** Tokens a merge would take off the floor: its sources' recall pairs, less
+   *  the one its parent renders as. Null when a source isn't held. */
+  protected mergeRelief(merge: { level: number; sourceIds: readonly string[] }, expected?: Map<number, number>): number | null {
+    let sources = 0;
+    for (const id of merge.sourceIds) {
+      const source = this.summaryById(id);
+      if (!source) return null;
+      sources += this.recallPairCost(source);
+    }
+    return sources - this.expectedPairCost(merge.level, expected);
+  }
+
+  /** What a new summary at `level` is expected to cost as a recall pair: the
+   *  mean of the latest summaries at that level, or the summary target before
+   *  any exists. A caller pricing many items passes `expected`, which keeps
+   *  each level's figure for the pass. */
+  private expectedPairCost(level: number, expected?: Map<number, number>): number {
+    const known = expected?.get(level);
+    if (known !== undefined) return known;
+    let count = 0;
+    let total = 0;
+    for (let i = this.summaries.length - 1; i >= 0 && count < EXPECTED_PAIR_SAMPLE; i--) {
+      const s = this.summaries[i]!;
+      if (s.level !== level) continue;
+      total += this.recallPairCost(s);
+      count++;
+    }
+    const cost = count > 0 ? total / count : (this.config.summaryTargetTokens ?? 2000);
+    expected?.set(level, cost);
+    return cost;
+  }
+
+  /**
+   * The floor (#415): the cheapest plan the summaries held allow for these
+   * inputs, head and tail included, in the plan's units. An adaptive compile
+   * refuses once it passes the hard budget, whatever the folding strategy
+   * picks, so the distance between the two is how near the store is to its
+   * first refusal. Null where the forest can't be built for these inputs;
+   * the figure is a report and never fails a compile.
+   */
+  private floorTokens(inputs: PickerInputs): number | null {
+    try {
+      const kv = this.config.foldingStrategy === 'kv-unified' ? this.config.kvUnified : undefined;
+      const reused = kv ? this.kvUnifiedReuse.forest : undefined;
+      const forest = reused?.builtFrom(inputs)
+        ? reused
+        : new CanonicalSummaryForest(inputs, {
+            treeifyNonContiguousSummaries: kv?.treeifyNonContiguousSummaries,
+            preserveGapBearingSummaries: kv?.preserveGapBearingSummaries,
+          });
+      const floor = forest.minimumTokens();
+      this.floorFailure = undefined;
+      return floor.feasible ? floor.floorTokens : null;
+    } catch (error) {
+      // Said once a run of failures with the same cause, as the report goes
+      // missing from every compile while it lasts.
+      const cause = describeCompressionFailure(error);
+      if (cause !== this.floorFailure) {
+        this.floorFailure = cause;
+        this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+      }
+      return null;
+    }
+  }
+
+  /** What the queued work is expected to take off the floor once it lands:
+   *  each queued chunk's L1 and each queued merge, as the lane prices them
+   *  (chunkRelief, mergeRelief), counting only work that relieves. Work tick
+   *  won't turn into a summary counts as zero, by the gates tick and
+   *  compressionWorkQueued read:
+   *  - a chunk the compression quarantine holds, which every rebuild queues
+   *    again and tick skips, and one deferred for the host's tool
+   *    definitions;
+   *  - from the first chunk a compression hold reaches, every chunk, since
+   *    tick stops there until the hold is released;
+   *  - a merge holding a source an operator hold or a merge-quarantine record
+   *    keeps out (mergeHeldSourceIds), which tick drops, and from the first
+   *    merge a hold blocks, every merge;
+   *  - every merge without a compression model, outside `hierarchical`, or
+   *    while the family waits for the host's tools.
+   *  Where the quarantine can't be read, no chunk counts, so the figure errs
+   *  low: a host that waits on it waits for nothing less often. Merges the
+   *  queue doesn't hold yet aren't counted. Unlike compressionWorkQueued it
+   *  doesn't ask which queued messages the selection can fold, which would
+   *  price every message again on each compile: the queue holds the
+   *  chunker's compressible messages, less any a raw pin placed since keeps
+   *  raw. */
+  protected queuedReliefTokens(): number {
+    const store = this.hostContext?.messageStore;
+    const tools = this.hostContext?.tools;
+    const quarantined = this.quarantinedChunkSources();
+    const heldSources = this.mergeHeldSourceIds();
+    const blocked = store ? this.holdBlockedIds(store) : null;
+    const deferredForTools: (chunk: Chunk) => boolean =
+      (tools?.length ?? 0) > 0 ? () => false
+        : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
+          : store ? this.requestCarriesToolBlocks(store) : () => false;
+    const expected = new Map<number, number>();
+    let total = 0;
+    if (quarantined) {
+      for (const index of this.compressionQueue) {
+        const chunk = this.chunks[index];
+        if (!chunk || chunk.compressed) continue;
+        if (this.chunkHasHeldMessage(chunk, blocked)) break;
+        if (this.toolsDeferredChunks.has(this.chunkKey(chunk)) || deferredForTools(chunk)) continue;
+        if (quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
+        total += Math.max(0, this.chunkRelief(chunk, expected));
+      }
+    }
+    if (this.config.hierarchical && this.config.compressionModel && !this.familyWaitsForTools(tools)) {
+      for (const merge of this.mergeQueue) {
+        if (store && this.mergeBlockedByHold(merge.sourceIds, store, blocked)) break;
+        if (merge.sourceIds.some((id) => heldSources.has(id))) continue;
+        total += Math.max(0, this.mergeRelief(merge, expected) ?? 0);
+      }
+    }
+    return Math.round(total);
+  }
+
+  /**
    * An answer to one of the lane's calls ends its route's pause and backoff:
    * the pause of the membrane instance and model the answered call went
    * through, on whatever branch. Another route's answer says nothing about this one, so
@@ -7666,6 +7821,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
       if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) break;
+      // A merge that takes more off the floor than this chunk's L1 goes first.
+      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore)) break;
       const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
       const queueGeneration = this.compressionQueueGeneration;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
@@ -9060,6 +9217,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._emittedSummaryIds = new Set();
     this._plannedTokens = null;
     this._plannedMeta = null;
+    this._plannedFloor = null;
     this._lastFoldDiff = null;
     this._rs = {
       head: { messages: 0, tokens: 0 },
@@ -9091,6 +9249,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
+  /** This select's floor and the budget its plan check refuses above (#415). */
+  private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
+  /** The cause of the last floor computation that failed, while it keeps failing (floorTokens). */
+  private floorFailure: string | undefined;
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
@@ -9199,6 +9361,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Dry runs and previews log the line too, and skip work a live compile
       // does, so a journal reader must be able to drop them.
       const dryRun = this._dryRunSelect;
+      const floor = this._plannedFloor;
+      const queuedRelief = floor ? this.queuedReliefTokens() : undefined;
       r.planVsActual = {
         planned,
         actual,
@@ -9213,6 +9377,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(ceiling ? { ceiling } : {}),
         ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
+        ...(floor ? { floorTokens: floor.floorTokens, hardBudget: floor.hardBudget, queuedReliefTokens: queuedRelief } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -9223,6 +9388,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
         (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
         (ceiling ? ` ceiling=${ceiling}` : '') +
+        (floor ? ` floor=${floor.floorTokens} hardBudget=${floor.hardBudget} queuedRelief=${queuedRelief}` : '') +
         (dryRun ? ' dryRun=true' : '');
       if (loud) this.diag.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else this.diag.error(line);
@@ -13456,6 +13622,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       diagnostics: {
         ...opts.diagnostics,
         ...this.summaryInventoryDiagnostics(),
+        ...(this._plannedFloor ? { floorTokens: this._plannedFloor.floorTokens, queuedReliefTokens: this.queuedReliefTokens() } : {}),
         configuredBudget: budget.maxTokens,
         reserveForResponse: budget.reserveForResponse,
         inputBudget: budget.maxTokens - budget.reserveForResponse,
@@ -13971,6 +14138,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // compare it against what was actually committed (its other figures,
     // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;
+    const floorTokens = this.floorTokens(pickerInputs);
+    this._plannedFloor = floorTokens === null ? null : { floorTokens, hardBudget: rejectionBudget };
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.

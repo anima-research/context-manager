@@ -1140,6 +1140,29 @@ export interface RenderStats {
      *  returned, past which no cached prefix reaches. Present only when a
      *  compile that changed at least one saved level committed. */
     foldDiff?: FoldDiff;
+    /** The floor (#415): the cheapest plan the summaries held allow for this
+     *  compile's inputs, head and tail included, in the plan's units, whatever
+     *  the folding strategy picked. A compile refuses once its plan passes
+     *  `hardBudget`, so `hardBudget - floorTokens` is how far the store is
+     *  from its first refusal: it shrinks as history arrives and grows as
+     *  L1s and merges land. Absent where the forest couldn't be built
+     *  (`floor=` on the plan line). */
+    floorTokens?: number;
+    /** The plan size above which this compile refuses: the input budget with
+     *  `overBudgetGraceRatio` added (`hardBudget=`). Set with `floorTokens`. */
+    hardBudget?: number;
+    /** What the work queued at the end of this compile is expected to take
+     *  off the floor once it lands, from each queued chunk's raw tokens less
+     *  the recall pair its L1 is expected to render as, and each queued
+     *  merge's sources' pairs less its parent's. Work that wouldn't shrink
+     *  the floor counts as zero, as does work tick won't turn into a summary:
+     *  a chunk the compression quarantine holds or deferred for the host's
+     *  tools; every chunk from the first a compression
+     *  hold reaches; a merge holding a source a hold or a merge-quarantine
+     *  record keeps out, and every merge from the first a hold blocks. Merges
+     *  not yet queued aren't counted (`queuedRelief=`). Set with
+     *  `floorTokens`. */
+    queuedReliefTokens?: number;
   };
 }
 

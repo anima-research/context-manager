@@ -62,6 +62,20 @@ export interface OverBudgetDiagnostics {
    * any.
    */
   rawPins?: { tokens: number; pins: readonly OverBudgetRawPin[] };
+  /**
+   * Under adaptive resolution, the cheapest plan the summaries held allow,
+   * head and tail included (#415). At or under the budget, a plan that could
+   * fit wasn't picked; over it, only new summaries, a larger budget or a
+   * smaller tail clear the refusal. Absent where it couldn't be computed.
+   */
+  floorTokens?: number;
+  /**
+   * Under adaptive resolution, what the queued compression work is expected
+   * to take off `floorTokens` once it lands (RenderStats' `queuedReliefTokens`).
+   * A floor that stays over the budget less this much won't be cleared by
+   * draining the queue alone.
+   */
+  queuedReliefTokens?: number;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
@@ -271,6 +285,8 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.configuredBudget === undefined ? '' : `, configured=${opts.diagnostics.configuredBudget}`) +
         (opts.diagnostics.reserveForResponse === undefined ? '' : `, response reserve=${opts.diagnostics.reserveForResponse}`) +
         (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
+        (opts.diagnostics.floorTokens === undefined ? '' : `, floor=${opts.diagnostics.floorTokens}`) +
+        (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across
