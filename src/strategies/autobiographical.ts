@@ -2546,10 +2546,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
     const callerMarkers = this.config.kvUnified?.callerCacheMarkers ?? 0;
     if (!Number.isInteger(callerMarkers) || callerMarkers < 0 || callerMarkers > 3) {
+      const shown = typeof callerMarkers === 'string' ? JSON.stringify(callerMarkers) : String(callerMarkers);
       throw new RangeError(
-        `kvUnified.callerCacheMarkers is ${JSON.stringify(callerMarkers)}; it must be an integer from 0 to 3, the cache ` +
-          `markers the caller's request carries outside the messages. kv-unified places at most 4 minus that many of ` +
-          `its own, and needs at least one.`,
+        `kvUnified.callerCacheMarkers is ${shown}; it must be an integer from 0 to 3, the cache markers the ` +
+          `caller's request carries outside the messages. kv-unified places at most 4 minus that many of its own, ` +
+          `and needs at least one.`,
       );
     }
     this.kvUnifiedCallerMarkers = callerMarkers;
@@ -15404,8 +15405,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Place message-level `cache_control` breakpoints across the final ordered
    * entries. `kv-unified` owns the four provider slots less the caller's own
-   * (`kvUnified.callerCacheMarkers`), spaces its history markers evenly over
-   * non-tail history's rendered tokens, and marks the tail end. Other
+   * (`kvUnified.callerCacheMarkers`), puts its history markers on the legal
+   * boundaries nearest to evenly spaced fractions of non-tail history's
+   * rendered tokens, and marks the tail end. Other
    * strategies retain the legacy three-slot contract: first slot, measured
    * stable-prefix boundary, and end. Their first slot is the end of the deep
    * band (`deepBandEnd`) when the compile emitted one, else the last head
@@ -15713,10 +15715,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  compile emits: for each marked entry, in order, its identity and the hash
    *  of every entry up to it. Reconcile refuses a marked entry with no
    *  identity, and acceptance keeps a reference only when the wire carried one
-   *  marker per reconciled unit beside the caller's declared ones, while it
-   *  carries one per marked entry. So an
-   *  accepted reference's prefixes run parallel to its markers, and the check
-   *  credits one whose don't as it is. */
+   *  marker per reconciled unit beside the caller's declared ones, while the
+   *  record carries one per marked entry. So an accepted reference's prefixes
+   *  run parallel to its markers, and the check credits one whose don't as it
+   *  is. */
   private kvUnifiedRenderRecord(
     entries: readonly ContextEntry[],
     layout: RenderLayout,

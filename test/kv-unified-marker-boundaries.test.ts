@@ -376,7 +376,8 @@ describe("a caller that places its own cache markers outside the messages (kvUni
           const compiled = await o.compile();
           const marked = breakpointsOf(compiled.messages);
           assert.equal(marked.length, placed, "kv-unified's breakpoints");
-          assert.equal(marked.at(-1), compiled.messages.length - 1, 'the tail end is marked');
+          assert.deepEqual(marked.slice(-Math.min(2, 4 - declared)), c.marked.slice(-Math.min(2, 4 - declared)),
+            "the history's last boundary, while a history marker remains, and the tail end, as with none declared");
           o.accept(o.begin(), placed + declared);
           const cache = receipts(o.strategy).cache;
           assert.ok(cache, 'the accepted presentation keeps a cache reference');
@@ -400,6 +401,21 @@ describe("a caller that places its own cache markers outside the messages (kvUni
       config.kvUnified.callerCacheMarkers = 3;
       o.accept(o.begin(), 4);
       assert.ok(receipts(o.strategy).cache, 'the request carrying 1 declared marker keeps its reference');
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a preview whose overrides replace kvUnified places for the count the strategy was built with", async () => {
+    const c = CASES["three messages in the head and three raw in the middle: the head's last and the middle are marked"]!;
+    const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(1) });
+    try {
+      await o.compile();
+      for (const replaced of [{}, { callerCacheMarkers: 2 }, { callerCacheMarkers: 4 }]) {
+        const preview = o.manager.previewContext(BIG, { kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, ...replaced } }, { render: true })!;
+        assert.equal(preview.entries!.filter((entry) => entry.cacheMarker).length, 3,
+          `${JSON.stringify(replaced)}: kv-unified's breakpoints, as for 1 declared`);
+      }
     } finally {
       await o.close();
     }
@@ -438,6 +454,10 @@ describe("a caller that places its own cache markers outside the messages (kvUni
         error instanceof RangeError && /kvUnified\.callerCacheMarkers is .*; it must be an integer from 0 to 3/.test(error.message),
       `${declared} is refused`);
     }
-    for (const declared of [0, 3]) assert.doesNotThrow(() => kvUnified({ ...withCallerMarkers(declared) }), `${declared} is taken`);
+    for (const declared of [0, 3, null as unknown as number]) {
+      assert.doesNotThrow(() => kvUnified({ ...withCallerMarkers(declared) }), `${declared} is taken`);
+    }
+    assert.throws(() => kvUnified({ ...withCallerMarkers(Number.NaN) }), /callerCacheMarkers is NaN;/);
+    assert.throws(() => kvUnified({ ...withCallerMarkers('1' as unknown as number) }), /callerCacheMarkers is "1";/);
   });
 });

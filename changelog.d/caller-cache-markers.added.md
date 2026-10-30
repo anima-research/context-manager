@@ -8,6 +8,5 @@
   carries its markers plus the declared ones. Before, such a hook's marker
   made every call's marker count differ from the compile's, so kv-unified
   kept no cache reference and weighed no cache costs, and once its own four
-  were in use the hook's was a fifth, which membrane's formatters doc says is
-  refused. The line kv-unified logs when the counts differ now names the
-  option.
+  were in use the hook's was a fifth, and membrane refused the request. The
+  line kv-unified logs when the counts differ now names the option.
