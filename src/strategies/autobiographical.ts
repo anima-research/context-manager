@@ -9653,7 +9653,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      its L_k children — using the children plus their parent
     //      doubles the prompt size unboundedly.
     //   3. Raw middle — messages between head and chunk not covered by
-    //      any summary (usually empty).
+    //      any summary or held by the compression quarantine (usually
+    //      empty).
     //   4. Marker — in-band signal that a memory is about to form.
     //   5. Chunk — raw messages being compressed, as the agent
     //      experienced them.
@@ -9731,6 +9732,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // stay declared (reasoning_extraction guard). L1 only; merge/transition
     // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
+    const quarantinedIds = this.quarantinedMessageIds();
 
     // History before the chunk, laid out for the messages that pins keep raw.
     const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
@@ -9769,10 +9771,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Raw messages before the chunk outside the head window, by position.
       // From the head window's end on, any message no summary represents yet
-      // (the raw middle: usually empty in adaptive-resolution mode, since
-      // chunking proceeds contiguously and summaries cover everything up to
-      // the chunk being processed). Before it, only what pins keep raw: the
-      // chunks a pin opened, and pinned messages no recall pair represents.
+      // and the compression quarantine doesn't hold (the raw middle: usually
+      // empty in adaptive-resolution mode, since chunking proceeds
+      // contiguously and summaries cover everything up to the chunk being
+      // processed). Before it, only what pins keep raw: the chunks a pin
+      // opened, and pinned messages no recall pair represents.
       // Same one-to-one rule as the head: coverage is judged against
       // `priorSummaryMessageIds`.
       //
@@ -9802,7 +9805,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (let i = 0; i < chunkStartIdx && i < allMessages.length; i++) {
           if (i >= headStartIdx && i < headEndIdx) continue;
           const m = allMessages[i];
-          if (priorSummaryMessageIds.has(m.id)) continue;
+          if (priorSummaryMessageIds.has(m.id) || quarantinedIds.has(m.id)) continue;
           const addedByPin = openedMessageIds.has(m.id) || (i < headEndIdx && forceRawMessageIds.has(m.id));
           if (!addedByPin && i < headEndIdx) continue;
           if (addedByPin) addPinnedRaw(i, m);
@@ -9886,6 +9889,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           headCoveredSkipped++;
           continue;
         }
+        if (quarantinedIds.has(m.id)) continue;
         llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
 
@@ -12410,6 +12414,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of priorSummariesAll) {
       this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
+    const quarantinedIds = this.quarantinedMessageIds();
 
     // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
     //
@@ -12436,6 +12441,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         headCoveredSkipped++;
         continue;
       }
+      if (quarantinedIds.has(m.id)) continue;
       llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
     }
     if (headCoveredSkipped > 0) {
@@ -12513,13 +12519,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Raw middle: any messages between the head window and the merge
-    // range that aren't covered by a prior summary or the merge tree.
-    // Usually empty (chunking is contiguous).
+    // range that aren't covered by a prior summary or the merge tree, or
+    // held by the compression quarantine. Usually empty (chunking is
+    // contiguous).
     if (mergeStartIdx >= 0 && !mergeSourceOnly) {
       for (let i = headEndIdx; i < mergeStartIdx; i++) {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
+        if (quarantinedIds.has(m.id)) continue;
         llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
     }
@@ -13362,8 +13370,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the start and end of the head that request gives (headAsOf, the head as
    * of the chunk, its end clipped at a hold as tick clips it, and 0 with the
    * head window off, headWindowTokens <= 0), that's every message the coverage
-   * leaves uncovered, up to the chunk or to that head's end, whichever is
-   * later. Before it, only what pins keep raw: the
+   * leaves uncovered and the compression quarantine doesn't hold
+   * (quarantinedMessageIds), up to the chunk or to that head's end, whichever
+   * is later. Before it, only what pins keep raw: the
    * messages of an L1 a pin opens, and a pinned message. Tick lays its
    * history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
@@ -13383,6 +13392,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Built at the first head read, so a count that reads none (source-only,
     // or each chunk holding a tool block itself) scans no holds.
     let heads: ((pos: number) => { start: number; end: number }) | undefined;
+    let held: Set<MessageId> | undefined;
     // For each count of pins before a chunk and the start its head's raw
     // reading takes, the index of the first message that request carries raw
     // with a tool block, or all.length for none.
@@ -13405,8 +13415,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Before `from`, the request carries only what pins keep raw: an L1 a
         // pin opens, and a pinned message. (Either lies before headEnd there,
         // since from is at most headEnd.)
+        const heldIds = (held ??= this.quarantinedMessageIds());
         const carried = (message: StoredMessage, i: number): boolean =>
-          !seen.coveredMessageIds.has(message.id)
+          !seen.coveredMessageIds.has(message.id) && !heldIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
         const found = all.findIndex((message, i) => carried(message, i) && hasToolBlocks(message.content));
         first = found === -1 ? all.length : found;
@@ -13442,6 +13453,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     return sources;
+  }
+
+  private quarantinedMessageIds(): Set<MessageId> {
+    const sources = this.quarantinedChunkSources();
+    const ids = new Set<MessageId>();
+    if (!sources?.size) return ids;
+    const records = new Map(this.chunkRecords.map((record) => [record.id, record] as const));
+    for (const chunk of this.chunks) {
+      if (chunk.compressed) continue;
+      const record = chunk.recordId === undefined ? undefined : records.get(chunk.recordId);
+      const held = sources.has(sha256Json(chunk.messages.map((m) => m.id)))
+        || (record !== undefined && Array.isArray(record.sourceIds) && sources.has(sha256Json(record.sourceIds)));
+      if (!held) continue;
+      for (const m of chunk.messages) ids.add(m.id);
+    }
+    return ids;
   }
 
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
