@@ -14,8 +14,9 @@
  * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
  * blob, not media inside a `tool_result`, which it keeps as given.
- * A write also refuses an `audience` where a reader's view can't honour one,
- * or one that isn't a list of reader names (audiencePlaces).
+ * A write also refuses an `audience` on a tool call, a tool result, a system
+ * change, inline media the store keeps as a blob or a block inside a tool
+ * result, or one that isn't a list of reader names (audiencePlaces).
  * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
  * still refuse a block without, and nothing else of a media source, such as
  * a URL image's URL, which the formatters and the providers read. A
@@ -46,8 +47,8 @@
  * as it is, since it resolves the content's own blocks; an image's
  * `blob_ref` without a string `mediaType` whose bytes carry no signature
  * (refHasMediaType); and a block with an `audience` a write refuses: in a
- * message, one where a reader's view doesn't read it or one that isn't a
- * list of reader names (audiencePlaces), and in a context entry, one a
+ * message, one where a write may not put it or one that isn't a list of
+ * reader names (audiencePlaces), and in a context entry, one a
  * message's block could carry, stored before such a write was refused.
  * Leaving out the first two would take a read that knows where a block
  * sits, which these walks don't.
@@ -275,7 +276,7 @@ function refHasMediaType(ref: Record<string, unknown>): boolean {
   return typeof ref.mediaType === 'string' || ref.originalType === 'image';
 }
 
-/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource), or `block` declares an `audience` that isn't a list of reader names, or where a reader's view doesn't read one, a block inside a tool result included (audiencePlaces). */
+/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource), or `block` declares an `audience` that isn't a list of reader names, or where a write may not put one, a block inside a tool result included (audiencePlaces). */
 function storeRefuses(block: unknown): boolean {
   return (
     isRecord(block) &&
@@ -481,8 +482,8 @@ export function malformedContentPlaces(content: unknown): string[] {
 
 /**
  * A write refused because its content doesn't match `ContentBlock`
- * (malformedContentPlaces), or puts an `audience` where no view reads one
- * or one that isn't a list of reader names, or a compile's or preview's
+ * (malformedContentPlaces), or puts an `audience` where a write may not put
+ * one or one that isn't a list of reader names, or a compile's or preview's
  * injections refused because they declare an `audience`; `places` names
  * each place.
  */

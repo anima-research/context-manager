@@ -760,7 +760,7 @@ describe('ContextManager.derive', () => {
     assert.ok((await compiled(reopened)).includes('[for ann]'), 'and its branch records her, so it reopens for her');
   });
 
-  it('keeps the namespace\'s reader on the branch of a child derived by a manager with no reader', { skip }, async () => {
+  it('derives, from a manager opened with no reader on a claimed namespace, a child that compiles for the namespace\'s reader, live and reopened', { skip }, async () => {
     const forReaders = (text: string, ...audience: string[]) => ({ type: 'text', text, audience }) as never;
     const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
     const ann = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: folding(), membrane: mockMembrane() as never, viewReader: 'ann' });
@@ -772,7 +772,7 @@ describe('ContextManager.derive', () => {
     managers.push(child);
     const compiled = async (manager: ContextManager) => JSON.stringify((await manager.compile(big)).messages);
     const seen = await compiled(child);
-    assert.ok(seen.includes('Hello.') && !seen.includes('[for ann]'), 'the child compiles for no reader, as its parent does');
+    assert.ok(seen.includes('Hello.') && seen.includes('[for ann]'), 'the live child compiles for the reader its branch records');
     assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/ann/reader'));
     const branch = (ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/inspected');
     await assert.rejects(
@@ -782,7 +782,7 @@ describe('ContextManager.derive', () => {
     const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: folding(), membrane: mockMembrane() as never });
     managers.push(reopened);
     assert.ok((await compiled(reopened)).includes('[for ann]'), 'reopened, it compiles for the reader its branch keeps');
-    assert.deepEqual([inspector.viewReader, child.viewReader, reopened.viewReader], [undefined, undefined, 'ann'], 'each says the reader it compiles for: the live child none, as its parent; the reopened one its branch\'s');
+    assert.deepEqual([inspector.viewReader, child.viewReader, reopened.viewReader], ['ann', 'ann', 'ann'], 'each says the reader it compiles for: the namespace\'s, live and reopened');
 
     branch.setStateJson('agents/ann/reader', 42);
     await assert.rejects(
@@ -881,12 +881,13 @@ describe('ContextManager.derive', () => {
   });
 
   it('refuses a derive over a head record that isn\'t a reader\'s name, with a reader and without one', { skip }, async () => {
-    const ann = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    const inspector = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(inspector);
+    const store = inspector.getStore();
+    const ann = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
     managers.push(ann);
     ann.addMessage('User', [{ type: 'text', text: 'Claimed.' }]);
-    const store = ann.getStore();
-    const inspector = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy() });
-    managers.push(inspector);
+    assert.equal(inspector.viewReader, undefined, 'the premise: opened before the claim, the inspector compiles for none');
     store.setStateJson('agents/ann/reader', 42);
     const writes = spyBranchWrites(store);
     try {
@@ -922,6 +923,8 @@ describe('ContextManager.derive', () => {
       ContextManager.open({ store: (ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/inspected-early'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
       /compiles for reader "ann", not "bob"/,
     );
+    assert.equal(before.viewReader, undefined, 'the premise: the parent was opened before the claim, with no reader');
+    assert.ok(JSON.stringify((await child.compile(big)).messages).includes('[for ann]') && child.viewReader === 'ann', 'the live child compiles for the reader its branch records');
     const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: new PassthroughStrategy() });
     managers.push(reopened);
     assert.ok(JSON.stringify((await reopened.compile(big)).messages).includes('[for ann]'), 'reopened, it compiles for the namespace\'s reader');

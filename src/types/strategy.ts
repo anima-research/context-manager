@@ -132,6 +132,24 @@ export interface StrategyContext {
    * exists, so strategies never need to handle the unscoped case.
    */
   namespace: string;
+  /**
+   * Records that compression may have read every message stored at or
+   * before store sequence `through`, so `editMessage` refuses to
+   * narrow a block's `audience` away from the manager's reader in any of
+   * them. Call it before the read: as a chunk closes, through its newest
+   * message, and before a request reads a message no closed chunk's newest
+   * covers. It throws when it can't record that, and then nothing may read
+   * those messages. The record is a state write made before the read, so in
+   * the store's log it comes before every record derived from the read, and
+   * a crash that loses it loses those too: chronicle recovers its log as a
+   * prefix (chronicle 0.5.0's README, "On disk", Durability). The record
+   * only rises, and is kept per branch. A write
+   * to the store that lowers it, an operator's act like clearing the reader
+   * record, is outside its guard. A manager that compiles for no reader
+   * records nothing. A context built outside a manager has no reader to
+   * guard, and may leave it out.
+   */
+  markCompressionRead?(through: Sequence): void;
 }
 
 /**
@@ -326,6 +344,15 @@ export interface ContextStrategy {
    * does not record authorship). Required when select() names summaries.
    */
   describeRenderedSummaries?(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo>;
+
+  /**
+   * True when the strategy calls `StrategyContext.markCompressionRead`
+   * before it reads a message for a summary or a model request, closing a
+   * chunk that holds the message included, or makes no such read.
+   * A manager that compiles for a reader (`viewReader`) refuses to start a
+   * strategy without it, by open, `setStrategy`, fork, switch or derive.
+   */
+  readonly marksCompressionReads?: boolean;
 
   /**
    * Why the last select() changed what it renders, when the strategy knows

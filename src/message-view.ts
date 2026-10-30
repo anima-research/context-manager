@@ -10,10 +10,6 @@
  * world, on both sides of every assertion. The messages remain in the
  * store: direct accessors (getMessage/getAllMessages/query) are unaffected.
  *
- * `audienceMessageStoreView` shows a view's reader only the content blocks
- * meant for it: a block that declares an `audience` is that audience's
- * alone.
- *
  * `mergeMessageStoreViews` presents several message slots as one timeline,
  * ordered by chronicle `sequence` — which is allocated per-branch under a
  * single write lock regardless of state slot, so cross-slot ordering is
@@ -115,6 +111,31 @@ export function contentForReader(content: readonly ContentBlock[], reader: strin
   return seen.length > 0 ? releaseEditedRawForms(compared, seen) : null;
 }
 
+export function audienceNarrowing(
+  before: readonly ContentBlock[],
+  after: readonly ContentBlock[],
+  reader: string | undefined,
+): { own: boolean; others: boolean } {
+  let own = false;
+  let others = false;
+  for (let i = 0; i < Math.min(before.length, after.length); i++) {
+    const next = (after[i] as { audience?: unknown }).audience;
+    if (next === undefined || !Array.isArray(next) || !next.every((name) => typeof name === 'string')) continue;
+    const was = audienceOf(before[i]!);
+    if (was === undefined) {
+      others = true;
+      if (reader !== undefined && !next.includes(reader)) own = true;
+      continue;
+    }
+    for (const name of was) {
+      if (next.includes(name)) continue;
+      if (name === reader) own = true;
+      else others = true;
+    }
+  }
+  return { own, others };
+}
+
 /** A content block with the readers it's for (`audience`), as a host may write one on a message's own blocks other than tool calls, tool results, system changes and inline media. */
 export type ContentBlockWithAudience = ContentBlock & { audience?: string[] };
 
@@ -147,29 +168,12 @@ export function messageForReader(message: StoredMessage, reader: string | undefi
   return seen;
 }
 
-/**
- * Wrap a view so that `reader` sees only the blocks meant for it
- * (contentForReader), and none of a message whose every block is someone
- * else's; with `keepEmptied`, such a message stays, with no content, so
- * its identity and its place in a body stay the stored ones. A message
- * with no `audience` block is the view's own object, and a listing with
- * none is the view's own array, so a store that never declares an
- * audience reads exactly as through `view`. A message that has one is one
- * object per reader while its stored object lives, so the estimate cache
- * and the strategy's per-listing memos hold across compiles. `getTail`
- * reads `view`'s window, as `getFrom(0)` does; `getFrom` past 0 reads the
- * listing, since a message left out before it moves its index. With
- * `mayHold`, each listing read (getAll, getFrom, getTail, length) and
- * sequenceOf asks it first and, while it's false, answers as `view` does;
- * get is decided by the message's own blocks. Both are decided at
- * each read, so a holder that keeps the view sees the reader's view
- * whenever it reads.
- */
 export function audienceMessageStoreView(
   view: MessageStoreView,
   reader: string | undefined,
-  opts: { keepEmptied?: boolean; mayHold?: () => boolean } = {},
+  opts: { keepEmptied?: boolean; mayHold?: () => boolean; fence?: () => void } = {},
 ): MessageStoreView {
+  const fence = opts.fence ?? (() => {});
   const plain = () => opts.mayHold !== undefined && !opts.mayHold();
   const form = (message: StoredMessage): StoredMessage | null => {
     const seen = messageForReader(message, reader);
@@ -210,14 +214,19 @@ export function audienceMessageStoreView(
     return out;
   };
   return {
-    getAll: () => (plain() ? view.getAll() : all()),
+    getAll: () => {
+      fence();
+      return plain() ? view.getAll() : all();
+    },
     get: (id: MessageId) => {
+      fence();
       const message = view.get(id);
       return message ? form(message) : null;
     },
     ...(view.sequenceOf
       ? {
           sequenceOf: (id: MessageId) => {
+            fence();
             if (plain()) return view.sequenceOf!(id);
             const message = view.get(id);
             return message && form(message) ? view.sequenceOf!(id) : undefined;
@@ -225,18 +234,23 @@ export function audienceMessageStoreView(
         }
       : {}),
     getFrom: (index: number) => {
+      fence();
       if (plain()) return view.getFrom(index);
       if (index !== 0) return all().slice(index);
       return mapped(view.getFrom(0)).out;
     },
     getTail: (count: number) => {
+      fence();
       if (plain()) return view.getTail(count);
       const window = mapped(view.getTail(count));
       if (!window.dropped) return window.out;
       const messages = all();
       return count >= messages.length ? messages : messages.slice(messages.length - count);
     },
-    length: () => (plain() ? view.length() : all().length),
+    length: () => {
+      fence();
+      return plain() ? view.length() : all().length;
+    },
     estimateTokens: (msg: StoredMessage) => view.estimateTokens(msg),
     setTokenCalibration: view.setTokenCalibration
       ? (f: number) => view.setTokenCalibration!(f)
