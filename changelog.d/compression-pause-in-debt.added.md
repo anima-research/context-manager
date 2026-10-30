@@ -7,6 +7,6 @@
   provider wait already stands. It's `null` only for a provider's stated wait that can't be held as
   an instant, which holds until a restart, `releaseCompressionPause()`, an answer to a call on the
   same membrane and model, or a change of membrane or model once a tick sees it. `model` is the model
-  the paused calls went to, the configured compression model, so a host can look up its own hold on
-  that model beside it. A report that failed outright carries it too, and `state` is decided
-  as before.
+  the pause holds, which is the configured compression model (`null` when none is configured), so a
+  host can look up its own hold on that model beside it. A report that failed outright carries it
+  too, and `state` is decided as before.

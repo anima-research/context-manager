@@ -8466,11 +8466,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  provider wait already stands. `until` is null only when a provider stated a wait that can't be
      *  held as an instant, which holds until a restart, releaseCompressionPause(), an answer to a
      *  call on the same membrane and model, or a change of membrane or model once a tick sees it.
-     *  `model` is the model the paused calls went to, the configured compression model (null only if
-     *  none is configured, when compression makes no call and so takes no pause). Like
-     *  checkReadiness(), the report can't see the membrane: a pause bound to another membrane
-     *  instance shows until a tick that reaches the pause check with another membrane drops it.
-     *  Reported in a report that failed too; it doesn't change `state`. */
+     *  `model` is the model the pause holds, which is the configured compression model, or null when
+     *  none is configured. Like checkReadiness(), the report can't see the membrane: a pause bound to
+     *  another membrane instance shows until a tick that reaches the pause check with another
+     *  membrane drops it. Reported in a report that failed too; it doesn't change `state`. */
     compressionPause: { until: number | null; model: string | null } | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
