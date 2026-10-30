@@ -37,6 +37,15 @@ class Summaries extends AutobiographicalStrategy {
   sentEstimate(ctx: StrategyContext, msg: StoredMessage): number {
     return ctx.messageStore.estimateTokens(this.prunedForSend(ctx.messageStore, msg));
   }
+  emissionPairCharge(s: SummaryEntry): number {
+    return this.recallPairCost(s, this.buildRecallHeader(s));
+  }
+  cutPair(ctx: StrategyContext, s: SummaryEntry, cap: number): { cut: boolean; tokens: number } {
+    const rendered = this.renderSummaryAnswer(s, cap);
+    const tokens = ctx.messageStore.estimateTokens({ content: [{ type: 'text', text: this.buildRecallHeader(s) }] } as never)
+      + ctx.messageStore.estimateTokens({ content: rendered.content } as never);
+    return { cut: rendered.refs.some((ref) => ref.partial), tokens };
+  }
 }
 
 const contextOf = (manager: ContextManager): StrategyContext =>
@@ -96,9 +105,19 @@ async function built(
     const summaries = new Set(sources.flatMap((m) => (m.kind === 'summary' ? m.summaries.map((x) => x.id) : [])));
     const inSummaries = new Set([...summaries].flatMap((id) => strategy.leavesOf(id)));
     const order = sources.flatMap((m) => (m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : m.kind === 'summary' ? m.summaries.map((x) => x.id) : []));
-    return { raw, summaries, inSummaries, order };
+    const rawList = sources.flatMap((m) => (m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : []));
+    return { raw, summaries, inSummaries, order, rawList };
   };
-  return { manager, strategy, ctx, all, position, estimate, rawOf, pairOf, level, rewrite, sent, shape };
+  const onceInOrder = (result: Awaited<ReturnType<typeof sent>>, leaves: readonly string[]): void => {
+    for (const id of leaves) {
+      assert.equal(result.rawList.filter((x) => x === id).length, 1, `${id} goes out raw exactly once`);
+      assert.ok(!result.inSummaries.has(id), `${id} isn't also under a summary sent`);
+    }
+    const at = leaves.map((id) => result.rawList.indexOf(id));
+    const stored = [...leaves].sort((a, b) => position.get(a)! - position.get(b)!);
+    assert.deepEqual([...leaves].sort((a, b) => result.rawList.indexOf(a) - result.rawList.indexOf(b)), stored, `they go out in store order (${at.join(',')})`);
+  };
+  return { manager, strategy, ctx, all, position, estimate, rawOf, pairOf, level, rewrite, sent, shape, onceInOrder };
 }
 
 describe('a summary weighed against what it covers, on the hierarchical select', () => {
@@ -115,6 +134,7 @@ describe('a summary weighed against what it covers, on the hierarchical select',
     const wide = await f.sent(1_000_000);
     assert.ok(!wide.summaries.has(dear.id), 'no recall pair for the dearer L1');
     for (const id of leaves) assert.ok(wide.raw.has(id), `its message ${id} goes out raw`);
+    f.onceInOrder(wide, leaves);
     for (const s of l1s) if (s !== dear) assert.ok(wide.summaries.has(s.id), `${s.id}, cheaper than its messages, still goes out`);
 
     const narrow = await f.sent(everything);
@@ -163,6 +183,7 @@ describe('a summary weighed against what it covers, on the hierarchical select',
       if (dearer) {
         assert.ok(!wide.summaries.has(s.id), `no recall pair for ${s.id}`);
         for (const id of rest) assert.ok(wide.raw.has(id), `${id} goes out raw`);
+        f.onceInOrder(wide, leaves);
       } else {
         assert.ok(wide.summaries.has(s.id), `${s.id} goes out beside the pin`);
         for (const id of rest) assert.ok(!wide.raw.has(id), `${id} doesn't go out raw`);
@@ -213,6 +234,8 @@ describe('a summary weighed against what it covers, on the hierarchical select',
     const wide = await f.sent(1_000_000);
     for (const s of [parent, first, second]) assert.ok(!wide.summaries.has(s.id), `no recall pair for ${s.id}`);
     for (const id of ids.slice(4, 12)) assert.ok(wide.raw.has(id), `${id} goes out raw`);
+    f.onceInOrder(wide, ids.slice(4, 12));
+    assert.equal(f.strategy.getStats().dearerReplaced, 1, 'the L2 counts once, with the L1s under it');
     await f.manager.close();
   });
 
@@ -242,6 +265,8 @@ describe('a summary weighed against what it covers, on the hierarchical select',
     const wide = await f.sent(1_000_000);
     for (const s of [top, ...l2s, ...l1s]) assert.ok(!wide.summaries.has(s.id), `no recall pair for ${s.id}`);
     for (const id of ids.slice(4, 20)) assert.ok(wide.raw.has(id), `${id} goes out raw`);
+    f.onceInOrder(wide, ids.slice(4, 20));
+    assert.equal(f.strategy.getStats().dearerReplaced, 1, 'the L3 counts once, with the summaries under it');
     await f.manager.close();
   });
 
@@ -1061,6 +1086,59 @@ describe('a summary weighed against what it covers, on the hierarchical select',
     for (const id of leaves) assert.ok(!wide.raw.has(id), `${id} doesn't go out raw`);
     const { messages } = await f.manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
     assert.ok(messages.some((m) => JSON.stringify(m.content).includes('[truncated')), 'premise: the L1 goes out cut');
+    await f.manager.close();
+  });
+
+  it('keeps an L1 that maxMessageTokens cuts where its messages cost more than emission charges for its pair, so a budget that fits that charge compiles', async () => {
+    const cap = 200;
+    let found = false;
+    for (let pad = 60; pad <= 110 && !found; pad++) {
+      const f = await built({ maxMessageTokens: cap, targetChunkTokens: 1e9, recentWindowTokens: 1 }, (manager) => {
+        manager.addMessage('user', text('message 0 ' + 'word '.repeat(pad)));
+        manager.addMessage('agent', text('message 1 ' + 'word '.repeat(pad)));
+        manager.addMessage('user', text('ok then go'));
+      });
+      const leaves = f.all.slice(0, 2).map((m) => m.id);
+      const s = f.strategy.seedL1('L1-at-the-cut', leaves);
+      f.rewrite(s, 'r'.repeat(801));
+      const raw = f.rawOf(leaves);
+      const charge = f.strategy.emissionPairCharge(s);
+      const asSent = f.strategy.cutPair(f.ctx, s, cap);
+      if (!(asSent.cut && raw > charge && raw < asSent.tokens)) {
+        await f.manager.close();
+        continue;
+      }
+      found = true;
+      const wide = await f.sent(1_000_000);
+      assert.ok(wide.summaries.has(s.id), `${s.id} goes out: its messages (${raw}) cost more than emission charges for its pair (${charge}), though less than the pair as sent (${asSent.tokens})`);
+      const fitted = f.strategy.getRenderStats(f.ctx.messageStore)!.total.tokens;
+      const latest = f.ctx.messageStore.estimateTokens(f.all[2]!);
+      assert.ok(fitted <= charge + latest, `the compile with ${s.id} needs ${fitted}, no more than emission's charge for the pair and the latest message (${charge + latest})`);
+      assert.ok(fitted < raw + latest, `premise: a budget of ${fitted} can't hold the messages raw beside the latest one (${raw + latest})`);
+      const atCharge = await f.sent(fitted);
+      assert.ok(atCharge.summaries.has(s.id), `at a budget of ${fitted}, the compile fits with ${s.id}`);
+      await f.manager.close();
+    }
+    assert.ok(found, 'premise: some message size put the messages between emission\'s charge for the pair and the pair as sent');
+  });
+
+  it('counts in getStats how many summaries the last compile that wasn\'t a dry run sent as their messages raw', async () => {
+    const f = await built();
+    const l1s = f.level(1);
+    const dear = l1s[1]!;
+    const everything = f.rawOf(f.all.map((m) => m.id));
+    assert.equal(f.strategy.getStats().dearerReplaced, 0, 'none before a compile');
+    f.rewrite(dear, 'a long recollection of everything said in those moments '.repeat(Math.ceil((everything * 4 * 1.5) / 57)));
+    const replacing = await f.sent(1_000_000);
+    assert.ok(!replacing.summaries.has(dear.id), `premise: the compile leaves ${dear.id} out`);
+    assert.equal(f.strategy.getStats().dearerReplaced, 1, 'one after a compile that sends one L1\'s messages raw');
+    f.rewrite(dear, 'brief');
+    const dry = await f.manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+    assert.ok(dry.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id === dear.id)), `premise: the dry run sends ${dear.id}`);
+    assert.equal(f.strategy.getStats().dearerReplaced, 1, 'a dry run, which replaces none, leaves the last compile\'s count');
+    const none = await f.sent(1_000_000);
+    assert.ok(none.summaries.has(dear.id), `premise: the compile sends ${dear.id}`);
+    assert.equal(f.strategy.getStats().dearerReplaced, 0, 'none after a compile that replaces none');
     await f.manager.close();
   });
 });

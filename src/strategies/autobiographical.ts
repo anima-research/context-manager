@@ -8202,6 +8202,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private acrossMode: 'ask' | 'leave' | 'take' = 'take';
   private leftOutAcross = 0;
   private _acrossFallbacks = 0;
+  private _dearerReplaced = 0;
 
   private selectByWindowRule(store: MessageStoreView, select: (dryRun: boolean) => ContextEntry[], dryRun: boolean): ContextEntry[] {
     const run = (mode: 'ask' | 'leave' | 'take', dry: boolean): ContextEntry[] => {
@@ -8341,7 +8342,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sentAt: (position: number) => number,
   ): Set<SummaryId> {
     const leftOut = new Set<SummaryId>();
-    if (this.config.positionedRecallPairs === false) return leftOut;
+    let replaced = 0;
+    if (this.config.positionedRecallPairs === false) {
+      if (!this._dryRunSelect) this._dearerReplaced = 0;
+      return leftOut;
+    }
     const position = this.positionIndex(messages);
     const inMiddle = (p: number): boolean => Number.isFinite(sentAt(p));
     const byId = new Map(notAcross.map((s) => [s.id as SummaryId, s]));
@@ -8504,10 +8509,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (s.mergedInto || !sends(s)) continue;
       const leaves = leavesOf(s);
       if (!leaves || !whole(s)) continue;
-      if (!(this.weighedRawPrice(store, leaves.map((p) => messages[p]!), msgCap) < this.weighedPairPrice(s, msgCap))) continue;
+      const pair = Math.min(this.weighedPairPrice(s, msgCap), this.recallPairCost(s, this.buildRecallHeader(s)));
+      if (!(this.weighedRawPrice(store, leaves.map((p) => messages[p]!), msgCap, pair) < pair)) continue;
       if (!alone(s) || !shaped(s)) continue;
       for (const id of subtree(s)) leftOut.add(id);
+      replaced++;
     }
+    if (!this._dryRunSelect) this._dearerReplaced = replaced;
     return leftOut;
   }
 
@@ -8517,6 +8525,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   getStats(): {
     chunksTotal: number; chunksCompressed: number; compressionCount: number;
     l1: number; l2: number; l3: number; pendingMerges: number; acrossFallbacks: number;
+    /** How many summaries the hierarchical select's last run that wasn't a dry run, and that weighed them, left out
+     *  because each cost more than its messages, whose messages that run's request then sends raw if it compiles. A
+     *  summary whose summaries under it went too counts once. */
+    dearerReplaced: number;
   } {
     this.requireLoadedBranch('getStats');
     return {
@@ -8528,6 +8540,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       l3: this.summaries.filter(s => s.level === 3 && !s.mergedInto).length,
       pendingMerges: this.mergeQueue.length,
       acrossFallbacks: this._acrossFallbacks,
+      dearerReplaced: this._dearerReplaced,
     };
   }
 
@@ -13402,7 +13415,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * says what it folds.
    *
    * `leftOut`, when given, holds the summaries the refusing hierarchical
-   * select sent as their messages raw (dearerSummaries). A chunk an L1 in
+   * select left out for costing more than their messages, and every summary
+   * under each of them (dearerSummaries). A chunk an L1 in
    * memory already covers doesn't count where its exact L1 in memory is
    * among them.
    */
@@ -16679,11 +16693,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return header + this.recallAnswerCost(s).estimate;
   }
 
-  private weighedRawPrice(store: MessageStoreView, messages: readonly StoredMessage[], msgCap: number): number {
+  private weighedRawPrice(store: MessageStoreView, messages: readonly StoredMessage[], msgCap: number, limit: number): number {
     let price = 0;
     for (const msg of messages) {
       const sent = store.estimateTokens(this.prunedForSend(store, msg)) + this.cappedForSend(store, msg, msgCap).extra;
       price += Math.max(store.estimateTokens(msg), sent);
+      if (price >= limit) return price;
     }
     return price;
   }

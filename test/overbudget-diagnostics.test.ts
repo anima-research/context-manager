@@ -224,7 +224,6 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
    *  arguments as passed, so this file also builds against code whose count takes no prefix. */
   countedWithin: ReadonlySet<string> | undefined;
 
-  /** The arguments the last count was given, for countsCompressionWork to pass the rest of them on. */
   private countedArgs: Parameters<AutobiographicalStrategy['compressionWorkQueued']> | undefined;
 
   protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
@@ -253,8 +252,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return this.getCompressibleMessages(this.countedView).every((m) => within.has(m.id));
   }
 
-  /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read,
-   *  with what else that refusal passed it past its prefix. */
+  /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
   countsCompressionWork(): boolean {
     assert.ok(this.countedView && this.countedArgs, 'a refusal has counted');
     const [, , , ...rest] = this.countedArgs;

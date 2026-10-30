@@ -34,13 +34,24 @@
   and sent forms, so a summary that costs less than its messages whole isn't
   swapped for messages whose tool results pruning replaces; one that costs
   more than them whole can be, and the replaced results go out as pruning's
-  markers. The pair is priced at its estimate as it is sent, cut by
-  `maxMessageTokens` where the cut applies; emission charges a summary with
-  a measured size at that size where it's larger, which only makes a
-  replaced summary dearer still. So the choice reads no budget, and the
-  calibration multiplier moves it only by rounding, where `maxMessageTokens`
-  cuts the summary or a message, and through the recent window, which the
-  multiplier moves for the whole select. The adaptive selects and
+  markers. The pair is priced at the lesser of its estimate as it is sent,
+  cut by `maxMessageTokens` where the cut applies, and what emission charges
+  for it, so a summary goes only where its messages cost less than both. So
+  the choice reads no budget. The calibration multiplier moves it only by
+  rounding, where `maxMessageTokens` cuts the summary or a message, and
+  through the recent window, which the multiplier moves for the whole
+  select, except for a summary charged at its measured size (`carrierPolicy:
+  'full'` with `responseContent`), whose charge the multiplier doesn't
+  scale. Under `carrierPolicy: 'full'`, a summary's recorded reasoning is
+  priced in a compile where the model's thinking isn't bound, and left out
+  of its price where it is, as the request leaves it out, so the choice for
+  such a summary can differ between the two. `KnowledgeStrategy` forces
+  `hierarchical: true` and can close a chunk at a phase change once it holds
+  two messages, so an L1 of its can cover a couple of short messages and
+  cost more than them. Its summarizer marks unresolved leads `[LEAD]` in its
+  summaries, so for a span whose L1 goes out as its messages raw, the
+  request carries those messages without that L1's marks; the strategy keeps
+  the L1, and only the request leaves it out. The adaptive selects and
   `positionedRecallPairs: false` are unchanged. A store where the select now
   replaces a summary it would have sent sends different requests from its
   first compile after the upgrade.
