@@ -72,6 +72,17 @@ function failRemoval(cm: ContextManager): void {
   };
 }
 
+/**
+ * Reading the store's tail, the read that tells whether a row whose append
+ * threw landed, throws. Returns what undoes it.
+ */
+function failTailRead(cm: ContextManager): () => void {
+  const messages = internals(cm).messageStore;
+  const getTail = messages.getTail.bind(messages);
+  messages.getTail = () => { throw new Error('store unreadable'); };
+  return () => { messages.getTail = getTail; };
+}
+
 /** What `fn` threw. */
 function thrownBy(fn: () => unknown): unknown {
   try {
@@ -166,6 +177,19 @@ describe('WriteLandedError: an add that fails after storing some of the message'
     const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
     assert.equal(err, failure, 'unwrapped: the store holds none of the message');
     assert.deepEqual(cm.getAllMessages().map(textOf), ['before']);
+    cm.close();
+  });
+
+  it("where the store can't be read to tell whether the failing shard landed, removing the shards before it takes out its row too, and the write's own error is thrown", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    const readable = failTailRead(cm);
+    const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+    readable();
+    assert.equal(err, failure, 'unwrapped: the store holds none of the message');
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], "the second shard's row, which landed, went with the first's");
     cm.close();
   });
 
