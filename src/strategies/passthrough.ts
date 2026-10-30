@@ -31,6 +31,9 @@ export class PassthroughStrategy implements ContextStrategy {
     return { ready: true };
   }
 
+  /** It reads no message for a summary or a model request. */
+  readonly marksCompressionReads = true;
+
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
     // No-op: context is rebuilt on select()
   }

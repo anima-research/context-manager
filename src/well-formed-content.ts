@@ -14,6 +14,9 @@
  * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
  * blob, not media inside a `tool_result`, which it keeps as given.
+ * A write also refuses an `audience` on a tool call, a tool result, a system
+ * change, inline media the store keeps as a blob or a block inside a tool
+ * result, or one that isn't a list of reader names (audiencePlaces).
  * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
  * still refuse a block without, and nothing else of a media source, such as
  * a URL image's URL, which the formatters and the providers read. A
@@ -36,15 +39,19 @@
  * string `mediaType`: a read gives an image the type its bytes' signature
  * names, where they carry one, and nothing else names a document's, audio's
  * or video's. The rule holds at any depth, as the read's other checks do.
- * Three shapes a read gives still meet a write's refusal, each in a record
+ * Four shapes a read gives still meet a write's refusal, each in a record
  * the store's writes don't make: inline media at the top of the content,
  * where the store keeps a blob, whose source it can't keep as one
  * (unstorableSource: data it can't read, or no media type it can give it); a
  * `blob_ref` the read takes inside a `tool_result`, which resolution leaves
- * as it is, since it resolves the content's own blocks; and an image's
+ * as it is, since it resolves the content's own blocks; an image's
  * `blob_ref` without a string `mediaType` whose bytes carry no signature
- * (refHasMediaType). Leaving out the first two would take a read that knows
- * where a block sits, which these walks don't.
+ * (refHasMediaType); and a block with an `audience` a write refuses: in a
+ * message, one where a write may not put it or one that isn't a list of
+ * reader names (audiencePlaces), and in a context entry, one a
+ * message's block could carry, stored before such a write was refused.
+ * Leaving out the first two would take a read that knows where a block
+ * sits, which these walks don't.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -81,10 +88,25 @@ import type { Diagnostics } from './diagnostics.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock } from './types/index.js';
 import { releaseEditedRawForms } from './raw-forms.js';
-import { unstorableSource } from './stored-media.js';
+import { blobKindOf, unstorableSource } from './stored-media.js';
 
 /** A write, which mends only a `tool_use`'s input and refuses the rest, or a read of stored content. */
 type Side = 'write' | 'read';
+
+export function audienceDeclarations(content: unknown, at: string): string[] {
+  const places: string[] = [];
+  const walk = (blocks: unknown, path: string): void => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block: unknown, i: number) => {
+      if (!isRecord(block)) return;
+      const where = `${path}[${i}]`;
+      if (block.audience !== undefined) places.push(where);
+      if (block.type === 'tool_result') walk(block.content, `${where}.content`);
+    });
+  };
+  walk(content, at);
+  return places;
+}
 
 /** An object that isn't an array: what a block, a `tool_use`'s `input` and a media `source` must be. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -254,14 +276,36 @@ function refHasMediaType(ref: Record<string, unknown>): boolean {
   return typeof ref.mediaType === 'string' || ref.originalType === 'image';
 }
 
-/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource). */
+/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource), or `block` declares an `audience` that isn't a list of reader names, or where a write may not put one, a block inside a tool result included (audiencePlaces). */
 function storeRefuses(block: unknown): boolean {
   return (
     isRecord(block) &&
-    MEDIA_TYPES.has(block.type as string) &&
-    isRecord(block.source) &&
-    unstorableSource(block as unknown as ContentBlock) !== null
+    ((MEDIA_TYPES.has(block.type as string) &&
+      isRecord(block.source) &&
+      unstorableSource(block as unknown as ContentBlock) !== null) ||
+      audiencePlaces(block, 'block').length > 0)
   );
+}
+
+function audiencePlaces(block: Record<string, unknown>, at: string): string[] {
+  const places: string[] = [];
+  if (block.audience !== undefined && !(Array.isArray(block.audience) && [...block.audience].every((reader) => typeof reader === 'string'))) {
+    const what = Array.isArray(block.audience) ? 'a list holding something other than a string' : kindOf(block.audience);
+    places.push(`${at}.audience isn't a list of reader names: it's ${what}`);
+  }
+  if (block.audience !== undefined && MEDIA_TYPES.has(block.type as string) && isRecord(block.source) && blobKindOf(block as unknown as ContentBlock) !== null) {
+    places.push(`${at} is inline ${block.type as string} with an audience; the store keeps inline media as a blob, which carries no audience`);
+  } else if (block.audience !== undefined && (block.type === 'tool_use' || block.type === 'tool_result')) {
+    places.push(`${at} is a ${block.type as string} with an audience; a tool call and its result go to every reader of the message, or a reader's view would hold one without the other`);
+  } else if (block.audience !== undefined && block.type === 'system_change') {
+    places.push(`${at} is a system_change with an audience; a system change goes to every reader`);
+  }
+  if (block.type === 'tool_result') {
+    for (const where of audienceDeclarations(block.content, `${at}.content`)) {
+      places.push(`${where} has an audience; an audience is read on a message's own blocks only, so a block inside another would reach every reader`);
+    }
+  }
+  return places;
 }
 
 function allWellFormed(content: readonly unknown[], side: Side): boolean {
@@ -386,6 +430,11 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
 /** The places of inline media in `block`, a block of the content, that the store can't keep, as phrases from `at`. */
 function storePlacesIn(block: unknown, at: string, places: string[]): void {
   if (!storeRefuses(block)) return;
+  const audience = audiencePlaces(block as Record<string, unknown>, at);
+  if (audience.length > 0) {
+    places.push(...audience);
+    return;
+  }
   const { type, source } = block as { type: string; source: Record<string, unknown> };
   const unstorable = unstorableSource(block as unknown as ContentBlock)!;
   if (unstorable.data) places.push(`${at}.source.data is ${kindOf(source.data)}, not base64 data`);
@@ -431,7 +480,13 @@ export function malformedContentPlaces(content: unknown): string[] {
   return allWellFormed(content, 'write') ? [] : malformedPlaces(content, 'write');
 }
 
-/** A write refused because its content doesn't match `ContentBlock`; `places` is malformedContentPlaces' answer for it. */
+/**
+ * A write refused because its content doesn't match `ContentBlock`
+ * (malformedContentPlaces), or puts an `audience` where a write may not put
+ * one or one that isn't a list of reader names, or a compile's or preview's
+ * injections refused because they declare an `audience`; `places` names
+ * each place.
+ */
 export class MalformedContentError extends Error {
   readonly places: readonly string[];
 

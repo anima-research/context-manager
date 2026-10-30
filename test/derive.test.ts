@@ -15,7 +15,7 @@
  * name, with the reason; the refusal on such a build runs everywhere.
  */
 
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -66,6 +66,11 @@ const turn = (i: number, tag = 'Turn') => [{ type: 'text' as const, text: `${tag
 
 async function settle(manager: ContextManager): Promise<void> {
   while (!manager.isReady()) await manager.tick();
+}
+
+function spyBranchWrites(store: unknown) {
+  const target = store as Record<'createBranchWithStates' | 'createBranchAtWithStates', (...args: unknown[]) => unknown>;
+  return [mock.method(target, 'createBranchWithStates'), mock.method(target, 'createBranchAtWithStates')];
 }
 
 /** Every state's value as the given handle's branch sees it. */
@@ -698,6 +703,233 @@ describe('ContextManager.derive', () => {
     }
     await assert.rejects(parent.derive({ branch: 'dendrite/replaced', strategy: new Replaced() }), /child initialize failed/);
     assert.ok(parent.listBranches().some((b) => b.name === 'dendrite/replaced'), 'the branch made meanwhile stays');
+  });
+
+  it('derives a child that compiles for the parent\'s reader, records it on its branch, and reopens with it', { skip }, async () => {
+    const forReaders = (text: string, ...audience: string[]) => ({ type: 'text', text, audience }) as never;
+    const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    const parent = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: folding(), membrane: mockMembrane() as never, viewReader: 'ann' });
+    managers.push(parent);
+    parent.addMessage('User', [forReaders('[for ann]', 'ann'), forReaders('[for bob]', 'bob'), { type: 'text', text: 'Hello.' }]);
+    const compiled = async (manager: ContextManager) => JSON.stringify((await manager.compile(big)).messages);
+    const fromParent = await compiled(parent);
+    assert.ok(fromParent.includes('[for ann]') && !fromParent.includes('[for bob]'), 'the premise: the parent compiles for ann');
+
+    const child = await parent.derive({ branch: 'dendrite/ann', strategy: folding() });
+    managers.push(child);
+    assert.equal(await compiled(child), fromParent, 'the child compiles for the parent\'s reader');
+    assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/ann/reader'));
+
+    const reopened = await ContextManager.reopenDerived({ store: parent.getStore(), derivation: child.getDerivation()!, strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(reopened);
+    assert.equal(await compiled(reopened), fromParent, 'reopened, it compiles for the reader its branch recorded');
+    assert.deepEqual([parent.viewReader, child.viewReader, reopened.viewReader], ['ann', 'ann', 'ann'], 'each says the reader it compiles for');
+
+    const branch = (parent.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/ann');
+    await assert.rejects(
+      ContextManager.open({ store: branch, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /compiles for reader "ann", not "bob"/,
+    );
+
+    const nobody = await ContextManager.open({ store: parent.getStore(), namespace: 'agents/nobody', strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(nobody);
+    const plain = await nobody.derive({ branch: 'dendrite/nobody', strategy: folding() });
+    managers.push(plain);
+    assert.ok(!plain.getDerivation()!.inherited.stateIds.some((id) => id.endsWith('/reader')), 'a manager with no reader derives no reader record');
+    const plainBranch = (parent.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/nobody');
+    assert.ok(!plainBranch.listStates().some((state) => state.id === 'agents/nobody/reader'), 'and its branch holds none');
+    assert.ok(!(await compiled(plain)).includes('[for '), 'and its child keeps no block that has an audience');
+    assert.deepEqual([nobody.viewReader, plain.viewReader], [undefined, undefined], 'and each says it compiles for no reader');
+  });
+
+  it('records the parent\'s reader on a child derived from before the namespace first recorded one', { skip }, async () => {
+    const forReaders = (text: string, ...audience: string[]) => ({ type: 'text', text, audience }) as never;
+    const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    const path = storePath();
+    const before = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(before);
+    before.addMessage('User', [forReaders('[for ann]', 'ann'), { type: 'text', text: 'Early.' }]);
+    const early = before.getStore().currentSequence();
+    const ann = await ContextManager.open({ store: before.getStore(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'Later.' }]);
+    const child = await ann.derive({ branch: 'dendrite/early', strategy: new PassthroughStrategy(), atSequence: early });
+    managers.push(child);
+    const compiled = async (manager: ContextManager) => JSON.stringify((await manager.compile(big)).messages);
+    assert.ok((await compiled(child)).includes('[for ann]'), 'the child compiles for ann');
+    const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: new PassthroughStrategy() });
+    managers.push(reopened);
+    assert.ok((await compiled(reopened)).includes('[for ann]'), 'and its branch records her, so it reopens for her');
+  });
+
+  it('derives, from a manager opened with no reader on a claimed namespace, a child that compiles for the namespace\'s reader, live and reopened', { skip }, async () => {
+    const forReaders = (text: string, ...audience: string[]) => ({ type: 'text', text, audience }) as never;
+    const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    const ann = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: folding(), membrane: mockMembrane() as never, viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [forReaders('[for ann]', 'ann'), { type: 'text', text: 'Hello.' }]);
+    const inspector = await ContextManager.open({ store: ann.getStore(), namespace: 'agents/ann', strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(inspector);
+    const child = await inspector.derive({ branch: 'dendrite/inspected', strategy: folding() });
+    managers.push(child);
+    const compiled = async (manager: ContextManager) => JSON.stringify((await manager.compile(big)).messages);
+    const seen = await compiled(child);
+    assert.ok(seen.includes('Hello.') && seen.includes('[for ann]'), 'the live child compiles for the reader its branch records');
+    assert.ok(child.getDerivation()!.inherited.stateIds.includes('agents/ann/reader'));
+    const branch = (ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/inspected');
+    await assert.rejects(
+      ContextManager.open({ store: branch, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /compiles for reader "ann", not "bob"/,
+    );
+    const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(reopened);
+    assert.ok((await compiled(reopened)).includes('[for ann]'), 'reopened, it compiles for the reader its branch keeps');
+    assert.deepEqual([inspector.viewReader, child.viewReader, reopened.viewReader], ['ann', 'ann', 'ann'], 'each says the reader it compiles for: the namespace\'s, live and reopened');
+
+    branch.setStateJson('agents/ann/reader', 42);
+    await assert.rejects(
+      ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: new PassthroughStrategy() }),
+      /namespace "agents\/ann" records its reader as 42, not a reader's name/,
+    );
+    await assert.rejects(
+      ContextManager.open({ store: branch, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /ContextManager\.open: namespace "agents\/ann" records its reader as 42, not a reader's name/,
+      'an open names a damaged record as such, not as a reader',
+    );
+    branch.setStateJson('agents/ann/reader', '');
+    await assert.rejects(
+      ContextManager.open({ store: branch, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /ContextManager\.open: namespace "agents\/ann" records its reader as "", not a reader's name/,
+    );
+  });
+
+  it('records on a child what the namespace records at the parent\'s head, a cleared record included', { skip }, async () => {
+    const path = storePath();
+    const before = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(before);
+    const ann = await ContextManager.open({ store: before.getStore(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'Claimed.' }]);
+    const claimed = ann.getStore().currentSequence();
+    ann.getStore().setStateJson('agents/ann/reader', null);
+    const child = await before.derive({ branch: 'dendrite/after-clear', strategy: new PassthroughStrategy(), atSequence: claimed });
+    managers.push(child);
+    assert.equal((ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/after-clear').getStateJson('agents/ann/reader'), null, 'the child records the head\'s cleared record, not the checkpoint\'s ann');
+    const bob = await ContextManager.open({ store: (ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/after-clear'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' });
+    managers.push(bob);
+  });
+
+  it('records on a child the reader the head records, over an earlier reader the checkpoint recorded before a clear', { skip }, async () => {
+    const path = storePath();
+    const inspector = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(inspector);
+    const store = inspector.getStore();
+    const ann = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'For ann, before the clear.' }]);
+    const claimed = store.currentSequence();
+    await ann.close();
+    store.setStateJson('agents/ann/reader', null);
+    const bob = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' });
+    managers.push(bob);
+    const branchOf = (name: string) => (store as unknown as { view(name: string): JsStore }).view(name);
+    for (const [label, parent] of [['a parent with no reader', inspector], ['a parent opened for bob', bob]] as const) {
+      const name = `dendrite/before-clear-${parent === bob ? 'bob' : 'inspector'}`;
+      const child = await parent.derive({ branch: name, strategy: new PassthroughStrategy(), atSequence: claimed });
+      managers.push(child);
+      assert.equal(branchOf(name).getStateJson('agents/ann/reader'), 'bob', `${label}: the child's branch records the head's reader`);
+      const opened = await ContextManager.open({ store: branchOf(name), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' });
+      managers.push(opened);
+    }
+  });
+
+  it('records its own reader on a child a manager derives after the head\'s record was cleared under it', { skip }, async () => {
+    const ann = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'Claimed.' }]);
+    const store = ann.getStore();
+    store.setStateJson('agents/ann/reader', null);
+    assert.equal(store.getStateJson('agents/ann/reader'), null, 'the premise: the head records none while ann\'s manager is open');
+    const child = await ann.derive({ branch: 'dendrite/cleared-under-ann', strategy: new PassthroughStrategy() });
+    managers.push(child);
+    const branch = (store as unknown as { view(name: string): JsStore }).view('dendrite/cleared-under-ann');
+    assert.equal(branch.getStateJson('agents/ann/reader'), 'ann', 'the child compiles for ann, so its branch records ann');
+    await assert.rejects(
+      ContextManager.open({ store: branch, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /compiles for reader "ann", not "bob"/,
+    );
+  });
+
+  it('refuses a derive whose head another reader holds, before it writes the child\'s branch', { skip }, async () => {
+    const ann = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'Claimed.' }]);
+    const store = ann.getStore();
+    store.setStateJson('agents/ann/reader', null);
+    const bob = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' });
+    managers.push(bob);
+    assert.equal(store.getStateJson('agents/ann/reader'), 'bob', 'the premise: the head records bob');
+    const writes = spyBranchWrites(store);
+    try {
+      await assert.rejects(
+        ann.derive({ branch: 'dendrite/held-by-bob', strategy: new PassthroughStrategy() }),
+        /ContextManager\.derive: namespace "agents\/ann" compiles for reader "bob", not "ann"/,
+      );
+      assert.deepEqual(writes.map((write) => write.mock.callCount()), [0, 0], 'the refusal comes before any branch is written');
+    } finally {
+      for (const write of writes) write.mock.restore();
+    }
+    assert.ok(!ann.listBranches().some((b) => b.name === 'dendrite/held-by-bob'), 'no branch is written');
+  });
+
+  it('refuses a derive over a head record that isn\'t a reader\'s name, with a reader and without one', { skip }, async () => {
+    const inspector = await ContextManager.open({ path: storePath(), namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(inspector);
+    const store = inspector.getStore();
+    const ann = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    ann.addMessage('User', [{ type: 'text', text: 'Claimed.' }]);
+    assert.equal(inspector.viewReader, undefined, 'the premise: opened before the claim, the inspector compiles for none');
+    store.setStateJson('agents/ann/reader', 42);
+    const writes = spyBranchWrites(store);
+    try {
+      await assert.rejects(
+        ann.derive({ branch: 'dendrite/damaged-ann', strategy: new PassthroughStrategy() }),
+        /ContextManager\.derive: namespace "agents\/ann" records its reader as 42, not a reader's name/,
+      );
+      store.setStateJson('agents/ann/reader', '');
+      await assert.rejects(
+        inspector.derive({ branch: 'dendrite/damaged-inspector', strategy: new PassthroughStrategy() }),
+        /ContextManager\.derive: namespace "agents\/ann" records its reader as "", not a reader's name/,
+      );
+      assert.deepEqual(writes.map((write) => write.mock.callCount()), [0, 0], 'neither refusal writes a branch first');
+    } finally {
+      for (const write of writes) write.mock.restore();
+    }
+    assert.ok(!ann.listBranches().some((b) => b.name.startsWith('dendrite/damaged-')), 'neither refusal leaves a branch');
+  });
+
+  it('records the namespace\'s reader on an inspection\'s child from before the first record', { skip }, async () => {
+    const forReaders = (text: string, ...audience: string[]) => ({ type: 'text', text, audience }) as never;
+    const big = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    const path = storePath();
+    const before = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy() });
+    managers.push(before);
+    before.addMessage('User', [forReaders('[for ann]', 'ann'), { type: 'text', text: 'Early.' }]);
+    const early = before.getStore().currentSequence();
+    const ann = await ContextManager.open({ store: before.getStore(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    managers.push(ann);
+    const child = await before.derive({ branch: 'dendrite/inspected-early', strategy: new PassthroughStrategy(), atSequence: early });
+    managers.push(child);
+    await assert.rejects(
+      ContextManager.open({ store: (ann.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/inspected-early'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'bob' }),
+      /compiles for reader "ann", not "bob"/,
+    );
+    assert.equal(before.viewReader, undefined, 'the premise: the parent was opened before the claim, with no reader');
+    assert.ok(JSON.stringify((await child.compile(big)).messages).includes('[for ann]') && child.viewReader === 'ann', 'the live child compiles for the reader its branch records');
+    const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: new PassthroughStrategy() });
+    managers.push(reopened);
+    assert.ok(JSON.stringify((await reopened.compile(big)).messages).includes('[for ann]'), 'reopened, it compiles for the namespace\'s reader');
   });
 
   it('removes its branch when the child fails after it starts, as when taking over the frontier throws', { skip }, async () => {

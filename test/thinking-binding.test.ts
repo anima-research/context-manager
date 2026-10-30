@@ -1442,3 +1442,19 @@ const exported: { binding: ThinkingBinding; identity: RequestIdentity | RequestI
   strip: { newly: [], cause: 'messages' },
 };
 void exported;
+
+describe('the binding under a reader', () => {
+  it('vouches for a row holding another reader\u2019s block by the reader\u2019s view of it, as passthrough sends it', async () => {
+    cleanup();
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), viewReader: 'ann' });
+    seed(manager);
+    await manager.compile(BIG, undefined, BIND);
+    const u3 = manager.addMessage('User', [{ type: 'text', text: 'zz-for-bob', audience: ['bob'] } as ContentBlock, text('U3')]);
+    const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
+    note(manager, [u3, a3], identity());
+    manager.addMessage('User', [text('U4')]);
+    const next = await manager.compile(BIG, undefined, BIND);
+    assert.equal(thinkingByText(next).A3, true, 'the reply after the row keeps its thinking');
+    await manager.close();
+  });
+});

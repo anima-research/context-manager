@@ -1155,7 +1155,9 @@ type CompressionAttemptOutcome =
  * the terminal-disposition gate. `tick()` catches this specifically to run
  * the bounded-retry/quarantine policy; any other executeMerge throw keeps
  * the pre-existing transient semantics (entry stays queued, retried on the
- * next tick with no attempt accounting).
+ * next tick with no attempt accounting), except MergeReadUnrecorded, whose
+ * entry stays queued uncounted and waits until what it reads can be
+ * recorded.
  */
 /**
  * A merge whose answer a compression hold placed on its span during the call
@@ -1164,6 +1166,10 @@ type CompressionAttemptOutcome =
  */
 class MergeHoldDiscard extends Error {
   override name = 'MergeHoldDiscard';
+}
+
+class MergeReadUnrecorded extends Error {
+  override name = 'MergeReadUnrecorded';
 }
 
 class SummariesAcrossWindows extends Error {
@@ -2449,6 +2455,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private compressionBranchGeneration = 0;
   /** The controller of each provider call out (callProvider), until the call settles. */
   private readonly callsOut = new Set<AbortController>();
+  private markCompressionRead: ((through: number) => void) | undefined;
+  private compressionReadMarked = -1;
+  private compressionReadUnmarked = -1;
+  private compressionReadMarkFailed = false;
   /**
    * Branch whose derived mirrors completed initialization. This is deliberately
    * absent while initialize() is running: partially loaded summaries/chunks/
@@ -3091,6 +3101,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    this.markCompressionRead = ctx.markCompressionRead;
+    this.compressionReadMarked = -1;
+    this.compressionReadUnmarked = -1;
+    this.compressionReadMarkFailed = false;
     this.reportImageLimitsWarningOnce();
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
@@ -3145,7 +3159,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
-      this.rebuildChunks(ctx.messageStore);
+      this.rebuildAndMark(ctx.messageStore);
       if (abortIfStale()) return;
       if (!this.config.auditOnly) this.sanitizePersistedMergeQueue(ctx.messageStore);
       if (abortIfStale()) return;
@@ -3247,6 +3261,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return await membrane.complete(request, { formatter: this.nativeFormatter, signal: call.signal });
     } finally {
       this.callsOut.delete(call);
+    }
+  }
+
+  /** It marks every message it reads for a summary or a request, through `StrategyContext.markCompressionRead`, before the read. */
+  readonly marksCompressionReads = true;
+
+  private markReadThrough(through: number): void {
+    if (through <= this.compressionReadMarked) return;
+    try {
+      this.markCompressionRead?.(through);
+    } catch (error) {
+      this.compressionReadUnmarked = Math.max(this.compressionReadUnmarked, through);
+      throw error;
+    }
+    this.compressionReadMarked = through;
+  }
+
+  private rebuildAndMark(store: MessageStoreView): void {
+    try {
+      this.rebuildChunks(store);
+    } finally {
+      this.markClosedChunks();
+    }
+  }
+
+  private markClosedChunks(): void {
+    let newest = -1;
+    for (const chunk of this.chunks) for (const message of chunk.messages) if (message.sequence > newest) newest = message.sequence;
+    try {
+      this.markReadThrough(Math.max(newest, this.compressionReadUnmarked));
+      this.compressionReadMarkFailed = false;
+    } catch (error) {
+      if (!this.compressionReadMarkFailed) {
+        this.compressionReadMarkFailed = true;
+        this.diag.error(
+          `[autobiographical] compression waits: what compression has read can't be recorded ` +
+            `(${error instanceof Error ? error.message : String(error)}), so no chunk or merge is taken from its queues until it can be`,
+        );
+      }
     }
   }
 
@@ -7438,7 +7491,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
     this.requireLoadedBranch('onNewMessage');
-    this.rebuildChunks(ctx.messageStore);
+    this.rebuildAndMark(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
     // each tick completes, if the queue still has work AND preflight
@@ -7646,7 +7699,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.toolsDeferredMerge = undefined;
     }
     for (const key of candidates) {
-      if (this.speculativeCapHolds()) break;
+      if (this.speculativeCapHolds() || this.compressionReadMarkFailed) break;
       if (this.toolsDeferredChunks.has(key)) continue;
       // Resolve against the current queue: a rebuild may renumber chunks or
       // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
@@ -7840,8 +7893,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // would silently lose the merge from disk and the sources would sit at
     // level N-1 with no mergedInto pointers forever. Commit the removal
     // only after the merge succeeds; on failure, the queue keeps its entry
-    // and the next tick() retries it.
-    if (this.config.hierarchical && this.mergeQueue.length > 0) {
+    // and the next tick() retries it, unless what it reads couldn't be
+    // recorded (MergeReadUnrecorded): then it waits until it can be.
+    if (this.config.hierarchical && this.mergeQueue.length > 0 && !this.compressionReadMarkFailed) {
       const merge = this.mergeQueue[0]!;
       // A late hold (placed on a message some L1 already covers) pauses
       // merges reaching it: the merge prompt replays raw sources. No progress
@@ -7902,6 +7956,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // attempt, no streak; the merge stays at the head of the queue for
         // the next tick.
         if (compressionFailureKind(error) === 'abort') throw error;
+        if (error instanceof MergeReadUnrecorded) return;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -8091,7 +8146,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
-      this.rebuildChunks(store);
+      this.rebuildAndMark(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
       // A select refused after it placed its markers (assertMiddleCoverage,
@@ -12362,6 +12417,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (1a), as a compression chunk in that state does.
     const positionOf = this.positionIndex(allMessages);
     const mergeStartIdx = this.startInStore(sourceLeafIds, positionOf);
+    let newestRead = -1;
+    for (const id of sourceLeafIds) newestRead = Math.max(newestRead, messageById.get(id)?.sequence ?? -1);
+    try {
+      this.markReadThrough(newestRead);
+    } catch (error) {
+      if (!this.compressionReadMarkFailed) {
+        this.compressionReadMarkFailed = true;
+        this.diag.error(
+          `[autobiographical] compression waits: what the L${targetLevel} merge from ${sourceIds[0] ?? '?'} reads can't be recorded as read ` +
+            `(${error instanceof Error ? error.message : String(error)}), so no chunk or merge is taken from its queues until it can be`,
+        );
+      }
+      throw new MergeReadUnrecorded(`the L${targetLevel} merge from ${sourceIds[0] ?? '?'} waits: what it reads can't be recorded as read`);
+    }
 
     // ---- 1a. PRIOR RECALL SET (chronologically before merge range) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -17679,6 +17748,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStart = this.getHeadWindowStartIndex(ctx.messageStore);
     const headEnd = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
     const headMessages = messages.slice(headStart, headEnd);
+    this.markReadThrough(headMessages.reduce((newest, message) => Math.max(newest, message.sequence), -1));
 
     // Format head content, truncated to ~2000 tokens (~8000 chars)
     const MAX_HEAD_CHARS = 8000;
@@ -19236,7 +19306,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   onCompressionHoldsReleased(ctx: StrategyContext): void {
     this.requireLoadedBranch('onCompressionHoldsReleased');
-    this.rebuildChunks(ctx.messageStore);
+    this.rebuildAndMark(ctx.messageStore);
     if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
       this.driveSpeculativeDrain(ctx);
     }

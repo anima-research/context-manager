@@ -22,6 +22,7 @@ import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
+import { hasAudience } from './message-view.js';
 
 /** Whether content, written or stored, holds a top-level block of `type`; content that isn't an array holds none. */
 function holdsBlock(content: unknown, type: string): boolean {
@@ -226,6 +227,14 @@ function recordRevisionAfterCountedWrite(store: JsStore, stateId: string): void 
   let m = sharedLastRevisions.get(store);
   if (!m) { m = new Map(); sharedLastRevisions.set(store, m); }
   m.set(stateId, slotRevision(store, stateId));
+}
+
+const sharedAudienceSlots = new WeakMap<object, Set<string>>();
+
+function noteAudienceWritten(store: object, stateId: string): void {
+  let slots = sharedAudienceSlots.get(store);
+  if (!slots) { slots = new Set(); sharedAudienceSlots.set(store, slots); }
+  slots.add(stateId);
 }
 
 /** Bumped by every mutation except append (main's token for a cache of
@@ -719,6 +728,7 @@ export class MessageStore {
       'sequence',
     );
     recordRevisionAfterCountedWrite(this.store, this.stateId);
+    if (hasAudience(content)) noteAudienceWritten(this.store, this.stateId);
     const index = this.length() - 1;
 
     const message: StoredMessage = {
@@ -967,6 +977,7 @@ export class MessageStore {
     bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, storedJson(updated));
     recordRevisionAfterCountedWrite(this.store, this.stateId);
+    if (hasAudience(newContent)) noteAudienceWritten(this.store, this.stateId);
     this.indexWriteVersion = slotRevision(this.store, this.stateId);
 
     // Write-through the materialized cache (see append — the cached entry
@@ -1236,6 +1247,41 @@ export class MessageStore {
     writeVersion: number;
     stored: StoredMessage[];
   } | null = null;
+
+  /**
+   * Whether the slot may hold a block that declares an `audience`: once a
+   * write through a MessageStore on this store object stored one, or a read
+   * of the slot found one. The slot is read at the first call, and again
+   * only after a write no MessageStore here counted (a gap, as the caches
+   * test it) or on another branch; between those, every write was counted,
+   * and one that stored such a block marked the slot itself. A block edited
+   * away still counts: a slot a write marked stays marked for its store
+   * object, and one a read found stays found until a write no MessageStore
+   * here counted, or a branch change, has the slot read again.
+   * On a chronicle without a slot revision, a write outside MessageStore
+   * isn't seen, as by the caches.
+   */
+  mayHoldAudience(): boolean {
+    if (sharedAudienceSlots.get(this.store)?.has(this.stateId)) return true;
+    const branchId = this.store.currentBranch().id;
+    const revision = slotRevision(this.store, this.stateId);
+    const gapCount = currentGapCount(this.store, this.stateId);
+    const read = this.audienceRead;
+    if (
+      read &&
+      read.branchId === branchId &&
+      read.gapCount === gapCount &&
+      (read.revision === revision || revisionLeftByLastCountedWrite(this.store, this.stateId) === revision)
+    ) {
+      read.revision = revision;
+      return read.found;
+    }
+    const found = this.getAllInternal().some((internal) => hasAudience(internal.content));
+    this.audienceRead = { branchId, revision, gapCount, found };
+    return found;
+  }
+
+  private audienceRead: { branchId: string; revision: number; gapCount: number; found: boolean } | null = null;
 
   /**
    * Get a window of messages by slot index — O(window), not O(all).
