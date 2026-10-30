@@ -4,10 +4,11 @@
  * renders the head as one unit. So a marker can sit in the head only at the
  * head's end, and a body that the head and the recent window share, merged
  * into one entry, ends on its last shard. Each case compiles a store, then
- * accepts the request with one wire marker for each breakpoint, as membrane's
- * receipt names them under `cm-owned`. The breakpoints must sit on the
- * messages the case names, and the accepted cache reference must keep every
- * marker, each at the offset where its message ends.
+ * accepts the request with one wire marker for each breakpoint, plus any the
+ * caller declares it places outside the messages, as membrane's receipt names
+ * them under `cm-owned`. The breakpoints must sit on the messages the case
+ * names, and the accepted cache reference must keep every breakpoint's marker,
+ * each at the offset where its message ends.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -170,6 +171,29 @@ const conversation = (c: Case): Array<[string, ContentBlock[]]> => [
   ['u', [{ type: 'text', text: 'next' }]],
 ];
 
+/** Where each marked message on the wire ends, in tokens: the stored messages
+ *  it holds, in store order, each at the store's estimate. */
+function markerOffsets(
+  o: Awaited<ReturnType<typeof open>>,
+  messages: readonly { content: ContentBlock[] }[],
+  marked: readonly number[],
+): number[] {
+  const stored = o.store.getAll();
+  let next = 0;
+  let offset = 0;
+  const ends = messages.map((message) => {
+    let chars = textLength(message.content);
+    while (chars > 0 && next < stored.length) {
+      chars -= textLength(stored[next]!.content);
+      offset += o.store.estimateTokens(stored[next]!);
+      next++;
+    }
+    assert.equal(chars, 0, 'premise: each message on the wire holds whole stored messages');
+    return offset;
+  });
+  return marked.map((i) => ends[i]!);
+}
+
 describe('kv-unified records each cache marker where its message ends', () => {
   for (const [name, c] of Object.entries(CASES)) {
     it(name, async () => {
@@ -182,22 +206,7 @@ describe('kv-unified records each cache marker where its message ends', () => {
         const marked = breakpointsOf(compiled.messages);
         assert.deepEqual(marked, c.marked, 'the messages on the wire that carry a breakpoint');
         o.accept(o.begin(), marked.length);
-        // Where each message on the wire ends, in tokens: the stored messages
-        // it holds, in store order, each at the store's estimate.
-        const stored = o.store.getAll();
-        let next = 0;
-        let offset = 0;
-        const ends = compiled.messages.map((message) => {
-          let chars = textLength(message.content);
-          while (chars > 0 && next < stored.length) {
-            chars -= textLength(stored[next]!.content);
-            offset += o.store.estimateTokens(stored[next]!);
-            next++;
-          }
-          assert.equal(chars, 0, 'premise: each message on the wire holds whole stored messages');
-          return offset;
-        });
-        const expected = marked.map((i) => ends[i]!);
+        const expected = markerOffsets(o, compiled.messages, marked);
         const cache = receipts(o.strategy).cache;
         assert.ok(cache, 'the accepted presentation keeps a cache reference');
         assert.deepEqual(cache.markers.map((marker) => marker.offset), expected,
@@ -330,5 +339,125 @@ describe("a request whose marker count differs from its compile's", () => {
       console.error = original;
       await o.close();
     }
+  });
+});
+
+describe("a caller that places its own cache markers outside the messages (kvUnified.callerCacheMarkers)", () => {
+  const withCallerMarkers = (callerCacheMarkers: number) => ({
+    kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, callerCacheMarkers },
+  });
+
+  it("kv-unified places at most 4 minus the declared count: history markers nearest to evenly spaced fractions of the history's tokens, the last at its last boundary, and the tail end", () => {
+    const expected = [[0, 2, 5, 6], [1, 5, 6], [5, 6], [6]];
+    for (const [declared, marks] of expected.entries()) {
+      const strategy = kvUnified({ headWindowTokens: 0, recentWindowTokens: 100, ...withCallerMarkers(declared) });
+      const entries = [1200, 400, 400, 400, 400, 400].map((chars, k) => ({
+        participant: 'u', content: [{ type: 'text', text: 'x'.repeat(chars) }],
+        sourceMessageId: `m${k}`, sourceRelation: 'copy',
+      } as ContextEntry));
+      entries.push({ participant: 'u', content: [{ type: 'text', text: 'x'.repeat(40) }], sourceMessageId: 't0', sourceRelation: 'copy' } as ContextEntry);
+      (strategy as unknown as {
+        placeCacheMarkers(entries: ContextEntry[], head: ReadonlySet<string>, tail: ReadonlySet<string>): void;
+      }).placeCacheMarkers(entries, new Set(), new Set(['t0']));
+      assert.deepEqual(entries.flatMap((e, i) => (e.cacheMarker ? [i] : [])), marks, `${declared} declared`);
+    }
+  });
+
+  for (const [name, placedFor] of [
+    ["three messages in the head and three raw in the middle: the head's last and the middle are marked", [3, 2, 1]],
+    ['a body first, its shards across the head and the recent window: the body is marked', [2, 2, 1]],
+  ] as const) {
+    for (const [index, placed] of placedFor.entries()) {
+      const declared = index + 1;
+      it(`${declared} declared markers beside kv-unified's own keep the cache reference, with kv-unified's markers where their messages end: ${name}`, async () => {
+        const c = CASES[name]!;
+        const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(declared) });
+        try {
+          const compiled = await o.compile();
+          const marked = breakpointsOf(compiled.messages);
+          assert.equal(marked.length, placed, "kv-unified's breakpoints");
+          assert.deepEqual(marked.slice(-Math.min(2, 4 - declared)), c.marked.slice(-Math.min(2, 4 - declared)),
+            "the history's last boundary, while a history marker remains, and the tail end, as with none declared");
+          o.accept(o.begin(), placed + declared);
+          const cache = receipts(o.strategy).cache;
+          assert.ok(cache, 'the accepted presentation keeps a cache reference');
+          assert.deepEqual(cache.markers.map((marker) => marker.offset), markerOffsets(o, compiled.messages, marked));
+        } finally {
+          await o.close();
+        }
+      });
+    }
+  }
+
+  it('the declared count is read when the strategy is built: changing the config object later changes neither placement nor acceptance', async () => {
+    const c = CASES["three messages in the head and three raw in the middle: the head's last and the middle are marked"]!;
+    const config = withCallerMarkers(1);
+    const o = await open(conversation(c), { ...c.config, ...config });
+    try {
+      config.kvUnified.callerCacheMarkers = 2;
+      const compiled = await o.compile();
+      const marked = breakpointsOf(compiled.messages);
+      assert.equal(marked.length, 3, "kv-unified's breakpoints, as for 1 declared");
+      config.kvUnified.callerCacheMarkers = 3;
+      o.accept(o.begin(), 4);
+      assert.ok(receipts(o.strategy).cache, 'the request carrying 1 declared marker keeps its reference');
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a preview whose overrides replace kvUnified places for the count the strategy was built with", async () => {
+    const c = CASES["three messages in the head and three raw in the middle: the head's last and the middle are marked"]!;
+    const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(1) });
+    try {
+      await o.compile();
+      for (const replaced of [{}, { callerCacheMarkers: 2 }, { callerCacheMarkers: 4 }]) {
+        const preview = o.manager.previewContext(BIG, { kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, ...replaced } }, { render: true })!;
+        assert.equal(preview.entries!.filter((entry) => entry.cacheMarker).length, 3,
+          `${JSON.stringify(replaced)}: kv-unified's breakpoints, as for 1 declared`);
+      }
+    } finally {
+      await o.close();
+    }
+  });
+
+  it('a request whose caller markers differ from the declared count keeps no reference, and the line names the option', async () => {
+    const c = CASES['a body first, its shards across the head and the recent window: the body is marked']!;
+    for (const [declared, carried] of [[0, 3], [1, 2]] as const) {
+      const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(declared) });
+      const logged: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => {
+        const line = args.map(String).join(' ');
+        if (line.startsWith('[kv-unified]') && line.includes('cache markers where')) logged.push(line);
+        else original(...args);
+      };
+      try {
+        await o.compile();
+        o.accept(o.begin(), carried);
+        assert.equal(receipts(o.strategy).cache, null, `${declared} declared, ${carried} carried: no reference`);
+        assert.equal(logged.length, 1);
+        assert.match(logged[0]!, new RegExp(
+          `carried ${carried} cache markers where its compile marked 2 layout boundaries, plus the ${declared} ` +
+          'kvUnified\\.callerCacheMarkers says the caller places outside the messages,',
+        ));
+      } finally {
+        console.error = original;
+        await o.close();
+      }
+    }
+  });
+
+  it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built', () => {
+    for (const declared of [4, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1' as unknown as number]) {
+      assert.throws(() => kvUnified({ ...withCallerMarkers(declared) }), (error: unknown) =>
+        error instanceof RangeError && /kvUnified\.callerCacheMarkers is .*; it must be an integer from 0 to 3/.test(error.message),
+      `${declared} is refused`);
+    }
+    for (const declared of [0, 3, null as unknown as number]) {
+      assert.doesNotThrow(() => kvUnified({ ...withCallerMarkers(declared) }), `${declared} is taken`);
+    }
+    assert.throws(() => kvUnified({ ...withCallerMarkers(Number.NaN) }), /callerCacheMarkers is NaN;/);
+    assert.throws(() => kvUnified({ ...withCallerMarkers('1' as unknown as number) }), /callerCacheMarkers is "1";/);
   });
 });
