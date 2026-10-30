@@ -742,6 +742,7 @@ describe('live image accounting', () => {
 });
 
 describe("the adaptive strip applies the estimate's verdicts", () => {
+  const STUB = "[this call's result isn't shown in this context. If you need its output and the tool only reads, call it again; you'll get what it returns now.]";
   const image = (data: string, tokenEstimate: number): ContentBlock =>
     ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' }, tokenEstimate }) as ContentBlock;
   /** Compiles the messages under the adaptive selection, and returns what's
@@ -758,10 +759,17 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     const sent = compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
     const stats = cm.getRenderStats()!;
     const live = compiled.messages.map((m) => [...imagesOf(m.content)].map((b) => (b as { source: { data: string } }).source.data).join(','));
+    const results = compiled.messages.flatMap((m) => m.content).flatMap((b) => {
+      if (b.type !== 'tool_result') return [];
+      const body = (b as { content?: unknown }).content;
+      return [typeof body === 'string' ? body : ((body as Array<{ type: string; text?: string }>).find((p) => p.type === 'text')?.text ?? '')];
+    });
     /** The text the repair leaves where it moved a message's only result, which no estimate prices. */
     const movedText = store.estimateTokens({ content: [{ type: 'text', text: '[tool result moved during context repair]' }] } as unknown as StoredMessage);
+    /** A message holding one stub the repair sends for a call with no result, which no estimate prices either. */
+    const stubText = store.estimateTokens({ content: [{ type: 'tool_result', toolUseId: 'x', content: STUB }] } as unknown as StoredMessage);
     cm.close();
-    return { sent, total: stats.total.tokens, planned: stats.planVsActual?.planned, actual: stats.planVsActual?.actual, live, movedText };
+    return { sent, total: stats.total.tokens, planned: stats.planVsActual?.planned, actual: stats.planVsActual?.actual, live, results, movedText, stubText };
   }
   function* imagesOf(content: ContentBlock[]): Generator<ContentBlock> {
     for (const b of content) {
@@ -863,7 +871,7 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     assert.equal(r.total + r.movedText, r.sent, `render stats ${r.total} and the repair's text ${r.movedText}, sent ${r.sent}`);
   });
 
-  it("sends no image live on another's verdict where two results for one call id share a message and the repair moves one", async () => {
+  it("sends the first of two results for one call id that share a message after the later of two calls with that id, and no image of the other", async () => {
     const use = (text: string): [string, ContentBlock[]] =>
       ['Claude', [{ type: 'text', text }, { type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]];
     const result = (data: string, tokenEstimate: number, text: string) =>
@@ -874,9 +882,9 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
       ['User', [result('SMAL', 100, 'small'), result('LARG', 5000, 'large')] as unknown as ContentBlock[]],
       ['Claude', [{ type: 'text', text: 'done' }]],
     ]);
-    assert.equal(r.live.length, 6, 'premise: the repair sent the two results apart, each after a call');
-    assert.ok(!r.live.some((data) => data.includes('LARG')), `the large image, which its own verdict strips, went out live: ${JSON.stringify(r.live)}`);
-    assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
+    assert.deepEqual(r.results, [STUB, 'small'], 'the earlier call goes with a stub, and the later call with the first result');
+    assert.ok(!r.live.some((data) => data.includes('LARG')), `the large image went out live: ${JSON.stringify(r.live)}`);
+    assert.ok(r.sent <= r.total + r.stubText, `sent ${r.sent}, past the render stats' ${r.total} and the stub's ${r.stubText}`);
   });
 
   it("counts a moved result's image once, so an older image the estimate kept stays live", async () => {

@@ -309,3 +309,53 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
     await manager.close();
   });
 });
+
+describe('a tool_use id used again by a later call', () => {
+  const ask = (q: string): ContentBlock => ({ type: 'tool_use', id: 'call_1', name: 'fn', input: { q } });
+  const resultAfter = (entries: { content: ContentBlock[] }[], q: string): ContentBlock | undefined => {
+    const at = entries.findIndex((e) => e.content.some((b) => b.type === 'tool_use' && (b as { input: { q?: string } }).input.q === q));
+    return entries[at + 1]?.content.find((b) => b.type === 'tool_result');
+  };
+
+  it('repair leaves a result with the later call when the unanswered earlier call is right before it', () => {
+    const entries = [
+      entry('Claude', [ask('first')]),
+      entry('Claude', [ask('again')]),
+      entry('User', [result('call_1', 'what the later call returned')]),
+    ];
+    runEnforce(entries);
+    assertPaired(entries);
+    assert.strictEqual((resultAfter(entries, 'again') as { content?: unknown } | undefined)?.content, 'what the later call returned');
+    assert.notStrictEqual((resultAfter(entries, 'first') as { content?: unknown } | undefined)?.content, 'what the later call returned');
+  });
+
+  const STORE = './test-tool-pairing-reused-id';
+  let stores = 0;
+  const made: string[] = [];
+  after(() => { for (const p of made) if (existsSync(p)) rmSync(p, { recursive: true, force: true }); });
+
+  const sent = async (config: Record<string, unknown>, secondId: string): Promise<ContextEntry[]> => {
+    const path = `${STORE}-${process.pid}-${stores++}`;
+    made.push(path);
+    const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, headWindowTokens: 0, recentWindowTokens: 1_000_000, ...config } as never);
+    const manager = await ContextManager.open({ path, strategy });
+    manager.addMessage('User', [text('Please look something up.')]);
+    manager.addMessage('Claude', [text('Looking.'), { type: 'tool_use', id: 'call_1', name: 'lookup', input: { q: 'first' } }]);
+    manager.addMessage('User', [text('Never mind that one.')]);
+    manager.addMessage('Claude', [text('Looking again.'), { type: 'tool_use', id: secondId, name: 'lookup', input: { q: 'again' } }]);
+    manager.addMessage('User', [result(secondId, 'FOUND for the second call')]);
+    manager.addMessage('Claude', [text('Here it is.')]);
+    const compiled = await manager.compile({ maxTokens: 200_000, reserveForResponse: 0 });
+    await manager.close();
+    return compiled.messages as unknown as ContextEntry[];
+  };
+
+  for (const [select, config] of [['hierarchical select', { adaptiveResolution: false }], ['adaptive select', { adaptiveResolution: true }]] as const) {
+    it(`${select}: each call goes out with what it would get were the ids distinct`, async () => {
+      const reused = await sent(config, 'call_1');
+      const distinct = await sent(config, 'call_2');
+      assert.strictEqual((resultAfter(reused, 'again') as { content?: unknown } | undefined)?.content, 'FOUND for the second call');
+      assert.strictEqual(JSON.stringify(reused), JSON.stringify(distinct).replaceAll('"call_2"', '"call_1"'));
+    });
+  }
+});

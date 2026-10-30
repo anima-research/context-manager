@@ -2193,10 +2193,11 @@ export interface AutobiographicalConfig {
    * The count runs over the whole conversation, not only what a compile
    * renders raw: a result is replaced once the conversation holds N newer
    * answered calls of its tool, folded ones included, so folding never
-   * brings a replaced result back. A result answers the earliest call with
-   * its id before it, in its own message or an earlier one, that no result
-   * has answered yet; a further result for an answered call goes with that
-   * call. Calls are ordered by the message that made them, and calls made in
+   * brings a replaced result back. A result answers the nearest call with
+   * its id before it, in its own message or an earlier one, so a later call
+   * that reuses an id takes the results after it; a further result for an
+   * answered call goes with that call. Calls are ordered by the message that
+   * made them, and calls made in
    * one message by where their results are stored, as the render sends them
    * unless pairing repair moves some. A result is replaced before
    * `maxMessageTokens` cuts its message, and the plan and the render stats

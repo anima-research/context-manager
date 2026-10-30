@@ -79,6 +79,7 @@ const resultOf = (compiled: CompileResult, id: string): string | undefined => {
   return undefined;
 };
 const MARKER = "[result of tool 'lookup' left out: this context shows only the tool's last result]";
+const STUB = "[this call's result isn't shown in this context. If you need its output and the tool only reads, call it again; you'll get what it returns now.]";
 
 describe('tool pruning, priced as sent', () => {
   for (const [name, selector] of SELECTORS) {
@@ -366,11 +367,7 @@ describe('tool pruning, priced as sent', () => {
     cm.close();
   });
 
-  it('answers the earliest unanswered call where a host reuses an id', async () => {
-    // The first call has no result yet when the host reuses its id. Pairing
-    // repair moves the first result up to the first call and gives the
-    // second to the second call, and the count does the same: two answered
-    // calls, so a limit of 1 sends the first result as its marker.
+  it('answers the nearest call where a host reuses an id', async () => {
     const { cm } = await open({ adaptiveResolution: true, toolResultMaxLastN: 1 });
     cm.addMessage('u', text('look'));
     cm.addMessage('a', [call('t1')]);
@@ -382,7 +379,7 @@ describe('tool pruning, priced as sent', () => {
     cm.addMessage('u', text('next'));
     const compiled = await cm.compile(BUDGET);
     const answers = compiled.messages.flatMap((m) => m.content).flatMap((b) => (b.type === 'tool_result' ? [String(b.content)] : []));
-    assert.deepEqual(answers, [MARKER, 'the second answer']);
+    assert.deepEqual(answers, [STUB, 'the first answer']);
     cm.close();
   });
 
@@ -612,7 +609,8 @@ describe('tool pruning, priced as sent', () => {
         "a result in its call's own message: epoch 6 reprices the store, so whatever epoch 4 answers there decides nothing");
       const reused = [msg('u', text('go')), msg('a', [call('x1', 'lookup')]), msg('u', text('wait')),
         msg('a', [call('x1', 'other')]), msg('u', [result('x1', 'r')])];
-      assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), true, 'a reused id answers its earliest call');
+      assert.equal(reprices(reused, at({ toolResultMaxLastN: { other: null } }), view(reused)), true, 'a reused id answers its nearest call');
+      assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), false, 'not the earlier call it reuses the id of');
       const big = conversation(1, { body: 'x'.repeat(2_000) });
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 100 }), view(big)), true, 'an input over the cap');
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 1_000 }), view(big)), false, 'an input under the cap');
