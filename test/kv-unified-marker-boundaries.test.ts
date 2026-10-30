@@ -134,9 +134,9 @@ async function open(messages: Array<[string, ContentBlock[]]>, config: Record<st
   const compile = (hash = true) =>
     manager.compile(BIG, undefined, hash ? { kvUnifiedImmutablePrefixHash: 'v1' } : undefined);
   /** Begin the compiled request's submission, and name it. */
-  const begin = (): string => {
+  const begin = (layoutHash?: string): string => {
     const id = `s${++submissions}`;
-    strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: `layout-${id}` });
+    strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: layoutHash ?? `layout-${id}` });
     return id;
   };
   /** Accept a submission with `markers` markers on the wire, or with no wire receipt. */
@@ -352,18 +352,19 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
     }
   }
 
-  it('a floated round leaves the reference as the first call set it', async () => {
-    for (const [c, markers] of [[ONE, 1], [FOUR, 4]] as const) {
+  it("a floated round leaves the reference, and the recorded wire receipt, as the first call set them", async () => {
+    for (const [c, markers, rounds] of [[ONE, 1, [2, 3, 4]], [FOUR, 4, [4, 4, 4]]] as const) {
       const o = await open(conversation(c), c.config);
       try {
         const compiled = await o.compile();
         assert.equal(breakpointsOf(compiled.messages).length, markers, 'premise: the compile marks as many messages as named');
-        o.accept(o.begin(), markers);
+        o.accept(o.begin('turn'), markers);
         const set = receipts(o.strategy).cache;
-        assert.ok(set, 'premise: the first call sets a reference');
-        o.accept(o.begin(), markers === 4 ? 4 : markers + 1);
-        o.accept(o.begin(), markers === 4 ? 4 : markers + 1);
+        const wire = receipts(o.strategy).wireReceipt;
+        assert.ok(set && wire, 'premise: the first call sets a reference and records its wire receipt');
+        for (const count of rounds) o.accept(o.begin('turn'), count);
         assert.equal(receipts(o.strategy).cache, set, `${markers} marker(s): the rounds leave the first call's reference`);
+        assert.deepEqual(receipts(o.strategy).wireReceipt, wire, `${markers} marker(s): and the first call's wire receipt`);
       } finally {
         await o.close();
       }
@@ -410,9 +411,11 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
         o.strategy.reportKvUnifiedFailed(o.begin());
         o.accept(o.begin(), 1);
         const set = receipts(o.strategy).cache;
+        const wire = receipts(o.strategy).wireReceipt;
         assert.ok(set, "after a failed own request, a matching first accepted round sets the reference");
         o.accept(o.begin(), 2);
         assert.equal(receipts(o.strategy).cache, set, 'and a later call leaves it');
+        assert.deepEqual(receipts(o.strategy).wireReceipt, wire, "and the first accepted round's wire receipt");
         await o.compile();
         o.strategy.reportKvUnifiedFailed(o.begin());
         o.accept(o.begin(), 2);
@@ -426,7 +429,7 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
     }
   });
 
-  it("a call still in flight when the next compile runs is accepted as its own compile's call", async () => {
+  it("a call still in flight when the next compile runs, an order other hosts may produce, is accepted as its own compile's call", async () => {
     const o = await open(conversation(ONE), ONE.config);
     try {
       await withMismatchLines(async (logged) => {

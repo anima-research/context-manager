@@ -680,7 +680,9 @@ model, or cached.
   cacheCreationTokens?})` — name is
   implementation-owned, but request identity must prevent a receipt for one
   compile being applied to another. The next solve reads the **newest valid
-  cache receipt**, not the newest compiled frontier. Cache fields may be
+  cache receipt**, not the newest compiled frontier. Under kv-unified the
+  receipt that sets the cache reference is a compile's first accepted call's;
+  a later call of the same compile leaves it (§5A.3). Cache fields may be
   absent while the accepted-presentation fields are still committed.
 - **Current immutable-prefix fingerprint is a required solve input.** Before
   cut selection, the host passes the hash of tools + system + context prefix
@@ -802,9 +804,12 @@ itself the main hazard; do not design from those numbers. After rev 6:
   round: in a free slot, with the message before the round's calling turn too
   when two or more are free, or in the earliest message marker's slot when all
   four are in use (context-manager#168). Within one tool loop membrane changes
-  nothing before the turn's opening, so the taken marker's prefix lies inside
-  the newest marker's. Once one of the compile's calls is accepted, a later
-  call's receipt leaves the cache reference as that call set it (§5).
+  no message content before the turn's opening: in a free slot its marker is
+  added, and when it takes the earliest message marker's slot, that marker's
+  content lies inside the newest marker's prefix, though its block no longer
+  carries `cache_control` on the wire. Once one of the compile's calls is
+  accepted, a later call's receipt leaves the cache reference, and the
+  recorded wire receipt, as that call set them (§5).
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
@@ -915,7 +920,7 @@ in `membrane-system` mode); the raw request carries at most the provider
 limit; membrane returns the exact wire receipt. These rules, and formatter
 parity's and the wire receipt's below, hold for a compile's own request: on
 the native tool loop's later calls, a membrane that floats under `cm-owned`
-adds markers of its own (§5A.3).
+places markers of its own (§5A.3).
 
 **Formatter parity** — the same normalized policy applies to native
 Anthropic, Anthropic XML/prefill, Bedrock (incl. its ttl rewrite), context-

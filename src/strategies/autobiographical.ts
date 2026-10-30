@@ -14839,8 +14839,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     const draft = this.kvUnifiedPendingDraft;
+    const later = !!draft?.accepted;
     let cache: ProviderCacheReference | null = null;
-    if (draft?.accepted) {
+    if (later) {
       // Under `cm-owned`, membrane's tool-loop float changes a later call's
       // markers (context-manager#168).
       cache = this.kvUnifiedReceipts.cache;
@@ -14888,7 +14889,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       args.submissionId,
       args.acceptedAt ?? Date.now(),
       cache,
-      args.wireReceipt,
+      later ? undefined : args.wireReceipt,
     );
     this.kvUnifiedPendingDraft = null;
     this.kvUnifiedPendingLayout = null;
