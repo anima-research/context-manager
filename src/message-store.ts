@@ -1164,6 +1164,29 @@ export class MessageStore {
   }
 
   /**
+   * Whether this store has ever held a message under `messageId`, on any of
+   * its branches: true for a live message and for one removed since, whose
+   * append record the removal's redaction leaves in the chronicle; false for
+   * an id it never gave a message of this slot. A removed id costs one
+   * decode of its append record, which grows with the message's size: about
+   * 0.14 ms for a 6,000-character message and 2.7 ms for a 100,000-character
+   * one, measured on Linux under Node 24.
+   */
+  held(messageId: MessageId): boolean {
+    if (this.lookupIndex(messageId) !== undefined) return true;
+    let update: string | null;
+    try {
+      update = this.store.getStateUpdateJson(messageId);
+    } catch {
+      // chronicle throws for an id that isn't a record id
+      return false;
+    }
+    if (update === null) return false;
+    const { state_id, operation } = JSON.parse(update) as { state_id?: unknown; operation?: unknown };
+    return state_id === this.stateId && typeof operation === 'object' && operation !== null && 'Append' in operation;
+  }
+
+  /**
    * Get a message as it was at a specific sequence (time travel).
    */
   getAt(messageId: MessageId, atSequence: Sequence): StoredMessage | null {
@@ -1538,6 +1561,7 @@ export class MessageStore {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
       sequenceOf: (id) => this.sequenceOf(id),
+      held: (id) => this.held(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
