@@ -1,5 +1,11 @@
 // Main class
-export { ContextManager, ContextDerivationUnsupportedError, InitializationSupersededError } from './context-manager.js';
+export {
+  ContextManager,
+  ContextDerivationUnsupportedError,
+  InitializationSupersededError,
+  WriteLandedError,
+  WriteOutcomeUnknownError,
+} from './context-manager.js';
 export type { ContextManagerConfig, DeriveContextOptions, ContextDerivation, ReopenDerivedOptions } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)
@@ -11,6 +17,7 @@ export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWin
 export { concatBodyGroups } from './adaptive/render.js';
 export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
+export { windowIndexStateId, type WindowMode, type WindowStatus } from './window-index.js';
 export { BlobManager, blockAsStored } from './blob-manager.js';
 export { MalformedContentError, malformedContentPlaces } from './well-formed-content.js';
 export {
@@ -86,6 +93,7 @@ export type {
   RequestOverhead,
   MessageStoreView,
   ContextLogView,
+  WindowIndexView,
   StrategyContext,
   ReadinessState,
   ContextStrategy,

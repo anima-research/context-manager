@@ -62,23 +62,6 @@ function entrySourceIds(entry: ContextEntry): MessageId[] {
 }
 
 /**
- * The position of the message stored at `sequence`, or -1. `stored` is in
- * sequence order, as every message view is.
- */
-function positionOfSequence(stored: readonly StoredMessage[], sequence: number): number {
-  let lo = 0;
-  let hi = stored.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >>> 1;
-    const at = stored[mid]!.sequence;
-    if (at === sequence) return mid;
-    if (at < sequence) lo = mid + 1;
-    else hi = mid - 1;
-  }
-  return -1;
-}
-
-/**
  * Finds stored messages by id, with their bodies, reading `stored` only
  * around the messages asked for, so a compile's attribution costs what its
  * raw entries name, not what is stored.
@@ -93,17 +76,20 @@ function positionOfSequence(stored: readonly StoredMessage[], sequence: number):
  *
  * A message is looked for first right after the last body found, since a
  * run of raw entries names consecutive messages, and otherwise at its
- * sequence (`sequenceOf`, then a binary search). So a run of consecutive
- * stored messages costs one lookup, at its start, and a named message that
- * doesn't follow the last body found costs one of its own, as one named out
- * of order does, or one after a message the view filter hid: at most one
- * lookup for each raw source, whatever the length of `stored`. An id that
- * no message in `stored` has is not found, and neither is one whose lookup
- * answers with a sequence no message of `stored` has under that id.
+ * position (`positionOf`, which the compile's view answers without reading
+ * the message: by its sequence while the view is the record, from the
+ * window's own positions once rows are presented in another order). So a
+ * run of consecutive stored messages costs one lookup, at its start, and a
+ * named message that doesn't follow the last body found costs one of its
+ * own, as one named out of order does, or one after a message the view
+ * filter hid: at most one lookup for each raw source, whatever the length
+ * of `stored`. An id that no message in `stored` has is not found, and
+ * neither is one whose lookup answers with a position where `stored` holds
+ * another message, or none.
  */
 function storedBodyFinder(
   stored: readonly StoredMessage[],
-  sequenceOf: (id: MessageId) => number | undefined,
+  positionOf: (id: MessageId) => number | undefined,
 ): { find: (id: MessageId) => StoredMessage | undefined; bodies: ReadonlyMap<MessageId, readonly StoredMessage[]> } {
   const found = new Map<MessageId, StoredMessage>();
   const bodies = new Map<MessageId, readonly StoredMessage[]>();
@@ -113,10 +99,9 @@ function storedBodyFinder(
     if (known) return known;
     let at = stored[next]?.id === id ? next : -1;
     if (at === -1) {
-      const sequence = sequenceOf(id);
-      if (sequence === undefined) return undefined;
-      at = positionOfSequence(stored, sequence);
-      if (at === -1 || stored[at]!.id !== id) return undefined;
+      const position = positionOf(id);
+      if (position === undefined || stored[position]?.id !== id) return undefined;
+      at = position;
     }
     const { from, to } = bodyBoundsIn(stored, at);
     const body = stored.slice(from, to + 1);
@@ -132,18 +117,25 @@ function storedBodyFinder(
 
 /**
  * Attribute every entry of one compile. `stored` is every message the
- * compile read, before any view filter (ordered by sequence): a body is
- * judged as stored, so a shard the filter hid from the strategy still
- * belongs to its body, whose head is shard 0 whether or not it was visible.
- * `sequenceOf` resolves an id among those same messages to its sequence
- * (undefined when none has it).
+ * compile read, before any view filter, in the order its window lists them
+ * (the record's order until rows are presented to the agent in another): a
+ * body is judged as stored, so a shard the filter hid from the strategy
+ * still belongs to its body, whose head is shard 0 whether or not it was
+ * visible. A body is presented whole, so its shards are consecutive in
+ * either order, but for one a presentation cut short left partly in the
+ * window (in an index a pre-release build wrote one record per row: see
+ * ContextManager.presentRows) and a later presentRows completed after
+ * other rows entered: its
+ * shards are then two runs in `stored`, each read as a body of its own and
+ * neither complete. `positionOf` resolves an id among those same messages
+ * to its position in `stored` (undefined when none has it).
  */
 export function attributeEntries(
   entries: readonly ContextEntry[],
   stored: readonly StoredMessage[],
-  sequenceOf: (id: MessageId) => number | undefined,
+  positionOf: (id: MessageId) => number | undefined,
 ): EntryProvenance {
-  const lookup = storedBodyFinder(stored, sequenceOf);
+  const lookup = storedBodyFinder(stored, positionOf);
 
   // Keyed by the body's head: two ingestions of the same text are two bodies.
   const bodies = new Map<MessageId, BodyState>();
@@ -237,7 +229,12 @@ export function attributeEntries(
 /**
  * Build the rendered layout of one compile: the view's members, and one unit
  * per raw message and per run of summarized or omitted messages, in view
- * order. `view` is in sequence order, as every message view is.
+ * order. `view` is the strategy's view, in the manager's window order.
+ * Without `ordinalOf` the window is the record, in sequence order, and the
+ * members are the messages' sequences. With it the window is the manager's
+ * index, and the members are its ordinals, which ascend in window order
+ * whatever the sequences do; it must answer for every message of the view,
+ * as the window it lists does.
  *
  * `estimateBase` returns a base (calibration-free) token estimate for some
  * rendered content. Raw message tokens are their entry's estimate, split
@@ -255,6 +252,8 @@ export function buildRenderedLayout(opts: {
   extraTokens: number;
   calibration: number;
   cause?: string;
+  /** Each view message's window-index ordinal, once rows are presented (see RenderedLayout.keyedBy). */
+  ordinalOf?: (id: MessageId) => number | undefined;
 }): RenderedLayout {
   const rawTokens = new Map<MessageId, number>();
   const summaryTokens = new Map<string, number>();
@@ -290,13 +289,24 @@ export function buildRenderedLayout(opts: {
     }
   }
 
+  const ordinalOf = opts.ordinalOf;
   const members: number[] = [];
   const memberIds: MessageId[] = [];
+  const memberSequences: number[] = [];
   // The layout's units are read-only once returned; here each run grows.
   const units: Array<Growing<LayoutUnit>> = [];
   for (const msg of opts.view) {
-    members.push(msg.sequence);
+    if (ordinalOf) {
+      const ordinal = ordinalOf(msg.id);
+      if (ordinal === undefined) {
+        throw new Error(`the rendered layout can't name ${msg.id}: the compile's view holds it, and the window it lists has no ordinal for it`);
+      }
+      members.push(ordinal);
+    } else {
+      members.push(msg.sequence);
+    }
     memberIds.push(msg.id);
+    memberSequences.push(msg.sequence);
     if (rawTokens.has(msg.id)) {
       const t = Math.round(rawTokens.get(msg.id)!);
       units.push(opts.rawComplete.get(msg.id) === false ? { k: 'r', t, p: 1 } : { k: 'r', t });
@@ -326,9 +336,11 @@ export function buildRenderedLayout(opts: {
   }
 
   return {
-    v: 2,
+    v: 3,
+    keyedBy: ordinalOf ? 'ordinal' : 'sequence',
     members,
     memberIds,
+    memberSequences,
     units,
     totalTokens: Math.round(totalTokens),
     calibration: opts.calibration,

@@ -12,6 +12,13 @@
  * hook still runs inside the write, after a holdCompression hold is placed
  * and before addMessage returns, and the manager's own work around the call
  * still fails the write.
+ *
+ * These run in legacy mode, where the manager's window is the record
+ * (window-index.ts), so a stored row enters the window at its add and the
+ * strategy hears it there. Once a host presents rows (agent-framework #291)
+ * the strategy hears a row at its presentRows instead, through onPresented,
+ * or through onNewMessage for a strategy without it, as these strategies
+ * are; on-presented.test.ts holds the presented-mode siblings.
  */
 
 import { describe, it, beforeEach, after } from 'node:test';

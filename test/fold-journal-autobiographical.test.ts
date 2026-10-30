@@ -124,6 +124,29 @@ describe('autobiographical rendered layout', () => {
     });
   });
 
+  it('writes a receipt for a fold over a window presented out of record order (#291)', async () => {
+    await withStore(async (path) => {
+      const { cm, strategy, ids } = await setup(path);
+      cm.presentRows([]);
+      const late = [cm.addMessage('user', text('zz-late-one')), cm.addMessage('user', text('zz-late-two'))];
+      cm.presentRows([late[1]!, late[0]!]);
+      const first = await cm.compile(BUDGET);
+      const layout = first.provenance!.layout!;
+      assert.equal(layout.keyedBy, 'ordinal');
+      assert.deepEqual(layout.memberIds, [...ids, late[1], late[0]], 'the window, in its order');
+      assert.deepEqual(layout.members, layout.memberIds.map((id) => cm.ordinalOf(id)));
+      assert.equal(cm.acceptRound({ provenance: first.provenance! })?.kind, 'baseline');
+      seedAll(strategy, ids);
+      const receipt = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance! });
+      assert.ok(receipt, 'the fold is recorded');
+      const afterIds = receipt.changes!.map((c) => (c.after.form === 'summary' ? c.after.summaries.map((s) => s.id) : [c.after.form]));
+      assert.deepEqual(afterIds, [['L2-100'], ['L1-101'], ['L1-102']]);
+      const sequence = (id: string) => cm.getAllMessages().find((m) => m.id === id)!.sequence;
+      assert.deepEqual(receipt.changes![0]!.first, { sequence: sequence(ids[0]!), messageId: ids[0] }, 'a bound names its store sequence');
+      cm.close();
+    });
+  });
+
   it('never claims a summary the combined answer\'s cap dropped, and marks the one it cut', async () => {
     for (const recallEnvelope of ['none', 'xml'] as const) {
       await withStore(async (path) => {

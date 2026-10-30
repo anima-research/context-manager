@@ -25,6 +25,7 @@ import {
   isResettableStrategy,
 } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { StrategyContext } from '../src/index.js';
 
 const TEST_STORE_PATH = './test-head-window-reset';
 
@@ -37,6 +38,54 @@ function cleanup() {
 function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
+
+describe('ContextManager.generateTransitionSummary', () => {
+  // The summary resetHeadWindow() would write, storing nothing: a host that
+  // checks its own conditions between the two calls (connectome-host's bare
+  // /newtopic) stores a transition only when they hold.
+  class Summarizing extends PassthroughStrategy {
+    contexts: StrategyContext[] = [];
+    resetHeadWindow(_fromMessageId: string): void {}
+    async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
+      this.contexts.push(ctx);
+      return `summary of ${ctx.messageStore.getAll().length} rows`;
+    }
+  }
+  const path = './test-head-window-reset-summary';
+  const clean = () => { if (existsSync(path)) rmSync(path, { recursive: true, force: true }); };
+  before(clean);
+  after(clean);
+
+  it('returns the strategy\'s summary over the manager\'s own context and stores nothing', async () => {
+    const strategy = new Summarizing();
+    const manager = await ContextManager.open({ path, strategy });
+    try {
+      manager.addMessage('user', textBlock('one'));
+      manager.addMessage('assistant', textBlock('two'));
+      const before = manager.getAllMessages().map((m) => m.id);
+      const summary = await manager.generateTransitionSummary();
+      assert.strictEqual(summary, 'summary of 2 rows');
+      assert.strictEqual(strategy.contexts.length, 1, 'the strategy was asked once, with a context');
+      assert.deepStrictEqual(manager.getAllMessages().map((m) => m.id), before, 'nothing was stored');
+      // The same summary is what resetHeadWindow stores when given it.
+      const stored = await manager.resetHeadWindow(summary);
+      assert.strictEqual(stored, summary);
+      assert.strictEqual(manager.getAllMessages().length, before.length + 1, 'the reset stored the transition');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses a strategy that cannot reset its head window, as resetHeadWindow does', async () => {
+    const manager = await ContextManager.open({ path: path + '-plain', strategy: new PassthroughStrategy() });
+    try {
+      await assert.rejects(manager.generateTransitionSummary(), /does not support head window reset/);
+    } finally {
+      manager.close();
+      rmSync(path + '-plain', { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Head Window Reset', () => {
   before(() => cleanup());

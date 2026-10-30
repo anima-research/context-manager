@@ -15,7 +15,7 @@ import { inspect } from 'node:util';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
-import { FoldJournal, applyLayoutChain, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
+import { FoldJournal, applyLayoutChain, applyLayoutDelta, decodeMembers, encodeMembers, layoutDelta } from '../src/fold-journal.js';
 import type { StoredLayout } from '../src/fold-journal.js';
 import type {
   ContextEntry,
@@ -767,7 +767,7 @@ describe('fold journal', () => {
     const lost = '999999';
     const handMade = (compileId: string, units: LayoutUnit[]): CompileProvenance => ({
       compileId, namespace: 'agents/tester', branch, messages: [], strategy: 'hand',
-      layout: { v: 2, members: [1], memberIds: [lost], units, totalTokens: 0, calibration: 1 },
+      layout: { v: 3, keyedBy: 'sequence', members: [1], memberIds: [lost], memberSequences: [1], units, totalTokens: 0, calibration: 1 },
     });
     const raw = handMade('before-crash', [{ k: 'r', t: 3 }]);
     const omitted = handMade('after-crash', [{ k: 'o', n: 1 }]);
@@ -900,7 +900,7 @@ function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; sto
     const { receipt: _receipt, ns: _ns, branch: _branch, compileId: _compileId, ...layout } = record;
     return {
       kind: record.kind, bytes: JSON.stringify(layout).length, stored: payload.length, json: Buffer.byteLength(JSON.stringify(record)),
-      chain: record.chain, sb: record.sb, db: record.db, members: record.m ? decodeSequences(record.m).length : 0,
+      chain: record.chain, sb: record.sb, db: record.db, members: record.m ? decodeMembers(record.m).length : 0,
     };
   });
 }
@@ -1033,7 +1033,7 @@ describe('fold journal size', () => {
     let members = Array.from({ length: 100_000 }, (_, i) => 2 * (i + 1));
     let ids = members.map((m) => `m${m}`);
     const layoutOf = (tail?: LayoutUnit): RenderedLayout => ({
-      v: 2, members, memberIds: ids, totalTokens: (members.length - omitted) * 10, calibration: 1,
+      v: 3, keyedBy: 'sequence', members, memberIds: ids, memberSequences: members, totalTokens: (members.length - omitted) * 10, calibration: 1,
       units: [
         { k: 'o', n: omitted },
         ...Array.from({ length: members.length - omitted - (tail ? 1 : 0) }, (): LayoutUnit => ({ k: 'r', t: 10 })),
@@ -1059,7 +1059,7 @@ describe('fold journal size', () => {
     // The records rebuild the last layout exactly, members and units.
     const store = cm.getStore();
     const payloads = store.getRecordIdsByType('context-manager/accepted-layout').map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')));
-    const rebuilt = applyLayoutChain({ members: decodeSequences(payloads[0].m), units: payloads[0].units }, payloads.slice(1));
+    const rebuilt = applyLayoutChain({ members: decodeMembers(payloads[0].m), units: payloads[0].units }, payloads.slice(1));
     const written = layoutOf();
     assert.deepEqual(rebuilt, { members: written.members, units: written.units });
 
@@ -1110,17 +1110,20 @@ describe('fold journal size', () => {
     cm.close();
   });
 
-  it('encodes ascending sequences exactly, and refuses anything else', () => {
+  // The encoder was encodeSequences: it encodes a layout's members, store
+  // sequences in format 3 and window-index ordinals in format 4, by the same
+  // gap coding, so only its name and its messages changed.
+  it('encodes ascending members exactly, and refuses anything else', () => {
     const cases = [[], [0], [7], [1, 2, 3], [5, 130, 131, 20_000, 2 ** 40, 2 ** 52]];
-    for (const seqs of cases) assert.deepEqual(decodeSequences(encodeSequences(seqs)), seqs);
+    for (const seqs of cases) assert.deepEqual(decodeMembers(encodeMembers(seqs)), seqs);
     let x = 0;
     const gapped = Array.from({ length: 5000 }, (_, i) => (x += 1 + ((i * 7919) % 5)));
-    const text = encodeSequences(gapped);
-    assert.deepEqual(decodeSequences(text), gapped);
+    const text = encodeMembers(gapped);
+    assert.deepEqual(decodeMembers(text), gapped);
     assert.ok(text.length <= gapped.length * 1.4, `${text.length} chars for ${gapped.length} small gaps`);
-    assert.throws(() => encodeSequences([3, 3]), /ascending/);
-    assert.throws(() => encodeSequences([5, 4]), /ascending/);
-    assert.throws(() => decodeSequences(Buffer.from([0x81]).toString('base64url')), /truncated/);
+    assert.throws(() => encodeMembers([3, 3]), /ascending/);
+    assert.throws(() => encodeMembers([5, 4]), /ascending/);
+    assert.throws(() => decodeMembers(Buffer.from([0x81]).toString('base64url')), /truncated/);
   });
 
   it('a delta rebuilds the next layout exactly, for random edits of members and units', () => {
@@ -1557,20 +1560,27 @@ describe('fold journal durability and index', () => {
   it('refuses a layout whose shape changed after compile returned it, and writes nothing', async () => {
     const { cm } = await open();
     add(cm, 3);
-    const refused = /its members aren't in ascending order, its units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id for each member, so accepting it again is refused the same way/;
-    // Each change on its own compile. The id count catches the first three;
-    // only the members-and-units check catches the last three.
-    const changes: Array<[string, (layout: { members: number[]; memberIds: string[]; units: LayoutUnit[] }) => void]> = [
+    // The refusal now also names what the members count, and a sequence for
+    // each member (RenderedLayout.keyedBy and memberSequences, #291).
+    const refused = /it doesn't say whether its members are store sequences or window-index ordinals, its members( \(each a store sequence\))? aren't in ascending order, its units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id and one sequence for each member, so accepting it again is refused the same way/;
+    type Writable = { keyedBy: string; members: number[]; memberIds: string[]; memberSequences: number[]; units: LayoutUnit[] };
+    // Each change on its own compile. The id and sequence counts catch the
+    // first five; only the members-and-units check catches the next three;
+    // the last names no count the journal knows.
+    const changes: Array<[string, (layout: Writable) => void]> = [
       ['a member added', (l) => l.members.push(Number.MAX_SAFE_INTEGER)],
       ['an id dropped', (l) => l.memberIds.pop()],
       ['an id added', (l) => l.memberIds.push('extra')],
+      ['a sequence dropped', (l) => l.memberSequences.pop()],
+      ['a sequence added', (l) => l.memberSequences.push(1)],
       ['members out of order', (l) => l.members.reverse()],
       ['a unit added', (l) => l.units.push({ k: 'o', n: 1 })],
       ['a unit of no members', (l) => l.units.push({ k: 'o', n: 0 })],
+      ['members that count something else', (l) => { l.keyedBy = 'position'; }],
     ];
     for (const [what, change] of changes) {
       const provenance = (await cm.compile(BUDGET)).provenance!;
-      change(provenance.layout as unknown as { members: number[]; memberIds: string[]; units: LayoutUnit[] });
+      change(provenance.layout as unknown as Writable);
       assert.throws(() => cm.acceptRound({ provenance }), refused, what);
     }
     assert.equal(layoutRecords(cm.getStore()).length, 0);
@@ -1582,6 +1592,8 @@ describe('fold journal durability and index', () => {
       p.layout!.members.push(1);
       // @ts-expect-error the layout is read-only
       p.layout!.memberIds.push('x');
+      // @ts-expect-error the layout is read-only
+      p.layout!.memberSequences.push(1);
       // @ts-expect-error the layout is read-only
       p.layout!.units[0]!.k = 'o';
       // @ts-expect-error the branch is read-only
@@ -1660,7 +1672,7 @@ describe('fold journal durability and index', () => {
       const cases: Array<[string, Record<string, unknown>]> = [
         ['another format', { v: 99, ns: 'agents/tester', branch, compileId: 'newer-format', kind: 'snapshot' }],
         ['a broken chain', { v: 3, ns: 'agents/tester', branch, compileId: 'broken-chain', kind: 'delta', prev: '987654321', p: 0, totalTokens: 0, chain: 1, sb: 10_000, db: 10 }],
-        ['members its units do not cover', { v: 3, ns: 'agents/tester', branch, compileId: 'ill-formed', kind: 'snapshot', m: encodeSequences([1, 2, 3]), units: [{ k: 'r', t: 1 }], totalTokens: 0, chain: 0, sb: 100, db: 0 }],
+        ['members its units do not cover', { v: 3, ns: 'agents/tester', branch, compileId: 'ill-formed', kind: 'snapshot', m: encodeMembers([1, 2, 3]), units: [{ k: 'r', t: 1 }], totalTokens: 0, chain: 0, sb: 100, db: 0 }],
       ];
       for (const [what, record] of cases) {
         // Written outside this journal, as a record a past process left.
@@ -1673,6 +1685,15 @@ describe('fold journal durability and index', () => {
         assert.ok(errors.some((e) => e.includes('is unreadable') && e.endsWith(' ns=agents/tester')), `${what}: and it is reported: ${errors.join('\n')}`);
         errors.length = 0;
       }
+      // A delta on a record of the other format (#291): a chain counts its
+      // members one way, so this one doesn't rebuild.
+      const store = cm.getStore();
+      const byOrdinal = store.appendJson('context-manager/accepted-layout', { v: 4, ns: 'agents/tester', branch, compileId: 'ordinal-snapshot', kind: 'snapshot', m: encodeMembers([1, 2, 3]), units: [{ k: 'o', n: 3 }], totalTokens: 0, chain: 0, sb: 100, db: 0 });
+      store.appendJson('context-manager/accepted-layout', { v: 3, ns: 'agents/tester', branch, compileId: 'mixed-chain', kind: 'delta', prev: byOrdinal.id, p: 0, totalTokens: 0, chain: 1, sb: 100, db: 10 });
+      cm.close();
+      ({ cm } = await open(strategy));
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline', 'a chain that mixes formats: a baseline');
+      assert.ok(errors.some((e) => e.includes(`record ${byOrdinal.id} in its chain counts its members by window-index ordinal, not by store sequence`)), errors.join('\n'));
     } finally {
       console.error = error;
     }
@@ -2189,6 +2210,171 @@ describe('fold journal durability and index', () => {
     assert.deepEqual(calls, ['sync']);
     assert.equal(journal.storeId(), minted);
     assert.deepEqual(calls, ['sync'], 'once per store object');
+    cm.close();
+  });
+});
+
+/**
+ * The journal over a window a host presents (agent-framework #291). Once
+ * rows are presented on a branch, the window can list them out of record
+ * order, so a layout counts its members by window-index ordinal (record
+ * format 4) and names its receipts' messages by store sequence beside them.
+ */
+describe('fold journal over a presented window', () => {
+  beforeEach(cleanup);
+  afterEach(cleanup);
+
+  const sequenceOf = (cm: ContextManager, id: string): number => cm.getAllMessages().find((m) => m.id === id)!.sequence;
+  /** Each accepted-layout record's format and kind, in log order. */
+  const formats = (store: JsStore): Array<[number, string]> => store.getRecordIdsByType('context-manager/accepted-layout').map((id) => {
+    const record = JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { v: number; kind: string };
+    return [record.v, record.kind];
+  });
+
+  it('accepts a window presented out of record order: members are its ordinals, and receipts name store sequences', async () => {
+    const { cm, strategy } = await open();
+    const [a, b, c] = add(cm, 3);
+    cm.presentRows([]);
+    const [d, e] = add(cm, 2, 'late');
+    // e, stored after d, is presented before it.
+    cm.presentRows([e!, d!]);
+    const window = [a!, b!, c!, e!, d!];
+    const layout = (await cm.compile(BUDGET)).provenance!.layout!;
+    assert.equal(layout.keyedBy, 'ordinal');
+    assert.deepEqual(layout.memberIds, window, 'the window, in its order');
+    assert.deepEqual(layout.members, window.map((id) => cm.ordinalOf(id)), 'each member is its ordinal');
+    assert.ok(layout.members.every((m, i) => i === 0 || m > layout.members[i - 1]!), 'ordinals ascend in window order');
+    assert.deepEqual(layout.memberSequences, window.map((id) => sequenceOf(cm, id)));
+    assert.ok(sequenceOf(cm, e!) > sequenceOf(cm, d!), 'and the sequences do not: before format 4 this layout was refused');
+
+    const baseline = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance! });
+    assert.equal(baseline?.kind, 'baseline');
+    assert.deepEqual(baseline!.layout!.map((run) => [run.first, run.last, run.messages]), [
+      [{ sequence: sequenceOf(cm, a!), messageId: a }, { sequence: sequenceOf(cm, d!), messageId: d }, 5],
+    ], 'a run is bounded by window order, each bound by its store sequence');
+
+    strategy.plan.set(e!, 'omit');
+    const receipt = await acceptCompile(cm);
+    assert.deepEqual(receipt?.changes?.map((change) => [change.first, change.last, change.before.form, change.after.form]), [
+      [{ sequence: sequenceOf(cm, e!), messageId: e }, { sequence: sequenceOf(cm, e!), messageId: e }, 'raw', 'omitted'],
+    ]);
+    assert.notEqual(sequenceOf(cm, e!), cm.ordinalOf(e!), 'the fixture tells a sequence from an ordinal');
+    assert.deepEqual(formats(cm.getStore()), [[4, 'snapshot'], [4, 'delta']], 'both records count ordinals');
+
+    // The layout the delta wrote rebuilds after a reopen: the next compile,
+    // unchanged, is no fold.
+    cm.close();
+    const reopened = await open(strategy);
+    assert.equal(reopened.cm.windowMode(), 'presented');
+    assert.equal(await acceptCompile(reopened.cm), null);
+    reopened.cm.close();
+  });
+
+  it('accepts a layout an earlier release\'s compile returned (v 2, without keyedBy) as keyed by sequence, in format 3', async () => {
+    // Review CM-Y: a v 2 layout says nothing of what its members count, and
+    // acceptRound refused it, so a provenance carried across the upgrade
+    // couldn't be accepted. Its members were store sequences, as they still
+    // are while the window is the record.
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const asV2 = (provenance: CompileProvenance): CompileProvenance => {
+      const { keyedBy: _keyedBy, memberSequences: _memberSequences, ...rest } = provenance.layout!;
+      return { ...provenance, layout: { ...rest, v: 2 } as unknown as RenderedLayout };
+    };
+    const older = asV2((await cm.compile(BUDGET)).provenance!);
+    assert.deepEqual(older.layout!.members, ids.map((id) => sequenceOf(cm, id)));
+    const baseline = cm.acceptRound({ provenance: older });
+    assert.equal(baseline?.kind, 'baseline');
+    assert.deepEqual(baseline!.layout!.map((run) => [run.first, run.last, run.messages]), [
+      [{ sequence: sequenceOf(cm, ids[0]!), messageId: ids[0] }, { sequence: sequenceOf(cm, ids[2]!), messageId: ids[2] }, 3],
+    ], 'each bound named by its sequence, the member itself');
+    assert.deepEqual(formats(cm.getStore()), [[3, 'snapshot']]);
+
+    // Compared as format 3, with this release's layouts and with another v 2.
+    assert.equal(await acceptCompile(cm), null, 'the same window as a v 3 layout is no change');
+    strategy.plan.set(ids[1]!, 'omit');
+    const folded = await acceptCompile(cm);
+    assert.deepEqual(folded?.changes?.map((change) => [change.first.messageId, change.before.form, change.after.form]), [[ids[1], 'raw', 'omitted']]);
+    strategy.plan.set(ids[2]!, 'omit');
+    const again = cm.acceptRound({ provenance: asV2((await cm.compile(BUDGET)).provenance!) });
+    assert.deepEqual(again?.changes?.map((change) => [change.first.messageId, change.before.form, change.after.form]), [[ids[2], 'raw', 'omitted']]);
+    assert.ok(formats(cm.getStore()).every(([v]) => v === 3), 'every record counts sequences');
+    cm.close();
+  });
+
+  it('a branch whose layouts count sequences starts again from one baseline at its first presentation, and keeps listing its receipts', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    await acceptCompile(cm);
+    strategy.plan.set(ids[0]!, 'omit');
+    await acceptCompile(cm);
+    // A compile made while the window was the record is recorded by sequence,
+    // even when it is accepted after the host has presented: its layout says so.
+    strategy.plan.set(ids[1]!, 'omit');
+    const legacy = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(legacy.layout!.keyedBy, 'sequence');
+    cm.presentRows([]);
+    assert.equal(cm.acceptRound({ provenance: legacy })?.kind, 'change', 'compared with the layout before it');
+    assert.deepEqual(formats(cm.getStore()).map(([v]) => v), [3, 3, 3]);
+
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    let rebased: FoldReceipt | null;
+    try {
+      rebased = await acceptCompile(cm);
+      assert.equal(rebased?.kind, 'baseline', 'the first layout by ordinal is compared with nothing');
+      assert.equal(rebased?.historyBefore, 'unknown');
+      assert.equal(await acceptCompile(cm), null, 'the next one is compared with it');
+    } finally {
+      console.warn = warn;
+    }
+    const switched = warnings.filter((w) => w.includes('counts its members by store sequence and this compile\'s by window-index ordinal'));
+    assert.equal(switched.length, 1, warnings.join('\n'));
+    assert.ok(switched[0]!.endsWith(' ns=agents/tester'), 'it names its namespace (#239)');
+
+    // Every receipt stays listed, the format-3 ones behind the baseline.
+    const listed = cm.listFoldReceipts({ limit: 10 });
+    assert.deepEqual(listed.receipts.map((r) => r.kind), ['baseline', 'change', 'change', 'baseline']);
+    assert.equal(listed.note, undefined);
+
+    // Exactly one baseline: a restart compares with the format-4 record.
+    cm.close();
+    ({ cm, strategy } = await open(strategy));
+    strategy.plan.set(ids[2]!, 'omit');
+    assert.equal((await acceptCompile(cm))?.kind, 'change');
+    assert.deepEqual(formats(cm.getStore()).map(([v]) => v), [3, 3, 3, 4, 4, 4]);
+    assert.deepEqual(cm.listFoldReceipts({ limit: 10 }).receipts.map((r) => r.kind), ['change', 'baseline', 'change', 'change', 'baseline']);
+    cm.close();
+  });
+
+  it('a row taken out of the window or removed from the store leaves the members, and no other member moves', async () => {
+    const { cm, strategy } = await open();
+    const [a, b, c, d, e] = add(cm, 5);
+    cm.presentRows([]);
+    const ordinals = new Map([a, b, c, d, e].map((id) => [id!, cm.ordinalOf(id!)!]));
+    const members = async () => (await cm.compile(BUDGET)).provenance!.layout!.members;
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+
+    cm.retractRows([b!]);
+    assert.deepEqual(await members(), [a, c, d, e].map((id) => ordinals.get(id!)));
+    assert.equal(await acceptCompile(cm), null, 'leaving the window is not a fold');
+    const left = layoutRecords(cm.getStore()).at(-1)!;
+    assert.equal(left.kind, 'delta');
+    assert.ok(left.bytes <= 160, `one member removed: ${left.bytes} bytes`);
+
+    cm.removeMessage(d!);
+    assert.deepEqual(await members(), [a, c, e].map((id) => ordinals.get(id!)));
+    assert.equal(await acceptCompile(cm), null, 'a removal is not a fold');
+
+    // A row presented again takes a new ordinal at the end: an arrival.
+    const [again] = cm.presentRows([b!]);
+    assert.ok(again! > ordinals.get(e!)!);
+    assert.deepEqual(await members(), [ordinals.get(a!), ordinals.get(c!), ordinals.get(e!), again]);
+    assert.equal(await acceptCompile(cm), null, 'a row presented again arrives');
+    strategy.plan.set(c!, 'omit');
+    const receipt = await acceptCompile(cm);
+    assert.deepEqual(receipt?.changes?.map((change) => [change.first.messageId, change.messages, change.after.form]), [[c, 1, 'omitted']]);
     cm.close();
   });
 });

@@ -382,21 +382,41 @@ export interface JournalMark {
 
 /**
  * A rendered layout: the form every message of the strategy's view took in
- * one compile. Membership and form are kept apart: `members` lists the
- * view's messages by sequence, ascending, and `units` partition them in
- * that order, each covering its `n` next members (a raw unit, one). A
- * message the view lacked (removed, filtered out) is in no unit, however
- * near a range it lies. Token estimates are base estimates (before the
- * store's calibration multiplier), so they compare across compiles.
+ * one compile. Membership and form are kept apart: `members` names the
+ * view's messages in view order, each by a number it keeps while it stays
+ * in the window, ascending, and `units` partition them in that order, each
+ * covering its `n` next members (a raw unit, one). A message the view
+ * lacked (removed, taken out of the window, filtered out) is in no unit,
+ * however near a range it lies, and every other member keeps its number.
+ * Token estimates are base estimates (before the store's calibration
+ * multiplier), so they compare across compiles.
+ *
+ * What the numbers are depends on the manager's window on the compile's
+ * branch (`keyedBy`, agent-framework #291). While the window is the record
+ * (legacy mode, see ContextManager.windowMode) they are the messages'
+ * store sequences, which ascend in the record's order. Once rows are
+ * presented the window can list them in another order, and they are the
+ * messages' window-index ordinals (ContextManager.ordinalOf), which ascend
+ * in the window's. Before this, a layout was `v: 2`, without `keyedBy` or
+ * `memberSequences`, and its members were store sequences: acceptRound
+ * reads a layout without `keyedBy` that way, so a provenance an earlier
+ * release's compile returned is still accepted.
  */
 export interface RenderedLayout {
-  readonly v: 2;
-  /** The view's message sequences, ascending: the layout's exact membership. */
+  readonly v: 3;
+  /** What `members` count: store sequences while the window is the record, window-index ordinals once rows are presented. */
+  readonly keyedBy: 'sequence' | 'ordinal';
+  /** The view's messages, by `keyedBy`, ascending: the layout's exact membership. */
   readonly members: readonly number[];
   /** The members' message ids, parallel to `members`. In memory only: an
-   *  accepted layout persists sequences, and receipts take ids from the
+   *  accepted layout persists members, and receipts take ids from the
    *  compile being accepted. */
   readonly memberIds: readonly MessageId[];
+  /** The members' store sequences, parallel to `members`: what a receipt
+   *  names a message by (`FoldSpanBound.sequence`), whatever `keyedBy` is.
+   *  Keyed by sequence, the same as `members`; keyed by ordinal, in window
+   *  order, which need not ascend. In memory only, as `memberIds`. */
+  readonly memberSequences: readonly number[];
   readonly units: readonly LayoutUnit[];
   /** Base-estimate tokens of everything this compile rendered. */
   readonly totalTokens: number;

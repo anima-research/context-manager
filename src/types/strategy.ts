@@ -9,6 +9,7 @@ import type {
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
+import type { WindowMode } from '../window-index.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -26,6 +27,16 @@ export interface MessageStoreView {
    * view asks each source's, and the source's `get` where it has none.
    */
   sequenceOf?(id: MessageId): number | undefined;
+  /**
+   * A message's position in `getAll()`, undefined when the listing doesn't
+   * hold it, without reading the message where the view can (optional).
+   * The window a ContextManager gives its strategy and its compile answers
+   * it: by sequence while the window is the record, which lists by
+   * sequence, and from the window's own positions once a host presents
+   * rows to the agent in another order (`ContextManager.presentRows`). A
+   * filtered view doesn't forward it, since its positions are its own.
+   */
+  positionOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */
@@ -72,11 +83,75 @@ export interface ContextLogView {
 }
 
 /**
+ * Read-only view of the agent's window index for strategies (see
+ * window-index.ts and ContextManager.presentRows): where each row entered
+ * the window, by index ordinal. An ordinal never moves, whatever leaves the
+ * window or the store, and it counts the window before the view filter, so
+ * a strategy can keep a place in the window that a host's filter, a removal
+ * or a retracted row doesn't shift. Every read asks the index on the branch
+ * the store is on, so a view held across a branch switch follows it.
+ *
+ * In legacy mode, until the window is written down on the branch (a host's
+ * first presentRows, presentRows([]) among them, or a retractRows that
+ * names a row), the window is the record and there are no ordinals: a
+ * strategy keeps its places by sequence there, as it always has.
+ */
+export interface WindowIndexView {
+  /** `'legacy'` while the window is the record, `'presented'` once it is written down on the branch (the first presentRows, or a retractRows that names a row), even while it holds no row. */
+  mode(): WindowMode;
+  /**
+   * The ordinal of every row in the window, from one reading of the index;
+   * null in legacy mode. Read it at once: a later presentation changes it.
+   * It can map the id of a row the record no longer has, removed through
+   * another manager, until a host retracts it (ContextManager.ordinalOf);
+   * the view never lists such a row.
+   */
+  ordinals(): ReadonlyMap<MessageId, number> | null;
+  /** The ordinal the next presented row will take. 0 in legacy mode. */
+  length(): number;
+  /**
+   * The ordinal of the first row in the window, in window order, stored at
+   * `sequence` or after; `length()` when no row in the window is. Undefined
+   * in legacy mode. While the window is in record order its rows from there
+   * on are the rows stored at `sequence` and after; once rows are presented
+   * out of record order, a row stored before `sequence` and presented after
+   * that first row is after it in the window too.
+   */
+  ordinalFrom(sequence: Sequence): number | undefined;
+  /** The sequence of the first row in the window at `ordinal` or after, before the view filter; undefined when none is, and in legacy mode. */
+  sequenceFrom(ordinal: number): Sequence | undefined;
+  /**
+   * The rows that left the window and haven't been presented again since,
+   * from one reading of the index: rows a host took out (retractRows), and
+   * rows removed from the record once they were taken out, by a removal
+   * through the manager or by their ids. Null in legacy mode. A row
+   * removed before the window was written down was never in it, and isn't
+   * one. A strategy that folds rows reads it at its open to let go of what
+   * covers a row that left while no strategy of its kind heard it go
+   * (onRetracted). Optional: a view a caller builds by hand may not have
+   * it, which a strategy reads as no row having left.
+   */
+  left?(): ReadonlySet<MessageId> | null;
+}
+
+/**
  * Context provided to strategy methods.
  */
 export interface StrategyContext {
-  /** Read-only view of message store */
+  /**
+   * Read-only view of the rows the strategy reads: the agent's window over
+   * the merged record (the manager's slot and its auxiliary slots), with
+   * the view filter applied. In legacy mode the window is the merged record
+   * itself; once a host presents rows, it is the rows presented, in the
+   * order they were presented (ContextManager.presentRows).
+   */
   messageStore: MessageStoreView;
+  /**
+   * The agent's window index (optional: a context a caller builds by hand
+   * has none, which a strategy reads as legacy mode). A ContextManager
+   * gives its own, live.
+   */
+  window?: WindowIndexView;
   /**
    * The agent's live tool definitions, as last supplied by the host (set on
    * every activation via ContextManager.setToolDefinitions). Summarizer /
@@ -251,12 +326,149 @@ export interface ContextStrategy {
   tick?(ctx: StrategyContext): Promise<void>;
 
   /**
-   * React to new messages.
-   * Called after a message is added to the store, inside the write that
-   * stored it, so its synchronous part runs before addMessage returns; the
-   * manager doesn't wait for the promise. A rejection, or a throw before it
-   * returns, is logged through the manager's diagnostics, naming the message,
-   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * React to rows entering the agent's window, the rows its strategy reads
+   * (see ContextManager.presentRows). Called with the rows that entered, in
+   * window order, every shard of a body, and a context whose view holds
+   * them, unless the manager's view filter leaves them out: a row the filter
+   * leaves out is given here all the same, and the view doesn't list it or
+   * give it a position. A presentRows call is one record, so one the store
+   * refuses presents nothing and calls nothing. In an index a pre-release
+   * build wrote one record per row (see ContextManager.presentRows), a
+   * presentRows cut short can have left a body's first shards in the
+   * window; the call that completes that body gives only the shards that
+   * enter then. A presentRows that puts a body back whole, its first
+   * shard having been out while later ones were in, calls onRetracted for
+   * those later shards first, then this with every shard of the body.
+   *
+   * While the manager is in legacy mode its window is the record, so a row
+   * enters it when this manager stores it: the call comes from inside the
+   * write that stored it, one row at a time, after a holdCompression hold
+   * is placed, and its synchronous part runs before addMessage returns.
+   * Once a host presents rows on the branch, or takes a row out of its
+   * window by name (retractRows ends legacy mode too), a stored row isn't
+   * heard until it is presented: the call comes from presentRows, once per call, after
+   * the rows are in the window and before presentRows returns. A row
+   * presented again after retractRows is heard again. A row from an
+   * auxiliary slot is heard only when a host presents it; in legacy mode it
+   * enters the window unheard, as it always has. The first presentRows on a
+   * branch, which writes the legacy window down, enters no new row and
+   * calls nothing. While the strategy isn't initialized (it is initializing,
+   * or its last initialization failed), the calls from presentRows wait until
+   * it is, and then one call carries the rows still in the window, in
+   * window order, each once. So do the calls for an add's later shards in
+   * legacy mode, when a hook of an earlier shard started an initialization:
+   * the rows the record still holds are carried, if the branch the
+   * strategy initialized on is still in legacy mode, and the rows its
+   * window holds, if a host presented there meanwhile. They wait for the manager's strategy, not for
+   * this instance: a strategy set with setStrategy() while rows wait hears
+   * them after its own initialize, though that initialize read a window
+   * that held them.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * rows, and doesn't reach the caller: the rows stay stored and in the
+   * window, and the strategy isn't offered them again. A hook that returns
+   * no promise isn't a failure, and nothing is logged.
+   *
+   * A strategy with this hook isn't called through onNewMessage.
+   */
+  onPresented?(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void>;
+
+  /**
+   * React to rows leaving the agent's window, so that nothing the strategy
+   * keeps of them shows the agent a row it no longer holds. Called with the
+   * rows that left, in the order the window held them, every shard of a
+   * body, and a context whose view no longer holds them. The window leaves
+   * the record alone: a row that left is still stored unless it was removed.
+   *
+   * `info.ids` is every row that left in the call, in the same order, and
+   * `rows` the ones among them the manager can give: a row the store holds,
+   * or one a removal through this manager read before it went. A row the
+   * store no longer holds, removed through another manager (which this one
+   * doesn't hear) and taken out of this window by its id, has no row to
+   * give: it is in `info.ids` alone, with `removed: true`, and `rows` can be
+   * empty. A strategy that keeps rows by id lets go of these as of the
+   * others, so that every reader of a removed row unfolds it, not only the
+   * manager that removed it.
+   *
+   * It is called once per call, before the call returns:
+   *
+   * - from ContextManager.retractRows, after the rows are out of the
+   *   window, with `undone` as the call gave it and `removed: false`. Rows
+   *   the store no longer holds, which retractRows takes out by their ids,
+   *   are given in a second call of their own, by `info.ids` alone, with
+   *   `removed: true`. A retractRows in legacy mode writes the window down
+   *   and then takes the rows out, so it calls this as it would once a host
+   *   presents.
+   * - from ContextManager.retractRemoved and retractAbsentRows, which take
+   *   out rows removed through another manager, by `info.ids` alone, with
+   *   `removed: true` and `undone: false`.
+   * - once a host presents rows on the branch, from a removal through this
+   *   manager (removeMessage, removeMessages) of rows the window held, after
+   *   the row is out of the window, with the rows as they were before they
+   *   were removed, `removed: true` and `undone: false`. The removal stands
+   *   whether or not the window's tombstone could be written, so a row
+   *   whose tombstone failed is given all the same, and is given again,
+   *   by its id, when retractAbsentRows later takes it out: a strategy
+   *   that kept nothing of a row takes such a call as nothing to do.
+   * - from ContextManager.presentRows, for the later shards of a body whose
+   *   first shard the window lacked, which leave so that the body enters
+   *   whole, with `undone: false` and `removed: false`, before the body is
+   *   heard through onPresented.
+   *
+   * While the manager is in legacy mode its window is the record, and a
+   * removal takes the row out of both at once: nothing calls this, and a
+   * strategy that folded the row keeps what it folded, as it always has. A
+   * tombstone write the store refuses takes nothing out and calls nothing;
+   * one that throws after the store kept part of it calls this with the
+   * rows it took out before the error is thrown or logged. A row
+   * presented again (a redo) is heard through onPresented, as a row new to
+   * the window, at its new place.
+   *
+   * A strategy that folds rows into summaries drops or folds again what
+   * covers these: a summary of a row that left shows the agent what it no
+   * longer holds, and once the row is presented again it would render
+   * twice, raw at its new place and folded at its old one.
+   *
+   * While the strategy isn't initialized, the calls wait until it is, and
+   * are then made in the order they came, before the rows presented
+   * meanwhile are heard. A row that has been presented again since is still
+   * given, since what the strategy kept of it is at its old place: the
+   * window holds it again, at a new ordinal, by the time this is called. A
+   * row the branch the strategy initialized on holds at the ordinal it
+   * left, in its window and its record (a branch made before it left), is
+   * left out, as is every row while that branch is in legacy mode, and a
+   * call left with no row isn't made. They wait for the manager's strategy,
+   * not for this instance, as onPresented's do.
+   *
+   * Fire and forget, as onPresented: a rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the rows,
+   * and doesn't reach the caller. The rows stay out of the window, and the
+   * strategy isn't offered them again.
+   */
+  onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean; ids: readonly MessageId[] }): Promise<void>;
+
+  /**
+   * React to a new row in the agent's window, one row at a time: the older
+   * form of onPresented, called only for a strategy without onPresented, at
+   * the points onPresented says. While the manager is in legacy mode, that
+   * is after a message is added to the store, inside the write that stored
+   * it, so its synchronous part runs before addMessage returns. Once a host
+   * presents rows on the branch, it is from presentRows, once per row
+   * presented, in window order, and no longer at the add: a row stored and
+   * not presented isn't in the window the context reads. Each row's call
+   * is made only if the manager is still open, with this strategy
+   * initialized: a call that closes the manager, sets a strategy, or starts
+   * an initialization (a setStrategy() or switchBranch() called before its
+   * first await) stops the calls for the rows after it, even one that
+   * finishes before the call returns (a strategy with no initialize). Those
+   * rows wait for the initialization, as onPresented's do, and so reach a
+   * replacement after its initialize, those the window of the branch it
+   * initialized on holds; after close() nothing hears them.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * message, and doesn't reach the caller: the message stays stored, and the
    * strategy isn't offered it again. A hook that returns no promise, as one
    * written in JavaScript can, isn't a failure, and nothing is logged.
    */
@@ -1399,8 +1611,10 @@ export interface AutobiographicalConfig {
   chunkOnMessageBoundary: boolean;
   /** Don't count attachment tokens toward chunk size */
   attachmentsIgnoreSize: boolean;
-  /** When true, onNewMessage() fires tick() as a background promise so compression
-   *  runs automatically without the framework calling tick() explicitly. */
+  /** When true, rows entering the window (onPresented: each add in legacy
+   *  mode, each presentRows once a host presents rows) fire tick() as a
+   *  background promise so compression runs automatically without the
+   *  framework calling tick() explicitly. The name is the hook's older one. */
   autoTickOnNewMessage: boolean;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
@@ -2241,8 +2455,8 @@ export interface AutobiographicalConfig {
    * toward the cap without holding production. Under `hierarchical: false`
    * tick runs no merge, so the cap holds nothing.
    *
-   * Default: undefined (no cap; compression fires eagerly on every
-   * new message when `autoTickOnNewMessage` is true).
+   * Default: undefined (no cap; compression fires eagerly whenever rows
+   * enter the window when `autoTickOnNewMessage` is true).
    */
   maxSpeculativeL1s?: number;
 
