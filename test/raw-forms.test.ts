@@ -85,10 +85,18 @@ const attempt = (rawXml = CALLS_XML): ContentBlock => ({ type: 'tool_attempt', r
 
 describe('raw forms: keys and release', () => {
   it('keys a raw form as the formatters tell them apart', () => {
-    assert.deepEqual(rawFormKeys(xmlUse('a', '/x')), [`xml:${CALLS_XML}`]);
-    assert.deepEqual(rawFormKeys(itemText('t')), ['item:message:msg_1']);
+    const xml = rawFormKeys(xmlUse('a', '/x'));
+    assert.equal(xml.length, 1);
+    assert.deepEqual(rawFormKeys(xmlUse('b', '/y')), xml, 'two invokes of one <function_calls> share its form');
+    assert.notDeepEqual(rawFormKeys(xmlUse('c', '/z', CALLS_XML.replace('/small', '/other'))), xml, 'another <function_calls> is another form');
+    const item = rawFormKeys(itemText('t'));
+    assert.equal(item.length, 1);
+    assert.deepEqual(rawFormKeys(itemText('u', { ...MESSAGE_ITEM })), item, 'two parts of one item share its form');
+    assert.notDeepEqual(rawFormKeys(itemText('t', { ...MESSAGE_ITEM, id: 'msg_2' })), item, 'another item is another form');
     const anonymous = { type: 'message', content: [] };
-    assert.deepEqual(rawFormKeys(itemText('t', anonymous)), [`item:${JSON.stringify(anonymous)}`]);
+    const unnamed = rawFormKeys(itemText('t', anonymous));
+    assert.equal(unnamed.length, 1, 'an item with no string id is a form too');
+    assert.notDeepEqual(rawFormKeys(itemText('t', { type: 'message', content: [{ type: 'output_text', text: 'x' }] })), unnamed, 'and another such item is another');
     // What the formatters don't replay isn't a raw form.
     assert.deepEqual(rawFormKeys({ type: 'tool_use', id: 'a', name: 'n', input: {}, rawXml: '' } as ContentBlock), []);
     assert.deepEqual(rawFormKeys(itemText('t', 'not-an-object')), []);

@@ -66,7 +66,7 @@ async function calibrationWarnings<T>(fn: () => Promise<T>): Promise<{ result: T
 /** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
 const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
 
-async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
+async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; toolCycle?: boolean; toolNearMiss?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
@@ -86,6 +86,16 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
       // A tool's generated image, nested in its result.
       ...(i === 3 && opts.nestedGeneratedImage
         ? [{ type: 'tool_result', toolUseId: 't-gen', content: [{ type: 'generated_image', data: 'C'.repeat(64), mimeType: 'image/png' }] } as never]
+        : []),
+      ...(i === 3 && opts.toolCycle
+        ? [{ type: 'tool_use', id: 't-cycle', name: 'look', input: {} } as never, { type: 'tool_result', toolUseId: 't-cycle', content: 'the file says hello' } as never]
+        : []),
+      ...(i === 1 && opts.toolNearMiss ? [{ type: 'tool_use', id: 't-a', name: 'look', input: {} } as never] : []),
+      ...(i === 3 && opts.toolNearMiss
+        ? [{ type: 'tool_use', id: 't-b', name: 'look', input: {} } as never, { type: 'tool_result', toolUseId: 't-a', content: 'a' } as never]
+        : []),
+      ...(i === 5 && opts.toolNearMiss
+        ? [{ type: 'tool_use', id: 't-c', name: 'look', input: {} } as never, { type: 'tool_result', toolUseId: 't-9', content: 'nine' } as never]
         : []),
       { type: 'text', text: `turn ${i} ${'lorem ipsum '.repeat(120)}` },
     ]);
@@ -339,6 +349,33 @@ describe('estimator calibration band', () => {
     const plainReopened = await openManager('epoch5-plain');
     await plainReopened.cm.compile(BUDGET);
     assert.equal(plainReopened.internals._calibration, 1.4, 'nothing this store holds was repriced');
+    const saved = plainReopened.internals.store!.getStateJson(plainReopened.internals.calibrationStateId) as { pricing?: number };
+    assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
+    plainReopened.cm.close();
+  });
+
+  it('an epoch-5 multiplier is discarded in a store holding a tool call and its result in one message, and kept in one whose results answer no call of their own message', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const cycle = await openManager('epoch6-cycle', { toolCycle: true });
+    await cycle.cm.compile(BUDGET);
+    cycle.internals.store!.setStateJson(cycle.internals.calibrationStateId, { multiplier: 0.7, at: 1, pricing: 5 });
+    cycle.cm.close();
+    const cycleReopened = await openManager('epoch6-cycle', { toolCycle: true });
+    await cycleReopened.cm.compile(BUDGET);
+    const cal = cycleReopened.cm.getRenderStats()!.calibration!;
+    assert.equal(cal.multiplier, 1, 'restarts from 1');
+    assert.equal(cal.provisional, true, 'provisional, for the first accepted sample to replace');
+    assert.equal(cal.reset?.discardedMultiplier, 0.7);
+    assert.equal(cal.reset?.fromEpoch, 5);
+    cycleReopened.cm.close();
+
+    const plain = await openManager('epoch6-near-miss', { toolNearMiss: true });
+    await plain.cm.compile(BUDGET);
+    plain.internals.store!.setStateJson(plain.internals.calibrationStateId, { multiplier: 0.7, at: 1, pricing: 5 });
+    plain.cm.close();
+    const plainReopened = await openManager('epoch6-near-miss', { toolNearMiss: true });
+    await plainReopened.cm.compile(BUDGET);
+    assert.equal(plainReopened.internals._calibration, 0.7, 'nothing this store holds was repriced');
     const saved = plainReopened.internals.store!.getStateJson(plainReopened.internals.calibrationStateId) as { pricing?: number };
     assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
     plainReopened.cm.close();

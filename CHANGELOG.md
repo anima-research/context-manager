@@ -12,6 +12,16 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.24.1 — 2026-10-29
+
+### Added
+
+- `getStats()` returned `chunksTotal`, `chunksCompressed`, `compressionCount`, `l1`, `l2`, `l3` and `pendingMerges`, and now also returns `acrossFallbacks`, the number of committing compiles since the strategy loaded its branch whose select with the summaries over a window's raw messages left out failed as a dry run, so the compile selected as before.
+
+### Fixed
+
+- A compile no longer sends a message both raw and inside a summary when the head window or the recent window holds some or all of a summary's messages, as it could once the calibration multiplier fell after the summary was written, unless it falls back as this entry says. Every select, hierarchical and adaptive alike, first leaves out each summary with a message a window sends raw: the messages it covers outside the windows go out in the summaries beneath it, or raw. Where a message that goes raw that way holds a tool call whose results, or a result whose call, another summary would carry, that summary is left out too, unless a pin keeps that other half raw anyway, so no message this leaves raw goes out with its pair's other half only inside a summary. The compile tries that select as a dry run first; when the dry run fails, whether over the budget or otherwise, the compile selects as before rather than refusing, so it can send a message twice, and logs a warning saying so. A message a pin keeps raw still goes out beside the summary over its chunk while no window holds a message of that summary; once one does, the summary is left out, and the pinned message and the summary's other messages go out raw or in the summaries beneath it. A request whose selection this changes misses the prompt cache from the first message that differs.
+
 ## 0.24.0 — 2026-10-29
 
 ### Breaking

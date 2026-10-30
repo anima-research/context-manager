@@ -86,8 +86,6 @@ async function setupWithQueuedChunk(strategy: TickCountingStrategy): Promise<Con
     manager.addMessage('user', textBlock(`m-${i} hello world`));
   }
   manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
-  // Wait for any onNewMessage handlers to settle
-  await new Promise(r => setTimeout(r, 30));
   return manager;
 }
 
@@ -136,7 +134,6 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       manager.addMessage('user', textBlock(`m-${i} hello world`));
     }
     manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
-    await new Promise(r => setTimeout(r, 30));
 
     assert.ok(strategy.hasQueuedChunk(), 'sanity: chunk formed');
     assert.ok(
@@ -166,7 +163,6 @@ describe('AutobiographicalStrategy — speculation cap (gap #8)', () => {
       manager.addMessage('user', textBlock(`m-${i} hello world`));
     }
     manager.addMessage('user', textBlock('latest one ' + 'X'.repeat(20)));
-    await new Promise(r => setTimeout(r, 30));
 
     assert.ok(strategy.hasQueuedChunk(), 'sanity: chunk formed');
     assert.ok(strategy.tickCalls > ticksBefore, 'auto-tick should fire when under cap');

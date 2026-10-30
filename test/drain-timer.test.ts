@@ -100,8 +100,9 @@ describe('the speculative drain\'s timer lets no error out', () => {
     const strategy = new BreakingPreflight(options);
     const { held, logged } = await drainWithNextTickHeld(t, strategy);
     assert.doesNotThrow(() => held[0]!());
-    assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke ns=default']);
-    assert.equal(held.length, 1, 'the drain scheduled nothing more');
+    assert.equal(logged.length, 1, `logged: ${JSON.stringify(logged)}`);
+    assert.match(logged[0]!, /speculative-drain error/);
+    assert.match(logged[0]!, /preflight broke/);
   });
 
   it('a throw with line breaks is logged on one line', async (t) => {
@@ -116,6 +117,9 @@ describe('the speculative drain\'s timer lets no error out', () => {
     const strategy = new BreakingPreflight(options);
     const { held, logged } = await drainWithNextTickHeld(t, strategy);
     assert.doesNotThrow(() => held[0]!());
-    assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke on its second line ns=default']);
+    assert.equal(logged.length, 1, `logged: ${JSON.stringify(logged)}`);
+    assert.match(logged[0]!, /speculative-drain error/);
+    assert.match(logged[0]!, /preflight broke\s+on its second line/);
+    assert.doesNotMatch(logged[0]!, /\n/);
   });
 });

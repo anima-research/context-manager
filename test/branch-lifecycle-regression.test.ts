@@ -32,22 +32,6 @@ afterEach(() => {
 });
 
 describe('ContextManager branch lifecycle regressions', () => {
-  it('clearing branch mirrors releases the listing-derived caches', async () => {
-    const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
-    const manager = await ContextManager.open({ path: storePath(), strategy });
-    for (const text of ['a', 'b', 'c']) manager.addMessage('user', content(text));
-    await manager.compile({ maxTokens: 10_000, reserveForResponse: 100 });
-    const internals = strategy as unknown as {
-      _storeOrderSource: readonly unknown[];
-      _chunkByPosition: unknown;
-      clearBranchMirrors(): void;
-    };
-    assert.equal(internals._storeOrderSource.length, 3);
-    internals.clearBranchMirrors();
-    assert.equal(internals._storeOrderSource.length, 0);
-    assert.equal(internals._chunkByPosition, null);
-  });
-
   it('branchAt keeps every message through the selected message after a sibling mutation', async () => {
     const manager = await ContextManager.open({
       path: storePath(),

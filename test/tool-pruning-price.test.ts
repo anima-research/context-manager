@@ -386,7 +386,7 @@ describe('tool pruning, priced as sent', () => {
     cm.close();
   });
 
-  it("leaves a result in its own call's message out of the count, as pairing repair drops it", async () => {
+  it("counts a result in its own call's message, which pairing repair sends", async () => {
     const { cm } = await open({ adaptiveResolution: true, toolResultMaxLastN: 1 });
     cm.addMessage('u', text('look these up'));
     cm.addMessage('a', [call('call-1')]);
@@ -395,7 +395,7 @@ describe('tool pruning, priced as sent', () => {
     cm.addMessage('a', [call('call-2'), result('call-2', 'two'), { type: 'text', text: 'and that was two' }]);
     cm.addMessage('u', text('next'));
     const compiled = await cm.compile(BUDGET);
-    assert.equal(resultOf(compiled, 'call-1'), 'one', 'the dropped result takes no slot');
+    assert.deepEqual(['call-1', 'call-2'].map((id) => resultOf(compiled, id)), [MARKER, 'two'], 'the bundled result is the last, and the earlier one gets the marker');
     cm.close();
   });
 
@@ -608,7 +608,8 @@ describe('tool pruning, priced as sent', () => {
         msg('a', [call('o1', 'other')]), msg('u', [result('o1', 'r')])];
       assert.equal(reprices(unanswered, at({ toolResultMaxLastN: { lookup: null } }), view(unanswered)), false, 'a call no result answers');
       const bundled = [msg('u', text('go')), msg('a', [call('b1', 'lookup'), result('b1', 'r')]), msg('u', text('next'))];
-      assert.equal(reprices(bundled, at({ toolResultMaxLastN: { lookup: null } }), view(bundled)), false, "a result in its call's own message");
+      assert.equal(AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[6]!(bundled, at({ toolResultMaxLastN: { lookup: null } }), view(bundled)), true,
+        "a result in its call's own message: epoch 6 reprices the store, so whatever epoch 4 answers there decides nothing");
       const reused = [msg('u', text('go')), msg('a', [call('x1', 'lookup')]), msg('u', text('wait')),
         msg('a', [call('x1', 'other')]), msg('u', [result('x1', 'r')])];
       assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), true, 'a reused id answers its earliest call');

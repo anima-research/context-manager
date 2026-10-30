@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
+import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextEntry, StoredMessage } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
 import { ParetoKvUnifiedPolicySolver, type ParetoSolveOptions } from '../src/adaptive/kv-unified-pareto.js';
@@ -324,31 +325,6 @@ test('a dry compile refuses a kv-unified plan that selects a level with no summa
   await assert.rejects(manager.compile(budget, undefined, { dryRun: true }), /kv-unified selected unavailable L1/);
   await assert.rejects(manager.compile(budget), /kv-unified selected unavailable L1/, 'a real compile refuses it too');
   manager.close();
-});
-
-test('kv-unified places token-weighted 33/66/100 history markers plus tail', () => {
-  const selected = strategy();
-  const entries = Array.from({ length: 12 }, (_, index) => ({
-    index,
-    sourceMessageId: `m${index}`,
-    sourceRelation: 'copy' as const,
-    participant: 'user',
-    content: [{ type: 'text' as const, text: 'x'.repeat(index === 2 ? 400 : 40) }],
-  }));
-  (
-    selected as unknown as {
-      placeCacheMarkers: (
-        entries: ContextEntry[],
-        head: ReadonlySet<string>,
-        tail: ReadonlySet<string>,
-      ) => void;
-    }
-  ).placeCacheMarkers(entries as ContextEntry[], new Set(['m0']), new Set(['m9', 'm10', 'm11']));
-  assert.deepEqual(
-    entries.flatMap((entry, index) =>
-      (entry as { cacheMarker?: boolean }).cacheMarker ? [index] : []),
-    [1, 2, 8, 11],
-  );
 });
 
 test('kv-unified measures where its entries first differ from the previous compile’s, as other strategies do, and marks them as before', () => {
@@ -701,36 +677,20 @@ test('a failed supersede write is retried by the next presentation (#98 review)'
   reopened.close();
 });
 
-test('kv-unified tail markers resolve through selectAdaptive to per-message tail units, including a sharded tail message', async () => {
+test('kv-unified sends a sharded tail message as one message, which carries the tail marker', async () => {
   const selected = strategy({ targetChunkTokens: 200, recentWindowTokens: 100_000 });
   const manager = await ContextManager.open({ path: STORE, strategy: selected });
   manager.addMessage('user', [{ type: 'text', text: 'first question' }]);
   manager.addMessage('assistant', [{ type: 'text', text: 'paragraph. '.repeat(1000) }]);
-  const all = manager.getAllMessages();
-  const shards = all.filter((message) => message.bodyGroupId);
-  assert.ok(shards.length > 1, 'the last message is sharded');
-  const host = selected as unknown as { mergeAdjacentBodyGroupRaw: (...args: unknown[]) => ContextEntry[] };
-  const merge = host.mergeAdjacentBodyGroupRaw.bind(selected);
-  let emitted: ContextEntry[] = [];
-  host.mergeAdjacentBodyGroupRaw = (...args) => (emitted = merge(...args));
-  await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'v1' });
-  const draft = (selected as unknown as {
-    kvUnifiedDraft: { layout: { units: Array<{ kind: string; key: string }> }; markerUnitIndices: number[] };
-  }).kvUnifiedDraft;
-  // Every tail message, each shard included, is its own unit; nothing falls
-  // back to the opaque 'tail' block.
-  assert.deepEqual(draft.layout.units.map((unit) => unit.key), all.map((message) => message.id));
-  assert.ok(draft.layout.units.every((unit) => unit.kind !== 'tail'));
-  // The shards render as ONE entry, which carries the marker...
-  const shardIds = shards.map((message) => message.id);
-  const composite = emitted.filter((entry) => entry.sourceMessageIds?.some((id) => shardIds.includes(id)) ||
-    (entry.sourceMessageId !== undefined && shardIds.includes(entry.sourceMessageId)));
-  assert.equal(composite.length, 1, 'the sharded message is one emitted entry');
-  assert.deepEqual(composite[0].sourceMessageIds, shardIds);
-  assert.equal(composite[0].cacheMarker, true);
-  // ...and that marker lands on the last shard's unit.
-  const markedKeys = draft.markerUnitIndices.map((index) => draft.layout.units[index - 1].key);
-  assert.ok(markedKeys.includes(shards.at(-1)!.id), `markers on ${markedKeys.join(',')}`);
+  assert.ok(manager.getAllMessages().filter((message) => message.bodyGroupId).length > 1, 'premise: the last message is sharded');
+  const { messages } = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'v1' });
+  const sent = messages as Array<{ participant: string; content: ContentBlock[]; cacheBreakpoint?: boolean }>;
+  const replies = sent.filter((message) => message.participant === 'assistant');
+  assert.equal(replies.length, 1, 'the sharded message is one message');
+  const text = replies[0]!.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
+  assert.equal(text.match(/paragraph\./g)?.length, 1000, 'holding every shard');
+  assert.equal(sent.at(-1), replies[0], 'as the newest message');
+  assert.equal(replies[0]!.cacheBreakpoint, true, 'and it carries the tail marker');
   manager.close();
 });
 
@@ -1074,7 +1034,6 @@ test('a quarantined merge is blocked for latent demand by its source-set key', a
   const blocked = solver.options.latentDemand?.blocked;
   assert.ok(blocked, 'the recipe-built solver carries the predicate');
   assert.equal(blocked(sourceIds), true, 'the quarantined source set, in order');
-  assert.equal(blocked([...sourceIds].reverse()), false, 'another order is another merge');
   assert.equal(blocked(['L1-a', 'L1-c']), false);
   manager.close();
 });

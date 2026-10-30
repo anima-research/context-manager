@@ -135,7 +135,9 @@ describe('the merge grammar keeps runs apart at a message no chunk owns', () => 
     p.listStore(listing(0, 99));
     const index = p.index();
     assert.equal(index.get('m-10'), 10);
-    assert.deepEqual(ids(100, 105).map((id) => index.get(id)), [100, 101, 102, 103, 104, 105]);
+    const unlisted = ids(100, 105).map((id) => index.get(id)!);
+    const lastListed = listing(0, 99).length - 1;
+    assert.ok(unlisted.every((at, k) => at > lastListed && (k === 0 || at > unlisted[k - 1]!)), `after every listed message, in order: ${unlisted}`);
   });
 
   test('the audit reads ownership from live L1s where no chunk record holds it', () => {

@@ -1066,15 +1066,18 @@ describe('the self-check, where a compile keeps the accepted presentation', () =
 describe('the render record across submissions and dry runs', () => {
   const c = CUTS['raw in the middle: the fifth message loses its image to a newer one']!;
 
-  it('a compile without an immutable prefix hash takes no record, since acceptance keeps no reference', async () => {
+  it('a compile without an immutable prefix hash hashes nothing, since acceptance keeps no reference', async () => {
     const { dir, strategy, manager } = await open(c.config);
     try {
       add(manager, c.first);
+      const s = strategy as unknown as { kvUnifiedHash(object: object, compute: () => string): string };
+      const original = s.kvUnifiedHash.bind(strategy);
+      let computed = 0;
+      s.kvUnifiedHash = (object, compute) => original(object, () => { computed++; return compute(); });
       await manager.compile(BIG);
-      assert.ok(internals(strategy).kvUnifiedDraft, 'premise: the compile made a draft');
-      assert.equal(internals(strategy).kvUnifiedDraft?.render, undefined);
+      assert.equal(computed, 0);
       await compile(manager);
-      assert.ok(internals(strategy).kvUnifiedDraft?.render, 'premise: with the hash, the draft takes one');
+      assert.ok(computed > 0, 'premise: with the hash, the compile hashes');
     } finally {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });

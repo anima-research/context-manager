@@ -5,9 +5,9 @@
 // jobs act on: the release publishes only if it is 0.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { availableParallelism, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +51,40 @@ const READS_STDIN = [
 /** Not a test file: run, as JavaScript or as stripped TypeScript, it would
  *  end the run red. */
 const NOT_A_TEST = "process.exit(3);";
+const waitsFor = (own: string, other: string, outlives = false): string => [
+  "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+  `writeFileSync(${JSON.stringify(`${own}.started`)}, String(process.pid));`,
+  `console.log(${JSON.stringify(`${own} has started`)});`,
+  "const until = Date.now() + 10_000;",
+  `while (!existsSync(${JSON.stringify(`${other}.started`)})) {`,
+  `  if (Date.now() > until) { console.log(${JSON.stringify(`${other} never ran beside ${own}`)}); process.exit(1); }`,
+  "  await new Promise((resolve) => setTimeout(resolve, 20));",
+  "}",
+  `console.log(${JSON.stringify(`${own} saw ${other} running`)});`,
+  ...(outlives ? [
+    `const pid = Number(readFileSync(${JSON.stringify(`${other}.started`)}, 'utf8'));`,
+    "const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };",
+    "while (alive()) {",
+    `  if (Date.now() > until) { console.log(${JSON.stringify(`${other} never ended`)}); process.exit(1); }`,
+    "  await new Promise((resolve) => setTimeout(resolve, 20));",
+    "}",
+    "const watch = Date.now() + 1_000;",
+    "while (Date.now() < watch) {",
+    `  if (readFileSync('script-stdout.txt', 'utf8').includes(${JSON.stringify(`\n${other} has started\n`)})) { console.log(${JSON.stringify(`${other} was printed before ${own} ended`)}); break; }`,
+    "  await new Promise((resolve) => setTimeout(resolve, 20));",
+    "}",
+    `console.log(${JSON.stringify(`${own} outlived ${other}`)});`,
+  ] : []),
+].join("\n");
+const SEES_ITS_LINE_PRINTED = [
+  "import { readFileSync } from 'node:fs';",
+  "console.log('written while running');",
+  "const until = Date.now() + 10_000;",
+  "while (!readFileSync('script-stdout.txt', 'utf8').includes('\\nwritten while running\\n')) {",
+  "  if (Date.now() > until) { console.log('not printed while running'); process.exit(1); }",
+  "  await new Promise((resolve) => setTimeout(resolve, 20));",
+  "}",
+].join("\n");
 
 interface Run {
   status: number | null;
@@ -71,7 +105,10 @@ interface Run {
  * one that kills itself has said so before it dies. If NODE_TEST_CONTEXT
  * reaches a fixture, it prints `context <value>` too.
  */
-function runScript(files: Record<string, string> | undefined): Run {
+function runScript(
+  files: Record<string, string> | undefined,
+  options: { jobs?: string } = {},
+): Run {
   const dir = mkdtempSync(join(tmpdir(), "test-each-file-"));
   try {
     writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
@@ -95,22 +132,33 @@ function runScript(files: Record<string, string> | undefined): Run {
         writeFileSync(join(dir, path), `${marker}${text}\n`);
       }
     }
-    const result = spawnSync("bash", [SCRIPT], {
-      cwd: dir,
-      env: {
-        ...process.env,
-        // The fixtures run on the node this test runs on.
-        PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
-        // node --test gives its children this, and the script must clear it:
-        // set here, every run with fixtures checks that.
-        NODE_TEST_CONTEXT: "child-v8",
-      },
-      encoding: "utf8",
-      // If bash itself hangs, its case fails here rather than at the job's
-      // limit. A fixture can't hang: each ends on its own.
-      timeout: 120_000,
-    });
-    const stdout = result.stdout ?? "";
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.TEST_EACH_FILE_JOBS;
+    if (options.jobs !== undefined) env.TEST_EACH_FILE_JOBS = options.jobs;
+    const stdoutPath = join(dir, "script-stdout.txt");
+    const stdoutFd = openSync(stdoutPath, "w");
+    let result: SpawnSyncReturns<string>;
+    try {
+      result = spawnSync("bash", [SCRIPT], {
+        cwd: dir,
+        env: {
+          ...env,
+          // The fixtures run on the node this test runs on.
+          PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
+          // node --test gives its children this, and the script must clear it:
+          // set here, every run with fixtures checks that.
+          NODE_TEST_CONTEXT: "child-v8",
+        },
+        encoding: "utf8",
+        stdio: ["pipe", stdoutFd, "pipe"],
+        // If bash itself hangs, its case fails here rather than at the job's
+        // limit. A fixture can't hang: each ends on its own.
+        timeout: 120_000,
+      });
+    } finally {
+      closeSync(stdoutFd);
+    }
+    const stdout = readFileSync(stdoutPath, "utf8");
     const lines = stdout.split("\n");
     return {
       status: result.status,
@@ -213,6 +261,42 @@ test("a path with a space runs as it is, and a file that reads stdin leaves the 
     "dist/test/c-passes.test.js",
   ]);
   assert.match(run.stdout, /read 0 bytes of stdin/, run.log);
+});
+
+test("files run at once, and each one's output is printed whole under its path, in path order, whichever ends first", notOnWindows, () => {
+  const run = runScript({
+    "dist/test/a-outlives-b.test.js": waitsFor("a", "b", true),
+    "dist/test/b-waits-for-a.test.js": waitsFor("b", "a"),
+  }, { jobs: "2" });
+  assert.equal(run.status, 0, run.log);
+  assertRanPlain(run, ["dist/test/a-outlives-b.test.js", "dist/test/b-waits-for-a.test.js"]);
+  const [, a, b] = run.stdout.split(/^== .*$/m);
+  assert.deepEqual(a!.match(/^[ab] .*$/gm), ["a has started", "a saw b running", "a outlived b"], run.log);
+  assert.deepEqual(b!.match(/^[ab] .*$/gm), ["b has started", "b saw a running"], run.log);
+});
+
+test("an empty or unset TEST_EACH_FILE_JOBS runs as many files at once as node's os.availableParallelism() gives", notOnWindows, () => {
+  for (const jobs of [undefined, ""]) {
+    const run = runScript({ "dist/test/a-passes.test.js": PASSES }, { jobs });
+    assert.equal(run.status, 0, run.log);
+    assert.equal(run.stdout.split("\n")[0], `Running 1 test files, ${availableParallelism()} at a time`, run.log);
+  }
+});
+
+test("a TEST_EACH_FILE_JOBS that isn't a whole number above 0, with no leading zero, ends the run red before any file runs", notOnWindows, () => {
+  for (const jobs of ["0", "07", "-1", "two", "1.5"]) {
+    const run = runScript({ "dist/test/a-passes.test.js": PASSES }, { jobs });
+    assert.equal(run.status, 1, run.log);
+    assert.deepEqual(run.started, [], run.log);
+    assert.deepEqual(run.errors, [`::error::TEST_EACH_FILE_JOBS must be a whole number above 0, with no leading zero, not '${jobs}'`], run.log);
+  }
+});
+
+test("the earliest file still running prints its output before it ends", notOnWindows, () => {
+  const run = runScript({ "dist/test/a-sees-its-line-printed.test.js": SEES_ITS_LINE_PRINTED });
+  assert.equal(run.status, 0, run.log);
+  assertRanPlain(run, ["dist/test/a-sees-its-line-printed.test.js"]);
+  assert.deepEqual(run.errors, [], run.log);
 });
 
 test("an empty dist/test ends the run red", notOnWindows, () => {

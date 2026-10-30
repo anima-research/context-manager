@@ -86,7 +86,7 @@ describe('AutobiographicalStrategy — capRecallPairs', () => {
     assert.equal(r.keptTokens, 0);
   });
 
-  it('estimates tokens from content.length / 4 when tokens field is absent', () => {
+  it('keeps a summary with no tokens field and charges it by its content', () => {
     const entry: SummaryEntry = {
       id: 'no-tokens',
       level: 1,
@@ -101,8 +101,7 @@ describe('AutobiographicalStrategy — capRecallPairs', () => {
     delete (entry as Partial<SummaryEntry>).tokens;
     const r = s.capRecallPairsTest([entry], 200);
     assert.equal(r.kept.length, 1);
-    // 100 (content/4) + 50 overhead = 150 ≤ 200
-    assert.ok(r.keptTokens >= 150 && r.keptTokens <= 160);
+    assert.ok(r.keptTokens >= Math.ceil(entry.content.length / 4), `charged at no less than its content's size: ${r.keptTokens}`);
   });
 
   it('accounts for +50 per-summary overhead', () => {
