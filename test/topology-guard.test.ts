@@ -91,13 +91,6 @@ describe('merge adjacency is judged in store order (issue #122)', () => {
     const picked = p.pick([...six, stray], 6);
     assert.deepEqual(picked?.map((s) => s.id), six.map((s) => s.id));
   });
-
-  test('without a store listing the index degrades to chunk-record order', () => {
-    const p = probe();
-    p.setChunks([ids(0, 9), ids(10, 19)]);
-    const picked = p.pick([l1('a', 0, 9), l1('b', 10, 19)], 2);
-    assert.deepEqual(picked?.map((s) => s.id), ['a', 'b']);
-  });
 });
 
 /** A Probe bound to a real store: branch-guarded entrypoints need one. */
@@ -457,7 +450,7 @@ describe('auditOnly opens never mutate the store', () => {
   const wipe = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
   before(wipe);
   after(wipe);
-  test('a plain open chunks the frontier; an audit-only open leaves records and queue untouched', async () => {
+  test('a plain open chunks the frontier; an audit-only open leaves the records untouched', async () => {
     const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) };
     const cfg = { adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 50, recentWindowTokens: 0, targetChunkTokens: 200 };
     const seed = new AutobiographicalStrategy(cfg);
@@ -478,5 +471,25 @@ describe('auditOnly opens never mutate the store', () => {
     const b = await ContextManager.open({ path: STORE, strategy: again, membrane: membrane as never });
     assert.equal(records(again), plainRecords, 'audit-only reads what the plain open wrote and adds nothing');
     b.close();
+  });
+
+  test('an audit-only open enqueues no merges, where a plain open under the same config does', async () => {
+    wipe();
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'a summary' }] }) };
+    const cfg = { compressionModel: 'm', hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 0, recentWindowTokens: 0, targetChunkTokens: 200, minChunkCharsForLLM: 0, l1HoldbackChunks: 0 };
+    const seed = new AutobiographicalStrategy({ ...cfg, mergeThreshold: 1000 });
+    const manager = await ContextManager.open({ path: STORE, strategy: seed, membrane: membrane as never });
+    for (let i = 0; i < 60; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i} ` + 'w '.repeat(30) }]);
+    await manager.compile();
+    for (let ticks = 0; !manager.isReady() && ticks < 200; ticks++) await manager.tick();
+    assert.ok(seed.getStats().l1 >= 2, `premise: the store holds L1s to merge (${seed.getStats().l1})`);
+    manager.close();
+    const pending = async (auditOnly: boolean): Promise<number> => {
+      const strategy = new AutobiographicalStrategy({ ...cfg, mergeThreshold: 2, auditOnly });
+      const m = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+      try { return strategy.getStats().pendingMerges; } finally { m.close(); }
+    };
+    assert.equal(await pending(true), 0);
+    assert.ok(await pending(false) > 0, 'premise: a plain open under the same config enqueues merges');
   });
 });

@@ -174,8 +174,9 @@ function isBindingRecord(value: unknown): value is BindingRecord {
 
 /**
  * A compiled message's digest: its participant and content, keys in canonical
- * order, so a block read back from the store (keys sorted) and the same block
- * as built compare equal, as the provider reads them. A cache breakpoint isn't
+ * order, so a block whose keys come back sorted, as chronicle before 0.5.1
+ * can store or read one, and the same block as built compare equal, as the
+ * provider reads them. A cache breakpoint isn't
  * part of it, nor a block's own cache marker (`cache_control`,
  * `cacheControl`): the binding doesn't count them, as observed in a run on
  * Anthropic's API on 2026-10-23 (Haiku 5.5 with the drop control, on an

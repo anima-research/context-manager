@@ -15,10 +15,6 @@
  *    pinned: 'skip-nullish' treats a later `undefined`/`null` as "not supplied",
  *    while 'spread-fidelity' lets a layer's own keys win exactly as object
  *    spread assigns them;
- *  - the null test, DIRECT over divergent inputs: the strategies' effective
- *    config through the layered path is identical to what the previous
- *    spread-then-`??=` constructors produced, for callers that supply explicit
- *    `undefined` and explicit `null` as well as ordinary values;
  *  - a subclass's forced values are attributed to the subclass, not to the
  *    caller, and the report names the strategy the instance actually is;
  *  - default silence: with `logEffectiveConfig` unset, nothing is emitted; with
@@ -39,7 +35,6 @@ import {
   resolveEffectiveConfig,
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
 } from '../src/index.js';
-import type { AutobiographicalOptions, KnowledgeOptions } from '../src/index.js';
 
 const TEST_STORE_PATH = './test-config-provenance';
 
@@ -47,54 +42,8 @@ function cleanup(): void {
   if (existsSync(TEST_STORE_PATH)) rmSync(TEST_STORE_PATH, { recursive: true, force: true });
 }
 
-/**
- * AutobiographicalStrategy's config resolution EXACTLY as it stood before this
- * change: object spread over the library defaults, then the conditional `??=`
- * repair blocks. The wiring tests assert the new path agrees with this key for
- * key, INCLUDING for callers whose keys are explicitly undefined or null —
- * which the spread kept and a nullish-skipping resolver would not.
- */
-function resolveConfigTheWayTheConstructorUsedTo(
-  config: AutobiographicalOptions,
-): Record<string, unknown> {
-  const resolved = { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG, ...config } as Record<string, unknown>;
-  resolved.hierarchical ??= true;
-  if (resolved.hierarchical) {
-    resolved.mergeThreshold ??= 6;
-    resolved.summaryTargetTokens ??= 2000;
-    resolved.l3BudgetTokens ??= 30000;
-    resolved.l2BudgetTokens ??= 30000;
-    resolved.l1BudgetTokens ??= 30000;
-  }
-  if (resolved.adaptiveResolution) {
-    resolved.foldingStrategy ??= 'flat-profile';
-    resolved.compressionSlackRatio ??= 0.1;
-    resolved.speculativeProduction ??= true;
-  }
-  resolved.compressionCacheMarkers ??= true;
-  resolved.compressionCacheTtl ??= '1h';
-  return resolved;
-}
-
-/** KnowledgeStrategy's, likewise: it forced hierarchical mode by spreading
- *  `hierarchical: true` over the caller's own options before calling super. */
-function resolveKnowledgeConfigTheWayTheConstructorUsedTo(
-  config: KnowledgeOptions,
-): Record<string, unknown> {
-  return resolveConfigTheWayTheConstructorUsedTo({ ...config, hierarchical: true });
-}
-
 function readStrategyConfig(strategy: AutobiographicalStrategy): Record<string, unknown> {
   return (strategy as unknown as { config: Record<string, unknown> }).config;
-}
-
-/** Every key the library defaults carry, supplied by the caller as one nullish
- *  value. The exhaustive form of the divergent-input fixture: whatever the old
- *  spread did with an erased default, it did for all of these. */
-function everyDefaultKeySuppliedAs(value: undefined | null): AutobiographicalOptions {
-  const config: Record<string, unknown> = {};
-  for (const key of Object.keys(DEFAULT_AUTOBIOGRAPHICAL_CONFIG)) config[key] = value;
-  return config as AutobiographicalOptions;
 }
 
 function captureStderrLines(body: () => void): string[] {
@@ -249,83 +198,9 @@ describe('resolveEffectiveConfig: spread-fidelity semantics', () => {
       fld5: 'zz-top',
     });
   });
-
-  it('keeps a key present-as-undefined, which is how a spread erases a default', () => {
-    const { effective } = resolveEffectiveConfig([
-      { source: 'zz-base', values: { fld1: 'erased' } },
-      { source: 'zz-top', values: { fld1: undefined } },
-    ], 'spread-fidelity');
-
-    assert.strictEqual('fld1' in effective, true);
-    assert.strictEqual(effective.fld1, undefined);
-  });
 });
 
-describe('AutobiographicalStrategy: config wiring is value-identical', () => {
-  const fixtures: Array<{ label: string; config: AutobiographicalOptions }> = [
-    { label: 'no caller config at all', config: {} },
-    {
-      label: 'a caller overriding defaults and adding non-default keys',
-      config: { targetChunkTokens: 1234, summaryParticipant: 'zz-participant', mergeThreshold: 9 },
-    },
-    { label: 'hierarchical explicitly off', config: { hierarchical: false } },
-    { label: 'adaptive resolution on', config: { adaptiveResolution: true } },
-    {
-      label: 'adaptive resolution on with the gated keys already set',
-      config: { adaptiveResolution: true, foldingStrategy: 'kv-stable', compressionSlackRatio: 0.25 },
-    },
-    {
-      label: 'a caller overriding the unconditional compression-cache defaults',
-      config: { compressionCacheMarkers: false, compressionCacheTtl: '5m' },
-    },
-    // Divergent inputs: every fixture below carries a caller key the caller
-    // supplied NULLISHLY. The old spread let those keys win and erase the
-    // default; a nullish-skipping resolve does not, which is the entire
-    // behavioral difference between the two readings.
-    {
-      label: 'a caller supplying explicit undefined for a defaulted key',
-      config: { recentWindowTokens: undefined },
-    },
-    {
-      label: 'a caller supplying explicit null for a defaulted key',
-      config: { targetChunkTokens: null as unknown as number },
-    },
-    {
-      label: 'a caller supplying explicit undefined for a key with no library default',
-      config: { productionBudgetTokens: undefined },
-    },
-    {
-      label: 'a caller supplying explicit undefined for a `??=`-repaired key, with its gate off',
-      config: { hierarchical: false, mergeThreshold: undefined },
-    },
-    {
-      label: 'a caller supplying explicit undefined for a `??=`-repaired key, with its gate on',
-      config: { hierarchical: true, mergeThreshold: undefined, compressionCacheTtl: undefined },
-    },
-    {
-      label: 'a caller supplying explicit null for an adaptive-gated key',
-      config: { adaptiveResolution: true, foldingStrategy: null as unknown as undefined },
-    },
-    {
-      label: 'a caller supplying explicit undefined for EVERY defaulted key',
-      config: everyDefaultKeySuppliedAs(undefined),
-    },
-    {
-      label: 'a caller supplying explicit null for EVERY defaulted key',
-      config: everyDefaultKeySuppliedAs(null),
-    },
-  ];
-
-  for (const { label, config } of fixtures) {
-    it(`resolves the same effective values as the previous constructor: ${label}`, () => {
-      const strategy = new AutobiographicalStrategy(config);
-      assert.deepStrictEqual(
-        readStrategyConfig(strategy),
-        resolveConfigTheWayTheConstructorUsedTo(config),
-      );
-    });
-  }
-
+describe('AutobiographicalStrategy: effective config and its provenance', () => {
   it('attributes every effective key to the layer that supplied it', () => {
     const strategy = new AutobiographicalStrategy({
       targetChunkTokens: 1234,
@@ -366,33 +241,6 @@ describe('AutobiographicalStrategy: config wiring is value-identical', () => {
 });
 
 describe('KnowledgeStrategy: forced config is attributed to the subclass', () => {
-  const fixtures: Array<{ label: string; config: KnowledgeOptions }> = [
-    { label: 'no caller config at all', config: {} },
-    {
-      label: 'a caller overriding defaults',
-      config: { targetChunkTokens: 1234, summaryParticipant: 'zz-participant' },
-    },
-    { label: 'a caller trying to switch hierarchical off', config: { hierarchical: false } },
-    {
-      label: 'a caller supplying explicit undefined for a defaulted key',
-      config: { recentWindowTokens: undefined },
-    },
-    {
-      label: 'a caller supplying explicit null for EVERY defaulted key',
-      config: everyDefaultKeySuppliedAs(null) as KnowledgeOptions,
-    },
-  ];
-
-  for (const { label, config } of fixtures) {
-    it(`resolves the same effective values as the previous constructor: ${label}`, () => {
-      const strategy = new KnowledgeStrategy(config);
-      assert.deepStrictEqual(
-        readStrategyConfig(strategy),
-        resolveKnowledgeConfigTheWayTheConstructorUsedTo(config),
-      );
-    });
-  }
-
   it('attributes forced hierarchical to the enforcing layer, not to the caller', () => {
     const strategy = new KnowledgeStrategy({ targetChunkTokens: 1234 });
 
@@ -465,6 +313,43 @@ describe('AutobiographicalStrategy: effective-config report', () => {
     assert.deepStrictEqual(
       Object.keys(report.provenance).sort(),
       Object.keys(report.effective).sort(),
+    );
+  });
+
+  it('reports the documented default of each option it names where the caller leaves it out', async () => {
+    const plain = (await reportFromInitializing(new AutobiographicalStrategy({ logEffectiveConfig: true }))).reports[0]!.effective;
+    assert.deepStrictEqual(
+      {
+        hierarchical: plain.hierarchical,
+        mergeThreshold: plain.mergeThreshold,
+        summaryTargetTokens: plain.summaryTargetTokens,
+        l1BudgetTokens: plain.l1BudgetTokens,
+        l2BudgetTokens: plain.l2BudgetTokens,
+        l3BudgetTokens: plain.l3BudgetTokens,
+        compressionCacheMarkers: plain.compressionCacheMarkers,
+        compressionCacheTtl: plain.compressionCacheTtl,
+      },
+      {
+        hierarchical: true,
+        mergeThreshold: 6,
+        summaryTargetTokens: 2000,
+        l1BudgetTokens: 30000,
+        l2BudgetTokens: 30000,
+        l3BudgetTokens: 30000,
+        compressionCacheMarkers: true,
+        compressionCacheTtl: '1h',
+      },
+    );
+    const adaptive = (await reportFromInitializing(
+      new AutobiographicalStrategy({ logEffectiveConfig: true, adaptiveResolution: true }),
+    )).reports[0]!.effective;
+    assert.deepStrictEqual(
+      {
+        foldingStrategy: adaptive.foldingStrategy,
+        compressionSlackRatio: adaptive.compressionSlackRatio,
+        speculativeProduction: adaptive.speculativeProduction,
+      },
+      { foldingStrategy: 'flat-profile', compressionSlackRatio: 0.1, speculativeProduction: true },
     );
   });
 

@@ -97,6 +97,17 @@ export interface PendingWork {
 }
 
 /**
+ * Background work that waits on something only the host can give, which
+ * `isReady()` and `getPendingWork()` don't count.
+ */
+export interface WaitingWork {
+  /** 'tools' until the host declares its tool definitions. */
+  waitingOn: 'tools';
+  /** Human-readable description, naming what waits */
+  description: string;
+}
+
+/**
  * An injection into the compiled context.
  * Source-agnostic: may come from MCPL servers, local strategies, or application code.
  */

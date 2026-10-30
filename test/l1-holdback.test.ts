@@ -142,7 +142,6 @@ describe('AutobiographicalStrategy — L1 holdback', () => {
     // A new message rebuilds the queue from scratch — the demanded chunk must
     // NOT be filtered back out by the holdback window.
     manager.addMessage('user', textBlock('another message'));
-    await new Promise((r) => setTimeout(r, 5));
     const stillNewest = strategy.closedChunks()[newest.index];
     assert.ok(
       strategy.queuedChunkIndices().includes(stillNewest.index) || stillNewest.compressed,

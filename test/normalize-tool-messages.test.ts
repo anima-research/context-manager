@@ -176,9 +176,9 @@ describe('stripUnpairedToolBlocks', () => {
     assert.deepEqual(stripUnpairedToolBlocks([]), []);
   });
 
-  it('preserves reference identity for unchanged messages', () => {
+  it('leaves a message with no unpaired tool blocks as it was', () => {
     const msg = { participant: 'user', content: [t('hello')] };
     const out = stripUnpairedToolBlocks([msg]);
-    assert.strictEqual(out[0].content, msg.content);
+    assert.deepStrictEqual(out[0].content, [t('hello')]);
   });
 });

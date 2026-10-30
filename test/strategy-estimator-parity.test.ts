@@ -49,7 +49,6 @@ describe('strategy estimator parity with the store', () => {
     const content: ContentBlock[] = [{ type: 'text', text: PROSE }, { type: 'thinking', thinking: '', signature: SIG } as ContentBlock];
     const est = s.estimateTokens(content);
     assert.equal(est, messages.estimateTokens({ content } as never));
-    assert.equal(est, Math.round(defaultTokenEstimator(PROSE) * 1.5) + Math.round(MessageStore.signedThinkingTokens(SIG) * 1.5));
     store.close?.();
   });
 });

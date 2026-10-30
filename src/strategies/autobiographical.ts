@@ -683,10 +683,11 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
- * the earliest call with its id, in an earlier message, that no result has
- * answered yet; a result with no such call goes with the call its id last
- * answered, as a further result; a result with neither answers none. Epoch
- * 4's predicate reads the same calls, so it sees what the count sees.
+ * the earliest call with its id before it, in its own message or an earlier
+ * one, that no result has answered yet; a result with no such call goes with
+ * the call its id last answered, as a further result; a result with neither
+ * answers none. Epoch 4's predicate reads the same calls, so it sees what the
+ * count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
   type Waiting = { toolName: string; call: AnsweredCall };
@@ -698,13 +699,12 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
   let place = 0;
   for (let at = 0; at < messages.length; at++) {
     const m = messages[at]!;
-    // A message's calls wait from the next message on: pairing repair
-    // drops a result in its call's own message.
-    const opened: Array<[string, Waiting]> = [];
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        opened.push([block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } }]);
+        let queue = waiting.get(block.id);
+        if (!queue) waiting.set(block.id, (queue = []));
+        queue.push({ toolName: block.name, call: { message: at, place: -1, results: [] } });
       } else if (block.type === 'tool_result') {
         const first = waiting.get(block.toolUseId)?.shift();
         let call: AnsweredCall | undefined;
@@ -720,11 +720,6 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
         }
         call?.results.push({ message: m.id, index: i });
       }
-    }
-    for (const [id, entry] of opened) {
-      let queue = waiting.get(id);
-      if (!queue) waiting.set(id, (queue = []));
-      queue.push(entry);
     }
   }
   return byTool;
@@ -1745,10 +1740,16 @@ export interface AutobiographicalProgressSnapshot {
   totalChunks: number;
   /** Chunks that already have an L1 summary. */
   chunksCompressed: number;
-  /** Chunks queued for L1 compression. */
+  /** Chunks queued for L1 compression, less those waiting on the host's tool definitions. */
   l1QueueLength: number;
-  /** Pending L1→L2 and L2→L3 merges. */
+  /** Queued chunks that wait on the host's tool definitions: a tick takes
+   *  them once it declares them. */
+  l1WaitingOnTools: number;
+  /** Pending L1→L2 and L2→L3 merges, less those waiting on the host's tool definitions. */
   mergeQueueLength: number;
+  /** Pending merges that wait on the host's tool definitions, as
+   *  `l1WaitingOnTools`. */
+  mergesWaitingOnTools: number;
   /** Stored summary counts per level (1 = raw L1, 2 = L1→L2 merge, 3 = L2→L3 merge). */
   summaryCounts: { l1: number; l2: number; l3: number };
   /** True if a compression or merge LLM call is currently in flight. */
@@ -2087,6 +2088,36 @@ function sentForm(block: ContentBlock): ContentBlock {
   return withoutRawForms(block);
 }
 
+/** A message's content in parts around each tool cycle of its own: a run
+ *  of tool_result blocks, one of which answers a tool_use earlier in the same
+ *  content that no result there has answered yet, is a part, and so is what
+ *  follows it. A cut never splits a run
+ *  of results or a run of other blocks, and the blocks that share a raw
+ *  replay form (raw-forms.ts) sit in one such run, so a form stays within one
+ *  part. */
+function cycleParts(content: ContentBlock[]): ContentBlock[][] {
+  const runs: ContentBlock[][] = [];
+  for (const block of content) {
+    const run = runs[runs.length - 1];
+    if (run && (run[0]!.type === 'tool_result') === (block.type === 'tool_result')) run.push(block);
+    else runs.push([block]);
+  }
+  const parts: ContentBlock[][] = [];
+  const waiting = new Set<string>();
+  let afterCycle = false;
+  for (const run of runs) {
+    const cycle = run.some((block) => block.type === 'tool_result' && waiting.has(block.toolUseId));
+    if (parts.length === 0 || cycle || afterCycle) parts.push([...run]);
+    else parts[parts.length - 1]!.push(...run);
+    afterCycle = cycle;
+    for (const block of run) {
+      if (block.type === 'tool_use') waiting.add(block.id);
+      else if (block.type === 'tool_result') waiting.delete(block.toolUseId);
+    }
+  }
+  return parts;
+}
+
 const TOP_LEVEL_IMAGES = Symbol('top-level images');
 /** Which of its message's image groups a block's images belong to, for the
  *  verdicts postStripEstimates keeps: a tool result's are its call's, and a
@@ -2415,6 +2446,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private mergeFailureRuns = new Map<string, CompressionFailureStreak>();
   /** A chunk whose split-stitch rung waits for its call window, until when (see CompressionSplitWindowWait). */
   private compressionNotBefore = new Map<string, number>();
+  private toolsDeferredChunks = new Set<string>();
+  private toolsDeferredMerge: string | undefined;
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -5099,9 +5132,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         record.normalizedConfig.sourceOnlyFallbackRequestHash &&
       // Same rule for the tool-prose rung: enabling or re-pointing it is a
       // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since a record read
-      // back from the store has their keys in another order than
-      // toolProseHoistOptions builds them in.
+      // options are compared as canonicalJson gives them, since the options
+      // of a record chronicle before 0.5.1 stored or reads back can have their
+      // keys in another order than toolProseHoistOptions builds them in.
       canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
         canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
     );
@@ -6220,16 +6253,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * put back only if that rebuild queued it, and a rebuild's withdrawal of
    * it stands.
    */
-  private requeuePendingChunk(key: string, place: 'head' | 'back', superseded: boolean): void {
+  private requeuePendingChunk(key: string, place: 'head' | 'back' | number, superseded: boolean): void {
     if (place === 'back') this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
     const index = this.chunks.findIndex((chunk) => !chunk.compressed && this.chunkKey(chunk) === key);
     if (index >= 0 && !superseded) {
       const queued = this.compressionQueue.indexOf(index);
-      if (place === 'head') {
+      if (place === 'back') {
+        if (queued === -1) this.compressionQueue.push(index);
+      } else {
         if (queued !== -1) this.compressionQueue.splice(queued, 1);
-        this.compressionQueue.unshift(index);
-      } else if (queued === -1) {
-        this.compressionQueue.push(index);
+        const at = place === 'head' ? 0 : Math.min(place, this.compressionQueue.length);
+        this.compressionQueue.splice(at, 0, index);
       }
     }
     this.orderCompressionQueue();
@@ -7374,25 +7408,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  private familyWaitsForTools(tools: readonly unknown[] | undefined): boolean {
+    return !(tools !== undefined && tools.length > 0) && isToolsLessRefusingSummarizer(this.config.compressionModel ?? '');
+  }
+
+  private waitingOnTools(): { chunks: number; merges: number } {
+    const tools = this.hostContext?.tools;
+    if (tools !== undefined && tools.length > 0) return { chunks: 0, merges: 0 };
+    let chunks = 0;
+    for (const index of this.compressionQueue) {
+      const chunk = this.chunks[index];
+      if (chunk !== undefined && !chunk.compressed && this.toolsDeferredChunks.has(this.chunkKey(chunk))) chunks++;
+    }
+    const head = this.mergeQueue[0];
+    const mergesWait = this.config.hierarchical === true && head !== undefined
+      && this.toolsDeferredMerge === mergeFailureKey(head) && this.familyWaitsForTools(tools);
+    if (mergesWait && this.speculativeCapHolds()) {
+      chunks = 0;
+      for (const index of this.compressionQueue) {
+        const chunk = this.chunks[index];
+        if (chunk !== undefined && !chunk.compressed) chunks++;
+      }
+    }
+    return { chunks, merges: mergesWait ? this.mergeQueue.length : 0 };
+  }
+
   checkReadiness(): ReadinessState {
     this.requireLoadedBranch('checkReadiness');
+    const waiting = this.waitingOnTools();
+    const waitingParts: string[] = [];
+    if (waiting.chunks > 0) waitingParts.push(`${waiting.chunks} chunks`);
+    if (waiting.merges > 0) waitingParts.push(`${waiting.merges} merges`);
+    const waitingText = waitingParts.length > 0
+      ? `${waitingParts.join(' + ')} wait on the host's tool definitions`
+      : undefined;
     if (this.pendingCompression) {
       return {
         ready: false,
         pendingWork: this.pendingCompression,
         description: `Compressing chunk ${this.compressionQueue[0] ?? '?'}`,
+        ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
       };
     }
 
     const needsCompression = this.chunks.some(
       (c) => !c.compressed && this.isChunkOldEnough(c)
     );
-    const needsMerge = this.config.hierarchical && this.mergeQueue.length > 0;
+    const runnableChunks = this.compressionQueue.length - waiting.chunks;
+    const runnableMerges = this.mergeQueue.length - waiting.merges;
+    const needsMerge = this.config.hierarchical && runnableMerges > 0;
 
-    if ((needsCompression && this.compressionQueue.length > 0) || needsMerge) {
+    if ((needsCompression && runnableChunks > 0) || needsMerge) {
       const parts: string[] = [];
-      if (this.compressionQueue.length > 0) parts.push(`${this.compressionQueue.length} chunks`);
-      if (needsMerge) parts.push(`${this.mergeQueue.length} merges`);
+      if (runnableChunks > 0) parts.push(`${runnableChunks} chunks`);
+      if (needsMerge) parts.push(`${runnableMerges} merges`);
       // The pause binds the membrane instance and model of the call that
       // failed. Readiness has no context to name the membrane, so a pause
       // bound to another instance shows until the next tick drops it; one
@@ -7412,9 +7481,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return {
         ready: false,
         description: `${parts.join(' + ')} pending${paused}`,
+        ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
       };
     }
 
+    if (waitingText !== undefined) return { ready: true, waitingOn: 'tools', waitingDescription: waitingText };
     return { ready: true };
   }
 
@@ -7623,8 +7694,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       candidates.add(this.chunkKey(chunk));
       return true;
     });
+    if ((ctx.tools?.length ?? 0) > 0) {
+      this.toolsDeferredChunks.clear();
+      this.toolsDeferredMerge = undefined;
+    }
     for (const key of candidates) {
       if (this.speculativeCapHolds() || this.compressionReadMarkFailed) break;
+      if (this.toolsDeferredChunks.has(key)) continue;
       // Resolve against the current queue: a rebuild may renumber chunks or
       // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
       // stale chunk object. Newly queued source identities wait for next tick.
@@ -7657,6 +7733,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let quarantineSkipped = false;
       let requestStopped = false;
       let joinedWorkDiscarded = false;
+      let toolsDeferred = false;
       const work: { chunk: Chunk; skipped?: true } = { chunk };
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
@@ -7668,6 +7745,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         requestStopped = true;
       }, () => {
         joinedWorkDiscarded = true;
+      }, () => {
+        toolsDeferred = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -7789,6 +7868,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // ladder, where a rung's answer, fresh or reused, ends its run.
         if (chunk.compressed || requestStopped) this.endChunkFailureRuns(key);
         this.compressionFailureOrder.delete(key);
+        if (toolsDeferred) {
+          const superseded = this.compressionQueueGeneration !== queueGeneration;
+          if (!superseded) this.toolsDeferredChunks.add(key);
+          this.requeuePendingChunk(key, queueIndex, superseded);
+        }
         this.checkMergeThreshold();
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
@@ -7817,8 +7901,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // merges reaching it: the merge prompt replays raw sources. No progress
       // is recorded, so the drain stops; release resumes it.
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
-      this._drainProgress++; // executing a merge is real work, even if a
-      // follow-on merge gets enqueued and the queue length nets out unchanged
       // Whether the merge wrote its parent (see executeMerge): a skipped
       // entry wrote nothing.
       let merged = false;
@@ -7827,7 +7909,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mergeModel = this.config.compressionModel;
       const mergeMembrane = ctx.membrane;
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
-      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx).then((wrote) => {
+      let mergeToolsDeferred = false;
+      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx, () => {
+        mergeToolsDeferred = true;
+      }).then((wrote) => {
         merged = wrote;
       });
       this.pendingCompression = merging;
@@ -7838,6 +7923,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // A merge written before the branch switched still landed on its
           // route: the domain's count is the route's.
           if (merged) noteDomainLanding(mergeMembrane, mergeModel);
+          return;
+        }
+        if (mergeToolsDeferred) {
+          if (this.mergeQueue[0] === merge) this.toolsDeferredMerge = mergeFailureKey(merge);
           return;
         }
         // Success, or a skipped entry: drop from head and persist the
@@ -7981,6 +8070,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.pendingCompression = null;
           this.pendingCompressionWork = null;
         }
+        if (!mergeToolsDeferred && this.isCompressionBranchCurrent(sourceBranch)) this._drainProgress++;
       }
     }
   }
@@ -8026,11 +8116,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       else if (s.level === 2) l2++;
       else if (s.level === 3) l3++;
     }
+    const waiting = this.waitingOnTools();
     return {
       totalChunks: this.chunks.length,
       chunksCompressed,
-      l1QueueLength: this.compressionQueue.length,
-      mergeQueueLength: this.mergeQueue.length,
+      l1QueueLength: this.compressionQueue.length - waiting.chunks,
+      l1WaitingOnTools: waiting.chunks,
+      mergeQueueLength: this.mergeQueue.length - waiting.merges,
+      mergesWaitingOnTools: waiting.merges,
       summaryCounts: { l1, l2, l3 },
       pending: this.pendingCompression !== null,
     };
@@ -9427,6 +9520,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // doesn't pass it on leaves the chunk to the next rebuild, as a return
     // that made no call does.
     onJoinedWorkDiscarded?: () => void,
+    // The chunk's request needs the host's tool definitions, which it hasn't
+    // declared: no call was made.
+    onToolsDeferred?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
@@ -9571,6 +9667,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // holds the branch now.
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
+      return;
+    }
+
+    // On Fable/Mythos-family summarizers a request without the agent's live
+    // tool definitions is refused whatever it holds: the bare
+    // marker+directive with no conversation at all is input-blocked, while
+    // the identical bytes with the live tool set declared mint cleanly (Linn,
+    // claude-fable-5-1, 2026-09-05; same on claude-fable-5). A pure-chat
+    // seed's first speculative L1 therefore fired ~300ms after boot -- before
+    // the host's first setToolDefinitions -- burned a doomed call and landed
+    // in quarantine. Opus-family summarizers mint tools-less (lena bench), so
+    // the content-independent rule is gated on the model family.
+    if (this.familyWaitsForTools(ctx.tools)) {
+      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; Fable/Mythos-family summarizer refuses tools-less requests) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return;
     }
 
@@ -9984,23 +10095,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
     // (reasoning_extraction -- see the `tools` comment below; labclaude
-    // 2026-07-09). On Fable/Mythos-family summarizers the refusal is
-    // content-INDEPENDENT: the bare marker+directive with no conversation
-    // at all is input-blocked, while the identical bytes with the live tool
-    // set declared mint cleanly (Linn, claude-fable-5-1, 2026-09-05; same on
-    // claude-fable-5). A pure-chat seed's first speculative L1 therefore
-    // fired ~300ms after boot -- before the host's first
-    // setToolDefinitions -- burned a doomed call and landed in quarantine.
-    // Tools are pushed by the host on MCPL registration / maintenance
-    // passes and on every activation, so defer rather than burn the call.
-    // Opus-family summarizers mint tools-less (lena bench), and test
-    // harnesses never push tools, so the content-independent rule is gated
-    // on the model family.
-    // compressionWorkQueued's count applies the same test (hasToolBlocks).
-    const chunkHasToolBlocks = cleaned.some((m) => hasToolBlocks(m.content));
-    const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
-    if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
-      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
+    // 2026-07-09).
+    // Change compressionWorkQueued's count (requestCarriesToolBlocks) with this check.
+    if (cleaned.some((m) => hasToolBlocks(m.content)) && !(ctx.tools && ctx.tools.length > 0)) {
+      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; history contains tool blocks) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return;
     }
 
@@ -10075,9 +10174,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
-      // workaround. Undefined before the first activation of a session --
-      // acceptable: those chunks stay raw and are retried after the agent's
-      // first turn (see the defer guard in compressChunkHierarchical).
+      // workaround.
       tools: ctx.tools,
     };
 
@@ -12176,7 +12273,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected async executeMerge(
     targetLevel: SummaryLevel,
     sourceIds: string[],
-    ctx: StrategyContext
+    ctx: StrategyContext,
+    // The merge's request needs the host's tool definitions, which it hasn't
+    // declared: no call was made.
+    onToolsDeferred?: () => void,
   ): Promise<boolean> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
     if (!ctx.membrane) {
@@ -12240,6 +12340,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);
+      return false;
+    }
+
+    if (this.familyWaitsForTools(ctx.tools)) {
+      this.diag.warn(`[autobiographical] deferring L${targetLevel} merge: host has not provided tool definitions yet (ctx.tools empty; Fable/Mythos-family summarizer refuses tools-less requests) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return false;
     }
 
@@ -12724,9 +12830,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
-      // workaround. Undefined before the first activation of a session --
-      // acceptable: those chunks stay raw and are retried after the agent's
-      // first turn (see the defer guard in compressChunkHierarchical).
+      // workaround.
       tools: ctx.tools,
     };
 
@@ -13065,8 +13169,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * reaches only after that. The merge in flight stays at
    * the head until it lands, and the walk reads it there: a hold placed since
    * ends the walk at it, since tick discards what its call returns and stops
-   * at that head. A queued merge counts even when executeMerge will
-   * drop it as stale without a model call (a source not loaded, already
+   * at that head. On a Fable/Mythos model with no tools declared no merge
+   * counts, since none can be sent; otherwise a queued merge counts even
+   * when executeMerge will drop it as stale without a model call (a source not loaded, already
    * parented or held out of merges, or a group its topology check refuses,
    * which it quarantines),
    * when a source in memory covers such a message: tick drops one such entry
@@ -13257,7 +13362,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // there, since tick discards what its call returns and stops at it.
     const modelled = Boolean(this.config.compressionModel);
     let mergeCounts = false;
-    if (this.config.hierarchical && modelled) {
+    if (this.config.hierarchical && modelled && !this.familyWaitsForTools(this.hostContext?.tools)) {
       for (const merge of this.mergeQueue) {
         if (this.mergeBlockedByHold(merge.sourceIds, store, held)) break;
         if (mergeFolds(merge.sourceIds)) {
@@ -14939,6 +15044,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      band, learned nothing from it.
    *   5: generated images (`generated_image`, nested in a tool result too)
    *      priced as an image without a stamp, where they had estimated as 0
+   *   6: a tool result answering a tool call before it in one message's
+   *      content sent with that message (enforceToolPairing), where pairing
+   *      repair dropped it after the plan and the render stats counted it,
+   *      and sent a stub. A store holding one learned a multiplier low
+   *      enough to make up for the results it priced and didn't send
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -14970,7 +15080,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 5;
+  static readonly CALIBRATION_PRICING_EPOCH = 6;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -15061,6 +15171,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const image of imagesIn(m.content)) if (image.type === 'generated_image') return true;
       return false;
     }),
+    6: (messages) => messages.some((m) => cycleParts(m.content).length > 1),
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
@@ -17774,6 +17885,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
+  /** Empty the chunk list and its queue for a rebuild: an attempt in flight finds its queue superseded. */
+  protected resetChunks(): void {
+    this.chunks = [];
+    this.compressionQueue = [];
+    this.compressionQueueGeneration++;
+    this.toolsDeferredChunks.clear();
+    this.toolsDeferredMerge = undefined;
+  }
+
   /**
    * Rebuild the chunk list: persisted records own the past; the running-sum
    * chunker only extends at the frontier, and a chunk is only ever created
@@ -17783,9 +17903,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prefix-generation families found fleet-wide in the 2026-07 audit).
    */
   protected rebuildChunks(store: MessageStoreView): void {
-    this.chunks = [];
-    this.compressionQueue = [];
-    this.compressionQueueGeneration++;
+    this.resetChunks();
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
     const listing = store.getAll();
@@ -19601,6 +19719,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     its use is adjacent; an entry left empty is replaced with a
    *     placeholder text block.
    *
+   * An entry holding a tool cycle of its own is judged in parts
+   * (cycleParts), and its parts fold back into the one entry, with any entry
+   * the repair placed between two of them in its place; a part the repair
+   * empties adds nothing, where an entry it empties gets the placeholder. The
+   * look-ahead counts an entry's parts as one entry.
+   *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
    * subclass overrides like KnowledgeStrategy are covered) and
@@ -19608,6 +19732,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * already-valid output.
    */
   protected enforceToolPairing(entries: ContextEntry[]): void {
+    const originOf = new Map<ContextEntry, ContextEntry>();
+    const parts = entries.flatMap((entry) => {
+      const cut = cycleParts(entry.content);
+      if (cut.length < 2) return [entry];
+      return cut.map((content) => {
+        const part: ContextEntry = { ...entry, content, relocatedResults: undefined };
+        originOf.set(part, entry);
+        return part;
+      });
+    });
+    if (originOf.size === 0) {
+      this.repairToolPairing(entries);
+      return;
+    }
+    this.repairToolPairing(parts, (entry) => originOf.get(entry) ?? entry);
+    const lastPart = new Map<ContextEntry, number>();
+    parts.forEach((part, i) => {
+      const origin = originOf.get(part);
+      if (origin) lastPart.set(origin, i);
+    });
+    const folded: ContextEntry[] = [];
+    let open: { origin: ContextEntry; last: number } | undefined;
+    parts.forEach((part, i) => {
+      const origin = originOf.get(part);
+      if (origin && origin !== open?.origin) {
+        open = { origin, last: lastPart.get(origin)! };
+        origin.content = [];
+        folded.push(origin);
+      }
+      if (!open || i > open.last) {
+        folded.push(part);
+        return;
+      }
+      open.origin.content.push(...part.content);
+      if (part.relocatedResults?.length) open.origin.relocatedResults = [...(open.origin.relocatedResults ?? []), ...part.relocatedResults];
+    });
+    entries.splice(0, entries.length, ...folded);
+    for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
+  }
+
+  private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
@@ -19626,7 +19791,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
             ? releaseEditedRawForms(entry.content, filtered)
-            : [{ type: 'text', text: '[tool call omitted]' }];
+            : unitOf(entry) !== entry ? [] : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
 
@@ -19645,7 +19810,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Rule A when we reach it). Move the real block up into position and
           // only stub the ids for which no real result exists — so tool output
           // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing);
+          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
@@ -19704,8 +19869,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    *   - if the genuine result exists within a short look-ahead window after
    *     `afterIndex`, MOVE it up into position (removing it from its source
-   *     entry — replacing a now-empty entry with a placeholder) so the real
-   *     tool output survives the repair;
+   *     entry — replacing a now-empty entry with a placeholder, and leaving a
+   *     now-empty part of a cut message empty) so the real tool output
+   *     survives the repair;
    *   - otherwise emit a stub.
    *
    * tool_use ids are unique, so the single result carrying a given id is
@@ -19718,9 +19884,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entries: ContextEntry[],
     afterIndex: number,
     missing: string[],
+    unitOf: (entry: ContextEntry) => ContextEntry,
   ): ContentBlock[] {
     const LOOKAHEAD = 6;
-    const end = Math.min(entries.length, afterIndex + 1 + LOOKAHEAD);
+    let end = afterIndex + 1;
+    for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
+      const next = unitOf(entries[end]!);
+      if (next === unit) continue;
+      if (++units > LOOKAHEAD) break;
+      unit = next;
+    }
     return missing.map(id => {
       for (let j = afterIndex + 1; j < end; j++) {
         const src = entries[j];
@@ -19736,7 +19909,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
           ? releaseEditedRawForms(source, rest)
-          : [{ type: 'text', text: '[tool result moved during context repair]' }];
+          : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
@@ -19757,24 +19930,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
    *    its message's id and its place in that message's content, with the
    *    marker its content becomes. The count is of calls. A result answers
-   *    the earliest call with its id, in an earlier message, that no result
-   *    has answered yet, the order pairing repair's look-ahead pairs them in
-   *    where it reaches: a result beyond its reach still answers its call and
-   *    keeps the slot, as a folded one does. A result with no such call goes
-   *    with the call its id last answered, as a further result, and takes no
-   *    slot. A result with neither, before any call with its id or beside
-   *    only its own message's call, answers none and is left as it is:
-   *    pairing repair drops it. Each
-   *    tool's answered calls are ordered by their call's message, and calls
-   *    made in one message by where the results that answer them are
-   *    stored, the order the render sends a batch the repair leaves alone.
-   *    All but the last N have every result replaced, whether they render
-   *    raw, folded or not at all: no selection brings a replaced result
-   *    back. Where the repair moves a batch's results (part of a batch
-   *    whose results are split across messages, or all of one when a recall
-   *    pair or pin comes between the calls and their results), it sends the
-   *    moved results first, in call order, so the render's order can differ,
-   *    while still sending at most N whole.
+   *    the earliest call with its id before it, in its own message or an
+   *    earlier one, that no result has answered yet, the order pairing
+   *    repair's look-ahead pairs them in where it reaches: a result beyond
+   *    its reach still answers its call and keeps the slot, as a folded one
+   *    does. A result with no such call goes with the call its id last
+   *    answered, as a further result, and takes no slot. A result with
+   *    neither, before any call with its id, answers none and is left as it
+   *    is: pairing repair drops it. Each tool's answered calls are ordered by
+   *    their call's message, and calls made in one message by where the
+   *    results that answer them are stored, the order the render sends a
+   *    batch the repair leaves alone. All but the last N have every result
+   *    replaced, whether they render raw, folded or not at all: no selection
+   *    brings a replaced result back. Where the repair moves a batch's
+   *    results (part of a batch whose results are split across messages, or
+   *    all of one when a recall pair or pin comes between the calls and their
+   *    results), it sends the moved results first, in call order, so the
+   *    render's order can differ, while still sending at most N whole.
    *  - `inputCap`: `toolUseInputMaxTokens`. A `tool_use` input over it is
    *    truncated by its own size alone (see prunedForSend).
    * Memoized per listing and per the two settings, a map of limits by its
@@ -19849,7 +20021,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `msg` as this strategy sends it before any cut: each `tool_result`
    * toolPruning replaces carries its marker, and each `tool_use` input over
    * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys }`
-   * (its first five keys as stored, which the store sorts). `msg` itself when
+   * (its first five keys as stored). `msg` itself when
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
@@ -20555,6 +20727,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // they were.
       compressionFailureOrder: new Map(this.compressionFailureOrder),
       compressionNotBefore: new Map(this.compressionNotBefore),
+      toolsDeferredChunks: new Set(this.toolsDeferredChunks),
+      toolsDeferredMerge: this.toolsDeferredMerge,
       mergeFailureOrder: new Map(this.mergeFailureOrder),
       compressionFailureRuns: new Map(this.compressionFailureRuns),
       mergeFailureRuns: new Map(this.mergeFailureRuns),
@@ -20585,6 +20759,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
       this.compressionFailureOrder = saved.compressionFailureOrder;
       this.compressionNotBefore = saved.compressionNotBefore;
+      this.toolsDeferredChunks = saved.toolsDeferredChunks;
+      this.toolsDeferredMerge = saved.toolsDeferredMerge;
       this.mergeFailureOrder = saved.mergeFailureOrder;
       this.compressionFailureRuns = saved.compressionFailureRuns;
       this.mergeFailureRuns = saved.mergeFailureRuns;

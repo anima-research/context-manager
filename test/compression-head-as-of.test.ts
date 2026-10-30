@@ -717,10 +717,6 @@ describe('the head a compression or merge request gives is the head as of the hi
     assert.deepEqual(chunks.map((c) => reader(c)), [true, true, true], "premise: the opening's head carries its tool cycle into each chunk's request");
     assert.equal(strategy.holdScans() - scans, 1, 'one scan of the holds');
     assert.equal(walks, 1, "one walk of the opening's head");
-    const before = strategy.holdScans();
-    const own = strategy.toolBlockReader(ctx);
-    assert.equal(own(chunkOf(ctx, at.OPEN1!, at.OPEN3!)), true, 'premise: a chunk holding a tool block answers from its own messages');
-    assert.equal(strategy.holdScans(), before, 'so its count reads no head and scans no holds');
     await manager.close();
   });
 

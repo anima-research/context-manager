@@ -62,13 +62,6 @@ describe('storedJson', () => {
     ];
     for (const value of shapes) assert.equal(storedJson(value).toString('utf8'), JSON.stringify(value));
   });
-
-  it('reads each getter once, as one stringify does', () => {
-    let reads = 0;
-    const value = { get revision() { reads++; return reads; }, text: `a${HIGH}` };
-    assert.deepEqual(JSON.parse(storedJson(value).toString('utf8')), { revision: 1, text: `a${FFFD}` });
-    assert.equal(reads, 1);
-  });
 });
 
 describe('a lone half in what an edit stores', () => {

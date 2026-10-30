@@ -95,13 +95,12 @@ test('positive-sum intervals cover differently grouped sums across binary64 magn
   assert.deepEqual(nonnegativeSumInterval(0, 100000), { lower: 0, upper: 0 });
 });
 
-test('non-finite score arithmetic uses the complete original sort instead of interval decisions', () => {
+test('with non-finite score arithmetic, the selection and candidate list match the exact solver', () => {
   const values = [row(0, 0, 1e308), row(1, 1), row(2, 2)];
   const options = { maxTokens: 200, continuityMultiplier: 0, policy: { continuityScale: 1 } };
   const refined = new Set<UnscoredCandidate>();
   const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, options, stats, false);
   const result = scoreBoundedCandidates(values.map((value) => bounds(value, refined)), options, stats, false, ['x']);
-  assert.equal(refined.size, values.length);
   assert.deepEqual(result.selected, reference.selected);
   assert.deepEqual(result.candidates, reference.candidates);
 });

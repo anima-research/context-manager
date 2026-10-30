@@ -58,6 +58,7 @@ async function assertFenced(manager: ContextManager, id: string) {
   await assert.rejects(manager.resetHeadWindow('transition'), fenced);
   assert.throws(() => manager.isReady(), fenced);
   assert.throws(() => manager.getPendingWork(), fenced);
+  assert.throws(() => manager.getWaitingWork(), fenced);
   assert.throws(() => manager.getHotContextSettings(), fenced);
   assert.throws(() => manager.previewContext({ maxTokens: 1000 } as never), fenced);
   assert.throws(() => manager.listPins(), fenced);

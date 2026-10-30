@@ -30,6 +30,7 @@ export type {
   ContextEntryInternal,
   TokenBudget,
   PendingWork,
+  WaitingWork,
   BranchInfo,
   ContextInjection,
   CompileResult,

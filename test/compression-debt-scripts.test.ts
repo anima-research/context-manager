@@ -86,6 +86,13 @@ AutobiographicalStrategy.prototype.callProvider = async function () {
 };
 `)}`;
 
+const REJECTS = `data:text/javascript,${encodeURIComponent(`
+import { AutobiographicalStrategy } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'dist/src/index.js')).href)};
+AutobiographicalStrategy.prototype.callProvider = async function () {
+  throw new Error('the provider is down (test)');
+};
+`)}`;
+
 const STRAYS_FAIL = `data:text/javascript,${encodeURIComponent(`
 import { AutobiographicalStrategy } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'dist/src/index.js')).href)};
 AutobiographicalStrategy.prototype.getStrandedSummaries = function () {
@@ -176,32 +183,45 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     await storeWithPendingChunks(cascade, 48);
     const recipe = join(dir, 'cascade-recipe.json');
     writeFileSync(recipe, JSON.stringify({ agent: { strategy: { mergeThreshold: 2 } } }));
-    const r = run(DRAIN, [...drainArgs(cascade).filter((a) => !a.startsWith('--max-steps')), '--max-steps=400', `--recipe=${recipe}`], ANSWERS);
+    const args = [...drainArgs(cascade).filter((a) => !a.startsWith('--max-steps')), '--max-steps=400', `--recipe=${recipe}`];
+    const r = run(DRAIN, args, ANSWERS);
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.equal(events(r.stdout).at(-1)?.completed, true);
-    const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0, minChunkCharsForLLM: 0, mergeThreshold: 2 } as never);
-    const manager = await ContextManager.open({ path: cascade, namespace: 'probe', strategy, membrane: { complete: async () => { throw new Error('no provider call (test)'); } } as never });
-    try {
-      const lane = strategy as unknown as { mergeQueue: unknown[]; summaries: Array<{ level: number }>; checkMergeThreshold(): void };
-      assert.ok(lane.summaries.some((x) => x.level >= 3), 'premise: the L2s merged on');
-      lane.checkMergeThreshold();
-      assert.deepEqual(lane.mergeQueue, [], 'nothing left to pick');
-    } finally { manager.close(); }
+    const finish = events(r.stdout).at(-1)!;
+    assert.equal(finish.completed, true);
+    assert.ok(Number((finish.summaries as { l3?: number } | undefined)?.l3) > 0, 'premise: the L2s merged on');
+    const again = run(DRAIN, args, ANSWERS);
+    assert.equal(again.status, 0, again.stdout + again.stderr);
+    const seen = events(again.stdout);
+    assert.deepEqual([seen[0]?.mergeQueue, seen[0]?.mergesUnpicked], [0, false], 'nothing left to pick when the store opens again');
+    assert.equal(seen.filter((e) => e.event === 'step').length, 0, 'so a second run takes no step');
+    assert.deepEqual([seen.at(-1)?.completed, seen.at(-1)?.stopped], [true, 'drained'], again.stdout);
   });
 
   it('the drain ends at a tick that fails, with its merges reported unpicked, when its chunks can\'t compress', async () => {
     const stalled = join(dir, 'stalled');
     await storeWithPendingChunks(stalled);
-    const r = run(DRAIN, [...drainArgs(stalled).filter((a) => !a.startsWith('--max-steps')), '--max-steps=3']);
+    const r = run(DRAIN, [...drainArgs(stalled).filter((a) => !a.startsWith('--max-steps')), '--max-steps=3'], REJECTS);
     assert.equal(r.status, 1, r.stderr);
     const finish = events(r.stdout).at(-1)!;
     assert.equal(finish.event, 'finish', r.stdout + r.stderr);
     assert.equal(finish.completed, false);
     assert.ok(Number(finish.pendingChunks) > 0, 'premise: chunks still wait for compression');
     assert.equal(finish.mergesUnpicked, true);
-    assert.match(String(finish.tickError), /Connection error/);
+    assert.match(String(finish.tickError), /the provider is down \(test\)/);
     assert.equal(finish.stopped, 'tick-error');
     assert.match(r.stderr, /not drained \(tick-error\): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands\n/);
+  });
+
+  it('the drain stops once only work waiting on the resident\'s tools is left, and says so', async () => {
+    const waiting = join(dir, 'waiting');
+    await storeWithPendingChunks(waiting);
+    const args = [...drainArgs(waiting).filter((a) => !a.startsWith('--max-steps') && !a.startsWith('--model')), '--model=claude-fable-5-1', '--max-steps=200'];
+    const r = run(DRAIN, args);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    const finish = events(r.stdout).at(-1)!;
+    assert.deepEqual([finish.event, finish.completed, finish.stopped, finish.tickError], ['finish', false, 'waiting-on-tools', undefined], r.stdout);
+    assert.ok(Number(finish.waitingOnTools) > 0, 'premise: chunks wait on the tools');
+    assert.match(r.stderr, /not drained \(waiting-on-tools\): \d+ chunks and merges wait on the resident's tool definitions; run the drain again with --tools-log=<a log of its requests>\n/);
   });
 
   it('the drain stops before any tick and fails', async () => {

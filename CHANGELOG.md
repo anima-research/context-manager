@@ -12,6 +12,149 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.24.2 — 2026-10-30
+
+### Added
+
+- `ContextManager.getWaitingWork()` names background work that waits on the
+  host, such as for its tool definitions, with `waitingOn: 'tools'` and a
+  description such as "4 chunks wait on the host's tool definitions"; it is
+  `null` when nothing waits. `getPendingWork()` is unchanged. The new
+  `WaitingWork` type is exported, and `ReadinessState` gains `waitingOn` and
+  `waitingDescription`, set whenever anything waits.
+- `AutobiographicalProgressSnapshot` gains `l1WaitingOnTools` and
+  `mergesWaitingOnTools`, counting the work its queue lengths leave out.
+
+### Changed
+
+- `ReadinessState.ready`, and `ContextManager.isReady()` and
+  `checkReadiness()` with it, no longer count background work that waits on
+  something only the host can give, such as its tool definitions, so a loop
+  that ticks until ready ends on a host that never declares any.
+  `ReadinessState.ready` was "Whether the strategy has no background work
+  pending." and is now "Whether the strategy has no background work pending,
+  other than work that waits on something only the host can give, such as its
+  tool definitions: `waitingOn` names that."; `isReady()` was "Whether the
+  strategy has no background work pending (its `checkReadiness()`)." and adds
+  "other than work that waits on the host, such as for its tool definitions,
+  which getWaitingWork() names."; `checkReadiness()` was "Whether the strategy
+  has background work pending, with its info if so." and adds "and what waits
+  on the host."
+- `AutobiographicalProgressSnapshot.l1QueueLength` and `mergeQueueLength`
+  leave out work waiting on the host's tool definitions: "Chunks queued for L1
+  compression." and "Pending L1→L2 and L2→L3 merges." each add "less those
+  waiting on the host's tool definitions." A loop that ticks while they are
+  above 0 ends once only waiting work is left.
+
+### Fixed
+
+- `AutobiographicalStrategy`'s lookup of the persisted canonical summaries no
+  longer compares each held summary with the whole stored summary list. It
+  groups the stored list by id once, and compares each held summary only with
+  the stored copies of its own id. On synthetic stores of about 20,000
+  summaries, on Linux with Node 24.22.1, one lookup took 4.2 and 5.7 s of CPU
+  before this change and 0.26 and 0.32 s after it, in two rounds. It finds the
+  same summaries.
+
+- `AutobiographicalStrategy` no longer loses a chunk whose compression it
+  defers because the host hasn't declared its tool definitions. The chunk
+  stays queued where it was, and ticks after the host declares them compress
+  the waiting chunks in order, where before they waited for the next rebuild
+  of the chunks (a new message, or a compile). Every later chunk whose request
+  replays the deferred one waits the same way.
+- On a Fable- or Mythos-family compression model with no tools declared, a
+  merge now waits for the host's tools as a chunk already did, rather than
+  going out without them. The head merge reads as waiting once a tick has
+  asked about it, and the merges behind it, and chunks the speculative cap
+  holds behind it, wait with it. A head merge that makes no call (a missing or
+  parented source, one a summary hold or quarantine record keeps, a crossed
+  merge) is still dropped when a tick asks about it, so a loop that ticks
+  until ready drops it too; one whose sources change after a tick found it
+  waiting reads as waiting until the next rebuild or the tools.
+- `scripts/drain-autobiographical.ts` no longer reports a store drained while
+  work waits on tools: it stops with `stopped: "waiting-on-tools"` and says to
+  run it again with `--tools-log`. `scripts/migrate-llr.ts` says its
+  compression stopped, naming what waits, rather than that it completed.
+
+- On chronicle 0.5.1 or later, which gives a stored object back with its keys
+  in the order they were written, a message's content renders that way, at
+  every level of a block. A text block written as `{"type":"text","text":"…"}`
+  rendered as `{"text":"…","type":"text"}`, its keys sorted, and now renders
+  as written, as do a `tool_use` block and an input `toolUseInputMaxTokens`
+  leaves whole. An image, document, audio or video block with inline data is
+  still rebuilt from its stored blob as `{type, source}`.
+- A message stored on an earlier chronicle comes back as that chronicle
+  stored it: sorted, for one appended there. One edited there can come back
+  as written from the upgrade on. A request holding such a message then
+  changes once, and so does its hash, so a compression refusal recorded
+  against that request no longer matches it: the chunk can be sent for
+  compression once more, unless its cap on quarantined shapes is already
+  reached.
+- The `_keys` of a `tool_use` input that `toolUseInputMaxTokens` truncates
+  name its first five keys in its own key order (in a JavaScript object, its
+  own property order), where they were its first five in sorted order. For an
+  input stored on an earlier chronicle, that order is still sorted.
+
+- **Hosts on membrane 0.9.0:** context-manager asked for
+  `@animalabs/membrane` `^0.8.0` and now accepts `^0.8.0 || ^0.9.0`, so npm
+  installs one copy, shared with context-manager, for a host on either
+  version. Before, a host on 0.9.0 got a second membrane installed for
+  context-manager: TypeScript refused the host's `Membrane` where
+  context-manager takes one ("Type 'import("…/membrane").Membrane' is not
+  assignable to type 'import("…/membrane").Membrane'", TS2322). A host on
+  0.8 changes nothing. For a host with no membrane dependency of its own,
+  the range now admits 0.9.0, npm's `latest`, as well as 0.8.
+  - **Unchanged:** context-manager's own code, which uses nothing membrane
+    0.9.0 adds. For the requests compared, through the Anthropic,
+    OpenRouter and an OpenAI-compatible adapter, with a system prompt, an
+    image, a tool call and its result and a cache breakpoint, and with
+    thinking, by `complete()`, `stream()` and `streamYielding()`, membrane
+    0.9.0 sent the same method, path, body and headers as 0.8.0 in all 36
+    cases, leaving out `host`, `content-length`, `connection` and the SDK's
+    retry-count and timeout headers.
+  - The lockfile now installs 0.9.0, so this release's tests run on it; the
+    same code ran on 0.8.0 before this change. membrane 0.9.0's own changes
+    reach context-manager's calls when the host's `Membrane` is 0.9;
+    membrane's changelog for 0.9.0 says what they are.
+
+- `AutobiographicalStrategy` and `KnowledgeStrategy` send a message that holds
+  a tool call and, after it in its own content, that call's result, with that
+  result, on the hierarchical and adaptive selects alike. Pairing repair
+  (`enforceToolPairing`) judged each message whole, so it dropped such a
+  result as answering no call before it and sent a stub for the call: a
+  message the compile's split (`splitMixedToolMessages`, which `compile()`
+  runs on every message) or membrane's normalizer would have sent with its
+  results lost them in every compile. The repair now judges such a message in
+  parts, each run of results that answers a call earlier in its own content,
+  one no result there has answered yet, as one part and what follows it as
+  another, and folds the parts back into the one message, so a result answers
+  its call in its own message; a call its own results don't answer is answered
+  as pairing repair answers any call: by its result moved up where the
+  look-ahead finds one, else by a stub. This holds for a user message of that
+  shape too, which membrane's normalizer re-roles. A compile holding no such
+  message is repaired exactly as before. Compile provenance now reports such a
+  message carried whole (`complete: true`) where nothing else alters it; it
+  reported it incomplete, missing `content`.
+- `toolResultMaxLastN` counts such a result as answering its call: a result
+  answers the earliest call with its id before it, in its own message or an
+  earlier one, that no result has answered yet. It answered none before, so it
+  was never replaced, and in a store holding one, an older result of the same
+  tool that was sent whole can now get its marker.
+- The calibration's pricing epoch is 6, after the generated images' 5. The
+  plan and the render stats priced such a message with its results while the
+  request carried stubs, so a store holding one learned a multiplier low
+  enough to make up for results it didn't send. In a store holding a message
+  with a tool result that answers a tool call before it in its own content, a
+  multiplier learned under an earlier pricing epoch, or with no stamp, is
+  discarded at load: it restarts from a provisional 1, which the first
+  provider sample within the calibration's band replaces. In any other store a
+  multiplier is kept or discarded as before, so one stamped with epoch 5 is
+  kept and re-stamped.
+- A store holding such a message sends different requests after the upgrade,
+  so its first request misses the prompt cache, and its window can move again
+  when the first accepted sample replaces its provisional multiplier. Every
+  other store sends what it sent.
+
 ## 0.24.1 — 2026-10-29
 
 ### Added

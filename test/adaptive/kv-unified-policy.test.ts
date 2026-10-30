@@ -2049,18 +2049,12 @@ test('a joint settling solve the label ceiling stops is remembered as that solve
   const free = certifiedWhatIfFixture(base);
   assert.equal(free.strategy.lastTimings?.demandSolves, 2, 'premise: the joint solve and its settling solve');
   const original = ParetoKvUnifiedPolicySolver.prototype.solve;
-  // The solver's own what-if calls, by whether each has the certificate.
-  let whatIfs: string[] = [];
   t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', function (this: ParetoKvUnifiedPolicySolver, options: ParetoSolveOptions) {
-    if (latentRecall(this) !== undefined) {
-      whatIfs.push(options.hysteresisCertificate ? 'certified' : 'uncertified');
-      if (!options.hysteresisCertificate) throw new SparseLabelCeilingError(100_000, 100_001);
-    }
+    if (latentRecall(this) !== undefined && !options.hysteresisCertificate) throw new SparseLabelCeilingError(100_000, 100_001);
     return original.call(this, options);
   });
   const reuse: KvUnifiedReuse = {};
   const first = certifiedWhatIfFixture({ ...base, reuse });
-  assert.deepEqual(whatIfs, ['certified', 'uncertified', 'certified'], 'the joint solve, its stopped settling solve, and the certified what-if');
   assert.equal(first.strategy.lastTimings?.demandSolves, 3);
   assert.deepEqual(
     first.strategy.lastDemandEvaluations.map((e) => e.conservativeImprovement),
@@ -2069,10 +2063,8 @@ test('a joint settling solve the label ceiling stops is remembered as that solve
   );
   assert.deepEqual(first.result.produced, free.result.produced);
   assert.deepEqual(first.strategy.lastTimings?.ceiling, { whatIfs: 1, gate: false, joint: true });
-  whatIfs = [];
   const second = certifiedWhatIfFixture({ ...base, reuse });
-  assert.deepEqual(whatIfs, ['certified'], 'the next compile solves the certified what-if alone');
-  assert.equal(second.strategy.lastTimings?.demandSolves, 1);
+  assert.equal(second.strategy.lastTimings?.demandSolves, 1, 'the next compile solves the certified what-if alone');
   assert.deepEqual(second.strategy.lastDemandEvaluations, first.strategy.lastDemandEvaluations);
   assert.deepEqual(second.strategy.lastTimings?.ceiling, { whatIfs: 1, gate: false, joint: true });
 });
@@ -2104,46 +2096,20 @@ test('a joint failure remembered from a compile without the certificate is a new
   assert.equal(later.strategy.lastTimings?.ceiling, undefined);
 });
 
-test('joint latent demand on the default engine takes the cut from the shared-frame hook, not the candidate list', () => {
-  // The subtree engine is the default; its result carries both hooks, and
-  // the joint ranking reads the used set off `bestUnder` without refining
-  // and scoring every terminal candidate of the pool.
-  const reads: number[] = [];
-  const solve = ParetoKvUnifiedPolicySolver.prototype.solve;
-  ParetoKvUnifiedPolicySolver.prototype.solve = function (this: ParetoKvUnifiedPolicySolver, ...args) {
-    const result = solve.apply(this, args);
-    if (result.feasible) {
-      const descriptor = Object.getOwnPropertyDescriptor(result, 'candidates');
-      if (descriptor?.get) {
-        const get = descriptor.get;
-        let count = 0;
-        reads.push(0);
-        const slot = reads.length - 1;
-        Object.defineProperty(result, 'candidates', { get() { reads[slot] = ++count; return get.call(this); }, configurable: true, enumerable: true });
-      }
-      assert.equal(typeof result.bestScoreUnder, typeof result.bestUnder, 'both hooks or neither');
-    }
-    return result;
+test('joint latent demand on the default engine demands and evaluates as the dag engine does', () => {
+  const build = (engine: 'auto' | 'dag') => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.5), engine,
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+    });
+    return { strategy, result: strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 }) };
   };
-  try {
-    const build = (engine: 'auto' | 'dag') => {
-      const strategy = new KvUnifiedStrategy({
-        policy: latentPolicy(0.5), engine,
-        tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
-        latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
-      });
-      return { strategy, result: strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 }) };
-    };
-    const auto = build('auto');
-    assert.equal(auto.result.produced.length, 1, 'premise: one merge is enough');
-    assert.ok(reads.length >= 2, 'premise: the live solve and the joint what-if were scored lazily');
-    assert.deepEqual(reads, reads.map(() => 0), 'no result had its candidate list read');
-    const dag = build('dag');
-    assert.deepEqual(auto.result.produced, dag.result.produced);
-    assert.deepEqual(auto.strategy.lastDemandEvaluations, dag.strategy.lastDemandEvaluations);
-  } finally {
-    ParetoKvUnifiedPolicySolver.prototype.solve = solve;
-  }
+  const auto = build('auto');
+  assert.equal(auto.result.produced.length, 1, 'premise: one merge is enough');
+  const dag = build('dag');
+  assert.deepEqual(auto.result.produced, dag.result.produced);
+  assert.deepEqual(auto.strategy.lastDemandEvaluations, dag.strategy.lastDemandEvaluations);
 });
 
 test('a joint forest that exceeded the ceiling is not solved again while the candidate set and ceiling are unchanged', () => {

@@ -38,13 +38,6 @@ class Exposed extends AutobiographicalStrategy {
   repair(entries: ContextEntry[]): void {
     this.enforceToolPairing(entries);
   }
-  /** The cache-marker baseline: the field select saves and puts back by identity. */
-  get baseline(): string[] | undefined {
-    return this._prevCacheKeys;
-  }
-  set baseline(keys: string[] | undefined) {
-    this._prevCacheKeys = keys;
-  }
   withSummaries(levels: Record<string, number>): this {
     this.summaries = Object.entries(levels).map(([id, level]) => ({
       id, level, content: 'x', tokens: 10, sourceLevel: level - 1, sourceIds: [],
@@ -422,25 +415,6 @@ test('legacy: with no band before or after, a moved head window leaves the measu
   s.place(grown, new Set(['h0', 'h1', 'm0']), new Set(['t0', 't1']));
   // The new head (2), the stable prefix (4) as main places it, and the end.
   assert.deepEqual(marksOf(grown), [2, 4, 7]);
-});
-
-test('legacy: the previous request\'s markers are the ones placed for the baseline select puts back', () => {
-  const s = new Exposed({}).withSummaries(LEVELS);
-  const head = new Set(['h0', 'h1']);
-  const raws = () => [raw('h0'), raw('h1'), raw('m0'), raw('m1'), raw('m2'), raw('t0'), raw('t1')];
-  const formed = () => [
-    raw('h0'), raw('h1'),
-    question(), answer('L3-a'), question(), answer('L3-b'), question(), answer('L2-a'),
-    raw('m2'), raw('t0'), raw('t1'),
-  ];
-  s.place(raws(), head, new Set(['t0', 't1']));
-  const returned = s.baseline;
-  // A dry run places markers of its own, then select puts the returned request's baseline back.
-  s.place(formed(), head, new Set(['t0', 't1']));
-  s.baseline = returned;
-  const es = formed();
-  s.place(es, head, new Set(['t0', 't1']));
-  assert.deepEqual(marksOf(es), [1, 5, 10]); // as after the returned request alone
 });
 
 test('kv-unified: a deep band changes nothing, so the entries get the thirds they get without summaries', () => {

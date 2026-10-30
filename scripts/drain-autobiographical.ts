@@ -12,7 +12,8 @@
  * read), --tools-log a log of the resident's requests for a summarizer that
  * needs tool definitions, and --clear-merge-quarantine a merge-quarantine
  * key to clear before the first tick (repeatable). Its finish line says why
- * it stopped (`stopped`): drained, max-steps, tick-error or debt-unreadable.
+ * it stopped (`stopped`): drained, waiting-on-tools, max-steps, tick-error or
+ * debt-unreadable.
  * Run again, it goes on from the store as it stands.
  */
 
@@ -160,6 +161,7 @@ const compact = () => {
   return {
     l1Queue: progress.l1QueueLength,
     mergeQueue: progress.mergeQueueLength,
+    waitingOnTools: progress.l1WaitingOnTools + progress.mergesWaitingOnTools,
     pending: progress.pending,
     summaries: progress.summaryCounts,
     // null when the debt report couldn't count one of them (see debtError)
@@ -179,7 +181,10 @@ let completed = false;
 let final = compact();
 let tickError: string | undefined;
 const drained = (c: ReturnType<typeof compact>): boolean =>
-  !c.pending && c.l1Queue === 0 && c.mergeQueue === 0 && c.pendingChunks === 0 && !c.mergesUnpicked;
+  !c.pending && c.l1Queue === 0 && c.mergeQueue === 0 && c.waitingOnTools === 0 && c.pendingChunks === 0 && !c.mergesUnpicked;
+const onlyWaiting = (c: ReturnType<typeof compact>): boolean =>
+  !c.pending && c.l1Queue === 0 && c.mergeQueue === 0 && c.waitingOnTools > 0;
+let waiting = false;
 try {
   for (let step = 1; step <= maxSteps; step++) {
     const before = compact();
@@ -196,16 +201,25 @@ try {
       tickError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       break;
     }
-    console.log(JSON.stringify({ event: 'step', step, ...compact() }));
+    const after = compact();
+    console.log(JSON.stringify({ event: 'step', step, ...after }));
+    if (onlyWaiting(after) && JSON.stringify(after) === JSON.stringify(before)) {
+      waiting = true;
+      break;
+    }
   }
   final = compact();
   if (!completed && tickError === undefined && final.debtError === undefined && drained(final)) completed = true;
 } finally {
   manager.close();
 }
-const stopped = completed ? 'drained' : tickError !== undefined ? 'tick-error' : final.debtError !== undefined ? 'debt-unreadable' : 'max-steps';
+const stopped = completed ? 'drained' : tickError !== undefined ? 'tick-error' : final.debtError !== undefined ? 'debt-unreadable'
+  : waiting ? 'waiting-on-tools' : 'max-steps';
 console.log(JSON.stringify({ event: 'finish', completed, stopped, ...final, ...(tickError !== undefined ? { tickError } : {}) }));
-if (!completed) {
+if (stopped === 'waiting-on-tools') {
+  console.error(`not drained (waiting-on-tools): ${final.waitingOnTools} chunks and merges wait on the resident's tool definitions; ` +
+    'run the drain again with --tools-log=<a log of its requests>');
+} else if (!completed) {
   console.error(`not drained (${stopped}): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands` +
     (stopped === 'debt-unreadable' ? ', once the debt report can be read' : ''));
   console.error('restarting the resident instead: it finishes by its own rules and can leave strays the audit lists; ' +

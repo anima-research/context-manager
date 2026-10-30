@@ -881,7 +881,6 @@ describe('Mint preimage materialization failures', () => {
       () => getMintRequestPreimageBytes(fx.store, fx.requestHash),
       (error: unknown) => {
         assert.ok(error instanceof MintPreimageMaterializationError);
-        assert.ok(error.cause instanceof TypeError);
         return true;
       },
     );

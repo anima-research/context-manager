@@ -679,15 +679,6 @@ describe('the stray list, getStrandedSummaries()', () => {
     assert.ok(strandedIn(runsAtLevel(input, 1).runs).some((x) => (x.s as SummaryEntry).id === 'x'), 'control');
   });
 
-  it('clears a put-off pick when a load finds no store', () => {
-    const p = new Probe({ adaptiveResolution: true, autoTickOnNewMessage: false });
-    const internals = p as unknown as { mergePicksDeferred: boolean; store: unknown; loadPersistedState(): void };
-    internals.mergePicksDeferred = true;
-    internals.store = undefined;
-    internals.loadPersistedState();
-    assert.equal(internals.mergePicksDeferred, false);
-  });
-
   it('ends the walk to a hole at a summary with no level, which no merge takes', () => {
     const p = probe({ speculativeProduction: true, mergeHoldSummaryIds: ['held'] });
     const under = (prefix: string, from: number, parent: string) =>
@@ -780,7 +771,8 @@ describe('the stray list, getStrandedSummaries()', () => {
     ]);
     p.quarantineGroup('pair', ['h1', 'h2']);
     p.quarantineGroup('three', ['h1', 'h2', 'h3']);
-    assert.deepEqual(p.getStrandedSummaries().summaries?.find((x) => x.id === 'P1')?.beside, [
+    const beside = p.getStrandedSummaries().summaries?.find((x) => x.id === 'P1')?.beside ?? [];
+    assert.deepEqual([...beside].sort((a, b) => a.id.localeCompare(b.id)), [
       { kind: 'merge-quarantine', id: 'pair', side: 'after', level: 1 }, { kind: 'merge-quarantine', id: 'three', side: 'after', level: 1 },
     ], 'clearing one leaves the other holding h1');
   });
