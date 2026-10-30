@@ -9,12 +9,14 @@
   call with the id, so the earlier call goes with a stub and the later call
   with its own result.
 - `toolResultMaxLastN` counts a result toward that same call: the nearest call
-  with its id before it, in its own message or an earlier one. This replaces
-  the rule that a result answers "the earliest call with its id before it, in
-  its own message or an earlier one, that no result has answered yet". Under
-  that rule, where an earlier call with the id went unanswered, each later
-  result counted toward the call before its own, so the newest call's result
-  could go as the marker while an older result of the tool went whole.
+  with its id before it, in its own message or an earlier one. Its doc said a
+  result answers "the earliest call with its id, in an earlier message, that
+  no result has answered yet", and an earlier entry, for a result in its
+  call's own message, said "the earliest call with its id before it, in its own
+  message or an earlier one, that no result has answered yet". Under that
+  rule, where an earlier call with the id went unanswered, each later result
+  counted toward the call before its own, so the newest call's result could go
+  as the marker while an older result of the tool went whole.
 - A host that stores a call's result late, after a later call has reused the
   call's id, now has that result paired with the later call: the earlier call
   goes with a stub, and a second result after the later call is dropped as a
