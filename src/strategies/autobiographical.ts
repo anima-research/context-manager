@@ -8457,18 +8457,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  `critical` until an operator clears it, its group queues as a valid merge, or a source
      *  is parented or gone, which the sweep then removes. */
     topologyRefusals: number | null;
-    /** The compression lane's pause, when one binds the configured compression model now: `until`
-     *  is when the lane may call again, or null when the pause holds until a restart, a change of
-     *  membrane or model, or releaseCompressionPause() (a provider's stated wait that can't be held
-     *  as an instant). Null when no pause binds. A pause bound to another membrane instance shows
-     *  until the next tick drops it. Reported in a report that failed too; it doesn't change `state`. */
-    compressionPause: { until: number | null } | null;
+    /** The compression lane's pause on the configured compression model, when one binds at `now`;
+     *  null when none does. `until` is when the lane will try again by itself, in milliseconds since
+     *  the Unix epoch as Date.now() gives: the later of its own backoff and the wait it was given, a
+     *  provider's stated wait after a failed call, or after a deferral by the caller's provider
+     *  admission, how long it keeps that answer before asking again (at most 30 s, less if the
+     *  admission's deadline comes first). `until` is null only when a provider stated a wait that
+     *  can't be held as an instant, which holds until a restart, releaseCompressionPause(), or a
+     *  change of membrane or model once a tick sees it. `model` is the model the pause holds, the
+     *  configured compression model, or null when none is configured. Like checkReadiness(), the
+     *  report can't see the membrane: a pause bound to another membrane instance shows until a tick
+     *  that reaches the pause check with another membrane drops it. Reported in a report that failed
+     *  too; it doesn't change `state`. */
+    compressionPause: { until: number | null; model: string | null } | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
     const pause = this.configuredModelPause(now);
-    const pausedUntil = pause ? pauseUntil(pause) : null;
-    const compressionPause = pausedUntil === null ? null : { until: Number.isFinite(pausedUntil) ? pausedUntil : null };
+    const pausedUntil = pause === null ? null : pauseUntil(pause);
+    const compressionPause = pause === null || pausedUntil === null
+      ? null
+      : { until: Number.isFinite(pausedUntil) ? pausedUntil : null, model: pause.model ?? null };
     try {
       const liveEdge = this.heldBackChunks(this.config.l1HoldbackChunks ?? 1);
       const keptBack = (c: Chunk, i: number): boolean => {
