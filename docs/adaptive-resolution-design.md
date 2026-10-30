@@ -690,10 +690,12 @@ So kv-stable emits `lower` ops -- **breaking the rev-3.0 / section 3.9 "monotoni
 Per-chunk depth ceiling handed to the shedder:
 
 ```
-foldDepthCap = 0                                      if pinned or in the flat (raw) zone
+foldDepthCap = 0                                      if pinned or in the raw zone
              = min(MAX_FOLD_LEVEL,                    otherwise
                    floor(log_k(age / flatZoneChunks)) + 1)      k = mergeThreshold (default 6)
 ```
+
+`flatZoneChunks` is the attended window's length in chunks (`ControlPlanParams.attendedChunks`). Under `kv-stable` that's the attended tail alone, so a head or pins kept raw outside it don't count.
 
 Intent: a scale-free raw->L1->L2->L3 banding matching the base-k summary-tree geometry -- recent content stays fine, old fades logarithmically. It produces the *relevance* gradient; it is **not** the cache mechanism (that is the reach cap, section 12.2).
 

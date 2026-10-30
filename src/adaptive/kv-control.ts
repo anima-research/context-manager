@@ -1048,8 +1048,13 @@ export interface ControlPlanParams {
    *  Also bounds how misallocated a dead-band hold may be before the solver
    *  self-heals. Default 0.35. */
   qualityGapRatio?: number;
-  /** Chunks forced to raw and never folded (flat zone / head / tail / pinned). */
+  /** Chunks forced to raw and never folded: the attended window (the flat
+   *  zone), and any head and pins kept raw. */
   rawZone: ReadonlySet<ChunkId>;
+  /** The attended window's length in chunks, the unit the shape prior
+   *  (`foldDepthCap`) measures age in. Default `rawZone.size`, which is that
+   *  length when the raw zone is the attended window alone. */
+  attendedChunks?: number;
   /**
    * Chunks kept at their carried resolution (locked), never folded or
    * un-folded by the solve. The base lowers a lock to its pin-max-level when
@@ -1398,7 +1403,7 @@ function planUnreported(
 
   // Shape prior: soft per-chunk depth caps (log-age band + pin caps), with the
   // −1 sentinel marking the hard-protected set (never folded by anything).
-  const flatZoneChunks = p.rawZone.size;
+  const flatZoneChunks = p.attendedChunks ?? p.rawZone.size;
   const caps = new Map<ChunkId, number>();
   for (const c of ordered) {
     let cap: number;

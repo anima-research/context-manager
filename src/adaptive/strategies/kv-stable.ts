@@ -8,9 +8,10 @@
  * `planControlledFrontier` (the *same* policy the replay harness measures)
  * and returns it for the picker to apply directly.
  *
- * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
- * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
- * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and reconciles a
+ * It minimizes real prefix churn: it holds the head, the attended tail (the
+ * flat zone) and pinned chunks raw, never folds locked chunks, honors V2
+ * leveled pins (`pinLevel` / `pinMaxLevel`) as fixed levels / hard
+ * fold-depth caps, and reconciles a
  * relevance-ideal cut (seeded from the carried frontier unless its
  * `seedFromCarried` option is false, as a measurement's from-scratch arm
  * sets it) against the carried frontier
@@ -103,10 +104,10 @@ export class KvStableStrategy implements FoldingSolver {
     const tree = new SummaryTree(inputs);
     const fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
 
-    // Flat zone (forced raw, never folded): head, tail, classic pins. Frozen
-    // (kept at their carried resolution, never touched): locked. V2 dynamic pins
-    // (`pinLevel` / `pinMaxLevel`) are honored as a fixed level or a hard fold-
-    // depth cap — see `planControlledFrontier`.
+    // Raw zone (forced raw, never folded): head, tail (the flat zone), classic
+    // pins. Frozen (kept at their carried resolution, never touched): locked.
+    // V2 dynamic pins (`pinLevel` / `pinMaxLevel`) are honored as a fixed level
+    // or a hard fold-depth cap — see `planControlledFrontier`.
     const rawZone = new Set<ChunkId>();
     const frozen = new Set<ChunkId>();
     const fixedLevels = new Map<ChunkId, number>();
@@ -176,6 +177,7 @@ export class KvStableStrategy implements FoldingSolver {
       qualityGapRatio: this.opts.qualityGapRatio,
       seedFromCarried: this.opts.seedFromCarried,
       rawZone,
+      attendedChunks: inputs.tailChunkIds.size,
       frozen,
       fixedLevels,
       pinCaps,
