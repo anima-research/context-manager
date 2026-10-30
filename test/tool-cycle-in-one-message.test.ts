@@ -44,7 +44,7 @@ async function compileOf(select: keyof typeof selects, stored: Stored, config: R
   }
 }
 
-// membrane 0.8.0's normalizer builds the provider's turns from these messages: it moves tool_use blocks to an
+// membrane 0.9.0's normalizer builds the provider's turns from these messages: it moves tool_use blocks to an
 // assistant turn and tool_result blocks to a user turn (normalize-tool-pairs.ts). These cases rely on that
 // re-role for a user message that holds a call. Where a call has no result it stands in for one, and a result
 // with no call of its own it rewrites as text; those are the repairs counted here.
