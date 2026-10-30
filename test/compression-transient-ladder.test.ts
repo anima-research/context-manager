@@ -820,6 +820,27 @@ describe("getCompressionDebt names the lane's pause: when it tries again by itse
     }
   });
 
+  it('a deferral under a longer provider wait reads the provider wait; the model is the one the paused calls went to', async () => {
+    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 120_000 }) }, OK('after')]);
+    const fx = await queued(mock.membrane);
+    const at = Date.now();
+    testMock.timers.enable({ apis: ['Date'], now: at });
+    try {
+      fx.strategy.notePause(failure('rate_limit', { httpStatus: 429, retryAfterMs: 600_000 }), managerContext(fx.manager));
+      fx.strategy.notePause(deferred(), managerContext(fx.manager));
+      assert.deepEqual(fx.strategy.getCompressionDebt().compressionPause, { until: at + 600_000, model: 'same-model' }, 'the provider wait outlasts the recheck');
+      assert.equal(fx.strategy.releaseCompressionPause(), true);
+      fx.strategy.expirePause();
+      fx.strategy.setCompressionModel('zz-model-b');
+      await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz rate_limit failure/);
+      assert.equal(fx.strategy.getCompressionDebt().compressionPause?.model, 'zz-model-b', 'a pause on another configured model names it');
+    } finally {
+      testMock.timers.reset();
+      fx.manager.close();
+    }
+  });
+
   it('a wait that cannot be held as an instant reads until null, however long, leaves state to the age rules, shows in a report that failed too, and not for another model; a release ends it', async () => {
     const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 1e20 }) }, OK('after the release')]);
     const fx = await queued(mock.membrane);
