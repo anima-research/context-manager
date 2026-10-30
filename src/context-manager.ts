@@ -384,6 +384,58 @@ export class InitializationSupersededError extends Error {
 }
 
 /**
+ * An addMessage that failed after storing some of the message: the rows of
+ * it the store holds, and the error the write failed with.
+ *
+ * `landed` names those rows, in store order: the message's one row, or the
+ * shards of a sharded body that stayed. `cause` is the write's own error,
+ * and this error's message ends with its message, so a check of the message
+ * that matched the write's own error still matches.
+ *
+ * It is thrown only when a row of the write is in the store as the write
+ * fails, so any other error from addMessage means the manager found none of
+ * the message in the store:
+ * - A write that fails before a row lands throws its own error, unwrapped:
+ *   a refusal of the message, or of a shard as the strategy chunked it
+ *   (MalformedContentError), a chunking the manager refuses, a strategy not
+ *   initialized, a store that refuses the first append.
+ * - A sharded write that fails after storing shards removes them, so that a
+ *   retry writes one body, and then throws its own error, unwrapped. When
+ *   that removal fails too, `landed` names the shards that stayed: a body
+ *   short of its shardCount, which a retry doesn't remove.
+ * - A message stored as one row stays: its append can fail after the row
+ *   landed, when the manager's own listener fails inside it (see
+ *   onMessage), and `landed` names the row.
+ *
+ * The manager reads the store to tell what stayed. Where that read fails,
+ * it goes by the rows it knows the write stored: after a failed removal,
+ * `landed` names all of them, and where it knows of none it throws the
+ * write's own error, and logs that the message may be stored.
+ *
+ * Its add may have gone unheard: a failure in the manager's own listener
+ * ends the event before a host's onMessage listener hears it, and before
+ * the strategy does in legacy mode. Once a host presents rows on the
+ * branch, the rows are out of the window until it presents them
+ * (presentRows(landed)), as for any add. Where the add placed a
+ * holdCompression hold on them, it stays: releaseCompression(landed)
+ * releases it.
+ */
+export class WriteLandedError extends Error {
+  readonly landed: readonly MessageId[];
+  override readonly cause: unknown;
+
+  constructor(landed: readonly MessageId[], cause: unknown) {
+    super(
+      `addMessage failed after storing ${landed.length === 1 ? `message ${landed[0]}` : `${landed.length} rows of the message (${landed.join(', ')})`}, ` +
+        `which the store holds: ${describeThrown(cause)}`,
+    );
+    this.name = 'WriteLandedError';
+    this.landed = Object.freeze([...landed]);
+    this.cause = cause;
+  }
+}
+
+/**
  * Context Manager - the main interface for managing conversation context.
  *
  * Sits between the application/agent layer and Membrane, managing what goes
@@ -778,6 +830,19 @@ export class ContextManager {
    * row's presentRows once a host presents rows), so not even the ingress
    * chunk rebuild can fold it. Release it with
    * releaseCompression([returnedId]) (releases every shard).
+   *
+   * A write that fails after storing some of the message throws
+   * {@link WriteLandedError}: its `landed` names the rows of the message
+   * the store holds, in store order, and its `cause` is the write's own
+   * error. Any other error means the manager found none of the message in
+   * the store: a write that fails before a row lands throws its own error,
+   * and so does a sharded write that fails partway, once it has removed the
+   * shards it stored. When that removal fails too, the error names the
+   * shards that stayed. A message stored as one row stays when its append
+   * fails after the row landed, the manager's own listener failing inside
+   * it (see onMessage). Where the store can't be read to tell what stayed,
+   * the error goes by the rows the manager knows the write stored, as
+   * WriteLandedError says.
    */
   addMessage(
     participant: string,
@@ -865,7 +930,7 @@ export class ContextManager {
             throw new MalformedContentError(`Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`, places);
           }
         }
-        let firstId: MessageId | null = null;
+        const stored: MessageId[] = [];
         const lengthBefore = this.messageStore.length();
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)
@@ -888,36 +953,95 @@ export class ContextManager {
                 shardCount,
               }
             );
-            if (firstId === null) firstId = message.id;
+            stored.push(message.id);
           }
         } catch (err) {
           // A write that fails partway leaves no part of the body in the
           // store: remove what it wrote (the failing shard too, if it
-          // landed), so a retry writes one body. If that fails as well, the
-          // shards may stay, and shardCount marks the body short. The first
-          // shard's own append can throw after it landed: then it's the
-          // store's last. Nothing here replaces the write's own error.
-          let landed = firstId;
-          try {
-            if (landed === null && this.messageStore.length() > lengthBefore) {
-              const last = this.messageStore.getTail(1)[0];
-              if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
-            }
-            if (landed !== null) this.messageStore.removeBodyGroup(landed);
-          } catch (removal) {
+          // landed), so a retry writes one body, and throw the write's own
+          // error. If that fails as well, the shards may stay, and
+          // shardCount marks the body short: the error names those that
+          // did (WriteLandedError). A shard's own append can throw after it
+          // landed: then its row follows the shards stored before it, and
+          // removing their run removes it too.
+          const wrote = [...stored];
+          const leftShort = (failure: unknown) =>
             this.diag.error(
               `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
-                `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
-                describeThrown(removal),
+                `${decision.bodyGroupId}${wrote.length > 0 ? ` (first shard ${wrote[0]})` : ''} may be left short: ` +
+                describeThrown(failure),
             );
+          try {
+            const failing = this.rowLandedAt(lengthBefore + stored.length, decision.bodyGroupId);
+            if (failing !== null) wrote.push(failing);
+          } catch (read) {
+            // With no shard stored before it, nothing says where its row
+            // would be, so nothing is removed.
+            if (stored.length === 0) {
+              leftShort(read);
+              throw err;
+            }
+          }
+          if (wrote.length === 0) throw err;
+          try {
+            this.messageStore.removeBodyGroup(wrote[0]!);
+          } catch (removal) {
+            leftShort(removal);
+            const stayed = this.rowsStillStored(wrote);
+            if (stayed.length > 0) throw new WriteLandedError(stayed, err);
           }
           throw err;
         }
-        return firstId!;
+        return stored[0]!;
       }
     }
-    const message = this.messageStore.append(participant, content, metadata, causedBy);
-    return message.id;
+    const lengthBefore = this.messageStore.length();
+    try {
+      return this.messageStore.append(participant, content, metadata, causedBy).id;
+    } catch (err) {
+      // The append can throw after its row landed: the manager's own
+      // listener runs inside it, and its failure fails the write (see
+      // onMessage). The row stays, and the error names it.
+      let landed: MessageId | null;
+      try {
+        landed = this.rowLandedAt(lengthBefore);
+      } catch (read) {
+        this.diag.error(
+          `[context-manager] addMessage failed, and reading the store to tell whether its row landed threw, so the row may be stored: ` +
+            describeThrown(read),
+        );
+        throw err;
+      }
+      throw landed === null ? err : new WriteLandedError([landed], err);
+    }
+  }
+
+  /**
+   * The id of the row an append that threw left in this manager's slot, if
+   * it landed: the slot's row at `index`, the slot's length before the
+   * append, when it carries the append's body group (none for a message
+   * stored as one row). Null when the slot holds no such row. A read that
+   * fails throws.
+   */
+  private rowLandedAt(index: number, bodyGroupId?: string): MessageId | null {
+    const length = this.messageStore.length();
+    if (length <= index) return null;
+    const row = this.messageStore.getTail(length - index)[0];
+    return row !== undefined && row.bodyGroupId === bodyGroupId ? row.id : null;
+  }
+
+  /**
+   * The rows of `ids` this manager's slot still holds, in the order given:
+   * what a sharded write's failed removal left. All of them when the store
+   * can't be read to tell, since the removal that would have taken them
+   * out failed.
+   */
+  private rowsStillStored(ids: readonly MessageId[]): MessageId[] {
+    try {
+      return ids.filter((id) => this.messageStore.sequenceOf(id) !== undefined);
+    } catch {
+      return [...ids];
+    }
   }
 
   /**
@@ -1236,7 +1360,8 @@ export class ContextManager {
   onMessage(listener: MessageStoreListener): () => void {
     // A host's listener observes; its throw isn't the write's failure. The
     // manager's own listener (the context log's propagation) stays outside
-    // this, so a failure there still fails the write as before.
+    // this, so a failure there still fails the write as before: an add
+    // whose row stays throws WriteLandedError, naming it.
     return this.messageStore.addListener((event) => {
       try {
         listener(event);
@@ -3271,7 +3396,9 @@ export class ContextManager {
    * the transition message's add lets the add finish, and the call then
    * rejects, naming the stored message, without resetting the head window.
    * So does a presentation of it that fails, or whose strategy hook closes
-   * the manager, sets a strategy or moves the store's branch.
+   * the manager, sets a strategy or moves the store's branch. An add of the
+   * transition that fails after storing it rejects with addMessage's
+   * WriteLandedError, naming it, without resetting the head window.
    */
   async resetHeadWindow(transitionText?: string, options?: { metadata?: MessageMetadata }): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
