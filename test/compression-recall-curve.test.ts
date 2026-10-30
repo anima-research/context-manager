@@ -2167,7 +2167,7 @@ describe('compression refusal recall curves', () => {
 
   for (const rung of [false, true]) {
     it(rung
-      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though the store gives back the rung\'s options with their keys in another order'
+      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though its record gives back the rung\'s options with their keys sorted, as chronicle before 0.5.1 stored them'
       : 'a quarantined chunk run again makes no call with the tool-prose rung off (the control)', async () => {
       // Every call is refused with a provider count, which the stored record's key carries and the gate's doesn't,
       // so only the record's family, in the current request regime, can hold the chunk.
@@ -2187,10 +2187,31 @@ describe('compression refusal recall curves', () => {
         "premise: the stored record's key carries the provider's count",
       );
       if (rung) {
-        const stored = (exhausted[0]!.record as { normalizedConfig: { toolProseFallback: object } }).normalizedConfig.toolProseFallback;
+        type Exhausted = { record: { key: string; normalizedConfig: { toolProseFallback: Record<string, unknown> } } };
+        const { eventId: _eventId, sequence: _sequence, ...event } = exhausted[0]! as Record<string, unknown> & Exhausted;
+        await fx.strategy.clearCompressionRefusalQuarantine(event.record.key);
+        const options = event.record.normalizedConfig.toolProseFallback;
+        fx.manager.getStore().appendToStateJsonWithIdentity(
+          'default/autobio:compression-refusal-quarantine-events',
+          {
+            ...event,
+            record: {
+              ...event.record,
+              normalizedConfig: {
+                ...event.record.normalizedConfig,
+                toolProseFallback: Object.fromEntries(Object.keys(options).sort().map((key) => [key, options[key]])),
+              },
+            },
+            created: Date.now(),
+          },
+          'eventId',
+          'sequence',
+        );
+        const latest = quarantineEvents(fx.manager).filter((entry) => entry.kind === 'exhausted').at(-1) as unknown as Exhausted;
+        const stored = latest.record.normalizedConfig.toolProseFallback;
         const built = (fx.strategy as unknown as { toolProseHoistOptions(): object }).toolProseHoistOptions();
         assert.deepEqual(stored, built, 'premise: the stored options are the ones the strategy builds');
-        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the store gives back their keys in another order');
+        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the record gives back their keys in another order');
       }
       const logPath = `${freshPath()}-trace.jsonl`;
       paths.push(logPath);

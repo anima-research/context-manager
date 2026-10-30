@@ -10,10 +10,11 @@
  * Two properties matter more than the feature itself:
  *
  *  1. The default ('none') is byte-identical to the render that existed
- *     before the envelope was added. That is pinned against
- *     `test/fixtures/recall-envelope-golden.json`, captured MECHANICALLY on
- *     the pre-change tree (see recall-envelope-golden.generate.ts). A red
- *     here is a compat break in the change, never a stale golden.
+ *     before the envelope was added, from the same store. That is pinned
+ *     against `test/fixtures/recall-envelope-golden.json`, first captured
+ *     MECHANICALLY on the pre-change tree and re-captured only when the
+ *     store's read-back changed (see recall-envelope-golden.generate.ts). A
+ *     red here is a compat break in the change, never a stale golden.
  *  2. Nothing downstream keys on answer bytes. Q-side labels are untouched in
  *     both modes, and zero-recall surgery removes enveloped pairs exactly as
  *     it removes bare ones.
@@ -33,6 +34,7 @@ import {
 import { transformZeroRecallCompression } from '../src/surgery/zero-recall-compression.js';
 import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
 import {
+  HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT,
   HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
   HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   renderAdaptiveFixture,
@@ -116,6 +118,16 @@ describe('recallEnvelope: default mode renders the pre-change bytes', () => {
   it('explicit none is the same as omitting the option', async () => {
     const explicit = await renderHierarchicalFixture({ recallEnvelope: 'none' });
     assert.equal(JSON.stringify(explicit.messages), JSON.stringify(GOLDEN.hierarchical));
+  });
+});
+
+describe('a turn read back from the store', () => {
+  it('renders the latest turn with the bytes it was written with', async () => {
+    const rendered = await renderHierarchicalFixture();
+    assert.equal(
+      JSON.stringify(rendered.messages.at(-1)),
+      JSON.stringify({ participant: 'user', content: [{ type: 'text', text: HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT }] }),
+    );
   });
 });
 
