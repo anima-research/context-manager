@@ -721,6 +721,7 @@ describe('ContextManager.derive', () => {
     const reopened = await ContextManager.reopenDerived({ store: parent.getStore(), derivation: child.getDerivation()!, strategy: folding(), membrane: mockMembrane() as never });
     managers.push(reopened);
     assert.equal(await compiled(reopened), fromParent, 'reopened, it compiles for the reader its branch recorded');
+    assert.deepEqual([parent.viewReader, child.viewReader, reopened.viewReader], ['ann', 'ann', 'ann'], 'each says the reader it compiles for');
 
     const branch = (parent.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/ann');
     await assert.rejects(
@@ -736,6 +737,7 @@ describe('ContextManager.derive', () => {
     const plainBranch = (parent.getStore() as unknown as { view(name: string): JsStore }).view('dendrite/nobody');
     assert.ok(!plainBranch.listStates().some((state) => state.id === 'agents/nobody/reader'), 'and its branch holds none');
     assert.ok(!(await compiled(plain)).includes('[for '), 'and its child keeps no block that has an audience');
+    assert.deepEqual([nobody.viewReader, plain.viewReader], [undefined, undefined], 'and each says it compiles for no reader');
   });
 
   it('records the parent\'s reader on a child derived from before the namespace first recorded one', { skip }, async () => {
@@ -780,6 +782,7 @@ describe('ContextManager.derive', () => {
     const reopened = await ContextManager.reopenDerived({ store: ann.getStore(), derivation: child.getDerivation()!, strategy: folding(), membrane: mockMembrane() as never });
     managers.push(reopened);
     assert.ok((await compiled(reopened)).includes('[for ann]'), 'reopened, it compiles for the reader its branch keeps');
+    assert.deepEqual([inspector.viewReader, child.viewReader, reopened.viewReader], [undefined, undefined, 'ann'], 'each says the reader it compiles for: the live child none, as its parent; the reopened one its branch\'s');
 
     branch.setStateJson('agents/ann/reader', 42);
     await assert.rejects(

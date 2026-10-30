@@ -45,4 +45,6 @@
   object after it's edited away), each listing read through the reader's
   view, and `sequenceOf`, answers as the slots do, asked at the read, so its
   writes don't list the slot. `contentForReader` is exported beside
-  `filterMessageStoreView`.
+  `filterMessageStoreView`, and a manager's read-only `viewReader` says the
+  reader it compiles for: the one it was opened with, its parent's for a
+  `derive`, the branch's record for a `reopenDerived`, or none.

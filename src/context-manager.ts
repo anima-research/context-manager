@@ -516,7 +516,7 @@ export class ContextManager {
   private readonly diag: Diagnostics = namespaceDiagnostics(() => this.strategyNamespace);
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
-  private viewReader?: string;
+  private readonly readerName?: string;
   /**
    * Compression holds (see holdCompression). Transient by design: never
    * persisted, so a restart can never leave compression permanently stalled.
@@ -576,7 +576,7 @@ export class ContextManager {
     this.membrane = membrane;
     this.debugLogContext = debugLogContext;
     this.viewFilter = viewFilter;
-    this.viewReader = viewReader;
+    this.readerName = viewReader;
     this.auxiliaryStores = auxiliaryStores;
     this.foldJournal = new FoldJournal(store, strategyNamespace);
 
@@ -597,7 +597,7 @@ export class ContextManager {
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
-    view = audienceMessageStoreView(view, this.viewReader, { mayHold: () => this.mayHoldAudience() });
+    view = audienceMessageStoreView(view, this.readerName, { mayHold: () => this.mayHoldAudience() });
     // Live predicate (strategies capture views across long drains). Every
     // view built above is a fresh object, so this never leaks into a store.
     const holds = this.compressionHolds;
@@ -1357,9 +1357,9 @@ export class ContextManager {
   private async selectBranch(name: string, created: boolean): Promise<void> {
     const from = this.store.currentBranch().name;
     this.store.switchBranch(name);
-    if (this.viewReader !== undefined) {
+    if (this.readerName !== undefined) {
       try {
-        claimViewReader(this.store, this.strategyNamespace, this.viewReader, created ? 'ContextManager.fork' : 'ContextManager.switchBranch');
+        claimViewReader(this.store, this.strategyNamespace, this.readerName, created ? 'ContextManager.fork' : 'ContextManager.switchBranch');
       } catch (error) {
         this.store.switchBranch(from);
         throw error;
@@ -1391,7 +1391,7 @@ export class ContextManager {
   async fork(name?: string): Promise<string> {
     this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
-    if (this.viewReader !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.viewReader, 'ContextManager.fork');
+    if (this.readerName !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.readerName, 'ContextManager.fork');
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
@@ -1451,8 +1451,8 @@ export class ContextManager {
     if (!ContextManager.supportsDerivation(this.store)) {
       throw new ContextDerivationUnsupportedError();
     }
-    if (this.viewReader !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.viewReader, 'ContextManager.derive');
-    const reader = this.viewReader ?? recordedViewReader(this.store, this.strategyNamespace, 'ContextManager.derive');
+    if (this.readerName !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.readerName, 'ContextManager.derive');
+    const reader = this.readerName ?? recordedViewReader(this.store, this.strategyNamespace, 'ContextManager.derive');
     const source = this.store as unknown as JsStore & DerivableStore;
     const solve = options.solve ?? 'reuse';
     const parentBranch = this.store.currentBranch().name;
@@ -1530,7 +1530,7 @@ export class ContextManager {
         options.debugLogContext ?? this.debugLogContext,
         options.viewFilter ?? this.viewFilter,
         auxiliaryStores,
-        this.viewReader,
+        this.readerName,
       );
       derived.now = this.now;
       derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
@@ -1577,6 +1577,16 @@ export class ContextManager {
       }
       throw error;
     }
+  }
+
+  /**
+   * The reader this manager compiles for: the `viewReader` it was opened with;
+   * for a context `derive` made, its parent's; for one `reopenDerived` made,
+   * the reader its branch records. Undefined when it compiles for no reader,
+   * and so shows no block that has an `audience`.
+   */
+  get viewReader(): string | undefined {
+    return this.readerName;
   }
 
   /** How this manager was derived, or null if it was opened directly. */
@@ -1760,7 +1770,7 @@ export class ContextManager {
     // view the strategy rendered. Attribution reads only around the
     // messages the raw entries name, and a lookup asks for a sequence, not
     // the message (#273).
-    const storedView = audienceMessageStoreView(this.mergedMessageView(), this.viewReader, { keepEmptied: true, mayHold: () => this.mayHoldAudience() });
+    const storedView = audienceMessageStoreView(this.mergedMessageView(), this.readerName, { keepEmptied: true, mayHold: () => this.mayHoldAudience() });
     const storedMessages = storedView.getAll();
     const sequenceOf = storedView.sequenceOf
       ? (id: MessageId) => storedView.sequenceOf!(id)
@@ -2383,7 +2393,7 @@ export class ContextManager {
       }
       // With no renderAsNewest, a row is its stored content as the reader
       // sees it, which for a body stored as shards is only its first shard's.
-      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? contentForReader(stored.content, this.viewReader) : null) : rendered[next];
+      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? contentForReader(stored.content, this.readerName) : null) : rendered[next];
       next++;
       if (content === null || content === undefined) {
         continued.push(UNVOUCHED);
@@ -2733,7 +2743,7 @@ export class ContextManager {
   ): Promise<void> {
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
-    if (this.viewReader !== undefined) claimViewReader(this.store, this.strategyNamespace, this.viewReader, by);
+    if (this.readerName !== undefined) claimViewReader(this.store, this.strategyNamespace, this.readerName, by);
     const strategy = this.strategy;
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
@@ -2932,7 +2942,7 @@ export class ContextManager {
       // thrown value that can't be formatted.
       const failed = (err: unknown) =>
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
-      const seen = messageForReader(message, this.viewReader);
+      const seen = messageForReader(message, this.readerName);
       if (seen === null) return;
       const ctx = this.createStrategyContext();
       try {
@@ -2944,7 +2954,7 @@ export class ContextManager {
   }
 
   private handleMessageEdit(messageId: MessageId, newContent: ContentBlock[]): void {
-    const seen = contentForReader(newContent, this.viewReader);
+    const seen = contentForReader(newContent, this.readerName);
     if (seen === null) {
       this.removeCopiesOf(messageId);
       return;
