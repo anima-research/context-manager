@@ -107,7 +107,7 @@ import {
   type ResolvedImageLimits,
 } from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
-import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
+import type { CarrierPolicy, IngressChunkResult, KvUnifiedConfig } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
@@ -2168,6 +2168,19 @@ export interface StrandedSummary {
  * L1 (raw→summary) → L2 (merge N L1s) → L3 (merge N L2s)
  * with anti-redundancy filtering and budget carryover.
  */
+/** `kvUnified.callerCacheMarkers`, read and checked: an integer from 0 to 3, 0 unless set. */
+function callerCacheMarkersOf(kv: KvUnifiedConfig | undefined): number {
+  const declared = kv?.callerCacheMarkers ?? 0;
+  if (!Number.isInteger(declared) || declared < 0 || declared > 3) {
+    throw new RangeError(
+      `kvUnified.callerCacheMarkers is ${JSON.stringify(declared)}; it must be an integer from 0 to 3, the cache ` +
+        `markers the caller's request carries outside the messages. kv-unified places 4 minus that many of its own, ` +
+        `and needs at least one.`,
+    );
+  }
+  return declared;
+}
+
 export class AutobiographicalStrategy implements ResettableStrategy {
   readonly name: string = 'autobiographical';
   /** History renders raw, through summaries, or (uncovered) not at all. */
@@ -2543,6 +2556,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.config = resolved.effective as unknown as AutobiographicalConfig;
     this.configProvenance = resolved.provenance;
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
+    callerCacheMarkersOf(this.config.kvUnified);
     // The solver committed to at construction. buildPicker compares the live
     // config against this on every compile: a runtime mutation (e.g. an
     // override merge carrying `foldingStrategy: undefined`) silently swaps
@@ -14832,11 +14846,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     let cache: ProviderCacheReference | null = null;
+    const callerMarkers = callerCacheMarkersOf(this.config.kvUnified);
     if (
       args.wireReceipt &&
       this.kvUnifiedPendingLayout &&
       this.kvUnifiedPendingImmutablePrefixHash &&
-      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length
+      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length + callerMarkers
     ) {
       cache = {
         immutablePrefixHash: this.kvUnifiedPendingImmutablePrefixHash,
@@ -14866,6 +14881,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.diag.error(
         `[kv-unified] submission ${args.submissionId}: the request carried ${args.wireReceipt.markers.length} ` +
           `cache markers where its compile marked ${boundaries} layout boundar${boundaries === 1 ? 'y' : 'ies'}, ` +
+          `plus the ${callerMarkers} kvUnified.callerCacheMarkers says the caller places outside the messages, ` +
           `so this presentation keeps no cache reference and the next compile weighs no cache costs ` +
           `(logged once per strategy)`,
       );
@@ -15504,11 +15520,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const historyEnd = firstTail - 1; // last non-tail entry
 
     if (this.config.foldingStrategy === 'kv-unified') {
-      // CM owns all four slots in kv-unified mode. Place three history
-      // breakpoints at the nearest legal rendered-token boundaries to
-      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
-      // no separate early/system marker: every history prefix already
-      // includes tools, system, and the raw head on the provider wire.
+      // CM owns all four slots in kv-unified mode, less those the caller
+      // declares it places outside the messages (callerCacheMarkers, r).
+      // Place 3 - r history breakpoints at the nearest legal rendered-token
+      // boundaries to evenly spaced fractions of the history, the last at its
+      // last legal boundary (33%/66%/100% at r = 0), plus one at the end of
+      // the tail. There is deliberately no separate early/system marker of
+      // its own: every history prefix already includes tools, system, and
+      // the raw head on the provider wire.
       //
       // A marker can go only where an entry ends a solved layout unit, since
       // reconcileKvUnifiedMarkerIndices records it as that unit's boundary.
@@ -15531,6 +15550,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const last = lastSourceOf(entry);
         return !(last !== undefined && headMessageIds.has(last) && index < lastHeadEntry);
       };
+      const markerBudget = 4 - callerCacheMarkersOf(this.config.kvUnified);
+      const historyMarkers = markerBudget - 1;
       const marks = new Set<number>();
       if (historyEnd >= 0) {
         const cumulative: number[] = [0];
@@ -15555,9 +15576,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           return best;
         };
         if (legalBoundaries.length > 0) {
-          marks.add(nearestBoundary(1 / 3));
-          marks.add(nearestBoundary(2 / 3));
-          marks.add(legalBoundaries.at(-1)!);
+          for (let i = 1; i < historyMarkers; i++) marks.add(nearestBoundary(i / historyMarkers));
+          if (historyMarkers > 0) marks.add(legalBoundaries.at(-1)!);
         }
       }
       let tailEnd = -1;
@@ -15569,9 +15589,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (tailEnd >= 0) marks.add(tailEnd);
-      if (marks.size > 4) {
+      if (marks.size > markerBudget) {
         throw new Error(
-          `placeCacheMarkers: ${marks.size} caller-owned markers exceed Anthropic's limit of 4`,
+          `placeCacheMarkers: ${marks.size} caller-owned markers exceed the ${markerBudget} of Anthropic's 4 ` +
+            'that kvUnified.callerCacheMarkers leaves',
         );
       }
       for (const idx of marks) entries[idx]!.cacheMarker = true;

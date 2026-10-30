@@ -332,3 +332,85 @@ describe("a request whose marker count differs from its compile's", () => {
     }
   });
 });
+
+describe("a caller that places its own cache markers outside the messages (kvUnified.callerCacheMarkers)", () => {
+  const withCallerMarkers = (callerCacheMarkers: number) => ({
+    kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, callerCacheMarkers },
+  });
+
+  it('kv-unified places 4 minus the declared count: history markers at evenly spaced fractions, the last at its last boundary, and the tail end', () => {
+    // Six history entries of equal size, then the tail: thirds fall after the
+    // second and fourth, halves after the third.
+    const expected = [[1, 3, 5, 6], [2, 5, 6], [5, 6], [6]];
+    for (const [declared, marks] of expected.entries()) {
+      const strategy = kvUnified({ headWindowTokens: 0, recentWindowTokens: 100, ...withCallerMarkers(declared) });
+      const entries = [0, 1, 2, 3, 4, 5].map((k) => ({
+        participant: 'u', content: [{ type: 'text', text: 'x'.repeat(400) }],
+        sourceMessageId: `m${k}`, sourceRelation: 'copy',
+      } as ContextEntry));
+      entries.push({ participant: 'u', content: [{ type: 'text', text: 'x'.repeat(40) }], sourceMessageId: 't0', sourceRelation: 'copy' } as ContextEntry);
+      (strategy as unknown as {
+        placeCacheMarkers(entries: ContextEntry[], head: ReadonlySet<string>, tail: ReadonlySet<string>): void;
+      }).placeCacheMarkers(entries, new Set(), new Set(['t0']));
+      assert.deepEqual(entries.flatMap((e, i) => (e.cacheMarker ? [i] : [])), marks, `${declared} declared`);
+    }
+  });
+
+  for (const [name, placed, when] of [
+    ["three messages in the head and three raw in the middle: the head's last and the middle are marked", 3, 'with four of its own at none declared'],
+    ['a body first, its shards across the head and the recent window: the body is marked', 2, 'with fewer than four of its own'],
+  ] as const) {
+    it(`a request that carries the declared marker beside kv-unified's own keeps its cache reference, ${when}`, async () => {
+      const c = CASES[name]!;
+      const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(1) });
+      try {
+        const compiled = await o.compile();
+        const marked = breakpointsOf(compiled.messages);
+        assert.equal(marked.length, placed, "kv-unified's breakpoints");
+        assert.equal(marked.at(-1), compiled.messages.length - 1, 'the tail end is marked');
+        o.accept(o.begin(), placed + 1);
+        const cache = receipts(o.strategy).cache;
+        assert.ok(cache, 'the accepted presentation keeps a cache reference');
+        assert.equal(cache.markers.length, placed, "the reference holds kv-unified's own markers");
+      } finally {
+        await o.close();
+      }
+    });
+  }
+
+  it('a request whose caller markers differ from the declared count keeps no reference, and the line names the option', async () => {
+    const c = CASES['a body first, its shards across the head and the recent window: the body is marked']!;
+    for (const [declared, carried] of [[0, 3], [1, 2]] as const) {
+      const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(declared) });
+      const logged: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => {
+        const line = args.map(String).join(' ');
+        if (line.startsWith('[kv-unified]') && line.includes('cache markers where')) logged.push(line);
+        else original(...args);
+      };
+      try {
+        await o.compile();
+        o.accept(o.begin(), carried);
+        assert.equal(receipts(o.strategy).cache, null, `${declared} declared, ${carried} carried: no reference`);
+        assert.equal(logged.length, 1);
+        assert.match(logged[0]!, new RegExp(
+          `carried ${carried} cache markers where its compile marked 2 layout boundaries, plus the ${declared} ` +
+          'kvUnified\\.callerCacheMarkers says the caller places outside the messages,',
+        ));
+      } finally {
+        console.error = original;
+        await o.close();
+      }
+    }
+  });
+
+  it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built', () => {
+    for (const declared of [4, -1, 1.5]) {
+      assert.throws(() => kvUnified({ ...withCallerMarkers(declared) }), (error: unknown) =>
+        error instanceof RangeError && /kvUnified\.callerCacheMarkers is .*; it must be an integer from 0 to 3/.test(error.message),
+      `${declared} is refused`);
+    }
+    for (const declared of [0, 3]) assert.doesNotThrow(() => kvUnified({ ...withCallerMarkers(declared) }), `${declared} is taken`);
+  });
+});
