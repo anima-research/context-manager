@@ -80,7 +80,8 @@ function summariesOf(strategy: AutobiographicalStrategy): FixtureSummary[] {
   }));
 }
 
-function textContent(text: string): ContentBlock[] {
+/** A stored message's content as the fixtures write it. */
+export function textContent(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
 

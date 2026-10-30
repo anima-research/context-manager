@@ -110,8 +110,10 @@ describe('tool pruning, priced as sent', () => {
       assert.deepEqual(inputs, [1, 2, 3].map((k) => ({
         _truncated: true,
         _originalTokens: Math.ceil(JSON.stringify(inputOf(k)).length / 4),
-        // The store gives an object back with its keys sorted.
-        _keys: ['body', 'group', 'mode', 'owner', 'path'],
+        // The input's first five keys in the order it was written: chronicle
+        // gives an object back with its keys in the order written (chronicle
+        // #67), where 0.5.0 gave them back sorted.
+        _keys: Object.keys(inputOf(k)).slice(0, 5),
       })), 'the input is truncated to its size and its first five keys');
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
       cm.close();

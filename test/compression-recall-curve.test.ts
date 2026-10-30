@@ -2167,7 +2167,7 @@ describe('compression refusal recall curves', () => {
 
   for (const rung of [false, true]) {
     it(rung
-      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though the store gives back the rung\'s options with their keys in another order'
+      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though the stored record holds the rung\'s options with their keys in another order'
       : 'a quarantined chunk run again makes no call with the tool-prose rung off (the control)', async () => {
       // Every call is refused with a provider count, which the stored record's key carries and the gate's doesn't,
       // so only the record's family, in the current request regime, can hold the chunk.
@@ -2178,7 +2178,32 @@ describe('compression refusal recall curves', () => {
           ? { compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] } }
           : {}),
       });
-      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      // Chronicle gives an object back with its keys in the order written
+      // (chronicle #67). Chronicle 0.5.0 gave them back sorted, and a store
+      // it wrote still holds them that way. So the first run writes its
+      // record with the rung's options in sorted order, as such a store
+      // holds them. The record's key and family stay the ones built from the
+      // strategy's own order.
+      type RecordBuilder = {
+        compressionRefusalQuarantineRecord?: (...args: unknown[]) => { normalizedConfig: { toolProseFallback?: Record<string, unknown> } };
+      };
+      const builder = fx.strategy as unknown as RecordBuilder;
+      if (rung) {
+        const build = builder.compressionRefusalQuarantineRecord!;
+        builder.compressionRefusalQuarantineRecord = function (this: unknown, ...args: unknown[]) {
+          const record = build.apply(this, args);
+          const options = record.normalizedConfig.toolProseFallback;
+          if (options) {
+            record.normalizedConfig.toolProseFallback = Object.fromEntries(Object.keys(options).sort().map((key) => [key, options[key]]));
+          }
+          return record;
+        };
+      }
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally {
+        delete builder.compressionRefusalQuarantineRecord;
+      }
       assert.ok(mock.calls.length >= 1, 'premise: the first run called the model');
       const exhausted = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
       assert.equal(exhausted.length, 1, 'premise: the first run quarantined the chunk');
@@ -2190,7 +2215,7 @@ describe('compression refusal recall curves', () => {
         const stored = (exhausted[0]!.record as { normalizedConfig: { toolProseFallback: object } }).normalizedConfig.toolProseFallback;
         const built = (fx.strategy as unknown as { toolProseHoistOptions(): object }).toolProseHoistOptions();
         assert.deepEqual(stored, built, 'premise: the stored options are the ones the strategy builds');
-        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the store gives back their keys in another order');
+        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the stored record holds their keys in another order');
       }
       const logPath = `${freshPath()}-trace.jsonl`;
       paths.push(logPath);
