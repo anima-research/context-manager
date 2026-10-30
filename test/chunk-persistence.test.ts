@@ -19,8 +19,9 @@
  *     chronicle state slot; persisted records OWN the past — rebuilds and
  *     restarts never re-chunk covered ground, regardless of config drift.
  *   - L1 production refuses to overlap an existing L1 (strict guard).
- *   - If most records resolve to zero live messages (chain-break
- *     signature), compression fails CLOSED (no re-chunking of history).
+ *   - If most records name only message ids the store never held
+ *     (chain-break signature), compression fails CLOSED (no re-chunking
+ *     of history).
  *   - Stores from before this change migrate lazily: records are
  *     synthesized from existing L1 sourceIds, longest generation per
  *     prefix family.

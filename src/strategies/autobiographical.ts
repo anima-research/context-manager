@@ -234,6 +234,15 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
   ].join('\n');
 }
 
+function chunkRecordsNeverHeldMessage(): string {
+  return [
+    'Compression of new conversation has stopped.',
+    "Cause: most of this agent's chunk records name message ids its store can't show it ever held, as when a store's messages are rebuilt under new ids.",
+    'Effect: no new chunk forms, so new conversation goes unsummarized, and in time its context fills and its turns fail.',
+    "Fix: reconcile the store's chunk records with its messages, then reopen it.",
+  ].join('\n');
+}
+
 function strandedSummariesFailedMessage(cause: unknown): string {
   return [
     'The stranded-summaries read failed.',
@@ -2252,12 +2261,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _salience: { listing: readonly StoredMessage[]; values: Float64Array } | null = null;
   protected chunkIdCounter = 0;
   /**
-   * Fail-closed latch: set when most persisted records resolve to zero live
-   * messages (the messages-chain-break signature). While set, NO compression
-   * runs — duplicate memories are strictly worse than delayed compression.
+   * Fail-closed latch: set when most persisted records name ids the store
+   * can't show it ever held (the messages-chain-break signature). While set,
+   * no new chunk forms or queues — duplicate memories are strictly worse
+   * than delayed compression.
    */
   protected chunkRecordsOrphaned = false;
   private _orphanWarned = false;
+  private readonly _emptiedRecordHeld = new WeakMap<ChunkRecord, boolean>();
   /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
   private mergePicksDeferred = false;
@@ -8383,6 +8394,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *                the load-time audit found crossed ownership, or a merge
    *                group stands in the merge quarantine because merging it
    *                would have minted a crossed node (`topologyRefusals`).
+   *                And while compression has stopped because most chunk
+   *                records name ids the store can't show it ever held
+   *                (`failure` `chunk-records`): no new chunk forms, so
+   *                nothing else in the report would show it.
    * - `unknown`  — the report couldn't read what decides its state.
    *
    * A report that couldn't read something says in `error` what happened,
@@ -8431,11 +8446,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     /**
      * What happened, what it means and what to do, for an operator: a line saying what
      * happened, then `Cause:`, `Effect:` and `Fix:` lines. Present whenever a count
-     * below is `null` for that reason.
+     * below is `null` for that reason, and while the chunk records have stopped
+     * compression (`failure` `chunk-records`); when the ledger can't be read
+     * then too, `error` holds both.
      */
     error?: string;
-    /** Which read failed, whenever `error` is present: the compression quarantine ledger, which compression needs, or the report itself. */
-    failure?: 'quarantine-ledger' | 'report';
+    /** What `error` is about, whenever it is present: a read that failed (the compression quarantine ledger, which compression needs, or the report itself), or compression stopped by the chunk records. */
+    failure?: 'quarantine-ledger' | 'chunk-records' | 'report';
     pendingChunks: number | null;
     oldestPendingAgeMs: number | null;
     mergeQueueDepth: number | null;
@@ -8526,9 +8543,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const withNone = stateWith(0);
         state = withNone === stateWith(1) ? withNone : 'unknown';
       }
+      const stopped = this.chunkRecordsOrphaned
+        ? { error: [chunkRecordsNeverHeldMessage(), ...(error !== undefined ? [error] : [])].join('\n\n'), failure: 'chunk-records' as const }
+        : error !== undefined ? { error, failure: 'quarantine-ledger' as const } : undefined;
+      if (this.chunkRecordsOrphaned) state = 'critical';
       const report = {
         state,
-        ...(error !== undefined ? { error, failure: 'quarantine-ledger' as const } : {}),
+        ...(stopped ?? {}),
         pendingChunks: pending.length,
         oldestPendingAgeMs,
         mergeQueueDepth: this.mergeQueue.length,
@@ -17824,6 +17845,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.toolsDeferredMerge = undefined;
   }
 
+  private recordWasHeld(record: ChunkRecord, store: MessageStoreView): boolean {
+    if (!store.held) return false;
+    let held = this._emptiedRecordHeld.get(record);
+    if (held !== undefined) return held;
+    held = record.sourceIds.some((id) => store.held!(id));
+    if (held || !record.sourceIds.some((id) => this.unusedRecordNumber(id))) this._emptiedRecordHeld.set(record, held);
+    return held;
+  }
+
+  private unusedRecordNumber(id: MessageId): boolean {
+    if (!this.store) return false;
+    try {
+      return this.store.getRecord(id) === null;
+    } catch {
+      // chronicle throws for an id that isn't a record id, which no later write takes
+      return false;
+    }
+  }
+
   /**
    * Rebuild the chunk list: persisted records own the past; the running-sum
    * chunker only extends at the frontier, and a chunk is only ever created
@@ -17881,7 +17921,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : store.estimateTokens(m)), 0);
         entries.push({ record: rec, messages: msgs, tokens, positions });
       }
-      if (msgs.length === 0) { orphaned++; continue; }
+      if (msgs.length === 0) {
+        if (!this.recordWasHeld(rec, store)) orphaned++;
+        continue;
+      }
       const chunk: Chunk = {
         index: this.chunks.length,
         startIndex: -1, // record-derived; filtered-array indices are not meaningful
@@ -17899,8 +17942,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._recordChunks = { listing, records: this.chunkRecords, calibration, ignoreSize, entries };
 
     // ---- 2. Fail closed on the chain-break signature. ----
-    // Most records resolving to zero live messages means message identity
-    // has been rebuilt/renumbered underneath us. Chunking "fresh" ground now
+    // Most records naming ids the store can't show it ever held means
+    // message identity has been rebuilt/renumbered underneath us. Chunking "fresh" ground now
     // would re-compress already-lived history into duplicate memories.
     // Halt ALL compression until an operator reconciles the store.
     if (this.chunkPersistenceEnabled && this.chunkRecords.length >= 3 &&
@@ -17911,7 +17954,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this._orphanWarned = true;
         this.diag.error(
           `[autobiographical] FAIL-CLOSED: ${orphaned}/${this.chunkRecords.length} chunk ` +
-          `records resolve to zero live messages (messages chain break / store ` +
+          `records name message ids this store can't show it ever held (messages chain break / store ` +
           `reconciliation signature). Compression halted to prevent duplicate ` +
           `memory formation — reconcile the store before resuming.`,
         );

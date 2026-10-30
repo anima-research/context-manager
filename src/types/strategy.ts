@@ -26,6 +26,14 @@ export interface MessageStoreView {
    * view asks each source's, and the source's `get` where it has none.
    */
   sequenceOf?(id: MessageId): number | undefined;
+  /**
+   * Whether the store has ever held a message under this id, on any of its
+   * branches: true for a message in the view, one a view filter hides, and
+   * one removed since; false for an id it never gave a message (optional —
+   * MessageStore provides it). A filtered view answers for the messages it hides, and a
+   * merged view for every source when each source can.
+   */
+  held?(id: MessageId): boolean;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */

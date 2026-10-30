@@ -1,0 +1,1 @@
+- `MessageStore.held(id)` says whether the store ever held a message under an id, on any of its branches: true for a live message, for one removed since and, through a filtered view, for one the filter hides; false for an id it never gave a message. `MessageStoreView` gains it as an optional `held?(id)`, which `filterMessageStoreView` and `mergeMessageStoreViews` pass through.
