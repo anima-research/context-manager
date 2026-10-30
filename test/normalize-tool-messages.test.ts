@@ -194,6 +194,37 @@ describe('stripUnpairedToolBlocks', () => {
     assert.equal((out[0].content[0] as { text: string }).text, '[tool call omitted]');
   });
 
+  it('keeps a later call with its result and a further result after an orphan result with its id', () => {
+    const input = [
+      { participant: 'user', content: [r('A'), t('thanks')] },
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [r('A')] },
+      { participant: 'user', content: [r('A')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text', 'tool_use'],
+      ['tool_result'],
+      ['tool_result'],
+    ]);
+  });
+
+  it('judges a block that occurs at two places at each of them', () => {
+    const orphan = r('A');
+    const input = [
+      { participant: 'user', content: [orphan, t('thanks')] },
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [orphan] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text', 'tool_use'],
+      ['tool_result'],
+    ]);
+  });
+
   it('replaces empty content with a placeholder text block', () => {
     const input = [{ participant: 'agent', content: [u('A')] }];
     const out = stripUnpairedToolBlocks(input);

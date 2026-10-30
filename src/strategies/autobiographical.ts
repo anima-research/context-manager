@@ -684,11 +684,12 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the nearest call with its id before it, in its own message or an earlier
- * one, the call pairing repair pairs it with where its look-ahead reaches
- * (relocateOrDropMissingResults): a later call can reuse an id, and the
- * earlier call is then answered by no result after it. A result whose
- * nearest call a result has already answered goes with that call, as a
- * further result; a result with no call before it with its id answers none.
+ * one, at any distance; pairing repair (relocateOrDropMissingResults) pairs
+ * it with the same call where its look-ahead reaches. A later call can reuse
+ * an id, and the earlier call is then answered by no result after it. A
+ * result whose nearest call a result has already answered goes with that
+ * call, as a further result; a result with no call before it with its id
+ * answers none.
  * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
@@ -19811,9 +19812,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (answeredToolCalls), and a later call can reuse an id: a provider that
    * leaves a streamed call's id out can get the same id in every response.
    * So the search for an id ends at the next call with it, from `afterIndex`
-   * on, leaving a result past that call to it. Results for `missing` ids
-   * never sit at or before `afterIndex` (that entry's results are already
-   * matched), so in that entry the search can meet only a later call.
+   * on, leaving a result past that call to it. The entry at `afterIndex`
+   * holds no result for a `missing` id, since its results are already
+   * matched, so there the search can meet only a later call. A result with
+   * the id in an entry before `afterIndex` answers an earlier call.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],

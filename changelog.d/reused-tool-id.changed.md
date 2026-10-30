@@ -30,6 +30,9 @@
   further one. Under the earlier rule the late result answered the earlier
   call.
 - A store in which a later call reuses a call's id before that call's result
-  is stored can send different requests after the upgrade, and where it does,
-  its first request misses the prompt cache. Every other store sends what it
-  sent.
+  is stored can compile different requests after the upgrade, and where it
+  does, its first request misses the prompt cache. Every other store compiles
+  what it compiled. A summariser's request changes where its messages hold a
+  call that no result with its id follows before the next call with that id,
+  while some result elsewhere carries the id, or a result that no call with
+  its id comes before, while a later call has that id.

@@ -386,9 +386,10 @@ function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string,
 
 /**
  * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and each moved result reached the
- * request unaltered where the repair put it. A result altered there, or
- * missing from the request, does not carry it.
+ * when it carries the rest unaltered and, for each moved result, a result
+ * with its id in the request carries it unaltered. A result altered, or
+ * missing from the request, does not carry it, unless another result with
+ * its id carries the same content.
  */
 function carriesWithRelocated(
   entry: ContextEntry,

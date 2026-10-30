@@ -103,22 +103,22 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
-  const paired = new Set<ContentBlock>();
-  const latest = new Map<string, ContentBlock>();
-  for (const msg of messages) {
-    for (const block of msg.content) {
-      if (block.type === 'tool_use') latest.set((block as { id: string }).id, block);
+  const paired = new Set<string>();
+  const latest = new Map<string, string>();
+  messages.forEach((msg, m) => {
+    msg.content.forEach((block, b) => {
+      if (block.type === 'tool_use') latest.set((block as { id: string }).id, `${m}:${b}`);
       else if (block.type === 'tool_result') {
         const call = latest.get((block as { toolUseId: string }).toolUseId);
         if (call) {
           paired.add(call);
-          paired.add(block);
+          paired.add(`${m}:${b}`);
         }
       }
-    }
-  }
-  return messages.map((msg) => {
-    const trimmed = msg.content.filter((block) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(block) : true));
+    });
+  });
+  return messages.map((msg, m) => {
+    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(`${m}:${b}`) : true));
     if (trimmed.length === msg.content.length) {
       return { participant: msg.participant, content: msg.content };
     }
