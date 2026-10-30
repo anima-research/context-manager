@@ -53,7 +53,7 @@ import {
 } from './settle-summaries.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
-import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { pairedToolBlocks, splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import {
   hoistToolProse,
   DEFAULT_TOOL_PROSE_FIELD,
@@ -1841,6 +1841,14 @@ const stripThinkingBlocks = withoutThinking;
 function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
   const stripped = stripThinkingBlocks(content);
   return holdsSystemChange(stripped) ? stripped.filter((b) => !isSystemChange(b)) : stripped;
+}
+
+function sentMessageIds(
+  offered: ReadonlyArray<{ id: MessageId; content: ContentBlock[] }>,
+  request: ReadonlyArray<{ content: ContentBlock[] }>,
+): MessageId[] {
+  const keeps = pairedToolBlocks(request);
+  return offered.filter(({ content }) => stripEmptyTextBlocks(content.filter(keeps)).length > 0).map(({ id }) => id);
 }
 
 /**
@@ -9891,7 +9899,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries: readonly SummaryEntry[],
     ) => {
       const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
-      const carried: MessageId[] = [];
+      const offered: Array<{ id: MessageId; content: ContentBlock[] }> = [];
 
       // ---- 1. Head window (raw, FIRST, ownership-capped) ----
       //
@@ -9928,8 +9936,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           headCoveredSkipped++;
           continue;
         }
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-        carried.push(m.id);
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        offered.push({ id: m.id, content });
       }
 
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
@@ -9952,8 +9961,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ].sort((a, b) => a.position - b.position);
       for (const { summary: s, message: m } of middle) {
         if (m) {
-          llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-          carried.push(m.id);
+          const content = compressionInputContent(m.content);
+          llmMessages.push({ participant: m.participant, content });
+          offered.push({ id: m.id, content });
           continue;
         }
         llmMessages.push({
@@ -9986,8 +9996,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // ---- 5. Chunk messages raw ----
       for (const m of chunk.messages) {
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-        carried.push(m.id);
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        offered.push({ id: m.id, content });
       }
 
       // ---- 6. Instruction (reading-mode aware; worked out above) ----
@@ -10014,7 +10025,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // by its tool_result, and any tool_result that doesn't follow a use.
       const cleaned = stripUnpairedToolBlocks(collapsed);
 
-      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped, carried };
+      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped, carried: sentMessageIds(offered, llmMessages) };
     };
 
     // The store's price of a built request as it is sent: each message with
@@ -10077,7 +10088,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const { priorSummaries, pinnedRawTokens } = history;
     const { kept: keptSummaries, keptTokens: recallTokens } = recall;
     const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped, carried } = built;
-    const chunkIds = chunk.messages.map((m) => m.id);
+    const chunkOffered = chunk.messages.map((m) => ({ id: m.id, content: compressionInputContent(m.content) }));
+    const chunkIds = sentMessageIds(chunkOffered, chunkOffered);
 
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
@@ -11437,7 +11449,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.splitCallTimes.push(slot);
             let res: unknown;
             try {
-              res = await runAttempt(sub, subset.map((m) => m.id), label, [], [], leafHash);
+              const subsetOffered = subset.map((m) => ({ id: m.id, content: compressionInputContent(m.content) }));
+              res = await runAttempt(sub, sentMessageIds(subsetOffered, subsetOffered), label, [], [], leafHash);
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
@@ -12373,7 +12386,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.expandSummaryToLeafMessageIds(source, summaryById, leaves);
         return leaves.size > 0 && [...leaves].every((id) => this.hasLeftView(id, ctx.messageStore));
       });
-      if (emptied.length > 0) {
+      const rest = sources.filter((source) => !emptied.includes(source));
+      const restProblem = rest.length >= 2 ? this.mergeTopologyProblem(targetLevel, rest, position) : null;
+      if (emptied.length > 0 && !restProblem) {
         this.diag.warn(
           `executeMerge: ${emptied.length}/${sources.length} source(s) have no message left ` +
             `(${emptied.map((source) => source.id).join(', ')}); skipping stale queue entry, whose merge ` +
@@ -12384,7 +12399,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.checkMergeThreshold();
         return false;
       }
-      this.refuseCrossedMerge(targetLevel, sourceIds, topology);
+      this.refuseCrossedMerge(targetLevel, sourceIds, restProblem ?? topology);
       return false;
     }
 
@@ -12529,7 +12544,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // merge over history from before a head-window reset is given the head
     // that history followed. Clipped at a hold there, as before.
     const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, mergeStartIdx);
-    const carriedIds: MessageId[] = [];
+    const mergeOffered: Array<{ id: MessageId; content: ContentBlock[] }> = [];
+    let carriedIds: MessageId[] = [];
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -12537,8 +12553,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         headCoveredSkipped++;
         continue;
       }
-      llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-      carriedIds.push(m.id);
+      const content = compressionInputContent(m.content);
+      llmMessages.push({ participant: m.participant, content });
+      mergeOffered.push({ id: m.id, content });
     }
     if (headCoveredSkipped > 0) {
       this.diag.warn(
@@ -12622,8 +12639,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-        carriedIds.push(m.id);
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        mergeOffered.push({ id: m.id, content });
       }
     }
 
@@ -12687,8 +12705,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
           if (m) {
-            llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
-            carriedIds.push(messageId);
+            const content = compressionInputContent(m.content);
+            llmMessages.push({ participant: m.participant, content });
+            mergeOffered.push({ id: messageId, content });
           }
         }
       } else {
@@ -12802,6 +12821,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         text: mergeInstructionText,
       }],
     });
+
+    carriedIds = sentMessageIds(mergeOffered, llmMessages);
 
     // Same bundled-tool-cycle defense as compressChunkHierarchical, after the
     // same separation of recall answers from the agent's raw turns: an L2
@@ -17258,7 +17279,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const items: Item[] = [];
         const summariesById = this.summaryIndex();
         for (const s of selectedSummaries) {
-          const start = this.summaryStartInStore(s, positionOf, summariesById);
+          const start = positionOf.get(s.sourceRange.first) ?? this.summaryStartInStore(s, positionOf, summariesById);
           items.push({ kind: 'summary', position: start >= 0 ? start : Number.MAX_SAFE_INTEGER, summary: s });
         }
         for (const p of middleRaw) {
@@ -17736,9 +17757,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Sort selected summaries by where each starts, its first message still in
-   * the store (summaryStartInStore), so they appear in chronological order.
-   * Summaries with no message left go after the rest, by created timestamp.
+   * Sort selected summaries by where each starts, its sourceRange.first while
+   * that is listed, else its first message still in the store
+   * (summaryStartInStore), so they appear in chronological order.
+   * Summaries with neither go after the rest, by created timestamp.
    */
   protected sortSummariesChronologically(
     summaries: SummaryEntry[],
@@ -17747,7 +17769,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const positionOf = this.positionIndex(messages);
     const summariesById = this.summaryIndex();
     const start = new Map(summaries.map((s) => {
-      const at = this.summaryStartInStore(s, positionOf, summariesById);
+      const at = positionOf.get(s.sourceRange.first) ?? this.summaryStartInStore(s, positionOf, summariesById);
       return [s.id, at >= 0 ? at : Number.MAX_SAFE_INTEGER] as const;
     }));
     return [...summaries].sort((a, b) => {

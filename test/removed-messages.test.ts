@@ -91,7 +91,7 @@ async function logged(run: () => Promise<void>): Promise<{ warnings: string[]; e
   }
   return { warnings, errors };
 }
-const DROPPED = /skipping stale queue entry, whose merge check found: \S/;
+const DROPPED = /skipping stale queue entry, whose merge check found: (\d+ source\(s\); a merge needs at least two|source level mismatch: |source position unresolved |sources are not adjacent in store order: )/;
 const REFUSED = /\[merge-topology\] ⛔ refused/;
 const droppedWithWarning = ({ warnings, errors }: { warnings: string[]; errors: string[] }): void => {
   assert.ok(warnings.some((line) => DROPPED.test(line)), 'a warning names what the merge check found');
@@ -168,6 +168,165 @@ describe('removed messages (#321)', () => {
       rmSync(path, { recursive: true, force: true });
     }
   });
+
+  const attempts = (logPath: string): string[] => existsSync(logPath)
+    ? readFileSync(logPath, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { event?: string }).event ?? '')
+    : [];
+
+  for (const left of ['a system change in the head', 'a message of thinking alone in the chunk', 'a message of empty text in the chunk'] as const) {
+    it(`a message its request left out, ${left}, removed during one of the chunk\'s requests discards nothing`, async () => {
+      const logPath = `${freshPath()}-calls.jsonl`;
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+      const at = left === 'a system change in the head' ? 0 : 2;
+      const emptied: [string, ContentBlock[]] = left === 'a system change in the head'
+        ? ['Harness', [{ type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock]]
+        : left === 'a message of thinking alone in the chunk'
+          ? ['assistant', [{ type: 'thinking', thinking: 'a thought', signature: 'signature' } as unknown as ContentBlock]]
+          : ['assistant', text(' ')];
+      const { manager, strategy, ids, requests, path } = await chunked(0, (call, ids, manager) => {
+        if (call === 1) {
+          manager.removeMessage(ids[at]! as never);
+          return '';
+        }
+      });
+      try {
+        for (let i = 0; i < 12; i++) ids.push(i === at ? manager.addMessage(...emptied) : manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+        const first = ids[at === 0 ? 1 : 0]!;
+        await manager.tick();
+        assert.ok(requests.length >= 2 && summarized(requests[0]!).join(',') === summarized(requests[1]!).join(','),
+          'the empty answer sent the chunk\'s next rung in the same tick');
+        assert.strictEqual(strategy.all().find((s) => s.sourceIds.includes(first))?.content, 'MEM[2]', 'the next rung\'s answer was written');
+        const events = attempts(logPath);
+        assert.ok(events.filter((event) => event === 'compression:attempt').length >= 2, `premise: both attempts logged; logged: ${events.join(', ')}`);
+        assert.ok(!events.includes('compression:removed-message-discarded'), `logged: ${events.join(', ')}`);
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        await manager.close();
+        rmSync(path, { recursive: true, force: true });
+        rmSync(logPath, { force: true });
+      }
+    });
+  }
+
+  for (const rung of ['source-only-final', 'a split piece'] as const) {
+    it(`a message of thinking alone in the chunk, removed during the chunk's first request, leaves ${rung} to go out and be kept`, async () => {
+      const logPath = `${freshPath()}-calls.jsonl`;
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+      const refused = { stopReason: 'refusal', content: [] as ContentBlock[] };
+      const { manager, strategy, ids, requests, path } = await chunked(0, (call, ids, manager, request) => {
+        if (call === 1) {
+          manager.removeMessage(ids[2]! as never);
+          return refused;
+        }
+        if (rung === 'a split piece' && summarized(request).length > 1) return refused;
+        return `KEPT[${call}]`;
+      }, {}, {
+        headWindowTokens: 60, compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+        compressionSplitFallback: rung === 'a split piece',
+      });
+      try {
+        for (let i = 0; i < 12; i++) {
+          ids.push(i === 2
+            ? manager.addMessage('assistant', [{ type: 'thinking', thinking: 'a thought', signature: 'signature' } as unknown as ContentBlock])
+            : manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+        }
+        await manager.tick();
+        assert.ok(['M1', 'M3'].every((name) => summarized(requests[0]!).includes(name)), `premise: the first chunk holds M1 to M3, M2 entering it empty: ${summarized(requests[0]!)}`);
+        const written = strategy.all().find((s) => s.sourceIds.includes(ids[1]!));
+        const calls = [...(written?.content ?? '').matchAll(/KEPT\[(\d+)\]/g)].map((match) => Number(match[1]));
+        assert.ok(calls.length > 0, `written from ${written?.content}; requests: ${requests.length}`);
+        for (const call of calls) {
+          const request = requests[call - 1]!;
+          if (rung === 'source-only-final') {
+            assert.ok(carries(requests[0]!, 'M0') && !carries(request, 'M0') && summarized(request).join(',') === summarized(requests[0]!).join(','),
+              `request ${call} is source-only-final: the chunk without the head`);
+          } else {
+            assert.ok(summarized(request).length <= 1 && summarized(request).length < summarized(requests[0]!).length, `request ${call} is a split piece`);
+          }
+        }
+        const events = attempts(logPath);
+        assert.ok(!events.includes('compression:removed-message-discarded'), `logged: ${events.join(', ')}`);
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        await manager.close();
+        rmSync(path, { recursive: true, force: true });
+        rmSync(logPath, { force: true });
+      }
+    });
+  }
+
+  it('a tool result whose call was removed before its chunk formed, removed during the chunk\'s first request, discards nothing', async () => {
+    const logPath = `${freshPath()}-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    const { manager, strategy, ids, requests, path } = await chunked(0, (call, ids, manager) => {
+      if (call === 1) {
+        manager.removeMessage(ids[1]! as never);
+        return '';
+      }
+    });
+    try {
+      manager.setToolDefinitions([{ name: 'get_weather', description: 'Weather.', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }]);
+      ids.push(manager.addMessage('assistant', [{ type: 'tool_use', id: 't1', name: 'get_weather', input: { city: 'Oslo' } } as unknown as ContentBlock]));
+      ids.push(manager.addMessage('user', [{ type: 'tool_result', toolUseId: 't1', content: 'Sunny.' } as unknown as ContentBlock]));
+      for (let i = 2; i < 12; i++) ids.push(manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+      manager.removeMessage(ids[0]! as never);
+      await tickUntil(manager, () => requests.length > 0);
+      assert.ok(summarized(requests[0]!).includes('M2') && !requests[0]!.includes('Sunny.') && !requests[0]!.includes('"tool_result"'),
+        'premise: the first request was the chunk holding the result, and sent none of it');
+      assert.ok(requests.length >= 2 && summarized(requests[0]!).join(',') === summarized(requests[1]!).join(','),
+        'the empty answer sent the chunk\'s next rung in the same tick');
+      assert.strictEqual(strategy.all().find((s) => s.sourceIds.includes(ids[2]!))?.content, 'MEM[2]', 'the next rung\'s answer was written');
+      const events = attempts(logPath);
+      assert.ok(events.filter((event) => event === 'compression:attempt').length >= 2, `premise: both attempts logged; logged: ${events.join(', ')}`);
+      assert.ok(!events.includes('compression:removed-message-discarded'), `logged: ${events.join(', ')}`);
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+      rmSync(logPath, { force: true });
+    }
+  });
+
+  for (const kept of ['a tool result whose call is in its chunk', 'a message of text and a tool result whose call was removed'] as const) {
+    it(`${kept}, removed during the chunk's first request, is in no later request`, async () => {
+      const logPath = `${freshPath()}-calls.jsonl`;
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+      const { manager, strategy, ids, requests, path } = await chunked(0, (call, ids, manager) => {
+        if (call === 1) {
+          manager.removeMessage(ids[1]! as never);
+          return '';
+        }
+      });
+      try {
+        manager.setToolDefinitions([{ name: 'get_weather', description: 'Weather.', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }]);
+        ids.push(manager.addMessage('assistant', [{ type: 'tool_use', id: 't1', name: 'get_weather', input: { city: 'Oslo' } } as unknown as ContentBlock]));
+        ids.push(manager.addMessage('user', kept === 'a tool result whose call is in its chunk'
+          ? [{ type: 'tool_result', toolUseId: 't1', content: 'Sunny.' } as unknown as ContentBlock]
+          : [{ type: 'tool_result', toolUseId: 't1', content: 'Sunny.' } as unknown as ContentBlock, ...text('Sunny, said the result.')]));
+        for (let i = 2; i < 12; i++) ids.push(manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+        if (kept !== 'a tool result whose call is in its chunk') manager.removeMessage(ids[0]! as never);
+        await tickUntil(manager, () => strategy.all().some((s) => s.sourceIds.includes(ids[2]!)));
+        assert.ok(summarized(requests[0]!).includes('M2') && requests[0]!.includes('Sunny'), 'premise: the first request sent the result\'s message');
+        for (const [i, request] of requests.entries()) {
+          if (i > 0) assert.ok(!request.includes('Sunny'), `request ${i + 1} carries the removed message`);
+        }
+        assert.ok(attempts(logPath).includes('compression:removed-message-discarded'), 'the discard is logged');
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        await manager.close();
+        rmSync(path, { recursive: true, force: true });
+        rmSync(logPath, { force: true });
+      }
+    });
+  }
 
   it('a message removed while the transport rejects a request\'s reasoning is not in the retry without it', async () => {
     const rejected = Object.assign(new Error('400: thinking blocks cannot be modified'),
@@ -402,20 +561,26 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('a message a filter hides while its chunk waits, and shows again, is left out of the summary and not lost', async () => {
+  it('a message a filter hides while its chunk waits is left out of the summary, and the store opens again', async () => {
     const viewFilter = (m: StoredMessage): boolean =>
       !m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HIDE'));
     const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
       if (call === 1) manager.editMessage(ids[5]! as never, text(body('HIDE M5')));
     }, { viewFilter });
+    let reopened: ContextManager | undefined;
     try {
       await tickUntil(manager, () => requests.length >= 2 && strategy.all().length >= 2);
       assert.deepStrictEqual(named(ids, strategy.all()[1]!.sourceIds), ['M4', 'M6', 'M7']);
-      manager.editMessage(ids[5]! as never, text(body('BACK M5')));
-      const out = JSON.stringify((await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).messages);
-      assert.ok(out.includes('BACK M5'), 'the message shown again is in the compile');
+      await manager.close();
+      const again = new Probe({
+        compressionModel: 'm', headWindowTokens: 1, recentWindowTokens: 0, l1HoldbackChunks: 0, targetChunkTokens: 60,
+        autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+      } as never);
+      reopened = await ContextManager.open({ path, strategy: again, membrane: { complete: async () => ({ stopReason: 'end_turn', content: text('MEM') }) } as never, viewFilter } as never);
+      assert.deepStrictEqual(again.all().map((s) => named(ids, s.sourceIds).join(',')), ['M0,M1,M2,M3', 'M4,M6,M7']);
     } finally {
       await manager.close();
+      await reopened?.close();
       rmSync(path, { recursive: true, force: true });
     }
   });
@@ -576,6 +741,51 @@ describe('removed messages (#321)', () => {
     }
   });
 
+  it('a message of thinking alone in a merge\'s range, removed while the transport rejects the merge\'s reasoning, leaves the retry without it to go out', async () => {
+    const rejected = Object.assign(new Error('400: thinking blocks cannot be modified'),
+      { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    let merging = false;
+    let mergeCalls = 0;
+    let rejectedAt = 0;
+    const { manager, strategy, ids, requests, path } = await chunked(0, (call, ids, manager) => {
+      if (!merging) return;
+      mergeCalls++;
+      if (mergeCalls === 1) {
+        return { stopReason: 'end_turn', content: [
+          { type: 'thinking', thinking: 'carried reasoning', signature: 'signature' } as never, { type: 'text', text: `MEM[${call}]` },
+        ] };
+      }
+      if (mergeCalls === 2) {
+        rejectedAt = call;
+        manager.removeMessage(ids[9]! as never);
+        return rejected;
+      }
+    }, {}, { hierarchical: true });
+    try {
+      for (let i = 0; i < 17; i++) {
+        ids.push(i === 9
+          ? manager.addMessage('assistant', [{ type: 'thinking', thinking: 'a thought', signature: 'signature' } as unknown as ContentBlock])
+          : manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+      }
+      await tickUntil(manager, () => strategy.all().filter((s) => s.level === 1).length >= 4);
+      const holder = strategy.all().filter((s) => s.level === 1)[2]!;
+      assert.ok(holder.sourceIds.includes(ids[9]!) && holder.sourceIds.includes(ids[10]!), 'premise: the third summary covers the message of thinking alone');
+      merging = true;
+      strategy.mergeAt(2);
+      for (let i = 0; i < 30 && mergeCalls < 3; i++) await manager.tick();
+      const sent = requests[rejectedAt - 1]!;
+      assert.ok(rejectedAt > 0 && sent.includes('carried reasoning') && carries(sent, 'M10'),
+        'premise: the merge holding it recalled reasoning and was rejected');
+      const next = requests[rejectedAt];
+      const names = (request: string): string => [...new Set(request.match(/\bM\d+\b/g) ?? [])].sort().join(',');
+      assert.ok(next !== undefined && !next.includes('carried reasoning') && names(next) === names(sent),
+        `the retry without reasoning went out next: ${next === undefined ? 'nothing' : names(next)} after ${names(sent)}`);
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
   it('the answer to a merge request sent before a message it summarizes was removed is kept', async () => {
     const { manager, strategy, ids, path } = await fourSummaries((call, ids, manager) => {
       if (call === 5) manager.removeMessage(ids[2]! as never);
@@ -601,7 +811,11 @@ describe('removed messages (#321)', () => {
       assert.deepStrictEqual(queue.map((m) => contents(m.sourceIds)), ['MEM[1]+MEM[2]'], 'premise: MEM[1] and MEM[2] are queued');
       for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
-      droppedWithWarning(await logged(() => manager.tick()));
+      const emptied = strategy.all().find((s) => s.content === 'MEM[2]')!.id;
+      const log = await logged(() => manager.tick());
+      droppedWithWarning(log);
+      assert.ok(log.warnings.some((line) => line.includes(`whose merge check found: source position unresolved (range endpoints neither in the store listing nor owned by a chunk): ${emptied}`)),
+        'the warning names this entry\'s finding: the emptied source can\'t be placed');
       assert.strictEqual(quarantine.size, 0, 'no merge refused');
       assert.ok(!queue.some((m) => contents(m.sourceIds).includes('MEM[2]')), 'the entry with MEM[2] is gone from the queue');
       assert.ok(queue.some((m) => contents(m.sourceIds).startsWith('MEM[1]+MEM[3]')), 'MEM[1] is offered with MEM[3]');
@@ -615,7 +829,7 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('a queued merge with a source that lost every message is dropped though its other sources aren\'t adjacent', async () => {
+  it('a queued merge with a source that lost every message is refused as crossed, not dropped, when its other sources aren\'t adjacent', async () => {
     const { manager, strategy, ids, path, requests } = await fourSummaries();
     try {
       const byContent = (content: string) => strategy.all().find((s) => s.content === content)!.id;
@@ -623,9 +837,31 @@ describe('removed messages (#321)', () => {
       queue.push({ level: 2, sourceIds: [byContent('MEM[1]'), byContent('MEM[2]'), byContent('MEM[4]')], attempts: 0 });
       for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
       const sent = requests.length;
+      const { errors } = await logged(() => manager.tick());
+      assert.strictEqual(requests.length, sent, 'no merge request sent');
+      const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, { lastOutcome: string }> }).mergeQuarantine;
+      assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), ['topology_violation'], 'MEM[1] and MEM[4], with MEM[3] between them, are refused');
+      const reason = [...(quarantine.values() as Iterable<{ lastErrorType?: string }>)][0]!.lastErrorType ?? '';
+      assert.ok(reason.startsWith('sources are not adjacent in store order: ') && reason.includes(byContent('MEM[1]')) && reason.includes(byContent('MEM[4]')) && !reason.includes(byContent('MEM[2]')),
+        `the refusal names the other sources' problem: ${reason}`);
+      assert.ok(errors.some((line) => REFUSED.test(line)), 'the refusal is an operator error');
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a queued merge with a source that lost every message is dropped when its other sources are adjacent', async () => {
+    const { manager, strategy, ids, path, requests } = await fourSummaries();
+    try {
+      const byContent = (content: string) => strategy.all().find((s) => s.content === content)!.id;
+      const queue = (strategy as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[]; attempts: number }> }).mergeQueue;
+      queue.push({ level: 2, sourceIds: [byContent('MEM[1]'), byContent('MEM[2]'), byContent('MEM[3]')], attempts: 0 });
+      for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
+      const sent = requests.length;
       droppedWithWarning(await logged(() => manager.tick()));
       assert.strictEqual(requests.length, sent, 'no merge request sent');
-      assert.deepStrictEqual(queue, [], 'the entry left the queue');
+      assert.ok(!queue.some((m) => m.sourceIds.includes(byContent('MEM[2]'))), 'the entry with MEM[2] left the queue');
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
       assert.strictEqual(quarantine.size, 0, 'no merge refused');
     } finally {
@@ -639,13 +875,13 @@ describe('removed messages (#321)', () => {
     try {
       const byContent = (content: string) => strategy.all().find((s) => s.content === content)!.id;
       const queue = (strategy as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[]; attempts: number }> }).mergeQueue;
-      queue.push({ level: 2, sourceIds: [byContent('MEM[1]'), byContent('MEM[2]'), byContent('MEM[4]')], attempts: 0 });
+      queue.push({ level: 2, sourceIds: [byContent('MEM[2]'), byContent('MEM[4]')], attempts: 0 });
       for (const i of [4, 5]) manager.removeMessage(ids[i]! as never);
       const sent = requests.length;
       const { errors } = await logged(() => manager.tick());
       assert.strictEqual(requests.length, sent, 'no merge request sent');
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, { lastOutcome: string }> }).mergeQuarantine;
-      assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), ['topology_violation'], 'MEM[1] and MEM[4] with MEM[3] between them is refused');
+      assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), ['topology_violation'], 'MEM[2], which keeps M6 and M7, and MEM[4], with MEM[3] between them, are refused');
       assert.ok(errors.some((line) => REFUSED.test(line)), 'the refusal is an operator error');
     } finally {
       await manager.close();

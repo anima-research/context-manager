@@ -1915,7 +1915,8 @@ export interface AutobiographicalConfig {
    * never executed: it is refused into the merge quarantine, unless one of
    * its sources had messages and has none left in the view: then it is
    * dropped, with a warning naming what the check found, and its other
-   * sources are offered again.
+   * sources are offered again, except where two or more others remain and the
+   * check finds a problem among them, which is refused as before.
    */
   topologyPolicy?: 'reject' | 'report';
   /**
