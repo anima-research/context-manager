@@ -1045,6 +1045,42 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
     }
   });
 
+  it('refuses every read through a view its strategy holds, once the namespace records a reader the manager doesn\'t compile for', async () => {
+    let held: MessageStoreView | undefined;
+    class Holding extends PassthroughStrategy {
+      override select(...args: Parameters<PassthroughStrategy['select']>): ReturnType<PassthroughStrategy['select']> {
+        held = args[0];
+        return super.select(...args);
+      }
+    }
+    const dir = tmp();
+    const nobody = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/h', strategy: new Holding() });
+    try {
+      const hi = nobody.addMessage('user', [t('Hi.')]);
+      await nobody.compile(BUDGET);
+      const view = held as MessageStoreView | undefined;
+      assert.ok(view, 'the premise: its compile handed the strategy a view');
+      assert.equal(typeof view.sequenceOf, 'function', 'the premise: the view answers sequenceOf');
+      const reads: Array<[string, () => unknown]> = [
+        ['getAll', () => view.getAll()],
+        ['get', () => view.get(hi)],
+        ['sequenceOf', () => view.sequenceOf!(hi)],
+        ['getFrom', () => view.getFrom(0)],
+        ['getTail', () => view.getTail(1)],
+        ['length', () => view.length()],
+      ];
+      for (const [name, read] of reads) assert.doesNotThrow(read, `the premise: ${name} answers before the claim`);
+      const ann = await ContextManager.open({ store: nobody.getStore(), namespace: 'agents/h', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+      await ann.close();
+      for (const [name, read] of reads) {
+        assert.throws(read, /ContextManager's reader view: namespace "agents\/h" compiles for reader "ann", and this manager compiles for none/, `${name} through the held view is refused`);
+      }
+    } finally {
+      await nobody.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('summarises nothing more of a namespace another manager claimed, through a drain that began before the claim', async () => {
     const dir = tmp();
     let release: (() => void) | undefined;
