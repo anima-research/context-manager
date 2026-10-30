@@ -38,7 +38,7 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "@animalabs/chronicle": "^0.5.0",
+    "@animalabs/chronicle": "^0.5.1",
     "@animalabs/membrane": "^0.8.0"
   },
   "devDependencies": {

@@ -5079,9 +5079,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         record.normalizedConfig.sourceOnlyFallbackRequestHash &&
       // Same rule for the tool-prose rung: enabling or re-pointing it is a
       // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since a record read
-      // back from the store has their keys in another order than
-      // toolProseHoistOptions builds them in.
+      // options are compared as canonicalJson gives them, since the options
+      // of a record chronicle before 0.5.1 stored or reads back can have their
+      // keys in another order than toolProseHoistOptions builds them in.
       canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
         canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
     );
@@ -20176,7 +20176,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `msg` as this strategy sends it before any cut: each `tool_result`
    * toolPruning replaces carries its marker, and each `tool_use` input over
    * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys }`
-   * (its first five keys as stored, which the store sorts). `msg` itself when
+   * (its first five keys as stored). `msg` itself when
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
