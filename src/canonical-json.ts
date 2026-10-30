@@ -2,11 +2,10 @@
  * JSON with each object's keys in one order whatever order they were set in
  * (sorted, though integer-like keys come first, ascending, as in any object),
  * and each array's items in their own order, so two values that differ only
- * in the order their keys were set give the same text. An object a store
- * written by chronicle 0.5.0 keeps comes back with its keys sorted, one
- * written by 0.6.0 (chronicle #67) in the order they were written, and one
- * built in code in the order it was built in; this gives the same text for
- * all three.
+ * in the order their keys were set give the same text. An object chronicle
+ * before 0.5.1 stored or reads back can have its keys sorted, one chronicle
+ * 0.5.1 or later stored comes back in the order written (chronicle #67), and
+ * one built in code keeps the order it was built in.
  */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(value, (_key, inner: unknown) => {

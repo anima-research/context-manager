@@ -303,7 +303,7 @@ describe('blockAsStored', () => {
   });
 
   it('leaves the store\'s serialization out: a block differs from its read-back only there', async () => {
-    // Undefined fields, key order and UTF-8 (a lone surrogate comes back as
+    // Undefined fields and UTF-8 (a lone surrogate comes back as
     // U+FFFD) belong to the store's serialization, which blockAsStored doesn't
     // model. Normalizing them on both sides makes the two equal.
     const block = { type: 'text', text: 'lone \ud800 surrogate', note: undefined } as unknown as ContentBlock;

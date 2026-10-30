@@ -10,13 +10,11 @@
  * Two properties matter more than the feature itself:
  *
  *  1. The default ('none') is byte-identical to the render that existed
- *     before the envelope was added. That is pinned against
- *     `test/fixtures/recall-envelope-golden.json`, captured MECHANICALLY on
- *     the pre-change tree (see recall-envelope-golden.generate.ts). A red
- *     here is a compat break in the change, never a stale golden. The one
- *     difference is the key order of the messages the fixtures store, which
- *     chronicle now gives back in the order written (chronicle #67). See
- *     goldenAsSent.
+ *     before the envelope was added, from the same store. That is pinned
+ *     against `test/fixtures/recall-envelope-golden.json`, first captured
+ *     MECHANICALLY on the pre-change tree and re-captured only when the
+ *     store's read-back changed (see recall-envelope-golden.generate.ts). A
+ *     red here is a compat break in the change, never a stale golden.
  *  2. Nothing downstream keys on answer bytes. Q-side labels are untouched in
  *     both modes, and zero-recall surgery removes enveloped pairs exactly as
  *     it removes bare ones.
@@ -35,13 +33,12 @@ import {
 } from '../src/recall-envelope.js';
 import { transformZeroRecallCompression } from '../src/surgery/zero-recall-compression.js';
 import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
-import { canonicalJson } from '../src/canonical-json.js';
 import {
+  HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT,
   HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
   HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   renderAdaptiveFixture,
   renderHierarchicalFixture,
-  textContent,
   type FixtureSummary,
   type RenderedMessage,
 } from './fixtures/recall-envelope-fixture.js';
@@ -99,53 +96,38 @@ function parseEnvelopeAttributes(text: string): Record<string, string> {
   return attributes;
 }
 
-/**
- * The golden's bytes as a compile sends them now. The golden was captured
- * with chronicle 0.5.0, which gave a stored message back with its keys
- * sorted. Chronicle now gives them back in the order written (chronicle #67),
- * so each message the fixture stored goes out with its blocks' keys in the
- * order textContent writes them. The recall pairs (a question and the answer
- * after it) are built by the strategy, not stored, so they keep the golden's
- * bytes. Only the key order changes, not the content.
- */
-function goldenAsSent(golden: RenderedMessage[]): RenderedMessage[] {
-  const written = Object.keys(textContent('')[0]!);
-  return golden.map((message, i) => {
-    if (isRecallQuestion(message) || (i > 0 && isRecallQuestion(golden[i - 1]!))) return message;
-    return {
-      ...message,
-      content: message.content.map((block) => {
-        assert.deepEqual(Object.keys(block).sort(), [...written].sort(), 'a stored block is one textContent writes');
-        return Object.fromEntries(written.map((key) => [key, (block as unknown as Record<string, unknown>)[key]])) as unknown as ContentBlock;
-      }),
-    };
-  });
-}
-
-/** The render is the golden's content, key for key, and its bytes are the golden's as sent (goldenAsSent). */
-function assertGolden(rendered: RenderedMessage[], golden: RenderedMessage[]): void {
-  assert.equal(canonicalJson(rendered), canonicalJson(golden), 'default-mode render drifted from the pre-change golden — fix the change, not the golden');
-  assert.equal(
-    JSON.stringify(rendered),
-    JSON.stringify(goldenAsSent(golden)),
-    'default-mode render drifted from the pre-change golden — fix the change, not the golden',
-  );
-}
-
 describe('recallEnvelope: default mode renders the pre-change bytes', () => {
   it('hierarchical path (per-id labels) matches the golden byte-for-byte', async () => {
     const rendered = await renderHierarchicalFixture();
-    assertGolden(rendered.messages, GOLDEN.hierarchical);
+    assert.equal(
+      JSON.stringify(rendered.messages),
+      JSON.stringify(GOLDEN.hierarchical),
+      'default-mode render drifted from the pre-change golden — fix the change, not the golden',
+    );
   });
 
   it('adaptive path (uniform label) matches the golden byte-for-byte', async () => {
     const rendered = await renderAdaptiveFixture();
-    assertGolden(rendered.messages, GOLDEN.adaptive);
+    assert.equal(
+      JSON.stringify(rendered.messages),
+      JSON.stringify(GOLDEN.adaptive),
+      'default-mode render drifted from the pre-change golden — fix the change, not the golden',
+    );
   });
 
   it('explicit none is the same as omitting the option', async () => {
     const explicit = await renderHierarchicalFixture({ recallEnvelope: 'none' });
-    assertGolden(explicit.messages, GOLDEN.hierarchical);
+    assert.equal(JSON.stringify(explicit.messages), JSON.stringify(GOLDEN.hierarchical));
+  });
+});
+
+describe('a turn read back from the store', () => {
+  it('renders the latest turn with the bytes it was written with', async () => {
+    const rendered = await renderHierarchicalFixture();
+    assert.equal(
+      JSON.stringify(rendered.messages.at(-1)),
+      JSON.stringify({ participant: 'user', content: [{ type: 'text', text: HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT }] }),
+    );
   });
 });
 
