@@ -742,7 +742,6 @@ describe('live image accounting', () => {
 });
 
 describe("the adaptive strip applies the estimate's verdicts", () => {
-  const STUB = "[this call's result isn't shown in this context. If you need its output and the tool only reads, call it again; you'll get what it returns now.]";
   const image = (data: string, tokenEstimate: number): ContentBlock =>
     ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' }, tokenEstimate }) as ContentBlock;
   /** Compiles the messages under the adaptive selection, and returns what's
@@ -766,10 +765,8 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     });
     /** The text the repair leaves where it moved a message's only result, which no estimate prices. */
     const movedText = store.estimateTokens({ content: [{ type: 'text', text: '[tool result moved during context repair]' }] } as unknown as StoredMessage);
-    /** A message holding one stub the repair sends for a call with no result, which no estimate prices either. */
-    const stubText = store.estimateTokens({ content: [{ type: 'tool_result', toolUseId: 'x', content: STUB }] } as unknown as StoredMessage);
     cm.close();
-    return { sent, total: stats.total.tokens, planned: stats.planVsActual?.planned, actual: stats.planVsActual?.actual, live, results, movedText, stubText };
+    return { sent, total: stats.total.tokens, planned: stats.planVsActual?.planned, actual: stats.planVsActual?.actual, live, results, movedText };
   }
   function* imagesOf(content: ContentBlock[]): Generator<ContentBlock> {
     for (const b of content) {
@@ -871,20 +868,21 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     assert.equal(r.total + r.movedText, r.sent, `render stats ${r.total} and the repair's text ${r.movedText}, sent ${r.sent}`);
   });
 
-  it("sends the first of two results for one call id that share a message after the later of two calls with that id, and no image of the other", async () => {
+  it("sends no image live on another's verdict where two results for one call id share a message and the repair moves one", async () => {
     const use = (text: string): [string, ContentBlock[]] =>
       ['Claude', [{ type: 'text', text }, { type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]];
     const result = (data: string, tokenEstimate: number, text: string) =>
       ({ type: 'tool_result', toolUseId: 'x', content: [{ type: 'text', text }, image(data, tokenEstimate)] });
     const r = await compileMoved(1, [
       ['User', [{ type: 'text', text: 'start' }]],
-      use('call'), use('again'),
-      ['User', [result('SMAL', 100, 'small'), result('LARG', 5000, 'large')] as unknown as ContentBlock[]],
+      use('call'),
+      ['User', [{ type: 'text', text: 'wait' }]],
+      ['Claude', [result('SMAL', 100, 'small'), { type: 'text', text: 'again' }, { type: 'tool_use', id: 'x', name: 'shot', input: {} }, result('LARG', 5000, 'large')] as unknown as ContentBlock[]],
       ['Claude', [{ type: 'text', text: 'done' }]],
     ]);
-    assert.deepEqual(r.results, [STUB, 'small'], 'the earlier call goes with a stub, and the later call with the first result');
-    assert.ok(!r.live.some((data) => data.includes('LARG')), `the large image went out live: ${JSON.stringify(r.live)}`);
-    assert.ok(r.sent <= r.total + r.stubText, `sent ${r.sent}, past the render stats' ${r.total} and the stub's ${r.stubText}`);
+    assert.deepEqual(r.results, ['small', 'large'], 'premise: the repair sent the two results apart, the first moved up to the earlier call');
+    assert.ok(!r.live.some((data) => data.includes('LARG')), `the large image, which its own verdict strips, went out live: ${JSON.stringify(r.live)}`);
+    assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
   });
 
   it("counts a moved result's image once, so an older image the estimate kept stays live", async () => {

@@ -72,11 +72,14 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 }
 
 /**
- * Strip `tool_use` blocks whose IDs have no matching `tool_result` anywhere
- * in the message list, and `tool_result` blocks whose IDs have no matching
- * `tool_use`. If stripping leaves a message with no blocks, replace its
- * content with a placeholder text block so the message stays structurally
- * valid (collapse/rendering paths assume non-empty content).
+ * Strip each `tool_use` that no `tool_result` in the message list answers,
+ * and each `tool_result` that answers no `tool_use` there. A result answers
+ * the nearest call before it with its id, so a call is kept only if a result
+ * with its id follows it before the next call with that id, and a result
+ * only if a call with its id comes before it. If stripping leaves a message
+ * with no blocks, replace its content with a placeholder text block so the
+ * message stays structurally valid (collapse/rendering paths assume
+ * non-empty content).
  *
  * Why this exists: the Anthropic API requires every `tool_use` to be
  * followed by its `tool_result` in the immediately-next message (and every
@@ -100,26 +103,22 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
-  const useIds = new Set<string>();
-  const resultIds = new Set<string>();
+  const paired = new Set<ContentBlock>();
+  const latest = new Map<string, ContentBlock>();
   for (const msg of messages) {
     for (const block of msg.content) {
-      if (block.type === 'tool_use') useIds.add((block as { id: string }).id);
+      if (block.type === 'tool_use') latest.set((block as { id: string }).id, block);
       else if (block.type === 'tool_result') {
-        resultIds.add((block as { toolUseId: string }).toolUseId);
+        const call = latest.get((block as { toolUseId: string }).toolUseId);
+        if (call) {
+          paired.add(call);
+          paired.add(block);
+        }
       }
     }
   }
   return messages.map((msg) => {
-    const trimmed = msg.content.filter((block) => {
-      if (block.type === 'tool_use') {
-        return resultIds.has((block as { id: string }).id);
-      }
-      if (block.type === 'tool_result') {
-        return useIds.has((block as { toolUseId: string }).toolUseId);
-      }
-      return true;
-    });
+    const trimmed = msg.content.filter((block) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(block) : true));
     if (trimmed.length === msg.content.length) {
       return { participant: msg.participant, content: msg.content };
     }

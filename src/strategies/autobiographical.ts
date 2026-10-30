@@ -684,12 +684,12 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the nearest call with its id before it, in its own message or an earlier
- * one, as pairing repair pairs them (relocateOrDropMissingResults): a later
- * call can reuse an id, and the earlier call is then answered by no result
- * after it. A result whose nearest call a result has already answered goes
- * with that call, as a further result; a result with no call before it with
- * its id answers none. Epoch 4's predicate reads the same calls, so it sees
- * what the count sees.
+ * one, the call pairing repair pairs it with where its look-ahead reaches
+ * (relocateOrDropMissingResults): a later call can reuse an id, and the
+ * earlier call is then answered by no result after it. A result whose
+ * nearest call a result has already answered goes with that call, as a
+ * further result; a result with no call before it with its id answers none.
+ * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
   type Waiting = { toolName: string; call: AnsweredCall };
@@ -18242,9 +18242,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  repair keep each block's images in order, copying a block at most. A
    *  result the repair drops, such as a second one for a call, leaves its
    *  verdicts unused, so its images took slots the window could have used.
-   *  Two results for one call id in a single message share a group: were
-   *  pairing repair to move one and send the other in another entry, they
-   *  could take each other's verdicts. A verdict whose image had
+   *  Two results for one call id in a single message share a group, and
+   *  pairing repair can send them apart: in a message holding its own tool
+   *  cycle, a result before a later call with its id goes up to an earlier
+   *  call, and the result after that call stays. They can then take each
+   *  other's verdicts. A verdict whose image had
    *  another payload (imagePayload) isn't this image's, so the image is
    *  replaced, as is one with no verdict at all, such as an entry with no
    *  source would send: both err under the budget. Only the same image in
@@ -19811,7 +19813,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * So the search for an id ends at the next call with it, from `afterIndex`
    * on, leaving a result past that call to it. Results for `missing` ids
    * never sit at or before `afterIndex` (that entry's results are already
-   * matched), so the search for one starts at `afterIndex + 1`.
+   * matched), so in that entry the search can meet only a later call.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],
@@ -19828,8 +19830,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       unit = next;
     }
     return missing.map(id => {
-      if (entries[afterIndex]!.content.some(b => b.type === 'tool_use' && b.id === id)) return this.createToolResultStub(id);
-      for (let j = afterIndex + 1; j < end; j++) {
+      for (let j = afterIndex; j < end; j++) {
         const src = entries[j];
         const bi = src.content.findIndex(
           b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),

@@ -329,6 +329,19 @@ describe('a tool_use id used again by a later call', () => {
     assert.notStrictEqual((resultAfter(entries, 'first') as { content?: unknown } | undefined)?.content, 'what the later call returned');
   });
 
+  it('repair moves a result that comes before a later call with its id, in that call\'s own message, up to the earlier call', () => {
+    const entries = [
+      entry('Claude', [ask('first')]),
+      entry('User', [text('wait')]),
+      entry('Claude', [result('call_1', 'what the earlier call returned'), text('again'), ask('again'), result('call_1', 'what the later call returned')]),
+    ];
+    runEnforce(entries);
+    assertPaired(entries);
+    assert.strictEqual((resultAfter(entries, 'first') as { content?: unknown } | undefined)?.content, 'what the earlier call returned');
+    const later = entries.find((e) => e.content.some((b) => b.type === 'tool_use' && (b as { input: { q?: string } }).input.q === 'again'))!;
+    assert.deepStrictEqual(later.content.flatMap((b) => (b.type === 'tool_result' ? [(b as { content?: unknown }).content] : [])), ['what the later call returned']);
+  });
+
   const STORE = './test-tool-pairing-reused-id';
   let stores = 0;
   const made: string[] = [];
