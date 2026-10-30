@@ -134,9 +134,9 @@ async function open(messages: Array<[string, ContentBlock[]]>, config: Record<st
   const compile = (hash = true) =>
     manager.compile(BIG, undefined, hash ? { kvUnifiedImmutablePrefixHash: 'v1' } : undefined);
   /** Begin the compiled request's submission, and name it. */
-  const begin = (): string => {
+  const begin = (layoutHash?: string): string => {
     const id = `s${++submissions}`;
-    strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: `layout-${id}` });
+    strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: layoutHash ?? `layout-${id}` });
     return id;
   };
   /** Accept a submission with `markers` markers on the wire, or with no wire receipt. */
@@ -328,6 +328,146 @@ describe("a request whose marker count differs from its compile's", () => {
       assert.match(logged[0]!, /carried 3 cache markers where its compile marked 2 layout boundaries,/);
     } finally {
       console.error = original;
+      await o.close();
+    }
+  });
+});
+
+describe("a native tool loop's later calls of one compile (context-manager#168)", () => {
+  const ONE = CASES['everything in the recent window: only the last message is marked']!;
+  const FOUR = CASES["three messages in the head and three raw in the middle: the head's last and the middle are marked"]!;
+
+  async function withMismatchLines(run: (logged: string[]) => Promise<void>): Promise<void> {
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = args.map(String).join(' ');
+      if (line.startsWith('[kv-unified]') && line.includes('cache markers where')) logged.push(line);
+      else if (!(line.startsWith('[kv-unified]') && line.includes('superseded by'))) original(...args);
+    };
+    try {
+      await run(logged);
+    } finally {
+      console.error = original;
+    }
+  }
+
+  it("a floated round leaves the reference, and the recorded wire receipt, as the first call set them", async () => {
+    for (const [c, markers, rounds] of [[ONE, 1, [2, 3, 4]], [FOUR, 4, [4, 4, 4]]] as const) {
+      const o = await open(conversation(c), c.config);
+      try {
+        const compiled = await o.compile();
+        assert.equal(breakpointsOf(compiled.messages).length, markers, 'premise: the compile marks as many messages as named');
+        o.accept(o.begin('turn'), markers);
+        const set = receipts(o.strategy).cache;
+        const wire = receipts(o.strategy).wireReceipt;
+        assert.ok(set && wire, 'premise: the first call sets a reference and records its wire receipt');
+        for (const count of rounds) o.accept(o.begin('turn'), count);
+        assert.equal(receipts(o.strategy).cache, set, `${markers} marker(s): the rounds leave the first call's reference`);
+        assert.deepEqual(receipts(o.strategy).wireReceipt, wire, `${markers} marker(s): and the first call's wire receipt`);
+      } finally {
+        await o.close();
+      }
+    }
+  });
+
+  it('no round logs the mismatch line, the first accepted one included when it is a round', async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async (logged) => {
+        await o.compile();
+        o.accept(o.begin(), 1);
+        o.accept(o.begin(), 2);
+        assert.deepEqual(logged, [], 'a round after an accepted first call');
+        await o.compile();
+        o.begin();
+        o.accept(o.begin(), 2);
+        assert.deepEqual(logged, [], "a round whose compile's first call was superseded");
+        assert.equal(receipts(o.strategy).cache, null, "premise: that round's count check failed");
+        await o.compile();
+        o.accept(o.begin(), 3);
+        assert.equal(logged.length, 1, "a compile's own first call still logs its mismatch");
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a superseded or failed first call's draft takes the first accepted round's reference where its count matches, and none where it doesn't", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async (logged) => {
+        await o.compile();
+        o.begin();
+        o.accept(o.begin(), 1);
+        assert.ok(receipts(o.strategy).cache, 'a matching first accepted round sets the reference');
+        await o.compile();
+        o.begin();
+        o.accept(o.begin(), 2);
+        assert.equal(receipts(o.strategy).cache, null, 'a mismatched first accepted round sets none');
+        o.accept(o.begin(), 1);
+        assert.equal(receipts(o.strategy).cache, null, 'and no later call of that compile sets one');
+        await o.compile();
+        o.strategy.reportKvUnifiedFailed(o.begin());
+        o.accept(o.begin(), 1);
+        const set = receipts(o.strategy).cache;
+        const wire = receipts(o.strategy).wireReceipt;
+        assert.ok(set, "after a failed own request, a matching first accepted round sets the reference");
+        o.accept(o.begin(), 2);
+        assert.equal(receipts(o.strategy).cache, set, 'and a later call leaves it');
+        assert.deepEqual(receipts(o.strategy).wireReceipt, wire, "and the first accepted round's wire receipt");
+        await o.compile();
+        o.strategy.reportKvUnifiedFailed(o.begin());
+        o.accept(o.begin(), 2);
+        assert.equal(receipts(o.strategy).cache, null, 'after a failed own request, a mismatched first accepted round sets none');
+        o.accept(o.begin(), 1);
+        assert.equal(receipts(o.strategy).cache, null, 'and no later call of that compile sets one');
+        assert.deepEqual(logged, [], 'none of these calls logs a mismatch');
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a call still in flight when the next compile runs, an order other hosts may produce, is accepted as its own compile's call", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async (logged) => {
+        await o.compile();
+        const own = o.begin();
+        await o.compile();
+        o.accept(own, 1);
+        assert.ok(receipts(o.strategy).cache, "the call in flight sets its own compile's reference");
+        o.accept(o.begin(), 3);
+        assert.equal(receipts(o.strategy).cache, null, "the next compile's own request takes its own count check");
+        assert.equal(logged.length, 1, 'and logs its mismatch');
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("without floats, a turn ends with today's reference", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async () => {
+        await o.compile();
+        o.accept(o.begin(), 1);
+        const first = receipts(o.strategy).cache;
+        assert.ok(first, 'the first call sets the reference');
+        o.accept(o.begin(), 1);
+        o.accept(o.begin(), 1);
+        assert.deepEqual(receipts(o.strategy).cache, first, "every call carrying the compile's markers ends with its reference");
+        await o.compile();
+        o.accept(o.begin(), 1);
+        const next = receipts(o.strategy).cache;
+        assert.ok(next && next !== first, "the next compile's first call sets a reference of its own");
+        await o.compile();
+        o.accept(o.begin(), 3);
+        o.accept(o.begin(), 3);
+        assert.equal(receipts(o.strategy).cache, null, 'a mismatch every call of a compile shares keeps none');
+      });
+    } finally {
       await o.close();
     }
   });
