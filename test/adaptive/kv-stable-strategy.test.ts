@@ -225,7 +225,7 @@ function planOfTheRest(
   keepRaw(ch);
   const inputs: PickerInputs = {
     chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
-    ...ch.computeHeadTail({ headTokens, tailTokens: 6000 }),
+    ...ch.computeHeadTail({ headTokens, tailTokens: 16_000 }),
   };
   const sol = new KvStableStrategy({}).solve(inputs, BUDGET(totalBudget));
   return new Map(ch.chunks.filter((c) => !kept.has(c.id)).map((c) => [c.id, sol.frontier.get(c.id) ?? 0]));
@@ -234,10 +234,38 @@ function planOfTheRest(
 const chunkRange = (from: number, to: number): Set<ChunkId> =>
   new Set(Array.from({ length: to - from }, (_, i) => `c-${String(from + i).padStart(4, '0')}`));
 
-test('kv-stable shape prior: pins outside the attended window plan the rest of the store as locks on the same raw chunks do', () => {
-  const kept = chunkRange(10, 30);
+test('kv-stable shape prior: a store whose only raw chunks are its attended tail plans as the shared planner does with that tail as its raw zone', () => {
   for (let total = 12_000; total <= 80_000; total += 1_000) {
-    const pinned = planOfTheRest((ch) => { for (const c of ch.chunks) if (kept.has(c.id)) c.pinned = true; }, 0, kept, total);
+    const ch = buildChronicleWithChain({ chunkCount: 120, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+    const inputs: PickerInputs = {
+      chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
+      ...ch.computeHeadTail({ headTokens: 0, tailTokens: 16_000 }),
+    };
+    const budget = BUDGET(total);
+    let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
+    const reference = planControlledFrontier(inputs, new SummaryTree(inputs), {
+      previous: new Map(inputs.chunks.map((c) => [c.id, c.currentResolution])),
+      foldAtTokens: budget.totalBudget, expandAtTokens: budget.targetBudget, targetTokens: budget.targetBudget,
+      windowTokens: budget.totalBudget, rawZone: inputs.tailChunkIds, now, mergeThreshold: 6,
+    });
+    const sol = new KvStableStrategy({}).solve(inputs, budget);
+    assert.deepEqual(sol.frontier, reference.resolutions, `budget ${total}`);
+  }
+});
+
+test('kv-stable shape prior: pins plan the rest of the store as locks on the same raw chunks do, outside the attended tail or inside it', () => {
+  const classic = new Set([...chunkRange(10, 17), ...chunkRange(110, 118)]);
+  const atLevel0 = chunkRange(17, 24);
+  const atMaxLevel0 = chunkRange(24, 30);
+  const kept = new Set([...classic, ...atLevel0, ...atMaxLevel0]);
+  for (let total = 12_000; total <= 80_000; total += 1_000) {
+    const pinned = planOfTheRest((ch) => {
+      for (const c of ch.chunks) {
+        if (classic.has(c.id)) c.pinned = true;
+        if (atLevel0.has(c.id)) c.pinLevel = 0;
+        if (atMaxLevel0.has(c.id)) c.pinMaxLevel = 0;
+      }
+    }, 0, kept, total);
     const locked = planOfTheRest((ch) => { for (const c of ch.chunks) if (kept.has(c.id)) c.lockedByAgent = true; }, 0, kept, total);
     assert.deepEqual(pinned, locked, `budget ${total}`);
   }

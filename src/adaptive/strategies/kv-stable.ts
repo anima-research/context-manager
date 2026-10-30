@@ -9,9 +9,9 @@
  * and returns it for the picker to apply directly.
  *
  * It minimizes real prefix churn: it holds the head, the attended tail (the
- * flat zone) and pinned chunks raw, never folds locked chunks, honors V2
- * leveled pins (`pinLevel` / `pinMaxLevel`) as fixed levels / hard
- * fold-depth caps, and reconciles a
+ * flat zone) and classic pins raw, never folds a locked chunk a level pin
+ * doesn't hold, honors V2 leveled pins (`pinLevel` / `pinMaxLevel`) as fixed
+ * levels / hard fold-depth caps, and reconciles a
  * relevance-ideal cut (seeded from the carried frontier unless its
  * `seedFromCarried` option is false, as a measurement's from-scratch arm
  * sets it) against the carried frontier
@@ -105,9 +105,10 @@ export class KvStableStrategy implements FoldingSolver {
     const fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
 
     // Raw zone (forced raw, never folded): head, tail (the flat zone), classic
-    // pins. Frozen (kept at their carried resolution, never touched): locked.
-    // V2 dynamic pins (`pinLevel` / `pinMaxLevel`) are honored as a fixed level
-    // or a hard fold-depth cap — see `planControlledFrontier`.
+    // pins. Frozen (kept at their carried resolution unless a pin holds or
+    // caps them): locked. V2 dynamic pins (`pinLevel` / `pinMaxLevel`) are
+    // honored as a fixed level or a hard fold-depth cap — see
+    // `planControlledFrontier`.
     const rawZone = new Set<ChunkId>();
     const frozen = new Set<ChunkId>();
     const fixedLevels = new Map<ChunkId, number>();
