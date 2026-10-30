@@ -695,14 +695,15 @@ describe('sharded writes declare their group size', () => {
     });
   });
 
-  it('a rollback whose own reads fail still raises the write\'s error, and reports it', async () => {
+  it('a rollback whose own reads fail still raises with the write\'s error, and reports the failed read', async () => {
     await withManager('./test-shard-count-recovery-read', async (open) => {
       const cm = await open();
       const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; getTail: (n: number) => unknown[] } }).messageStore;
       const append = store.append.bind(store);
       const getTail = store.getTail.bind(store);
       // The first shard lands, then its append throws, so the rollback has
-      // to read the store's tail to find it, and that read fails too.
+      // to read the store's tail to find it, and that read fails too. No
+      // removal is tried: no id names what to remove.
       store.append = (...args: unknown[]) => {
         append(...args);
         throw new Error('injected failure after the first shard landed');
@@ -719,7 +720,7 @@ describe('sharded writes declare their group size', () => {
         store.getTail = getTail;
       }
       assert.ok(
-        logged.some((l) => l.includes('removing what it wrote threw') && l.includes('injected failure of the tail read')),
+        logged.some((l) => l.includes('reading the store to tell whether that shard landed threw') && l.includes('injected failure of the tail read')),
         `the failed recovery is reported: ${logged.join('\n')}`,
       );
       cm.close();

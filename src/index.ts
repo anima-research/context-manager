@@ -1,5 +1,11 @@
 // Main class
-export { ContextManager, ContextDerivationUnsupportedError, InitializationSupersededError, WriteLandedError } from './context-manager.js';
+export {
+  ContextManager,
+  ContextDerivationUnsupportedError,
+  InitializationSupersededError,
+  WriteLandedError,
+  WriteOutcomeUnknownError,
+} from './context-manager.js';
 export type { ContextManagerConfig, DeriveContextOptions, ContextDerivation, ReopenDerivedOptions } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)

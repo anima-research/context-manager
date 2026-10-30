@@ -1,13 +1,15 @@
 /**
- * An addMessage that fails after storing some of the message throws
- * WriteLandedError, naming the rows of it the store holds, with the write's
- * own error as its cause (agent-framework #844, design question 5). Any
- * other error from addMessage means the manager found none of the message
- * in the store: a write that fails before a row lands throws its own error,
- * unwrapped, and so does a sharded write once it has removed the shards it
- * stored. When that removal fails too, the error names the shards that
- * stayed. Where the store can't be read to tell, the error goes by the rows
- * the manager knows the write stored.
+ * What a failed addMessage throws tells a host which of three things
+ * happened (agent-framework #844, design question 5):
+ * - WriteLandedError: the store holds the rows of the message it names, and
+ *   no others, with the write's own error as its cause.
+ * - WriteOutcomeUnknownError: the manager can't tell whether the store holds
+ *   some row of the message, because the read that would tell threw. It
+ *   names the rows the manager knows are stored, and what it can't say
+ *   about.
+ * - Any other error: the store holds none of the message. A write that fails
+ *   before a row lands throws its own error, unwrapped, and so does a
+ *   sharded write once it has removed the shards it stored.
  *
  * A host's onMessage listener can't fail a write (its throw is logged), so
  * the failure after a row landed is the manager's own: its listener runs
@@ -20,7 +22,7 @@ import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, MalformedContentError, PassthroughStrategy, WriteLandedError } from '../src/index.js';
+import { ContextManager, MalformedContentError, PassthroughStrategy, WriteLandedError, WriteOutcomeUnknownError } from '../src/index.js';
 import type { MessageStore, StoredMessage } from '../src/index.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -124,7 +126,7 @@ function flakyStore(path: string, error: unknown) {
   return { real, store, state };
 }
 
-describe('WriteLandedError: an add that fails after storing some of the message', () => {
+describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails throws', () => {
   it("a message stored as one row stays when its append fails after it landed: the error names it, and its cause is the write's own error", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     cm.addMessage('bob', [text('before')]);
@@ -261,7 +263,7 @@ describe('WriteLandedError: an add that fails after storing some of the message'
     cm.close();
   });
 
-  it("where the store can't be read to tell which shards stayed, the error names every shard the write stored", async () => {
+  it("where the store can't be read to tell which shards a failed removal left, the error says the manager can't tell, naming every shard the write stored", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
@@ -272,26 +274,106 @@ describe('WriteLandedError: an add that fails after storing some of the message'
     messages.sequenceOf = () => { throw new Error('store unreadable'); };
     const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
     messages.sequenceOf = sequenceOf;
-    assert.ok(err instanceof WriteLandedError);
-    assert.deepEqual(err.landed, cm.getAllMessages().slice(1).map((m) => m.id));
-    assert.equal(err.landed.length, 2);
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.ok(!(err instanceof WriteLandedError));
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ']);
+    assert.deepEqual(err.landed, [], 'none it knows stayed');
+    assert.deepEqual(err.unknown, stored.slice(1).map((m) => m.id), "the second shard's own row too: the store could be read to tell that it landed");
+    assert.equal(err.unnamed, 0);
+    assert.equal(err.cause, failure);
+    assert.ok(err.message.includes(`can't tell whether the store holds 2 rows of the message (${err.unknown.join(', ')}): propagation failed`), err.message);
     cm.close();
   });
 
-  it("where the store can't be read to tell whether a row landed, the write's own error is thrown, and the failed read is logged", async () => {
+  it("a removal that took the shards out and then failed, where the store can't be read to tell, isn't taken to have left them", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    const messages = internals(cm).messageStore;
+    const remove = messages.removeBodyGroup.bind(messages);
+    const sequenceOf = messages.sequenceOf.bind(messages);
+    let written: string[] = [];
+    messages.removeBodyGroup = (id) => {
+      written = messages.getAll().slice(1).map((m) => m.id);
+      remove(id);
+      messages.sequenceOf = () => { throw new Error('store unreadable'); };
+      throw new Error('failed after removing');
+    };
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    messages.sequenceOf = sequenceOf;
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], 'the removal took them out');
+    assert.deepEqual(err.landed, []);
+    assert.deepEqual(err.unknown, written);
+    assert.equal(err.unnamed, 0);
+    assert.equal(err.unknown.length, 2);
+    cm.close();
+  });
+
+  it("where the store can't be read to tell whether a row landed, the error says the manager can't tell, and the failed read is logged", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('zz the manager failed');
     internals(cm).createStrategyContext = () => { throw failure; };
-    const messages = internals(cm).messageStore;
-    const getTail = messages.getTail.bind(messages);
-    messages.getTail = () => { throw new Error('store unreadable'); };
+    const readable = failTailRead(cm);
     const { result: err, logged } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one')])));
-    messages.getTail = getTail;
+    readable();
     delete (cm as unknown as { createStrategyContext?: unknown }).createStrategyContext;
-    assert.equal(err, failure);
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.ok(err instanceof Error && !(err instanceof WriteLandedError));
+    assert.equal(err.name, 'WriteOutcomeUnknownError');
+    assert.deepEqual(err.landed, []);
+    assert.deepEqual(err.unknown, []);
+    assert.equal(err.unnamed, 1, 'the row, whose append returned no id');
+    assert.equal(err.cause, failure);
+    assert.match(err.message, /^addMessage failed, and the manager can't tell whether the store holds a row of the append that threw: /);
+    assert.match(err.message, /zz the manager failed$/, "the message ends with the write's own");
     assert.ok(logged.some((l) => l.includes('reading the store to tell whether its row landed threw, so the row may be stored: store unreadable')), logged.join('\n'));
     assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one'], 'it was');
+    cm.close();
+  });
+
+  it("where the store can't be read to tell whether a sharded write's first shard landed, nothing is removed, the failed read is logged, and the error says the manager can't tell", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 1, failure);
+    const readable = failTailRead(cm);
+    const { result: err, logged } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two ')])));
+    readable();
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.deepEqual(err.landed, []);
+    assert.deepEqual(err.unknown, []);
+    assert.equal(err.unnamed, 1);
+    assert.equal(err.cause, failure);
+    assert.ok(
+      logged.some((l) => l.includes('failed on its first shard, and reading the store to tell whether that shard landed threw, so it may be stored, leaving body group three short: store unreadable')),
+      logged.join('\n'),
+    );
+    assert.ok(!logged.some((l) => l.includes('removing what it wrote threw')), `no removal was tried: ${logged.join('\n')}`);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one '], 'it was stored');
+    cm.close();
+  });
+
+  it("where the failing shard's landing can't be read and removing the shards fails too, the error names the shards that stayed and says the manager can't tell about the failing one", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    failRemoval(cm);
+    const readable = failTailRead(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    readable();
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two '], "the second shard's row is stored too, which the manager couldn't read");
+    assert.deepEqual(err.landed, [stored[1]!.id], 'the first shard, which it knows stayed');
+    assert.deepEqual(err.unknown, []);
+    assert.equal(err.unnamed, 1, 'the second shard, whose append threw');
+    assert.equal(err.cause, failure);
+    assert.ok(err.message.includes(`a row of the append that threw; it holds message ${stored[1]!.id}: propagation failed`), err.message);
     cm.close();
   });
 

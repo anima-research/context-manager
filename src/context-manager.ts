@@ -388,29 +388,33 @@ export class InitializationSupersededError extends Error {
  * it the store holds, and the error the write failed with.
  *
  * `landed` names those rows, in store order: the message's one row, or the
- * shards of a sharded body that stayed. `cause` is the write's own error,
- * and this error's message ends with its message, so a check of the message
- * that matched the write's own error still matches.
+ * shards of a sharded body that stayed. The store holds no other row of the
+ * message. `cause` is the write's own error, and this error's message ends
+ * with its message, so a check of the message that matched the write's own
+ * error still matches.
  *
- * It is thrown only when a row of the write is in the store as the write
- * fails, so any other error from addMessage means the manager found none of
- * the message in the store:
- * - A write that fails before a row lands throws its own error, unwrapped:
- *   a refusal of the message, or of a shard as the strategy chunked it
- *   (MalformedContentError), a chunking the manager refuses, a strategy not
- *   initialized, a store that refuses the first append.
- * - A sharded write that fails after storing shards removes them, so that a
- *   retry writes one body, and then throws its own error, unwrapped. When
- *   that removal fails too, `landed` names the shards that stayed: a body
- *   short of its shardCount, which a retry doesn't remove.
+ * What addMessage throws tells which of three things happened:
+ * - WriteLandedError: the store holds the rows of the message `landed`
+ *   names, and no others.
+ * - {@link WriteOutcomeUnknownError}: the manager can't tell whether the
+ *   store holds some row of the message, because the read of the store that
+ *   would tell threw. It names what the manager does know.
+ * - Any other error: the store holds none of the message.
+ *
+ * It is thrown when a row of the write stays:
  * - A message stored as one row stays: its append can fail after the row
  *   landed, when the manager's own listener fails inside it (see
  *   onMessage), and `landed` names the row.
+ * - A sharded write that fails partway removes the shards it stored, the
+ *   failing shard's row with them where it landed, so that a retry writes
+ *   one body, and then throws its own error, unwrapped. When that removal
+ *   fails too, `landed` names the shards that stayed: a body short of its
+ *   shardCount, which a retry doesn't remove.
  *
- * The manager reads the store to tell what stayed. Where that read fails,
- * it goes by the rows it knows the write stored: after a failed removal,
- * `landed` names all of them, and where it knows of none it throws the
- * write's own error, and logs that the message may be stored.
+ * A write that fails before a row lands throws its own error, unwrapped: a
+ * refusal of the message, or of a shard as the strategy chunked it
+ * (MalformedContentError), a chunking the manager refuses, a strategy not
+ * initialized, a store that refuses the first append.
  *
  * Its add may have gone unheard: a failure in the manager's own listener
  * ends the event before a host's onMessage listener hears it, and before
@@ -426,13 +430,90 @@ export class WriteLandedError extends Error {
 
   constructor(landed: readonly MessageId[], cause: unknown) {
     super(
-      `addMessage failed after storing ${landed.length === 1 ? `message ${landed[0]}` : `${landed.length} rows of the message (${landed.join(', ')})`}, ` +
-        `which the store holds: ${describeThrown(cause)}`,
+      `addMessage failed after storing ${rowsOfTheMessage(landed)}, which the store holds: ${describeThrown(cause)}`,
     );
     this.name = 'WriteLandedError';
     this.landed = Object.freeze([...landed]);
     this.cause = cause;
   }
+}
+
+/**
+ * An addMessage that failed where the manager can't tell whether the store
+ * holds some row of the message: the read of the store that would tell
+ * threw. What the manager does know, and the error the write failed with.
+ *
+ * - `landed`: the rows of the message the manager knows the store holds, in
+ *   store order. Possibly none.
+ * - `unknown`: rows the write stored, by id, that may have gone since: a
+ *   sharded write's removal of its shards threw, and the store can't be
+ *   read to tell whether it took them out before it threw. The removal is
+ *   one store write, so the store holds all of these or none of them.
+ * - `unnamed`: how many rows the store may hold that the manager can't
+ *   name: 1 when the store can't be read to tell whether the row of the
+ *   append that failed the write landed (the store gives a row its id as it
+ *   writes it, so an append that throws returns none), else 0.
+ * - `cause`: the write's own error. This error's message ends with its
+ *   message, as WriteLandedError's does.
+ *
+ * Together they name every row of the message the store may hold: `landed`
+ * is stored, and of the rest the store holds at most those `unknown` names
+ * and `unnamed` counts. It is thrown:
+ * - For a message stored as one row whose append threw, where the store
+ *   can't be read to tell whether the row landed (`unnamed` 1). The manager
+ *   logs the failed read.
+ * - For a sharded write whose first shard's append threw, likewise. Nothing
+ *   is removed, since no id names what to remove (`unnamed` 1). The manager
+ *   logs the failed read.
+ * - For a sharded write that stored shards before the one whose append
+ *   threw, where the store can't be read to tell whether that one landed,
+ *   and removing what it stored threw too (`landed` the shards that stayed,
+ *   `unnamed` 1). Where the removal goes through, it takes out the failing
+ *   shard's row with the run of shards before it, if that row landed, so
+ *   the write's own error is thrown.
+ * - For a sharded write whose removal of what it stored threw, where the
+ *   store can't be read to tell whether the shards stayed (`unknown`, and
+ *   `unnamed` 1 if the failing shard's landing can't be read either).
+ *
+ * A host that stores the message another way when an add stored none of it
+ * can't tell from this error whether doing so stores it twice: a read of
+ * the store, once it reads, tells.
+ *
+ * As for WriteLandedError, the add may have gone unheard; the rows `landed`
+ * names are out of the window until a host presents them, once it presents
+ * rows on the branch; and a holdCompression hold the add placed stays on any
+ * row of it that is stored (getCompressionHolds lists it, and
+ * releaseCompression releases it).
+ */
+export class WriteOutcomeUnknownError extends Error {
+  readonly landed: readonly MessageId[];
+  readonly unknown: readonly MessageId[];
+  readonly unnamed: number;
+  override readonly cause: unknown;
+
+  constructor(
+    known: { landed: readonly MessageId[]; unknown: readonly MessageId[]; unnamed: number },
+    cause: unknown,
+  ) {
+    const whether = [
+      ...(known.unknown.length > 0 ? [rowsOfTheMessage(known.unknown)] : []),
+      ...(known.unnamed > 0 ? [known.unnamed === 1 ? 'a row of the append that threw' : `${known.unnamed} rows of appends that threw`] : []),
+    ];
+    super(
+      `addMessage failed, and the manager can't tell whether the store holds ${whether.length > 0 ? whether.join(', or ') : 'some of the message'}` +
+        `${known.landed.length > 0 ? `; it holds ${rowsOfTheMessage(known.landed)}` : ''}: ${describeThrown(cause)}`,
+    );
+    this.name = 'WriteOutcomeUnknownError';
+    this.landed = Object.freeze([...known.landed]);
+    this.unknown = Object.freeze([...known.unknown]);
+    this.unnamed = known.unnamed;
+    this.cause = cause;
+  }
+}
+
+/** Rows of a message as an error names them: `message <id>`, or `<n> rows of the message (<ids>)`. */
+function rowsOfTheMessage(ids: readonly MessageId[]): string {
+  return ids.length === 1 ? `message ${ids[0]}` : `${ids.length} rows of the message (${ids.join(', ')})`;
 }
 
 /**
@@ -831,18 +912,23 @@ export class ContextManager {
    * chunk rebuild can fold it. Release it with
    * releaseCompression([returnedId]) (releases every shard).
    *
-   * A write that fails after storing some of the message throws
-   * {@link WriteLandedError}: its `landed` names the rows of the message
-   * the store holds, in store order, and its `cause` is the write's own
-   * error. Any other error means the manager found none of the message in
-   * the store: a write that fails before a row lands throws its own error,
-   * and so does a sharded write that fails partway, once it has removed the
-   * shards it stored. When that removal fails too, the error names the
-   * shards that stayed. A message stored as one row stays when its append
-   * fails after the row landed, the manager's own listener failing inside
-   * it (see onMessage). Where the store can't be read to tell what stayed,
-   * the error goes by the rows the manager knows the write stored, as
-   * WriteLandedError says.
+   * What a write that fails throws says what of the message the store
+   * holds:
+   * - {@link WriteLandedError}: the rows its `landed` names, in store order,
+   *   and no others. A message stored as one row stays when its append fails
+   *   after the row landed, the manager's own listener failing inside it
+   *   (see onMessage). A sharded write that fails partway removes the shards
+   *   it stored, and when that removal fails too, the error names the shards
+   *   that stayed.
+   * - {@link WriteOutcomeUnknownError}: the manager can't tell whether the
+   *   store holds some row of the message, because the read of the store
+   *   that would tell threw. Its `landed` names the rows it knows are
+   *   stored, and its `unknown` and `unnamed` what it can't say about.
+   * - Any other error: none of it. A write that fails before a row lands
+   *   throws its own error, and so does a sharded write that fails partway,
+   *   once it has removed what it stored.
+   *
+   * The first two carry the write's own error as their `cause`.
    */
   addMessage(
     participant: string,
@@ -959,36 +1045,51 @@ export class ContextManager {
           // A write that fails partway leaves no part of the body in the
           // store: remove what it wrote (the failing shard too, if it
           // landed), so a retry writes one body, and throw the write's own
-          // error. If that fails as well, the shards may stay, and
-          // shardCount marks the body short: the error names those that
-          // did (WriteLandedError). A shard's own append can throw after it
-          // landed: then its row follows the shards stored before it, and
-          // removing their run removes it too.
+          // error. A shard's own append can throw after it landed: then its
+          // row follows the shards stored before it, and removing their run
+          // removes it too, whether or not the store could be read to tell
+          // that it landed. If the removal fails as well, the shards may
+          // stay, and shardCount marks the body short: the error names those
+          // that did (WriteLandedError). Where the store can't be read to
+          // tell whether a row of the write is in it, the error says so,
+          // naming what the manager knows (WriteOutcomeUnknownError).
           const wrote = [...stored];
-          const leftShort = (failure: unknown) =>
-            this.diag.error(
-              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
-                `${decision.bodyGroupId}${wrote.length > 0 ? ` (first shard ${wrote[0]})` : ''} may be left short: ` +
-                describeThrown(failure),
-            );
+          // 1 when the store can't be read to tell whether the failing
+          // shard's row landed, which then has no id here.
+          let unnamed = 0;
           try {
             const failing = this.rowLandedAt(lengthBefore + stored.length, decision.bodyGroupId);
             if (failing !== null) wrote.push(failing);
           } catch (read) {
-            // With no shard stored before it, nothing says where its row
-            // would be, so nothing is removed.
+            unnamed = 1;
+            // With no shard stored before it, no id names what to remove,
+            // so nothing is removed.
             if (stored.length === 0) {
-              leftShort(read);
-              throw err;
+              this.diag.error(
+                `[context-manager] a sharded addMessage failed on its first shard, and reading the store to tell whether that ` +
+                  `shard landed threw, so it may be stored, leaving body group ${decision.bodyGroupId} short: ` +
+                  describeThrown(read),
+              );
+              throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed }, err);
             }
           }
           if (wrote.length === 0) throw err;
           try {
             this.messageStore.removeBodyGroup(wrote[0]!);
           } catch (removal) {
-            leftShort(removal);
+            this.diag.error(
+              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
+                `${decision.bodyGroupId} (first shard ${wrote[0]}) may be left short: ` +
+                describeThrown(removal),
+            );
+            // The removal is one store write, of the whole run: the shards
+            // stayed, a failing shard's row that landed with them, or none
+            // of them did.
             const stayed = this.rowsStillStored(wrote);
-            if (stayed.length > 0) throw new WriteLandedError(stayed, err);
+            if (stayed === null) throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
+            if (stayed.length > 0) {
+              throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
+            }
           }
           throw err;
         }
@@ -1001,7 +1102,8 @@ export class ContextManager {
     } catch (err) {
       // The append can throw after its row landed: the manager's own
       // listener runs inside it, and its failure fails the write (see
-      // onMessage). The row stays, and the error names it.
+      // onMessage). The row stays, and the error names it. Where the store
+      // can't be read to tell, the error says the manager can't.
       let landed: MessageId | null;
       try {
         landed = this.rowLandedAt(lengthBefore);
@@ -1010,7 +1112,7 @@ export class ContextManager {
           `[context-manager] addMessage failed, and reading the store to tell whether its row landed threw, so the row may be stored: ` +
             describeThrown(read),
         );
-        throw err;
+        throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, err);
       }
       throw landed === null ? err : new WriteLandedError([landed], err);
     }
@@ -1032,15 +1134,15 @@ export class ContextManager {
 
   /**
    * The rows of `ids` this manager's slot still holds, in the order given:
-   * what a sharded write's failed removal left. All of them when the store
-   * can't be read to tell, since the removal that would have taken them
-   * out failed.
+   * what a sharded write's failed removal left. Null when the store can't be
+   * read to tell: a removal can throw after it took the rows out (its
+   * listeners run after the write).
    */
-  private rowsStillStored(ids: readonly MessageId[]): MessageId[] {
+  private rowsStillStored(ids: readonly MessageId[]): MessageId[] | null {
     try {
       return ids.filter((id) => this.messageStore.sequenceOf(id) !== undefined);
     } catch {
-      return [...ids];
+      return null;
     }
   }
 
@@ -1361,7 +1463,8 @@ export class ContextManager {
     // A host's listener observes; its throw isn't the write's failure. The
     // manager's own listener (the context log's propagation) stays outside
     // this, so a failure there still fails the write as before: an add
-    // whose row stays throws WriteLandedError, naming it.
+    // whose row stays throws WriteLandedError, naming it, and one where the
+    // store can't be read to tell throws WriteOutcomeUnknownError.
     return this.messageStore.addListener((event) => {
       try {
         listener(event);
@@ -3398,7 +3501,9 @@ export class ContextManager {
    * So does a presentation of it that fails, or whose strategy hook closes
    * the manager, sets a strategy or moves the store's branch. An add of the
    * transition that fails after storing it rejects with addMessage's
-   * WriteLandedError, naming it, without resetting the head window.
+   * WriteLandedError, naming it, without resetting the head window, and one
+   * where the store can't be read to tell whether it was stored rejects with
+   * its WriteOutcomeUnknownError, likewise.
    */
   async resetHeadWindow(transitionText?: string, options?: { metadata?: MessageMetadata }): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
