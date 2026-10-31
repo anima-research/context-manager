@@ -5997,6 +5997,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Date.now() < pauseUntil(pause) ? pause : null;
   }
 
+  private configuredModelPause(now: number): CompressionLanePause | null {
+    const pause = this.compressionPause;
+    return pause && pause.model === this.config.compressionModel && now < pauseUntil(pause) ? pause : null;
+  }
+
   /**
    * Release the provider's stated wait from the lane's pause: the caller's
    * explicit word that the wait no longer holds (agent-framework calls this
@@ -7415,11 +7420,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // bound to another model doesn't show. It names what failed last and
       // its class: how long compression has been behind is
       // getCompressionDebt's oldest pending age.
-      const pause = this.compressionPause &&
-        this.compressionPause.model === this.config.compressionModel &&
-        Date.now() < pauseUntil(this.compressionPause)
-        ? this.compressionPause
-        : null;
+      const pause = this.configuredModelPause(Date.now());
       const paused = pause
         ? `; compression paused ${pauseUntilText(pause)} ` +
           `(${pauseSourceText(pause)}, failure ${pause.failures}` +
@@ -8456,9 +8457,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  `critical` until an operator clears it, its group queues as a valid merge, or a source
      *  is parented or gone, which the sweep then removes. */
     topologyRefusals: number | null;
+    /** The compression lane's pause on the configured compression model, when one binds at `now`;
+     *  null when none does. `until` is when the pause stops holding the lane back, so its next tick
+     *  with work may call again, in milliseconds since the Unix epoch as Date.now() gives: the later
+     *  of its own backoff and the wait it holds, a provider's stated wait after a failed call, or
+     *  after a deferral by the caller's provider admission, the time it keeps that answer before
+     *  asking again (at most 30 s, less if the admission's deadline comes first), unless a longer
+     *  provider wait already stands. `until` is null only when a provider stated a wait that can't be
+     *  held as an instant, which holds until a restart, releaseCompressionPause(), an answer to a
+     *  call on the same membrane and model, or a change of membrane or model once a tick sees it.
+     *  `model` is the model the pause holds, which is the configured compression model, or null when
+     *  none is configured. Like checkReadiness(), the report can't see the membrane: a pause bound to
+     *  another membrane instance shows until a tick that reaches the pause check with another
+     *  membrane drops it. Reported in a report that failed too; it doesn't change `state`. */
+    compressionPause: { until: number | null; model: string | null } | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
+    const pause = this.configuredModelPause(now);
+    const pausedUntil = pause === null ? null : pauseUntil(pause);
+    const compressionPause = pause === null || pausedUntil === null
+      ? null
+      : { until: Number.isFinite(pausedUntil) ? pausedUntil : null, model: pause.model ?? null };
     try {
       const liveEdge = this.heldBackChunks(this.config.l1HoldbackChunks ?? 1);
       const keptBack = (c: Chunk, i: number): boolean => {
@@ -8545,6 +8565,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         lastMintAt,
         topologyViolations: this.topologyViolations.length,
         topologyRefusals,
+        compressionPause,
       };
       // Noted once the report is built, so a failure while building it isn't
       // taken for a success that re-arms the log.
@@ -8569,6 +8590,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         lastMintAt: null,
         topologyViolations: null,
         topologyRefusals: null,
+        compressionPause,
       };
     }
   }
