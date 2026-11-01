@@ -273,6 +273,82 @@ describe('KnowledgeStrategy', () => {
     });
   });
 
+  describe('Phase Classification by configured tool names', () => {
+    const names = { researchToolPrefixes: ['find_'], subagentToolPrefixes: ['spawn_'], lessonToolNames: ['note_save'] };
+
+    it('classifies a message with both a subagent call and a research call as subagent', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      manager.addMessage('Claude', [
+        { type: 'tool_use', id: 'tu1', name: 'find_papers', input: {} },
+        { type: 'tool_use', id: 'tu2', name: 'spawn_reader', input: {} },
+      ]);
+      manager.addMessage('User', [
+        { type: 'tool_result', toolUseId: 'tu1', content: 'found' },
+        { type: 'tool_result', toolUseId: 'tu2', content: 'spawned' },
+      ]);
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const state = getStrategyState(strategy);
+      assert.ok(state.chunks.length > 0, 'premise: a chunk formed');
+      assert.strictEqual(state.chunks[0].phaseType, 'subagent');
+      manager.close();
+    });
+
+    it('matches lesson tool names exactly, not as prefixes', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      const call = (id: string, name: string): void => {
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name, input: {} }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Result ${id}` }]);
+      };
+      call('tu1', 'note_save');
+      manager.addMessage('Claude', [{ type: 'text', text: 'Saved. Now a draft.' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Go ahead' }]);
+      call('tu2', 'note_save_draft');
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const chunks = getStrategyState(strategy).chunks;
+      const holding = (name: string) => chunks.find((c) => c.messages.some((m: any) =>
+        m.content.some((b: any) => b.type === 'tool_use' && b.name === name)));
+      assert.strictEqual(holding('note_save')?.phaseType, 'lesson', 'premise: the configured name is a lesson');
+      assert.strictEqual(holding('note_save_draft')?.phaseType, 'synthesis');
+      manager.close();
+    });
+
+    it('by default, a lesson chunk\'s size limit is targetChunkTokens', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      for (const id of ['tu1', 'tu2', 'tu3']) {
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name: 'note_save', input: {} }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Saved ${id} ` + 'x'.repeat(480) }]);
+      }
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const lessons = getStrategyState(strategy).chunks.filter((c) => c.phaseType === 'lesson');
+      assert.deepStrictEqual(lessons.map((c) => c.messages.length), [2, 2, 2], 'each lesson chunk holds one call and its result');
+      for (const c of lessons) {
+        assert.ok(c.tokens >= 100 && c.tokens < 200, `premise: a call and its result reach 1x the target and stay under 2x (${c.tokens})`);
+      }
+      manager.close();
+    });
+  });
+
   describe('Semantic Chunking', () => {
     it('should create chunk boundaries at phase transitions', async () => {
       cleanup();
@@ -325,6 +401,52 @@ describe('KnowledgeStrategy', () => {
       }
 
       manager.close();
+    });
+  });
+
+  describe('Rebuilds', () => {
+    it('after a message is removed inside a summary\'s span, later compiles serve the rest of the span as that summary, not raw', async () => {
+      cleanup();
+      let calls = 0;
+      const membrane = {
+        complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${++calls}` }] }),
+      };
+      const strategy = new KnowledgeStrategy({
+        targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0, mergeThreshold: 99,
+      });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+      const settle = async () => {
+        for (let i = 0; i < 100 && !manager.isReady(); i++) await manager.tick();
+        assert.ok(manager.isReady(), 'premise: the strategy settled');
+      };
+      const texts = (messages: Array<{ content: ContentBlock[] }>) => messages
+        .map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(''));
+      const raw = (messages: Array<{ content: ContentBlock[] }>) => texts(messages).filter((text) => /^Talk [0-4] /.test(text));
+      try {
+        const ids: string[] = [];
+        for (let i = 0; i < 24; i++) {
+          ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(120)}` }]));
+        }
+        await manager.compile();
+        await settle();
+        const first = manager.getSummariesInRange({ level: 1 }).find((s) => s.sourceIds.includes(ids[3]!));
+        assert.deepStrictEqual(first?.sourceIds, ids.slice(0, 5), 'premise: one summary covers messages 0 to 4');
+        const before = (await manager.compile()).messages;
+        assert.deepStrictEqual(raw(before), [], 'premise: they are served as that summary');
+        assert.ok(texts(before).includes(first!.content), 'premise: the summary is in the context');
+
+        manager.removeMessage(ids[3]!);
+        await manager.compile();
+        await settle();
+
+        for (const label of ['the compile after the strategy settles', 'the compile after that']) {
+          const { messages } = await manager.compile();
+          assert.deepStrictEqual(raw(messages), [], label);
+          assert.ok(texts(messages).includes(first!.content), `${label} carries the summary`);
+        }
+      } finally {
+        manager.close();
+      }
     });
   });
 
