@@ -322,6 +322,15 @@ describe('WindowedPassthroughStrategy', () => {
     );
     await manager2.close();
   });
+
+  it('refuses a reAnchorFraction outside (0, 1], and takes 1', () => {
+    for (const reAnchorFraction of [-0.5, 0, 1.5, NaN]) {
+      assert.throws(() => new WindowedPassthroughStrategy({ reAnchorFraction }), {
+        message: `reAnchorFraction must be in (0, 1], got ${reAnchorFraction}`,
+      });
+    }
+    assert.doesNotThrow(() => new WindowedPassthroughStrategy({ reAnchorFraction: 1 }));
+  });
 });
 
 // ---------------------------------------------------------------------------
