@@ -502,6 +502,19 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
+  it('a report with no usable total leaves the compile\'s sample to the next real report', async () => {
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      const { cm, strategy, internals } = await openManager(`unusable-total-${unusable}`);
+      await cm.compile(BUDGET);
+      strategy.reportRealInputTokens(unusable);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+      await cm.compile(BUDGET);
+      const { multiplier } = cm.getRenderStats()!.calibration!;
+      assert.ok(Math.abs(multiplier - 1.4) < 1e-9, `learned from the real report after ${unusable}: got ${multiplier}`);
+      cm.close();
+    }
+  });
+
   it('a store with no calibration record is still provisional after a restart before its first sample', async () => {
     const first = await openManager('fresh-restart');
     await first.cm.compile(BUDGET);
