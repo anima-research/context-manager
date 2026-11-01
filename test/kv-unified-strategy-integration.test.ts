@@ -171,6 +171,33 @@ test('kv-unified failed submission clears single flight without committing', asy
   manager.close();
 });
 
+test('a receipt hash covers which leaves changed, so receipts that differ only in their changes differ in hash', async () => {
+  const firstReceipt = async (removeFirst: boolean) => {
+    rmSync(STORE, { recursive: true, force: true });
+    const selected = strategy();
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    const first = manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+    if (removeFirst) {
+      manager.addMessage('assistant', [{ type: 'text', text: 'hello again' }]);
+      manager.removeMessage(first);
+    }
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1 });
+    const head = receipts(selected).head;
+    manager.close();
+    assert.ok(head);
+    return head;
+  };
+  const { receiptHash: hashA, changes: changesA, ...restA } = await firstReceipt(false);
+  const { receiptHash: hashB, changes: changesB, ...restB } = await firstReceipt(true);
+  const same = { sequence: 1, parentReceiptHash: null, submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1', acceptedAt: 1 };
+  assert.deepEqual([restA, restB], [same, same]);
+  assert.equal(changesA.length, changesB.length);
+  assert.notDeepEqual(changesA, changesB);
+  assert.notEqual(hashA, hashB);
+});
+
 /** The pending compile a begun submission carries, as its acceptance will read it. */
 function pendingOf(strategy: AutobiographicalStrategy) {
   const fields = strategy as unknown as {
