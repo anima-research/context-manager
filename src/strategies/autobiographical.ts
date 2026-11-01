@@ -3088,6 +3088,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // failure only an earlier one met. A host that moves the store's branch
     // itself leaves this load in place until the manager initializes it again.
     this.namedDroppedQuarantineKeys.clear();
+    this.floorFailure = undefined;
     this.namedUnlistedQuarantineState.clear();
     this.compressionDebtFailureLogged = null;
 
@@ -6379,17 +6380,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The floor (#415): the cheapest plan the summaries held allow for these
    * inputs, head and tail included, in the plan's units. An adaptive compile
    * refuses once it passes the hard budget, whatever the folding strategy
-   * picks, so the distance between the two is how near the store is to its
-   * first refusal. Null where the forest can't be built for these inputs;
-   * the figure is a report and never fails a compile.
+   * picks, and every plan does once the floor does, so the distance between
+   * the two is how near the store is to the point where every compile
+   * refuses. Under kv-unified it takes that solver's own constraints, locks
+   * included. The other folding strategies give pins precedence over locks
+   * in ways these constraints don't follow, so there it counts no lock, and
+   * is a lower bound. Null where the forest can't be built for these inputs or
+   * the computation fails; the figure is a report and never fails a compile.
    */
   private floorTokens(inputs: PickerInputs): number | null {
     try {
       const kv = this.config.foldingStrategy === 'kv-unified' ? this.config.kvUnified : undefined;
       const reused = kv ? this.kvUnifiedReuse.forest : undefined;
-      const forest = reused?.builtFrom(inputs)
+      const floorInputs = this.config.foldingStrategy === 'kv-unified'
+        ? inputs
+        : { ...inputs, chunks: inputs.chunks.map((chunk) => chunk.lockedByAgent ? { ...chunk, lockedByAgent: false } : chunk) };
+      const forest = reused?.builtFrom(floorInputs)
         ? reused
-        : new CanonicalSummaryForest(inputs, {
+        : new CanonicalSummaryForest(floorInputs, {
             treeifyNonContiguousSummaries: kv?.treeifyNonContiguousSummaries,
             preserveGapBearingSummaries: kv?.preserveGapBearingSummaries,
           });

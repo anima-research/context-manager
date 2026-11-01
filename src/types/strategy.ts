@@ -1143,10 +1143,14 @@ export interface RenderStats {
     /** The floor (#415): the cheapest plan the summaries held allow for this
      *  compile's inputs, head and tail included, in the plan's units, whatever
      *  the folding strategy picked. A compile refuses once its plan passes
-     *  `hardBudget`, so `hardBudget - floorTokens` is how far the store is
-     *  from its first refusal: it shrinks as history arrives and grows as
-     *  L1s and merges land. Absent where the forest couldn't be built
-     *  (`floor=` on the plan line). */
+     *  `hardBudget`, and every plan does once the floor does, so
+     *  `hardBudget - floorTokens` is how far the store is from the point
+     *  where every compile refuses: it usually shrinks as history arrives and
+     *  grows as L1s and merges land. Under kv-unified it takes that solver's
+     *  own constraints, locks included; under the other folding strategies,
+     *  which give pins precedence over locks, it counts no lock, and is a
+     *  lower bound. Absent where the forest couldn't be built or its computation
+     *  fails (`floor=` on the plan line). */
     floorTokens?: number;
     /** The plan size above which this compile refuses: the input budget with
      *  `overBudgetGraceRatio` added (`hardBudget=`). Set with `floorTokens`. */
