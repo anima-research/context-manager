@@ -15,7 +15,7 @@ const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const say = (i: number) => `message ${i}: ` + 'a considered sentence about the work at hand. '.repeat(3);
 const OK: Answer = { content: [text('A summary of what happened.')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
 const REFUSAL: Answer = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 } };
-const transient = () => Object.assign(new Error('zz overloaded failure'), { type: 'overloaded', retryable: true });
+const transient = () => Object.assign(new Error('zz server failure'), { type: 'server', httpStatus: 529, retryable: true });
 
 function membraneOf(handler: (call: number) => Answer) {
   const calls: NormalizedRequest[] = [];
@@ -78,13 +78,13 @@ describe('compression lifecycle: retry order and the alarm interval', () => {
       return first;
     };
     const first = addUntilQueued(1);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     const second = addUntilQueued(2);
     mock.timers.setTime(Date.now() + 60 * MINUTE);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     assert.ok(requestText(calls[1]!).includes(`message ${second}:`), "premise: the chunk that hadn't failed went first, and failed");
     mock.timers.setTime(Date.now() + 60 * MINUTE);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     const firstChunk = Array.from({ length: second - first }, (_, i) => `message ${first + i}:`);
     assert.deepEqual(messagesIn(calls[2]!), firstChunk, 'the chunk that failed first is asked first');
     manager.addMessage(said % 2 ? 'Claude' : 'User', [text(say(said++))]);
