@@ -117,14 +117,21 @@ describe('compression lifecycle: retry order and the alarm interval', () => {
     await manager.tick();
     assert.deepEqual(alarms, [1], 'premise: the alarm sounds');
     const sounded = Date.now();
-    for (const repeat of [1, 2]) {
-      mock.timers.setTime(sounded + repeat * 15 * MINUTE - 1);
-      await manager.tick();
-      assert.equal(alarms.length, repeat, `not again before ${repeat * 15} minutes`);
-      mock.timers.setTime(sounded + repeat * 15 * MINUTE);
-      await manager.tick();
-      assert.equal(alarms.length, repeat + 1, `again at ${repeat * 15} minutes`);
-    }
+    mock.timers.setTime(sounded + 15 * MINUTE - 1);
+    await manager.tick();
+    assert.equal(alarms.length, 1, 'not again before 15 minutes');
+    mock.timers.setTime(sounded + 15 * MINUTE);
+    await manager.tick();
+    assert.equal(alarms.length, 2, 'again at 15 minutes');
+    mock.timers.setTime(sounded + 35 * MINUTE);
+    await manager.tick();
+    assert.equal(alarms.length, 3, 'again at a tick that comes late, at 35 minutes');
+    mock.timers.setTime(sounded + 50 * MINUTE - 1);
+    await manager.tick();
+    assert.equal(alarms.length, 3, 'not again before 15 minutes after that late repeat');
+    mock.timers.setTime(sounded + 50 * MINUTE);
+    await manager.tick();
+    assert.equal(alarms.length, 4, 'again 15 minutes after it');
     assert.ok(alarms.every((count) => count === 1), 'each alarm reports the one quarantined record');
     manager.close();
   });
