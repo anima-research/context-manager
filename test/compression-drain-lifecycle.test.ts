@@ -12,7 +12,7 @@ const MODEL = 'test-compression-model';
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const say = (i: number) => `message ${i}: ` + 'a considered sentence about the work at hand. '.repeat(3);
 const OK = { content: [text('A summary of what happened.')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
-const transient = (type = 'overloaded') => Object.assign(new Error(`zz ${type} failure`), { type, retryable: true });
+const transient = () => Object.assign(new Error('zz server failure'), { type: 'server', httpStatus: 529, retryable: true });
 const admissionDeferral = () => Object.assign(new Error('zz held by provider admission'), {
   type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 0,
 });
@@ -122,7 +122,7 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
     const ids: string[] = [];
     const add = () => ids.push(manager.addMessage(ids.length % 2 ? 'Claude' : 'User', [text(say(ids.length))]));
     addUntilQueued(manager, 1, add);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     const firstLater = ids.length;
     addUntilQueued(manager, 2, add);
     mock.timers.setTime(Date.now() + 60_000);
@@ -160,7 +160,7 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
     const manager = await ContextManager.open({ path: storePath(t), strategy: new AutobiographicalStrategy(config()), membrane });
     let said = 0;
     addUntilQueued(manager, 1, () => manager.addMessage(said % 2 ? 'Claude' : 'User', [text(say(said++))]));
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     assert.match(manager.getPendingWork()?.description ?? '', /chunks pending; compression paused/);
     mock.timers.setTime(Date.now() + 60_000);
     const after = manager.getPendingWork()?.description ?? '';
@@ -239,7 +239,7 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
     });
     for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(say(i))]);
     assert.equal(pendingChunks(manager), 1, `premise: one substantive chunk (${manager.getPendingWork()?.description})`);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     assert.match(manager.getPendingWork()?.description ?? '', /failure 1\b/);
     for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text('.' + ' '.repeat(120))]);
     assert.equal(pendingChunks(manager), 2, `premise: a thin chunk queued too (${manager.getPendingWork()?.description})`);
@@ -247,7 +247,7 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
     await manager.tick();
     assert.equal(calls.length, 1, 'premise: the thin chunk landed as a stub, with no call');
     assert.equal(l1Sources(manager).length, 1);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     assert.match(manager.getPendingWork()?.description ?? '', /failure 2\b/, 'the stub ended no run of failures');
     manager.close();
   });

@@ -127,10 +127,10 @@ describe('compression lifecycle: alarms and logs', () => {
     const manager = await ContextManager.open({
       path: join(dir, 'store'),
       strategy: new AutobiographicalStrategy(config()),
-      membrane: membraneOf(() => { throw failure('overloaded'); }).membrane,
+      membrane: membraneOf(() => { throw Object.assign(failure('server'), { httpStatus: 529 }); }).membrane,
     });
     closeChunks(manager, 1);
-    await assert.rejects(manager.tick(), /zz overloaded failure/);
+    await assert.rejects(manager.tick(), /zz server failure/);
     manager.close();
     assert.ok(existsSync(log), 'premise: the log was written');
     const events = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line).event);
