@@ -86,9 +86,8 @@ test("a merge's expected recall cost is read from the level's recall costs, not 
 });
 
 test('the merges that would save the most are the ones measured first', () => {
-  // y0+y1 save 200 - 33 recall tokens, y2+y3 only 80 - 33.
-  const evaluations = demand(latentFixture([100, 100, 40, 40], 33), { maxCandidates: 1 });
-  assert.deepEqual(evaluations.map((evaluation) => [evaluation.first, evaluation.last]), [['y0', 'y1']]);
+  const evaluations = demand(latentFixture([40, 40, 100, 100], 33), { maxCandidates: 1 });
+  assert.deepEqual(evaluations.map((evaluation) => [evaluation.first, evaluation.last]), [['y2', 'y3']]);
 });
 
 /** Four existing L2s, x0..x3's, recalled at 10, 10, 500 and 500: a new L2's

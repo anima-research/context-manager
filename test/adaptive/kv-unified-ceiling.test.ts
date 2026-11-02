@@ -185,6 +185,8 @@ test("a what-if the ceiling stopped isn't solved again while the inputs hold, an
   assert.deepEqual(run(fixture(), new KvUnifiedStrategy(options(31))), stopped, 'and so is another ceiling');
 });
 
+type Changed = { level?: number; repHash?: string; lastChangedSeq?: number };
+
 // The presentation and the continuity multiplier are inputs of a what-if solve
 // like the leaves are: a remembered stop holds only while they hold too.
 test('a changed presentation is a new question for a what-if the ceiling stopped', (t) => {
@@ -194,24 +196,30 @@ test('a changed presentation is a new question for a what-if the ceiling stopped
     if (isWhatIf(this)) solved++;
     return original.call(this, options);
   });
-  const presentation = (lastChangedSeq: number) => ({
+  const presentation = (first: Changed) => ({
     currentSeq: 3,
     leaves: new Map(fixture().chunks.map((chunk, index) => [
-      chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: index === 0 ? lastChangedSeq : 1 },
+      chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1, ...(index === 0 ? first : {}) },
     ] as const)),
   });
   const reuse: KvUnifiedReuse = {};
-  const run = (lastChangedSeq: number) => {
+  const run = (first: Changed = {}) => {
     solved = 0;
     new KvUnifiedStrategy({
       policy: POLICY, ...GRID, labelCeiling: 30, reuse, latentDemand: { ...DEMAND, mode: 'individual' },
-      presentation: presentation(lastChangedSeq),
+      presentation: presentation(first),
     }).solve(fixture(), WALL);
     return solved;
   };
-  assert.equal(run(1), 3, 'three what-ifs solved');
-  assert.equal(run(1), 1, 'the two stopped are remembered under the same presentation');
-  assert.equal(run(2), 3, "one leaf's changed presentation is a new question");
+  assert.equal(run(), 3, 'three what-ifs solved');
+  assert.equal(run(), 1, 'the two stopped are remembered under the same presentation');
+  const afterSame = (first: Changed) => {
+    run();
+    return run(first);
+  };
+  assert.equal(afterSame({ lastChangedSeq: 2 }), 3, "one leaf's changed sequence is a new question");
+  assert.equal(afterSame({ level: 1 }), 3, "one leaf's changed level is a new question");
+  assert.equal(afterSame({ repHash: 'raw:rewritten' }), 3, "one leaf's changed representation is a new question");
 });
 
 test('a changed continuity multiplier is a new question for a what-if the ceiling stopped', (t) => {

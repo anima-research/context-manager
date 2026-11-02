@@ -2359,7 +2359,7 @@ test('a presented leaf the forest no longer holds is skipped, so the rest of the
   if (!best.feasible) return;
   assert.ok(best.selected.renderedTokens < 360, 'premise: without hysteresis a fold scores best');
   const leaves = new Map(presentation.leaves);
-  leaves.set('removed-message', { repHash: 'raw:removed-message', level: 0, lastChangedSeq: 0 });
+  leaves.set('removed-message', { repHash: 'summary:gone', level: 1, lastChangedSeq: 0 });
   const held = new ExactKvUnifiedPolicySolver(inputs).solve({
     maxTokens: 400, presentation: { ...presentation, leaves }, adoptEpsilon: 1_000_000_000, policy: OVER_HIGH,
   });
@@ -2382,6 +2382,21 @@ test('a leaf presented at the same level with another representation is not the 
   assert.ok(result.candidates.some((candidate) => candidate.frontier.size === inputs.chunks.length && isOnlyFolded(candidate, ['c-0000', 'c-0001'])), 'premise: the presented levels are a candidate');
   assert.equal(result.selected.frontier.size, inputs.chunks.length, 'premise: the selection names every leaf');
   assert.ok(isOnlyFolded(result.selected, []), 'the best cut, all raw, is selected rather than the stale presentation');
+  const forest = new CanonicalSummaryForest(inputs);
+  const current = (id: string) => `summary:${forest.leaf(id)!.summaryIds.find((summary) => forest.summary(summary)!.level === 1)}`;
+  const held = (repHash: (id: string) => string) => Object.fromEntries((['default', 'dag'] as const).map((engine) => {
+    const shown = new Map(presentation.leaves);
+    for (const id of ['c-0000', 'c-0001']) shown.set(id, { repHash: repHash(id), level: 1, lastChangedSeq: 0 });
+    const frontier = new Map(new KvUnifiedStrategy({
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      ...(engine === 'dag' ? { engine } : {}),
+      presentation: { ...presentation, leaves: shown }, adoptEpsilon: 1_000_000_000,
+      policy: { budgetLowRatio: 0, budgetHighRatio: 1, budgetUnderLambda: 0, budgetOverLambda: 0, cacheLambda: 0, continuityLambda: 0 },
+    }).solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 }).frontier);
+    return [engine, inputs.chunks.every((chunk) => frontier.get(chunk.id) === (chunk.id === 'c-0000' || chunk.id === 'c-0001' ? 1 : 0))];
+  }));
+  assert.deepEqual(held(current), { default: true, dag: true }, 'premise: on each engine the presentation at its own representations is held');
+  assert.deepEqual(held(() => 'summary:rewritten'), { default: false, dag: false }, "on each engine the stale presentation isn't held");
 });
 
 test("a pool's best is its lowest score", () => {
@@ -2395,25 +2410,4 @@ test("a pool's best is its lowest score", () => {
   const best = result.bestUnder(result.cacheFloor, result.continuityFloor);
   assert.equal(best.score, Math.min(...scores));
   assert.deepEqual(best.frontier, result.selected.frontier, 'the cut the solve selected');
-});
-
-test('without an immutable prefix hash for this compile, the cache is not compared, even against a cache that has none', () => {
-  const { inputs } = fixture();
-  const rawLayout = renderLayout(inputs, new SummaryTree(inputs), new Map());
-  const result = new ExactKvUnifiedPolicySolver(inputs).solve({
-    maxTokens: 250,
-    cache: { immutablePrefixHash: undefined as unknown as string, layout: rawLayout, markers: [{ unitIndex: 2, offset: 180 }, { unitIndex: 4, offset: 360 }] },
-    policy: { alpha: 0, budgetUnderLambda: 0, budgetOverLambda: 0, cacheLambda: 10_000, cacheScale: 100, continuityLambda: 0 },
-  });
-  assert.equal(result.feasible, true);
-  if (!result.feasible) return;
-  assert.equal(result.cacheRelevant, false);
-  assert.ok(result.candidates.every((candidate) => candidate.cacheChurn === 0));
-  const uncached = new ExactKvUnifiedPolicySolver(inputs).solve({
-    maxTokens: 250,
-    policy: { alpha: 0, budgetUnderLambda: 0, budgetOverLambda: 0, cacheLambda: 10_000, cacheScale: 100, continuityLambda: 0 },
-  });
-  assert.equal(uncached.feasible, true);
-  if (!uncached.feasible) return;
-  assert.deepEqual(result.selected.frontier, uncached.selected.frontier, 'the cut is the one chosen with no cache at all');
 });

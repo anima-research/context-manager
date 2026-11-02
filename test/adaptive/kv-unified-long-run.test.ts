@@ -1,8 +1,3 @@
-// What kv-unified's selection does from a presentation, the cut a previous
-// compile accepted: it holds a cut no deviation pays for, doesn't rebound
-// after a forced shed, refills a cut far below its low edge once under-fill
-// outweighs keeping it, never keeps a cut over the wall, and lands the
-// improvements a cache held back once a cut diverges from it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -78,7 +73,7 @@ test('a cut no deviation pays for is held: the accepted presentation plus the ap
   assert.equal(levels(solve(inputs(), 1000, { policy: HOLD, presentation })), levels(expected));
 });
 
-test("a forced shed doesn't rebound on the next compile once the wall is restored", () => {
+test('a forced shed is held under a continuity-dominant policy once the wall is restored', () => {
   const { inputs } = store();
   const a = solve(inputs(), 1000, { policy: HOLD });
   assert.equal(tokens(inputs(), a), 600, 'premise: with room, every message is raw');
