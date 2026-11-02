@@ -901,3 +901,25 @@ describe('MessageStore message views', () => {
     }
   });
 });
+
+describe('MessageStore.deriveOnto', () => {
+  it("a store its parent's messages can't seed loads cold, at its parent's calibration multiplier", { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-derive-cold-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const parent = new MessageStore(root);
+      parent.append('user', [{ type: 'text', text: 'before the fork' }]);
+      parent.setTokenCalibration(1.3);
+      root.createBranchAt('cold-child', root.currentBranch().name, root.currentSequence());
+      parent.append('user', [{ type: 'text', text: 'after the fork' }]);
+      const derived = parent.deriveOnto((root as ViewStore).view('cold-child'));
+      assert.deepEqual(derived.getAll().map((m) => (m.content[0] as { text: string }).text), ['before the fork'],
+        'premise: the child holds what its branch held at the fork');
+      assert.equal(derived.getTokenCalibration(), 1.3);
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

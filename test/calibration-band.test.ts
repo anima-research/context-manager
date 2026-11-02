@@ -148,6 +148,32 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
+  it('a ratio inside the band is learned from, though the multiplier it implies is past the ceiling', async () => {
+    const first = await openManager('band-top');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.2, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('band-top');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1.2, null], 'premise: the seeded record loads as learned');
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.6);
+    await cm.compile(BUDGET);
+    const { multiplier } = cm.getRenderStats()!.calibration!;
+    assert.ok(multiplier > 1.2 && multiplier < 1.8, `the EMA steps toward the sample: got ${multiplier}`);
+    cm.close();
+  });
+
+  it('a sample on a branch the strategy has not loaded is refused', async () => {
+    const { cm, strategy } = await openManager('unloaded-branch');
+    const main = cm.currentBranch().name;
+    await cm.fork('other');
+    await cm.compile(BUDGET);
+    cm.getStore().switchBranch(main);
+    assert.throws(() => strategy.reportRealInputTokens(1_000), /requires reinitialization for the current branch generation/);
+    cm.close();
+  });
+
   it('the startup wedge: a stale-epoch 1.8 no longer makes the first compile throw', async () => {
     // A store that pinned 1.8 under flat-600 thinking pricing reopens
     // estimating ~1.8x its real size; if that is over the hard budget the

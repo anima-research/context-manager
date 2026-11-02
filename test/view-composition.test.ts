@@ -115,6 +115,15 @@ describe('mergeMessageStoreViews', () => {
     assert.equal(mergeMessageStoreViews(primary, []), primary);
   });
 
+  it("reports the primary view's calibration multiplier", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    primary.getTokenCalibration = () => 1.1;
+    const auxiliary = fakeView([{ id: 'x1', sequence: 2 }]);
+    auxiliary.getTokenCalibration = () => 1.3;
+    const merged = mergeMessageStoreViews(primary, [auxiliary]);
+    assert.equal(merged.getTokenCalibration?.(), 1.1);
+  });
+
   it('serves one merged listing while every source listing is the same array', () => {
     // A store's getAll returns its cached array until a write; the memo
     // keys on those arrays, so fresh view objects over unchanged sources
