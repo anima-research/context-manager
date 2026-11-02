@@ -808,8 +808,8 @@ itself the main hazard; do not design from those numbers. After rev 6:
   added, and when it takes the earliest message marker's slot, that marker's
   content lies inside the newest marker's prefix, though its block no longer
   carries `cache_control` on the wire. Once one of the compile's calls is
-  accepted, a later call's receipt leaves the cache reference, and the
-  recorded wire receipt, as that call set them (§5).
+  accepted, a later call's receipt leaves the cache reference and the
+  recorded wire receipt as they stood once that call was accepted (§5).
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
