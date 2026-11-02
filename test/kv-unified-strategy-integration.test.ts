@@ -117,6 +117,25 @@ test('a live solve past the label ceiling compiles anyway, warns once and marks 
   for (const line of planLines) assert.ok(line.includes(' ceiling=live'), line);
 });
 
+test('discarding the rendering frontier forgets the receipt chain, in memory as well as in the store', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  const persisted = selected as unknown as { store: { getStateJson(id: string): unknown }; kvUnifiedReceiptStateId: string };
+  const chain = () => {
+    const held = receipts(selected);
+    return [held.head, held.leaves.size, held.cache, persisted.store.getStateJson(persisted.kvUnifiedReceiptStateId)] as const;
+  };
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', pendingOf(selected).markers) });
+  const [head, leaves, cache, stored] = chain();
+  assert.ok(head !== null && leaves > 0 && cache !== null && stored !== null, 'premise: a chain to forget');
+  selected.discardRenderingFrontier();
+  assert.deepEqual(chain(), [null, 0, null, null]);
+  manager.close();
+});
+
 test('kv-unified presentation commits only after acceptance and survives restart', async () => {
   const first = strategy();
   const manager = await ContextManager.open({ path: STORE, strategy: first });
