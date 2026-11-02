@@ -433,11 +433,21 @@ describe('an edit that narrows a block\'s audience', () => {
     }, () => new PassthroughStrategy());
   });
 
-  it('is refused where one of two blocks with the same content goes, hiding it from the reader only that one was for', async () => {
+  it('is refused where one of two blocks with the same content goes, hiding it from the reader only that one was for, and lets the two be reordered', async () => {
     await withReaders(async ({ ann, bob }) => {
       const twice = ann.addMessage('user', [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
       assert.throws(() => bob.editMessage(twice, [forReaders('Same.', 'bob')]), /may hide a block from a reader other than "bob"/);
       assert.deepEqual(contentOf(ann, twice), [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
+      bob.editMessage(twice, [forReaders('Same.', 'bob'), forReaders('Same.', 'ann')]);
+      assert.deepEqual(contentOf(ann, twice), [forReaders('Same.', 'bob'), forReaders('Same.', 'ann')], 'reordered, each reader still sees the content, so it goes through');
+    }, () => new PassthroughStrategy());
+  });
+
+  it('compares content whatever order a block\'s fields were written in', async () => {
+    await withReaders(async ({ ann }) => {
+      const shared = ann.addMessage('user', [{ type: 'text', text: 'Shared.' } as ContentBlock]);
+      assert.throws(() => ann.editMessage(shared, [{ audience: ['ann'], text: 'Shared.', type: 'text' } as unknown as ContentBlock]), /may hide a block from a reader other than "ann"/);
+      assert.deepEqual(contentOf(ann, shared), [t('Shared.')]);
     }, () => new PassthroughStrategy());
   });
 
@@ -1027,7 +1037,7 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
     }
   });
 
-  it('refuses a compile, preview, tick or edit once the namespace records a reader the manager doesn\'t compile for', async () => {
+  it('refuses a compile, preview, tick, edit, render, summary listing or render stats once the namespace records a reader the manager doesn\'t compile for', async () => {
     const dir = tmp();
     const host = await ContextManager.open({ path: join(dir, 'store'), namespace: 'host', strategy: new PassthroughStrategy() });
     try {
@@ -1044,6 +1054,9 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       await assert.rejects(nobody.tick(), stale);
       assert.throws(() => nobody.editMessage(hi, [forReaders('[for ann]', 'ann'), t('Hi, edited.')]), /ContextManager\.editMessage: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
       assert.deepEqual(host.getAllMessages().find((m) => m.id === hi)!.content, [forReaders('[for ann]', 'ann'), t('Hi.')], 'and the edit wrote nothing');
+      assert.throws(() => nobody.renderAsNewest([hi]), /ContextManager\.renderAsNewest: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
+      assert.throws(() => nobody.getSummariesInRange({}), /ContextManager\.getSummariesInRange: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
+      assert.throws(() => nobody.getRenderStats(), /ContextManager\.getRenderStats: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
       await nobody.close();
       store.createBranchAt('bobs', home, store.currentSequence());
       const annT = await ContextManager.open({ store, namespace: 'agents/t', strategy: new PassthroughStrategy(), viewReader: 'ann' });
@@ -1180,6 +1193,27 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       });
     });
 
+    it('refuses a head-window reset whose transition add a listener answers with a claim, naming the stored transition, and the strategy resets nothing', async () => {
+      await staleAfterClaim(async ({ host, nobody, watched }) => {
+        let transition: string | undefined;
+        let claimed: Promise<ContextManager> | undefined;
+        nobody.onMessage((event) => {
+          if (event.type === 'add' && event.message.participant === 'Context Manager') {
+            transition = event.message.id;
+            claimed = ContextManager.open({ store: host.getStore(), namespace: 'agents/s', strategy: new PassthroughStrategy(), viewReader: 'ann' });
+          }
+        });
+        await assert.rejects(nobody.resetHeadWindow('Moving on.'), (error: Error) => {
+          assert.match(error.message, stale);
+          assert.ok(transition && error.message.includes(`Its transition add finished: message ${transition} is stored, and the head window wasn't reset.`), error.message);
+          return true;
+        });
+        await (await claimed!).close();
+        assert.equal(transitions(host), 1, 'the transition stands');
+        assert.deepEqual(watched.reset, []);
+      });
+    });
+
     it('refuses a head-window reset whose transition summary was being made when the claim came, and one after it before asking the strategy for a summary, storing no transition', async () => {
       await staleAfterClaim(async ({ host, nobody, watched, claim }) => {
         let open!: () => void;
@@ -1227,6 +1261,8 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       for (let i = 0; i < 400 && asked.length === 1 && !refused(); i++) await new Promise((r) => setTimeout(r, 5));
       assert.equal(asked.length, 1, `after the claim its drain asks its model nothing more (asked ${asked.length} times)`);
       assert.ok(refused(), `its reads are refused, and the refusal is logged (logged: ${JSON.stringify(logged.slice(0, 3))})`);
+      const summaries = store.getStateJson('agents/s/autobio:summaries') as unknown;
+      assert.ok(summaries == null || (Array.isArray(summaries) && summaries.length === 0), `the request out at the claim writes no summary (${JSON.stringify(summaries)})`);
       await nobody.close();
     } finally {
       error.mock.restore();

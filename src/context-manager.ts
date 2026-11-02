@@ -206,15 +206,21 @@ interface ContextManagerBaseConfig {
    * on a namespace that records a reader compiles for that reader, and a
    * manager compiling for none is refused a switch to a branch, or a
    * setStrategy, where its namespace records a reader. A compile, a
-   * previewContext, a tick, an edit and every read of its messages through
-   * the view it hands its strategy, compression's included, are refused
-   * when the namespace's record on the store's current branch names another
-   * reader, or any reader for a manager compiling for none, as after a claim made
-   * once this manager opened or a branch switched through another handle; a
-   * compression already waiting on its model when the claim is made writes
-   * no summary, since its read after the model answers is refused too
-   * (AutobiographicalStrategy logs that refusal as a compression failure
-   * that pauses its compression). Summaries written
+   * previewContext, a tick, an edit, a resetHeadWindow, a renderAsNewest,
+   * a getSummariesInRange, a getRenderStats and every read of its messages
+   * through the view it hands its strategy, compression's included, are
+   * refused when the namespace's record on the store's current branch names
+   * another reader, or any reader for a manager compiling for none, as after
+   * a claim made once this manager opened or a branch switched through
+   * another handle. Then a message it adds is stored without its strategy's
+   * onNewMessage hearing of it, and a compression hold it releases isn't
+   * passed on to onCompressionHoldsReleased. A compression already waiting
+   * on its model when the claim is made is stopped only where its strategy
+   * reads its view again before it writes, since that read is refused too:
+   * AutobiographicalStrategy does, so it writes no summary, and it logs the
+   * refusal as a compression failure that pauses its compression. A
+   * strategy that writes without reading its view again isn't stopped.
+   * Summaries written
    * before a reader claims the namespace are kept, and that reader's
    * compiles use them as written. A write may put an `audience` only on a
    * message's own blocks, other than tool calls, tool results, system
@@ -1025,10 +1031,11 @@ export class ContextManager {
    * other reader, or from its own while another namespace on the branch
    * records the same reader, since this manager can't see what their
    * compression has read. Blocks are compared by content, their `audience`
-   * aside, wherever they sit in the message: an edit narrows when a reader
-   * saw a block before it and sees no block with the same content after it.
-   * A block with no equal before the edit is new content, and one with no
-   * equal after it is removed, as in any edit. Nothing takes a
+   * aside, wherever they sit in the message: an edit narrows when content
+   * the message keeps was seen by a reader before the edit, and that reader
+   * sees none of its blocks after it. A block with no equal before the edit
+   * is new content, and one with no equal after it is removed, as in any
+   * edit. Nothing takes a
    * block out of a summary already written or a request already sent, a
    * removal included. Like a compile, an edit is refused when the
    * namespace records a reader this manager doesn't compile for.
@@ -2454,6 +2461,7 @@ export class ContextManager {
    */
   renderAsNewest(ids: readonly MessageId[]): Array<ContentBlock[] | null> | undefined {
     this.requireInitialized('renderAsNewest');
+    this.requireRecordedReader('ContextManager.renderAsNewest');
     const stored = this.mergedMessageView();
     const unknown = ids.filter((id) => stored.get(id) === null);
     if (unknown.length > 0) {
@@ -2798,6 +2806,7 @@ export class ContextManager {
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
     this.requireInitialized('getSummariesInRange');
+    this.requireRecordedReader('ContextManager.getSummariesInRange');
     if (!isSummaryOverviewStrategy(this.strategy)) return [];
     return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
   }
@@ -2825,6 +2834,7 @@ export class ContextManager {
    */
   getRenderStats(): RenderStats | null {
     this.requireInitialized('getRenderStats');
+    this.requireRecordedReader('ContextManager.getRenderStats');
     if (!isRenderStatsCapable(this.strategy)) return null;
     return this.strategy.getRenderStats(this.strategyMessageView());
   }
@@ -2862,14 +2872,16 @@ export class ContextManager {
     const msgId = this.addMessage('Context Manager', [
       transitionText == null && this.readerName !== undefined ? { ...transition, audience: [this.readerName] } : transition,
     ]);
-    // A listener of that add may have closed the manager, set a strategy or
-    // moved the store's branch. The add stands and the strategy isn't told,
+    // A listener of that add may have closed the manager, set a strategy,
+    // moved the store's branch or claimed the namespace for another reader.
+    // The add stands and the strategy isn't told,
     // and the refusal says the message is stored. It gives the reason without
     // the advice to retry or to recover, and says instead what a later call
     // that goes ahead does: it stores a second transition. After a close(), or
     // while a strategy initializes, a later call refuses at once.
     try {
       this.requireInitialized('resetHeadWindow', attempt, false);
+      this.requireRecordedReader('ContextManager.resetHeadWindow');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw new Error(

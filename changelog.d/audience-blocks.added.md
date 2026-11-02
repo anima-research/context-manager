@@ -16,17 +16,20 @@
   `viewReader` on a namespace that records a reader compiles for that
   reader, and a manager compiling for no reader is refused a `switchBranch`,
   `fork` or `setStrategy` onto a branch where its namespace records one. A
-  `compile`, `previewContext`, `tick`, `editMessage`, `resetHeadWindow` and
-  every read of the manager's messages through the view it hands its
-  strategy, compression's included, are refused when the namespace's record
-  on the store's current branch names another reader, or any reader for a
-  manager compiling for none, as after a claim made once the manager opened
-  or a branch switched through another handle. Then a message it adds is
-  stored without its strategy's `onNewMessage` being called, a compression
-  hold it releases isn't passed on to `onCompressionHoldsReleased`, and each
-  is logged. A compression already waiting on its model when the claim is
-  made writes no summary, since its read after the model answers is refused
-  too. A manager's
+  `compile`, `previewContext`, `tick`, `editMessage`, `resetHeadWindow`,
+  `renderAsNewest`, `getSummariesInRange`, `getRenderStats` and every read
+  of the manager's messages through the view it hands its strategy,
+  compression's included, are refused when the namespace's record on the
+  store's current branch names another reader, or any reader for a manager
+  compiling for none, as after a claim made once the manager opened or a
+  branch switched through another handle. Then a message it adds is stored
+  without its strategy's `onNewMessage` being called, and a compression hold
+  it releases isn't passed on to `onCompressionHoldsReleased`; where the
+  strategy has that hook and would have been called, the manager logs why
+  it wasn't. A compression already waiting on its model when the claim is
+  made is stopped only where its strategy reads its view again before it
+  writes: `AutobiographicalStrategy` does, so it writes no summary. A
+  manager's
   read-only `viewReader` says the reader it compiles for: the one it was
   opened with or, opened with none, the one its namespace records;
   for a `derive` or a `reopenDerived`, the one its branch records; or none.
@@ -58,9 +61,10 @@
   another namespace on the branch records the same reader, it's always refused,
   since a manager can't see what another namespace's compression has read.
   Blocks are compared by content, their `audience` aside, wherever they sit
-  in the message: an edit narrows when a reader saw a block before it and
-  sees no block with the same content after it, and a block with no equal
-  before the edit is new content. So a block takes its audience when its
+  in the message: an edit narrows when content the message keeps was seen
+  by a reader before the edit, and that reader sees none of its blocks
+  after it. A block with no equal before the edit is new content, and one
+  with no equal after it is removed, as in any edit. So a block takes its audience when its
   message is added. The record is a
   state write, made by a manager that compiles for a reader as its
   strategy's chunks close, so it moves later sequence numbers too. A request
