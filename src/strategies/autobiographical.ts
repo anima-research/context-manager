@@ -14884,13 +14884,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `(logged once per strategy)`,
       );
     }
-    if (draft) draft.accepted = true;
-    this.kvUnifiedReceipts.accept(
+    const { duplicate } = this.kvUnifiedReceipts.accept(
       args.submissionId,
       args.acceptedAt ?? Date.now(),
       cache,
       later ? undefined : args.wireReceipt,
     );
+    if (draft && !duplicate) draft.accepted = true;
     this.kvUnifiedPendingDraft = null;
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];

@@ -429,6 +429,30 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
     }
   });
 
+  it("a first call the receipt chain refuses as a duplicate leaves the count check to the first accepted later call", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async () => {
+        await o.compile();
+        const settled = o.begin();
+        o.accept(settled, 1);
+        const earlier = receipts(o.strategy).cache;
+        assert.ok(earlier, 'premise: the first compile sets a reference');
+        o.manager.addMessage('a', [{ type: 'text', text: plain(1) }]);
+        await o.compile();
+        o.strategy.beginKvUnifiedSubmission({ submissionId: settled, requestHash: `wire-${settled}`, layoutHash: 'layout-again' });
+        o.accept(settled, 1);
+        assert.equal(receipts(o.strategy).cache, earlier, 'premise: the chain refuses the repeated id and keeps the earlier reference');
+        o.accept(o.begin(), 1);
+        const set = receipts(o.strategy).cache;
+        assert.ok(set && set !== earlier, "the later call takes the count check and sets this compile's reference");
+        assert.notDeepEqual(set.markers, earlier.markers, "premise: this compile's markers differ from the earlier compile's");
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
   it("a call still in flight when the next compile runs, an order other hosts may produce, is accepted as its own compile's call", async () => {
     const o = await open(conversation(ONE), ONE.config);
     try {
