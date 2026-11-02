@@ -117,11 +117,11 @@ describe('mergeMessageStoreViews', () => {
 
   it("reports the primary view's calibration multiplier", () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
-    primary.getTokenCalibration = () => 1.3;
+    primary.getTokenCalibration = () => 1.1;
     const auxiliary = fakeView([{ id: 'x1', sequence: 2 }]);
-    auxiliary.getTokenCalibration = () => 1.1;
+    auxiliary.getTokenCalibration = () => 1.3;
     const merged = mergeMessageStoreViews(primary, [auxiliary]);
-    assert.equal(merged.getTokenCalibration?.(), 1.3);
+    assert.equal(merged.getTokenCalibration?.(), 1.1);
   });
 
   it('serves one merged listing while every source listing is the same array', () => {
