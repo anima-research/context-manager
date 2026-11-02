@@ -331,9 +331,10 @@ describe('KnowledgeStrategy', () => {
       const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
 
-      for (const id of ['tu1', 'tu2', 'tu3']) {
+      for (let i = 1; i <= 9; i++) {
+        const id = `tu${i}`;
         manager.addMessage('Claude', [{ type: 'tool_use', id, name: 'note_save', input: {} }]);
-        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Saved ${id} ` + 'x'.repeat(480) }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Saved ${id} ` + 'x'.repeat(64) }]);
       }
       for (let i = 0; i < 8; i++) {
         manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
@@ -341,9 +342,9 @@ describe('KnowledgeStrategy', () => {
 
       await manager.compile();
       const lessons = getStrategyState(strategy).chunks.filter((c) => c.phaseType === 'lesson');
-      assert.deepStrictEqual(lessons.map((c) => c.messages.length), [2, 2, 2], 'each lesson chunk holds one call and its result');
+      assert.deepStrictEqual(lessons.map((c) => c.messages.length), [6, 6, 6], 'each lesson chunk closes at its third call and result, the first to reach the target');
       for (const c of lessons) {
-        assert.ok(c.tokens >= 100 && c.tokens < 200, `premise: a call and its result reach 1x the target and stay under 2x (${c.tokens})`);
+        assert.ok(c.tokens >= 100 && (c.tokens / 3) * 2 < 100, `premise: two calls and their results stay under the target and three reach it (${c.tokens})`);
       }
       manager.close();
     });
