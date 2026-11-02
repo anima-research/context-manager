@@ -286,6 +286,8 @@ describe('an edit that narrows a block\'s audience', () => {
     return ids;
   };
   const toBob = (id: string, text: string): [string, ContentBlock[]] => [id, [forReaders(`${text} ${words}`, 'bob')]];
+  const storedToBob = (manager: ContextManager, id: string): [string, ContentBlock[]] =>
+    [id, contentOf(manager, id).map((block) => ({ ...block, audience: ['bob'] } as ContentBlock))];
   const ownRefusal = /refused: the edit of message \S+ may hide a block from "ann", the reader this manager compiles for, and compression may have read the message: a chunk holding it or a later message has closed, or a compression request has read it/;
 
   it('is refused away from the reader once compression has read the message, and the message stays as it was', async () => {
@@ -756,7 +758,7 @@ describe('an edit that narrows a block\'s audience', () => {
       const heldBack = lane.chunks.filter((chunk) => !chunk.compressed && !lane.compressionQueue.includes(chunk.index));
       assert.ok(heldBack.length > 0, 'the premise: a closed chunk is held back');
       assert.ok(!lane.chunks.some((chunk) => chunk.messages.some((m) => m.id === ids[0])), 'the premise: the first message is in the head, in no chunk');
-      assert.throws(() => ann.editMessage(...toBob(heldBack.at(-1)!.messages.at(-1)!.id, 'HELD')), ownRefusal, 'a message in the held-back chunk');
+      assert.throws(() => ann.editMessage(...storedToBob(ann, heldBack.at(-1)!.messages.at(-1)!.id)), ownRefusal, 'a message in the held-back chunk');
       assert.throws(() => ann.editMessage(ids[0]!, [t('Opening.'), forReaders(`SECRET-0 ${words}`, 'bob')]), ownRefusal, 'a head message');
     }, holding);
   });
@@ -863,7 +865,7 @@ describe('an edit that narrows a block\'s audience', () => {
       await ann.switchBranch(home);
       const ids = await summarized(ann, a.payloads);
       await ann.fork('after');
-      for (const id of [early, ids[3]!]) assert.throws(() => ann.editMessage(...toBob(id, 'EARLY')), ownRefusal, 'on a branch forked after compression read it');
+      for (const id of [early, ids[3]!]) assert.throws(() => ann.editMessage(...storedToBob(ann, id)), ownRefusal, 'on a branch forked after compression read it');
       const child = await ann.derive({ branch: 'derived', strategy: new PassthroughStrategy() });
       try {
         assert.throws(() => child.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal, 'and on a context derived from it');

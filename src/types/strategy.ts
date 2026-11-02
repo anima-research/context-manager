@@ -2306,7 +2306,9 @@ export interface AutobiographicalConfig {
    * Enable picker-driven adaptive resolution. When true, `select()` uses
    * the FoldingStrategy + Picker to choose per-message resolution under
    * token-budget pressure rather than the threshold-driven `checkMergeThreshold`
-   * path. Default: false (existing hierarchical behavior preserved).
+   * path. Default: false (existing hierarchical behavior preserved). A
+   * message holding a block with an `audience` is stored whole, never split
+   * into shards at ingress.
    */
   adaptiveResolution?: boolean;
 

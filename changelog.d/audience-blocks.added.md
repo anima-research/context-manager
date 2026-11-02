@@ -16,13 +16,17 @@
   `viewReader` on a namespace that records a reader compiles for that
   reader, and a manager compiling for no reader is refused a `switchBranch`,
   `fork` or `setStrategy` onto a branch where its namespace records one. A
-  `compile`, `previewContext`, `tick`, `editMessage` and every read of the
-  manager's messages through the view it hands its strategy, compression's
-  included, are refused when the namespace's record on the store's current branch
-  names another reader, or any reader for a manager compiling for none, as
-  after a claim made once the manager opened or a branch switched through
-  another handle; a compression already waiting on its model when the claim
-  is made writes the summary it was making. A manager's
+  `compile`, `previewContext`, `tick`, `editMessage`, `resetHeadWindow` and
+  every read of the manager's messages through the view it hands its
+  strategy, compression's included, are refused when the namespace's record
+  on the store's current branch names another reader, or any reader for a
+  manager compiling for none, as after a claim made once the manager opened
+  or a branch switched through another handle. Then a message it adds is
+  stored without its strategy's `onNewMessage` being called, a compression
+  hold it releases isn't passed on to `onCompressionHoldsReleased`, and each
+  is logged. A compression already waiting on its model when the claim is
+  made writes no summary, since its read after the model answers is refused
+  too. A manager's
   read-only `viewReader` says the reader it compiles for: the one it was
   opened with or, opened with none, the one its namespace records;
   for a `derive` or a `reopenDerived`, the one its branch records; or none.
@@ -38,12 +42,12 @@
   them, and removed where the reader sees nothing of it. Summaries written
   before a reader claims a namespace are kept, and that reader's compiles
   use them as written.
-- An `editMessage` that may narrow a block's `audience`, hiding a block in
-  place from a reader who saw it (blocks are compared by position), is
-  refused, naming why, wherever compression may have read the block, since
-  nothing takes a block out of a summary already written or a request
-  already sent, a removal included. Away from the manager's own reader it's
-  refused once a chunk holding the message or a later one has closed, or a
+- An `editMessage` that may narrow a block's `audience`, hiding a block
+  from a reader who saw it, is refused, naming why, wherever compression
+  may have read the block, since nothing takes a block out of a summary
+  already written or a request already sent, a removal included. Away
+  from the manager's own reader it's refused once a chunk holding the
+  message or a later one has closed, or a
   compression request has read it. The namespace records that on each
   branch, through the new `StrategyContext.markCompressionRead`, whichever
   strategy or manager on it did the reading, and a reopen keeps it. So a
@@ -53,7 +57,11 @@
   declares it as it is. Away from any other reader, or from its own while
   another namespace on the branch records the same reader, it's always refused,
   since a manager can't see what another namespace's compression has read.
-  So a block takes its audience when its message is added. The record is a
+  Blocks are compared by content, their `audience` aside, wherever they sit
+  in the message: an edit narrows when a reader saw a block before it and
+  sees no block with the same content after it, and a block with no equal
+  before the edit is new content. So a block takes its audience when its
+  message is added. The record is a
   state write, made by a manager that compiles for a reader as its
   strategy's chunks close, so it moves later sequence numbers too. A request
   never reads a message the record doesn't cover: while it can't be

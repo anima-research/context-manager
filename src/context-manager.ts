@@ -212,7 +212,9 @@ interface ContextManagerBaseConfig {
    * reader, or any reader for a manager compiling for none, as after a claim made
    * once this manager opened or a branch switched through another handle; a
    * compression already waiting on its model when the claim is made writes
-   * the summary it was making. Summaries written
+   * no summary, since its read after the model answers is refused too
+   * (AutobiographicalStrategy logs that refusal as a compression failure
+   * that pauses its compression). Summaries written
    * before a reader claims the namespace are kept, and that reader's
    * compiles use them as written. A write may put an `audience` only on a
    * message's own blocks, other than tool calls, tool results, system
@@ -1014,8 +1016,8 @@ export class ContextManager {
    * that must reach compressed memory, hold the message (holdCompression /
    * addMessage `holdCompression`) until after the edit.
    *
-   * So an edit that may narrow a block's `audience`, hiding a block in place
-   * from a reader who saw it, is refused, naming why, wherever compression
+   * So an edit that may narrow a block's `audience`, hiding a block from a
+   * reader who saw it, is refused, naming why, wherever compression
    * may have read the block: away from this manager's reader once a chunk
    * holding the message or a later one has closed, or a compression request
    * has read it, as its namespace records whatever strategy or manager did
