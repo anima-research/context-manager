@@ -1035,7 +1035,9 @@ export class ContextManager {
    * the message keeps was seen by a reader before the edit, and that reader
    * sees none of its blocks after it. A block with no equal before the edit
    * is new content, and one with no equal after it is removed, as in any
-   * edit. Nothing takes a
+   * edit. So the refusal holds for content the edit keeps: an edit that
+   * replaces a block's content is a removal and an addition, and a summary
+   * already built from the old content keeps it, as above. Nothing takes a
    * block out of a summary already written or a request already sent, a
    * removal included. Like a compile, an edit is refused when the
    * namespace records a reader this manager doesn't compile for.

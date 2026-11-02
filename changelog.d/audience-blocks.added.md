@@ -64,7 +64,10 @@
   in the message: an edit narrows when content the message keeps was seen
   by a reader before the edit, and that reader sees none of its blocks
   after it. A block with no equal before the edit is new content, and one
-  with no equal after it is removed, as in any edit. So a block takes its audience when its
+  with no equal after it is removed, as in any edit. So the refusal holds
+  for content the edit keeps: an edit that replaces a block's content is a
+  removal and an addition, and a summary already built from the old
+  content keeps it, as after any edit. So a block takes its audience when its
   message is added. The record is a
   state write, made by a manager that compiles for a reader as its
   strategy's chunks close, so it moves later sequence numbers too. A request
