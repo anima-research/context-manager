@@ -289,3 +289,57 @@ test('the ceiling mark names what the ceiling stopped', () => {
   assert.equal(ceilingMark({ whatIfs: 0, gate: true, joint: false }), 'gate');
   assert.equal(ceilingMark({ whatIfs: 2, gate: true, joint: true }), 'joint+gate+whatIfs:2');
 });
+
+function pricedFixture(): PickerInputs {
+  const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+  const raw = [90, 130, 70, 160, 110, 140, 120, 100, 150, 90, 130, 110];
+  const recall = [40, 75, 55, 90, 65, 80, 60, 70, 85, 50, 75, 60];
+  const l1s: string[] = [];
+  for (let index = 0; index < raw.length; index++) {
+    const id = `priced-${index}`;
+    chronicle.addChunk({ id, rawTokens: raw[index] });
+    chronicle.chunks[index].salience = 0.4 + 0.05 * index;
+    const l1 = chronicle.produceL1([id]);
+    chronicle.recallPairTokens.set(l1.id, recall[index]);
+    l1s.push(l1.id);
+  }
+  for (const [pair, cost] of [[0, 40], [1, 60], [2, 90], [3, 120]] as const) {
+    const l2 = chronicle.produceUpper(2, [l1s[2 * pair]!, l1s[2 * pair + 1]!]);
+    chronicle.recallPairTokens.set(l2.id, cost);
+  }
+  return {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+}
+const PRICED_WALL = { totalBudget: 800, targetBudget: 720, slack: 0.1 };
+
+test("a what-if the ceiling stopped at one recall cost doesn't stop the same candidate's what-if at another", (t) => {
+  const costs = new Map<string, number[]>();
+  const original = ParetoKvUnifiedPolicySolver.prototype.solve;
+  t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', function (this: ParetoKvUnifiedPolicySolver, solveOptions: ParetoSolveOptions) {
+    const summaries = (this as unknown as { inputs: PickerInputs }).inputs.summaries;
+    const latent = [...summaries.keys()].filter((id) => id.startsWith('__latent:'));
+    if (latent.length === 1) {
+      const seen = costs.get(latent[0]!) ?? [];
+      const tokens = summaries.get(latent[0]!)!.tokens;
+      if (!seen.includes(tokens)) seen.push(tokens);
+      costs.set(latent[0]!, seen);
+      if (seen.indexOf(tokens) === 1) throw new SparseLabelCeilingError(1, 2);
+    }
+    return original.call(this, solveOptions);
+  });
+  const strategy = new KvUnifiedStrategy({
+    policy: POLICY, ...GRID, labelCeiling: 1_000_000, reuse: {}, latentDemand: { ...DEMAND, mode: 'individual' },
+  });
+  const demands = (produced: readonly { range: { firstChunkId: string } }[], firstChunkId: string) =>
+    produced.some((request) => request.range.firstChunkId === firstChunkId);
+  const first = strategy.solve(pricedFixture(), PRICED_WALL);
+  const priced = strategy.lastDemandEvaluations.find((evaluation) =>
+    evaluation.expectedRecallTokens !== evaluation.conservativeRecallTokens && demands(first.produced, evaluation.request.range.firstChunkId));
+  assert.ok(priced, 'premise: a demanded candidate whose expected and conservative recall costs differ');
+  assert.deepEqual(costs.get(`__latent:L${priced.request.level}:${priced.sourceIds.join('+')}`),
+    [priced.conservativeRecallTokens, priced.expectedRecallTokens], 'premise: the ceiling stopped its expected-cost what-if');
+  const second = strategy.solve(pricedFixture(), PRICED_WALL);
+  assert.ok(demands(second.produced, priced.request.range.firstChunkId), 'the candidate is still demanded at the next compile');
+});
