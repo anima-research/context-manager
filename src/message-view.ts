@@ -18,6 +18,7 @@
 
 import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageStoreView, StoredMessage, MessageId } from './types/index.js';
+import { canonicalJson } from './canonical-json.js';
 import { releaseEditedRawForms } from './raw-forms.js';
 
 /**
@@ -116,24 +117,44 @@ export function audienceNarrowing(
   after: readonly ContentBlock[],
   reader: string | undefined,
 ): { own: boolean; others: boolean } {
+  const was = readersByContent(before);
+  const now = readersByContent(after);
   let own = false;
   let others = false;
-  for (let i = 0; i < Math.min(before.length, after.length); i++) {
-    const next = (after[i] as { audience?: unknown }).audience;
-    if (next === undefined || !Array.isArray(next) || !next.every((name) => typeof name === 'string')) continue;
-    const was = audienceOf(before[i]!);
-    if (was === undefined) {
+  for (const [content, then] of was) {
+    const next = now.get(content);
+    if (next === undefined || next === 'all') continue;
+    if (then === 'all') {
       others = true;
-      if (reader !== undefined && !next.includes(reader)) own = true;
+      if (reader !== undefined && !next.has(reader)) own = true;
       continue;
     }
-    for (const name of was) {
-      if (next.includes(name)) continue;
+    for (const name of then) {
+      if (next.has(name)) continue;
       if (name === reader) own = true;
       else others = true;
     }
   }
   return { own, others };
+}
+
+function readersByContent(blocks: readonly ContentBlock[]): Map<string, 'all' | Set<string>> {
+  const readers = new Map<string, 'all' | Set<string>>();
+  for (const block of blocks) {
+    const { audience: _audience, ...rest } = block as ContentBlock & { audience?: unknown };
+    const content = canonicalJson(rest);
+    const audience = audienceOf(block);
+    const known = readers.get(content);
+    if (known === 'all') continue;
+    if (audience === undefined) {
+      readers.set(content, 'all');
+      continue;
+    }
+    const names = known ?? new Set<string>();
+    for (const name of audience) names.add(name);
+    readers.set(content, names);
+  }
+  return readers;
 }
 
 /** A content block with the readers it's for (`audience`), as a host may write one on a message's own blocks other than tool calls, tool results, system changes and inline media. */

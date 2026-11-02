@@ -410,6 +410,45 @@ describe('an edit that narrows a block\'s audience', () => {
     }, () => new PassthroughStrategy());
   });
 
+  it('compares blocks by content wherever they sit, so a line added for a reader hides nothing', async () => {
+    await withReaders(async ({ ann }) => {
+      const body = ann.addMessage('user', [t('Body.')]);
+      ann.editMessage(body, [forReaders('[ann: #general]', 'ann'), t('Body.')]);
+      assert.deepEqual(contentOf(ann, body), [forReaders('[ann: #general]', 'ann'), t('Body.')], 'a line before the body');
+      const lines = ann.addMessage('user', [forReaders('[for ann]', 'ann'), forReaders('[for bob]', 'bob'), t('Hello.')]);
+      ann.editMessage(lines, [forReaders('[for ann]', 'ann'), forReaders('[for bob]', 'bob'), forReaders('[for carol]', 'carol'), t('Hello.')]);
+      assert.equal(contentOf(ann, lines).length, 4, 'a line for a reader who joined, between the lines and the body');
+    }, () => new PassthroughStrategy());
+  });
+
+  it('is refused where a block a reader saw moves to another place in a narrower audience, and the reader still sees it', async () => {
+    await withReaders(async ({ ann, bob }) => {
+      const secret = ann.addMessage('user', [t('SECRET')]);
+      assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/, 'the premise: bob sees it');
+      assert.throws(() => ann.editMessage(secret, [t('Prefix.'), forReaders('SECRET', 'ann')]), /may hide a block from a reader other than "ann"/);
+      assert.deepEqual(contentOf(ann, secret), [t('SECRET')]);
+      assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/);
+    }, () => new PassthroughStrategy());
+  });
+
+  it('is refused where one of two blocks with the same content goes, hiding it from the reader only that one was for', async () => {
+    await withReaders(async ({ ann, bob }) => {
+      const twice = ann.addMessage('user', [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
+      assert.throws(() => bob.editMessage(twice, [forReaders('Same.', 'bob')]), /may hide a block from a reader other than "bob"/);
+      assert.deepEqual(contentOf(ann, twice), [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
+    }, () => new PassthroughStrategy());
+  });
+
+  it('lets through an edit that puts each audience block back unchanged around changed blocks, as agent-framework does', async () => {
+    await withReaders(async ({ ann, bob }) => {
+      const message = ann.addMessage('user', [t('First.'), t('Second.'), forReaders('[for ann]', 'ann')]);
+      bob.editMessage(message, [t('First, edited.'), forReaders('[for ann]', 'ann')]);
+      assert.deepEqual(contentOf(ann, message), [t('First, edited.'), forReaders('[for ann]', 'ann')], 'with fewer blocks before it than it had');
+      ann.editMessage(message, [t('New.'), forReaders('[for ann]', 'ann'), t('First, edited.')]);
+      assert.deepEqual(contentOf(ann, message), [t('New.'), forReaders('[for ann]', 'ann'), t('First, edited.')], 'and with a block added before it');
+    }, () => new PassthroughStrategy());
+  });
+
   it('is refused away from the reader where another namespace on the branch records the same reader', async () => {
     const dir = tmp();
     const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
@@ -1079,6 +1118,82 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       await nobody.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe('once the namespace records a reader the manager doesn\'t compile for', () => {
+    class Watched extends PassthroughStrategy {
+      added: string[] = [];
+      released = 0;
+      reset: (string | null)[] = [];
+      summaries = 0;
+      gate: Promise<void> = Promise.resolve();
+      override async onNewMessage(message: StoredMessage): Promise<void> { this.added.push(message.id); }
+      onCompressionHoldsReleased(): void { this.released++; }
+      resetHeadWindow(id: string | null): void { this.reset.push(id); }
+      async generateTransitionSummary(): Promise<string> { this.summaries++; await this.gate; return 'Transition.'; }
+    }
+    const stale = /namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/;
+    async function staleAfterClaim(run: (m: { host: ContextManager; nobody: ContextManager; watched: Watched; claim: () => Promise<void>; logged: string[] }) => Promise<void>): Promise<void> {
+      const dir = tmp();
+      const logged: string[] = [];
+      const error = mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map((arg) => (arg instanceof Error ? arg.message : String(arg))).join(' ')); });
+      const host = await ContextManager.open({ path: join(dir, 'store'), namespace: 'host', strategy: new PassthroughStrategy() });
+      try {
+        const watched = new Watched();
+        const nobody = await ContextManager.open({ store: host.getStore(), namespace: 'agents/s', strategy: watched });
+        const claim = async () => { await (await ContextManager.open({ store: host.getStore(), namespace: 'agents/s', strategy: new PassthroughStrategy(), viewReader: 'ann' })).close(); };
+        await run({ host, nobody, watched, claim, logged });
+        await nobody.close();
+      } finally {
+        error.mock.restore();
+        await host.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    const transitions = (host: ContextManager) => host.getAllMessages().filter((m) => texts([m]).startsWith('[Topic Transition]')).length;
+
+    it('stores a message added after the claim without handing it to the strategy, and logs why', async () => {
+      await staleAfterClaim(async ({ host, nobody, watched, claim, logged }) => {
+        nobody.addMessage('user', [t('Before.')]);
+        assert.equal(watched.added.length, 1, 'the premise: before the claim the strategy is told');
+        await claim();
+        const after = nobody.addMessage('user', [t('After.')]);
+        assert.ok(host.getAllMessages().some((m) => m.id === after), 'the message is stored');
+        assert.equal(watched.added.length, 1, 'the strategy is told nothing of it');
+        assert.ok(logged.some((line) => line.includes('onNewMessage not called') && stale.test(line)), `logged: ${JSON.stringify(logged)}`);
+      });
+    });
+
+    it('tells the strategy of no hold released after the claim, and logs why', async () => {
+      await staleAfterClaim(async ({ nobody, watched, claim, logged }) => {
+        const id = nobody.addMessage('user', [t('Held.')]);
+        nobody.holdCompression([id]);
+        nobody.releaseCompression([id]);
+        assert.equal(watched.released, 1, 'the premise: before the claim the strategy is told');
+        nobody.holdCompression([id]);
+        await claim();
+        nobody.releaseCompression([id]);
+        assert.equal(watched.released, 1);
+        assert.ok(logged.some((line) => line.includes('onCompressionHoldsReleased not called') && stale.test(line)), `logged: ${JSON.stringify(logged)}`);
+      });
+    });
+
+    it('refuses a head-window reset whose transition summary was being made when the claim came, and one after it before asking the strategy for a summary, storing no transition', async () => {
+      await staleAfterClaim(async ({ host, nobody, watched, claim }) => {
+        let open!: () => void;
+        watched.gate = new Promise<void>((resolve) => { open = resolve; });
+        const reset = nobody.resetHeadWindow();
+        for (let i = 0; i < 200 && watched.summaries === 0; i++) await new Promise((r) => setTimeout(r, 5));
+        assert.equal(watched.summaries, 1, 'the premise: its transition summary is being made');
+        await claim();
+        open();
+        await assert.rejects(reset, stale);
+        await assert.rejects(nobody.resetHeadWindow(), stale);
+        assert.equal(watched.summaries, 1, 'the later reset asks the strategy for no summary');
+        assert.equal(transitions(host), 0, 'no transition is stored');
+        assert.deepEqual(watched.reset, [], 'and the strategy resets nothing');
+      });
+    });
   });
 
   it('summarises nothing more of a namespace another manager claimed, through a drain that began before the claim', async () => {

@@ -1022,7 +1022,11 @@ export class ContextManager {
    * it (`StrategyContext.markCompressionRead`); and always away from any
    * other reader, or from its own while another namespace on the branch
    * records the same reader, since this manager can't see what their
-   * compression has read. Blocks are compared by position. Nothing takes a
+   * compression has read. Blocks are compared by content, their `audience`
+   * aside, wherever they sit in the message: an edit narrows when a reader
+   * saw a block before it and sees no block with the same content after it.
+   * A block with no equal before the edit is new content, and one with no
+   * equal after it is removed, as in any edit. Nothing takes a
    * block out of a summary already written or a request already sent, a
    * removal included. Like a compile, an edit is refused when the
    * namespace records a reader this manager doesn't compile for.
@@ -1230,6 +1234,12 @@ export class ContextManager {
       return;
     }
     this.holdReleaseNotifyPending = false;
+    try {
+      this.requireRecordedReader("ContextManager's onCompressionHoldsReleased");
+    } catch (err) {
+      this.diag.error('Strategy onCompressionHoldsReleased not called:', err);
+      return;
+    }
     try {
       this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
     } catch (err) {
@@ -2833,6 +2843,7 @@ export class ContextManager {
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
+    this.requireRecordedReader('ContextManager.resetHeadWindow');
     if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
     }
@@ -2842,6 +2853,7 @@ export class ContextManager {
     // Generate transition summary if not provided
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
     this.requireInitialized('resetHeadWindow', attempt);
+    this.requireRecordedReader('ContextManager.resetHeadWindow');
 
     // Inject transition message
     const transition: ContentBlockWithAudience = { type: 'text', text: `[Topic Transition]\n\n${summary}` };
@@ -3104,6 +3116,12 @@ export class ContextManager {
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
       const seen = messageForReader(message, this.readerName);
       if (seen === null) return;
+      try {
+        this.requireRecordedReader("ContextManager's onNewMessage");
+      } catch (err) {
+        logThrown(`Strategy onNewMessage not called for ${describeStoreEvent({ type: 'add', message })}, which is stored:`, err, this.diag);
+        return;
+      }
       const ctx = this.createStrategyContext();
       try {
         Promise.resolve(this.strategy.onNewMessage(seen, ctx)).catch(failed);
