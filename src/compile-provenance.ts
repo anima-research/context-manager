@@ -160,7 +160,7 @@ export function attributeEntries(
 
   // Pass 1: which members each raw entry carries, and whether it carried
   // them unaltered.
-  let resultsByUse: ReadonlyMap<string, readonly ContentBlock[]> | undefined;
+  let inRequest: ReadonlySet<ContentBlock> | undefined;
   const entryBodies: Array<BodyState[] | null> = [];
   for (const entry of entries) {
     if (!isRawEntry(entry)) {
@@ -177,7 +177,7 @@ export function attributeEntries(
       if (!states.includes(state)) states.push(state);
     }
     const unaltered = entry.relocatedResults?.length
-      ? carriesWithRelocated(entry, sourceMessages, resultsByUse ??= toolResultsByUse(entries))
+      ? carriesWithRelocated(entry, sourceMessages, inRequest ??= new Set(entries.flatMap((e) => e.content)))
       : carries(entry.content, sourceMessages);
     if (!unaltered) for (const state of states) state.contentOk = false;
     entryBodies.push(states);
@@ -369,32 +369,17 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
   return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
 }
 
-/** Every tool_result block of the compile, by the id of the tool_use it
- *  answers: a later call can reuse an id, so one id can have several. */
-function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string, readonly ContentBlock[]> {
-  const out = new Map<string, ContentBlock[]>();
-  for (const entry of entries) {
-    for (const block of entry.content) {
-      if (block.type !== 'tool_result') continue;
-      const placed = out.get(block.toolUseId);
-      if (placed) placed.push(block);
-      else out.set(block.toolUseId, [block]);
-    }
-  }
-  return out;
-}
-
 /**
  * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and, for each moved result, a result
- * with its id in the request carries it unaltered. A result altered, or
- * missing from the request, does not carry it, unless another result with
- * its id carries the same content.
+ * when it carries the rest unaltered and, for each moved result, a block the
+ * repair placed for it is still in the request and carries it unaltered.
+ * Another result with its id, even with the same content, doesn't stand in
+ * for the placed block.
  */
 function carriesWithRelocated(
   entry: ContextEntry,
   sourceMessages: readonly StoredMessage[],
-  resultsByUse: ReadonlyMap<string, readonly ContentBlock[]>,
+  inRequest: ReadonlySet<ContentBlock>,
 ): boolean {
   const moved = new Set(entry.relocatedResults);
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
@@ -403,7 +388,8 @@ function carriesWithRelocated(
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;
-      const placed = resultsByUse.get((block as { toolUseId: string }).toolUseId) ?? [];
+      const id = (block as { toolUseId: string }).toolUseId;
+      const placed = (entry.relocatedBlocks ?? []).filter((b) => b.type === 'tool_result' && b.toolUseId === id && inRequest.has(b));
       if (!placed.some((result) => covers(result, block))) return false;
     }
   }

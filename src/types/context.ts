@@ -59,6 +59,11 @@ export interface ContextEntry {
    * still is.
    */
   relocatedResults?: string[];
+  /**
+   * The result blocks that repair placed for `relocatedResults`, as it
+   * placed them.
+   */
+  relocatedBlocks?: ContentBlock[];
 }
 
 /**

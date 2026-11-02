@@ -559,6 +559,32 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
   });
 
+  it('credits the body with its result where repair moves it out of a message it cut at a tool cycle', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), use('y'), result('y', 'the cycle\'s output')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const moved = entries.find((e) => e.sourceMessageId === 'r')!;
+    assert.deepEqual(moved.relocatedResults, ['tu-1'], 'premise: repair moved the result out of the message it cut');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
+  });
+
+  it('doesn\'t credit a moved result that was altered afterwards with another result of its id and identical content', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const r1 = msg('r1', 3, [result('x', 'SAME')]);
+    const b = msg('b', 4, [use('x')]);
+    const r2 = msg('r2', 5, [result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), recall, copy(r1), copy(b), copy(r2)]);
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r1')!.relocatedResults, ['x'], 'premise: repair moved r1\'s result up to a');
+    const placed = entries.find((e) => e.content.some((block) => block.type === 'tool_result'))!;
+    const i = placed.content.findIndex((block) => block.type === 'tool_result');
+    placed.content[i] = result('x', 'ALTERED');
+    const body = attributeEntries(entries, [a, r1, b, r2]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r1');
+    assert.deepEqual(body, { messageId: 'r1', sequence: 3, complete: false, missing: ['content'] });
+  });
+
   it('credits the body with its result where a later call reuses an unanswered call\'s id and repair moves the result to the later call', async () => {
     const a = msg('a', 1, [use('x')]);
     const n = msg('n', 2, [text('never mind')]);

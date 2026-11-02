@@ -19671,7 +19671,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const cut = cycleParts(entry.content);
       if (cut.length < 2) return [entry];
       return cut.map((content) => {
-        const part: ContextEntry = { ...entry, content, relocatedResults: undefined };
+        const part: ContextEntry = { ...entry, content, relocatedResults: undefined, relocatedBlocks: undefined };
         originOf.set(part, entry);
         return part;
       });
@@ -19701,6 +19701,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       open.origin.content.push(...part.content);
       if (part.relocatedResults?.length) open.origin.relocatedResults = [...(open.origin.relocatedResults ?? []), ...part.relocatedResults];
+      if (part.relocatedBlocks?.length) open.origin.relocatedBlocks = [...(open.origin.relocatedBlocks ?? []), ...part.relocatedBlocks];
     });
     entries.splice(0, entries.length, ...folded);
     for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
@@ -19770,6 +19771,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
       }
+
+      const unanswered = entry.content.filter((b, p) =>
+        b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id));
+      if (unanswered.length > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b) => !unanswered.includes(b)));
 
       prevUseIds = new Set();
       for (const b of entry.content) {
@@ -19852,6 +19857,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
         const moved = releaseSharedRawFormsOnMove(real, source);
+        (src.relocatedBlocks ??= []).push(moved);
         // Where it came from, for the image strip (applyImageStripping's
         // asEstimated).
         if (src.sourceMessageId !== undefined) this._movedFrom.set(moved, src.sourceMessageId);

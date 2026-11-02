@@ -22,6 +22,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
+import { NativeFormatter } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextEntry } from '../src/types/index.js';
@@ -44,6 +45,8 @@ function assertPaired(entries: ContextEntry[]): void {
   for (let i = 0; i < entries.length; i++) {
     const runs = runsOf(entries[i].content);
     runs.forEach((run, r) => {
+      const callIds = run.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id);
+      assert.strictEqual(new Set(callIds).size, callIds.length, `entries[${i}]: two tool_use blocks in one run share an id`);
       for (const block of run) {
         if (block.type === 'tool_use') {
           const id = (block as { id: string }).id;
@@ -100,6 +103,24 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
     runEnforce(entries);
     assert.strictEqual(JSON.stringify(entries), snapshot, 'valid input must pass through unchanged');
     assertPaired(entries);
+  });
+
+  it('keeps only the last of two calls with one id in an entry, so membrane formats the repaired output', () => {
+    const first: ContentBlock = { type: 'tool_use', id: 'A', name: 'fn', input: { n: 1 } };
+    const second: ContentBlock = { type: 'tool_use', id: 'A', name: 'fn', input: { n: 2 } };
+    const entries = [
+      entry('Claude', [text('trying twice'), first, second]),
+      entry('User', [result('A', 'for the second')]),
+      entry('Claude', [text('done')]),
+    ];
+    entries.forEach((e, i) => { e.index = i; });
+    runEnforce(entries);
+    assertPaired(entries);
+    assert.deepStrictEqual(entries[0].content.filter((b) => b.type === 'tool_use').map((b) => (b as { input: unknown }).input), [{ n: 2 }]);
+    assert.doesNotThrow(() => new NativeFormatter().buildMessages(
+      entries.map(({ participant, content }) => ({ participant, content })),
+      { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
+    ));
   });
 
   it('drops a mid-list orphan tool_result (its tool_use was compressed away)', () => {
