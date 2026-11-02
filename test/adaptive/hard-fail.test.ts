@@ -317,7 +317,7 @@ describe('AutobiographicalStrategy — adaptive budget line and coverage', () =>
     return ids;
   };
 
-  it('reads a negative overBudgetGraceRatio as 0: a plan that fits the input budget is sent, and one over it with nothing to fold is refused', async () => {
+  it('reads a negative overBudgetGraceRatio as 0: a plan that fits the input budget is sent, and one over it with nothing to fold is refused, even by less than the default grace', async () => {
     const strategy = new AutobiographicalStrategy({
       compressionModel: 'mock',
       adaptiveResolution: true,
@@ -333,7 +333,8 @@ describe('AutobiographicalStrategy — adaptive budget line and coverage', () =>
       const planned = manager.previewContext(budget)!.finalTokens;
       const fitting = { maxTokens: Math.ceil(planned / 0.85), reserveForResponse: 0 };
       await assert.doesNotReject(() => manager.compile(fitting));
-      const over = { maxTokens: Math.floor(planned / 1.2), reserveForResponse: 0 };
+      const over = { maxTokens: Math.floor(planned / 1.01), reserveForResponse: 0 };
+      assert.ok(planned > over.maxTokens && planned <= Math.floor(over.maxTokens * 1.02), 'the premise: over the budget, by less than the default grace of 0.02');
       await assert.rejects(() => manager.compile(over), OverBudgetError);
     } finally {
       manager.close();

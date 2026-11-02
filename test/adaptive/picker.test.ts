@@ -1053,13 +1053,14 @@ test('picker: a chunk the solver frontier does not name applies at level 0', () 
 
 test('picker: a solver that leaves exhausted unset is exhausted when nothing is produced and the applied tokens are above the soft target', () => {
   const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
-  const over = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(1000));
+  const over = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(1250));
   assert.equal(over.finalTokens, 1200);
+  assert.ok(over.finalTokens > BUDGET(1250).targetBudget && over.finalTokens <= BUDGET(1250).totalBudget, 'the premise: above the soft target, within the hard budget');
   assert.equal(over.exhausted, true);
   const under = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(100_000));
   assert.equal(under.exhausted, false);
   const request = { level: 2, range: { firstChunkId: 'c-0000', lastChunkId: 'c-0011' } };
-  const producing = new Picker(stubSolver(new Map(), { produced: [request] })).run(chainInputs(chronicle), BUDGET(1000));
+  const producing = new Picker(stubSolver(new Map(), { produced: [request] })).run(chainInputs(chronicle), BUDGET(1250));
   assert.equal(producing.finalTokens, 1200);
   assert.equal(producing.exhausted, false);
 });
