@@ -18,6 +18,7 @@
 
 import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageStoreView, StoredMessage, MessageId } from './types/index.js';
+import { withoutCacheMarker } from './cache-marker.js';
 import { canonicalJson } from './canonical-json.js';
 import { releaseEditedRawForms } from './raw-forms.js';
 
@@ -141,7 +142,7 @@ export function audienceNarrowing(
 function readersByContent(blocks: readonly ContentBlock[]): Map<string, 'all' | Set<string>> {
   const readers = new Map<string, 'all' | Set<string>>();
   for (const block of blocks) {
-    const { audience: _audience, ...rest } = block as ContentBlock & { audience?: unknown };
+    const { audience: _audience, ...rest } = withoutCacheMarker(block);
     const content = canonicalJson(rest);
     const audience = audienceOf(block);
     const known = readers.get(content);

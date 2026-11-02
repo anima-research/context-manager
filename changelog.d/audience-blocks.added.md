@@ -60,8 +60,10 @@
   declares it as it is. Away from any other reader, or from its own while
   another namespace on the branch records the same reader, it's always refused,
   since a manager can't see what another namespace's compression has read.
-  Blocks are compared by content, their `audience` aside, wherever they sit
-  in the message: an edit narrows when content the message keeps was seen
+  Blocks are compared by content, their `audience` and cache markers
+  (`cache_control`, `cacheControl`) aside, wherever they sit in the
+  message, so a change to any other field, citations included, replaces
+  the block's content: an edit narrows when content the message keeps was seen
   by a reader before the edit, and that reader sees none of its blocks
   after it. A block with no equal before the edit is new content, and one
   with no equal after it is removed, as in any edit. So the refusal holds
