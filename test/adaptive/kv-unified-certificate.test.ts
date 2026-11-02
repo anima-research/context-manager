@@ -222,13 +222,16 @@ function warmAndCold(first: ReturnType<typeof seededCertificateFixture>, next: P
   const reuse: KvUnifiedReuse = {};
   new ParetoKvUnifiedPolicySolver(first.inputs, first.forest).solve({ ...first.options, hysteresisCertificate: true, reuse });
   assert.ok(reuse.certificate, 'the first compile kept its graph');
+  const kept = reuse.certificate;
+  const keptLeaves = kept.leafObjects;
   const forest = CanonicalSummaryForest.derive(first.forest, next, FOREST_OPTIONS);
   assert.ok(forest, 'the next compile derives from the first');
   assert.equal(forest.ownership, first.forest.ownership);
   const warm = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, hysteresisCertificate: true, reuse });
+  const reused = reuse.certificate === kept && kept.leafObjects !== keptLeaves;
   const cold = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, hysteresisCertificate: true, reuse: {} });
   const full = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, reuse: {} });
-  return { warm, cold, full };
+  return { warm, cold, full, reused };
 }
 
 function assertSameSelection(actual: ParetoPolicySolveResult, expected: ParetoPolicySolveResult, label: string) {
@@ -252,19 +255,20 @@ test('with the certificate on, a wall lowered below every cut leaves the solve i
   assert.equal(warm.feasible, false);
 });
 
-test('a reused graph certifies as a fresh one does after a summary-owned leaf changes its pin', () => {
+test('after a summary-owned leaf changes its pin, the kept graph is not reused, the certificate declines, and the solve selects as with a fresh graph', () => {
   const first = seededCertificateFixture(25);
   const next = nextCompile(first.inputs);
   const owned = next.chunks.find((chunk) => first.forest.leaf(chunk.id)!.summaryIds.length > 0)!;
   owned.pinned = !owned.pinned;
-  const { warm, cold, full } = warmAndCold(first, next, first.options);
+  const { warm, cold, full, reused } = warmAndCold(first, next, first.options);
+  assert.ok(!reused, 'the kept graph is not reused once an owned leaf changes');
   assert.ok(!(cold.feasible && cold.certificate), 'a fresh graph declines after the pin change');
   assertCertifiedAlike(warm, cold, 'certified warm and cold alike');
   assertSameSelection(warm, cold, 'warm against cold');
   assertSameSelection(warm, full, 'warm against full');
 });
 
-test('a reused graph certifies as a fresh one does whichever carried layout the next compile accepts', () => {
+test("a reused graph certifies or declines as a fresh one does for each complete cut, carried with every leaf's representation current", () => {
   const first = seededCertificateFixture(1);
   const solves = first.cuts.map((cut) => {
     const next = nextCompile(first.inputs);
@@ -273,7 +277,8 @@ test('a reused graph certifies as a fresh one does whichever carried layout the 
     return { cut, ...warmAndCold(first, next, options) };
   });
   assert.ok(solves.some(({ cold }) => cold.feasible && cold.certificate), 'some carried layout certifies');
-  for (const { cut, warm, cold } of solves) {
+  for (const { cut, warm, cold, reused } of solves) {
+    assert.ok(reused, `the warm solve reused the kept graph from ${[...cut.frontier]}`);
     assertCertifiedAlike(warm, cold, `certified warm and cold alike from ${[...cut.frontier]}`);
     assertSameSelection(warm, cold, 'warm against cold');
   }
@@ -283,7 +288,8 @@ test('a reused graph certifies as a fresh one does after leaf salience changes',
   const first = seededCertificateFixture(1);
   const next = nextCompile(first.inputs);
   for (const chunk of next.chunks) chunk.salience = first.random();
-  const { warm, cold, full } = warmAndCold(first, next, first.options);
+  const { warm, cold, full, reused } = warmAndCold(first, next, first.options);
+  assert.ok(reused, 'the warm solve reused the kept graph');
   assert.ok(cold.feasible && cold.certificate, 'a fresh graph certifies');
   assertCertifiedAlike(warm, cold, 'certified warm and cold alike');
   assertSameSelection(warm, cold, 'warm against cold');

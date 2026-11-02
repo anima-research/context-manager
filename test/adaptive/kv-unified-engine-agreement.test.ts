@@ -51,7 +51,7 @@ const metrics = (result: ParetoPolicySolveResult) => result.feasible ? candidate
 function assertSubtreeMatchesObjects({ inputs, forest, options }: Fixture) {
   const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
   const reference = solver.solve({ ...options, storage: 'objects' });
-  const subtree = solver.solve({ ...options, reuse: {} });
+  const subtree = solver.solve({ ...options, engine: 'subtree', reuse: {} });
   assert.ok(reference.feasible && subtree.feasible);
   assert.ok(solver.lastSubtreeStats, 'the subtree engine ran');
   assert.deepEqual(subtree.selected.frontier, reference.selected.frontier);
@@ -61,12 +61,12 @@ function assertSubtreeMatchesObjects({ inputs, forest, options }: Fixture) {
 
 function solveWarmAndCold({ inputs, forest, options }: Fixture, next: Fixture['options']) {
   const reuse: KvUnifiedReuse = {};
-  new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, reuse });
+  new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree', reuse });
   assert.ok(reuse.subtree && reuse.subtree.size > 0, 'the first solve kept its sets');
   const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
-  const warm = solver.solve({ ...next, reuse });
+  const warm = solver.solve({ ...next, engine: 'subtree', reuse });
   const reused = solver.lastSubtreeStats!.summariesReused;
-  const cold = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...next, reuse: {} });
+  const cold = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...next, engine: 'subtree', reuse: {} });
   assert.ok(warm.feasible && cold.feasible);
   return { warm, cold, reused };
 }
@@ -142,6 +142,7 @@ test("a warm subtree solve after an accepted entry's representation changes at i
   const presentation = fixture.options.presentation;
   assert.ok(presentation && presentation.leaves.size > 0);
   const [first] = presentation.leaves.keys();
+  assert.notEqual(presentation.leaves.get(first)!.repHash, 'summary:regenerated', "the entry's representation changes");
   const leaves = new Map(presentation.leaves);
   leaves.set(first, { ...leaves.get(first)!, repHash: 'summary:regenerated' });
   const solved = solveWarmAndCold(fixture, { ...fixture.options, presentation: { ...presentation, leaves } });
@@ -164,10 +165,10 @@ test("the subtree engine's diagnostics leave its result as it is without them", 
   let plain: ParetoPolicySolveResult, diagnosed: ParetoPolicySolveResult;
   try {
     delete process.env.KVU_SUBTREE_DIAG;
-    plain = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, reuse: {} });
+    plain = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree', reuse: {} });
     process.env.KVU_SUBTREE_DIAG = '1';
     console.error = (...args: unknown[]) => { printed.push(args.join(' ')); };
-    diagnosed = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, reuse: {} });
+    diagnosed = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree', reuse: {} });
   } finally {
     if (previous === undefined) delete process.env.KVU_SUBTREE_DIAG; else process.env.KVU_SUBTREE_DIAG = previous;
     console.error = report;
@@ -184,7 +185,7 @@ test('the minimum-token cut is a candidate of a gridded subtree solve whose tail
   assert.ok(options.tokenBucketSize > 0, 'the solve is gridded');
   const floor = forest.minimumTokens(options.maxTokens);
   assert.ok(floor.feasible);
-  const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, reuse: {} });
+  const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree', reuse: {} });
   assert.ok(result.feasible);
   assert.ok(result.candidates.some((candidate) => candidate.renderedTokens === floor.floorTokens &&
     [...floor.frontier].every(([id, level]) => candidate.frontier.get(id) === level)));
@@ -236,7 +237,7 @@ test('a run of ownerless roots after a summary selects in the subtree engine as 
   assert.ok(roots.join(',').includes('summary,leaf,leaf'), 'two ownerless roots in a row after a summary');
   assert.ok(forest.hasInternalProtectedHoles() || forest.gapBearingSummaryIds.length > 0, 'the forest buffers emissions');
   assert.ok(options.cache.immutablePrefixHash === options.currentImmutablePrefixHash, 'the receipt applies');
-  const subtree = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, reuse: {} });
+  const subtree = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree', reuse: {} });
   const objects = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, storage: 'objects' });
   assert.ok(subtree.feasible && objects.feasible);
   assert.deepEqual(subtree.selected.frontier, objects.selected.frontier);
