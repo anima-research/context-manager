@@ -13,8 +13,8 @@ const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const say = (i: number) => `message ${i}: ` + 'a considered sentence about the work at hand. '.repeat(3);
 const OK = { content: [text('A summary of what happened.')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
 const transient = () => Object.assign(new Error('zz server failure'), { type: 'server', httpStatus: 529, retryable: true });
-const admissionDeferral = () => Object.assign(new Error('zz held by provider admission'), {
-  type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 0,
+const admissionDeferral = (retryAfterMs = 0) => Object.assign(new Error('zz held by provider admission'), {
+  type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs,
 });
 
 type Step = typeof OK | { throw: unknown };
@@ -72,6 +72,17 @@ async function until(cond: () => boolean, what: string, ms = 5_000): Promise<voi
 
 async function turns(n: number): Promise<void> {
   for (let i = 0; i < n; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** With `setTimeout` mocked: moves the clock on in `step` ms steps, letting each step's callbacks and what they
+ *  start run (setImmediate isn't mocked), until `cond` holds or `ms` has passed. */
+async function advance(ms: number, cond: () => boolean = () => false, step = 1): Promise<boolean> {
+  for (let passed = 0; !cond(); passed += step) {
+    if (passed >= ms) return false;
+    mock.timers.tick(step);
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  }
+  return true;
 }
 
 async function drain(manager: ContextManager): Promise<void> {
@@ -171,7 +182,9 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
 
   it('the drain starts nothing after a tick that threw, until the next message', async (t) => {
     const path = await closedChunksStore(t);
-    const { membrane, calls } = scripted([{ throw: admissionDeferral() }, OK]);
+    // The deferral asks for a recheck after 100 ms, so a drain that re-armed at its retry would come due inside
+    // the hour this test lets pass.
+    const { membrane, calls } = scripted([{ throw: admissionDeferral(100) }, OK]);
     const errors = mock.method(console, 'error', () => {});
     t.after(() => errors.mock.restore());
     const manager = await ContextManager.open({
@@ -179,15 +192,17 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
       strategy: new AutobiographicalStrategy(config({ autoTickOnNewMessage: true })),
       membrane,
     });
+    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    t.after(() => mock.timers.reset());
     manager.addMessage('User', [text(say(100))]);
-    await until(
-      () => errors.mock.calls.some((call) => String(call.arguments[0]).includes('speculative-drain error')),
-      'the drain to log the thrown tick',
+    assert.ok(
+      await advance(5_000, () => errors.mock.calls.some((call) => String(call.arguments[0]).includes('speculative-drain error'))),
+      'the drain logs the thrown tick',
     );
-    await turns(50);
-    assert.equal(calls.length, 1, 'nothing resumed the drain');
+    await advance(60 * 60_000, () => calls.length > 1, 1_000);
+    assert.equal(calls.length, 1, 'nothing resumed the drain in the hour after');
     manager.addMessage('Claude', [text(say(101))]);
-    await until(() => calls.length > 1, 'the next message to resume the drain');
+    assert.ok(await advance(5_000, () => calls.length > 1), 'the next message resumes the drain');
     manager.close();
   });
 

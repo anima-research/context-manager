@@ -345,7 +345,7 @@ describe('compression lifecycle: the ladder and its options', () => {
         await manager.tick();
         await assert.rejects(manager.tick(), /held by provider admission/, 'an L1 landed, then the merge was deferred again');
       }
-      assert.equal(strategy.getCompressionDebt().mergeQuarantineCount, 0, 'ten deferrals, eight after a landing, quarantine nothing');
+      assert.equal(strategy.getCompressionDebt().mergeQueueMaxAttempts, 0, 'ten deferrals, eight after a landing, record no attempt on any merge');
       admitted = true;
       await drain(manager);
       assert.ok(manager.getMaxSummaryLevel() >= 2, 'the deferred merges land once admitted');
