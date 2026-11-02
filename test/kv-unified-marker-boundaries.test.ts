@@ -429,10 +429,12 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
     }
   });
 
-  it("a first call the receipt chain refuses as a duplicate leaves the count check to the first accepted later call", async () => {
+  it("a first call the receipt chain refuses as a duplicate leaves the count check to the first accepted later call: a reference where its count matches, none where it doesn't", async () => {
     const o = await open(conversation(ONE), ONE.config);
     try {
       await withMismatchLines(async () => {
+        const again = (id: string) =>
+          o.strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: `layout-${id}-again` });
         await o.compile();
         const settled = o.begin();
         o.accept(settled, 1);
@@ -440,13 +442,22 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
         assert.ok(earlier, 'premise: the first compile sets a reference');
         o.manager.addMessage('a', [{ type: 'text', text: plain(1) }]);
         await o.compile();
-        o.strategy.beginKvUnifiedSubmission({ submissionId: settled, requestHash: `wire-${settled}`, layoutHash: 'layout-again' });
+        again(settled);
         o.accept(settled, 1);
         assert.equal(receipts(o.strategy).cache, earlier, 'premise: the chain refuses the repeated id and keeps the earlier reference');
         o.accept(o.begin(), 1);
         const set = receipts(o.strategy).cache;
         assert.ok(set && set !== earlier, "the later call takes the count check and sets this compile's reference");
-        assert.notDeepEqual(set.markers, earlier.markers, "premise: this compile's markers differ from the earlier compile's");
+        assert.notDeepEqual(set.markers, earlier.markers, "a reference of this compile's, not the earlier compile's");
+        o.manager.addMessage('a', [{ type: 'text', text: plain(2) }]);
+        await o.compile();
+        again(settled);
+        o.accept(settled, 1);
+        assert.equal(receipts(o.strategy).cache, set, 'premise: the chain refuses the repeated id again');
+        o.accept(o.begin(), 2);
+        assert.equal(receipts(o.strategy).cache, null, 'a mismatched first accepted later call sets none');
+        o.accept(o.begin(), 1);
+        assert.equal(receipts(o.strategy).cache, null, 'and no later call of that compile sets one');
       });
     } finally {
       await o.close();
