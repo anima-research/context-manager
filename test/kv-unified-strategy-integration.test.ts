@@ -1185,7 +1185,7 @@ test('kv-unified with no kvUnified configuration is refused by name', async () =
   manager.close();
 });
 
-test('a persisted receipt whose head has no string layout hash is refused when the store opens', async () => {
+test('a persisted receipt in the current format whose head has no string layout hash is refused when the store opens', async () => {
   const stored = await acceptedStore();
   const state = stored.written() as { head: Record<string, unknown> };
   assert.equal(typeof state.head.layoutHash, 'string', 'premise: the head as written names its layout hash');
@@ -1201,6 +1201,7 @@ test('a persisted receipt state that is not an object opens as an empty chain', 
     manager.close();
     const second = strategy();
     const reopened = await ContextManager.open({ path: STORE, strategy: second });
+    assert.deepEqual(receiptStore(second).get(), value, `premise: the reopened store holds ${JSON.stringify(value)}`);
     assert.deepEqual(receipts(second).snapshot(), receipts(strategy()).snapshot(), `${JSON.stringify(value)} opens as a new chain`);
     reopened.close();
     rmSync(STORE, { recursive: true, force: true });
@@ -1223,7 +1224,10 @@ test("latent demand's settings the recipe leaves unset: merge threshold 6, fallb
   assert.equal(defaults.mergeThreshold, 6);
   assert.equal(defaults.fallbackRecallTokens, 2_020);
   assert.equal(defaults.maxCandidates, 16);
-  assert.equal((await latentDemandOf({ hierarchical: false })).mergeThreshold, 6);
+  const flat = await latentDemandOf({ hierarchical: false });
+  assert.equal(flat.mergeThreshold, 6);
+  assert.equal(flat.fallbackRecallTokens, 2_020);
+  assert.equal((await latentDemandOf({ summaryTargetTokens: 1_000 })).fallbackRecallTokens, 1_020);
 });
 
 test("each leaf's presentation count since it last changed survives the receipt being written and read back", async () => {
