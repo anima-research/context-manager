@@ -310,6 +310,34 @@ describe('ContextManager.derive', () => {
     );
   });
 
+  it('a child of another strategy places its cache markers as a fresh solve does, not from its parent\'s last request', { skip }, async () => {
+    const parent = await ContextManager.open({
+      path: storePath(),
+      strategy: new WindowedPassthroughStrategy(),
+      membrane: mockMembrane() as never,
+    });
+    managers.push(parent);
+    for (let i = 0; i < 12; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    const fromParent = await parent.compile(BUDGET);
+    assert.ok(fromParent.messages.some((m) => (m as { cacheBreakpoint?: boolean }).cacheBreakpoint), 'premise: the parent placed cache markers');
+
+    const child = () => new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 100, recentWindowTokens: 200 });
+    const reusing = await parent.derive({ branch: 'dendrite/reusing', strategy: child() });
+    const fresh = await parent.derive({ branch: 'dendrite/fresh', strategy: child(), solve: 'fresh' });
+    managers.push(reusing, fresh);
+    const marks = (r: { messages: unknown[] }) =>
+      r.messages.flatMap((m, i) => ((m as { cacheBreakpoint?: boolean }).cacheBreakpoint ? [i] : []));
+    const fromReusing = await reusing.compile(BUDGET);
+    const fromFresh = await fresh.compile(BUDGET);
+    assert.equal(
+      JSON.stringify(fromReusing.messages.map((m) => m.content)),
+      JSON.stringify(fromFresh.messages.map((m) => m.content)),
+      'premise: both children render the same content',
+    );
+    assert.ok(marks(fromFresh).length > 0, 'premise: a fresh child places cache markers');
+    assert.deepEqual(marks(fromReusing), marks(fromFresh));
+  });
+
   it('hands a reusing child the markers the parent placed, with the cache keys they were placed for', { skip }, async () => {
     const { parent, strategy } = await foldedParent();
     const childStrategy = folding();
