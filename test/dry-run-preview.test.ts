@@ -922,7 +922,8 @@ describe('AutobiographicalStrategy — previewed as adaptive through an override
       addSeededInputs(manager, strategy);
       const adaptive = { adaptiveResolution: true };
       const unfolded = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, adaptive)!.finalTokens;
-      const budget = { maxTokens: Math.ceil(unfolded / 0.85), reserveForResponse: 0 };
+      const budget = { maxTokens: Math.ceil(unfolded / 0.89), reserveForResponse: 0 };
+      assert.ok(unfolded <= budget.maxTokens * 0.9 && unfolded > budget.maxTokens * 0.88, `premise: the plan is within 90% of the budget, and above 88% (${unfolded} of ${budget.maxTokens})`);
 
       const wider = manager.previewContext(budget, { ...adaptive, compressionSlackRatio: 0.2 })!;
       assert.ok(wider.finalTokens < unfolded, `premise: a slack of 0.2 folds this plan (${wider.finalTokens} < ${unfolded})`);
@@ -931,8 +932,10 @@ describe('AutobiographicalStrategy — previewed as adaptive through an override
       assert.strictEqual(preview.finalTokens, unfolded);
       assert.ok(Object.values(preview.resolutions).every((level) => level === 0));
 
-      const tighter = manager.previewContext({ maxTokens: Math.ceil(unfolded / 0.95), reserveForResponse: 0 }, adaptive)!;
-      assert.ok(tighter.finalTokens < unfolded, `a plan at 95% of the budget folds (${tighter.finalTokens} < ${unfolded})`);
+      const tight = { maxTokens: Math.ceil(unfolded / 0.91), reserveForResponse: 0 };
+      assert.ok(unfolded > tight.maxTokens * 0.9 && unfolded <= tight.maxTokens * 0.92, `premise: the plan is above 90% of the budget, and within 92% (${unfolded} of ${tight.maxTokens})`);
+      const tighter = manager.previewContext(tight, adaptive)!;
+      assert.ok(tighter.finalTokens < unfolded, `a plan at 91% of the budget folds (${tighter.finalTokens} < ${unfolded})`);
     } finally {
       manager.close();
     }
