@@ -300,8 +300,10 @@ describe('compression lifecycle: the ladder and its options', () => {
     });
 
     it("each retry of a merge a provider rejected halves the merge's recall budget, down to an 8,000-token floor", async (t) => {
-      const sizes = [12_000, 6_000, 6_000];
-      const rejected: number[] = [];
+      // A recall pair costs its summary's tokens and some 50 to 120 for its envelope. So 16,000 holds the two
+      // 7,800s but not the 300 beside them, and 8,000 holds one 7,800 but not the 300.
+      const sizes = [300, 7_800, 7_800];
+      const rejected: string[][] = [];
       let merged = 0;
       const { membrane } = membraneOf((request) => {
         if (mergeLevel(request) !== 2) return answer('a memory');
@@ -309,7 +311,7 @@ describe('compression lifecycle: the ladder and its options', () => {
           const tokens = sizes[merged++]!;
           return answer('a long consolidated memory. '.repeat(tokens / 7), tokens);
         }
-        rejected.push(recallIds(request).filter((id) => id.startsWith('L2')).length);
+        rejected.push(recallIds(request).filter((id) => id.startsWith('L2')));
         throw rejection();
       });
       const manager = await ContextManager.open({
@@ -318,9 +320,14 @@ describe('compression lifecycle: the ladder and its options', () => {
         membrane,
       });
       await treeWithL2s(manager, 3);
+      const [small, older, newest] = unmergedAt(manager, 2).map((s) => s.id);
       closeChunks(manager, 5);
       await drain(manager);
-      assert.deepEqual(rejected, [3, 2, 1, 1, 1], 'budgets of 32,000, 16,000, 8,000, then 8,000 twice, over earlier merges of 6,000, 6,000 and 12,000 tokens, newest first');
+      assert.deepEqual(
+        rejected,
+        [[small, older, newest], [older, newest], [newest], [newest], [newest]],
+        'budgets of 32,000, 16,000 and 8,000, then the 8,000 floor twice, over earlier merges of 300, 7,800 and 7,800 tokens, oldest first',
+      );
       manager.close();
     });
 
@@ -344,6 +351,7 @@ describe('compression lifecycle: the ladder and its options', () => {
         closeChunks(manager, 1);
         await manager.tick();
         await assert.rejects(manager.tick(), /held by provider admission/, 'an L1 landed, then the merge was deferred again');
+        assert.equal(messagesIn(calls.filter((r) => mergeLevel(r)).at(-1)!)[0], messagesIn(merges[0]!)[0], 'the deferred merge is still asked first');
       }
       assert.equal(strategy.getCompressionDebt().mergeQueueMaxAttempts, 0, 'ten deferrals, eight after a landing, record no attempt on any merge');
       admitted = true;

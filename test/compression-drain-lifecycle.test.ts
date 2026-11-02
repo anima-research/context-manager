@@ -196,8 +196,8 @@ describe('compression lifecycle: the tick, the drain and holds', () => {
     t.after(() => mock.timers.reset());
     manager.addMessage('User', [text(say(100))]);
     assert.ok(
-      await advance(5_000, () => errors.mock.calls.some((call) => String(call.arguments[0]).includes('speculative-drain error'))),
-      'the drain logs the thrown tick',
+      await advance(5_000, () => errors.mock.calls.some((call) => /speculative-drain error: .*zz held by provider admission/.test(String(call.arguments[0])))),
+      'the drain logs what the tick threw',
     );
     await advance(60 * 60_000, () => calls.length > 1, 1_000);
     assert.equal(calls.length, 1, 'nothing resumed the drain in the hour after');
