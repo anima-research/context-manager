@@ -559,6 +559,41 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
   });
 
+  it('credits a body whose later result with the moved result\'s id stays with its own call', async () => {
+    const c = msg('c', 1, [use('x')]);
+    const t = msg('t', 2, [text('an aside')]);
+    const m = msg('m', 3, [result('x', 'small'), text('and then'), use('x'), result('x', 'large')]);
+    const entries = await repaired([copy(c), copy(t), copy(m)]);
+    const own = entries.find((e) => e.sourceMessageId === 'm')!;
+    assert.deepEqual(own.relocatedResults, ['x'], 'premise: repair moved the first result');
+    assert.ok(own.content.some((b) => b.type === 'tool_result'), 'premise: the later result stays with its own call');
+    const body = attributeEntries(entries, [c, t, m]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'm');
+    assert.deepEqual(body, { messageId: 'm', sequence: 3, complete: true });
+  });
+
+  it('doesn\'t credit two identical results with the one block repair placed when the other is dropped', async () => {
+    const u = msg('u', 1, [use('x')]);
+    const r = msg('r', 3, [result('x', 'SAME'), result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const placed = entries.filter((e) => e.content.some((b) => b.type === 'tool_result'));
+    assert.equal(placed.flatMap((e) => e.content).filter((b) => b.type === 'tool_result').length, 1, 'premise: one of the two results reaches the request');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: false, missing: ['content'] });
+  });
+
+  it('doesn\'t credit a moved result that was altered before repair moved it', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const sent = copy(r);
+    sent.content = [result('tu-1', '[result left out]'), ...sent.content.slice(1)];
+    const entries = await repaired([copy(u), recall, sent]);
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r')!.relocatedResults, ['tu-1'], 'premise: repair moved the altered result');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: false, missing: ['content'] });
+  });
+
   it('credits the body with its result where repair moves it out of a message it cut at a tool cycle', async () => {
     const u = msg('u', 1, [use('tu-1')]);
     const r = msg('r', 3, [result('tu-1', 'the real output'), use('y'), result('y', 'the cycle\'s output')]);

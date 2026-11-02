@@ -371,10 +371,12 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
 
 /**
  * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and, for each moved result, a block the
- * repair placed for it is still in the request and carries it unaltered.
- * Another result with its id, even with the same content, doesn't stand in
- * for the placed block.
+ * when it carries the rest unaltered and each of the body's results with a
+ * moved id is carried, unaltered and in any order, by a block of its own:
+ * one the repair placed for this entry that is still in the request, or a
+ * result with that id still in the entry. Each block carries one result.
+ * Another entry's result with its id, even with the same content, doesn't
+ * stand in for it.
  */
 function carriesWithRelocated(
   entry: ContextEntry,
@@ -385,12 +387,13 @@ function carriesWithRelocated(
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
   const rest = sourceMessages.map((m) => ({ ...m, content: m.content.filter((b) => !isMoved(b)) }));
   if (!carries(entry.content, rest)) return false;
+  const carriers = [...(entry.relocatedBlocks ?? []).filter((b) => inRequest.has(b)), ...entry.content.filter(isMoved)];
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;
-      const id = (block as { toolUseId: string }).toolUseId;
-      const placed = (entry.relocatedBlocks ?? []).filter((b) => b.type === 'tool_result' && b.toolUseId === id && inRequest.has(b));
-      if (!placed.some((result) => covers(result, block))) return false;
+      const k = carriers.findIndex((result) => covers(result, block));
+      if (k === -1) return false;
+      carriers.splice(k, 1);
     }
   }
   return true;
