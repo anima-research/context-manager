@@ -28,6 +28,7 @@ import {
   ContextManager,
   MessageStore,
   PassthroughStrategy,
+  WindowedPassthroughStrategy,
 } from '../src/index.js';
 
 type ViewStore = JsStore & { view(branch: string): JsStore };
@@ -582,6 +583,21 @@ describe('ContextManager.derive', () => {
     assert.equal(child.getStore().getStateJson('framework/state') ?? null, null);
     assert.deepEqual(root.getStateJson('framework/state'), { host: 'only' });
     other.close();
+  });
+
+  it('starts a windowed child derived at the head from the parent\'s anchor, in the strategy\'s own slot or the one its caller names', { skip }, async () => {
+    for (const options of [{}, { anchorStateId: 'subconscious/anchor' }]) {
+      const parentStrategy = new WindowedPassthroughStrategy(options);
+      const parent = await ContextManager.open({ path: storePath(), namespace: 'agents/mira', strategy: parentStrategy });
+      managers.push(parent);
+      for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+      const anchor = parent.getAllMessages()[3]!.sequence;
+      parentStrategy.setAnchor(anchor);
+
+      const childStrategy = new WindowedPassthroughStrategy(options);
+      managers.push(await parent.derive({ branch: 'dendrite/windowed', strategy: childStrategy }));
+      assert.equal(childStrategy.getAnchor(), anchor, JSON.stringify(options));
+    }
   });
 
   it('survives a restart: the branch is the child\'s durable state', { skip }, async () => {
