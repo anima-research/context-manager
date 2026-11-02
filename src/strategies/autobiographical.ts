@@ -683,6 +683,17 @@ type StripReplay = {
  *  answers it, by message and place in its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
 
+interface ListingSpans {
+  listing: readonly StoredMessage[];
+  at: Map<string, readonly [number, number] | null>;
+  unlisted: Set<MessageId>;
+}
+
+function extendsListing(prev: ReadonlyArray<unknown>, next: ReadonlyArray<unknown>): boolean {
+  for (let i = 0; i < prev.length; i++) if (next[i] !== prev[i]) return false;
+  return true;
+}
+
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the earliest call with its id before it, in its own message or an earlier
@@ -3317,6 +3328,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._storeOrderSource = NO_LISTING;
     this._chunkByPosition = null;
     this._l1ByMessage = null;
+    this._summaryIndex = null;
     this._recordChunks = null;
     this._salience = null;
     this._exactL1 = null;
@@ -3969,6 +3981,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const out: TimeRangeSummaryEntry[] = [];
     let listing: readonly StoredMessage[] | undefined;
+    let spans: ListingSpans | undefined;
     let position: ReadonlyMap<MessageId, number> | undefined;
     for (const entry of this.summaries) {
       if (opts.level !== undefined && entry.level !== opts.level) continue;
@@ -3978,10 +3991,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let lastMsg = store.get(entry.sourceRange.last);
       if (!firstMsg || !lastMsg) {
         listing ??= store.getAll();
-        position ??= this.positionIndex(listing);
-        const leaves = new Set<MessageId>();
-        this.expandSummaryToLeafMessageIds(entry, this.summaryIndex(), leaves);
-        const span = spanInStore(leaves, position);
+        spans ??= this.spansIn(listing);
+        const listed = listing;
+        const span = this.spanInListing(entry, spans, () => (position ??= this.positionIndex(listed)));
         if (!span) continue;
         firstMsg = listing[span[0]]!;
         lastMsg = listing[span[1]]!;
@@ -6671,12 +6683,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A listing that keeps every earlier element (same object, so same id
     // and position: the store reuses message objects until an edit) only
     // grew at the end — add the tail instead of rehashing the whole store.
-    let from = 0;
-    if (prev.length > 0 && messages.length >= prev.length) {
-      let i = 0;
-      while (i < prev.length && messages[i] === prev[i]) i++;
-      if (i === prev.length) from = prev.length;
-    }
+    const from = prev.length > 0 && extendsListing(prev, messages) ? prev.length : 0;
     // A dry select puts back the order it found, by reference (select()), so
     // it extends a copy instead of writing into that one.
     const order = from === 0
@@ -6778,7 +6785,62 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return map;
   }
 
-  private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
+  private _summaryIndex: {
+    source: readonly SummaryEntry[];
+    length: number;
+    byId: Map<string, SummaryEntry>;
+    spans?: ListingSpans;
+  } | null = null;
+  private spansIn(listing: readonly StoredMessage[]): ListingSpans {
+    this.summaryIndex();
+    const index = this._summaryIndex!;
+    const kept = index.spans;
+    if (kept && kept.listing !== listing) {
+      let added = extendsListing(kept.listing, listing);
+      for (let i = kept.listing.length; added && i < listing.length; i++) added = !kept.unlisted.has(listing[i]!.id);
+      if (added) kept.listing = listing;
+      else index.spans = undefined;
+    }
+    return (index.spans ??= { listing, at: new Map(), unlisted: new Set() });
+  }
+  private spanInListing(
+    entry: SummaryEntry,
+    spans: ListingSpans,
+    position: () => ReadonlyMap<MessageId, number>,
+  ): readonly [number, number] | null {
+    const known = spans.at.get(entry.id);
+    if (known !== undefined) return known;
+    spans.at.set(entry.id, null);
+    const where = position();
+    const at = (id: MessageId): number | undefined => {
+      const p = where.get(id);
+      if (p === undefined) spans.unlisted.add(id);
+      return p;
+    };
+    const leaves = entry.sourceLevel === 0;
+    let first = leaves ? at(entry.sourceRange.first) : undefined;
+    let last = leaves ? at(entry.sourceRange.last) : undefined;
+    if (first === undefined || last === undefined) {
+      first = Infinity;
+      last = -Infinity;
+      for (const id of entry.sourceIds) {
+        let part: readonly [number, number] | null;
+        if (leaves) {
+          const p = at(id);
+          part = p === undefined ? null : [p, p];
+        } else {
+          const child = this._summaryIndex!.byId.get(id);
+          part = child ? this.spanInListing(child, spans, position) : null;
+        }
+        if (!part) continue;
+        if (part[0] < first) first = part[0];
+        if (part[1] > last) last = part[1];
+      }
+    }
+    const span = Number.isFinite(first) ? [first, last] as const : null;
+    spans.at.set(entry.id, span);
+    return span;
+  }
   private summaryById(id: string): SummaryEntry | undefined {
     return this.summaryIndex().get(id);
   }

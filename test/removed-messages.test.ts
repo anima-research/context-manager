@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, StoreTopologyError } from '../src/index.js';
 import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
 import type { StrategyContext } from '../src/types/strategy.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -561,7 +561,7 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('a message a filter hides while its chunk waits is left out of the summary, and the store opens again', async () => {
+  it('with a predicate whose answer an edit changes, which viewFilter\'s contract forbids, a message hidden while its chunk waits is left out of the next request and of the summary, and the store opens again while it stays hidden', async () => {
     const viewFilter = (m: StoredMessage): boolean =>
       !m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HIDE'));
     const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
@@ -570,6 +570,7 @@ describe('removed messages (#321)', () => {
     let reopened: ContextManager | undefined;
     try {
       await tickUntil(manager, () => requests.length >= 2 && strategy.all().length >= 2);
+      assert.deepStrictEqual(summarized(requests[1]!), ['M4', 'M6', 'M7']);
       assert.deepStrictEqual(named(ids, strategy.all()[1]!.sourceIds), ['M4', 'M6', 'M7']);
       await manager.close();
       const again = new Probe({
@@ -585,21 +586,39 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('a message the view stops showing while its chunk waits is left out the same way', async () => {
-    const viewFilter = (m: StoredMessage): boolean =>
-      !m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HIDE'));
-    const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
-      if (call === 1) manager.editMessage(ids[5]! as never, text(body('HIDE M5')));
-    }, { viewFilter });
-    try {
-      await tickUntil(manager, () => requests.length >= 2);
-      assert.ok(!summarized(requests[1]!).includes('M5'), `the second request summarizes ${summarized(requests[1]!)}`);
-      for (const s of strategy.all()) assert.ok(!s.sourceIds.includes(ids[5]!), `${s.id} names M5 among its sources`);
-    } finally {
-      await manager.close();
-      rmSync(path, { recursive: true, force: true });
-    }
-  });
+  for (const route of ['by an edit', 'by a later open that passes no filter'] as const) {
+    it(`with a predicate whose answer an edit changes, which viewFilter's contract forbids, a message hidden while its chunk waits and shown again ${route} leaves a store that open refuses under topologyPolicy 'reject', and that 'report' opens`, async () => {
+      const viewFilter = (m: StoredMessage): boolean =>
+        !m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HIDE'));
+      const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
+        if (call === 1) manager.editMessage(ids[5]! as never, text(body('HIDE M5')));
+      }, { viewFilter });
+      const config = {
+        compressionModel: 'm', headWindowTokens: 1, recentWindowTokens: 0, l1HoldbackChunks: 0, targetChunkTokens: 60,
+        autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+      };
+      const membrane = { complete: async () => ({ stopReason: 'end_turn', content: text('MEM') }) };
+      const filter = route === 'by an edit' ? { viewFilter } : {};
+      let reported: ContextManager | undefined;
+      try {
+        await tickUntil(manager, () => requests.length >= 2 && strategy.all().length >= 2);
+        assert.deepStrictEqual(named(ids, strategy.all()[1]!.sourceIds), ['M4', 'M6', 'M7'], 'premise: the summary left M5 out');
+        if (route === 'by an edit') manager.editMessage(ids[5]! as never, text(body('M5')));
+        await manager.close();
+        await assert.rejects(
+          ContextManager.open({ path, strategy: new Probe({ ...config, topologyPolicy: 'reject' } as never), membrane: membrane as never, ...filter } as never),
+          StoreTopologyError,
+        );
+        const opened = new Probe({ ...config, topologyPolicy: 'report' } as never);
+        reported = await ContextManager.open({ path, strategy: opened, membrane: membrane as never, ...filter } as never);
+        assert.strictEqual(opened.getTopologyViolations().length, 1, 'the one summary that left M5 out');
+      } finally {
+        await manager.close();
+        await reported?.close();
+        rmSync(path, { recursive: true, force: true });
+      }
+    });
+  }
 
   async function fourSummaries(
     onCall: (call: number, ids: string[], manager: ContextManager) =>
@@ -958,6 +977,185 @@ describe('removed messages (#321)', () => {
       const listed = manager.getSummariesInRange({ level: 2 }).find((s) => s.id === parent.id);
       assert.ok(listed, 'the L2 is listed');
       assert.deepStrictEqual([listed.firstMessageId, listed.lastMessageId], [ids[1], ids[7]]);
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  function watchPositions(strategy: Probe): { built: () => number; looked: Set<string>; restore: () => void } {
+    const probe = strategy as unknown as { positionIndex: (...args: unknown[]) => ReadonlyMap<string, number> };
+    const positionIndex = probe.positionIndex;
+    let built = 0;
+    const looked = new Set<string>();
+    class Watched extends Map<string, number> {
+      override get(id: string): number | undefined {
+        looked.add(id);
+        return super.get(id);
+      }
+    }
+    probe.positionIndex = (...args: unknown[]) => {
+      built++;
+      return new Watched(positionIndex.apply(strategy, args));
+    };
+    return {
+      built: () => {
+        const seen = built;
+        built = 0;
+        return seen;
+      },
+      looked,
+      restore: () => {
+        probe.positionIndex = positionIndex;
+      },
+    };
+  }
+
+  it('the range query works out the span of a summary that lost a message once, over positions it builds once, and not again on each later call over the same messages, also when none of its messages is left', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      for (const i of [0, 8, 9, 10, 11]) manager.removeMessage(ids[i]! as never);
+      const positions = watchPositions(strategy);
+      const first = manager.getSummariesInRange({});
+      assert.strictEqual(positions.built(), 1, 'the first call builds the store\'s positions once for every span it works out');
+      assert.ok(!first.some((s) => s.content === 'MEM[3]'), 'premise: the summary that lost every message is left out');
+      assert.deepStrictEqual(manager.getSummariesInRange({}), first);
+      assert.strictEqual(positions.built(), 0, 'a second call over the same messages and summaries works out no span');
+      positions.restore();
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query doesn\'t work out a span again for a message added after an earlier call', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      manager.removeMessage(ids[0]! as never);
+      const positions = watchPositions(strategy);
+      const first = manager.getSummariesInRange({});
+      assert.ok(positions.built() > 0, 'premise: the first call works out spans over the store\'s positions');
+      manager.addMessage('user', text(body('M16')));
+      assert.deepStrictEqual(manager.getSummariesInRange({}), first);
+      assert.strictEqual(positions.built(), 0, 'the call after the addition works out no span');
+      positions.restore();
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query places an L1 whose first and last messages are both listed by those two, not by each of its messages', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      manager.removeMessage(ids[0]! as never);
+      const positions = watchPositions(strategy);
+      const listed = manager.getSummariesInRange({ level: 2 });
+      positions.restore();
+      assert.deepStrictEqual(listed.map((s) => [s.firstMessageId, s.lastMessageId]), [[ids[1], ids[7]], [ids[8], ids[15]]]);
+      assert.ok([1, 2, 3].every((i) => positions.looked.has(ids[i]!)), 'premise: the L1 that lost M0 is placed by its messages');
+      assert.deepStrictEqual([5, 6].filter((i) => positions.looked.has(ids[i]!)), [], 'the L1 beside it is placed by M4 and M7 alone');
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query places a summary above L1 by its children, whatever its own recorded ends say', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      strategy.mergeAt(2);
+      for (let i = 0; i < 30 && !strategy.all().some((s) => s.level === 3); i++) await manager.tick();
+      assert.ok(strategy.all().some((s) => s.level === 3), 'premise: the two L2s merged');
+      const later = strategy.all().find((s) => s.level === 2 && s.sourceRange.last === ids[15])!;
+      later.sourceRange = { ...later.sourceRange, last: ids[14]! };
+      manager.removeMessage(ids[0]! as never);
+      const top = manager.getSummariesInRange({ level: 3 });
+      assert.deepStrictEqual(top.map((s) => [s.firstMessageId, s.lastMessageId]), [[ids[1], ids[15]]]);
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query works out spans in summaries whose sources name each other', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      const [earlier, later] = strategy.all().filter((s) => s.level === 2);
+      earlier!.sourceIds = [...earlier!.sourceIds, later!.id];
+      later!.sourceIds = [...later!.sourceIds, earlier!.id];
+      manager.removeMessage(ids[0]! as never);
+      const listed = manager.getSummariesInRange({ level: 2 });
+      assert.strictEqual(listed.length, 2);
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query, called again on a listing it has already read, reads only the messages its summaries start and end at', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      manager.removeMessage(ids[0]! as never);
+      const read = new Set<number>();
+      const counted = (listing: StoredMessage[]) => new Proxy(listing, {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) read.add(Number(key));
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      const beyondEnds = (listing: StoredMessage[], listed: ReturnType<typeof list>) => {
+        const ends = new Set(listed.flatMap((s) => [s.firstMessageId, s.lastMessageId]).map((id) => listing.findIndex((m) => m.id === id)));
+        return [...read].filter((i) => !ends.has(i)).map((i) => listing[i]!.id);
+      };
+      const view = (shown: StoredMessage[], listing: StoredMessage[]) => ({ getAll: () => shown, get: (id: string) => listing.find((m) => m.id === id) ?? null });
+      const before = manager.getAllMessages();
+      manager.addMessage('user', text(body('M16')));
+      const after = manager.getAllMessages();
+      assert.strictEqual(after.length, before.length + 1, 'premise: the later listing only grew');
+      const [shownBefore, shownAfter] = [counted(before), counted(after)];
+      const list = (shown: StoredMessage[], listing: StoredMessage[]) => strategy.listSummariesInRange(view(shown, listing) as never, {});
+      list(shownBefore, before);
+      read.clear();
+      assert.deepStrictEqual(beyondEnds(before, list(shownBefore, before)), [], 'the same listing again');
+      list(shownAfter, after);
+      read.clear();
+      assert.deepStrictEqual(beyondEnds(after, list(shownAfter, after)), [], 'the grown listing again');
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query follows a removal and an addition made together after an earlier call', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      manager.removeMessage(ids[0]! as never);
+      const parent = strategy.all().find((s) => s.level === 2 && s.sourceIds.some((id) => strategy.all().find((x) => x.id === id)?.content === 'MEM[1]'))!;
+      const ends = () => {
+        const listed = manager.getSummariesInRange({ level: 2 }).find((s) => s.id === parent.id);
+        return [listed?.firstMessageId, listed?.lastMessageId];
+      };
+      assert.deepStrictEqual(ends(), [ids[1], ids[7]]);
+      manager.removeMessage(ids[7]! as never);
+      manager.addMessage('user', text(body('M16')));
+      assert.deepStrictEqual(ends(), [ids[1], ids[6]]);
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('the range query follows a summary\'s message that a later listing shows again at its end', async () => {
+    const { manager, strategy, ids, path } = await twoParents();
+    try {
+      manager.removeMessage(ids[8]! as never);
+      const all = manager.getAllMessages();
+      assert.strictEqual(all.at(-1)!.id, ids[15], 'premise: M15 is the newest message');
+      const view = (listing: StoredMessage[]) => ({ getAll: () => listing, get: (id: string) => listing.find((m) => m.id === id) ?? null });
+      const last = (listing: StoredMessage[]) => strategy.listSummariesInRange(view(listing) as never, { level: 2 }).at(-1)!.lastMessageId;
+      assert.strictEqual(last(all.slice(0, -1)), ids[14]);
+      assert.strictEqual(last(all), ids[15]);
     } finally {
       await manager.close();
       rmSync(path, { recursive: true, force: true });
