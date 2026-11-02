@@ -51,6 +51,20 @@ test('kv-unified receipts clear single flight on failure without changing baseli
   assert.equal(chain.inFlightSubmissionId, 's2');
 });
 
+test('kv-unified receipts keep the last accepted cache reference through a failed submission', () => {
+  const chain = new KvUnifiedReceiptChain();
+  const cache = {
+    immutablePrefixHash: 'tools',
+    layout: { units: [], totalTokens: 0 },
+    markers: [],
+  };
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  chain.accept('s1', 100, cache);
+  chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
+  chain.fail('s2');
+  assert.deepEqual(chain.cache, cache, 'a failed submission leaves the accepted cache reference');
+});
+
 test('kv-unified keepalive leaves continuity head unchanged but refreshes cache state', () => {
   const chain = new KvUnifiedReceiptChain();
   chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'same', leaves: leaves('raw:a') });
