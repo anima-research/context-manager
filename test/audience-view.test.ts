@@ -287,7 +287,7 @@ describe('an edit that narrows a block\'s audience', () => {
   };
   const toBob = (id: string, text: string): [string, ContentBlock[]] => [id, [forReaders(`${text} ${words}`, 'bob')]];
   const storedToBob = (manager: ContextManager, id: string): [string, ContentBlock[]] =>
-    [id, contentOf(manager, id).map((block) => ({ ...block, audience: ['bob'] } as ContentBlock))];
+    [id, contentOf(manager, id).map((block) => Object.assign({}, block, { audience: ['bob'] }))];
   const ownRefusal = /refused: the edit of message \S+ may hide a block from "ann", the reader this manager compiles for, and compression may have read the message: a chunk holding it or a later message has closed, or a compression request has read it/;
 
   it('is refused away from the reader once compression has read the message, and the message stays as it was', async () => {
