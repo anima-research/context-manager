@@ -504,6 +504,21 @@ describe('ContextManager.derive', () => {
     assert.equal(child.getAllMessages().length, HISTORY);
   });
 
+  it('keeps compression holds apart: the parent\'s holds at the derive stay its own, and a hold placed on either side after it is that side\'s alone', { skip }, async () => {
+    const { parent, ids } = await foldedParent();
+    parent.holdCompression([ids[HISTORY - 3]!]);
+    assert.deepEqual([...parent.getCompressionHolds()], [ids[HISTORY - 3]], 'premise: the parent holds a message when it derives');
+    const child = await parent.derive({ branch: 'dendrite/holds', strategy: folding() });
+    managers.push(child);
+    assert.deepEqual([...child.getCompressionHolds()], [], 'the child starts with none of the parent\'s holds');
+
+    parent.holdCompression([ids[HISTORY - 1]!]);
+    child.holdCompression([ids[HISTORY - 2]!]);
+
+    assert.deepEqual([...parent.getCompressionHolds()], [ids[HISTORY - 3], ids[HISTORY - 1]]);
+    assert.deepEqual([...child.getCompressionHolds()], [ids[HISTORY - 2]]);
+  });
+
   it('leaves the parent\'s merge queue and refusal ledger behind, by the strategy\'s manifest', { skip }, async () => {
     const { parent, strategy } = await foldedParent();
     const root = parent.getStore();
