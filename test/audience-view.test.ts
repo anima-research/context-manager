@@ -455,7 +455,7 @@ describe('an edit that narrows a block\'s audience', () => {
     await withReaders(async ({ ann, bob }) => {
       for (const marker of [{ cache_control: { type: 'ephemeral' } }, { cacheControl: { type: 'ephemeral' } }]) {
         const secret = ann.addMessage('user', [t('SECRET')]);
-        assert.throws(() => ann.editMessage(secret, [{ type: 'text', text: 'SECRET', audience: ['ann'], ...marker } as ContentBlock]), /may hide a block from a reader other than "ann"/, JSON.stringify(marker));
+        assert.throws(() => ann.editMessage(secret, [Object.assign(forReaders('SECRET', 'ann'), marker)]), /may hide a block from a reader other than "ann"/, JSON.stringify(marker));
         assert.deepEqual(contentOf(ann, secret), [t('SECRET')]);
       }
       assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/);
