@@ -6957,6 +6957,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * audit runs again over the rebuilt chunks until it names nothing; what
    * it still names after that is the gate's (assertStoreTopology).
    *
+   * An uncompressed chunk record whose rows the window holds apart is
+   * trimmed the same way, to its longest run, and its other rows released.
+   * An unfold writes the summaries, the chunk records and the merge queue
+   * one after another (unfold), so a process that stopped after the
+   * summaries' write left the record of a dropped L1 naming it; the load
+   * makes such a record compressible again over every row it held
+   * (releaseUnsummarizedRecords), and nothing else stops it being
+   * compressed across the window into an L1 the next open demotes again.
+   *
    * In legacy mode the window is the record and its rows never move, so a
    * non-contiguous summary there is a store the gate refuses, as it always
    * has; under `'report'` the gate records it for inspection, and an
@@ -6967,28 +6976,49 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private demoteSplitSummaries(messages: readonly StoredMessage[], ctx: StrategyContext): void {
     if (ctx.window?.mode() !== 'presented' || this.config.auditOnly || this.resolvedTopologyPolicy() !== 'reject') return;
-    // Each pass drops a summary at least, so the summaries bound the passes.
-    const passes = this.summaries.length;
+    // Each pass drops a summary at least, or trims every uncompressed record
+    // the window holds apart (a trim releases rows, which splits no other
+    // record and parts no summary's leaves), so the summaries bound the
+    // passes, with one more for the records.
+    const passes = this.summaries.length + 1;
     for (let pass = 0; pass < passes; pass++) {
       const violations = this.auditStoreTopology(messages);
-      if (violations.length === 0) return;
       const position = this.ownershipPositionIndex();
+      const split = new Set(
+        this.chunkRecords.filter((record) => !record.compressed && windowRuns(record.sourceIds, position).length > 1).map((record) => record.id),
+      );
+      if (violations.length === 0 && split.size === 0) return;
       const l1s = new Set(violations.filter((v) => v.level === 1).map((v) => v.id));
       const released: MessageId[] = [];
+      const trimmed: string[] = [];
+      const releasedUncompressed: MessageId[] = [];
       const unfolded = this.unfold(new Set(violations.map((v) => v.id)), (record) => {
-        if (!record.summaryId || !l1s.has(record.summaryId)) return undefined;
+        const demoted = record.summaryId !== undefined && l1s.has(record.summaryId);
+        if (!demoted && !split.has(record.id)) return undefined;
         const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
         const kept = new Set(longest);
-        for (const id of record.sourceIds) if (!kept.has(id)) released.push(id);
+        const out = demoted ? released : releasedUncompressed;
+        for (const id of record.sourceIds) if (!kept.has(id)) out.push(id);
+        if (!demoted) trimmed.push(record.id);
         return longest;
       });
-      this.diag.warn(
-        `[autobiographical] the window holds the leaves of ${violations.length} summar${violations.length === 1 ? 'y' : 'ies'} apart ` +
-          `(a row that left the window and was presented again before this strategy heard it go): dropped ` +
-          `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
-          `compressed again over their longest run in the window [${unfolded.refolded.join(', ')}], releasing ` +
-          `[${released.join(', ')}] to be chunked where the window holds them; removed, keeping none [${unfolded.emptied.join(', ')}]`,
-      );
+      if (violations.length > 0) {
+        const refolded = unfolded.refolded.filter((id) => !split.has(id));
+        this.diag.warn(
+          `[autobiographical] the window holds the leaves of ${violations.length} summar${violations.length === 1 ? 'y' : 'ies'} apart ` +
+            `(a row that left the window and was presented again before this strategy heard it go): dropped ` +
+            `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
+            `compressed again over their longest run in the window [${refolded.join(', ')}], releasing ` +
+            `[${released.join(', ')}] to be chunked where the window holds them; removed, keeping none [${unfolded.emptied.join(', ')}]`,
+        );
+      }
+      if (trimmed.length > 0) {
+        this.diag.warn(
+          `[autobiographical] the window holds the rows of ${trimmed.length} uncompressed chunk record(s) apart (a drop of ` +
+            `their L1 stopped between its writes of the summaries and of the chunk records): trimmed [${trimmed.join(', ')}] ` +
+            `to their longest run in the window, releasing [${releasedUncompressed.join(', ')}] to be chunked where the window holds them`,
+        );
+      }
       this.rebuildChunks(ctx.messageStore);
     }
   }
@@ -7746,9 +7776,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * merges again, and a queued merge of a dropped summary goes. A copy is
    * changed, as the open changes one, never a summary in place.
    *
-   * The summaries are written first, then the records, then the queue:
-   * should the records' write not follow, the open makes a record whose L1
-   * it lacks compressible again. The chunks aren't rebuilt here.
+   * The summaries are written first, then the records, then the queue,
+   * each a write of its own: the store writes no two states at once.
+   * Should the records' write not follow, the open makes a record whose L1
+   * it lacks compressible again (releaseUnsummarizedRecords) and, once a
+   * host presents, trims one whose rows the window holds apart to its
+   * longest run (demoteSplitSummaries); should the queue's not follow, the
+   * load drops a queued merge naming a summary it doesn't keep. The other
+   * order is no safer: a record written without its L1 while the L1 stays
+   * leaves an L1 no record names, which the audit takes for a superseded
+   * generation (liveL1Ids) and never names. The chunks aren't rebuilt here.
    */
   private unfold(
     seeds: ReadonlySet<string>,
