@@ -36,9 +36,12 @@
     shard's row out with them where it landed, whether or not the store
     could be read to tell that it did.
   - The add may have gone unheard: a failure in the manager's own listener
-    ends the event before a host's `onMessage` listener hears it. Once a host
-    presents rows, the rows are out of the window until it presents them
-    (`presentRows(landed)`), and a `holdCompression` hold the add placed on
-    them stays until `releaseCompression(landed)`. `resetHeadWindow` rejects
-    with either error when its transition's add fails so, without resetting
-    the head window.
+    ends the event before a host's `onMessage` listener hears it. A sharded
+    write's shards before the failing one were heard as each was stored, so
+    a listener that presents rows as they are added may have presented them.
+    Once a host presents rows, present only the rows of `landed` that
+    `windowStatusOf` reads `'out'`: `presentRows` refuses a row already in
+    the window. A `holdCompression` hold the add placed on them stays until
+    `releaseCompression(landed)`. `resetHeadWindow` rejects with either
+    error when its transition's add fails so, without resetting the head
+    window.
