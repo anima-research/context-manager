@@ -715,7 +715,9 @@ describe('removal and the window', () => {
     }
     assert.deepEqual([cm.getMessage(a), cm.getMessage(b)], [null, null], 'the removal stands');
     assert.equal(logged.length, 1, logged.join('\n'));
-    assert.ok(logged[0]!.includes(`removing messages ${a} to ${b}`) && logged[0]!.includes('zz-index-read-failed'), logged[0]);
+    // The rows are read from the slot, which reads; the index's failure is
+    // the tombstones' (retract-removed.test.ts has what the strategy is told).
+    assert.ok(logged[0]!.includes('taking 2 removed messages out of the window failed') && logged[0]!.includes('zz-index-read-failed'), logged[0]);
     // Their ordinals stay issued until a host takes them out; the window
     // lists only what the record holds.
     assert.notEqual(cm.ordinalOf(a), undefined);

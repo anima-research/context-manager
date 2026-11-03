@@ -593,3 +593,75 @@ describe('a folding reader of a removal through another manager unfolds the remo
     b.close();
   });
 });
+
+/**
+ * Every read of `cm`'s window index throws while `fn` runs, as a store
+ * that can't be read would; the store's other states read as before.
+ * Returns console.error's and console.warn's lines.
+ */
+async function whileIndexUnreadable(cm: ContextManager, fn: () => void): Promise<string[]> {
+  const store = cm.getStore() as unknown as Record<string, ((id: string) => unknown) | undefined>;
+  const saved: Record<string, (id: string) => unknown> = {};
+  for (const name of ['stateHeadOffset', 'getStateLen']) {
+    const read = store[name];
+    if (typeof read !== 'function') continue;
+    saved[name] = read;
+    store[name] = function (this: unknown, id: string) {
+      if (id === INDEX) throw new Error('zz-index-read-failed');
+      return read.call(this, id);
+    };
+  }
+  try {
+    return await linesDuring(fn);
+  } finally {
+    for (const [name, read] of Object.entries(saved)) store[name] = read;
+  }
+}
+
+describe("a removal through the manager where the window can't be read", () => {
+  it('removeMessage tells the strategy all the same, with the row as it was, removed, and retractAbsentRows later takes its ordinal out', async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const lines = await whileIndexUnreadable(cm, () => cm.removeMessage(a));
+    assert.equal(cm.getMessage(a), null, 'the removal stands');
+    assert.ok(lines.some((line) => line.includes(`taking removed message ${a} out of the window failed`)), lines.join('\n'));
+    assert.deepEqual(strategy.retracted, [{ rows: [a], info: { undone: false, removed: true, ids: [a] } }]);
+    assert.notEqual(cm.ordinalOf(a), undefined, "setup: the tombstone wasn't written");
+    assert.deepEqual(cm.retractAbsentRows(), [a]);
+    assert.equal(cm.ordinalOf(a), undefined);
+    assert.notEqual(cm.ordinalOf(b), undefined);
+    cm.close();
+  });
+
+  it('removeMessages reads the rows of its range all the same, and tells the strategy of each, removed', async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    const lines = await whileIndexUnreadable(cm, () => cm.removeMessages(a, b));
+    assert.deepEqual(ids(cm.getAllMessages()), [c], 'the removal stands');
+    assert.ok(!lines.some((line) => line.includes('before removing')), `the rows were read: ${lines.join('\n')}`);
+    assert.ok(lines.some((line) => line.includes('taking 2 removed messages out of the window failed')), lines.join('\n'));
+    assert.deepEqual(strategy.retracted, [{ rows: [a, b], info: { undone: false, removed: true, ids: [a, b] } }]);
+    assert.deepEqual(cm.retractAbsentRows(), [a, b]);
+    assert.deepEqual(ordinals(cm, [a, b]), [undefined, undefined]);
+    assert.notEqual(cm.ordinalOf(c), undefined);
+    cm.close();
+  });
+
+  it('in legacy mode, where the window is readable, a removal still tells nothing', async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.removeMessage(c);
+    cm.removeMessages(a, b);
+    assert.deepEqual(cm.getAllMessages(), []);
+    assert.deepEqual(strategy.retracted, []);
+    assert.equal(cm.windowMode(), 'legacy');
+    cm.close();
+  });
+});
