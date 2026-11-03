@@ -411,10 +411,12 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
         assert.equal(receipts(o.strategy).cache, null, 'and no later call of that compile sets one');
         await o.compile();
         o.strategy.reportKvUnifiedFailed(o.begin());
-        o.accept(o.begin(), 1);
+        const first = o.begin();
+        o.accept(first, 1);
         const set = receipts(o.strategy).cache;
         const wire = receipts(o.strategy).wireReceipt;
         assert.ok(set, "after a failed own request, a matching first accepted round sets the reference");
+        assert.equal(wire?.requestHash, `wire-${first}`, 'and records its wire receipt');
         o.accept(o.begin(), 2);
         assert.equal(receipts(o.strategy).cache, set, 'and a later call leaves it');
         assert.deepEqual(receipts(o.strategy).wireReceipt, wire, "and the first accepted round's wire receipt");
@@ -519,9 +521,13 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
       await withMismatchLines(async (logged) => {
         await o.compile();
         const own = o.begin();
+        const draft = (o.strategy as unknown as { kvUnifiedDraft: { layout: unknown } }).kvUnifiedDraft;
+        o.manager.addMessage('a', [{ type: 'text', text: plain(1) }]);
         await o.compile();
+        const next = (o.strategy as unknown as { kvUnifiedDraft: { layout: unknown } }).kvUnifiedDraft;
+        assert.notDeepEqual(next.layout, draft.layout, 'premise: the next compile lays the turn out differently');
         o.accept(own, 1);
-        assert.ok(receipts(o.strategy).cache, "the call in flight sets its own compile's reference");
+        assert.deepEqual(receipts(o.strategy).cache?.layout, draft.layout, "the call in flight sets its own compile's reference");
         o.accept(o.begin(), 3);
         assert.equal(receipts(o.strategy).cache, null, "the next compile's own request takes its own count check");
         assert.equal(logged.length, 1, 'and logs its mismatch');
