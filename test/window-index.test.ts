@@ -318,11 +318,13 @@ describe('writing the window down', () => {
     cm.retractRows([]);
     cm.retractRows([], { undone: true });
     assert.equal(cm.getStore().getStateJson(INDEX), null, 'nothing is written');
+    assert.equal(indexRegistered(cm, 'zz-agent'), false, 'and no window state is registered');
     assert.equal(cm.windowMode(), 'legacy');
     const c = cm.addMessage('alice', [text('c')]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'a later write still reaches the window at once');
     assert.throws(() => cm.retractRows(['zz-no-such-row']), /no stored message has id zz-no-such-row, and the window holds none/);
     assert.equal(cm.getStore().getStateJson(INDEX), null);
+    assert.equal(indexRegistered(cm, 'zz-agent'), false);
 
     // Any other retract switches the mode: the window is written down as
     // it stands, then the rows named leave it.
@@ -463,6 +465,7 @@ describe('the window in presented mode', () => {
     // In legacy mode too, an unknown id is refused before anything is written.
     assert.throws(() => cm.presentRows(['zz-no-such-row']), /no stored message has id zz-no-such-row/);
     assert.equal(cm.getStore().getStateJson(windowIndexStateId('zz-agent')), null);
+    assert.equal(indexRegistered(cm, 'zz-agent'), false, 'the refusal registers no window state');
     cm.presentRows([]);
     const doc = cm.addMessage('alice', [text('part 0 '), text('part 1 ')]);
     const doc1 = cm.getAllMessages().find((m) => m.bodyGroupId === 'zz-doc' && m.shardIndex === 1)!.id;

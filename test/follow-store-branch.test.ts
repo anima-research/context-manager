@@ -16,9 +16,13 @@
  *   every manager on the store can make the call after one move, in turn or
  *   at once, and all of them compile. It is the one call for this: the
  *   manager has no reinitializeOnStoreBranch().
- * - It writes nothing, and the window index follows the store on its own:
- *   on a branch made before the write-down the manager reads 'legacy', and
- *   presentRows([]) writes that branch down.
+ * - It adds no message and writes no window: the window index follows the
+ *   store on its own, so on a branch made before the write-down the
+ *   manager reads 'legacy', and presentRows([]) writes that branch down.
+ *   The strategy's initialize may write its own load-time repairs (the
+ *   autobiographical strategy lets go of what covers a row out of the
+ *   window), so the store's sequence can advance; where it has none to
+ *   make, as here, nothing is written.
  * - Its recovery contract is setStrategy()'s: a superseded call rejects
  *   with InitializationSupersededError naming no branch, a failed one keeps
  *   the manager fenced until a call succeeds, and a store moved again while

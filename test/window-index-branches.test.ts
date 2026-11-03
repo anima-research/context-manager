@@ -7,12 +7,18 @@
  *   with the parent's window and its arrivals, from the parent's reading of
  *   it; from an earlier checkpoint it starts with the window as it stood
  *   then. reopenDerived() finds it on the branch.
- *   derive() cuts at the sequence it is given, so a cut at a presented
- *   row's own sequence leaves that row out of the child's window.
+ *   derive() cuts at the sequence it is given, so a cut at the own
+ *   sequence of a row stored after the write-down leaves that row out of
+ *   the child's window. A cut at the own sequence of a row stored before
+ *   the write-down comes before the write-down: the child is in legacy
+ *   mode, its window the record, which holds the row.
  * - branchAt() cuts at the write that presented a row, the last of its
  *   body's shards, once a host presents, so the new branch's window holds
- *   the row; it finds a row of an auxiliary slot too. A row the write-down
- *   presented is cut at its own sequence, as in legacy mode.
+ *   the row; it finds a row of an auxiliary slot too. A row the window
+ *   doesn't hold is cut at its own sequence, as in legacy mode. A row the
+ *   write-down presented is cut at its own sequence too, and the new
+ *   branch is in legacy mode; a body the write-down presented is cut at its
+ *   last shard, where legacy mode cuts at the shard named.
  * - A row removed from the manager's slot leaves the window as a
  *   tombstone, so no other row's ordinal moves, also when the context log
  *   throws on the removal. A window that can't be read before a range is
@@ -325,7 +331,7 @@ describe('derive and the window', () => {
 });
 
 describe('fork and the window', () => {
-  it('a row removed on a fork leaves the window of the branch it was forked from', async () => {
+  it('a row removed on a fork leaves only the fork\'s window: the branch it was forked from keeps it', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]);
     const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
@@ -733,7 +739,9 @@ describe('removal and the window', () => {
     const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
     cm.removeMessage(a!);
     cm.removeMessages(b!, c!);
+    assert.deepEqual(cm.getAllMessages(), [], 'the rows are removed');
     assert.equal(cm.getStore().getStateJson(INDEX), null);
+    assert.ok(!cm.getStore().listStates().some((state) => state.id === INDEX), 'and no window state is registered');
     assert.equal(cm.windowMode(), 'legacy');
     cm.close();
   });
