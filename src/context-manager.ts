@@ -1074,7 +1074,18 @@ export class ContextManager {
             }
           }
           if (wrote.length === 0) throw err;
+          // A host's listener of the add may have presented a shard, so the
+          // removal takes the window's shards out with it, and the strategy
+          // is told, as removeMessages tells it: the rows are read first,
+          // for the store's event (handleMessageStoreEvent).
+          const removingBefore = this.removing;
           try {
+            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, () =>
+              wrote.flatMap((id) => {
+                const row = this.messageStore.get(id);
+                return row ? [row] : [];
+              }),
+            );
             this.messageStore.removeBodyGroup(wrote[0]!);
           } catch (removal) {
             this.diag.error(
@@ -1090,6 +1101,8 @@ export class ContextManager {
             if (stayed.length > 0) {
               throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
             }
+          } finally {
+            this.removing = removingBefore;
           }
           throw err;
         }
@@ -3792,11 +3805,13 @@ export class ContextManager {
         //
         // The window's rows of the span were read before it went
         // (removeMessages). The only other range removed here is what a
-        // sharded addMessage that failed partway wrote, which no host has
-        // presented yet. Holds can be probed by asking the slot, since every
-        // held row is this slot's; the window can't, since it also holds
-        // rows of the auxiliary slots, and a row of a slot this manager no
-        // longer merges would read as removed and leave the window for good.
+        // sharded addMessage that failed partway wrote, whose rows it reads
+        // first too, since a host's listener of the add may have presented
+        // a shard (appendMessage). Holds can be probed by asking the slot,
+        // since every held row is this slot's; the window can't, since it
+        // also holds rows of the auxiliary slots, and a row of a slot this
+        // manager no longer merges would read as removed and leave the
+        // window for good.
         if (this.removing) this.retractOnRemoval(this.removing.map((m) => m.id), this.removing);
         break;
     }

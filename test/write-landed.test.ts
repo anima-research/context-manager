@@ -23,7 +23,7 @@ import { rmSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, MalformedContentError, PassthroughStrategy, WriteLandedError, WriteOutcomeUnknownError } from '../src/index.js';
-import type { MessageStore, StoredMessage } from '../src/index.js';
+import type { MessageId, MessageStore, StoredMessage, StrategyContext } from '../src/index.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const textOf = (m: StoredMessage): string => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
@@ -43,6 +43,18 @@ after(() => {
 class Sharding extends PassthroughStrategy {
   chunkIngressMessage(_participant: string, content: ContentBlock[]) {
     return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+  }
+}
+
+/** Sharding, keeping the ids each onPresented and onRetracted call was given. */
+class ShardingHears extends Sharding {
+  presented: MessageId[][] = [];
+  retracted: Array<{ ids: readonly MessageId[]; rows: MessageId[]; removed: boolean }> = [];
+  async onPresented(rows: readonly StoredMessage[], _ctx: StrategyContext): Promise<void> {
+    this.presented.push(rows.map((m) => m.id));
+  }
+  async onRetracted(rows: readonly StoredMessage[], _ctx: StrategyContext, info: { removed: boolean; ids: readonly MessageId[] }): Promise<void> {
+    this.retracted.push({ ids: info.ids, rows: rows.map((m) => m.id), removed: info.removed });
   }
 }
 
@@ -244,6 +256,32 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.equal(err.cause, diskFull);
     cm.close();
     real.close();
+  });
+
+  it("a sharded write that fails partway takes a shard a host's listener presented out of the window as it removes it, and the strategy hears it leave", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.presentRows([]);
+    cm.presentRows([cm.addMessage('bob', [text('before')])]);
+    // The host presents each row as it is stored.
+    const shown: MessageId[] = [];
+    cm.onMessage((event) => {
+      if (event.type !== 'add') return;
+      shown.push(event.message.id);
+      cm.presentRows([event.message.id]);
+    });
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+    assert.equal(err, failure, 'unwrapped: the store holds none of the message');
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before']);
+    assert.equal(shown.length, 1, "setup: the listener presented the first shard, and the second's event ended at the manager's own listener");
+    assert.deepEqual(strategy.presented.at(-1), shown, 'setup: the strategy heard the first shard enter');
+    assert.equal(cm.ordinalOf(shown[0]!), undefined, 'the shard left the window as it was removed');
+    assert.deepEqual(strategy.retracted, [{ ids: shown, rows: shown, removed: true }], 'the strategy heard it leave, with the row as it was, removed');
+    assert.deepEqual(cm.retractAbsentRows(), [], 'nothing is left for a repair to take out');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
   });
 
   it("a removal that took the shards out and then failed leaves none, so the write's own error is thrown", async () => {
