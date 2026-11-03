@@ -2096,9 +2096,15 @@ export class ContextManager {
    * slot and its auxiliary slots: arrived and not presented. Leaves out an
    * undone turn's rows (retractRows with `undone`). Empty in legacy mode.
    *
-   * A body partly in the window (see presentRows) lists the shards it
-   * lacks, undone or not, and presentRows takes the first of them as
-   * naming the rest of the body, so presenting these ids completes it.
+   * A body whose first shards are in the window and the rest out (see
+   * presentRows) lists the shards it lacks, undone or not, and presentRows
+   * takes the first of them as naming the rest of the body, so presenting
+   * these ids completes it. A shard with no earlier shard of its body in
+   * the window is listed as any row is, and left out when it is undone,
+   * whatever the shards after it: the first shard of a body whose later
+   * shards are in the window is listed only when its tombstone wasn't
+   * `undone`, and presenting it puts the body back whole (see presentRows,
+   * windowStatusOf).
    *
    * With `afterSequence`, only the rows stored after that sequence: the
    * rows the whole listing gives whose sequence is greater, found by a
