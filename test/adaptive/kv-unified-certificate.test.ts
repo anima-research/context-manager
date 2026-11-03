@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { certifyCarriedLayout } from '../../src/adaptive/kv-unified-certificate.js';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { ExactKvUnifiedPolicySolver, type AcceptedPresentationReference } from '../../src/adaptive/kv-unified-policy.js';
-import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
+import { ParetoKvUnifiedPolicySolver, type ParetoPolicySolveResult, type ParetoSolveOptions } from '../../src/adaptive/kv-unified-pareto.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
-import { MockChronicle } from './harness.js';
+import { MockChronicle, seededPolicyFixture } from './harness.js';
+import type { KvUnifiedReuse } from '../../src/adaptive/kv-unified-reuse.js';
 
 function fixture(gaps = false): PickerInputs {
   const chronicle = new MockChronicle({ recallPairTokens: 55 });
@@ -186,4 +187,111 @@ test('protected internal and externally accounted holes have exact bounds', () =
   assert.ok(oracle.feasible);
   assert.deepEqual(result.selected.frontier, oracle.selected.frontier);
   assert.ok(result.certificate.lowerBound <= Math.min(...oracle.candidates.map((c) => c.fidelityLoss + c.budgetPenalty)));
+});
+
+function nextCompile(inputs: PickerInputs): PickerInputs {
+  return {
+    chunks: inputs.chunks.map((chunk) => ({ ...chunk })),
+    summaries: new Map([...inputs.summaries].map(([id, entry]) => [id, { ...entry }])),
+    recallPairTokens: new Map(inputs.recallPairTokens ?? []),
+    headTokens: inputs.headTokens, tailTokens: inputs.tailTokens,
+    headChunkIds: new Set(inputs.headChunkIds), tailChunkIds: new Set(inputs.tailChunkIds),
+  };
+}
+
+function acceptedAt(forest: CanonicalSummaryForest, inputs: PickerInputs, frontier: ReadonlyMap<string, number>) {
+  return new Map(inputs.chunks.map((chunk) => {
+    const level = frontier.get(chunk.id) ?? 0;
+    const id = forest.leaf(chunk.id)!.summaryIds.find((sid) => forest.summary(sid)!.level === level);
+    return [chunk.id, { level, repHash: level === 0 ? `raw:${chunk.id}` : `summary:${id}`, lastChangedSeq: 1 }];
+  }));
+}
+
+function seededCertificateFixture(seed: number) {
+  const { inputs, forest, options, prior, random } = seededPolicyFixture(seed);
+  return {
+    inputs, forest, random, cuts: forest.enumerateExactCuts().candidates,
+    options: { maxTokens: prior.renderedTokens + 100, presentation: { currentSeq: 3, leaves: acceptedAt(forest, inputs, prior.frontier) },
+      adoptEpsilon: 2000, policy: options.policy },
+  };
+}
+
+const FOREST_OPTIONS = { preserveGapBearingSummaries: true };
+
+function warmAndCold(first: ReturnType<typeof seededCertificateFixture>, next: PickerInputs, options: ParetoSolveOptions) {
+  const reuse: KvUnifiedReuse = {};
+  new ParetoKvUnifiedPolicySolver(first.inputs, first.forest).solve({ ...first.options, hysteresisCertificate: true, reuse });
+  assert.ok(reuse.certificate, 'the first compile kept its graph');
+  const kept = reuse.certificate;
+  const keptLeaves = kept.leafObjects;
+  const forest = CanonicalSummaryForest.derive(first.forest, next, FOREST_OPTIONS);
+  assert.ok(forest, 'the next compile derives from the first');
+  assert.equal(forest.ownership, first.forest.ownership);
+  const warm = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, hysteresisCertificate: true, reuse });
+  const reused = reuse.certificate === kept && kept.leafObjects !== keptLeaves;
+  const cold = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, hysteresisCertificate: true, reuse: {} });
+  const full = new ParetoKvUnifiedPolicySolver(next, forest).solve({ ...options, reuse: {} });
+  return { warm, cold, full, reused };
+}
+
+function assertSameSelection(actual: ParetoPolicySolveResult, expected: ParetoPolicySolveResult, label: string) {
+  assert.ok(actual.feasible && expected.feasible, label);
+  assert.deepEqual(actual.selected.frontier, expected.selected.frontier, label);
+  assert.equal(actual.selected.score, expected.selected.score, label);
+}
+
+function assertCertifiedAlike(warm: ParetoPolicySolveResult, cold: ParetoPolicySolveResult, label: string) {
+  const proof = (result: ParetoPolicySolveResult) => result.feasible && result.certificate
+    ? [result.certificate.lowerBound, result.certificate.carriedScore, result.certificate.maxImprovement] : null;
+  assert.deepEqual(proof(warm), proof(cold), label);
+}
+
+test('with the certificate on, a wall lowered below every cut leaves the solve infeasible, as the full solver finds it', () => {
+  const first = seededCertificateFixture(1);
+  const next = nextCompile(first.inputs);
+  const options = { ...first.options, maxTokens: Math.max(1, Math.floor(first.options.maxTokens * 0.6)) };
+  const { warm, full } = warmAndCold(first, next, options);
+  assert.ok(!full.feasible, 'no cut fits the lowered wall');
+  assert.equal(warm.feasible, false);
+});
+
+test('after a summary-owned leaf changes its pin, the kept graph is not reused, the certificate declines, and the solve selects as with a fresh graph', () => {
+  const first = seededCertificateFixture(25);
+  const next = nextCompile(first.inputs);
+  const owned = next.chunks.find((chunk) => first.forest.leaf(chunk.id)!.summaryIds.length > 0)!;
+  owned.pinned = !owned.pinned;
+  const { warm, cold, full, reused } = warmAndCold(first, next, first.options);
+  assert.ok(!reused, 'the kept graph is not reused once an owned leaf changes');
+  assert.ok(!(cold.feasible && cold.certificate), 'a fresh graph declines after the pin change');
+  assertCertifiedAlike(warm, cold, 'certified warm and cold alike');
+  assertSameSelection(warm, cold, 'warm against cold');
+  assertSameSelection(warm, full, 'warm against full');
+});
+
+test("a reused graph certifies or declines as a fresh one does for each complete cut, carried with every leaf's representation current", () => {
+  const first = seededCertificateFixture(1);
+  const solves = first.cuts.map((cut) => {
+    const next = nextCompile(first.inputs);
+    const options = { ...first.options, presentation: { ...first.options.presentation, leaves: acceptedAt(first.forest, next, cut.frontier) },
+      maxTokens: Math.max(first.options.maxTokens, cut.renderedTokens + 50) };
+    return { cut, ...warmAndCold(first, next, options) };
+  });
+  assert.ok(solves.some(({ cold }) => cold.feasible && cold.certificate), 'some carried layout certifies');
+  for (const { cut, warm, cold, reused } of solves) {
+    assert.ok(reused, `the warm solve reused the kept graph from ${[...cut.frontier]}`);
+    assertCertifiedAlike(warm, cold, `certified warm and cold alike from ${[...cut.frontier]}`);
+    assertSameSelection(warm, cold, 'warm against cold');
+  }
+});
+
+test('a reused graph certifies as a fresh one does after leaf salience changes', () => {
+  const first = seededCertificateFixture(1);
+  const next = nextCompile(first.inputs);
+  for (const chunk of next.chunks) chunk.salience = first.random();
+  const { warm, cold, full, reused } = warmAndCold(first, next, first.options);
+  assert.ok(reused, 'the warm solve reused the kept graph');
+  assert.ok(cold.feasible && cold.certificate, 'a fresh graph certifies');
+  assertCertifiedAlike(warm, cold, 'certified warm and cold alike');
+  assertSameSelection(warm, cold, 'warm against cold');
+  assertSameSelection(warm, full, 'warm against full');
 });

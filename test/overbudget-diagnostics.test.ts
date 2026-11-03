@@ -1526,7 +1526,7 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: countingMembrane(calls) });
   });
 
-  it('names nothing for a merge queued behind a chunk that needs a model call while the compression quarantine can\'t be read, since tick takes queued chunks before merges and throws at that one', async () => {
+  it('names nothing for a merge queued behind a chunk that needs a model call while the compression quarantine can\'t be read, since without adaptive resolution tick takes queued chunks before merges and throws at that one', async () => {
     const strategy = modelCallChunks({ hierarchical: true, positionedRecallPairs: true });
     const calls = { n: 0 };
     await withManager(strategy, async (manager) => {

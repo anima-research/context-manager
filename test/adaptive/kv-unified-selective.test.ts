@@ -135,3 +135,27 @@ test('exact scoring takes more candidates than a call takes as spread arguments'
   assert.equal(result.continuityFloor, 1);
   assert.equal(result.cacheFloor, 3);
 });
+
+test('the continuity floor is the least exact loss, though the candidate with the lowest upper bound has more', () => {
+  const w = row(0, 1, 10);
+  const x = row(1, 1, 9);
+  const candidates = [bounds(w, new Set(), 0), bounds(x, new Set(), 2)];
+  const options: ExactPolicySolveOptions = { maxTokens: 200, policy: { continuityScale: 1, continuityLambda: 1 } };
+  const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates([w, x], options, stats, false);
+  assert.equal(reference.continuityFloor, 9, 'premise: the exact floor');
+  const result = scoreBoundedCandidates(candidates, options, stats, false, ['x']);
+  assert.equal(result.continuityFloor, 9);
+  assert.deepEqual(result.selected, reference.selected);
+});
+
+test('the carried presentation is the best matching candidate, not the first one scored', () => {
+  const b = row(0, 10);
+  const m1 = row(1, 12, 0, 0, true);
+  const m2 = row(2, 11, 0, 0, true);
+  const options: ExactPolicySolveOptions = { maxTokens: 200, adoptEpsilon: 100, presentation: { currentSeq: 1, leaves: new Map() } };
+  const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates([b, m1, m2], options, stats, false);
+  assert.equal(reference.selected.frontier.get('x'), 2, 'premise: the exact solver carries M2');
+  const result = scoreBoundedCandidates([b, m1, m2].map((value) => bounds(value, new Set(), 5)), options, stats, false, ['x']);
+  assert.equal(result.selected.frontier.get('x'), 2);
+  assert.deepEqual(result.selected, reference.selected);
+});
