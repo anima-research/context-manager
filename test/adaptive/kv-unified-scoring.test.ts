@@ -7,10 +7,11 @@ import {
   type ExactPolicyCandidate,
 } from '../../src/adaptive/kv-unified-policy.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
+import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
-import { MockChronicle } from './harness.js';
+import { MockChronicle, seededPolicyFixture } from './harness.js';
 
 function inputsOf(chronicle: MockChronicle): PickerInputs {
   return {
@@ -138,6 +139,23 @@ test('a changed representation at the same level costs continuity', () => {
   }).solve(inputs, { totalBudget: 1000, targetBudget: 1000, slack: 0 }).frontier))]));
   assert.deepEqual(chosen(`summary:${l1.id}`), { default: 'a:1 b:0', dag: 'a:1 b:0' }, 'premise: on each engine the presented representation is held');
   assert.deepEqual(chosen('summary:rewritten'), { default: 'a:0 b:0', dag: 'a:0 b:0' }, 'on each engine a stale representation costs what unfolding does, so fidelity decides');
+});
+
+test('the subtree and packed engines charge a stale representation at the same level while they prune, as object storage does', () => {
+  const { inputs, forest, options } = seededPolicyFixture(1833, false, true);
+  const shown = options.presentation?.leaves.get('c3');
+  const own = forest.leaf('c3')?.summaryIds.find((id) => forest.summary(id)?.level === 1);
+  assert.ok(shown?.level === 1 && own !== undefined && shown.repHash !== `summary:${own}`, 'premise: c3 is presented at L1 under a summary that is no longer its own');
+  const selected = (engine: object): string => {
+    const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, ...engine });
+    assert.ok(result.feasible, 'premise: the solve is feasible');
+    return [...result.selected.frontier].filter(([, level]) => level > 0).map(([id, level]) => `${id}:${level}`).join(' ');
+  };
+  assert.equal(selected({ storage: 'objects' }), 'c0:1 c1:1', 'premise: object storage leaves c3 raw');
+  assert.deepEqual(
+    { subtree: selected({ engine: 'subtree', reuse: {} }), dag: selected({ engine: 'dag' }) },
+    { subtree: 'c0:1 c1:1', dag: 'c0:1 c1:1' },
+  );
 });
 
 test('the cache term charges only the cache loss above the frame floor', () => {

@@ -1,5 +1,3 @@
-// What the kv-unified strategy asks to have produced: L1s for the foldable
-// messages that lack one when the wall can't be met.
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 

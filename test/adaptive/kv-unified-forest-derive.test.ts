@@ -139,14 +139,20 @@ test('derive declines ownership removals and option changes, extends re-parentin
   assert.equal(CanonicalSummaryForest.derive(first, nextCompile(fixture()), { ...options, overlapExempt: new Set(['c0']) }), null, 'overlap exempt');
 });
 
-// Each forest flag alone decides whether a forest can be derived: the case above
-// changes both at once.
 test('derive refuses a forest built under the other treeifyNonContiguousSummaries alone', () => {
   const off = new CanonicalSummaryForest(fixture());
   const on = new CanonicalSummaryForest(fixture(), { treeifyNonContiguousSummaries: true });
   assert.ok(CanonicalSummaryForest.derive(off, nextCompile(fixture()), {}), 'premise: the same flags derive, off');
   assert.ok(CanonicalSummaryForest.derive(on, nextCompile(fixture()), { treeifyNonContiguousSummaries: true }), 'premise: and on');
   assert.equal(CanonicalSummaryForest.derive(off, nextCompile(fixture()), { treeifyNonContiguousSummaries: true }), null, 'off, then on');
+  assert.equal(CanonicalSummaryForest.derive(on, nextCompile(fixture()), {}), null, 'on, then off');
+});
+
+test('derive refuses a forest built under the other preserveGapBearingSummaries alone', () => {
+  const off = new CanonicalSummaryForest(fixture());
+  const on = new CanonicalSummaryForest(fixture(), { preserveGapBearingSummaries: true });
+  assert.ok(CanonicalSummaryForest.derive(on, nextCompile(fixture()), { preserveGapBearingSummaries: true }), 'premise: the same flags derive, on');
+  assert.equal(CanonicalSummaryForest.derive(off, nextCompile(fixture()), { preserveGapBearingSummaries: true }), null, 'off, then on');
   assert.equal(CanonicalSummaryForest.derive(on, nextCompile(fixture()), {}), null, 'on, then off');
 });
 
