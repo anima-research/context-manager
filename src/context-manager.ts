@@ -85,6 +85,8 @@ import type {
 } from './types/index.js';
 
 type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
+/** A store branch as ContextManager.branchStamp reads it. */
+type BranchStamp = StoreBranchGeneration & { id: string };
 
 /**
  * A compiled message as `firstChanged` compares it. An injection's content
@@ -410,15 +412,22 @@ export class InitializationSupersededError extends Error {
  *   one body, and then throws its own error, unwrapped. When that removal
  *   fails too, `landed` names the shards that stayed: a body short of its
  *   shardCount, which a retry doesn't remove.
+ * - A sharded write whose store a listener of a shard's add moved to
+ *   another branch stops before the next shard, which would land on that
+ *   branch: `landed` names the shards stored, which stay on the branch the
+ *   write started on, and `cause` says the branch moved. Nothing is
+ *   removed, since the store no longer reads that branch.
  *
  * A write that fails before a row lands throws its own error, unwrapped: a
  * refusal of the message, or of a shard as the strategy chunked it
  * (MalformedContentError), a chunking the manager refuses, a strategy not
- * initialized, a store that refuses the first append.
+ * initialized, a store that refuses the first append, an add made while a
+ * sharded add stores its shards.
  *
  * Its add may have gone unheard: a failure in the manager's own listener
  * ends the event before a host's onMessage listener hears it, and before
- * the strategy does in legacy mode. Once a host presents rows on the
+ * the strategy does in legacy mode, where a sharded write that fails tells
+ * the strategy of none of its shards. Once a host presents rows on the
  * branch, the rows are out of the window until it presents them
  * (presentRows(landed)), as for any add. Where the add placed a
  * holdCompression hold on them, it stays: releaseCompression(landed)
@@ -474,6 +483,11 @@ export class WriteLandedError extends Error {
  * - For a sharded write whose removal of what it stored threw, where the
  *   store can't be read to tell whether the shards stayed (`unknown`, and
  *   `unnamed` 1 if the failing shard's landing can't be read either).
+ * - For a sharded write whose shard's append threw after a listener moved
+ *   the store to another branch: the shards stored before it stay on the
+ *   branch the write started on (`landed`), which the store no longer
+ *   reads to tell whether the failing shard's row landed there (`unnamed`
+ *   1), and nothing is removed.
  *
  * A host that stores the message another way when an add stored none of it
  * can't tell from this error whether doing so stores it twice: a read of
@@ -593,6 +607,12 @@ export class ContextManager {
   private holdingAddAt = 0;
   /** Set while addMessage(..., { holdCompression: true }) appends. */
   private holdingAdds: MessageId[] | null = null;
+  /**
+   * While a sharded addMessage stores its shards: the rows a legacy window
+   * took in, which the strategy hears in one call once every shard is
+   * stored (handleMessageAdd). An addMessage meanwhile is refused.
+   */
+  private writingShards: { heard: StoredMessage[] } | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
   /** How this manager's slots are named — what a derived context inherits. */
@@ -937,6 +957,17 @@ export class ContextManager {
    *   once it has removed what it stored.
    *
    * The first two carry the write's own error as their `cause`.
+   *
+   * A sharded body's shards land together, as one body: a chunking whose
+   * `bodyGroupId` is empty or not a string is refused before any shard is
+   * stored, and an addMessage made while a sharded addMessage stores its
+   * shards (from a listener of a shard's add, or a strategy hook a
+   * listener runs by presenting a shard) is refused, saying why, since its
+   * row would land between the shards and split the body. In legacy mode
+   * the strategy hears the shards once every one is stored, in one call,
+   * so no hook of its runs between them. A listener that moves the store's
+   * branch between shards stops the write there, and its WriteLandedError
+   * names the shards stored, on the branch the write started on.
    */
   addMessage(
     participant: string,
@@ -948,6 +979,16 @@ export class ContextManager {
     // A closed manager refuses the add by name, before its content or hold
     // options are read.
     this.requireOpen('addMessage');
+    // So does a sharded addMessage storing its shards, whose listeners can
+    // run a host's code (onMessage) and the strategy's (through a listener
+    // that presents a shard): a row added now would land between the
+    // shards, and the body-runs rule (body-runs.ts) would read two bodies.
+    if (this.writingShards) {
+      throw new Error(
+        'ContextManager.addMessage refused: a sharded addMessage is storing its shards, and a message added now would ' +
+          'land between them and split the body. Add it once that call has returned.',
+      );
+    }
     // First, so a message refused here changes nothing: no hold expires, no
     // hold is placed, and the strategy's ingress chunking never reads it.
     // What a write mends is mended here, so the strategy chunks what is
@@ -1011,6 +1052,15 @@ export class ContextManager {
               `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
           );
         }
+        // The group id is what makes the shards one body (body-runs.ts) and
+        // what a failed write's cleanup removes by: a shard without one is a
+        // message of its own.
+        if (typeof decision.bodyGroupId !== 'string' || decision.bodyGroupId === '') {
+          throw new Error(
+            `chunkIngressMessage returned bodyGroupId ${JSON.stringify(decision.bodyGroupId) ?? String(decision.bodyGroupId)}; ` +
+              `a group of ${shardCount} shards needs a non-empty string`,
+          );
+        }
         // Shards are written in index order, so the id returned (the first
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
@@ -1031,11 +1081,30 @@ export class ContextManager {
         // reads a body as consecutive messages of one group id whose shard indices
         // rise, so a body's shards must land together: a message appended between
         // them would split the body. Nothing in context-manager appends a message
-        // anywhere but here and below, so nothing of its own can. A host's
-        // onMessage listener runs inside each append, and its contract rules out
-        // adding a message from there synchronously.
+        // anywhere but here and below, and an addMessage made while this loop runs
+        // is refused (writingShards): a host's onMessage listener runs inside each
+        // append, and the strategy's hooks run there when that listener presents a
+        // shard. In legacy mode the strategy hears the body once the loop ends, in
+        // one call, as presentRows gives a body, so no hook of its runs between
+        // the shards. They land on one branch too: a listener that moves the
+        // store's branch stops the write before the next shard, which would land
+        // on the other branch.
+        // The branch the shards land on: its id, which a branch made again
+        // under the same name doesn't share.
+        const branch = this.store.currentBranch();
+        const onBranch = () => this.store.currentBranch().id === branch.id;
+        let moved: Error | null = null;
+        this.writingShards = { heard: [] };
         try {
           for (const shard of ordered) {
+            if (stored.length > 0 && !onBranch()) {
+              moved = new Error(
+                `the store's branch moved from ${branch.name} to ${this.store.currentBranch().name} while addMessage stored ` +
+                  `the shards of body group ${decision.bodyGroupId}, after ${stored.length} of ${shardCount}; the rest weren't ` +
+                  `stored, and those that were are on ${branch.name}`,
+              );
+              throw moved;
+            }
             const message = this.messageStore.append(
               participant,
               shard.content,
@@ -1049,7 +1118,23 @@ export class ContextManager {
             );
             stored.push(message.id);
           }
+          // The strategy hears the shards a legacy window took in, once every
+          // shard is stored, where the last shard's listeners left the store:
+          // on another branch they wait, as rows a hook stopped do.
+          const { heard } = this.writingShards;
+          this.writingShards = null;
+          if (onBranch()) this.notifyPresented(heard);
+          else this.deferPresented(heard, true);
         } catch (err) {
+          this.writingShards = null;
+          // A write the store's branch moved under stopped there, or failed
+          // after it moved: what it stored is on the branch it started on,
+          // which the store no longer reads, so nothing is read or removed.
+          // The shards it stored stayed; a shard whose append threw may have
+          // landed there too.
+          if (!onBranch()) {
+            throw err === moved ? new WriteLandedError(stored, err) : new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err);
+          }
           // A write that fails partway leaves no part of the body in the
           // store: remove what it wrote (the failing shard too, if it
           // landed), so a retry writes one body, and throw the write's own
@@ -1478,8 +1563,11 @@ export class ContextManager {
    * A listener runs synchronously inside the write that emitted its event,
    * so it can run while a sharded addMessage is still storing that body's
    * remaining shards. It must not add a message synchronously: one added there
-   * would land between a body's shards and split the body (body-runs.ts).
-   * Add it after the call returns (a microtask or later) instead. A listener
+   * would land between a body's shards and split the body (body-runs.ts), so
+   * an addMessage made while a sharded addMessage stores its shards is
+   * refused. Add it after the call returns (a microtask or later) instead.
+   * Nor may it move the store's branch then: the sharded write stops before
+   * its next shard and throws (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
    * heard stands: the throw doesn't reach the caller. A listener that calls
    * close() lets the write that ran it finish (see close()). Each call
@@ -3935,9 +4023,14 @@ export class ContextManager {
     // In legacy mode the window is the record, so the row enters it here,
     // and the strategy hears it inside the append: its synchronous part
     // comes before addMessage returns, after a holdCompression hold is
-    // placed (#288). Once a host presents rows on the branch, the row
-    // enters the window at its presentRows, and the strategy hears it then.
-    if (this.windowIndex.mode() === 'legacy') this.notifyPresented([message]);
+    // placed (#288). A sharded add's shards it hears together, once the
+    // last is stored (appendMessage), so no hook of its runs between them.
+    // Once a host presents rows on the branch, the row enters the window at
+    // its presentRows, and the strategy hears it then.
+    if (this.windowIndex.mode() === 'legacy') {
+      if (this.writingShards) this.writingShards.heard.push(message);
+      else this.notifyPresented([message]);
+    }
   }
 
   /**
@@ -3945,7 +4038,7 @@ export class ContextManager {
    * (ContextStrategy.onPresented), or, for a strategy without that hook,
    * each row in turn through onNewMessage. After close() nothing reaches
    * the strategy: a close() from a listener lets the write it interrupted
-   * finish, and that write's remaining shards are stored unheard. While the
+   * finish, and a sharded write's shards are then stored unheard. While the
    * strategy isn't initialized the rows wait for the manager's strategy,
    * whether or not the one initializing has a row hook
    * (deliverPresentedUnheard); an add, the legacy caller, requires an
@@ -4063,8 +4156,8 @@ export class ContextManager {
    * first of two calls (presentRows, retractRows), and checked before the
    * second (inHookScope).
    */
-  private hookScope(): { strategy: ContextStrategy; attempt: number; branch: StoreBranchGeneration; id: string } {
-    return { strategy: this.strategy, attempt: this.initializationAttempt, branch: observeStoreBranch(this.store), id: this.store.currentBranch().id };
+  private hookScope(): { strategy: ContextStrategy; attempt: number; branch: BranchStamp } {
+    return { strategy: this.strategy, attempt: this.initializationAttempt, branch: this.branchStamp() };
   }
 
   /**
@@ -4075,8 +4168,22 @@ export class ContextManager {
    */
   private inHookScope(scope: ReturnType<ContextManager['hookScope']>): boolean {
     if (this.closed || this.strategy !== scope.strategy || this.initializationAttempt !== scope.attempt) return false;
-    const branch = observeStoreBranch(this.store);
-    return branch.name === scope.branch.name && branch.generation === scope.branch.generation && this.store.currentBranch().id === scope.id;
+    return this.onBranch(scope.branch);
+  }
+
+  /** The store's branch as a write finds it: its name and generation (observeStoreBranch) and its id. */
+  private branchStamp(): BranchStamp {
+    return { ...observeStoreBranch(this.store), id: this.store.currentBranch().id };
+  }
+
+  /**
+   * Whether the store is still on the branch `stamp` read, at the same
+   * generation: a manager's switch away and back starts a new one, and a
+   * branch made again under the name has another id.
+   */
+  private onBranch(stamp: BranchStamp): boolean {
+    const now = this.branchStamp();
+    return now.name === stamp.name && now.generation === stamp.generation && now.id === stamp.id;
   }
 
   /**

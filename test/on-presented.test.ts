@@ -822,28 +822,37 @@ describe('onPresented in legacy mode', () => {
 
   // House review of #350, untested contract 1: a hook that closes the
   // manager stops what the write it interrupted would tell the strategy.
-  it("a sharded add whose first shard's onPresented closes the manager: the later shards are stored and not heard", async () => {
-    let cm!: ContextManager;
-    class ClosesOnFirst extends ShardingRecords {
-      async onPresented(rows: readonly StoredMessage[], _ctx: StrategyContext): Promise<void> {
-        this.heard.push({ rows: rows.map((m) => m.id), held: [], window: [] });
-        if (this.heard.length === 1) cm.close();
+  // CM #350 bot review finding 28: a sharded add's shards are heard in one
+  // call, once every shard is stored, so no hook runs between them.
+  it("a sharded add is heard once every shard is stored, in one call, and a close() from that call or a listener of the first shard's add tells nothing more", async () => {
+    for (const closes of ['hook', 'listener'] as const) {
+      let cm!: ContextManager;
+      class Closes extends ShardingRecords {
+        async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          this.heard.push({ rows: rows.map((m) => m.id), held: [], window: ctx.messageStore.getAll().map((m) => m.id) });
+          if (closes === 'hook' && this.heard.length === 1) cm.close();
+        }
       }
+      const strategy = new Closes();
+      // An app-owned store, which stays open after close(), so the record can be read.
+      const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+      const errors = await errorsDuring(async () => {
+        cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+        if (closes === 'listener') cm.onMessage((event) => { if (event.type === 'add') cm.close(); });
+        cm.addMessage('alice', [text('x'), text('y'), text('z')]);
+        await settle();
+      });
+      assert.ok(cm.isClosed(), closes);
+      const shards = cm.getAllMessages().map((m) => m.id);
+      assert.equal(shards.length, 3, `${closes}: the add finished, and every shard is stored`);
+      assert.deepEqual(
+        strategy.heard.map((h) => [h.rows, h.window]),
+        closes === 'hook' ? [[shards, shards]] : [],
+        closes === 'hook' ? 'one call, with every shard, over a view that holds them all' : 'after close() nothing reaches the strategy',
+      );
+      assert.deepEqual(errors.filter((args) => /fail|threw/i.test(args.map(String).join(' '))), [], `${closes}: nothing failed`);
+      owner.close();
     }
-    const strategy = new ClosesOnFirst();
-    // An app-owned store, which stays open after close(), so the record can be read.
-    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
-    const errors = await errorsDuring(async () => {
-      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
-      cm.addMessage('alice', [text('x'), text('y'), text('z')]);
-      await settle();
-    });
-    assert.ok(cm.isClosed());
-    assert.equal(cm.getAllMessages().length, 3, 'the add finished: every shard is stored');
-    assert.equal(strategy.heard.length, 1, 'only the first shard was heard: after close() nothing reaches the strategy');
-    assert.equal(strategy.heard[0]!.rows.length, 1);
-    assert.deepEqual(errors.filter((args) => /fail|threw/i.test(args.map(String).join(' '))), [], 'nothing failed');
-    owner.close();
   });
 
   // House review of #350, code finding 2: in legacy mode there is no index,

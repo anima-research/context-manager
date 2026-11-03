@@ -463,3 +463,122 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     real.close();
   });
 });
+
+// CM #350 bot review findings 27, 28 and 29: a sharded add's shards are one
+// body only while they land together, in one slot, under one group id.
+describe("a sharded addMessage's shards land together, as one body", () => {
+  it('a chunking whose body group id is empty or not a string is refused before any shard is stored', async () => {
+    for (const bodyGroupId of ['', 42, undefined]) {
+      const chunking = (_participant: string, content: ContentBlock[]) => ({
+        bodyGroupId,
+        shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })),
+      });
+      const strategy = Object.assign(new PassthroughStrategy(), { chunkIngressMessage: chunking }) as unknown as PassthroughStrategy;
+      const cm = await ContextManager.open({ path: freshPath(), strategy });
+      cm.addMessage('bob', [text('before')]);
+      const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+      assert.ok(err instanceof Error && !(err instanceof WriteLandedError) && !(err instanceof WriteOutcomeUnknownError), `${JSON.stringify(bodyGroupId)}: ${String(err)}`);
+      assert.match(err.message, /^chunkIngressMessage returned bodyGroupId /, String(bodyGroupId));
+      assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], `${JSON.stringify(bodyGroupId)}: no shard was stored`);
+      cm.close();
+    }
+  });
+
+  it('in legacy mode the strategy hears the body once every shard is stored, in one call, so a message its hook adds lands after the body', async () => {
+    let cm!: ContextManager;
+    class Replies extends ShardingHears {
+      views: MessageId[][] = [];
+      replied = false;
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        this.views.push(ctx.messageStore.getAll().map((m) => m.id));
+        const heard = super.onPresented(rows, ctx);
+        // Before its first await, as a hook's synchronous part runs inside the add.
+        if (!this.replied) {
+          this.replied = true;
+          cm.addMessage('bob', [text('reply')]);
+        }
+        return heard;
+      }
+    }
+    const strategy = new Replies();
+    cm = await ContextManager.open({ path: freshPath(), strategy });
+    const id = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['one ', 'two ', 'three', 'reply'], 'the reply follows the body');
+    assert.equal(id, stored[0]!.id);
+    const shards = stored.slice(0, 3).map((m) => m.id);
+    assert.deepEqual(strategy.views[0], shards, 'the call came once every shard was stored');
+    assert.deepEqual(strategy.presented, [shards, [stored[3]!.id]], 'one call with every shard, then the reply');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  it('an addMessage while a sharded addMessage stores its shards is refused, saying why, and the body is stored whole', async () => {
+    for (const from of ['listener', 'hook'] as const) {
+      let cm!: ContextManager;
+      let refusal: unknown;
+      const nest = () => {
+        try {
+          cm.addMessage('bob', [text('nested')]);
+        } catch (err) {
+          refusal = err;
+        }
+      };
+      // The hook is the strategy's, for a shard a host's listener presents as it is stored.
+      class NestsOnPresented extends ShardingHears {
+        nested = false;
+        async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          if (!this.nested) {
+            this.nested = true;
+            nest();
+          }
+          return super.onPresented(rows, ctx);
+        }
+      }
+      cm = await ContextManager.open({ path: freshPath(), strategy: from === 'hook' ? new NestsOnPresented() : new Sharding() });
+      if (from === 'hook') cm.presentRows([]);
+      let first = true;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || !first) return;
+        first = false;
+        if (from === 'listener') nest();
+        else cm.presentRows([event.message.id]);
+      });
+      const id = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+      assert.ok(refusal instanceof Error, `${from}: refused`);
+      assert.match(refusal.message, /^ContextManager\.addMessage refused: a sharded addMessage is storing its shards/, from);
+      assert.match(refusal.message, /split the body/, from);
+      assert.deepEqual(cm.getAllMessages().map(textOf), ['one ', 'two ', 'three'], `${from}: nothing landed between the shards`);
+      assert.equal(id, cm.getAllMessages()[0]!.id);
+      const after = cm.addMessage('bob', [text('after')]);
+      assert.equal(cm.getAllMessages().at(-1)!.id, after, `${from}: an add once the call returned is taken`);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
+  });
+
+  it("a listener that moves the store's branch between shards stops the write: the error names the shards stored, on the branch it started on", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore();
+    const start = cm.currentBranch().name;
+    const other = store.createBranchAt('zz-other', start, store.currentSequence()).name;
+    let switched: Promise<void> | undefined;
+    cm.onMessage((event) => {
+      if (event.type === 'add' && !switched) switched = cm.switchBranch(other);
+    });
+    const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+    await switched;
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    assert.ok(err.cause instanceof Error);
+    assert.match(err.cause.message, new RegExp(`^the store's branch moved from ${start} to ${other} while addMessage stored the shards of body group three, after 1 of 3`));
+    assert.match(err.message, /branch moved/);
+    assert.equal(cm.currentBranch().name, other);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], 'no shard was written to the other branch');
+    await cm.switchBranch(start);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one '], 'the first shard stays where the write started');
+    assert.deepEqual(err.landed, [stored[1]!.id]);
+    cm.close();
+  });
+});
