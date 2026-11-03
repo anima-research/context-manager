@@ -76,10 +76,13 @@ export function splitMixedToolMessages<T extends { participant: string; content:
  * and each `tool_result` that answers no `tool_use` there. A result answers
  * the nearest call before it with its id, so a call is kept only if a result
  * with its id follows it before the next call with that id, and a result
- * only if a call with its id comes before it. If stripping leaves a message
- * with no blocks, replace its content with a placeholder text block so the
- * message stays structurally valid (collapse/rendering paths assume
- * non-empty content).
+ * only if a call with its id comes before it. Within one message's run of
+ * calls sharing an id, with no result with the id between them, the results
+ * after the run answer its calls in order, and only the last call so
+ * answered is kept, with its result and any further results. If stripping
+ * leaves a message with no blocks, replace its content with a placeholder
+ * text block so the message stays structurally valid (collapse/rendering
+ * paths assume non-empty content).
  *
  * Why this exists: the Anthropic API requires every `tool_use` to be
  * followed by its `tool_result` in the immediately-next message (and every
@@ -104,19 +107,31 @@ export function stripUnpairedToolBlocks<T extends { participant: string; content
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
   const paired = new Set<string>();
-  const latest = new Map<string, string>();
+  // Each id's latest run of calls, and the results after it.
+  type Run = { message: number; calls: string[]; results: string[] };
+  const runs = new Map<string, Run>();
+  const settle = (run: Run): void => {
+    const k = Math.min(run.results.length, run.calls.length);
+    if (k === 0) return;
+    paired.add(run.calls[k - 1]!);
+    for (const result of k === run.calls.length ? run.results.slice(k - 1) : [run.results[k - 1]!]) paired.add(result);
+  };
   messages.forEach((msg, m) => {
     msg.content.forEach((block, b) => {
-      if (block.type === 'tool_use') latest.set((block as { id: string }).id, `${m}:${b}`);
-      else if (block.type === 'tool_result') {
-        const call = latest.get((block as { toolUseId: string }).toolUseId);
-        if (call) {
-          paired.add(call);
-          paired.add(`${m}:${b}`);
+      if (block.type === 'tool_use') {
+        const id = (block as { id: string }).id;
+        const run = runs.get(id);
+        if (run && run.message === m && run.results.length === 0) run.calls.push(`${m}:${b}`);
+        else {
+          if (run) settle(run);
+          runs.set(id, { message: m, calls: [`${m}:${b}`], results: [] });
         }
+      } else if (block.type === 'tool_result') {
+        runs.get((block as { toolUseId: string }).toolUseId)?.results.push(`${m}:${b}`);
       }
     });
   });
+  for (const run of runs.values()) settle(run);
   return messages.map((msg, m) => {
     const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(`${m}:${b}`) : true));
     if (trimmed.length === msg.content.length) {

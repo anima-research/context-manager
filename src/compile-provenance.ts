@@ -376,7 +376,9 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
  * one the repair placed for this entry that is still in the request, or a
  * result with that id still in the entry. Each block carries one result.
  * Another entry's result with its id, even with the same content, doesn't
- * stand in for it.
+ * stand in for it. An entry that names no placed blocks
+ * (`relocatedBlocks`) is judged by id instead: a result with a moved id is
+ * carried by any result with its id in the request that covers it.
  */
 function carriesWithRelocated(
   entry: ContextEntry,
@@ -387,6 +389,10 @@ function carriesWithRelocated(
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
   const rest = sourceMessages.map((m) => ({ ...m, content: m.content.filter((b) => !isMoved(b)) }));
   if (!carries(entry.content, rest)) return false;
+  if (!entry.relocatedBlocks) {
+    const sent = [...inRequest].filter(isMoved);
+    return sourceMessages.every((m) => m.content.every((block) => !isMoved(block) || sent.some((result) => covers(result, block))));
+  }
   const carriers = [...(entry.relocatedBlocks ?? []).filter((b) => inRequest.has(b)), ...entry.content.filter(isMoved)];
   for (const m of sourceMessages) {
     for (const block of m.content) {

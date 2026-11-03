@@ -56,12 +56,17 @@ export interface ContextEntry {
    * carries each result, in that other entry: attribution looks for it
    * there by its tool_use id, so moving a result is not a loss, while a
    * moved result that was later altered, or is missing from the request,
-   * still is.
+   * still is. Where `relocatedBlocks` is set, attribution looks for those
+   * blocks instead.
    */
   relocatedResults?: string[];
   /**
    * The result blocks that repair placed for `relocatedResults`, as it
-   * placed them.
+   * placed them, one block of its own for each move. Where it's set,
+   * attribution credits a moved result only through one of these blocks
+   * still in the request, unaltered, or through a result with its id still
+   * in this entry, so another result with the same id and content can't
+   * stand in for it.
    */
   relocatedBlocks?: ContentBlock[];
 }

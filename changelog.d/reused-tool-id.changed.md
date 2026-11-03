@@ -24,10 +24,14 @@
   so a summariser's request could hold an earlier call with no result beside a
   later call reusing its id, or a result whose only call with that id came
   after it.
-- Pairing repair keeps only the last of two calls with one id in one
-  message, the call a result after them answers. It kept both, with one
-  result for the two, and membrane refuses two calls with one id in one
-  assistant turn, so a request holding such a message couldn't be sent.
+- Where one message holds several calls with one id and no result with the
+  id between them, their results answer them in order. Pairing repair and
+  `stripUnpairedToolBlocks` keep the last call so answered, with its result,
+  and leave the other calls and their results out. Where no result answers
+  any of them, the repair keeps the last call, answered by a stub, and the
+  strip keeps none. Each kept all of them, and membrane refuses two calls
+  with one id in one assistant turn, so a request holding such a message
+  couldn't be sent.
 - A host that stores a call's result late, after a later call has reused the
   call's id, now has that result paired with the later call: the earlier call
   goes with a stub, and a second result after the later call is dropped as a
@@ -37,7 +41,8 @@
   is stored can compile different requests after the upgrade, and where it
   does, its first request misses the prompt cache. A store with two calls
   with one id in one message now compiles requests membrane sends. Every
-  other store compiles what it compiled. A summariser's request changes where its messages hold a
-  call that no result with its id follows before the next call with that id,
-  while some result elsewhere carries the id, or a result that no call with
-  its id comes before, while a later call has that id.
+  other store compiles what it compiled. A summariser's request changes
+  where its messages hold a call that no result with its id follows before
+  the next call with that id, while some result elsewhere carries the id, or
+  a result that no call with its id comes before, while a later call has
+  that id.

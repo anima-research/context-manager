@@ -24,6 +24,7 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { NativeFormatter } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import { stripUnpairedToolBlocks } from '../src/normalize-tool-messages.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextEntry } from '../src/types/index.js';
 import type { MessageStoreView } from '../src/types/index.js';
@@ -105,22 +106,18 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
     assertPaired(entries);
   });
 
-  it('keeps only the last of two calls with one id in an entry, so membrane formats the repaired output', () => {
-    const first: ContentBlock = { type: 'tool_use', id: 'A', name: 'fn', input: { n: 1 } };
-    const second: ContentBlock = { type: 'tool_use', id: 'A', name: 'fn', input: { n: 2 } };
+  it('keeps one of a call object that stands at two places in an entry, with its result', () => {
+    const shared: ContentBlock = { type: 'tool_use', id: 'A', name: 'fn', input: {} };
     const entries = [
-      entry('Claude', [text('trying twice'), first, second]),
-      entry('User', [result('A', 'for the second')]),
+      entry('Claude', [text('trying'), shared, shared]),
+      entry('User', [result('A', 'OUT')]),
       entry('Claude', [text('done')]),
     ];
     entries.forEach((e, i) => { e.index = i; });
     runEnforce(entries);
     assertPaired(entries);
-    assert.deepStrictEqual(entries[0].content.filter((b) => b.type === 'tool_use').map((b) => (b as { input: unknown }).input), [{ n: 2 }]);
-    assert.doesNotThrow(() => new NativeFormatter().buildMessages(
-      entries.map(({ participant, content }) => ({ participant, content })),
-      { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
-    ));
+    assert.equal(entries[0].content.filter((b) => b.type === 'tool_use').length, 1);
+    assert.deepStrictEqual(entries[1].content.map((b) => (b as { content?: unknown }).content), ['OUT']);
   });
 
   it('drops a mid-list orphan tool_result (its tool_use was compressed away)', () => {
@@ -329,6 +326,41 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
 
     await manager.close();
   });
+});
+
+describe('a run of calls sharing an id in one entry', () => {
+  const call = (n: number): ContentBlock => ({ type: 'tool_use', id: 'A', name: 'fn', input: { n } });
+  const out = (n: number): ContentBlock => result('A', `OUT OF n=${n}`);
+  const recall = (): ContextEntry => ({ index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] });
+  // The call each path keeps, by its n, and the results that go with it.
+  const kept = (messages: { content: ContentBlock[] }[]): { n: number[]; results: unknown[] } => {
+    const at = messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
+    return {
+      n: messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use').map((b) => (b as unknown as { input: { n: number } }).input.n),
+      results: messages.slice(at + 1).flatMap((m) => m.content).filter((b) => b.type === 'tool_result').map((b) => (b as { content?: unknown }).content),
+    };
+  };
+  const shapes: Array<[string, () => ContextEntry[], number]> = [
+    ['two calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2],
+    ['three calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2), call(3)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2],
+    ['two calls and one result', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('Claude', [text('done')])], 1],
+    ['two calls and two results a recall pair displaces', () => [entry('Claude', [text('trying'), call(1), call(2)]), recall(), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2],
+    ['two calls and two results in two entries', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('User', [out(2)]), entry('Claude', [text('done')])], 2],
+  ];
+  for (const [shape, make, n] of shapes) {
+    it(`${shape}: repair and strip keep the last call position answers, with its result`, () => {
+      const repaired = make();
+      repaired.forEach((e, i) => { e.index = i; });
+      runEnforce(repaired);
+      assertPaired(repaired);
+      assert.deepStrictEqual(kept(repaired), { n: [n], results: [`OUT OF n=${n}`] }, 'repair');
+      assert.doesNotThrow(() => new NativeFormatter().buildMessages(
+        repaired.map(({ participant, content }) => ({ participant, content })),
+        { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
+      ));
+      assert.deepStrictEqual(kept(stripUnpairedToolBlocks(make())), { n: [n], results: [`OUT OF n=${n}`] }, 'strip');
+    });
+  }
 });
 
 describe('a tool_use id used again by a later call', () => {
