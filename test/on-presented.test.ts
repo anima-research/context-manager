@@ -23,8 +23,10 @@ import {
   ContextManager,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
+  windowIndexStateId,
 } from '../src/index.js';
 import type { MessageId, MessageStoreView, StoredMessage, StrategyContext } from '../src/index.js';
+import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-on-presented';
 let storeSeq = 0;
@@ -363,6 +365,47 @@ describe('onPresented in presented mode', () => {
     }
   });
 
+  // CM #350 bot review finding 22: a delivery whose read fails keeps the rows
+  // waiting, and the strategy's next notification tries it again.
+  it("rows presented while the strategy initializes, whose delivery can't read the window, are heard at its next notification, before that one's rows", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const y = cm.addMessage('bob', [text('y')]);
+    const { gate, open } = gated();
+    const strategy = new GatedRecords();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.presentRows([x]);
+    // The next read of the window throws: the delivery's, once the initialize returns.
+    const reads = cm as unknown as { presentedMessageView: () => unknown };
+    const read = reads.presentedMessageView;
+    let fail = true;
+    reads.presentedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-window-read-failed');
+      }
+      return read.call(this);
+    };
+    let errors: unknown[][];
+    try {
+      errors = await errorsDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { presentedMessageView?: unknown }).presentedMessageView;
+    }
+    assert.equal(fail, false, 'setup: the read failed');
+    assert.ok(errors.some((args) => args.map(String).join(' ').includes('zz-window-read-failed')), 'and was logged');
+    assert.equal(strategy.heard.length, 0, 'nothing was heard');
+    cm.presentRows([y]);
+    assert.deepEqual(strategy.heard.map((h) => h.rows), [[x], [y]], 'x is heard at the next notification, first');
+    await settle();
+    cm.close();
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.
@@ -592,6 +635,71 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
   });
 });
 
+// CM #350 bot review finding 24: a presentRows that puts a body back whole
+// makes two hook calls, and the first can move the store's branch.
+describe("a body put back whole, whose onRetracted hook moves the store's branch", () => {
+  for (const initializes of [false, true]) {
+    it(`${initializes ? 'a strategy with an initialize' : 'a strategy with no initialize'}: presentRows returns, and the body is heard entering only where the window of the branch it initialized on holds it`, async () => {
+      let cm!: ContextManager;
+      let elsewhere = '';
+      class Switches extends ShardingRecords {
+        switchOnRetract = false;
+        switched: Promise<void> | undefined;
+        async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+          if (this.switchOnRetract) {
+            this.switchOnRetract = false;
+            this.switched = cm.switchBranch(elsewhere);
+          }
+          return super.onRetracted(rows, ctx, info);
+        }
+      }
+      class SwitchesAfterInitialize extends Switches {
+        async initialize(_ctx: StrategyContext): Promise<void> {}
+      }
+      const strategy = initializes ? new SwitchesAfterInitialize() : new Switches();
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      const store = cm.getStore();
+      cm.presentRows([]);
+      // A branch made before the body: neither its record nor its window holds it.
+      elsewhere = store.createBranchAt('zz-elsewhere', cm.currentBranch().name, store.currentSequence()).name;
+      const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+      const shards = cm.getAllMessages().map((m) => m.id);
+      const a = cm.addMessage('alice', [text('a')]);
+      cm.presentRows([doc, a]);
+      // A retract cut short after the first shard's tombstone, in an index
+      // written one record per item: the first shard out, the later ones in.
+      const handle = store as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+      const append = handle.appendToStateJsonWithIdentity;
+      const batched = perItemIndexWrites(store);
+      let appends = 0;
+      handle.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+        if (id === windowIndexStateId('zz-agent') && ++appends === 2) throw new Error('zz-index-append-failed');
+        return append.call(this, id, ...rest);
+      };
+      try {
+        assert.throws(() => cm.retractRows([doc]), /zz-index-append-failed/);
+      } finally {
+        handle.appendToStateJsonWithIdentity = append;
+        batched();
+      }
+      assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['out', 'in', 'in'], 'setup: the first shard out, the later ones in');
+      strategy.heard = [];
+      strategy.retracted = [];
+      strategy.switchOnRetract = true;
+      const errors = await errorsDuring(async () => {
+        cm.presentRows([shards[0]!]);
+        await strategy.switched;
+        await settle();
+      });
+      assert.equal(cm.currentBranch().name, elsewhere, 'setup: the hook moved the store to the branch made before the body');
+      assert.deepEqual(strategy.retracted, [{ rows: [shards[1], shards[2]], undone: false }], 'the later shards were heard leaving, on the branch they left');
+      assert.deepEqual(strategy.heard, [], 'the branch it initialized on holds no shard of the body, so none is heard entering');
+      assert.deepEqual(errors, [], 'nothing failed');
+      cm.close();
+    });
+  }
+});
+
 // House review of #350, code finding 9: once rows are presented,
 // resetHeadWindow presents its transition, unless a host's listener of the
 // add has presented it already.
@@ -615,6 +723,90 @@ describe('resetHeadWindow once a host presents', () => {
       cm.close();
     }
   });
+
+  // CM #350 bot review finding 25: the strategy's hook for the transition's
+  // presentation can take it out again, without moving anything else.
+  it("refuses when the hook of the transition's presentation takes it out of the window, and doesn't reset the head window", async () => {
+    let cm!: ContextManager;
+    class TakesItOut extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (rows.some((m) => m.participant === 'Context Manager')) cm.retractRows([rows[0]!.id]);
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new TakesItOut();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = cm.getAllMessages().at(-1)!;
+    assert.equal(cm.windowStatusOf(transition.id), 'out', 'setup: the hook took the transition out');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset to start at a row the window lacks");
+    assert.match(err.message, /took the transition out of the window/);
+    assert.ok(err.message.includes(`message ${transition.id} is stored and out of the window, and the head window wasn't reset`), err.message);
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review finding 26: the presentation can land and then throw.
+  it('a presentation of the transition that fails says whether the window holds it', async () => {
+    for (const readable of [true, false]) {
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+      }
+      const strategy = new Resettable();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      // The window's append lands and then throws; after it, the index reads
+      // (control) or can't be read (probe).
+      const index = windowIndexStateId('zz-agent');
+      const store = cm.getStore() as unknown as Record<string, (id: string, ...rest: unknown[]) => unknown>;
+      const saved: Record<string, (id: string, ...rest: unknown[]) => unknown> = {};
+      let landed = false;
+      for (const name of ['appendManyToStateJsonWithIdentity', 'appendToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen']) {
+        const real = store[name];
+        if (typeof real !== 'function') continue;
+        saved[name] = real;
+        store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+          if (id !== index) return real.call(this, id, ...rest);
+          if (name.startsWith('append')) {
+            real.call(this, id, ...rest);
+            landed = true;
+            throw new Error('zz-landed-then-threw');
+          }
+          if (landed && !readable) throw new Error('zz-index-read-failed');
+          return real.call(this, id, ...rest);
+        };
+      }
+      let err: Error;
+      try {
+        err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      } finally {
+        for (const [name, real] of Object.entries(saved)) store[name] = real;
+      }
+      const transition = cm.getAllMessages().at(-1)!;
+      const label = readable ? 'control' : 'probe';
+      assert.equal(cm.windowStatusOf(transition.id), 'in', `${label}, setup: the presentation landed`);
+      assert.deepEqual(strategy.resets, [], `${label}: the head window wasn't reset`);
+      assert.match(err.message, /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-landed-then-threw\./, `${label}: ${err.message}`);
+      const where = readable ? 'stored and presented' : 'stored, and may be presented';
+      assert.ok(err.message.includes(`message ${transition.id} is ${where}, and the head window wasn't reset`), `${label}: ${err.message}`);
+      await settle();
+      cm.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {
@@ -630,28 +822,37 @@ describe('onPresented in legacy mode', () => {
 
   // House review of #350, untested contract 1: a hook that closes the
   // manager stops what the write it interrupted would tell the strategy.
-  it("a sharded add whose first shard's onPresented closes the manager: the later shards are stored and not heard", async () => {
-    let cm!: ContextManager;
-    class ClosesOnFirst extends ShardingRecords {
-      async onPresented(rows: readonly StoredMessage[], _ctx: StrategyContext): Promise<void> {
-        this.heard.push({ rows: rows.map((m) => m.id), held: [], window: [] });
-        if (this.heard.length === 1) cm.close();
+  // CM #350 bot review finding 28: a sharded add's shards are heard in one
+  // call, once every shard is stored, so no hook runs between them.
+  it("a sharded add is heard once every shard is stored, in one call, and a close() from that call or a listener of the first shard's add tells nothing more", async () => {
+    for (const closes of ['hook', 'listener'] as const) {
+      let cm!: ContextManager;
+      class Closes extends ShardingRecords {
+        async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          this.heard.push({ rows: rows.map((m) => m.id), held: [], window: ctx.messageStore.getAll().map((m) => m.id) });
+          if (closes === 'hook' && this.heard.length === 1) cm.close();
+        }
       }
+      const strategy = new Closes();
+      // An app-owned store, which stays open after close(), so the record can be read.
+      const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+      const errors = await errorsDuring(async () => {
+        cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+        if (closes === 'listener') cm.onMessage((event) => { if (event.type === 'add') cm.close(); });
+        cm.addMessage('alice', [text('x'), text('y'), text('z')]);
+        await settle();
+      });
+      assert.ok(cm.isClosed(), closes);
+      const shards = cm.getAllMessages().map((m) => m.id);
+      assert.equal(shards.length, 3, `${closes}: the add finished, and every shard is stored`);
+      assert.deepEqual(
+        strategy.heard.map((h) => [h.rows, h.window]),
+        closes === 'hook' ? [[shards, shards]] : [],
+        closes === 'hook' ? 'one call, with every shard, over a view that holds them all' : 'after close() nothing reaches the strategy',
+      );
+      assert.deepEqual(errors.filter((args) => /fail|threw/i.test(args.map(String).join(' '))), [], `${closes}: nothing failed`);
+      owner.close();
     }
-    const strategy = new ClosesOnFirst();
-    // An app-owned store, which stays open after close(), so the record can be read.
-    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
-    const errors = await errorsDuring(async () => {
-      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
-      cm.addMessage('alice', [text('x'), text('y'), text('z')]);
-      await settle();
-    });
-    assert.ok(cm.isClosed());
-    assert.equal(cm.getAllMessages().length, 3, 'the add finished: every shard is stored');
-    assert.equal(strategy.heard.length, 1, 'only the first shard was heard: after close() nothing reaches the strategy');
-    assert.equal(strategy.heard[0]!.rows.length, 1);
-    assert.deepEqual(errors.filter((args) => /fail|threw/i.test(args.map(String).join(' '))), [], 'nothing failed');
-    owner.close();
   });
 
   // House review of #350, code finding 2: in legacy mode there is no index,

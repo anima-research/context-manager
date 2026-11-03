@@ -1,0 +1,24 @@
+- A sharded `addMessage` keeps a body's shards together, as one body:
+  - It refuses a `chunkIngressMessage` decision whose `bodyGroupId` is empty
+    or not a string, before any shard is stored. Such shards didn't read as
+    one body, so a write that failed partway removed only the first of them
+    and threw as if none stayed.
+  - An `addMessage` made while a sharded `addMessage` stores its shards (from
+    an `onMessage` listener of a shard's add, or a strategy hook that
+    listener runs by presenting a shard) is refused, with an error that says
+    its row would land between the shards and split the body. Before, it
+    landed there, and the cleanup of a write that then failed left the
+    shards after it stored.
+  - In legacy mode the strategy hears a sharded body once every shard is
+    stored, in one `onPresented` call with every shard, as `presentRows`
+    gives a body (a strategy with only `onNewMessage` hears each shard in
+    turn then). It heard each shard from inside that shard's append, so a
+    hook of its could add a message or move the store between the shards. A
+    sharded write that fails tells it of none of its shards.
+  - A listener that moves the store's branch between shards stops the write
+    before the next shard, and `addMessage` throws `WriteLandedError` naming
+    the shards stored, which stay on the branch the write started on, with a
+    `cause` that says the branch moved (`WriteOutcomeUnknownError`, with
+    `unnamed` 1, where a shard's append threw after the move). Before, the
+    later shards landed on the other branch, and the cleanup of a write that
+    failed looked for the first shard there.

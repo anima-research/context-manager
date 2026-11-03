@@ -434,6 +434,128 @@ describe('onRetracted', () => {
     }
   });
 
+  // CM #350 bot review finding 24: retractRows makes two calls when rows the
+  // store no longer holds leave with rows it holds, and the first call's hook
+  // can move the store's branch.
+  it("a call whose hook moves the store's branch: the call by ids alone after it is made only where those rows left the window of the branch the strategy initialized on", async () => {
+    let cm!: ContextManager;
+    let before = '';
+    class Switches extends Records {
+      switchOnRetract = false;
+      switched: Promise<void> | undefined;
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: Info): Promise<void> {
+        if (this.switchOnRetract) {
+          this.switchOnRetract = false;
+          this.switched = cm.switchBranch(before);
+        }
+        return super.onRetracted(rows, ctx, info);
+      }
+    }
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const strategy = new Switches();
+    cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    // A branch made before b was removed: its record and its window hold b.
+    const store = cm.getStore();
+    before = store.createBranchAt('zz-before', cm.currentBranch().name, store.currentSequence()).name;
+    writer.removeMessage(b);
+    strategy.switchOnRetract = true;
+    const lines = await linesDuring(async () => {
+      cm.retractRows([a, b]);
+      await strategy.switched;
+      await settle();
+    });
+    assert.equal(cm.currentBranch().name, before, "setup: the first call's hook moved the store");
+    assert.notEqual(cm.ordinalOf(b), undefined, "setup: the branch's window holds b where it was");
+    assert.deepEqual(
+      strategy.retracted.map((l) => [l.rows, l.info]),
+      [[[a], { undone: false, removed: false, ids: [a] }]],
+      'b, which the branch the strategy initialized on holds, is not told there',
+    );
+    assert.deepEqual(lines, []);
+    cm.close();
+    writer.close();
+  });
+
+  // CM #350 bot review finding 22: a delivery whose read fails keeps the call
+  // waiting, and the strategy's next notification makes it first.
+  it("a call made while the strategy initializes, whose delivery can't read the window, is made at the strategy's next notification, before that one", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    // The next read of the merged record throws: the delivery's, once the initialize returns.
+    const reads = cm as unknown as { mergedMessageView: () => unknown };
+    const read = reads.mergedMessageView;
+    let fail = true;
+    reads.mergedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-window-read-failed');
+      }
+      return read.call(this);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(fail, false, 'setup: the read failed');
+    assert.ok(lines.some((line) => line.includes('zz-window-read-failed')), lines.join('\n'));
+    assert.equal(strategy.log.length, 0, 'nothing was told');
+    cm.presentRows([a]);
+    assert.deepEqual(strategy.log, ['retracted a', 'presented a'], 'the call that waited is made first, then the row presented again is heard');
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review finding 21: while initialization stays failed the
+  // calls wait without bound, so what each keeps is kept small.
+  it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const big = cm.addMessage('alice', [text('x'.repeat(100_000))]);
+    cm.presentRows([big]);
+    class Fails extends Records {
+      async initialize(_ctx: StrategyContext): Promise<void> {
+        throw new Error('zz-init-failed');
+      }
+    }
+    await assert.rejects(cm.setStrategy(new Fails()), /zz-init-failed/);
+    for (let i = 0; i < 20; i++) {
+      cm.retractRows([big]);
+      cm.presentRows([big]);
+    }
+    const waiting = cm as unknown as {
+      presentedUnheard: ReadonlyMap<MessageId, unknown>;
+      retractedUnheard: Array<{ left: Array<{ id: MessageId; row?: unknown }> }>;
+    };
+    assert.equal(waiting.presentedUnheard.size, 1, 'the row waits once to be heard entering');
+    assert.equal(waiting.retractedUnheard.length, 20);
+    assert.ok(waiting.retractedUnheard.every((call) => call.left.every((l) => l.row === undefined)), 'no waiting call keeps the row, which the store holds');
+    const strategy = new Records();
+    await cm.setStrategy(strategy);
+    assert.equal(strategy.retracted.length, 20, 'each call is made once a strategy initializes');
+    assert.ok(
+      strategy.retracted.every((l) => l.rows.length === 1 && l.rows[0] === big && l.texts[0]!.length === 100_000),
+      'with the row, read when the call is made',
+    );
+    assert.deepEqual(strategy.presented, [[big]], 'and the row is heard entering once');
+    await settle();
+    cm.close();
+  });
+
   for (const [name, make] of [
     ['passthrough', () => new PassthroughStrategy()],
     ['windowed passthrough', () => new WindowedPassthroughStrategy()],
