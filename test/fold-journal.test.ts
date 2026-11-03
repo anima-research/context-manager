@@ -284,6 +284,37 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it("prices a receipt's rendered tokens at the store's calibration multiplier", async () => {
+    class Calibrating extends ScriptedStrategy {
+      multiplier = 1;
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget): ContextEntry[] {
+        store.setTokenCalibration?.(this.multiplier);
+        return super.select(store, log, budget);
+      }
+    }
+    async function run(baselineAt: number, foldAt: number) {
+      cleanup();
+      const strategy = new Calibrating();
+      strategy.multiplier = baselineAt;
+      const { cm } = await open(strategy);
+      const ids = add(cm, 6);
+      const baseline = await acceptCompile(cm);
+      strategy.multiplier = foldAt;
+      for (const id of ids.slice(1, 4)) strategy.plan.set(id, { summary: 'L1-0', level: 1 });
+      const fold = await acceptCompile(cm);
+      cm.close();
+      return { baseline: baseline!.renderedTokens, fold: fold!.renderedTokens };
+    }
+    const atOne = await run(1, 1);
+    assert.ok(typeof atOne.baseline.after === 'number' && atOne.baseline.after > 0, 'setup: the baseline gives its rendered tokens');
+    assert.ok(typeof atOne.fold.after === 'number' && atOne.fold.after > 0, 'setup: the fold gives its rendered tokens');
+    const foldAt15 = await run(1, 1.5);
+    assert.equal(foldAt15.fold.before, Math.round(atOne.baseline.after * 1.5), "the previous layout, at the fold's 1.5");
+    assert.equal(foldAt15.fold.after, Math.round(atOne.fold.after * 1.5), 'the fold, at 1.5');
+    const baselineAt15 = await run(1.5, 1.5);
+    assert.equal(baselineAt15.baseline.after, Math.round(atOne.baseline.after * 1.5), 'the baseline, at 1.5');
+  });
+
   it('reports a deeper fold, an immediate fold-down from raw, an unfold and window omission', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 8);

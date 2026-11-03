@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
+import { ExactKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-policy.js';
 import { TerminalPolicyEvaluator, type FrontierTrace } from '../../src/adaptive/kv-unified-terminal.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
@@ -48,6 +49,18 @@ test('reusable buckets keep numeric/string identities separate and reset each ge
   }
 });
 
+test('a numeric key outside the dense range is not the string of its digits', () => {
+  const buckets = new PackedBuckets(100);
+  buckets.begin(10);
+  for (const key of [250, -1, 2.5]) {
+    const numeric = buckets.group(key);
+    const text = buckets.group(String(key));
+    assert.notEqual(text, numeric, `${key} and '${key}'`);
+    assert.equal(buckets.group(key), numeric);
+    assert.equal(buckets.group(String(key)), text);
+  }
+});
+
 test('delayed exact evaluation retains captured budgets and partial traces retain default-raw semantics', () => {
   const chronicle = buildChronicleWithChain({ chunkCount: 4, tokensPerChunk: 90, mergeThreshold: 2, recallPairTokens: 55 });
   const inputs: PickerInputs = { chunks: chronicle.chunks, summaries: chronicle.summaries,
@@ -65,6 +78,24 @@ test('delayed exact evaluation retains captured budgets and partial traces retai
   assert.deepEqual(estimated.exact(), expected);
   const partial = evaluator.estimate(null, 360);
   assert.deepEqual(partial.exact(), expected);
+
+  const accepted = buildChronicleWithChain({ chunkCount: 4, tokensPerChunk: 90, mergeThreshold: 2, recallPairTokens: 55 });
+  const acceptedInputs: PickerInputs = { chunks: accepted.chunks, summaries: accepted.summaries,
+    recallPairTokens: accepted.recallPairTokens, headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set() };
+  const acceptedForest = new CanonicalSummaryForest(acceptedInputs);
+  const leaves = new Map(acceptedForest.orderedLeaves().map((leaf) => [leaf.id,
+    { level: 1, repHash: leaf.repHashes[leaf.availableLevels.indexOf(1)], lastChangedSeq: 0 }]));
+  const presented = new TerminalPolicyEvaluator(acceptedInputs, acceptedForest,
+    { maxTokens: 400, presentation: { currentSeq: 10, leaves } });
+  const first = acceptedInputs.chunks[0].id;
+  const estimate = presented.estimate({ parent: null, ids: [first], level: 0 }, 360);
+  const exact = estimate.exact();
+  assert.ok(exact.continuityLoss > 0);
+  assert.ok(estimate.continuity.lower <= exact.continuityLoss && exact.continuityLoss <= estimate.continuity.upper,
+    `continuity ${JSON.stringify(estimate.continuity)} against the default-raw cut's ${exact.continuityLoss}`);
+  assert.ok(estimate.fidelity.lower <= exact.fidelityLoss && exact.fidelityLoss <= estimate.fidelity.upper);
+  assert.equal(estimate.matchesPresentation, exact.matchesPresentation);
 });
 
 test('packed/full and packed/selective agree with object storage, including every retained candidate and error envelope', () => {
@@ -160,4 +191,33 @@ test('trace ancestry survives the 2^18 trace page boundary', () => {
     visited.push(ids[0]);
   });
   assert.deepEqual(visited, expected.reverse());
+});
+
+test('a gridded packed solve over fully tied cuts returns the same candidates on every solve', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 100 });
+  chronicle.produceL1(['a', 'b']);
+  chronicle.produceL1(['c', 'd']);
+  const inputs: PickerInputs = { chunks: chronicle.chunks, summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens, headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set() };
+  const forest = new CanonicalSummaryForest(inputs);
+  const options = { maxTokens: 300, engine: 'dag' as const, policy: { alpha: 0 },
+    tokenBucketSize: 50, continuityBucketSize: 30, fidelityBucketSize: 100 };
+  const exact = new ExactKvUnifiedPolicySolver(inputs, forest).solve(options);
+  assert.ok(exact.feasible);
+  const holding = (a: number, c: number) => exact.candidates.find((candidate) =>
+    ['a', 'b'].every((id) => (candidate.frontier.get(id) ?? 0) === a) && ['c', 'd'].every((id) => (candidate.frontier.get(id) ?? 0) === c));
+  const [first, second] = [holding(1, 0), holding(0, 1)];
+  assert.ok(first && second, 'both cuts holding one L1 are candidates');
+  assert.equal(first.score, second.score, 'the two cuts tie');
+  assert.equal(first.renderedTokens, second.renderedTokens);
+  assert.equal(first.fidelityLoss, second.fidelityLoss);
+  const solved = new ParetoKvUnifiedPolicySolver(inputs, forest).solve(options);
+  assert.ok(solved.feasible);
+  for (let run = 0; run < 20; run++) {
+    const again = new ParetoKvUnifiedPolicySolver(inputs, forest).solve(options);
+    assert.ok(again.feasible);
+    assert.deepEqual(again.candidates, solved.candidates, `solve ${run}`);
+  }
 });
