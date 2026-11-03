@@ -57,9 +57,13 @@
  * existed. (Its provenance differs: the rendered layout says what its
  * members count, RenderedLayout.keyedBy.) A host's first presentation, or
  * its first naming retraction, writes the index down as the window stands
- * then (every row of the record, in record order, then the header; a
- * retraction's tombstones follow in the same write) and the manager is in
- * presented mode on that branch from then on.
+ * then (every row of the record, in record order, then the header) and the
+ * manager is in presented mode on that branch from then on. A retraction's
+ * tombstones are a record of their own, after the write-down's: one the
+ * store refuses after the write-down landed leaves the branch as
+ * presentRows([]) leaves it, in presented mode with the rows it named
+ * still in the window, so a row stored after it is out of the window
+ * until presented, and a retry takes the named rows out of that window.
  *
  * Each write to the index is one record, at one sequence: the write-down,
  * the rows one presentRows call presents, and the tombstones of one call,
