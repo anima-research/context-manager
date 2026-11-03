@@ -712,7 +712,13 @@ export class WindowIndex {
   /**
    * The sequence of the record that presented the row, while it is in the
    * window and its item says: the point a branch cut has to reach for the
-   * branch's window to hold the row.
+   * branch's window to hold the row, for a row a presentRows call
+   * presented. A row the write-down presented (presentedByWriteDown) is the
+   * exception: it was in the window from its own write, and a cut before
+   * the write-down makes a branch in legacy mode, whose window is the
+   * record up to the cut, so a cut at the row's own sequence holds it, and
+   * such a row stays cut there (a body's at its last shard's: see
+   * ContextManager.branchSequenceOf).
    */
   presentedAt(id: MessageId): number | undefined {
     const state = this.current();
