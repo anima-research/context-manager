@@ -10046,14 +10046,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // `priorSummaryMessageIds`.
       //
       // The raw that pins add to this prompt (`pinnedRaw`) is what recalling
-      // their summaries would take out: the messages of opened chunks,
-      // wherever they render, and pinned messages before the head window,
-      // which no prompt showed before. It's spent from the recall budget
-      // before any recall pair. A pinned message from the head window on
-      // that no summary covers was never chunked, since the chunker skips
-      // what pins keep raw; it renders raw with or without the pins and has
-      // no summary to recall, so it isn't charged here. When pins are
-      // admitted, the request's price includes it.
+      // their summaries would take out: the messages of opened chunks the
+      // quarantine doesn't hold, wherever they render, and pinned messages
+      // before the head window, which no prompt showed before. It's spent
+      // from the recall budget before any recall pair. A pinned message from
+      // the head window on that no summary covers was never chunked, since
+      // the chunker skips what pins keep raw; it renders raw with or without
+      // the pins and has no summary to recall, so it isn't charged here. When
+      // pins are admitted, the request's price includes it.
       const rawMiddle: Array<{ position: number; message: StoredMessage }> = [];
       const pinnedRaw: number[] = [];
       let pinnedRawTokens = 0;
@@ -10066,7 +10066,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // that pins add.
         for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
           const m = allMessages[i];
-          if (openedMessageIds.has(m.id) && !priorSummaryMessageIds.has(m.id)) addPinnedRaw(i, m);
+          if (openedMessageIds.has(m.id) && !priorSummaryMessageIds.has(m.id) && !quarantinedIds.has(m.id)) addPinnedRaw(i, m);
         }
         for (let i = 0; i < chunkStartIdx && i < allMessages.length; i++) {
           if (i >= headStartIdx && i < headEndIdx) continue;
@@ -10450,12 +10450,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sourceOnlyFallbackRequestHash,
     );
     const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
-    // The attempt's first read of the ledger, before any model call: while
-    // the ledger can't be read, every attempt that would call the model
-    // stops here, so the error says what that means for the agent. A chunk
-    // adopted, covered or stubbed above needs no model and has returned
-    // before this; the attempt's later reads come after this one; and load,
-    // the sweep and an operator's clear meet the failure in their own terms.
+    // The attempt's first read of the ledger that can stop it, before any
+    // model call: while the ledger can't be read, every attempt that would
+    // call the model stops here, so the error says what that means for the
+    // agent. The layout above read it only for the messages the quarantine
+    // holds, and leaves none out where that read fails. A chunk adopted,
+    // covered or stubbed above needs no model and has returned before this;
+    // the attempt's later reads come after this one; and load, the sweep and
+    // an operator's clear meet the failure in their own terms.
     let durableQuarantine: Map<string, ActiveCompressionQuarantine>;
     try {
       durableQuarantine = this.readCompressionQuarantineProjection();

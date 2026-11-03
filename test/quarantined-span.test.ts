@@ -54,7 +54,11 @@ function summarizer() {
 const context = (manager: ContextManager): StrategyContext =>
   (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 
-const label = (content: unknown) => `raw-${(JSON.stringify(content).match(/raw-(\d+) /) ?? [])[1]} `;
+const label = (content: unknown) => {
+  const n = JSON.stringify(content).match(/raw-(\d+) /)?.[1];
+  assert.ok(n !== undefined, `premise: a fixture message carries its raw-N label (${JSON.stringify(content).slice(0, 80)})`);
+  return `raw-${n} `;
+};
 
 async function quarantinedFirst(name: string, config: Record<string, unknown> = {}) {
   const path = join(dir, name);
@@ -110,14 +114,14 @@ describe('a quarantined span and the requests after it', () => {
   });
 
   it("ticks compress and merge the chunks after the quarantined span, quarantine none of them, and send it in no request", async () => {
-    const fx = await quarantinedFirst('merge', { mergeThreshold: 2, hierarchical: true });
+    const fx = await quarantinedFirst('merge', { mergeThreshold: 2, hierarchical: true, l1HoldbackChunks: 0 });
     const before = fx.requests.length;
     for (let i = 0; i < 30; i++) await fx.strategy.tick(fx.ctx);
     const after = fx.strategy.closedChunks();
     const compressed = after.map((c) => (c.compressed ? 1 : 0)).join('');
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, `the quarantine still holds only the first chunk (compressed: ${compressed})`);
     assert.ok(!fx.strategy.queued(fx.ctx.messageStore), `no compression work is left queued (compressed: ${compressed})`);
-    assert.ok(after[1]!.compressed, `the chunk after the span compressed (compressed: ${compressed})`);
+    assert.ok(after.slice(1).every((c) => c.compressed), `every chunk after the span compressed (compressed: ${compressed})`);
     const sent = fx.requests.slice(before);
     for (const request of sent) for (const text of fx.spanTexts) assert.ok(!request.includes(text), `a request leaves out ${text.trim()}`);
     assert.ok(fx.strategy.merged() > 0, `a merge landed (${JSON.stringify(fx.strategy.getStats())})`);
@@ -357,24 +361,19 @@ describe('a quarantined span and the requests after it', () => {
     await re.manager.close();
   });
 
-  it("with no tools declared, the queued-work count and the relief estimate each read the quarantine once", async () => {
-    const strategy = new ProbeStrategy(CONFIG as never);
-    const { membrane } = summarizer();
-    const manager = await ContextManager.open({ path: join(dir, 'one-read'), strategy, membrane });
-    for (let i = 0; i < 24; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `raw-${i} ${'substantive '.repeat(12)}` }]);
-    await manager.compile();
-    const ctx = context(manager);
-    assert.ok(!(ctx.tools?.length), 'premise: no tools are declared');
+  it("with no tools declared and a quarantined chunk, the queued-work count and the relief estimate each read the quarantine once", async () => {
+    const fx = await quarantinedFirst('one-read');
+    assert.ok(!(fx.ctx.tools?.length), 'premise: no tools are declared');
     let reads = 0;
-    const internals = strategy as unknown as { readCompressionQuarantineProjection(): unknown };
-    const read = internals.readCompressionQuarantineProjection.bind(strategy);
+    const internals = fx.strategy as unknown as { readCompressionQuarantineProjection(): unknown };
+    const read = internals.readCompressionQuarantineProjection.bind(fx.strategy);
     internals.readCompressionQuarantineProjection = () => { reads++; return read(); };
-    assert.ok(strategy.queued(ctx.messageStore), 'premise: a chunk is queued for a model call');
+    assert.ok(fx.strategy.queued(fx.ctx.messageStore), 'premise: a chunk after the quarantined one is queued for a model call');
     const countReads = reads;
     reads = 0;
-    strategy.relief();
+    fx.strategy.relief();
     assert.deepEqual({ count: countReads, estimate: reads }, { count: 1, estimate: 1 }, 'each read the quarantine once');
-    await manager.close();
+    await fx.manager.close();
   });
 
   it("once the quarantine is cleared, the span is back in a later chunk's raw middle", async () => {

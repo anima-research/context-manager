@@ -43,10 +43,10 @@
   `CHUNK_QUARANTINE_SHAPE_CAP` (3) shapes in its request regime, after which
   it is held whatever its request. Each new shape the summarizer refuses
   costs its refused call, plus any fallback calls the ladder makes after it.
-- A held chunk a host has removed a message from is a new chunk to tick, as
-  it was before this change: its refusals are recorded under the messages it
-  has left, which the paid-off sweep can clear as orphaned, so its own
-  retries can go past the cap. It is tried again each time it is queued
-  again, after each new message and at each reopen, as in 0.24.2, and
-  each try the summarizer refuses costs its refused call, plus any
-  fallback calls the ladder makes after it.
+- Under `AutobiographicalStrategy`, a held chunk a host has removed a
+  message from is a new chunk to tick, as it was before this change: its
+  refusals are recorded under the messages it has left, which the paid-off
+  sweep can clear as orphaned, so its own retries can go past the cap. It
+  is tried again each time it is queued again, after each new message and
+  at each reopen, as in 0.24.2, and each try the summarizer refuses costs
+  its refused call, plus any fallback calls the ladder makes after it.
