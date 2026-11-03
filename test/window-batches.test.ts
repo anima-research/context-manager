@@ -679,11 +679,7 @@ describe('a store handle without the batched append', () => {
     }
   });
 
-  // TODO(review4 #16): the open registers the message slot, the context log
-  // and the thinking-binding state before the WindowIndex constructor asks
-  // for the batched append, so a refused open of a fresh store leaves three
-  // registrations behind. Unskip once openOn asks first.
-  it('is refused at open before any state is registered', { skip: 'TODO(review4 #16): openOn registers states before it asks for the batched append' }, async () => {
+  it('is refused at open before any state is registered', async () => {
     const store = JsStore.openOrCreate({ path: freshPath() });
     try {
       const handle = store as unknown as Record<string, unknown>;

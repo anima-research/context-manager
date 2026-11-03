@@ -1202,7 +1202,7 @@ export class WindowIndex {
  * writing nothing. Asked at each such write, as stateHeadOffset is at each
  * read, and once at open (the WindowIndex constructor).
  */
-function requireBatchedIdentityAppend(store: JsStore): void {
+export function requireBatchedIdentityAppend(store: JsStore): void {
   if (typeof (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity === 'function') return;
   throw new Error(
     'ContextManager: the store handle has no appendManyToStateJsonWithIdentity, the identity-stamped batched append of ' +

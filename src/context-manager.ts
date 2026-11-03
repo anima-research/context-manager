@@ -57,7 +57,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
+import { WindowIndex, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -502,6 +502,9 @@ export class WriteLandedError extends Error {
  * holdCompression hold the add placed stays on any row of it that is
  * stored (getCompressionHolds lists it, and releaseCompression releases
  * it).
+ *
+ * A window write (presentRows and the retractions) whose outcome can't be
+ * read throws WindowWriteOutcomeUnknownError instead; see it.
  */
 export class WriteOutcomeUnknownError extends Error {
   readonly landed: readonly MessageId[];
@@ -791,6 +794,9 @@ export class ContextManager {
     ownsStore: boolean,
     config: ContextManagerConfig,
   ): Promise<ContextManager> {
+    // The index refuses a store without the batched append (chronicle 0.6.0
+    // on). Asked first, so a refused open registers no state (#350 review, 16).
+    requireBatchedIdentityAppend(store);
     // Namespace for messages: only when `isolate` is true
     if (config.isolate && !config.namespace) {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
@@ -1765,7 +1771,11 @@ export class ContextManager {
    * stored. A call the store refuses tells it nothing; a call that throws
    * after the store kept part of it tells the strategy the rows that left
    * and entered before it, then throws; a call that completes a body tells
-   * it only the shards that entered then.
+   * it only the shards that entered then. Where the write throws and
+   * the index can't be read again to tell whether it landed, the call
+   * throws WindowWriteOutcomeUnknownError (its `cause` the write's own
+   * error), and the strategy hears what the store kept at the next write
+   * to the window on that branch.
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
@@ -1798,7 +1808,7 @@ export class ContextManager {
         // The rows a failed write got in stay in the window, and no later
         // call presents them again: this is the strategy's one hearing of
         // them, as of the rows it took out. The write's own error is the
-        // one thrown.
+        // one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
         try {
           tellAndHear(leftBefore, enteredBefore);
         } catch (error) {
@@ -1838,6 +1848,10 @@ export class ContextManager {
    * The strategy is told the rows left (ContextStrategy.onRetracted, with
    * `undone` as given) once they are out of the window and before this
    * returns, fire and forget: its failure is logged, and the rows stay out.
+   * A call that throws after the store kept its tombstones tells the
+   * strategy the rows that left, then throws; where the index can't be read
+   * again to tell, it throws WindowWriteOutcomeUnknownError and the
+   * strategy hears at the next write to the window.
    * A row the store no longer holds (one removed through another manager)
    * has no row to give: it is told by its id alone, in a call of its own
    * with `removed`, after the call for the rows the store holds, so a
@@ -1879,7 +1893,7 @@ export class ContextManager {
       const left = this.windowIndex.retract(ids, record, positionOf, info.undone, (cutShort) => {
         // The rows a failed write took out stay out, and no later call
         // takes them out again: this is the strategy's one hearing of them.
-        // The write's own error is the one thrown.
+        // The write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
         try {
           tell(cutShort);
         } catch (error) {
@@ -1907,7 +1921,8 @@ export class ContextManager {
    * the record there, and a removed row has left it already. Unlike
    * retractRows it never writes the window down, nor finishes a write-down
    * cut short, and on an index in another version's format it writes
-   * nothing either.
+   * nothing either. Where its write throws and the index can't be read again, it
+   * throws WindowWriteOutcomeUnknownError, as presentRows does.
    *
    * A row of a slot the manager no longer merges (an auxiliary view
    * dropped from its configuration since the row was presented) reads as
@@ -1941,6 +1956,8 @@ export class ContextManager {
    * (a removal made while the agent wasn't running), and rows whose own
    * removal's tombstone failed. A host runs it at boot. Returns the ids
    * taken out, in window order, and writes nothing when there are none.
+   * Where its write throws and the index can't be read again, it throws
+   * WindowWriteOutcomeUnknownError, as presentRows does.
    *
    * A row of a slot the manager no longer merges (an auxiliary view
    * dropped from its configuration since the row was presented) reads as
@@ -1977,7 +1994,7 @@ export class ContextManager {
       const left = take((cutShort) => {
         // The rows a failed write took out stay out, and a later call passes
         // over them: this is the strategy's one hearing of them here. The
-        // write's own error is the one thrown.
+        // write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
         try {
           tell(cutShort);
         } catch (error) {
