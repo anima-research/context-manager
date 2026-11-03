@@ -3273,6 +3273,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionQueueGeneration++;
     this._compressionCount = 0;
     this._acrossFallbacks = 0;
+    this._dearerReplaced = 0;
     this._drainProgress = 0;
     this._demandedL1Chunks.clear();
     this.chunkRecords = [];

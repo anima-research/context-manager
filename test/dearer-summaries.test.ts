@@ -1141,4 +1141,17 @@ describe('a summary weighed against what it covers, on the hierarchical select',
     assert.equal(f.strategy.getStats().dearerReplaced, 0, 'none after a compile that replaces none');
     await f.manager.close();
   });
+
+  it('a branch opened after a compile that sent a summary\'s messages raw reports none of it', async () => {
+    const f = await built();
+    const dear = f.level(1)[1]!;
+    const everything = f.rawOf(f.all.map((m) => m.id));
+    f.rewrite(dear, 'a long recollection of everything said in those moments '.repeat(Math.ceil((everything * 4 * 1.5) / 57)));
+    const replacing = await f.sent(1_000_000);
+    assert.ok(!replacing.summaries.has(dear.id), `premise: the compile leaves ${dear.id} out`);
+    assert.equal(f.strategy.getStats().dearerReplaced, 1, 'premise: the compile counts it');
+    await f.manager.fork('after-a-replacement');
+    assert.equal(f.strategy.getStats().dearerReplaced, 0, "the new branch's count starts at 0");
+    await f.manager.close();
+  });
 });
