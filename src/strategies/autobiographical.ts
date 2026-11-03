@@ -1264,9 +1264,18 @@ export interface TopologyViolation {
 
 /**
  * Thrown by `initialize` (so by `ContextManager.open`) when the summary
- * archive carries crossed ownership and `topologyPolicy` is `'reject'`.
- * The store is intact; nothing was written. Repair it (or open with
- * `topologyPolicy: 'report'` to inspect) before running a resident on it.
+ * archive carries crossed ownership and `topologyPolicy` is `'reject'`. In
+ * presented mode an open that isn't audit-only first demotes each summary
+ * the audit names (demoteSplitSummaries), and throws for what the audit
+ * still names after that. The open writes before it throws: every open
+ * writes the load-time repairs of what readers can't use (see
+ * `auditOnly`), and one that isn't audit-only also writes the chunk
+ * records it cuts at the frontier, the merge queue it sanitizes and, in
+ * presented mode, what it demotes and lets go of. Repair the store before
+ * running a resident on it. An open with `topologyPolicy: 'report'` and
+ * `auditOnly: true` records the violations and changes none of them, so it
+ * can inspect the store, but it still writes the load-time repairs: to
+ * inspect the store as it is, open a copy of it.
  */
 export class StoreTopologyError extends Error {
   constructor(readonly violations: TopologyViolation[]) {
@@ -1277,8 +1286,9 @@ export class StoreTopologyError extends Error {
           `L${v.level} ${v.id} (${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
           `${v.holeOwners.length ? ` owned by ${v.holeOwners.join('/')}` : ''})`).join('; ') +
         (violations.length > 8 ? `; +${violations.length - 8} more` : '') +
-        `. Repair the store, or open it with topologyPolicy: 'report' and auditOnly: true to inspect it as it stands` +
-        ` (a 'report' open without auditOnly runs the load-time repairs).`,
+        `. Repair the store, or open it with topologyPolicy: 'report' and auditOnly: true to inspect it` +
+        ` (that open still writes the load-time repairs of what readers can't use, and a 'report' open without auditOnly` +
+        ` writes every repair: to inspect the store as it is, open a copy of it).`,
     );
     this.name = 'StoreTopologyError';
   }
