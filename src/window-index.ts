@@ -98,9 +98,11 @@
  *
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header
- * to say whose they are. The manager reads the window as the record there,
- * with a warning, and refuses to present or retract, so it never writes its
- * items into a log another format keeps.
+ * to say whose they are, and a state that holds no list of items at all: a
+ * value of another kind, one that isn't JSON, or records the store can't
+ * read back as one value. The manager reads the window as the record there,
+ * with a warning that says what the state holds, and refuses to present or
+ * retract, so it never writes its items into a state another format keeps.
  *
  * Not to be confused with two other senses of the word in this package:
  * kv-unified's presentation receipts (a provider submission's leaf layout)
@@ -270,6 +272,13 @@ interface IndexState {
   otherFormat: number | null;
   /** How many items this version can't read. */
   unreadable: number;
+  /**
+   * What the state holds where it holds no list of items this version can
+   * read, as an error names it: a value of another kind, one that isn't
+   * JSON, or records the store can't read back as one value. Null for a
+   * list, and for no value.
+   */
+  found: string | null;
 }
 
 /** Bumped for every new reading or change of any index, so versions never repeat. */
@@ -289,20 +298,65 @@ function emptyState(branchId: unknown, revision: number | null): IndexState {
     header: null,
     otherFormat: null,
     unreadable: 0,
+    found: null,
   };
 }
 
 /**
- * Why this version must not write to the index, or null: a header naming
- * another format, or, with no header, items it can't read, which some other
- * format's write-down left. The window reads as the record there.
+ * Why this version must not write to the index, or null: a state that
+ * holds no list of items (found), a header naming another format, or, with
+ * no header, items it can't read, which some other format's write-down
+ * left. The window reads as the record there.
  */
 function foreignness(state: IndexState): string | null {
+  if (state.found !== null) return `holds ${state.found}`;
   if (state.otherFormat !== null) return `is in format ${state.otherFormat}, which this version (format ${INDEX_FORMAT}) doesn't read`;
   if (state.header === null && state.unreadable > 0) {
     return `holds ${state.unreadable} item(s) this version can't read and no header naming their format`;
   }
   return null;
+}
+
+/**
+ * What a state whose value `getStateJson` threw on holds, as foreignness
+ * names it, or the error thrown on: a value that isn't JSON, where the
+ * store reads the value's bytes and they don't parse, or records the store
+ * can't read back as one value, where reading the bytes fails with
+ * chronicle's deserialization error (`Deserialization error: …`, matched
+ * by its prefix, as state-registration.ts matches a duplicate
+ * registration: chronicle gives no code), as an item appended to a
+ * snapshot's value leaves. Both are what the state holds, read after read.
+ * Any other failure, a store that can't be read now, throws `error`, and
+ * so do bytes that parse: the read failed some other way.
+ */
+function unreadableValue(store: JsStore, stateId: string, error: unknown): string {
+  let raw: Buffer | null;
+  try {
+    raw = store.getState(stateId);
+  } catch (rawError) {
+    const message = describeThrown(rawError);
+    if (message.startsWith('Deserialization error: ')) return `records the store can't read back as one value (${message})`;
+    throw error;
+  }
+  if (raw === null) throw error;
+  try {
+    JSON.parse(raw.toString('utf8'));
+  } catch {
+    return `a value that isn't JSON (${describeThrown(error)})`;
+  }
+  throw error;
+}
+
+/** A JSON value's kind as foreignness names it, with the start of the value: `an object ({"a":1})`. */
+function kindOf(value: unknown): string {
+  const kind = typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+  let shown: string;
+  try {
+    shown = JSON.stringify(value) ?? String(value);
+  } catch {
+    return kind;
+  }
+  return `${kind} (${shown.length > 80 ? `${shown.slice(0, 80)}…` : shown})`;
 }
 
 /**
@@ -558,12 +612,23 @@ export class WindowIndex {
   private read(branchId: unknown, revision: number | null): IndexState {
     const state = emptyState(branchId, revision);
     if (revision === null) return state;
-    const items = this.store.getStateJson(this.stateId) as unknown;
-    if (!Array.isArray(items)) return state;
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i] as { at?: unknown } | null;
-      const at = typeof item?.at === 'number' ? item.at : undefined;
-      apply(state, item, i, at);
+    let items: unknown;
+    try {
+      items = this.store.getStateJson(this.stateId);
+    } catch (error) {
+      // A value the store can't give as JSON is no index this version
+      // reads, as one of another kind isn't; a read that fails another way
+      // is thrown, so the next read tries again.
+      state.found = unreadableValue(this.store, this.stateId, error);
+    }
+    if (state.found === null && Array.isArray(items)) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i] as { at?: unknown } | null;
+        const at = typeof item?.at === 'number' ? item.at : undefined;
+        apply(state, item, i, at);
+      }
+    } else if (state.found === null && items !== null && items !== undefined) {
+      state.found = `${kindOf(items)}, not a list of index items`;
     }
     const foreign = foreignness(state);
     if (foreign !== null) {
@@ -1035,6 +1100,7 @@ export class WindowIndex {
       header: state.header,
       otherFormat: state.otherFormat,
       unreadable: state.unreadable,
+      found: state.found,
     };
   }
 

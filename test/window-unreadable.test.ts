@@ -8,14 +8,21 @@
  *   settled at the next write through the index, on the branch it was made
  *   on: the strategy then hears the rows that entered or left, once, before
  *   that call's own work, and hears nothing of a write the store refused.
+ * - A window state that holds no index this version reads, a value that
+ *   isn't a list of items or one the store can't read back: the window is
+ *   the record, with one warning saying what the state holds, and
+ *   presentRows and retractRows refuse to write to it, saying so; nothing
+ *   is written, and a reopen reads the same. A read that fails another way
+ *   throws, and the next read reads the index.
  */
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, WindowWriteOutcomeUnknownError, windowIndexStateId } from '../src/index.js';
-import type { MessageId, StoredMessage } from '../src/index.js';
+import type { CompileResult, MessageId, StoredMessage } from '../src/index.js';
 
 const BASE = './test-window-unreadable';
 let storeSeq = 0;
@@ -33,6 +40,24 @@ after(() => {
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const INDEX = windowIndexStateId('zz-agent');
+const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
+
+/** The first text of each compiled message, in order. */
+function texts(result: CompileResult): string[] {
+  return result.messages.map((m) => (m.content.find((b) => b.type === 'text') as { text: string } | undefined)?.text ?? '');
+}
+
+/** Runs `fn`, keeping what it warns. */
+async function warnings<T>(fn: () => Promise<T>): Promise<{ value: T; warned: string[] }> {
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+  try {
+    return { value: await fn(), warned };
+  } finally {
+    console.warn = warn;
+  }
+}
 
 /** Passthrough that keeps each onPresented and onRetracted call, in one log. */
 class Hearing extends PassthroughStrategy {
@@ -209,4 +234,102 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       cm.close();
     });
   }
+});
+
+describe('a window state that holds no index this version reads', () => {
+  const cases: Array<[label: string, setUp: (store: JsStore) => void, says: RegExp]> = [
+    ['an object', (store) => {
+      store.registerState({ id: INDEX, strategy: 'snapshot' });
+      store.setStateJson(INDEX, { someone: 'else', n: 1 });
+    }, /holds an object \(\{"someone":"else","n":1\}\), not a list of index items/],
+    ['a string', (store) => {
+      store.registerState({ id: INDEX, strategy: 'snapshot' });
+      store.setStateJson(INDEX, 'zz');
+    }, /holds a string \("zz"\), not a list of index items/],
+    ['bytes that aren\'t JSON', (store) => {
+      store.registerState({ id: INDEX, strategy: 'snapshot' });
+      store.setState(INDEX, Buffer.from([0xff, 0x00, 0x13]));
+    }, /holds a value that isn't JSON \(.+\)/],
+    // A snapshot value with an item appended after it: the store can't
+    // rebuild one value from its records.
+    ['records the store can\'t read back', (store) => {
+      store.registerState({ id: INDEX, strategy: 'snapshot' });
+      store.setStateJson(INDEX, { someone: 'else' });
+      store.appendToStateJsonWithIdentity(INDEX, { id: 'zz-x' }, 'by', 'at');
+    }, /holds records the store can't read back as one value \(Deserialization error: .+\)/],
+    ['an item that isn\'t JSON', (store) => {
+      store.registerState({ id: INDEX, strategy: 'append_log' });
+      store.appendToState(INDEX, Buffer.from([0xff, 0x00]));
+    }, /holds records the store can't read back as one value \(Deserialization error: .+\)/],
+  ];
+  for (const [label, setUp, says] of cases) {
+    it(`${label}: the window is the record, with one warning, and presentRows and retractRows refuse to write to it`, async () => {
+      const path = freshPath();
+      const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+      const store = cm.getStore();
+      setUp(store);
+      const revision = store.stateHeadOffset(INDEX);
+      const { warned } = await warnings(async () => {
+        assert.equal(cm.windowMode(), 'legacy');
+        assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b']);
+        assert.equal(cm.getPresentedMessages(), cm.getAllMessages());
+        assert.equal(cm.ordinalOf(a!), undefined);
+        assert.equal(cm.indexLength(), 0);
+        assert.deepEqual(cm.getUnpresentedMessages(), []);
+        const refused = new RegExp(`the window index of branch main ${says.source}, so this version writes nothing to it`);
+        assert.throws(() => cm.presentRows([]), refused);
+        assert.throws(() => cm.presentRows([b!]), refused);
+        assert.throws(() => cm.retractRows([a!]), refused);
+        cm.retractRows([]);
+        assert.deepEqual(cm.retractAbsentRows(), []);
+        assert.deepEqual(cm.retractRemoved([a!]), []);
+      });
+      const lines = warned.filter((line) => line.includes('window index'));
+      assert.equal(lines.length, 1, warned.join('\n'));
+      assert.match(lines[0]!, new RegExp(`the window index of branch main ${says.source}; the window there is the record \\(legacy mode\\)`));
+      assert.equal(store.stateHeadOffset(INDEX), revision, 'nothing is written');
+      cm.close();
+
+      const reopened = await warnings(async () => {
+        const again = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+        try {
+          assert.equal(again.windowMode(), 'legacy');
+          assert.deepEqual(texts(await again.compile(BIG)), ['a', 'b'], 'a reopen reads the record');
+        } finally {
+          again.close();
+        }
+      });
+      assert.equal(reopened.warned.filter((line) => line.includes('window index')).length, 1);
+    });
+  }
+
+  it('a read that fails another way throws, and isn\'t kept: the next read reads the index', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([]);
+    const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const b = other.addMessage('alice', [text('b')]);
+    other.presentRows([b]);
+    other.close();
+    // The index moved under cm, which reads it again at its next read.
+    const store = cm.getStore() as unknown as { getStateJson: (id: string) => unknown };
+    const read = store.getStateJson;
+    let fail = true;
+    store.getStateJson = function (this: unknown, id: string) {
+      if (id === INDEX && fail) {
+        fail = false;
+        throw new Error('zz-io-failed');
+      }
+      return read.call(this, id);
+    };
+    try {
+      assert.throws(() => cm.windowMode(), /zz-io-failed/);
+      assert.equal(cm.windowMode(), 'presented');
+      assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b]);
+    } finally {
+      store.getStateJson = read;
+    }
+    cm.close();
+  });
 });
