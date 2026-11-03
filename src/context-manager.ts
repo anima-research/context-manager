@@ -428,10 +428,12 @@ export class InitializationSupersededError extends Error {
  * ends the event before a host's onMessage listener hears it, and before
  * the strategy does in legacy mode, where a sharded write that fails tells
  * the strategy of none of its shards. Once a host presents rows on the
- * branch, the rows are out of the window until it presents them
- * (presentRows(landed)), as for any add. Where the add placed a
- * holdCompression hold on them, it stays: releaseCompression(landed)
- * releases it.
+ * branch, a row is out of the window until it is presented, as for any
+ * add, but a host's listener of the add may have presented one already, as
+ * a host that presents each row as it is stored does: present only the
+ * rows of `landed` that windowStatusOf reads `'out'`, since presentRows
+ * refuses a row the window holds. Where the add placed a holdCompression
+ * hold on them, it stays: releaseCompression(landed) releases it.
  */
 export class WriteLandedError extends Error {
   readonly landed: readonly MessageId[];
@@ -493,11 +495,13 @@ export class WriteLandedError extends Error {
  * can't tell from this error whether doing so stores it twice: a read of
  * the store, once it reads, tells.
  *
- * As for WriteLandedError, the add may have gone unheard; the rows `landed`
- * names are out of the window until a host presents them, once it presents
- * rows on the branch; and a holdCompression hold the add placed stays on any
- * row of it that is stored (getCompressionHolds lists it, and
- * releaseCompression releases it).
+ * As for WriteLandedError, the add may have gone unheard; once a host
+ * presents rows on the branch, a row of `landed` is out of the window until
+ * it is presented, unless a listener of the add presented it already, so a
+ * host presents only those windowStatusOf reads `'out'`; and a
+ * holdCompression hold the add placed stays on any row of it that is
+ * stored (getCompressionHolds lists it, and releaseCompression releases
+ * it).
  */
 export class WriteOutcomeUnknownError extends Error {
   readonly landed: readonly MessageId[];

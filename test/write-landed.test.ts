@@ -240,6 +240,35 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     cm.close();
   });
 
+  it("where a host's listener presented shards that stayed, presenting the rows of landed that read 'out' completes the body", async () => {
+    for (const failing of ['own listener', 'store'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+      cm.presentRows([]);
+      // The host presents each row as it is stored. The manager's own
+      // listener failing on the second shard ends that event before the
+      // host's hears it; the store refusing the third leaves two presented.
+      cm.onMessage((event) => { if (event.type === 'add') cm.presentRows([event.message.id]); });
+      const messages = internals(cm).messageStore;
+      if (failing === 'own listener') failOwnListenerAfterAdd(cm, 2, new Error('propagation failed'));
+      else {
+        const append = messages.append.bind(messages);
+        messages.append = (...args: Parameters<MessageStore['append']>) => {
+          if (args[4]?.shardIndex === 2) throw new Error('disk full');
+          return append(...args);
+        };
+      }
+      failRemoval(cm);
+      const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+      assert.ok(err instanceof WriteLandedError, `${failing}: a WriteLandedError, not ${String(err)}`);
+      const statuses = err.landed.map((id) => cm.windowStatusOf(id));
+      assert.deepEqual(statuses, failing === 'own listener' ? ['in', 'out'] : ['in', 'in'], `${failing}, setup: the listener presented what it heard`);
+      if (failing === 'store') assert.throws(() => cm.presentRows(err.landed), /in the window already/, 'presenting every row of landed is refused');
+      cm.presentRows(err.landed.filter((id) => cm.windowStatusOf(id) === 'out'));
+      assert.deepEqual(err.landed.map((id) => cm.windowStatusOf(id)), ['in', 'in'], failing);
+      cm.close();
+    }
+  });
+
   it("a shard the store refused isn't named: the error names the shards stored before it", async () => {
     const diskFull = new Error('disk full');
     const { real, store, state } = flakyStore(freshPath(), diskFull);
