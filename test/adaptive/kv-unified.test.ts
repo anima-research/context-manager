@@ -184,6 +184,39 @@ test('kv-unified intersects locks and pins instead of choosing precedence', () =
   );
 });
 
+test("a constraint conflict's certificate names every leaf that conflicts, not only the first", () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  for (const id of ['a', 'b']) {
+    const chunk = chronicle.addChunk({ id, rawTokens: 100, lockedByAgent: true });
+    chronicle.produceL1([id]);
+    chunk.currentResolution = 0;
+    chunk.pinLevel = 1;
+  }
+
+  const result = new CanonicalSummaryForest(inputsOf(chronicle)).minimumTokens(1_000);
+  assert.equal(result.feasible, false);
+  if (result.feasible) return;
+  assert.equal(result.certificate.reason, 'constraint-conflict');
+  assert.deepEqual(result.certificate.bindingLeaves.map((conflict) => conflict.leafId), ['a', 'b']);
+});
+
+test('a wall one token under the floor is infeasible, and the floor itself is feasible', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 50 });
+  for (const id of ['a', 'b', 'c']) chronicle.addChunk({ id, rawTokens: 100 });
+  chronicle.produceL1(['a', 'b']);
+  const forest = new CanonicalSummaryForest(inputsOf(chronicle));
+  const unbounded = forest.minimumTokens();
+  assert.equal(unbounded.feasible, true);
+  if (!unbounded.feasible) return;
+  const floor = unbounded.floorTokens;
+  assert.equal(floor, 150, "premise: the floor is a and b's L1 (50) and c raw (100)");
+  assert.equal(forest.minimumTokens(floor).feasible, true, 'a wall at the floor fits');
+  const under = forest.minimumTokens(floor - 1);
+  assert.equal(under.feasible, false, 'a wall one token under the floor does not');
+  if (under.feasible) return;
+  assert.equal(under.certificate.reason, 'over-budget');
+});
+
 test('kv-unified holds a level pin at the deepest level its chain supplies until the pinned one exists (#193)', () => {
   const chronicle = new MockChronicle({ recallPairTokens: 50 });
   const a = chronicle.addChunk({ id: 'a', rawTokens: 100 });
