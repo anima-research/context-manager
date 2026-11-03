@@ -914,6 +914,15 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       const initializing = hooked ? new Gated() : new Unhooked();
       initializing.gate = gate;
       const next = autobiographical();
+      // The strategy set in its place lets go of the row at its initialize
+      // too (the load-time repair of a row out of the window), so what it
+      // keeps can't tell whether the queued call reached it: the spy can.
+      const told: MessageId[] = [];
+      const onRetracted = next.onRetracted.bind(next);
+      next.onRetracted = (rows, ctx, info) => {
+        told.push(...(info.ids ?? rows.map((r) => r.id)));
+        return onRetracted(rows, ctx, info);
+      };
       await linesDuring(async () => {
         const first = cm.setStrategy(initializing);
         cm.retractRows([row], { undone: true });
@@ -923,6 +932,7 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
         await replaced;
       });
       const label = hooked ? 'control' : 'probe';
+      assert.deepEqual(told, [row], `${label}: the call queued while the first strategy initialized reaches the one set in its place`);
       assert.ok(!coveredRows(cm, next).has(row), `${label}: no summary covers the row that left`);
       const result = await cm.compile(BIG);
       assert.ok(!renderedRows(cm, result).includes(row), `${label}: the compile omits the row that left`);
