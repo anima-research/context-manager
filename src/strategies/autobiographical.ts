@@ -5845,33 +5845,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Quarantine a family whose ladder ended with no summary, with its record
    * (`outcomes`), and say what became of it:
+   *  - 'left': `spanInWindow` says a row of the chunk's span left the
+   *    window (windowLost), and nothing is written: the chunk's record is
+   *    compressed again over the rows it keeps, so the family's chunk is
+   *    gone;
    *  - 'written': the record is written, with its alert;
    *  - 'held': the ledger already holds a record under this key, which
    *    stands, and nothing is written. In this process a ladder never runs
    *    for a quarantined chunk, so only another process can have written it;
    *  - 'dropped': `familyOpen` says the family was dropped while its ladder
    *    ran (minted, cleared or swept), and it isn't brought back.
-   * Both are asked under the ledger's lock, the lock an operator's clear
-   * drops a family's progress under, the held key first, so a family another
-   * process quarantined isn't reported dropped. A drop before the ladder
-   * first saw its family's progress isn't seen (see familyOpen's comment).
-   * Undefined when nothing was decided: with no store, or when the branch
-   * stopped being current, which the caller checks after.
+   * Each is asked under the ledger's lock, the lock an operator's clear
+   * drops a family's progress under: the span first, as the caller asked it
+   * before the wait for the lock, since a row can leave during the wait;
+   * then the held key, so a family another process quarantined isn't
+   * reported dropped. A drop before the ladder first saw its family's
+   * progress isn't seen (see familyOpen's comment). Undefined when nothing
+   * was decided: with no store, or when the branch stopped being current,
+   * which the caller checks after.
    */
   private async exhaustCompressionRequestFamily(
     source: CompressionOperationBranch,
     record: CompressionRefusalQuarantineRecord,
     outcomes: CompressionRefusalOutcomeRecord[],
     familyOpen: () => boolean,
-  ): Promise<'written' | 'held' | 'dropped' | undefined> {
+    spanInWindow: () => boolean,
+  ): Promise<'left' | 'written' | 'held' | 'dropped' | undefined> {
     if (!this.store) return undefined;
-    let exhaustion: 'written' | 'held' | 'dropped' | undefined;
+    let exhaustion: 'left' | 'written' | 'held' | 'dropped' | undefined;
     await withCompressionStateLock(
       this.store,
       source.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
+      if (!spanInWindow()) {
+        exhaustion = 'left';
+        return;
+      }
       const current = this.readCompressionQuarantineProjection();
       if (current.has(record.key)) {
         exhaustion = 'held';
@@ -5908,7 +5919,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * span writes nothing when it lands: no L1, which would cover a row the
    * window no longer holds, and, when it ends with no summary, no
    * quarantine record for a chunk that is gone, since its record is
-   * compressed again over the rows it keeps.
+   * compressed again over the rows it keeps. An exhaustion asks it before
+   * it waits for the quarantine ledger's lock, and again under the lock
+   * (exhaustCompressionRequestFamily's 'left'), since a row can leave
+   * during the wait.
    */
   private spanLeftWindowMidRequest(chunk: Chunk): boolean {
     if (!this._spanLeftWindow.has(chunk)) return false;
@@ -11075,6 +11089,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // drops the progress by its own rule. Across processes nothing
       // coordinates.
       const familyOpen = (): boolean => !progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey);
+      /** No row of the chunk's span has left the window (windowLost marks it), asked again under the ledger's lock. */
+      const spanInWindow = (): boolean => !this._spanLeftWindow.has(chunk);
       /** The opt-in compression log's line for an exhaustion, at either exit: the record the ladder wrote. */
       const logExhausted = (): void => logCompressionCall({
         event: 'compression:curve-exhausted',
@@ -11091,14 +11107,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }, this.ns);
       /**
        * What either exhaustion exit does once the family's exhaustion is
-       * decided: a family dropped meanwhile is reported; one whose record the
+       * decided: a span a row left while the ledger's lock was awaited is
+       * reported, as the check before the wait reports it, and nothing else
+       * is done; a family dropped meanwhile is reported; one whose record the
        * ledger now holds, this ladder's or another process's, has its
        * progress forgotten, and tick is told that its request won't go again
        * (onRequestStopped), so tick ends the chunk's runs; and only a record
        * this ladder wrote is logged.
        */
-      const settleExhaustion = (exhaustion: 'written' | 'held' | 'dropped' | undefined): void => {
+      const settleExhaustion = (exhaustion: 'left' | 'written' | 'held' | 'dropped' | undefined): void => {
         if (exhaustion === undefined) return;
+        if (exhaustion === 'left') {
+          this.spanLeftWindowMidRequest(chunk);
+          return;
+        }
         if (exhaustion === 'dropped') {
           this.logCompressionFamilyDropped(chunk, quarantineRecord);
           return;
@@ -12018,7 +12040,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           if (this.spanLeftWindowMidRequest(chunk)) return;
-          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
+          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           settleExhaustion(exhaustion);
           return;
@@ -12154,7 +12176,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           for (const outcome of ended) noteOutcome(outcome);
-          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
+          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow);
           if (this.isCompressionBranchCurrent(sourceBranch)) settleExhaustion(exhaustion);
         }
         return;
