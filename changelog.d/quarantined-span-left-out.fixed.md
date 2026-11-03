@@ -1,18 +1,32 @@
-- `AutobiographicalStrategy` no longer sends the messages of a chunk the
-  compression quarantine holds in the requests that compress the chunks after
-  it, or in merges over them. Those requests could carry the held chunk,
-  which stays raw: between the head window and the chunk or merge range (the
-  raw middle), and in the head window itself where the head had grown over
-  the chunk. Where the summarizer had refused the held chunk for its content,
-  it could refuse those requests too, and the recall-curve retries reuse the
+- `AutobiographicalStrategy`, and `KnowledgeStrategy`, which extends it, no
+  longer send the messages of a chunk the compression quarantine holds in the
+  requests that compress the chunks after it, in merges over them, or in a
+  transition summary (`generateTransitionSummary()`). Those requests could
+  carry the held chunk, which stays raw: between the head window and the
+  chunk or merge range (the raw middle), and in the head window itself where
+  the head had grown over the chunk, as reopening a store with a larger
+  `headWindowTokens` can make it, and a transition summary quotes that head
+  window. Where the summarizer had refused the held chunk for its content, it
+  could refuse those requests too, and the recall-curve retries reuse the
   rest of the request, so unless `compressionSourceOnlyFallback` was on, the
   chunks after it could be quarantined in turn and stay raw. Those requests
   now leave the held chunk's messages out, as they already left out what a
   summary covers, including after a host removes one of its messages. A
-  store whose quarantine holds no chunk sends the same requests as before.
-  Once the quarantine no longer holds the chunk, as after
+  pinned message inside a held chunk is left out too, and
+  `compressionWorkQueued`'s count leaves it out the same way. A store whose
+  quarantine holds no chunk sends the same requests as before. Once the
+  quarantine no longer holds the chunk, as after
   `clearCompressionRefusalQuarantine()`, the requests after it no longer
   leave its messages out.
+- A quarantine record now keeps its chunk's message ids, so a held chunk's
+  messages stay out of those requests wherever they now sit, also where a
+  reopen has cut the chunks again, as `KnowledgeStrategy`'s reopen does,
+  since it keeps no chunk records. A record written before this release
+  keeps only the hash of its chunk's ids, and is matched against the chunks
+  as they are now, as before, so under `KnowledgeStrategy` it can stop
+  holding them once a reopen cuts the chunks again. Where a reopen puts a
+  held message inside a later chunk, that chunk's own request carries it,
+  and the chunk is tried as a new chunk.
 - A chunk quarantined because its request carried a held chunk now has a
   request of another shape, so its next compression is a fresh attempt,
   unless the quarantine already holds that request or its family, or the

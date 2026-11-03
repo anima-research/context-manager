@@ -998,6 +998,7 @@ interface CompressionRefusalQuarantineRecord {
   familyKey: string;
   model: string;
   chunkSourceHash: string;
+  sourceIds?: string[];
   frontierHash: string;
   canonicalRequestHash: string;
   accountingSource: string;
@@ -6507,7 +6508,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const deferredForTools: (chunk: Chunk) => boolean =
       (tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
-          : store ? this.requestCarriesToolBlocks(store) : () => false;
+          : store ? this.requestCarriesToolBlocks(store, quarantined) : () => false;
     const expected = new Map<number, number>();
     let total = 0;
     if (quarantined && !this.speculativeCapHolds()) {
@@ -6611,7 +6612,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     canonicalProviderInputTokens?: number,
     sourceOnlyFallbackRequestHash?: string,
   ): CompressionRefusalQuarantineRecord {
-    const chunkSourceHash = sha256Json(chunk.messages.map((message) => message.id));
+    const sourceIds = chunk.messages.map((message) => message.id);
+    const chunkSourceHash = sha256Json(sourceIds);
     const frontierHash = sha256Json(
       keptSummaries.map((summary) => ({ id: summary.id, level: summary.level })),
     );
@@ -6664,6 +6666,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       familyKey,
       model,
       chunkSourceHash,
+      sourceIds,
       frontierHash,
       canonicalRequestHash,
       accountingSource: COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
@@ -9994,7 +9997,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // stay declared (reasoning_extraction guard). L1 only; merge/transition
     // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const quarantinedIds = this.quarantinedMessageIds();
+    const quarantinedIds = this.quarantinedMessageIds(this.quarantinedChunkSources());
 
     // History before the chunk, laid out for the messages that pins keep raw.
     const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
@@ -10036,8 +10039,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // and the compression quarantine doesn't hold (the raw middle: usually
       // empty in adaptive-resolution mode, since chunking proceeds
       // contiguously and summaries cover everything up to the chunk being
-      // processed). Before it, only what pins keep raw: the chunks a pin
-      // opened, and pinned messages no recall pair represents.
+      // processed). Before it, only what pins keep raw and the quarantine
+      // doesn't hold: the chunks a pin opened, and pinned messages no recall
+      // pair represents.
       // Same one-to-one rule as the head: coverage is judged against
       // `priorSummaryMessageIds`.
       //
@@ -12676,7 +12680,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of priorSummariesAll) {
       this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
     }
-    const quarantinedIds = this.quarantinedMessageIds();
+    const quarantinedIds = this.quarantinedMessageIds(this.quarantinedChunkSources());
 
     // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
     //
@@ -13592,11 +13596,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Until the host has declared its tools, tick defers a chunk it would
     // call the model for when its request carries tool blocks, or every such
     // chunk when the summarizer refuses requests without them.
+    const quarantined = this.quarantinedChunkSources();
     const deferredForTools: (chunk: Chunk) => boolean =
       (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
-          : this.requestCarriesToolBlocks(store);
-    const quarantined = this.quarantinedChunkSources();
+          : this.requestCarriesToolBlocks(store, quarantined);
     // A chunk that folds nothing frees no room once it has an L1. Tick still
     // takes such a chunk in turn, so the walk goes past it where tick does.
     // Tick takes the queued chunks in order, one a call, and a host's tick
@@ -13637,9 +13641,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * head window off, headWindowTokens <= 0), that's every message the coverage
    * leaves uncovered and the compression quarantine doesn't hold
    * (quarantinedMessageIds), up to the chunk or to that head's end, whichever
-   * is later. Before it, only what pins keep raw: the
-   * messages of an L1 a pin opens, and a pinned message. Tick lays its
-   * history out without the pins when the raw they add doesn't fit, so the
+   * is later. Before it, only what pins keep raw and the quarantine doesn't
+   * hold: the messages of an L1 a pin opens, and a pinned message. Tick lays
+   * its history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
    * tool blocks first. So this can say yes where tick's request has none,
    * never the reverse. The test it returns takes one chunk. Chunks with the
@@ -13649,7 +13653,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * that message comes before the later of the chunk's start and its head's
    * end.
    */
-  private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
+  private requestCarriesToolBlocks(
+    store: MessageStoreView,
+    quarantined: ReadonlyMap<string, readonly MessageId[] | undefined> | undefined,
+  ): (chunk: Chunk) => boolean {
     const all = store.getAll();
     const sourceOnly = this.config.compressionSourceOnly === true;
     const position = new Map(all.map((message, i) => [message.id, i]));
@@ -13677,10 +13684,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (first === undefined) {
         const pinnedIds = new Set(pinned.map((i) => all[i].id));
         const seen = this.recallCoverage(pinnedIds);
-        // Before `from`, the request carries only what pins keep raw: an L1 a
-        // pin opens, and a pinned message. (Either lies before headEnd there,
-        // since from is at most headEnd.)
-        const heldIds = (held ??= this.quarantinedMessageIds());
+        // Before `from`, the request carries only what pins keep raw and the
+        // quarantine doesn't hold: an L1 a pin opens, and a pinned message.
+        // (Either lies before headEnd there, since from is at most headEnd.)
+        const heldIds = (held ??= this.quarantinedMessageIds(quarantined));
         const carried = (message: StoredMessage, i: number): boolean =>
           !seen.coveredMessageIds.has(message.id) && !heldIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
@@ -13694,7 +13701,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The source hashes (chunkSourceHash) of the chunks the compression
-   * quarantine holds under the current budget accounting, from the durable
+   * quarantine holds under the current budget accounting, each with the
+   * chunk's message ids where a record keeps them, from the durable
    * projection tick reads (empty without a store), or undefined when that
    * projection can't be read: tick's own read throws there, so it takes no
    * chunk past it to a model call. Tick skips a chunk the quarantine holds
@@ -13704,32 +13712,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * gets a fresh attempt. Counting none of them under-names that, the safe
    * side: naming work tick won't do tells a host to wait for nothing.
    */
-  private quarantinedChunkSources(): Set<string> | undefined {
+  private quarantinedChunkSources(): Map<string, readonly MessageId[] | undefined> | undefined {
     let projection: Map<string, ActiveCompressionQuarantine>;
     try {
       projection = this.readCompressionQuarantineProjection();
     } catch {
       return undefined;
     }
-    const sources = new Set<string>();
-    for (const active of projection.values()) {
-      if (active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION) {
-        sources.add(active.record.chunkSourceHash);
-      }
+    const sources = new Map<string, readonly MessageId[] | undefined>();
+    for (const { record } of projection.values()) {
+      if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION) continue;
+      const listed = isIdList(record.sourceIds) ? record.sourceIds : undefined;
+      if (!sources.get(record.chunkSourceHash)) sources.set(record.chunkSourceHash, listed);
     }
     return sources;
   }
 
-  private quarantinedMessageIds(): Set<MessageId> {
-    const sources = this.quarantinedChunkSources();
+  private quarantinedMessageIds(sources: ReadonlyMap<string, readonly MessageId[] | undefined> | undefined): Set<MessageId> {
     const ids = new Set<MessageId>();
     if (!sources?.size) return ids;
+    const unlisted = new Set<string>();
+    for (const [hash, listed] of sources) {
+      if (listed) for (const id of listed) ids.add(id);
+      else unlisted.add(hash);
+    }
+    if (unlisted.size === 0) return ids;
     const records = new Map(this.chunkRecords.map((record) => [record.id, record] as const));
     for (const chunk of this.chunks) {
       if (chunk.compressed) continue;
       const record = chunk.recordId === undefined ? undefined : records.get(chunk.recordId);
-      const held = sources.has(sha256Json(chunk.messages.map((m) => m.id)))
-        || (record !== undefined && Array.isArray(record.sourceIds) && sources.has(sha256Json(record.sourceIds)));
+      const held = unlisted.has(sha256Json(chunk.messages.map((m) => m.id)))
+        || (record !== undefined && Array.isArray(record.sourceIds) && unlisted.has(sha256Json(record.sourceIds)));
       if (!held) continue;
       for (const m of chunk.messages) ids.add(m.id);
     }
@@ -17981,7 +17994,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messages = ctx.messageStore.getAll();
     const headStart = this.getHeadWindowStartIndex(ctx.messageStore);
     const headEnd = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
-    const headMessages = messages.slice(headStart, headEnd);
+    const held = this.quarantinedMessageIds(this.quarantinedChunkSources());
+    const headMessages = messages.slice(headStart, headEnd).filter((m) => !held.has(m.id));
 
     // Format head content, truncated to ~2000 tokens (~8000 chars)
     const MAX_HEAD_CHARS = 8000;

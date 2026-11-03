@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageStoreView, StrategyContext } from '../src/types/index.js';
@@ -24,6 +24,13 @@ class ProbeStrategy extends AutobiographicalStrategy {
   head(store: MessageStoreView, pos: number): { start: number; end: number } { return this.headAsOf(store, pos); }
   merged(): number { return this.summaries.filter((s) => s.level >= 2).length; }
   queued(store: MessageStoreView): boolean { return this.compressionWorkQueued(store, 'hierarchical'); }
+  relief(): number { return this.queuedReliefTokens(); }
+}
+
+class KnowledgeProbe extends KnowledgeStrategy {
+  closedChunks(): Chunk[] { return this.chunks; }
+  run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
+  head(store: MessageStoreView, pos: number): { start: number; end: number } { return this.headAsOf(store, pos); }
 }
 
 function summarizer() {
@@ -231,6 +238,107 @@ describe('a quarantined span and the requests after it', () => {
       const text = label(m.content);
       assert.ok(requests[0]!.includes(text), `the second chunk's request carries the first chunk's ${text.trim()}`);
     }
+    await manager.close();
+  });
+
+  it("under KnowledgeStrategy, after a reopen whose head window grows over a quarantined chunk, the next chunk's request leaves out that chunk's messages outside its own, and the chunk compresses on its first call", async () => {
+    const path = join(dir, 'knowledge-head');
+    const first = new KnowledgeProbe(CONFIG as never);
+    const one = summarizer();
+    const opened = await ContextManager.open({ path, strategy: first, membrane: one.membrane });
+    for (let i = 0; i < 24; i++) {
+      opened.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `${i === 0 ? `${MARK} ` : ''}raw-${i} ${'substantive '.repeat(12)}` }]);
+    }
+    await opened.compile();
+    const held = first.closedChunks()[0]!;
+    assert.ok(held.messages.some((m) => JSON.stringify(m.content).includes(MARK)), 'premise: the first chunk carries the mark');
+    await first.run(held, context(opened));
+    assert.equal(first.getCompressionQuarantineStatus().count, 1, 'premise: the first chunk was refused into the quarantine');
+    const heldIds = held.messages.map((m) => m.id);
+    await opened.close();
+    const strategy = new KnowledgeProbe({ ...CONFIG, headWindowTokens: 150 } as never);
+    const { membrane, requests } = summarizer();
+    const manager = await ContextManager.open({ path, strategy, membrane });
+    await manager.compile();
+    const ctx = context(manager);
+    const chunk = strategy.closedChunks()[0]!;
+    const own = new Set(chunk.messages.map((m) => m.id));
+    assert.notDeepEqual([...own], heldIds, 'premise: the reopen cut the chunks again');
+    const all = ctx.messageStore.getAll();
+    const head = strategy.head(ctx.messageStore, all.findIndex((m) => m.id === chunk.messages[0]!.id));
+    const marked = all.findIndex((m) => m.id === heldIds[0]);
+    assert.ok(head.start <= marked && marked < head.end, `premise: the head window as of the first chunk holds the marked message ([${head.start},${head.end}) at ${marked})`);
+    const outside = all.filter((m) => heldIds.includes(m.id) && !own.has(m.id)).map((m) => label(m.content));
+    assert.ok(outside.length > 0, 'premise: some of the quarantined chunk lies outside the first chunk');
+    await strategy.run(chunk, ctx);
+    assert.equal(requests.length, 1, `the chunk took one call (${requests.length})`);
+    for (const text of outside) assert.ok(!requests[0]!.includes(text), `its request leaves out the quarantined chunk's ${text.trim()}`);
+    assert.ok(chunk.compressed, 'the chunk compressed');
+    assert.equal(strategy.getCompressionQuarantineStatus().count, 1, 'and the quarantine still holds only the first');
+    await manager.close();
+  });
+
+  it("a quarantine record without its chunk's message ids, as one written before they were kept, still leaves its chunk out of a later chunk's request", async () => {
+    const path = join(dir, 'record-without-ids');
+    const strategy = new ProbeStrategy(CONFIG as never);
+    const internals = strategy as unknown as { compressionRefusalQuarantineRecord(...args: unknown[]): Record<string, unknown> };
+    const build = internals.compressionRefusalQuarantineRecord.bind(strategy);
+    internals.compressionRefusalQuarantineRecord = (...args: unknown[]) => {
+      const record = build(...args);
+      delete record.sourceIds;
+      return record;
+    };
+    const { membrane, requests } = summarizer();
+    const manager = await ContextManager.open({ path, strategy, membrane });
+    for (let i = 0; i < 24; i++) {
+      manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `${i === 0 ? `${MARK} ` : ''}raw-${i} ${'substantive '.repeat(12)}` }]);
+    }
+    await manager.compile();
+    const chunks = strategy.closedChunks();
+    const ctx = context(manager);
+    await strategy.run(chunks[0]!, ctx);
+    assert.equal(strategy.getCompressionQuarantineStatus().count, 1, 'premise: the first chunk was refused into the quarantine');
+    const projection = (strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { record: Record<string, unknown> }> }).readCompressionQuarantineProjection();
+    assert.ok([...projection.values()].every(({ record }) => !('sourceIds' in record)), 'premise: its record keeps no message ids');
+    const spanTexts = chunks[0]!.messages.map((m) => label(m.content));
+    const before = requests.length;
+    await strategy.run(chunks[1]!, ctx);
+    const sent = requests.slice(before);
+    assert.equal(sent.length, 1, `the second chunk took one call (${sent.length})`);
+    for (const text of spanTexts) assert.ok(!sent[0]!.includes(text), `its request leaves out the quarantined chunk's ${text.trim()}`);
+    assert.ok(chunks[1]!.compressed, 'the second chunk compressed');
+    await manager.close();
+  });
+
+  it("a transition summary leaves out a quarantined span its head window has grown over", async () => {
+    const fx = await quarantinedFirst('transition-head');
+    const re = await reopenedWithHead(fx, {});
+    await re.strategy.generateTransitionSummary(re.ctx);
+    assert.equal(re.requests.length, 1, 'premise: the transition summary was asked');
+    for (const text of fx.spanTexts) assert.ok(!re.requests[0]!.includes(text), `its request leaves out the quarantined span's ${text.trim()}`);
+    await re.strategy.clearCompressionRefusalQuarantine();
+    await re.strategy.generateTransitionSummary(re.ctx);
+    assert.ok(fx.spanTexts.some((text) => re.requests[1]!.includes(text)), 'control: with the quarantine cleared, its request quotes the span');
+    await re.manager.close();
+  });
+
+  it("with no tools declared, the queued-work count and the relief estimate each read the quarantine once", async () => {
+    const strategy = new ProbeStrategy(CONFIG as never);
+    const { membrane } = summarizer();
+    const manager = await ContextManager.open({ path: join(dir, 'one-read'), strategy, membrane });
+    for (let i = 0; i < 24; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `raw-${i} ${'substantive '.repeat(12)}` }]);
+    await manager.compile();
+    const ctx = context(manager);
+    assert.ok(!(ctx.tools?.length), 'premise: no tools are declared');
+    let reads = 0;
+    const internals = strategy as unknown as { readCompressionQuarantineProjection(): unknown };
+    const read = internals.readCompressionQuarantineProjection.bind(strategy);
+    internals.readCompressionQuarantineProjection = () => { reads++; return read(); };
+    assert.ok(strategy.queued(ctx.messageStore), 'premise: a chunk is queued for a model call');
+    const countReads = reads;
+    reads = 0;
+    strategy.relief();
+    assert.deepEqual({ count: countReads, estimate: reads }, { count: 1, estimate: 1 }, 'each read the quarantine once');
     await manager.close();
   });
 
