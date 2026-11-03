@@ -338,12 +338,22 @@ export interface ContextStrategy {
    * window; the call that completes that body gives only the shards that
    * enter then. A presentRows that puts a body back whole, its first
    * shard having been out while later ones were in, calls onRetracted for
-   * those later shards first, then this with every shard of the body.
+   * those later shards first, then this with every shard of the body. A
+   * sharded addMessage stores its shards on one branch: where a hook moves
+   * the store's branch between two shards (a host's onMessage listener of
+   * a shard's add), the write stops before the next shard and throws
+   * WriteLandedError naming the shards stored, which stay on the branch it
+   * started on (WriteOutcomeUnknownError where a shard's append threw after
+   * the move), and in legacy mode the strategy hears none of them.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
-   * write that stored it, one row at a time, after a holdCompression hold
-   * is placed, and its synchronous part runs before addMessage returns.
+   * addMessage that stored it, after a holdCompression hold is placed, and
+   * its synchronous part runs before addMessage returns. A sharded add is
+   * told once, after every shard is stored, with every shard, as a
+   * presentRows gives a body; a strategy with only onNewMessage hears each
+   * shard in turn at that point. A sharded write that fails tells the
+   * strategy of none of its shards.
    * Once a host presents rows on the branch, or takes a row out of its
    * window by name (retractRows ends legacy mode too), a stored row isn't
    * heard until it is presented: the call comes from presentRows, once per call, after
@@ -355,10 +365,11 @@ export interface ContextStrategy {
    * calls nothing. While the strategy isn't initialized (it is initializing,
    * or its last initialization failed), the calls from presentRows wait until
    * it is, and then one call carries the rows still in the window, in
-   * window order, each once. So do the calls for an add's later shards in
-   * legacy mode, when a hook of an earlier shard started an initialization:
-   * the rows the record still holds are carried, if the branch the
-   * strategy initialized on is still in legacy mode, and the rows its
+   * window order, each once. So, for a strategy with only onNewMessage, do
+   * the calls for an add's later shards in legacy mode, when its hook for an
+   * earlier shard started an initialization: the rows the record still
+   * holds are carried, if the branch the strategy initialized on is still
+   * in legacy mode, and the rows its
    * window holds, if a host presented there meanwhile. They wait for the manager's strategy, not for
    * this instance: a strategy set with setStrategy() while rows wait hears
    * them after its own initialize, though that initialize read a window
@@ -378,8 +389,10 @@ export interface ContextStrategy {
    * React to rows leaving the agent's window, so that nothing the strategy
    * keeps of them shows the agent a row it no longer holds. Called with the
    * rows that left, in the order the window held them, every shard of a
-   * body, and a context whose view no longer holds them. The window leaves
-   * the record alone: a row that left is still stored unless it was removed.
+   * body, and a context whose view no longer holds them, except where a
+   * presentRows moves a body whole (below): there the view holds the
+   * shards that moved at their new places. The window leaves the record
+   * alone: a row that left is still stored unless it was removed.
    *
    * `info.ids` is every row that left in the call, in the same order, and
    * `rows` the ones among them the manager can give: a row the store holds,
@@ -411,10 +424,23 @@ export interface ContextStrategy {
    *   whose tombstone failed is given all the same, and is given again,
    *   by its id, when retractAbsentRows later takes it out: a strategy
    *   that kept nothing of a row takes such a call as nothing to do.
+   *   Where the window index's ordinals can't be read at the removal, so
+   *   the manager can't tell which rows the window held, every row removed
+   *   is given, with the row as it was and its id, `removed: true`; with no
+   *   ordinal to tell it by, such a call waiting on an initialization is
+   *   made on a branch whose record no longer holds the row. The shards a
+   *   sharded addMessage that fails partway removes, as it removes what it
+   *   stored, are given the same way, with `removed: true`, when a host's
+   *   listener of a shard's add presented them.
    * - from ContextManager.presentRows, for the later shards of a body whose
    *   first shard the window lacked, which leave so that the body enters
    *   whole, with `undone: false` and `removed: false`, before the body is
-   *   heard through onPresented.
+   *   heard through onPresented. The move is one write, which takes the
+   *   shards out of their old places and puts them back after the first
+   *   shard, so this call's view still holds them, at their new places
+   *   (`ctx.messageStore.get(id)` finds them): the call says they left
+   *   their old places, and what covers them there goes, while
+   *   onPresented hears them where they stand now.
    *
    * While the manager is in legacy mode its window is the record, and a
    * removal takes the row out of both at once: nothing calls this, and a
