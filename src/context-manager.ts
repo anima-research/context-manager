@@ -3177,10 +3177,12 @@ export class ContextManager {
    * switchBranch() or fork(). It selects no branch and starts no branch
    * generation, so every manager sharing the store can make it after one
    * move, in turn or at once, and none of them leaves another stale. It
-   * writes nothing to the record. The window index follows the store's
-   * branch on its own, so on a branch made before this manager's write-down
-   * windowMode() reads 'legacy' after the call, and presentRows([]) writes
-   * that branch down.
+   * adds no message and writes no window, but the strategy's initialize may
+   * write its own load-time repairs (AutobiographicalStrategy lets go of a
+   * folded row that left the window unheard, say), so the store's sequence
+   * can advance. The window index follows the store's branch on its own,
+   * so on a branch made before this manager's write-down windowMode() reads
+   * 'legacy' after the call, and presentRows([]) writes that branch down.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.requireOpen('setStrategy');
