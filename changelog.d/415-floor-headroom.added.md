@@ -5,20 +5,26 @@
   included, whatever the folding strategy picked; a compile refuses once its
   plan passes `hardBudget`, and every plan does once the floor does, so
   `hardBudget - floorTokens` is how far the store is from the point where
-  every compile refuses. `queuedReliefTokens` is what the queued L1s and
-  merges are expected to take off the floor once they land. Work tick won't
-  turn into a summary counts as zero: a chunk the compression quarantine
-  holds or deferred for the host's tools, every chunk from the first a
-  compression hold reaches, a merge holding a source a hold or a
-  merge-quarantine record keeps out, and every merge from the first a hold
-  blocks. Under `kv-unified` the floor takes that solver's own constraints,
+  every compile refuses. `queuedReliefTokens` estimates what the queued L1s
+  and merges would take off the floor once they land, each chunk priced as
+  the compile would send it, as the floor prices it. Work the gates tick
+  reads keep from a summary counts as zero: everything without a compression
+  model or a membrane, every chunk while the `maxSpeculativeL1s` cap holds, a
+  chunk the compression quarantine holds or deferred for the host's tools,
+  every chunk from the first a compression hold reaches, a merge holding a
+  source a hold or a merge-quarantine record keeps out or one already
+  merged, and every merge from the first a hold blocks. It doesn't replay
+  the rest of tick (an exact L1 the store holds, the overlap guard, a merge
+  whose covered messages a pin or a lock keeps in the floor), so it is an
+  estimate, not a promise. Under `kv-unified` the floor takes that solver's own constraints,
   locks included, and is exact. The other folding strategies give pins
   precedence over locks in ways those constraints don't follow, so there the
   floor counts no lock. Outside `kv-unified` the floor is a lower bound: a
   floor over `hardBudget` means every compile refuses, and one at or under it
-  doesn't promise a plan fits. A floor that can't be computed leaves the
-  fields out and is said once per cause, and once more by each load that
-  meets it, as `[autobiographical] floor not computed`.
+  doesn't promise a plan fits. A floor that can't be computed, or that no
+  cut can meet, leaves the fields out and is said once per cause, causes
+  that differ only in their numbers counting as one, and once more by each
+  load that meets it, as `[autobiographical] floor not computed`.
 - `OverBudgetDiagnostics` gains `floorTokens` and `queuedReliefTokens` on
   the adaptive refusals that come once the plan is made, when its floor was
   computed, and the refusal's message then names them as `floor=` and

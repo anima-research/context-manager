@@ -6454,43 +6454,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             preserveGapBearingSummaries: kv?.preserveGapBearingSummaries,
           });
       const floor = forest.minimumTokens();
-      this.floorFailure = undefined;
-      return floor.feasible ? floor.floorTokens : null;
-    } catch (error) {
-      // Said once a run of failures with the same cause, as the report goes
-      // missing from every compile while it lasts.
-      const cause = describeCompressionFailure(error);
-      if (cause !== this.floorFailure) {
-        this.floorFailure = cause;
-        this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+      if (!floor.feasible) {
+        const conflicts = floor.certificate.bindingLeaves.length;
+        this.noteFloorFailure(`no cut meets the plan's constraints (${floor.certificate.reason}, ${conflicts} conflicting leaves)`);
+        return null;
       }
+      this.floorFailure = undefined;
+      return floor.floorTokens;
+    } catch (error) {
+      this.noteFloorFailure(describeCompressionFailure(error));
       return null;
     }
   }
 
-  /** What the queued work is expected to take off the floor once it lands:
-   *  each queued chunk's L1 and each queued merge, as the lane prices them
-   *  (chunkRelief, mergeRelief), counting only work that relieves. Work tick
-   *  won't turn into a summary counts as zero, by the gates tick and
-   *  compressionWorkQueued read:
-   *  - a chunk the compression quarantine holds, which every rebuild queues
-   *    again and tick skips, and one deferred for the host's tool
-   *    definitions;
-   *  - from the first chunk a compression hold reaches, every chunk, since
-   *    tick stops there until the hold is released;
-   *  - a merge holding a source an operator hold or a merge-quarantine record
-   *    keeps out (mergeHeldSourceIds), which tick drops, and from the first
-   *    merge a hold blocks, every merge;
-   *  - every merge without a compression model, outside `hierarchical`, or
+  /** Says once, for a run of compiles whose floor is missing for the same
+   *  cause, why it is, since the report goes missing from each while it
+   *  lasts. Causes that differ only in their numbers or ids count as one. */
+  private noteFloorFailure(cause: string): void {
+    const kind = cause.replace(/[0-9a-f]{8,}|\d+/gi, '#');
+    if (kind === this.floorFailure) return;
+    this.floorFailure = kind;
+    this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+  }
+
+  /** An estimate of what the queued work would take off the floor once it
+   *  lands: each queued chunk's L1 and each queued merge, priced as the lane
+   *  prices them (chunkRelief, mergeRelief), counting only work that
+   *  relieves. Work the gates tick reads keep from a summary counts as zero:
+   *  - everything, without a compression model or a membrane;
+   *  - every chunk while the speculative cap holds L1 production;
+   *  - a chunk deferred for the host's tool definitions, and one the
+   *    compression quarantine holds, which every rebuild queues again and
+   *    tick skips, in tick's order: from the first chunk a compression hold
+   *    reaches, every chunk, since tick stops there;
+   *  - a merge holding a source a hold or a merge-quarantine record keeps
+   *    out, or one already merged, which tick drops; from the first merge a
+   *    hold blocks, every merge; and every merge outside `hierarchical` or
    *    while the family waits for the host's tools.
    *  Where the quarantine can't be read, no chunk counts, so the figure errs
-   *  low: a host that waits on it waits for nothing less often. Merges the
-   *  queue doesn't hold yet aren't counted. Unlike compressionWorkQueued it
-   *  doesn't ask which queued messages the selection can fold, which would
-   *  price every message again on each compile: the queue holds the
-   *  chunker's compressible messages, less any a raw pin placed since keeps
-   *  raw. */
+   *  low. It doesn't replay the rest of tick: an exact L1 the store holds,
+   *  which tick adopts, counts as the L1 it is; a chunk the overlap guard
+   *  refuses counts; and a merge counts by its sources' pairs, even where a
+   *  pin or a lock keeps what they cover in the floor another way. Merges the
+   *  queue doesn't hold yet aren't counted. */
   protected queuedReliefTokens(): number {
+    if (!this.config.compressionModel || !this.hostContext?.membrane) return 0;
     const store = this.hostContext?.messageStore;
     const tools = this.hostContext?.tools;
     const quarantined = this.quarantinedChunkSources();
@@ -6502,20 +6510,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : store ? this.requestCarriesToolBlocks(store) : () => false;
     const expected = new Map<number, number>();
     let total = 0;
-    if (quarantined) {
+    if (quarantined && !this.speculativeCapHolds()) {
       for (const index of this.compressionQueue) {
         const chunk = this.chunks[index];
         if (!chunk || chunk.compressed) continue;
-        if (this.chunkHasHeldMessage(chunk, blocked)) break;
         if (this.toolsDeferredChunks.has(this.chunkKey(chunk)) || deferredForTools(chunk)) continue;
+        if (this.chunkHasHeldMessage(chunk, blocked)) break;
         if (quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
         total += Math.max(0, this.chunkRelief(chunk, expected));
       }
     }
-    if (this.config.hierarchical && this.config.compressionModel && !this.familyWaitsForTools(tools)) {
+    const parented = (id: string): boolean => {
+      const source = this.summaryById(id);
+      return source !== undefined && getSummaryParentId(source) !== undefined;
+    };
+    if (this.config.hierarchical && !this.familyWaitsForTools(tools)) {
       for (const merge of this.mergeQueue) {
         if (store && this.mergeBlockedByHold(merge.sourceIds, store, blocked)) break;
-        if (merge.sourceIds.some((id) => heldSources.has(id))) continue;
+        if (merge.sourceIds.some((id) => heldSources.has(id) || parented(id))) continue;
         total += Math.max(0, this.mergeRelief(merge, expected) ?? 0);
       }
     }
@@ -9430,6 +9442,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const delta = actual - planned;
       const pct = planned > 0 ? (delta / planned) * 100 : 0;
       const m = this._plannedMeta;
+      // The queued relief is walked before compileMs is read, so the time
+      // the line reports includes it.
+      const floor = this._plannedFloor;
+      const queuedRelief = floor ? this.queuedReliefTokens() : undefined;
       // Whole ms: the journal line stays greppable and a before/after across
       // versions needs no parsing of fractions.
       const compileMs = Math.round(performance.now() - this._selectStartedAt);
@@ -9443,8 +9459,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Dry runs and previews log the line too, and skip work a live compile
       // does, so a journal reader must be able to drop them.
       const dryRun = this._dryRunSelect;
-      const floor = this._plannedFloor;
-      const queuedRelief = floor ? this.queuedReliefTokens() : undefined;
       r.planVsActual = {
         planned,
         actual,

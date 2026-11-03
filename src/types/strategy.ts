@@ -1155,17 +1155,21 @@ export interface RenderStats {
     /** The plan size above which this compile refuses: the input budget with
      *  `overBudgetGraceRatio` added (`hardBudget=`). Set with `floorTokens`. */
     hardBudget?: number;
-    /** What the work queued at the end of this compile is expected to take
-     *  off the floor once it lands, from each queued chunk's raw tokens less
-     *  the recall pair its L1 is expected to render as, and each queued
-     *  merge's sources' pairs less its parent's. Work that wouldn't shrink
-     *  the floor counts as zero, as does work tick won't turn into a summary:
-     *  a chunk the compression quarantine holds or deferred for the host's
-     *  tools; every chunk from the first a compression
-     *  hold reaches; a merge holding a source a hold or a merge-quarantine
-     *  record keeps out, and every merge from the first a hold blocks. Merges
-     *  not yet queued aren't counted (`queuedRelief=`). Set with
-     *  `floorTokens`. */
+    /** An estimate of what the work queued at the end of this compile would
+     *  take off the floor once it lands: each queued chunk's messages as this
+     *  compile would send them (as the floor prices them, a message a raw pin
+     *  keeps raw at nothing) less the recall pair its L1 is expected to render
+     *  as, and each queued merge's sources' pairs less its parent's. Work that
+     *  wouldn't shrink the floor counts as zero, as does work the gates tick
+     *  reads keep from a summary: everything without a compression model or a
+     *  membrane; every chunk while the speculative cap holds; a chunk the
+     *  compression quarantine holds or deferred for the host's tools; every
+     *  chunk from the first a compression hold reaches; a merge holding a
+     *  source a hold or a merge-quarantine record keeps out, or already
+     *  merged, and every merge from the first a hold blocks. It doesn't replay
+     *  the rest of tick (adoption, the overlap guard, pins and locks over a
+     *  merge's sources), and merges not yet queued aren't counted
+     *  (`queuedRelief=`). Set with `floorTokens`. */
     queuedReliefTokens?: number;
   };
 }

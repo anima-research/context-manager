@@ -651,6 +651,34 @@ describe('The relief rule through failed merges, priced as sent (#415 review)', 
     assert.deepStrictEqual(probe.calls, ['l1']);
     probe.manager.close();
   });
+
+  it('says once that a floor no cut can meet is missing, however its counts vary', async () => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const forest = CanonicalSummaryForest.prototype as unknown as { minimumTokens: () => unknown };
+    const minimumTokens = forest.minimumTokens;
+    let conflicts = 0;
+    forest.minimumTokens = () => ({
+      feasible: false,
+      floorTokens: null,
+      certificate: { reason: 'constraint-conflict', floorTokens: null, bindingLeaves: Array.from({ length: ++conflicts }, () => ({})), protectedTokens: 0, missingLevels: [], requiredAdditionalTokens: 0, suggestion: '' },
+    });
+    const floor = collectFloorWarnings();
+    try {
+      await reader.manager.compile(budget);
+      await reader.manager.compile(budget);
+      await reader.manager.compile(budget);
+      assert.strictEqual(reader.manager.getRenderStats()?.planVsActual?.floorTokens, undefined, 'no floor is reported');
+      assert.strictEqual(floor.warnings.length, 1, `said once over three compiles: ${JSON.stringify(floor.warnings)}`);
+      assert.match(floor.warnings[0]!, /no cut meets the plan's constraints \(constraint-conflict, 1 conflicting leaves\)/);
+    } finally {
+      forest.minimumTokens = minimumTokens;
+      floor.restore();
+    }
+    reader.manager.close();
+  });
 });
 
 // The burst scenario's geometry: two reads a turn (about a chunk) against one
