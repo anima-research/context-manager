@@ -80,6 +80,19 @@ class SpyStrategy extends AutobiographicalStrategy {
   configChunk(): number | undefined {
     return ((this as any).config as { targetChunkTokens?: number }).targetChunkTokens;
   }
+  seedL1(content: string, sourceIds: string[]): void {
+    const entry: SummaryEntry = {
+      id: `L1-${this.nextSummaryIdCounter()}`,
+      level: 1,
+      content,
+      tokens: Math.ceil(content.length / 4),
+      sourceLevel: 0,
+      sourceIds,
+      sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+      created: Date.now(),
+    };
+    this.pushSummary(entry);
+  }
 }
 
 function makeStrategy(overrides: Record<string, unknown> = {}): SpyStrategy {
@@ -92,6 +105,14 @@ function makeStrategy(overrides: Record<string, unknown> = {}): SpyStrategy {
     autoTickOnNewMessage: false,
     ...overrides,
   });
+}
+
+function addSeededInputs(manager: ContextManager, strategy: SpyStrategy): string[] {
+  const inputs: string[] = [];
+  for (let i = 0; i < 8; i++) inputs.push(manager.addMessage('User', textBlock(`Input ${i}. ` + 'word '.repeat(80))));
+  strategy.seedL1('The user gave eight inputs.', inputs);
+  for (let i = 0; i < 10; i++) manager.addMessage('Assistant', textBlock(`Round ${i}. ` + 'step '.repeat(30)));
+  return inputs;
 }
 
 function addConversation(manager: ContextManager, count = 30): void {
@@ -792,19 +813,6 @@ describe('previewContext — pins it is told to leave out', () => {
       if (args[2]?.dryRun && this.throwOnDryRun) throw new Error('zz-dry-select');
       return super.selectAdaptive(...args);
     }
-    seedL1(content: string, sourceIds: string[]): void {
-      const entry: SummaryEntry = {
-        id: `L1-${this.nextSummaryIdCounter()}`,
-        level: 1,
-        content,
-        tokens: Math.ceil(content.length / 4),
-        sourceLevel: 0,
-        sourceIds,
-        sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
-        created: Date.now(),
-      };
-      this.pushSummary(entry);
-    }
   }
 
   async function pinnedInputs(): Promise<{ manager: ContextManager; strategy: PinStrategy; pinId: string; docId: string }> {
@@ -817,10 +825,7 @@ describe('previewContext — pins it is told to leave out', () => {
       autoTickOnNewMessage: false,
     });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-    const inputs: string[] = [];
-    for (let i = 0; i < 8; i++) inputs.push(manager.addMessage('User', textBlock(`Input ${i}. ` + 'word '.repeat(80))));
-    strategy.seedL1('The user gave eight inputs.', inputs);
-    for (let i = 0; i < 10; i++) manager.addMessage('Assistant', textBlock(`Round ${i}. ` + 'step '.repeat(30)));
+    const inputs = addSeededInputs(manager, strategy);
     const docId = manager.markDocument(inputs[0], { name: 'brief' });
     const pinId = manager.pinRange(inputs[1], inputs[inputs.length - 1], { name: 'turn-inputs' });
     return { manager, strategy, pinId, docId };
@@ -891,6 +896,47 @@ describe('previewContext — pins it is told to leave out', () => {
       assert.deepStrictEqual(manager.listPins().map((pin) => pin.id), [...before, added]);
     } finally {
       phaseChannel.report = report;
+      manager.close();
+    }
+  });
+});
+
+describe('AutobiographicalStrategy — previewed as adaptive through an override', () => {
+  const SLACK_STORE_PATH = './test-dry-run-preview-slack';
+  const cleanSlackStore = () => {
+    if (existsSync(SLACK_STORE_PATH)) rmSync(SLACK_STORE_PATH, { recursive: true, force: true });
+  };
+  before(cleanSlackStore);
+  after(cleanSlackStore);
+
+  it('folds against the default slack of 0.1: a plan within 90% of the budget stays raw, and one above 90% folds', async () => {
+    const strategy = new SpyStrategy({
+      compressionModel: 'mock',
+      headWindowTokens: 0,
+      targetChunkTokens: 100,
+      recentWindowTokens: 200,
+      autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({ path: SLACK_STORE_PATH, strategy });
+    try {
+      addSeededInputs(manager, strategy);
+      const adaptive = { adaptiveResolution: true };
+      const unfolded = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, adaptive)!.finalTokens;
+      const budget = { maxTokens: Math.ceil(unfolded / 0.89), reserveForResponse: 0 };
+      assert.ok(unfolded <= budget.maxTokens * 0.9 && unfolded > budget.maxTokens * 0.88, `premise: the plan is within 90% of the budget, and above 88% (${unfolded} of ${budget.maxTokens})`);
+
+      const wider = manager.previewContext(budget, { ...adaptive, compressionSlackRatio: 0.2 })!;
+      assert.ok(wider.finalTokens < unfolded, `premise: a slack of 0.2 folds this plan (${wider.finalTokens} < ${unfolded})`);
+
+      const preview = manager.previewContext(budget, adaptive)!;
+      assert.strictEqual(preview.finalTokens, unfolded);
+      assert.ok(Object.values(preview.resolutions).every((level) => level === 0));
+
+      const tight = { maxTokens: Math.ceil(unfolded / 0.91), reserveForResponse: 0 };
+      assert.ok(unfolded > tight.maxTokens * 0.9 && unfolded <= tight.maxTokens * 0.92, `premise: the plan is above 90% of the budget, and within 92% (${unfolded} of ${tight.maxTokens})`);
+      const tighter = manager.previewContext(tight, adaptive)!;
+      assert.ok(tighter.finalTokens < unfolded, `a plan at 91% of the budget folds (${tighter.finalTokens} < ${unfolded})`);
+    } finally {
       manager.close();
     }
   });
