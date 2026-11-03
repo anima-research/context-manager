@@ -2113,13 +2113,28 @@ export interface AutobiographicalConfig {
   /**
    * Store-topology policy. On every load the summary archive is audited for
    * crossed ownership: a summary whose leaves are not contiguous among the
-   * chunk-owned messages in store order (an interleaved live representation
-   * sits inside its span — issue #122's cross-era merges, restore/branch
-   * interleavings, hand surgery). `'reject'` (default) throws
-   * `StoreTopologyError` from `initialize`, so `ContextManager.open` fails
-   * and the operator repairs the store before the resident runs on it.
+   * chunk-owned messages in view order, which is record order in legacy
+   * mode and window order once a host presents (an interleaved live
+   * representation sits inside its span — issue #122's cross-era merges,
+   * restore/branch interleavings, hand surgery, or, once a host presents, a
+   * row that left the window and was presented again before the strategy
+   * heard it go). `'reject'` (default) throws `StoreTopologyError` from
+   * `initialize` for what the audit names, so `ContextManager.open` fails
+   * and the operator repairs the store before the resident runs on it. Once
+   * a host presents, an open that isn't `auditOnly` first demotes every
+   * summary the audit names, whatever made it non-contiguous, and throws
+   * only if the audit still names a summary after that: each is dropped
+   * with every summary above it, an L1's chunk record is compressed again
+   * over its longest run of rows the window holds together, and its other
+   * rows are chunked again where the window holds them (an uncompressed
+   * record whose rows the window holds apart is trimmed the same way). So
+   * a store whose crossed ownership predates presentation is demoted, not
+   * refused, at its first open after a host presents; open it with
+   * `'report'` first to keep it for a repair. In legacy mode, and in an
+   * audit-only open, nothing is demoted.
    * `'report'` logs the violations at error level and reports them through
-   * `getCompressionDebt().topologyViolations` (state `critical`).
+   * `getCompressionDebt().topologyViolations` (state `critical`), and
+   * leaves them as it finds them.
    * A kv-unified config that explicitly opts into gap handling
    * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
    * defaults to `'report'`: those stores are known to carry gaps.

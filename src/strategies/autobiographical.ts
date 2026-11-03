@@ -6904,8 +6904,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Leaf-level ownership audit over the whole summary archive: every summary
-   * whose leaves are not contiguous among chunk-owned messages in store
-   * order. Read-only; safe to call on any loaded strategy.
+   * whose leaves are not contiguous among chunk-owned messages in view
+   * order, the order of `messages` (the strategy's view: record order in
+   * legacy mode, window order once a host presents). Read-only; safe to
+   * call on any loaded strategy. At load, under `topologyPolicy` `'reject'`,
+   * the open throws StoreTopologyError on what it names (assertStoreTopology),
+   * but once a host presents, an open that isn't audit-only first demotes
+   * every summary it names (demoteSplitSummaries) and throws only on what it
+   * still names after that.
    */
   auditStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): TopologyViolation[] {
     this.refreshStoreOrder(messages);
@@ -6990,7 +6996,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * strategy never heard it go: it left and came back while the strategy
    * initialized, or the process stopped between the window's tombstone and
    * the strategy's own writes (onRetracted). A store written down with such
-   * a summary already in it is repaired the same way.
+   * a summary already in it is repaired the same way, and so is every other
+   * summary the audit names in presented mode, whatever made it
+   * non-contiguous (#122's cross-era merges, hand surgery): the demote
+   * doesn't ask why, so such a store is demoted, not refused, at its first
+   * open once a host presents. An operator who wants it kept for a repair
+   * opens it with `'report'` first.
    *
    * Each summary the audit names is dropped, with every summary above it,
    * as onRetracted drops one (unfold). An L1's chunk record is compressed
@@ -7051,7 +7062,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const refolded = unfolded.refolded.filter((id) => !split.has(id));
         this.diag.warn(
           `[autobiographical] the window holds the leaves of ${violations.length} summar${violations.length === 1 ? 'y' : 'ies'} apart ` +
-            `(a row that left the window and was presented again before this strategy heard it go): dropped ` +
+            `(a row that left the window and was presented again before this strategy heard it go, or crossed ownership ` +
+            `the store held already): dropped ` +
             `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
             `compressed again over their longest run in the window [${refolded.join(', ')}], releasing ` +
             `[${released.join(', ')}] to be chunked where the window holds them; removed, keeping none [${unfolded.emptied.join(', ')}]`,
