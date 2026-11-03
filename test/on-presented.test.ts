@@ -363,6 +363,47 @@ describe('onPresented in presented mode', () => {
     }
   });
 
+  // CM #350 bot review finding 22: a delivery whose read fails keeps the rows
+  // waiting, and the strategy's next notification tries it again.
+  it("rows presented while the strategy initializes, whose delivery can't read the window, are heard at its next notification, before that one's rows", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const y = cm.addMessage('bob', [text('y')]);
+    const { gate, open } = gated();
+    const strategy = new GatedRecords();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.presentRows([x]);
+    // The next read of the window throws: the delivery's, once the initialize returns.
+    const reads = cm as unknown as { presentedMessageView: () => unknown };
+    const read = reads.presentedMessageView;
+    let fail = true;
+    reads.presentedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-window-read-failed');
+      }
+      return read.call(this);
+    };
+    let errors: unknown[][];
+    try {
+      errors = await errorsDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { presentedMessageView?: unknown }).presentedMessageView;
+    }
+    assert.equal(fail, false, 'setup: the read failed');
+    assert.ok(errors.some((args) => args.map(String).join(' ').includes('zz-window-read-failed')), 'and was logged');
+    assert.equal(strategy.heard.length, 0, 'nothing was heard');
+    cm.presentRows([y]);
+    assert.deepEqual(strategy.heard.map((h) => h.rows), [[x], [y]], 'x is heard at the next notification, first');
+    await settle();
+    cm.close();
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.

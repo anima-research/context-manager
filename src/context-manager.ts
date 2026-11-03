@@ -3681,9 +3681,8 @@ export class ContextManager {
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
     // Rows that left first: what the strategy kept of a row that left and
     // was presented again is at its old place, and goes before the row is
-    // heard at its new one.
-    if (this.retractedUnheard.length > 0) this.deliverRetractedUnheard();
-    if (this.presentedUnheard.size > 0) this.deliverPresentedUnheard();
+    // heard at its new one (deliverUnheard).
+    this.deliverUnheard();
   }
 
   /** Refuse an operation on a closed manager, naming it. */
@@ -3943,11 +3942,19 @@ export class ContextManager {
     if (rows.length === 0 || this.closed) return;
     // The rows wait for the manager's strategy, whichever instance that is
     // once it is initialized, so they wait while one without a row hook
-    // initializes too: a replacement set meanwhile hears them.
-    if (this.initializedAttempt !== this.initializationAttempt) {
+    // initializes too: a replacement set meanwhile hears them. They wait
+    // too behind calls a delivery that failed to read left waiting, once
+    // those are tried again (unheardStillWaiting).
+    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
       this.waitToBeHeard(rows, this.windowIndex.mode() === 'legacy');
       return;
     }
+    this.tellPresented(rows);
+  }
+
+  /** Make notifyPresented's call of the initialized strategy, now. */
+  private tellPresented(rows: readonly StoredMessage[]): void {
+    if (rows.length === 0 || this.closed) return;
     const strategy = this.strategy;
     if (!strategy.onPresented && !strategy.onNewMessage) return;
     const ctx = this.createStrategyContext();
@@ -3994,7 +4001,7 @@ export class ContextManager {
   private deferPresented(rows: readonly StoredMessage[], legacy: boolean): void {
     if (this.closed) return;
     this.waitToBeHeard(rows, legacy);
-    if (this.initializedAttempt === this.initializationAttempt) this.deliverPresentedUnheard();
+    if (this.initializedAttempt === this.initializationAttempt) this.deliverUnheard();
   }
 
   /** Rows that wait to be heard entering the window (presentedUnheard), with whether they entered a legacy window. */
@@ -4019,13 +4026,20 @@ export class ContextManager {
   private notifyRetracted(left: readonly RetractedRow[], info: Retraction): void {
     if (left.length === 0 || this.closed) return;
     // As notifyPresented's rows, the call waits for the manager's strategy,
-    // whether or not the one initializing has the hook.
-    if (this.initializedAttempt !== this.initializationAttempt) {
+    // whether or not the one initializing has the hook, and behind calls a
+    // delivery that failed to read left waiting.
+    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
       this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
       return;
     }
+    this.tellRetracted(left, info);
+  }
+
+  /** Make notifyRetracted's call of the initialized strategy, now. */
+  private tellRetracted(left: readonly RetractedRow[], info: Retraction): void {
+    if (left.length === 0 || this.closed) return;
     const strategy = this.strategy;
     if (!strategy.onRetracted) return;
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
@@ -4039,74 +4053,155 @@ export class ContextManager {
     }
   }
 
+  /** While deliverUnheard runs: a notification it makes, or an initialization a hook finishes, leaves what waits to it. */
+  private deliveringUnheard = false;
+  /** While deliverRetractedUnheard makes its calls: a call made meanwhile waits behind those it hasn't made. */
+  private drainingRetracted = false;
+
+  /** Whether a call waits for the initialized strategy, or a delivery of them is making its calls. */
+  private unheardWaiting(): boolean {
+    return this.drainingRetracted || this.retractedUnheard.length > 0 || this.presentedUnheard.size > 0;
+  }
+
   /**
-   * Once the strategy is initialized, the calls of onRetracted made while
-   * it wasn't, in the order they came. A row is given when it left the
-   * window of the branch the strategy initialized on: that window doesn't
-   * hold it at the ordinal it left, whether it is out or was presented
-   * again since, or the branch's record no longer holds it (a removal whose
-   * tombstone failed). A branch made before it left holds it there, in its
-   * window and its record, and a branch in legacy mode holds every row of
-   * its record, so neither is told. A call left with no row isn't made. A
-   * call whose hook closes the manager, sets a strategy or starts an
-   * initialization sends the calls after it where a call made then goes.
-   * A row the call didn't keep is read then, from the record of that
-   * branch, and given where it holds it; one it no longer holds is told by
-   * its id alone. Nothing here fails the initialization that ran it: a
-   * failure of the manager's own work is logged.
+   * Whether calls still wait for the initialized strategy once the ones a
+   * delivery that failed to read left waiting have been tried again: a
+   * notification's own call then waits behind them, so the strategy hears
+   * the calls in the order they came, and a row that left and was
+   * presented again is heard to go before it is heard to enter.
    */
-  private deliverRetractedUnheard(): void {
-    const queued = this.retractedUnheard;
-    this.retractedUnheard = [];
-    for (let i = 0; i < queued.length; i++) {
-      try {
-        const { left, info } = queued[i]!;
-        const presented = this.windowIndex.mode() === 'presented';
-        const merged = presented ? this.mergedMessageView() : null;
-        // A row told with no ordinal was removed where the index couldn't
-        // be read: it left where the record no longer holds it.
-        const leftHere = ({ id, ordinal }: RetractedRow) =>
-          (ordinal !== undefined && this.windowIndex.ordinalOf(id) !== ordinal) || !holdsRow(merged!, id);
-        const withRow = (l: RetractedRow): RetractedRow => {
-          if (l.row) return l;
-          const row = merged!.get(l.id);
-          return row ? { ...l, row } : l;
-        };
-        this.notifyRetracted(presented ? left.filter(leftHere).map(withRow) : [], info);
-      } catch (err) {
-        logThrown('[context-manager] telling the strategy of rows that left the window while it initialized failed:', err, this.diag);
+  private unheardStillWaiting(): boolean {
+    if (!this.unheardWaiting()) return false;
+    this.deliverUnheard();
+    return this.unheardWaiting();
+  }
+
+  /**
+   * Once the strategy is initialized, make the calls that waited for it:
+   * the onRetracted calls first, in the order they came, then the rows
+   * presented meanwhile (deliverRetractedUnheard, deliverPresentedUnheard).
+   * A delivery whose read of the window or the record fails puts back what
+   * it didn't make, logged, and the strategy's next notification
+   * (notifyPresented, notifyRetracted) tries it again, before its own call.
+   * A hook that sends calls to wait while this runs, one that starts an
+   * initialization that finishes before it returns among them, leaves them
+   * to this, which makes them after the ones before them. Nothing here
+   * fails the initialization that ran it.
+   */
+  private deliverUnheard(): void {
+    if (this.deliveringUnheard) return;
+    this.deliveringUnheard = true;
+    try {
+      while (!this.closed && this.initializedAttempt === this.initializationAttempt) {
+        if (this.retractedUnheard.length > 0) {
+          if (!this.deliverRetractedUnheard()) return;
+        } else if (this.presentedUnheard.size > 0) {
+          if (!this.deliverPresentedUnheard()) return;
+        } else {
+          return;
+        }
       }
+    } finally {
+      this.deliveringUnheard = false;
     }
   }
 
   /**
-   * Once the strategy is initialized, the rows that entered the window
-   * while it wasn't that are still in the window of the branch it
-   * initialized on, in window order. Once a host presents there, that is
-   * the rows its index holds, however each entered: a row presented on
-   * another branch has no ordinal there. While that branch is in legacy
-   * mode its window is its record, and the rows given are those an add
-   * entered into a legacy window (a sharded add's later shards, after a
-   * hook of an earlier one started the initialization) that the record
-   * holds; a row presented on a branch whose index was written down isn't
-   * given there. Nothing here fails the initialization that ran it: a
-   * failure of the manager's own work is logged, and the strategy's next
-   * rebuild reads the window.
+   * The calls of onRetracted made while the strategy wasn't initialized,
+   * in the order they came. A row is given when it left the window of the
+   * branch the strategy initialized on: that window doesn't hold it at the
+   * ordinal it left, whether it is out or was presented again since, or
+   * the branch's record no longer holds it (a removal whose tombstone
+   * failed). A branch made before it left holds it there, in its window
+   * and its record, and a branch in legacy mode holds every row of its
+   * record, so neither is told. A call left with no row isn't made. A row
+   * the call didn't keep is read then, from the record of that branch, and
+   * given where it holds it; one it no longer holds is told by its id
+   * alone. A call whose hook closes the manager, sets a strategy or starts
+   * an initialization leaves the calls after it waiting, as a call made
+   * then would. False when a read failed: the call it was for and those
+   * after it wait still.
    */
-  private deliverPresentedUnheard(): void {
-    const presented = this.windowIndex.mode() === 'presented';
-    const unheard = new Set([...this.presentedUnheard].filter(([, legacy]) => presented || legacy).map(([id]) => id));
-    this.presentedUnheard = new Map();
+  private deliverRetractedUnheard(): boolean {
+    const queued = this.retractedUnheard;
+    this.retractedUnheard = [];
+    this.drainingRetracted = true;
+    let i = 0;
     try {
+      for (; i < queued.length; i++) {
+        if (this.closed || this.initializedAttempt !== this.initializationAttempt) return true;
+        const { left, info } = queued[i]!;
+        let told: RetractedRow[];
+        try {
+          const presented = this.windowIndex.mode() === 'presented';
+          const merged = presented ? this.mergedMessageView() : null;
+          // A row told with no ordinal was removed where the index couldn't
+          // be read: it left where the record no longer holds it.
+          const leftHere = ({ id, ordinal }: RetractedRow) =>
+            (ordinal !== undefined && this.windowIndex.ordinalOf(id) !== ordinal) || !holdsRow(merged!, id);
+          const withRow = (l: RetractedRow): RetractedRow => {
+            if (l.row) return l;
+            const row = merged!.get(l.id);
+            return row ? { ...l, row } : l;
+          };
+          told = presented ? left.filter(leftHere).map(withRow) : [];
+          this.tellRetracted(told, info);
+        } catch (err) {
+          logThrown(
+            '[context-manager] telling the strategy of rows that left the window while it initialized failed; it is told at its next notification:',
+            err,
+            this.diag,
+          );
+          return false;
+        }
+      }
+      return true;
+    } finally {
+      this.drainingRetracted = false;
+      // What wasn't made waits, ahead of any call made while these were.
+      if (i < queued.length) this.retractedUnheard = [...queued.slice(i), ...this.retractedUnheard];
+    }
+  }
+
+  /**
+   * The rows that entered the window while the strategy wasn't initialized
+   * that are still in the window of the branch it initialized on, in window
+   * order. Once a host presents there, that is the rows its index holds,
+   * however each entered: a row presented on another branch has no ordinal
+   * there. While that branch is in legacy mode its window is its record,
+   * and the rows given are those an add entered into a legacy window (a
+   * sharded add's later shards, after a hook of an earlier one started the
+   * initialization) that the record holds; a row presented on a branch
+   * whose index was written down isn't given there. False when the read of
+   * the window failed, or the manager's own work around the call: the rows
+   * wait still.
+   */
+  private deliverPresentedUnheard(): boolean {
+    const waiting = this.presentedUnheard;
+    let rows: StoredMessage[];
+    try {
+      const presented = this.windowIndex.mode() === 'presented';
+      const unheard = new Set([...waiting].filter(([, legacy]) => presented || legacy).map(([id]) => id));
       // The window's listing: the index's rows once a host presents, the
       // merged record in legacy mode.
-      const rows = this.presentedMessageView()
+      rows = this.presentedMessageView()
         .getAll()
         .filter((m) => unheard.has(m.id));
-      this.notifyPresented(rows);
     } catch (err) {
-      logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; its next rebuild reads them:', err, this.diag);
+      logThrown('[context-manager] reading the window to tell the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
+      return false;
     }
+    this.presentedUnheard = new Map();
+    try {
+      this.tellPresented(rows);
+    } catch (err) {
+      // The manager's own work before the strategy's call failed, so no
+      // hook ran: the rows wait again.
+      for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
+      logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
+      return false;
+    }
+    return true;
   }
 
   private handleMessageEdit(messageId: MessageId, newContent: ContentBlock[]): void {

@@ -434,6 +434,47 @@ describe('onRetracted', () => {
     }
   });
 
+  // CM #350 bot review finding 22: a delivery whose read fails keeps the call
+  // waiting, and the strategy's next notification makes it first.
+  it("a call made while the strategy initializes, whose delivery can't read the window, is made at the strategy's next notification, before that one", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    // The next read of the merged record throws: the delivery's, once the initialize returns.
+    const reads = cm as unknown as { mergedMessageView: () => unknown };
+    const read = reads.mergedMessageView;
+    let fail = true;
+    reads.mergedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-window-read-failed');
+      }
+      return read.call(this);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(fail, false, 'setup: the read failed');
+    assert.ok(lines.some((line) => line.includes('zz-window-read-failed')), lines.join('\n'));
+    assert.equal(strategy.log.length, 0, 'nothing was told');
+    cm.presentRows([a]);
+    assert.deepEqual(strategy.log, ['retracted a', 'presented a'], 'the call that waited is made first, then the row presented again is heard');
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review finding 21: while initialization stays failed the
   // calls wait without bound, so what each keeps is kept small.
   it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {
