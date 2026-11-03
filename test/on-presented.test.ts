@@ -800,7 +800,13 @@ describe('resetHeadWindow once a host presents', () => {
       const label = readable ? 'control' : 'probe';
       assert.equal(cm.windowStatusOf(transition.id), 'in', `${label}, setup: the presentation landed`);
       assert.deepEqual(strategy.resets, [], `${label}: the head window wasn't reset`);
-      assert.match(err.message, /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-landed-then-threw\./, `${label}: ${err.message}`);
+      // The control's cause is the write's own error; the probe's is the
+      // outcome-unknown error the index throws when it can't be read again,
+      // which ends with the write's own.
+      assert.match(err.message, readable
+        ? /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-landed-then-threw\./
+        : /^ContextManager\.resetHeadWindow's presentation of its transition failed: ContextManager\.presentRows: the window index's write threw, and the index can't be read again to tell whether the write landed \(zz-index-read-failed\)/, `${label}: ${err.message}`);
+      if (!readable) assert.ok(err.message.includes('zz-landed-then-threw'), `${label}: the write's own error is named: ${err.message}`);
       const where = readable ? 'stored and presented' : 'stored, and may be presented';
       assert.ok(err.message.includes(`message ${transition.id} is ${where}, and the head window wasn't reset`), `${label}: ${err.message}`);
       await settle();
