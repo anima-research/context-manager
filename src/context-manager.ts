@@ -3548,7 +3548,8 @@ export class ContextManager {
    * the transition message's add lets the add finish, and the call then
    * rejects, naming the stored message, without resetting the head window.
    * So does a presentation of it that fails, or whose strategy hook closes
-   * the manager, sets a strategy or moves the store's branch. An add of the
+   * the manager, sets a strategy, moves the store's branch or takes the
+   * transition out of the window again. An add of the
    * transition that fails after storing it rejects with addMessage's
    * WriteLandedError, naming it, without resetting the head window, and one
    * where the store can't be read to tell whether it was stored rejects with
@@ -3603,6 +3604,11 @@ export class ContextManager {
         this.requireInitialized('resetHeadWindow', attempt, false);
       } catch (error) {
         throw refuse(reasonOf(error), 'stored and presented');
+      }
+      // It may also have taken the transition out again, moving nothing
+      // else: the head window can't start at a row the window lacks.
+      if (this.windowIndex.ordinalOf(msgId) === undefined) {
+        throw refuse("ContextManager.resetHeadWindow: the strategy's hook for its transition's presentation took the transition out of the window", 'stored and out of the window');
       }
     }
 

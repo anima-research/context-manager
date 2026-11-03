@@ -723,6 +723,36 @@ describe('resetHeadWindow once a host presents', () => {
       cm.close();
     }
   });
+
+  // CM #350 bot review finding 25: the strategy's hook for the transition's
+  // presentation can take it out again, without moving anything else.
+  it("refuses when the hook of the transition's presentation takes it out of the window, and doesn't reset the head window", async () => {
+    let cm!: ContextManager;
+    class TakesItOut extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (rows.some((m) => m.participant === 'Context Manager')) cm.retractRows([rows[0]!.id]);
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new TakesItOut();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = cm.getAllMessages().at(-1)!;
+    assert.equal(cm.windowStatusOf(transition.id), 'out', 'setup: the hook took the transition out');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset to start at a row the window lacks");
+    assert.match(err.message, /took the transition out of the window/);
+    assert.ok(err.message.includes(`message ${transition.id} is stored and out of the window, and the head window wasn't reset`), err.message);
+    await settle();
+    cm.close();
+  });
 });
 
 describe('onPresented in legacy mode', () => {
