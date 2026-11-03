@@ -739,6 +739,7 @@ describe('removal and the window', () => {
     cm.removeMessages(b!, c!);
     assert.deepEqual(cm.getAllMessages(), [], 'the rows are removed');
     assert.equal(cm.getStore().getStateJson(INDEX), null);
+    assert.ok(!cm.getStore().listStates().some((state) => state.id === INDEX), 'and no window state is registered');
     assert.equal(cm.windowMode(), 'legacy');
     cm.close();
   });
