@@ -310,6 +310,41 @@ describe('a quarantined span and the requests after it', () => {
     await manager.close();
   });
 
+  it("a quarantine record without its chunk's message ids, whose chunk then loses a message, still leaves every message it has left out of the later chunks' requests", async () => {
+    const path = join(dir, 'record-without-ids-removal');
+    const strategy = new ProbeStrategy(CONFIG as never);
+    const internals = strategy as unknown as { compressionRefusalQuarantineRecord(...args: unknown[]): Record<string, unknown> };
+    const build = internals.compressionRefusalQuarantineRecord.bind(strategy);
+    internals.compressionRefusalQuarantineRecord = (...args: unknown[]) => {
+      const record = build(...args);
+      delete record.sourceIds;
+      return record;
+    };
+    const { membrane, requests } = summarizer();
+    const manager = await ContextManager.open({ path, strategy, membrane });
+    for (let i = 0; i < 24; i++) {
+      manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `${i === 0 ? `${MARK} ` : ''}raw-${i} ${'substantive '.repeat(12)}` }]);
+    }
+    await manager.compile();
+    let chunks = strategy.closedChunks();
+    await strategy.run(chunks[0]!, context(manager));
+    assert.equal(strategy.getCompressionQuarantineStatus().count, 1, 'premise: the first chunk was refused into the quarantine');
+    const removed = chunks[0]!.messages[1]!;
+    assert.ok(!JSON.stringify(removed.content).includes(MARK), 'premise: the removed message is not the marked one');
+    manager.removeMessage(removed.id);
+    await manager.compile();
+    chunks = strategy.closedChunks();
+    assert.ok(chunks[0]!.messages.some((m) => JSON.stringify(m.content).includes(MARK)), 'premise: the first chunk still holds the marked message');
+    const heldTexts = chunks[0]!.messages.map((m) => label(m.content));
+    const before = requests.length;
+    await strategy.run(chunks[1]!, context(manager));
+    const sent = requests.slice(before);
+    assert.equal(sent.length, 1, `the second chunk took one call (${sent.length})`);
+    for (const text of heldTexts) assert.ok(!sent[0]!.includes(text), `its request leaves out the held chunk's ${text.trim()}`);
+    assert.ok(chunks[1]!.compressed, 'the second chunk compressed');
+    await manager.close();
+  });
+
   it("a transition summary leaves out a quarantined span its head window has grown over", async () => {
     const fx = await quarantinedFirst('transition-head');
     const re = await reopenedWithHead(fx, {});
