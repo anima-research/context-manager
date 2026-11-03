@@ -21,7 +21,12 @@
 - A quarantine record now keeps its chunk's message ids, so a held chunk's
   messages stay out of those requests wherever they now sit, also where a
   reopen has cut the chunks again, as `KnowledgeStrategy`'s reopen does,
-  since it keeps no chunk records. A record written before this release
+  since it keeps no chunk records. A transition summary leaves out every
+  message a record keeps until the record clears, one a later chunk's
+  summary covers included; under `KnowledgeStrategy`, once a reopen has cut
+  the chunks again, that means until an operator clears it with
+  `clearCompressionRefusalQuarantine()`, or until a later reopen cuts that
+  chunk as it was and it compresses. A record written before this release
   keeps only the hash of its chunk's ids, and is matched against the chunks
   as they are now, as before, so under `KnowledgeStrategy` it can stop
   holding them once a reopen cuts the chunks again. Where a reopen puts a
