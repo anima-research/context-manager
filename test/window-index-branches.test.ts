@@ -737,6 +737,7 @@ describe('removal and the window', () => {
     const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
     cm.removeMessage(a!);
     cm.removeMessages(b!, c!);
+    assert.deepEqual(cm.getAllMessages(), [], 'the rows are removed');
     assert.equal(cm.getStore().getStateJson(INDEX), null);
     assert.equal(cm.windowMode(), 'legacy');
     cm.close();
