@@ -667,10 +667,33 @@ describe('a store handle without the batched append', () => {
     try {
       const handle = store as unknown as Record<string, unknown>;
       handle.appendManyToStateJsonWithIdentity = undefined;
+      const sequence = store.currentSequence();
       await assert.rejects(
         ContextManager.open({ store, namespace: 'zz-agent', strategy: new Hearing() }),
         /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install @animalabs\/chronicle \^0\.6\.0/,
       );
+      assert.equal(store.currentSequence(), sequence, 'the refusal appends no record');
+    } finally {
+      delete (store as unknown as Record<string, unknown>).appendManyToStateJsonWithIdentity;
+      store.close();
+    }
+  });
+
+  // TODO(review4 #16): the open registers the message slot, the context log
+  // and the thinking-binding state before the WindowIndex constructor asks
+  // for the batched append, so a refused open of a fresh store leaves three
+  // registrations behind. Unskip once openOn asks first.
+  it('is refused at open before any state is registered', { skip: 'TODO(review4 #16): openOn registers states before it asks for the batched append' }, async () => {
+    const store = JsStore.openOrCreate({ path: freshPath() });
+    try {
+      const handle = store as unknown as Record<string, unknown>;
+      handle.appendManyToStateJsonWithIdentity = undefined;
+      const states = JSON.stringify(store.listStates());
+      await assert.rejects(
+        ContextManager.open({ store, namespace: 'zz-agent', strategy: new Hearing() }),
+        /ContextManager: the store handle has no appendManyToStateJsonWithIdentity/,
+      );
+      assert.equal(JSON.stringify(store.listStates()), states, 'the refusal registers no state');
     } finally {
       delete (store as unknown as Record<string, unknown>).appendManyToStateJsonWithIdentity;
       store.close();
