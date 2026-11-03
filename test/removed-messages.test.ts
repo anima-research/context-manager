@@ -4,7 +4,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, StoreTopologyError } from '../src/index.js';
 import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
 import type { StrategyContext } from '../src/types/strategy.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 const ROOT = './test-removed-messages';
 let counter = 0;
@@ -34,6 +34,11 @@ class Probe extends AutobiographicalStrategy {
   mergeAt(threshold: number): void {
     (this.config as { mergeThreshold: number }).mergeThreshold = threshold;
     this.checkMergeThreshold();
+  }
+  onPrepare: ((request: NormalizedRequest) => void) | undefined;
+  protected override prepareCompressionRequest(request: NormalizedRequest) {
+    this.onPrepare?.(request);
+    return super.prepareCompressionRequest(request);
   }
 }
 
@@ -658,6 +663,30 @@ describe('removed messages (#321)', () => {
     return parent ? { request: requests[call - 1]! } : undefined;
   };
 
+  it('a message removed while a merge\'s request is prepared is in no call, and the merge is built again without it', async () => {
+    const { manager, strategy, ids, path, requests } = await fourSummaries();
+    try {
+      let removedBefore = 0;
+      strategy.onPrepare = (request) => {
+        if (removedBefore > 0 || !JSON.stringify(request).includes('M9 ')) return;
+        removedBefore = requests.length + 1;
+        manager.removeMessage(ids[9]! as never);
+      };
+      strategy.mergeAt(2);
+      for (let i = 0; i < 30 && !parentOf(strategy, requests, 'MEM[3]'); i++) await manager.tick();
+      assert.strictEqual(removedBefore, 6, 'premise: M9 left while the second merge\'s first request was prepared');
+      for (const [i, request] of requests.entries()) {
+        if (i + 1 >= removedBefore) assert.ok(!request.includes('M9 '), `request ${i + 1} summarizes M9`);
+      }
+      const written = parentOf(strategy, requests, 'MEM[3]');
+      assert.ok(written, 'MEM[3] merged');
+      assert.ok(!written.request.includes('M9 ') && written.request.includes('M8 '), 'the merge that was written summarized the rest');
+    } finally {
+      await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
   it('a message removed while the transport rejects a merge\'s reasoning is not in the retry without it', async () => {
     const rejected = Object.assign(new Error('400: thinking blocks cannot be modified'),
       { type: 'invalid_request', retryable: false, httpStatus: 400 });
@@ -1078,7 +1107,7 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('the range query works out spans in summaries whose sources name each other', async () => {
+  it('the range query ends, and lists both, when two summaries name each other among their sources', async () => {
     const { manager, strategy, ids, path } = await twoParents();
     try {
       const [earlier, later] = strategy.all().filter((s) => s.level === 2);

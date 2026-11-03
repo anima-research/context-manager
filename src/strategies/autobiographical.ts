@@ -8017,11 +8017,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // retries with no attempt accounting.
         if (error instanceof MergeDiscard) {
           // A hold placed on the span during the call keeps its answer out,
-          // and a removal of a message the request carries keeps its retry
-          // without reasoning from going out: no pause, nothing counted. The
-          // entry stays queued (the next tick waits on the hold, or builds the
-          // request again without the message), and its run ends, since that
-          // request won't be sent again.
+          // and a removal of a message the request carries keeps the request,
+          // or its retry without reasoning, from going out: no pause, nothing
+          // counted. The entry stays queued (the next tick waits on the hold,
+          // or builds the request again without the message), and its run
+          // ends, since that request won't be sent again.
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           this.mergeFailureOrder.delete(mergeFailureKey(merge));
           this.mergeFailureRuns.delete(mergeFailureKey(merge));
@@ -12370,8 +12370,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * from the provider resumes the lane, a refusal included, but only a
    * written merge is a landing (noteCompressionLanded). A hold placed on the
    * span during the call keeps a valid answer out, and a removal of a message
-   * its request carries keeps its retry without reasoning from going out
-   * (MergeDiscard).
+   * its request carries keeps the request, or its retry without reasoning,
+   * from going out (MergeDiscard).
    */
   protected async executeMerge(
     targetLevel: SummaryLevel,
@@ -12993,9 +12993,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const stale = (error: unknown): boolean =>
       !isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch);
     // Preparing the request can run a subclass's prepareCompressionRequest(),
-    // so the currency is checked again just before the call, as each L1
-    // attempt checks it: a generation ended there makes no call.
+    // so the currency and the messages the request carries are checked again
+    // just before the call, as each L1 attempt checks them: a generation
+    // ended there, or a carried message gone, makes no call.
     if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
+    discardIfRemoved(`L${targetLevel} merge`);
 
     try {
       let response: NormalizedResponse;
