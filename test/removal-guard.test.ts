@@ -194,7 +194,7 @@ describe('removal and the chain-break guard', () => {
     ['ids of another form', (c: number) => [`ghost-${c}-a`, `ghost-${c}-b`]],
     ['record numbers it never assigned', (c: number) => [String(900000 + 2 * c), String(900001 + 2 * c)]],
   ] as const) {
-    it(`chunk records naming ${label} still halt compression, and the debt report reads critical`, async () => {
+    it(`chunk records naming ${label} still halt chunk compression, and the debt report reads critical`, async () => {
       const path = freshPath();
       {
         const cm = await ContextManager.open({ path, strategy: strategy(), membrane });
@@ -289,6 +289,20 @@ describe('MessageStore.held', () => {
     await cm.fork('held-fork');
     cm.removeMessage(ids[6]!);
     assert.strictEqual(messageStoreOf(cm).held(ids[6]!), true, 'removed on a fork');
+    await cm.close();
+  });
+
+  it('answers true for an id appended only on another branch', async () => {
+    const path = freshPath();
+    const cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+    add(cm, 2);
+    const main = cm.currentBranch().name;
+    await cm.fork('held-other');
+    const [onFork] = add(cm, 1);
+    await cm.switchBranch(main);
+    const store = messageStoreOf(cm);
+    assert.strictEqual(store.get(onFork!), null, 'setup: the message isn\'t on this branch');
+    assert.strictEqual(store.held(onFork!), true);
     await cm.close();
   });
 

@@ -237,9 +237,9 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
 function chunkRecordsNeverHeldMessage(): string {
   return [
     'Compression of new conversation has stopped.',
-    "Cause: most of this agent's chunk records name message ids its store can't show it ever held, as when a store's messages are rebuilt under new ids.",
+    "Cause: most of this agent's chunk records name message ids its store can't show it ever held, as when a store's messages are rebuilt under new ids, or when the strategy reads the store through a view without `held`, such as an older custom view, which can show none.",
     'Effect: no new chunk forms, so new conversation goes unsummarized, and in time its context fills and its turns fail.',
-    "Fix: reconcile the store's chunk records with its messages, then reopen it.",
+    "Fix: reconcile the store's chunk records with its messages, or give the strategy a view with `held`, then reopen it.",
   ].join('\n');
 }
 
@@ -8394,7 +8394,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *                the load-time audit found crossed ownership, or a merge
    *                group stands in the merge quarantine because merging it
    *                would have minted a crossed node (`topologyRefusals`).
-   *                And while compression has stopped because most chunk
+   *                And while chunk compression has stopped because most chunk
    *                records name ids the store can't show it ever held
    *                (`failure` `chunk-records`): no new chunk forms, so
    *                nothing else in the report would show it.
@@ -17945,7 +17945,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Most records naming ids the store can't show it ever held means
     // message identity has been rebuilt/renumbered underneath us. Chunking "fresh" ground now
     // would re-compress already-lived history into duplicate memories.
-    // Halt ALL compression until an operator reconciles the store.
+    // Halt chunk compression until an operator reconciles the store.
     if (this.chunkPersistenceEnabled && this.chunkRecords.length >= 3 &&
         orphaned / this.chunkRecords.length > 0.5) {
       this.chunkRecordsOrphaned = true;
@@ -17955,7 +17955,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.error(
           `[autobiographical] FAIL-CLOSED: ${orphaned}/${this.chunkRecords.length} chunk ` +
           `records name message ids this store can't show it ever held (messages chain break / store ` +
-          `reconciliation signature). Compression halted to prevent duplicate ` +
+          `reconciliation signature). Chunk compression halted to prevent duplicate ` +
           `memory formation — reconcile the store before resuming.`,
         );
       }
