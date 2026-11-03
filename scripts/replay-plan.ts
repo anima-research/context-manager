@@ -79,6 +79,7 @@ async function main() {
     windowTokens: totalBudget,
     reachTokens: reach,
     rawZone,
+    attendedChunks: inputs.tailChunkIds.size,
     frozen,
     fixedLevels,
     pinCaps,
