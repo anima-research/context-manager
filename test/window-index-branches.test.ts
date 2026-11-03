@@ -331,7 +331,7 @@ describe('derive and the window', () => {
 });
 
 describe('fork and the window', () => {
-  it('a row removed on a fork leaves the window of the branch it was forked from', async () => {
+  it('a row removed on a fork leaves only the fork\'s window: the branch it was forked from keeps it', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]);
     const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
