@@ -85,7 +85,25 @@ function collectFloorWarnings(): { warnings: string[]; restore: () => void } {
   return { warnings, restore: () => { console.warn = warn; } };
 }
 
-async function openReader(config: Record<string, unknown> = {}, summaryWords = 4, refuse?: RegExp): Promise<Reader> {
+function collectWarnings(pattern: RegExp): { warnings: string[]; restore: () => void } {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message?: unknown) => { if (pattern.test(String(message))) warnings.push(String(message)); };
+  return { warnings, restore: () => { console.warn = warn; } };
+}
+
+/** Ends a pause a failed call put on the lane, as its backoff passing would. */
+function endPause(strategy: AutobiographicalStrategy): void {
+  const lane = strategy as unknown as { compressionPause: { backoffUntil: number } | null };
+  if (lane.compressionPause) lane.compressionPause.backoffUntil = 0;
+}
+
+/** A merge call's fault, by its count from 1: a refusal, or a call that fails. */
+type MergeFault = (merge: number) => 'refuse' | 'throw' | undefined;
+
+const injected = (error: unknown): boolean => (error as { injected?: boolean })?.injected === true;
+
+async function openReader(config: Record<string, unknown> = {}, summaryWords = 4, refuse?: RegExp, mergeFault?: MergeFault): Promise<Reader> {
   cleanup();
   const calls = { l1: 0, merge: 0 };
   const membrane = {
@@ -94,8 +112,12 @@ async function openReader(config: Record<string, unknown> = {}, summaryWords = 4
         return { stopReason: 'refusal', content: [], usage: { input_tokens: 100, output_tokens: 0 } };
       }
       const last = JSON.stringify(request.messages?.[request.messages.length - 1] ?? '');
-      if (/consolidat/i.test(last)) calls.merge++;
-      else calls.l1++;
+      if (/consolidat/i.test(last)) {
+        calls.merge++;
+        const fault = mergeFault?.(calls.merge);
+        if (fault === 'refuse') return { stopReason: 'refusal', content: [], usage: { input_tokens: 100, output_tokens: 0 } };
+        if (fault === 'throw') throw Object.assign(new Error('connection reset'), { type: 'network', retryable: true, injected: true });
+      } else calls.l1++;
       return {
         stopReason: 'end_turn',
         content: [t(`a recollection of what happened, ${words(summaryWords)}`)],
@@ -131,14 +153,16 @@ async function openReader(config: Record<string, unknown> = {}, summaryWords = 4
     },
     async grant(ticks: number) {
       for (let k = 0; k < ticks; k++) {
-        await manager.tick();
+        await manager.tick().catch((error: unknown) => { if (!injected(error)) throw error; });
         await settle();
+        endPause(strategy);
       }
     },
     async drain() {
       for (let k = 0; k < 400 && !manager.isReady(); k++) {
-        await manager.tick();
+        await manager.tick().catch((error: unknown) => { if (!injected(error)) throw error; });
         await settle();
+        endPause(strategy);
       }
     },
   };
@@ -151,50 +175,79 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
     const reader = await openReader();
     let backloggedTurns = 0;
     let mostMergesQueued = 0;
+    let mergedWhileBacklogged = 0;
     const TURNS = 60;
-    for (let turn = 0; turn < TURNS; turn++) {
-      // Three reads a turn close about a chunk and a half, against one call.
-      reader.read(3);
-      await reader.grant(1);
-      const progress = reader.strategy.getProgressSnapshot();
-      if (progress.l1QueueLength > 0) backloggedTurns++;
-      mostMergesQueued = Math.max(mostMergesQueued, progress.mergeQueueLength);
+    const landed = collectWarnings(/merge landed/);
+    try {
+      for (let turn = 0; turn < TURNS; turn++) {
+        // Three reads a turn close about a chunk and a half, against one call.
+        reader.read(3);
+        const merges = reader.calls.merge;
+        await reader.grant(1);
+        const progress = reader.strategy.getProgressSnapshot();
+        if (progress.l1QueueLength > 0) backloggedTurns++;
+        if (reader.calls.merge > merges && progress.l1QueueLength > 0) mergedWhileBacklogged++;
+        mostMergesQueued = Math.max(mostMergesQueued, progress.mergeQueueLength);
+      }
+    } finally {
+      landed.restore();
     }
     const snapshot = reader.strategy.getProgressSnapshot();
     assert.ok(backloggedTurns >= TURNS / 2, `premise: a chunk waited for L1 after most turns (${backloggedTurns}/${TURNS})`);
     assert.ok(reader.calls.l1 >= 30, `premise: the lane ran a call per turn (${reader.calls.l1} L1 calls)`);
     assert.ok(mostMergesQueued > 0, 'premise: a merge was queued');
     assert.ok(
-      reader.calls.merge > 0,
-      `${snapshot.mergeQueueLength} merge(s) queued, but no merge got a call in ${reader.calls.l1} compression calls over ${TURNS} turns`,
+      mergedWhileBacklogged > 0,
+      `${snapshot.mergeQueueLength} merge(s) queued, but no merge got a call while chunks waited, in ${reader.calls.l1} compression calls over ${TURNS} turns`,
+    );
+    assert.ok(
+      landed.warnings.some((line) => /merge landed over \d+ summaries, ahead of queued L1 work \(relief\)/.test(line)),
+      `a landing says it ran ahead of queued L1 work by relief: ${JSON.stringify(landed.warnings.slice(0, 2))}`,
     );
     reader.manager.close();
   });
 
-  it('stays live through reading bursts the lane catches up on between them', async () => {
-    // Summaries about two thirds of their chunk, as the default target of
-    // 2,000 tokens is of 3,000-token chunks: an L1 relieves little, a merge
-    // a lot.
-    const reader = await openReader({}, BURST_SUMMARY_WORDS);
-    const budget = { maxTokens: BURST_BUDGET, reserveForResponse: 0 };
-    const refusals: string[] = [];
-    for (let turn = 1; turn <= BURST_TURNS; turn++) {
-      reader.read(2);
-      await reader.grant(1);
-      if (turn % BURST_LENGTH === 0) await reader.drain();
+  // Each arm makes merge calls fail its own way. The rule's turn must
+  // survive a failure: a merge that fails once still runs during the burst.
+  const seeded = (seed: number) => () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+  const quarter = seeded(415);
+  const ARMS: Array<[string, MergeFault | undefined]> = [
+    ['no merge call fails', undefined],
+    ['the first merge is refused', (merge) => (merge === 1 ? 'refuse' : undefined)],
+    ['a quarter of merge calls are refused', () => (quarter() < 0.25 ? 'refuse' : undefined)],
+    ['the first merge call fails', (merge) => (merge === 1 ? 'throw' : undefined)],
+  ];
+  for (const [arm, fault] of ARMS) {
+    it(`stays live through reading bursts the lane catches up on between them, where ${arm}`, async () => {
+      // Summaries about two thirds of their chunk, as the default target of
+      // 2,000 tokens is of 3,000-token chunks: an L1 relieves little, a merge
+      // a lot.
+      const reader = await openReader({}, BURST_SUMMARY_WORDS, undefined, fault);
+      const budget = { maxTokens: BURST_BUDGET, reserveForResponse: 0 };
+      const refusals: string[] = [];
+      const quiet = collectWarnings(/^$/);
       try {
-        await reader.manager.compile(budget);
-      } catch (error) {
-        if (!(error instanceof OverBudgetError)) throw error;
-        refusals.push(`turn ${turn}: ${error.message}`);
+        for (let turn = 1; turn <= BURST_TURNS; turn++) {
+          reader.read(2);
+          await reader.grant(1);
+          if (turn % BURST_LENGTH === 0) await reader.drain();
+          try {
+            await reader.manager.compile(budget);
+          } catch (error) {
+            if (!(error instanceof OverBudgetError)) throw error;
+            refusals.push(`turn ${turn}: ${error.message}`);
+          }
+        }
+      } finally {
+        quiet.restore();
       }
-    }
-    const { totalChunks } = reader.strategy.getProgressSnapshot();
-    assert.ok(totalChunks >= BURST_TURNS * 0.9, `premise: the reader closed about a chunk a turn, against one call a turn (${totalChunks} chunks)`);
-    assert.ok(reader.calls.merge > 0, 'premise: merges ran');
-    assert.deepStrictEqual(refusals.slice(0, 3), [], `${refusals.length} of ${BURST_TURNS} compiles refused`);
-    reader.manager.close();
-  });
+      const { totalChunks } = reader.strategy.getProgressSnapshot();
+      assert.ok(totalChunks >= BURST_TURNS * 0.9, `premise: the reader closed about a chunk a turn, against one call a turn (${totalChunks} chunks)`);
+      assert.ok(reader.calls.merge > 0, 'premise: merges ran');
+      assert.deepStrictEqual(refusals.slice(0, 3), [], `${refusals.length} of ${BURST_TURNS} compiles refused`);
+      reader.manager.close();
+    });
+  }
 
   it('reports the floor beside the hard budget, under the plan, dropping as relief lands', async () => {
     const reader = await openReader();
@@ -410,7 +463,7 @@ class OrderProbe extends AutobiographicalStrategy {
   }
 }
 
-async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; truncateMerges?: boolean; failFirstMerge?: boolean; drainMode?: boolean } = {}) {
+async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; truncateMerges?: boolean; failFirstMerge?: boolean; drainMode?: boolean; config?: Record<string, unknown>; trailingReads?: number; passage?: string } = {}) {
   cleanup();
   const calls: Array<'l1' | 'merge'> = [];
   let mergeFailed = false;
@@ -439,16 +492,17 @@ async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; tru
     recentWindowTokens: 0,
     mergeThreshold: 99,
     autoTickOnNewMessage: false,
+    ...opts.config,
   } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
   strategy.drainMode = opts.drainMode ?? false;
   const manager = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
   manager.setToolDefinitions(TOOLS);
   let n = 0;
-  const read = (reads: number) => {
+  const read = (reads: number, passage = opts.passage ?? words(12)) => {
     for (let k = 0; k < reads; k++, n++) {
       const id = `read-${n}`;
       manager.addMessage('agent', [t('reading on'), { type: 'tool_use', id, name: 'read', input: { offset: n } } as ContentBlock]);
-      manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: `passage ${n}: ${words(12)}` } as ContentBlock]);
+      manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: `passage ${n}: ${passage}` } as ContentBlock]);
     }
   };
   const tickOnce = async () => { await manager.tick(); await settle(); };
@@ -458,11 +512,11 @@ async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; tru
   const l1s = manager.getSummariesInRange({ level: 1 });
   assert.ok(l1s.length >= 6, `premise: six L1s to merge (${l1s.length})`);
   strategy.queueMergeOf(l1s.slice(0, 6).map((summary) => summary.id));
-  read(5);
-  assert.ok(strategy.getProgressSnapshot().l1QueueLength > 0, 'premise: chunks wait for L1');
+  read(opts.trailingReads ?? 5);
+  if ((opts.trailingReads ?? 5) > 0) assert.ok(strategy.getProgressSnapshot().l1QueueLength > 0, 'premise: chunks wait for L1');
   assert.strictEqual(strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the merge is queued');
   calls.length = 0;
-  return { manager, strategy, calls, tickOnce };
+  return { manager, strategy, calls, tickOnce, read };
 }
 
 describe('The relief rule leaves the usual order where it should (#415)', () => {
@@ -533,6 +587,68 @@ describe('The relief rule leaves the usual order where it should (#415)', () => 
     (probe.strategy as unknown as { config: { mergeHoldSummaryIds?: string[] } }).config.mergeHoldSummaryIds = [sourceId];
     await probe.manager.compile(budget);
     assert.strictEqual(probe.manager.getRenderStats()?.planVsActual?.queuedReliefTokens, 0, 'a merge tick will drop relieves nothing');
+    probe.manager.close();
+  });
+});
+
+describe('The relief rule through failed merges, priced as sent (#415 review)', () => {
+  after(cleanup);
+
+  const FAILURES: Array<[string, { refuseMerges?: boolean; truncateMerges?: boolean; failFirstMerge?: boolean }]> = [
+    ['refused', { refuseMerges: true }],
+    ['cut off', { truncateMerges: true }],
+    ['whose call failed', { failFirstMerge: true }],
+  ];
+  for (const [label, opts] of FAILURES) {
+    it(`gives a merge ${label} one L1's turn, then takes the lane again while chunks keep arriving`, async () => {
+      const probe = await openOrder(opts);
+      const lines = collectWarnings(/merge gives the lane|merge landed/);
+      try {
+        for (let tick = 0; tick < 3; tick++) {
+          // Four reads close about two chunks, so the L1 queue never empties.
+          probe.read(4);
+          await probe.tickOnce().catch((error: unknown) => { if (!/connection reset/.test(String(error))) throw error; });
+          endPause(probe.strategy);
+        }
+      } finally {
+        lines.restore();
+      }
+      assert.deepStrictEqual(probe.calls, ['merge', 'l1', 'merge'], 'the failed merge waits one L1, not the backlog');
+      assert.ok(probe.strategy.getProgressSnapshot().l1QueueLength > 0, 'premise: chunks still waited');
+      assert.ok(lines.warnings.some((line) => /merge gives the lane to one L1/.test(line)), `the yield is said: ${JSON.stringify(lines.warnings)}`);
+      if (opts.failFirstMerge) {
+        assert.ok(lines.warnings.some((line) => /merge landed .*\(relief\)/.test(line)), `the retry lands by relief: ${JSON.stringify(lines.warnings)}`);
+      }
+      probe.manager.close();
+    });
+  }
+
+  it('prices an L1 at what its chunk costs as sent: a merge goes before an L1 over pruned tool results', async () => {
+    // Every read returns 20,000 characters, stored at about 8,700 tokens,
+    // which toolResultMaxLastN: 0 sends as a marker: the floor holds almost
+    // none of a queued chunk, and an L1 over it relieves almost nothing.
+    const probe = await openOrder({ config: { toolResultMaxLastN: 0 }, passage: 'x'.repeat(20_000) });
+    await probe.manager.compile({ maxTokens: 20_000, reserveForResponse: 0 });
+    const stats = probe.manager.getRenderStats()?.planVsActual;
+    assert.ok(stats?.floorTokens !== undefined && stats.queuedReliefTokens !== undefined, 'premise: the floor and relief are reported');
+    const st = probe.strategy as unknown as { chunks: Array<{ tokens: number }>; compressionQueue: number[] };
+    const head = st.chunks[st.compressionQueue[0]!]!;
+    assert.ok(head.tokens > 5_000, `premise: the queued chunk is stored large (${head.tokens} tokens)`);
+    assert.ok(
+      stats.queuedReliefTokens <= stats.floorTokens,
+      `the queue claims no more relief (${stats.queuedReliefTokens}) than the whole floor (${stats.floorTokens})`,
+    );
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['merge'], 'the merge relieves more than an L1 over content the floor never sends');
+    probe.manager.close();
+  });
+
+  it('leaves the turn to the L1 when the head merge holds a held source, which tick would drop without a call', async () => {
+    const probe = await openOrder();
+    const head = (probe.strategy as unknown as { mergeQueue: Array<{ sourceIds: string[] }> }).mergeQueue[0]!;
+    (probe.strategy as unknown as { config: { mergeHoldSummaryIds?: string[] } }).config.mergeHoldSummaryIds = [head.sourceIds[0]!];
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['l1']);
     probe.manager.close();
   });
 });

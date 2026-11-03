@@ -2421,6 +2421,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private compressionFailureOrder = new Map<string, number>();
   private mergeFailureOrder = new Map<string, number>();
+  /** The failure mark of the head merge the relief rule last gave way for,
+   *  and `l1Attempts` then (mergeTakesTurnByRelief): that merge competes by
+   *  relief again once an L1 has run since. Branch-local, like the queues. */
+  private reliefYield: { mark: string; l1Attempts: number } | undefined;
+  /** L1 attempts tick made with a model call, on this load (reliefYield). */
+  private l1Attempts = 0;
+  /** What the last adaptive compile priced each middle and tail message at,
+   *  as it would send it, 0 for one a raw pin keeps raw: the floor's charge
+   *  for the message, which an L1 over it can take off (chunkRelief). */
+  private sentPrices: Map<MessageId, number> | null = null;
   private compressionFailureSequence = 0;
   /**
    * The lane's runs of failures (CompressionFailureStreak): an L1 chunk's by
@@ -3273,6 +3283,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.summaries = [];
     this.summaryIdCounter = 0;
     this.mergeQueue = [];
+    this.reliefYield = undefined;
+    this.sentPrices = null;
     this.mergePicksDeferred = false;
     this.mergeQuarantine.clear();
     this.headWindowStartId = null;
@@ -6319,29 +6331,69 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * otherwise always goes first, so an agent that closes chunks as fast as
    * calls complete keeps a chunk queued at every tick and its merges never
    * run: the pyramid stops deepening while unmerged L1s fill the middle
-   * (#412). An L1 takes its chunk's raw tokens down to one recall pair; a
-   * merge takes its sources' pairs down to one, which with the default
-   * summary target is several times as much. A merge that has failed (a
-   * transient failure, or an answer recordMergeRejection counted as an
-   * attempt), waits on a hold or on the host's tools, or would land as
-   * planned under a drain (landsAsPlanned) keeps its usual place.
+   * (#412). An L1 takes its chunk's raw tokens, as sent, down to one recall
+   * pair; a merge takes its sources' pairs down to one, which with the
+   * default summary target is several times as much.
+   *
+   * A head merge whose last attempt failed (an answer recordMergeRejection
+   * counted, or a call that failed, which mergeFailureOrder records) gives
+   * the lane to one L1, then competes by relief again: each failure costs
+   * one L1's turn, not the rest of the backlog, and mergeAttemptLimit still
+   * bounds a merge that keeps failing. The rule leaves the usual order to a
+   * merge tick would drop or defer without a call (a held source, a hold,
+   * the host's tools), and under a drain (landsAsPlanned). The speculative
+   * cap, checked before this, runs the merge whatever its failures.
    */
-  private mergeTakesTurnByRelief(chunk: Chunk | undefined, store: MessageStoreView): boolean {
+  private mergeTakesTurnByRelief(chunk: Chunk | undefined, store: MessageStoreView, tools: readonly unknown[] | undefined): boolean {
     if (!chunk || !this.config.adaptiveResolution || !this.config.hierarchical || this.landsAsPlanned()) return false;
     const head = this.mergeQueue[0];
     if (!head) return false;
-    if ((head.attempts ?? 0) > 0 || head.hadRefusal) return false;
     const key = mergeFailureKey(head);
-    if (this.mergeFailureOrder.has(key) || this.toolsDeferredMerge === key) return false;
+    if (this.toolsDeferredMerge === key || this.familyWaitsForTools(tools)) return false;
     if (this.mergeBlockedByHold(head.sourceIds, store)) return false;
+    const held = this.mergeHeldSourceIds();
+    if (held.size > 0 && head.sourceIds.some((id) => held.has(id))) return false;
+    const failedAt = this.mergeFailureOrder.get(key);
+    const attempts = head.attempts ?? 0;
+    if (attempts > 0 || failedAt !== undefined) {
+      const mark = `${key}:${attempts}:${failedAt ?? ''}`;
+      if (this.reliefYield?.mark !== mark) {
+        this.reliefYield = { mark, l1Attempts: this.l1Attempts };
+        this.diag.warn(
+          `[autobiographical] L${head.level} merge gives the lane to one L1 after ` +
+            (failedAt !== undefined ? 'its call failed' : `attempt ${attempts} was rejected`) +
+            ', then competes by relief again',
+        );
+        return false;
+      }
+      if (this.l1Attempts === this.reliefYield.l1Attempts) return false;
+    }
     const mergeRelief = this.mergeRelief(head);
     return mergeRelief !== null && mergeRelief > this.chunkRelief(chunk);
   }
 
-  /** Tokens an L1 of `chunk` would take off the floor: its raw tokens, less
-   *  the recall pair an L1 renders as. */
+  /** Tokens an L1 of `chunk` would take off the floor: its messages as the
+   *  floor charges them (chunkSentTokens), less the recall pair an L1
+   *  renders as. */
   protected chunkRelief(chunk: Chunk, expected?: Map<number, number>): number {
-    return chunk.tokens - this.expectedPairCost(1, expected);
+    return this.chunkSentTokens(chunk) - this.expectedPairCost(1, expected);
+  }
+
+  /** `chunk`'s messages as the last adaptive compile priced them to send:
+   *  pruned, capped and stripped as the plan and the floor price them, and 0
+   *  for one a raw pin keeps raw. A chunk holding a message that compile
+   *  didn't price (stored since, or no adaptive compile yet) is taken at its
+   *  stored estimate, `chunk.tokens`, which can only overstate it. */
+  private chunkSentTokens(chunk: Chunk): number {
+    const prices = this.sentPrices;
+    if (!prices) return chunk.tokens;
+    let tokens = 0;
+    for (const message of chunk.messages) {
+      const price = prices.get(message.id);
+      if (price === undefined) return chunk.tokens;
+      tokens += price;
+    }
+    return tokens;
   }
 
   /** Tokens a merge would take off the floor: its sources' recall pairs, less
@@ -7808,8 +7860,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.toolsDeferredChunks.clear();
       this.toolsDeferredMerge = undefined;
     }
+    // Why tick reaches the merge step with L1 work queued, for the landing
+    // line below; left unset when no queued chunk could run.
+    let mergeTurn: 'relief' | 'after a failed L1' | 'speculative cap' | undefined;
     for (const key of candidates) {
-      if (this.speculativeCapHolds()) break;
+      if (this.speculativeCapHolds()) {
+        mergeTurn = 'speculative cap';
+        break;
+      }
       if (this.toolsDeferredChunks.has(key)) continue;
       // Resolve against the current queue: a rebuild may renumber chunks or
       // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
@@ -7828,9 +7886,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
-      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) break;
+      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
+        mergeTurn = 'after a failed L1';
+        break;
+      }
       // A merge that takes more off the floor than this chunk's L1 goes first.
-      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore)) break;
+      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
+        mergeTurn = 'relief';
+        break;
+      }
       const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
       const queueGeneration = this.compressionQueueGeneration;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
@@ -7918,6 +7982,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           continue;
         }
+        if (kind !== 'abort' && !isNoCallDeferral(error)) this.l1Attempts++;
         throw error;
       } finally {
         // A branch switch may have installed different pending work.
@@ -7989,7 +8054,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
-      if (!quarantineSkipped) return;
+      if (!quarantineSkipped) {
+        if (!toolsDeferred && !requestStopped) this.l1Attempts++;
+        return;
+      }
     }
 
     if (this.mergePicksDeferred) {
@@ -8061,6 +8129,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.resumeCompressionLane(mergeMembrane, mergeModel);
           // The merge's summary is written and its entry dequeued: it has landed.
           this.noteCompressionLanded(mergeMembrane, mergeModel);
+          // One line a merge, so a journal shows the merges and why each ran
+          // before the queued L1s, where it did (#415).
+          this.diag.warn(
+            `[autobiographical] L${merge.level} merge landed over ${merge.sourceIds.length} summaries` +
+              (mergeTurn ? `, ahead of queued L1 work (${mergeTurn})` : ''),
+          );
         }
       } catch (error) {
         // Withdrawn by the host, or its call cancelled by the host: no
@@ -13316,7 +13390,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * without compressing it, and its next call takes the next chunk, so a
    * chunk queued behind a held one still counts.
    * Tick takes the queued chunks in order, one a call, and reaches a merge
-   * only once it has taken them all. It takes a chunk's steps in this order:
+   * once it has taken them all, or, under adaptive resolution, before a
+   * chunk whose L1 relieves less (mergeTakesTurnByRelief), which the count
+   * doesn't foresee. It takes a chunk's steps in this order:
    * it adopts an exact L1, drops or refuses a chunk with a covered message,
    * and stubs a thin one, all without a model call; then it defers for the
    * host's tools, needs a compression model, and skips a chunk the
@@ -13452,8 +13528,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // Without a compression model no merge counts: tick drops a stale head
     // merge without a model call, and throws at the first merge it would make
-    // (executeMerge needs the model). It reaches a merge only once it has
-    // taken every queued chunk, or while the cap holds production. With a
+    // (executeMerge needs the model). It reaches a merge once it has taken
+    // every queued chunk, while the cap holds production, or, under adaptive
+    // resolution, before a chunk the merge relieves more than. With a
     // model, tick takes the merges in order, the head each call: it runs a
     // head that folds nothing (a model call, or a drop with none when it's
     // stale) and takes the next once that call lands or drops it, and
@@ -13929,6 +14006,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const middleSegments = AutobiographicalStrategy.middleRanges(headStart, headEnd, effectiveRecentStart);
 
     const pickerChunks: PickerChunk[] = [];
+    // Each middle and tail message as this compile would send it: what an L1
+    // over it takes off the floor (chunkRelief), 0 where a raw pin keeps it
+    // raw. The tail's are kept for the chunks that close as it moves on.
+    const sentPrices = new Map<MessageId, number>();
     const salience = this.salienceByPosition(messages);
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
@@ -13943,6 +14024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // its summary. The head and recent windows cut a shard as they emit it.
       const tokens = middlePrice(i);
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
+      sentPrices.set(msg.id, bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound) ? 0 : tokens);
       const ownL1 = ch?.summaryId ?? l1ByMessage.get(msg.id);
       const l1Id = ownL1 !== undefined && across.has(ownL1) ? undefined : ownL1;
       pickerChunks.push({
@@ -13977,6 +14059,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
+      sentPrices.set(msg.id, tokens);
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -13987,6 +14070,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         l1Id: undefined,
       });
     }
+
+    this.sentPrices = sentPrices;
 
     // ----- 3. Build summaries map and recall-pair tokens -----
     const summariesMap = new Map<SummaryId, SummaryEntry>();
