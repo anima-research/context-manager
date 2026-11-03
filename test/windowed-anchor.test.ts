@@ -12,7 +12,9 @@
  * when it is made, keeping the sequence for a release that reads it alone,
  * so a reload reads the ordinal back rather than converting again. From
  * then on a row stored before the anchor's sequence and presented later is
- * in the window, which a sequence anchor leaves out.
+ * in the window, which a sequence anchor leaves out. A re-anchor or
+ * setAnchorOrdinal writes `moved: true` beside them, so setAnchor of the
+ * sequence the anchor has converts it again rather than keeping it.
  */
 
 import { describe, it, after } from 'node:test';
@@ -279,9 +281,9 @@ describe('windowed passthrough: the anchor as an ordinal', () => {
     assert.deepEqual(texts(await cm.compile(BIG)), ['x', 'z']);
     // The slot's sequence is x's, which converted would start the window at
     // y, the first row in it stored there or after: a reopen reads the
-    // ordinal, not the sequence.
+    // ordinal, not the sequence, and `moved` says setAnchor converts it.
     const ordinal = cm.ordinalOf(x);
-    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, x), ordinal, v: 2 });
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, x), ordinal, v: 2, moved: true });
     cm.close();
     const reopened = await open(path);
     assert.equal(reopened.strategy.getAnchorOrdinal(), ordinal);
@@ -302,7 +304,7 @@ describe('windowed passthrough: the anchor as an ordinal', () => {
     assert.ok(first.messages.length < 10, 'the overflow re-anchored');
     const startId = cm.getPresentedMessages().find((m) => texts(first)[0] === (m.content[0] as { text: string }).text.split('-')[0])!.id;
     assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(startId));
-    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, startId), ordinal: cm.ordinalOf(startId), v: 2 });
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, startId), ordinal: cm.ordinalOf(startId), v: 2, moved: true });
 
     const second = await cm.compile(OVERFLOW);
     assert.deepEqual(second.messages.map((m) => m.content), first.messages.map((m) => m.content), 'no growth, no move');
@@ -322,6 +324,52 @@ describe('windowed passthrough: the anchor as an ordinal', () => {
     assert.equal(reopened.strategy.getAnchorOrdinal(), ordinal);
     assert.deepEqual(texts(await reopened.cm.compile(OVERFLOW)), texts(first));
     reopened.cm.close();
+  });
+
+  it('setAnchor of the sequence the anchor has converts it again once a re-anchor moved it, to a row at that sequence too, across a reopen', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const [x, y, p1, p2, p3] = ['x', 'y', 'p1', 'p2', 'p3'].map((t) => cm.addMessage('u', long(t)));
+    cm.presentRows([x!, y!, p1!, p2!, p3!]);
+    // A tune-out starts at x.
+    const start = sequenceOf(cm, x!);
+    strategy.setAnchor(start);
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(x!));
+    assert.deepEqual(slot(cm), { anchor: start, ordinal: cm.ordinalOf(x!), v: 2 }, 'set, not moved: no flag');
+    // x is taken out and presented again, after the rest.
+    cm.retractRows([x!]);
+    cm.presentRows([x!]);
+    // The overflow keeps the newest, x: the anchor moves to x's new
+    // ordinal, and its sequence is x's, the tune-out's start.
+    assert.deepEqual(texts(await cm.compile(OVERFLOW)), ['x']);
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(x!));
+    assert.equal(strategy.getAnchor(), start, 'the same sequence as the tune-out\'s start');
+    assert.deepEqual(slot(cm), { anchor: start, ordinal: cm.ordinalOf(x!), v: 2, moved: true }, 'the slot says the anchor moved');
+    cm.close();
+
+    // At a restart the host sets the tune-out's start again: it is converted,
+    // to y, the first row in the window stored at it or after, not kept at x.
+    ({ cm, strategy } = await open(path));
+    strategy.setAnchor(start);
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(y!));
+    assert.deepEqual(slot(cm), { anchor: start, ordinal: cm.ordinalOf(y!), v: 2 }, 'set again: the flag is cleared');
+    // Set once more, it is kept, though converted again it would start at
+    // p1 now that y is presented again after the rest.
+    const ordinal = strategy.getAnchorOrdinal();
+    cm.retractRows([y!]);
+    cm.presentRows([y!]);
+    strategy.setAnchor(start);
+    assert.equal(strategy.getAnchorOrdinal(), ordinal);
+    assert.notEqual(cm.ordinalOf(p1!), ordinal, 'the fixture tells keeping from converting');
+
+    // setAnchorOrdinal moves it too: the sequence it keeps is that of the
+    // row at the ordinal, and setAnchor of that sequence converts it.
+    strategy.setAnchorOrdinal(cm.ordinalOf(p3!)!);
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, p3!), ordinal: cm.ordinalOf(p3!), v: 2, moved: true });
+    strategy.setAnchor(sequenceOf(cm, p3!));
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, p3!), ordinal: cm.ordinalOf(p3!), v: 2 });
+    cm.close();
   });
 
   it('counts the window before the view filter, so a host\'s filter doesn\'t move it', async () => {
@@ -356,9 +404,9 @@ describe('windowed passthrough: the anchor as an ordinal', () => {
     // as the call found it (the slot's write comes after).
     const head = cm.getStore().currentSequence();
     strategy.setAnchorOrdinal(cm.indexLength());
-    assert.deepEqual(slot(cm), { anchor: head, ordinal: cm.indexLength(), v: 2 });
+    assert.deepEqual(slot(cm), { anchor: head, ordinal: cm.indexLength(), v: 2, moved: true });
     strategy.setAnchorOrdinal(cm.ordinalOf(a)!);
-    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, a), ordinal: cm.ordinalOf(a), v: 2 });
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, a), ordinal: cm.ordinalOf(a), v: 2, moved: true });
     cm.close();
   });
 });

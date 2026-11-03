@@ -171,7 +171,10 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * The slot holds `{ anchor }`, the sequence, while the window is the
  * record, as it always has, and `{ anchor, ordinal, v: 2 }` once the anchor
  * is an ordinal: once a compile or a setter moves it in presented mode, or
- * a sequence anchor is converted. A conversion is written when it is made,
+ * a sequence anchor is converted. Where a re-anchor or setAnchorOrdinal
+ * set the ordinal, rather than setAnchor or a conversion of `anchor`, the
+ * slot says so with `moved: true` beside them, so setAnchor of that
+ * sequence, at a restart too, converts it again (see setAnchor). A conversion is written when it is made,
  * since converting the same sequence later, once rows have been presented
  * out of record order, can give another ordinal, and so another window,
  * with no move: a reload has to read the ordinal the window was sent
@@ -241,6 +244,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * sequence is converted (presentedAnchor), and always in legacy mode.
    */
   private anchorOrdinal: number | null = null;
+  /**
+   * Whether a re-anchor or setAnchorOrdinal set the ordinal, rather than
+   * setAnchor or a conversion of `anchor`, the sequence: setAnchor of that
+   * sequence then converts it again (see setAnchor). Persisted in the slot
+   * as `moved`; false while there is no ordinal.
+   */
+  private anchorMoved = false;
   /** The manager's window index (StrategyContext.window); null for a context without one, which reads as legacy mode. */
   private window: WindowIndexView | null = null;
   private store: JsStore | null = null;
@@ -363,8 +373,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * nothing, so a host that sets a tune-out's start again at a restart
    * keeps the window it had, but only while the anchor hasn't moved since.
    * A re-anchor (select, on overflow) gives the anchor the sequence of the
-   * row it starts the window at, so the tune-out's start is then converted
-   * again, which can give another window (below).
+   * row it starts the window at, and setAnchorOrdinal that of the row at
+   * its ordinal, so the tune-out's start is then converted again, which
+   * can give another window (below), even where that row was stored at the
+   * same sequence: the slot records such a move (`moved`), so a restart
+   * converts it too.
    *
    * While the window is the record, the window is every row stored at
    * `sequence` or after. Once the manager presents rows on the branch, the
@@ -387,9 +400,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    */
   setAnchor(sequence: Sequence): void {
     this.syncToBranch();
-    if (sequence === this.anchor) return;
+    if (sequence === this.anchor && !this.anchorMoved) return;
     this.anchor = sequence;
     this.anchorOrdinal = this.window?.ordinalFrom(sequence) ?? null;
+    this.anchorMoved = false;
     this.persistAnchor();
   }
 
@@ -423,6 +437,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     if (ordinal === this.presentedAnchor()?.from) return;
     this.anchorOrdinal = ordinal;
     this.anchor = window.sequenceFrom(ordinal) ?? this.store!.currentSequence();
+    this.anchorMoved = true;
     this.persistAnchor();
   }
 
@@ -509,10 +524,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private loadBranchState(): void {
     this.anchor = 0;
     this.anchorOrdinal = null;
+    this.anchorMoved = false;
     this.prevCacheKeys = null;
     this.keptSlotReported = false;
     if (!this.store || !this.stateId) return;
-    const persisted = this.store.getStateJson(this.stateId) as { anchor?: unknown; ordinal?: unknown; v?: unknown } | null;
+    const persisted = this.store.getStateJson(this.stateId) as { anchor?: unknown; ordinal?: unknown; v?: unknown; moved?: unknown } | null;
     const format = slotFormatOf(persisted);
     if (format !== undefined && format !== ANCHOR_SLOT_FORMAT) {
       // Another version's slot: its `anchor` may not mean what this
@@ -558,6 +574,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       return;
     }
     this.anchorOrdinal = ordinal;
+    this.anchorMoved = persisted!.moved === true;
   }
 
   /**
@@ -723,6 +740,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     if (movedAnchor !== undefined && !opts?.dryRun) {
       this.anchor = movedAnchor.sequence;
       this.anchorOrdinal = movedAnchor.ordinal;
+      this.anchorMoved = movedAnchor.ordinal !== null;
       this.persistAnchor();
       this.pendingCause = 'window';
     }
@@ -1009,7 +1027,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
     this.store.setStateJson(
       this.stateId,
-      this.anchorOrdinal === null ? { anchor: this.anchor } : { anchor: this.anchor, ordinal: this.anchorOrdinal, v: ANCHOR_SLOT_FORMAT },
+      this.anchorOrdinal === null
+        ? { anchor: this.anchor }
+        : { anchor: this.anchor, ordinal: this.anchorOrdinal, v: ANCHOR_SLOT_FORMAT, ...(this.anchorMoved ? { moved: true } : {}) },
     );
   }
 }
