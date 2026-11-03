@@ -70,7 +70,10 @@
  * changes, in either mode). The store keeps or loses such a record whole:
  * a write the store refuses writes nothing, and after any throw the index
  * is read again from the store, so its reading is what the store holds,
- * whatever the failure left.
+ * whatever the failure left. Where that read throws too, whether the write
+ * landed is unknown: the call throws WindowWriteOutcomeUnknownError, and
+ * the next write through the index settles what the write did, once the
+ * index reads.
  * A batch is one presentation point: every item of it carries the same `at`,
  * and chronicle cuts a branch only between records, so a cut at a row a
  * batch presented keeps every row of the batch, and a cut before it drops
@@ -110,6 +113,7 @@
 
 import type { JsStore } from '@animalabs/chronicle';
 import { bodyBoundsIn, continuesBody } from './body-runs.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
 import type { Diagnostics } from './diagnostics.js';
 import { registerStateIfAbsent } from './state-registration.js';
 import type { MessageId, MessageStoreView, StoredMessage } from './types/index.js';
@@ -129,6 +133,79 @@ export type WindowStatus = 'in' | 'out' | 'undone' | 'absent';
 export interface LeftRow {
   id: MessageId;
   ordinal: number;
+}
+
+/**
+ * A write to the window index that the store threw on, where the index
+ * then couldn't be read again to tell whether the write landed: thrown by
+ * presentRows, retractRows, retractRemoved and retractAbsentRows in place
+ * of the write's own error, which is its `cause`.
+ *
+ * The write is one record, which the store holds whole or not at all, so
+ * either every row `entering` names entered the window and every row
+ * `leaving` names left it, or none did. `operation` names the call,
+ * `entering` the rows the write would have put in the window, in the order
+ * it would have, `leaving` the rows it would have taken out, and
+ * `readError` the error of the read that would have told. This error's
+ * message ends with the cause's message, so a check of the message that
+ * matched the write's own error still matches.
+ *
+ * windowStatusOf tells which, once the index reads; a row that entered is
+ * refused by presentRows as in the window already, and a row that left by
+ * retractRows as not in it. The strategy hears what the write did
+ * (onPresented, onRetracted) at the next write to the window on the branch
+ * it was made on, once the index reads there, before that call's own work:
+ * presentRows (presentRows([]) among them), retractRows, retractRemoved,
+ * retractAbsentRows or a removal. Of a write the store didn't keep it
+ * hears nothing.
+ */
+export class WindowWriteOutcomeUnknownError extends Error {
+  readonly operation: string;
+  readonly entering: readonly MessageId[];
+  readonly leaving: readonly MessageId[];
+  readonly readError: unknown;
+  override readonly cause: unknown;
+
+  constructor(
+    operation: string,
+    rows: { entering: readonly MessageId[]; leaving: readonly MessageId[] },
+    cause: unknown,
+    readError: unknown,
+  ) {
+    const whether = [
+      ...(rows.entering.length > 0 ? [`${rowsNamed(rows.entering)} entered`] : []),
+      ...(rows.leaving.length > 0 ? [`${rowsNamed(rows.leaving)} left`] : []),
+    ].join(' and ');
+    super(
+      `ContextManager.${operation}: the window index's write threw, and the index can't be read again to tell ` +
+        `whether the write landed (${describeThrown(readError)}), so whether ${whether} the window is unknown; ` +
+        `the store holds the write whole or not at all, windowStatusOf tells which once the index reads, and the ` +
+        `strategy hears what it did at the next write to the window: ${describeThrown(cause)}`,
+    );
+    this.name = 'WindowWriteOutcomeUnknownError';
+    this.operation = operation;
+    this.entering = Object.freeze([...rows.entering]);
+    this.leaving = Object.freeze([...rows.leaving]);
+    this.readError = readError;
+    this.cause = cause;
+  }
+}
+
+/** Rows as an error names them: `row <id>`, or `rows <id>, <id>`, the first ten of more. */
+function rowsNamed(ids: readonly MessageId[]): string {
+  if (ids.length === 1) return `row ${ids[0]}`;
+  const shown = ids.slice(0, 10).join(', ');
+  return ids.length > 10 ? `${ids.length} rows (${shown}, …)` : `rows ${shown}`;
+}
+
+/**
+ * A write whose outcome a failed read left unknown, waiting to be settled
+ * (WindowIndex.settled): the branch it was made on, and what hears what it
+ * did, given the ordinals as the store holds them.
+ */
+interface Unsettled {
+  branch: string;
+  settle: (ordinals: ReadonlyMap<MessageId, number>) => void;
 }
 
 /**
@@ -371,6 +448,8 @@ export class WindowIndex {
   private registered = false;
   /** The last presented listing, with what it was built from. */
   private built: { source: readonly StoredMessage[]; version: number; listing: StoredMessage[] } | null = null;
+  /** Writes whose outcome a failed read left unknown, in the order they were made (see settled). */
+  private unsettled: Unsettled[] = [];
 
   constructor(private readonly store: JsStore, namespace: string, private readonly diag: Diagnostics) {
     // Asked at open as well as at each write of several items, so an
@@ -410,6 +489,70 @@ export class WindowIndex {
     const state = this.state;
     if (state && state.revision === revision && state.branchId === branchId) return state;
     return (this.state = this.read(branchId, revision));
+  }
+
+  /**
+   * The index as it stands, once the writes whose outcome a failed read
+   * left unknown (WindowWriteOutcomeUnknownError) are settled: each made on
+   * the handle's branch hears what the store holds of it, as it would have
+   * at the write, in the order they were made, and one the store didn't
+   * keep hears nothing. A write made on another branch waits for a reading
+   * of that one. Every write through the index reads it so, before its own
+   * work, in the manager's call, where the strategy's hooks run; a read
+   * doesn't, since it can come from inside a strategy's own select or
+   * drain, where they must not. Throws, settling nothing, while the index
+   * can't be read.
+   */
+  private settled(): IndexState {
+    const state = this.current();
+    if (this.unsettled.length === 0) return state;
+    let branch: string;
+    try {
+      branch = this.store.currentBranch().id;
+    } catch {
+      return state;
+    }
+    const due = this.unsettled.filter((write) => write.branch === branch);
+    if (due.length === 0) return state;
+    this.unsettled = this.unsettled.filter((write) => write.branch !== branch);
+    for (const write of due) {
+      try {
+        write.settle(state.ordinals);
+      } catch (error) {
+        logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
+      }
+    }
+    // A hook may have written to the index since.
+    return this.current();
+  }
+
+  /**
+   * After a write that threw: read the index again and give `tell` the
+   * ordinals as the store holds them, then return the write's own error to
+   * throw on. Where the index can't be read, the outcome is unknown: `tell`
+   * waits for the next write on the branch (settled), and the error to
+   * throw is a WindowWriteOutcomeUnknownError naming the rows.
+   */
+  private afterThrow(
+    operation: string,
+    error: unknown,
+    rows: { entering: readonly MessageId[]; leaving: readonly MessageId[] },
+    tell: (ordinals: ReadonlyMap<MessageId, number>) => void,
+  ): unknown {
+    let ordinals: ReadonlyMap<MessageId, number>;
+    try {
+      ordinals = this.current().ordinals;
+    } catch (readError) {
+      try {
+        this.unsettled.push({ branch: this.store.currentBranch().id, settle: tell });
+      } catch {
+        // The store can't say which branch the write was on, so nothing
+        // waits: the strategy reads the window at its next select.
+      }
+      return new WindowWriteOutcomeUnknownError(operation, rows, error, readError);
+    }
+    tell(ordinals);
+    return error;
   }
 
   private read(branchId: unknown, revision: number | null): IndexState {
@@ -678,7 +821,10 @@ export class WindowIndex {
    * when it is read again, before the error is thrown on: each that entered
    * is in the window, each that left is out of it, and no later call
    * presents or takes it out again. A write the store refuses whole leaves
-   * none, so it hears nothing.
+   * none, so it hears nothing. Where the index can't be read again to tell,
+   * the call throws WindowWriteOutcomeUnknownError in place of the write's
+   * error, and `cutShort` hears at the next write through the index on the
+   * branch, once the index reads there (settled).
    */
   present(
     ids: readonly MessageId[],
@@ -686,7 +832,7 @@ export class WindowIndex {
     positionOf: (id: MessageId) => number | undefined,
     cutShort?: (entered: MessageId[], left: LeftRow[]) => void,
   ): { ordinals: number[]; entered: MessageId[]; left: LeftRow[] } {
-    const state = this.current();
+    const state = this.settled();
     const legacy = !inEffect(state);
     // A cut-short write-down's rows aren't a window: in legacy mode the
     // window is the whole record, which holds no body in part.
@@ -725,21 +871,13 @@ export class WindowIndex {
     try {
       this.write(items);
     } catch (error) {
-      if (cutShort) {
-        let entered: MessageId[] = [];
-        let left: LeftRow[] = [];
-        try {
-          const now = this.current().ordinals;
-          left = moving.filter((row) => now.get(row.id) !== row.ordinal);
-          const before = new Map(moving.map((row) => [row.id, row.ordinal] as const));
-          entered = rows.filter((id) => now.has(id) && now.get(id) !== before.get(id));
-        } catch {
-          // The index can't be read: the error thrown on says why, and the
-          // next read finds what entered and what left.
-        }
+      if (!cutShort) throw error;
+      const before = new Map(moving.map((row) => [row.id, row.ordinal] as const));
+      throw this.afterThrow('presentRows', error, { entering: rows, leaving: inWindowOrder(moving).map((row) => row.id) }, (now) => {
+        const left = moving.filter((row) => now.get(row.id) !== row.ordinal);
+        const entered = rows.filter((id) => now.has(id) && now.get(id) !== before.get(id));
         if (entered.length > 0 || left.length > 0) cutShort(entered, inWindowOrder(left));
-      }
-      throw error;
+      });
     }
     const ordinals = this.current().ordinals;
     return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows, left: inWindowOrder(moving) };
@@ -758,8 +896,11 @@ export class WindowIndex {
    * order. The tombstones are one record (write), and the write-down
    * another before them. `cutShort`, when given, hears the rows the store
    * holds as taken out after a write that threw, in window order, before
-   * the error is thrown on: none, when the store refused the write whole. A
-   * write-down that throws has taken nothing out.
+   * the error is thrown on: none, when the store refused the write whole.
+   * Where the index can't be read again to tell, it hears at the next write
+   * instead, as present's does, and the call throws
+   * WindowWriteOutcomeUnknownError. A write-down that throws has taken
+   * nothing out.
    */
   retract(
     ids: readonly MessageId[],
@@ -768,7 +909,7 @@ export class WindowIndex {
     undone: boolean,
     cutShort?: (left: LeftRow[]) => void,
   ): LeftRow[] {
-    const state = this.current();
+    const state = this.settled();
     const legacy = !inEffect(state);
     const rows = namedBodies('retractRows', ids, record, positionOf, (id) => {
       // In legacy mode the window is the record, so a row it doesn't hold
@@ -795,7 +936,7 @@ export class WindowIndex {
     const held = this.current().ordinals;
     const left = leaving.map((id): LeftRow => ({ id, ordinal: held.get(id)! }));
     const tombstones = leaving.map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
-    this.writeLeaving(tombstones, left, cutShort);
+    this.writeLeaving('retractRows', tombstones, left, cutShort);
     return inWindowOrder(left);
   }
 
@@ -809,14 +950,14 @@ export class WindowIndex {
    * retract's.
    */
   retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
-    const state = this.current();
+    const state = this.settled();
     if (!inEffect(state)) return [];
     const left: LeftRow[] = [];
     for (const id of new Set(ids)) {
       const ordinal = state.ordinals.get(id);
       if (ordinal !== undefined) left.push({ id, ordinal });
     }
-    this.writeLeaving(left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
+    this.writeLeaving('retractRemoved', left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
     return inWindowOrder(left);
   }
 
@@ -832,36 +973,37 @@ export class WindowIndex {
    * order; `cutShort` is as retract's.
    */
   retractAbsent(record: readonly StoredMessage[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
-    const state = this.current();
+    const state = this.settled();
     if (!inEffect(state)) return [];
     const held = positionsIn(record);
     const left: LeftRow[] = [];
     for (const [id, ordinal] of state.ordinals) if (!held.has(id)) left.push({ id, ordinal });
-    this.writeLeaving(left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
+    this.writeLeaving('retractAbsentRows', left.map((row): IndexItem => ({ retract: row.id })), left, cutShort);
     return inWindowOrder(left);
   }
 
   /**
-   * Write `tombstones`, which take `left` out of the window. A write that
-   * throws partway tells `cutShort` the rows of `left` out of the window by
-   * then, in window order, and the error is thrown on.
+   * Write `tombstones`, which take `left` out of the window, for the
+   * manager's `operation`. A write that throws tells `cutShort` the rows of
+   * `left` the store holds as out of the window, in window order, and the
+   * error is thrown on; where the index can't be read again to tell, the
+   * error is a WindowWriteOutcomeUnknownError, and `cutShort` hears at the
+   * next write (afterThrow).
    */
-  private writeLeaving(tombstones: IndexItem[], left: readonly LeftRow[], cutShort?: (left: LeftRow[]) => void): void {
+  private writeLeaving(
+    operation: string,
+    tombstones: IndexItem[],
+    left: readonly LeftRow[],
+    cutShort?: (left: LeftRow[]) => void,
+  ): void {
     try {
       this.write(tombstones);
     } catch (error) {
-      if (cutShort) {
-        let out: LeftRow[] = [];
-        try {
-          const now = this.current().ordinals;
-          out = left.filter((row) => now.get(row.id) !== row.ordinal);
-        } catch {
-          // The index can't be read: the error thrown on says why, and the
-          // next read finds what left.
-        }
+      if (!cutShort) throw error;
+      throw this.afterThrow(operation, error, { entering: [], leaving: inWindowOrder(left).map((row) => row.id) }, (now) => {
+        const out = left.filter((row) => now.get(row.id) !== row.ordinal);
         if (out.length > 0) cutShort(inWindowOrder(out));
-      }
-      throw error;
+      });
     }
   }
 
