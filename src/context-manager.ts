@@ -3597,7 +3597,15 @@ export class ContextManager {
       try {
         this.presentRows([msgId]);
       } catch (error) {
-        throw refuse(`ContextManager.resetHeadWindow couldn't present its transition: ${reasonOf(error)}`, 'stored');
+        // A presentation can land and then throw, so the window says
+        // whether the transition is in it; where it can't be read, it may be.
+        let where = 'stored';
+        try {
+          if (this.windowIndex.ordinalOf(msgId) !== undefined) where = 'stored and presented';
+        } catch {
+          where = 'stored, and may be presented';
+        }
+        throw refuse(`ContextManager.resetHeadWindow's presentation of its transition failed: ${reasonOf(error)}`, where);
       }
       // The strategy's hook for the presentation may have done what a listener of the add can.
       try {

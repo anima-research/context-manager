@@ -753,6 +753,60 @@ describe('resetHeadWindow once a host presents', () => {
     await settle();
     cm.close();
   });
+
+  // CM #350 bot review finding 26: the presentation can land and then throw.
+  it('a presentation of the transition that fails says whether the window holds it', async () => {
+    for (const readable of [true, false]) {
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+      }
+      const strategy = new Resettable();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      // The window's append lands and then throws; after it, the index reads
+      // (control) or can't be read (probe).
+      const index = windowIndexStateId('zz-agent');
+      const store = cm.getStore() as unknown as Record<string, (id: string, ...rest: unknown[]) => unknown>;
+      const saved: Record<string, (id: string, ...rest: unknown[]) => unknown> = {};
+      let landed = false;
+      for (const name of ['appendManyToStateJsonWithIdentity', 'appendToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen']) {
+        const real = store[name];
+        if (typeof real !== 'function') continue;
+        saved[name] = real;
+        store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+          if (id !== index) return real.call(this, id, ...rest);
+          if (name.startsWith('append')) {
+            real.call(this, id, ...rest);
+            landed = true;
+            throw new Error('zz-landed-then-threw');
+          }
+          if (landed && !readable) throw new Error('zz-index-read-failed');
+          return real.call(this, id, ...rest);
+        };
+      }
+      let err: Error;
+      try {
+        err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      } finally {
+        for (const [name, real] of Object.entries(saved)) store[name] = real;
+      }
+      const transition = cm.getAllMessages().at(-1)!;
+      const label = readable ? 'control' : 'probe';
+      assert.equal(cm.windowStatusOf(transition.id), 'in', `${label}, setup: the presentation landed`);
+      assert.deepEqual(strategy.resets, [], `${label}: the head window wasn't reset`);
+      assert.match(err.message, /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-landed-then-threw\./, `${label}: ${err.message}`);
+      const where = readable ? 'stored and presented' : 'stored, and may be presented';
+      assert.ok(err.message.includes(`message ${transition.id} is ${where}, and the head window wasn't reset`), `${label}: ${err.message}`);
+      await settle();
+      cm.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {
