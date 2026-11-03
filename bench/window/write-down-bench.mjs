@@ -50,13 +50,21 @@ async function run(size, perRow) {
     const before = logMb(path);
 
     // One record per item, as before batched writes: a stand-in for the
-    // batched append on this handle. Its ordinal matches no reading, so the
-    // index reads the items back from the store.
+    // batched append on this handle. It answers with the ordinal the first
+    // item took, as the batched append does, so the index applies the items
+    // in memory, as those builds applied each one they wrote, and the timing
+    // holds the record writes alone, not a reload of the whole index. (The
+    // test harness's stand-in, test/_harness/index-writes.ts, answers with
+    // an ordinal no reading ends at instead, so that the index reads each
+    // item back at its own record's sequence; that reload is no part of
+    // what this measures. The items compared below are read from the store,
+    // and the reopen reads them again.)
     if (perRow) {
       cm.getStore().appendManyToStateJsonWithIdentity = function (stateId, items, idField, sequenceField) {
+        const firstOrdinal = this.getStateLen(stateId) ?? 0;
         let record;
         for (const item of items) record = this.appendToStateJsonWithIdentity(stateId, item, idField, sequenceField);
-        return { record, firstOrdinal: -1 };
+        return { record, firstOrdinal };
       };
     }
     t = process.hrtime.bigint();

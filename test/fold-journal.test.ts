@@ -1639,6 +1639,47 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('refuses a layout whose sequences are not store sequences, or, keyed by sequence, not its members, naming the place, and writes nothing', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    type Writable = { members: number[]; memberSequences: unknown[] };
+    // An array of the same length as the members passes the shape check;
+    // each entry is a receipt's bound sequence, so each is checked too.
+    const notASequence = (at: number, shown: string) => new RegExp(
+      `can't be accepted: its memberSequences\\[${at}\\] is ${shown}, not a store sequence \\(a non-negative safe integer\\), ` +
+        `so accepting it again is refused the same way`,
+    );
+    const changes: Array<[string, (layout: Writable) => void, RegExp]> = [
+      ['an undefined sequence', (l) => { l.memberSequences[0] = undefined; }, notASequence(0, 'undefined')],
+      ['a string', (l) => { l.memberSequences[1] = 'zz'; }, notASequence(1, '"zz"')],
+      ['a negative number', (l) => { l.memberSequences[2] = -1; }, notASequence(2, '-1')],
+      ['a fraction', (l) => { l.memberSequences[1] = 1.5; }, notASequence(1, '1.5')],
+      ['an unsafe integer', (l) => { l.memberSequences[0] = 2 ** 53; }, notASequence(0, String(2 ** 53))],
+      ['null', (l) => { l.memberSequences[2] = null; }, notASequence(2, 'null')],
+      ['another member\'s sequence', (l) => { l.memberSequences[1] = l.members[2]; },
+        /can't be accepted: it is keyed by sequence, and its memberSequences\[1\] \(\d+\) isn't its members\[1\] \(\d+\), each member's own sequence, so accepting it again is refused the same way/],
+    ];
+    for (const [what, change, refused] of changes) {
+      const provenance = (await cm.compile(BUDGET)).provenance!;
+      assert.equal(provenance.layout!.keyedBy, 'sequence');
+      change(provenance.layout as unknown as Writable);
+      assert.throws(() => cm.acceptRound({ provenance }), refused, what);
+    }
+    assert.equal(layoutRecords(cm.getStore()).length, 0);
+
+    // Keyed by ordinal, each member is an ordinal and its sequence the row's
+    // own, so the two differ, and only the sequence is checked.
+    cm.presentRows([]);
+    const byOrdinal = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(byOrdinal.layout!.keyedBy, 'ordinal');
+    assert.notDeepEqual(byOrdinal.layout!.memberSequences, byOrdinal.layout!.members, 'the fixture tells a sequence from an ordinal');
+    (byOrdinal.layout as unknown as Writable).memberSequences[0] = 'zz';
+    assert.throws(() => cm.acceptRound({ provenance: byOrdinal }), notASequence(0, '"zz"'));
+    assert.equal(layoutRecords(cm.getStore()).length, 0);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline', 'a compile as returned is accepted');
+    cm.close();
+  });
+
   it('keeps its own copy of what it accepted, so a change to the provenance afterwards changes nothing it records', async () => {
     const { cm, strategy } = await open();
     const ids = add(cm, 4);
