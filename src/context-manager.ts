@@ -2147,7 +2147,11 @@ export class ContextManager {
 
   /**
    * Create a branch from a specific message.
-   * The new branch will have state as of that message's sequence (time-travel branching).
+   * The new branch will have state as of the point the message is cut at
+   * (time-travel branching): its own sequence in legacy mode and for a row
+   * the window doesn't hold; for a row the window holds, the write that
+   * presented it, or the sequence of its body's last shard where the
+   * write-down presented it (below).
    * The message can be in this manager's slot or one of its auxiliary slots.
    *
    * Once a host presents rows on the branch (see presentRows), a row is in
@@ -2169,8 +2173,11 @@ export class ContextManager {
    *
    * A row the window holds from the write-down (the first presentRows on
    * the branch, which writes the window down as the record stood) was in
-   * the window from its own write, as every row was then: it is cut at its
-   * own sequence, its body's last shard's, as in legacy mode. The new
+   * the window from its own write, as every row was then: it is cut at the
+   * sequence of its body's last shard, which is its own for a row stored as
+   * one. Legacy mode cuts at the named row's own sequence instead, so a
+   * body stored as shards and named by its first shard is cut there at
+   * that first shard, and after the write-down at its last. The new
    * branch has no index, or the start of one without its header, and is in
    * legacy mode, its window the record up to the row; a cut at the
    * write-down's item would keep every row stored before the write-down in
