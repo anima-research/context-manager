@@ -14,9 +14,12 @@
  *   presented and unpresented listings, each row's status and the compile,
  *   over a write-down of many rows and a workload of presentations,
  *   retracts, removals and a redo, before and after a reopen.
- * - A batch is one presentation point: branchAt of any row a call presented
- *   cuts after the whole call, and a derive at a sequence takes the call
- *   whole or not at all, so a body presented in one call is never split.
+ * - A batch is one presentation point: branchAt of any row a presentRows
+ *   call after the write-down presented cuts after the whole call, and a
+ *   derive at a sequence takes the call whole or not at all, so a body
+ *   presented in one call is never split. (A row the write-down entered is
+ *   cut at its own sequence, its body's last shard's, and the new branch is
+ *   in legacy mode: see window-index-branches.test.ts.)
  * - A batch that throws writes nothing: a write-down leaves legacy mode as
  *   it was, a presentation enters no row and tells the strategy nothing, a
  *   retract takes nothing out, and the next call writes the whole of it.
