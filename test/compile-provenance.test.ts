@@ -620,6 +620,15 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r1', sequence: 3, complete: false, missing: ['content'] });
   });
 
+  it('counts a result the repair moved within its own cut message once, so an identical result it dropped reads as missing', async () => {
+    const m = msg('m', 1, [use('x'), use('y'), result('y', 'y out'), text('note'), result('x', 'SAME'), result('x', 'SAME')]);
+    const entries = await repaired([copy(m), { index: 0, participant: 'Claude', content: [text('done')] } as ContextEntry]);
+    assert.deepEqual(entries[0]!.relocatedResults, ['x'], 'premise: repair moved a result within the message');
+    assert.equal(entries.flatMap((e) => e.content).filter((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'x').length, 1, 'premise: one of the two identical results reaches the request');
+    const body = attributeEntries(entries, [m]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'm');
+    assert.deepEqual(body, { messageId: 'm', sequence: 1, complete: false, missing: ['content'] });
+  });
+
   it('attributes by tool_use id an entry that names its moved results and no placed blocks', () => {
     const u = msg('u', 1, [use('tu-1')]);
     const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);

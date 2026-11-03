@@ -681,10 +681,6 @@ type StripReplay = {
  *  answers it, by message and place in its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
 
-/** A result block in a compile's entries: its entry, and which of that
- *  entry's results with its id it is, counting from 0. */
-type ResultPlace = { entry: ContextEntry; nth: number };
-
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the nearest call with its id before it, in its own message or an earlier
@@ -19713,9 +19709,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
-    // For each id of the previous entry's calls that it held more than
-    // once, the result its kept call takes (keptRunCalls).
-    let runAnswers = new Map<string, ResultPlace>();
+    // The ids the previous entry held more than one call with: their calls
+    // but the last were dropped, and every result after them answers it.
+    let prevRunIds = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
@@ -19724,14 +19720,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // immediately-preceding entry (and only once). Drop orphans/dupes. ---
       if (entry.content.some(b => b.type === 'tool_result')) {
         const seen = new Set<string>();
-        const nth = new Map<string, number>();
         const filtered = entry.content.filter(b => {
           if (b.type !== 'tool_result') return true;
-          const n = nth.get(b.toolUseId) ?? 0;
-          nth.set(b.toolUseId, n + 1);
-          if (!prevUseIds.has(b.toolUseId) || seen.has(b.toolUseId)) return false;
-          const kept = runAnswers.get(b.toolUseId);
-          if (kept && (kept.entry !== entry || kept.nth !== n)) return false;
+          if (!prevUseIds.has(b.toolUseId) || (seen.has(b.toolUseId) && !prevRunIds.has(b.toolUseId))) return false;
           seen.add(b.toolUseId);
           return true;
         });
@@ -19757,7 +19748,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Rule A when we reach it). Move the real block up into position and
           // only stub the ids for which no real result exists — so tool output
           // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf, runAnswers);
+          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
@@ -19779,15 +19770,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // already filtered above and none survived — Rule A matched
             // against the same prevUseIds and answered.size === 0).
             prevUseIds = new Set();
-            runAnswers = new Map();
+            prevRunIds = new Set();
             continue;
           }
         }
       }
 
-      const { keep, answers } = this.keptRunCalls(entries, i, unitOf);
-      runAnswers = answers;
-      if (keep.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => b.type !== 'tool_use' || !keep.has(b.id) || keep.get(b.id) === p));
+      const later = (b: ContentBlock, p: number): boolean =>
+        b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id);
+      prevRunIds = new Set(entry.content.flatMap((b, p) => (b.type === 'tool_use' && later(b, p) ? [b.id] : [])));
+      if (prevRunIds.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => !later(b, p)));
 
       prevUseIds = new Set();
       for (const b of entry.content) {
@@ -19815,66 +19807,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  came from has an id. */
   private readonly _movedFrom = new WeakMap<ContentBlock, MessageId>();
 
-  /** Where relocateOrDropMissingResults' search from `afterIndex` ends: six
-   *  units on (the parts of one cut message are one unit). */
-  private lookAheadEnd(entries: readonly ContextEntry[], afterIndex: number, unitOf: (entry: ContextEntry) => ContextEntry): number {
-    const LOOKAHEAD = 6;
-    let end = afterIndex + 1;
-    for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
-      const next = unitOf(entries[end]!);
-      if (next === unit) continue;
-      if (++units > LOOKAHEAD) break;
-      unit = next;
-    }
-    return end;
-  }
-
-  /**
-   * For each id that entry `at` holds more than one call with, the place of
-   * the call it keeps and the result that call takes. A result answers the
-   * nearest earlier call with its id; within one entry's run of calls
-   * sharing an id, results answer them in order, and the request keeps the
-   * last call so answered, with its result. When none is answered, it keeps
-   * the last call, unanswered. The run's results are those
-   * relocateOrDropMissingResults' search reaches before the next call with
-   * the id.
-   */
-  private keptRunCalls(
-    entries: readonly ContextEntry[],
-    at: number,
-    unitOf: (entry: ContextEntry) => ContextEntry,
-  ): { keep: Map<string, number>; answers: Map<string, ResultPlace> } {
-    const keep = new Map<string, number>();
-    const answers = new Map<string, ResultPlace>();
-    const calls = new Map<string, number[]>();
-    entries[at]!.content.forEach((b, p) => {
-      if (b.type === 'tool_use') calls.set(b.id, [...(calls.get(b.id) ?? []), p]);
-    });
-    for (const [id, places] of calls) {
-      if (places.length < 2) continue;
-      const results: ResultPlace[] = [];
-      // The entry's results with the id, up to its next call with the id;
-      // whether it holds such a call.
-      const resultsIn = (entry: ContextEntry): boolean => {
-        let nth = 0;
-        for (const b of entry.content) {
-          if (b.type === 'tool_use' && b.id === id) return true;
-          if (b.type === 'tool_result' && b.toolUseId === id) results.push({ entry, nth: nth++ });
-        }
-        return false;
-      };
-      const next = entries[at + 1];
-      if (next && !resultsIn(next)) {
-        const end = this.lookAheadEnd(entries, at + 1, unitOf);
-        for (let j = at + 2; j < end && !resultsIn(entries[j]!); j++);
-      }
-      const k = Math.min(results.length, places.length);
-      keep.set(id, places[k > 0 ? k - 1 : places.length - 1]!);
-      if (k > 0) answers.set(id, results[k - 1]!);
-    }
-    return { keep, answers };
-  }
-
   /**
    * For each `missing` tool_use id (a use in the preceding entry with no
    * adjacent result), return the result block to place next to it:
@@ -19900,19 +19832,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     afterIndex: number,
     missing: string[],
     unitOf: (entry: ContextEntry) => ContextEntry,
-    runAnswers: ReadonlyMap<string, ResultPlace> = new Map(),
   ): ContentBlock[] {
-    const end = this.lookAheadEnd(entries, afterIndex, unitOf);
+    const LOOKAHEAD = 6;
+    let end = afterIndex + 1;
+    for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
+      const next = unitOf(entries[end]!);
+      if (next === unit) continue;
+      if (++units > LOOKAHEAD) break;
+      unit = next;
+    }
     return missing.map(id => {
-      const wanted = runAnswers.get(id);
       for (let j = afterIndex; j < end; j++) {
         const src = entries[j];
-        let nth = 0;
-        const bi = wanted
-          ? (wanted.entry === src ? src.content.findIndex(b => b.type === 'tool_result' && b.toolUseId === id && nth++ === wanted.nth) : -1)
-          : src.content.findIndex(
-            b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
-          );
+        const bi = src.content.findIndex(
+          b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
+        );
         if (bi === -1) continue;
         if (src.content[bi]!.type === 'tool_use') break;
         const source = src.content;

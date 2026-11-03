@@ -374,7 +374,9 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
  * when it carries the rest unaltered and each of the body's results with a
  * moved id is carried, unaltered and in any order, by a block of its own:
  * one the repair placed for this entry that is still in the request, or a
- * result with that id still in the entry. Each block carries one result.
+ * result with that id still in the entry. Each block carries one result,
+ * including one the repair placed within the entry's own message, which
+ * folding a cut message's parts back puts in its content too.
  * Another entry's result with its id, even with the same content, doesn't
  * stand in for it. An entry that names no placed blocks
  * (`relocatedBlocks`) is judged by id instead: a result with a moved id is
@@ -393,7 +395,8 @@ function carriesWithRelocated(
     const sent = [...inRequest].filter(isMoved);
     return sourceMessages.every((m) => m.content.every((block) => !isMoved(block) || sent.some((result) => covers(result, block))));
   }
-  const carriers = [...(entry.relocatedBlocks ?? []).filter((b) => inRequest.has(b)), ...entry.content.filter(isMoved)];
+  const placed = entry.relocatedBlocks.filter((b) => inRequest.has(b));
+  const carriers = [...placed, ...entry.content.filter((b) => isMoved(b) && !placed.includes(b))];
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;

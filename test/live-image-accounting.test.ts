@@ -885,6 +885,22 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
   });
 
+  it("sends a run's images as it would were the ids distinct, where a message calls one id twice and its two results carry images", async () => {
+    const shot = (id: string, q: string): ContentBlock => ({ type: 'tool_use', id, name: 'shot', input: { q } } as ContentBlock);
+    const result = (id: string, data: string, text: string) => ({ type: 'tool_result', toolUseId: id, content: [{ type: 'text', text }, image(data, 1000)] });
+    const compile = (first: string, second: string) => compileMoved(1, [
+      ['User', [{ type: 'text', text: 'start' }]],
+      ['Claude', [{ type: 'text', text: 'two shots' }, shot(first, 'one'), shot(second, 'two')]],
+      ['User', [result(first, 'AAAA', 'first'), result(second, 'BBBB', 'second')] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    const reused = await compile('x', 'x');
+    const distinct = await compile('x1', 'x2');
+    assert.deepEqual(reused.results, ['first', 'second'], 'premise: the repair keeps both results after the one call it keeps');
+    assert.ok(distinct.live.some((data) => data.length > 0), `premise: with distinct ids one image goes out live: ${JSON.stringify(distinct.live)}`);
+    assert.deepEqual(reused.live, distinct.live, 'each result keeps the verdict its image gets with distinct ids');
+  });
+
   it("counts a moved result's image once, so an older image the estimate kept stays live", async () => {
     // Result a's message sends nothing once the repair moves its result, so
     // its image goes out in result b's entry.

@@ -11,9 +11,10 @@
 - `toolResultMaxLastN` counts a result toward that same call: the nearest call
   with its id before it, in its own message or an earlier one. Its doc said a
   result answers "the earliest call with its id, in an earlier message, that
-  no result has answered yet", and an earlier entry, for a result in its
-  call's own message, said "the earliest call with its id before it, in its own
-  message or an earlier one, that no result has answered yet". Under that
+  no result has answered yet", and 0.24.2's changelog, for a result in its
+  call's own message, said "a result answers the earliest call with its id
+  before it, in its own message or an earlier one, that no result has
+  answered yet". Under that
   rule, where an earlier call with the id went unanswered, each later result
   counted toward the call before its own, so the newest call's result could go
   as the marker while an older result of the tool went whole.
@@ -25,24 +26,25 @@
   later call reusing its id, or a result whose only call with that id came
   after it.
 - Where one message holds several calls with one id and no result with the
-  id between them, their results answer them in order. Pairing repair and
-  `stripUnpairedToolBlocks` keep the last call so answered, with its result,
-  and leave the other calls and their results out. Where no result answers
-  any of them, the repair keeps the last call, answered by a stub, and the
-  strip keeps none. Each kept all of them, and membrane refuses two calls
-  with one id in one assistant turn, so a request holding such a message
-  couldn't be sent.
+  id between them, pairing repair keeps only the last, the nearest call
+  before every result after them, with each of the results in the message
+  that answers it. Membrane sends the first as the call's result and the
+  rest as `[duplicate tool_result for …]` text. The repair kept every call,
+  and membrane refuses two calls with one id in one assistant turn, so a
+  request holding such a message couldn't be sent.
 - A host that stores a call's result late, after a later call has reused the
   call's id, now has that result paired with the later call: the earlier call
-  goes with a stub, and a second result after the later call is dropped as a
-  further one. Under the earlier rule the late result answered the earlier
-  call.
-- A store in which a later call reuses a call's id before that call's result
-  is stored can compile different requests after the upgrade, and where it
-  does, its first request misses the prompt cache. A store with two calls
-  with one id in one message now compiles requests membrane sends. Every
-  other store compiles what it compiled. A summariser's request changes
-  where its messages hold a call that no result with its id follows before
-  the next call with that id, while some result elsewhere carries the id, or
-  a result that no call with its id comes before, while a later call has
-  that id.
+  goes with a stub. Pairing repair drops a second result after the later call
+  as a further one, and the strip keeps it, which membrane sends as
+  `[duplicate tool_result for …]` text. Under the earlier rule the late
+  result answered the earlier call.
+- A store in which a later call reuses a call's id can compile different
+  requests after the upgrade wherever a compile sends the earlier call
+  without its own result, whether that result was stored after the later
+  call or the selection leaves it out, and where it does, its first request
+  misses the prompt cache. A store with two calls with one id in one message
+  now compiles requests membrane sends. Every other store compiles what it
+  compiled. A summariser's request changes where its messages hold a call
+  that no result with its id follows before the next call with that id,
+  while some result elsewhere carries the id, or a result that no call with
+  its id comes before, while a later call has that id.
