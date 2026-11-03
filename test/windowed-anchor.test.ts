@@ -219,6 +219,86 @@ describe('windowed passthrough: a sequence anchor once rows are presented', () =
   });
 });
 
+describe('windowed passthrough: a failed write of the anchor', () => {
+  /** Makes the next `count` writes of the anchor slot throw; returns the undo. */
+  function failAnchorWrites(cm: ContextManager, count: number): () => void {
+    const store = cm.getStore() as unknown as { setStateJson: (id: string, value: unknown) => unknown };
+    const write = store.setStateJson;
+    let left = count;
+    store.setStateJson = function (this: unknown, id: string, value: unknown) {
+      if (id === ANCHOR && left > 0) {
+        left--;
+        throw new Error('zz-slot-write-failed');
+      }
+      return write.call(this, id, value);
+    };
+    return () => { store.setStateJson = write; };
+  }
+
+  it('a conversion whose write fails is written at the next read, so a reload keeps the window sent', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    const [, b] = ['a', 'b'].map((t) => cm.addMessage('u', text(t)));
+    const start = cm.getStore().currentSequence() + 1;
+    strategy.setAnchor(start);
+    cm.presentRows([]);
+    const restore = failAnchorWrites(cm, 2);
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    try {
+      // The compile converts the anchor; its write fails, and so does the
+      // first try again.
+      assert.deepEqual(texts(await cm.compile(BIG)), []);
+      const ordinal = strategy.getAnchorOrdinal();
+      assert.equal(ordinal, cm.indexLength());
+      assert.deepEqual(slot(cm), { anchor: start }, 'setup: the conversion is unwritten');
+      const said = warned.filter((line) => line.includes('[windowed-passthrough]'));
+      assert.equal(said.length, 1, warned.join('\n'));
+      assert.match(said[0]!, new RegExp(`the anchor converted to ordinal ${ordinal} couldn't be written; it is written at the next compile or read of the anchor, and a reload before then converts its sequence ${start} again: zz-slot-write-failed`));
+
+      // b, stored before the start, is taken out and presented again; c
+      // arrives and is presented. The next compile writes the conversion.
+      cm.retractRows([b!]);
+      cm.presentRows([b!]);
+      const c = cm.addMessage('u', text('c'));
+      cm.presentRows([c]);
+      assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c']);
+      assert.deepEqual(slot(cm), { anchor: start, ordinal, v: 2 }, 'the conversion as it was made, written');
+      assert.equal(warned.filter((line) => line.includes('[windowed-passthrough]')).length, 1, 'a try again that fails says nothing more');
+    } finally {
+      console.warn = warn;
+      restore();
+    }
+    cm.close();
+
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'converting the start again would leave b out');
+    cm.close();
+  });
+
+  it('a move whose write throws is written at the next read too', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    const restore = failAnchorWrites(cm, 1);
+    try {
+      assert.throws(() => strategy.setAnchorOrdinal(cm.ordinalOf(ids[1]!)!), /zz-slot-write-failed/);
+    } finally {
+      restore();
+    }
+    assert.equal(slot(cm), null, 'setup: the move is unwritten');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'the window is the move\'s');
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal: cm.ordinalOf(ids[1]!), v: 2, moved: true });
+    cm.close();
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c']);
+    cm.close();
+  });
+});
+
 describe('windowed passthrough: the anchor as an ordinal', () => {
   it('setAnchor(currentSequence()) past the last row maps to the index length, and keeps every row presented after', async () => {
     const { cm, strategy } = await open(freshPath());

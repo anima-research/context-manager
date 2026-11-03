@@ -171,25 +171,26 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * The slot holds `{ anchor }`, the sequence, while the window is the
  * record, as it always has, and `{ anchor, ordinal, v: 2 }` once the anchor
  * is an ordinal: once a compile or a setter moves it in presented mode, or
- * a sequence anchor is converted. Where a re-anchor or setAnchorOrdinal
- * set the ordinal, rather than setAnchor or a conversion of `anchor`, the
- * slot says so with `moved: true` beside them, so setAnchor of that
- * sequence, at a restart too, converts it again (see setAnchor). A conversion is written when it is made,
- * since converting the same sequence later, once rows have been presented
- * out of record order, can give another ordinal, and so another window,
- * with no move: a reload has to read the ordinal the window was sent
- * from. A load itself stays read-only, a preview (`dryRun`) converts
- * without keeping or writing anything, and an anchor of 0, the start,
- * isn't written, as it converts to the whole window whenever it is
- * converted. `anchor` stays a sequence in both forms, at or before the
- * branch head, so a release that reads only it still loads the slot: the
- * sequence setAnchor was given, or that of the row the window starts at.
- * A slot naming a `v` other than 2 is another version's, whose `anchor`
- * this one can't vouch for: it is read as no anchor, so the window starts
- * at the branch's start, with a warning. One naming a later version than 2 is
- * never written over, so that version reads back what it wrote, and the
- * anchor's moves here are kept in memory only; any other is written over
- * by the next move.
+ * a sequence anchor is converted. Where a re-anchor or setAnchorOrdinal set
+ * the ordinal, rather than setAnchor or a conversion of `anchor`, the slot
+ * says so with `moved: true` beside them, so setAnchor of that sequence, at
+ * a restart too, converts it again (see setAnchor). A conversion is written
+ * when it is made, since converting the same sequence later, once rows have
+ * been presented out of record order, can give another ordinal, and so
+ * another window, with no move: a reload has to read the ordinal the window
+ * was sent from; a write of it that fails is made again at the next compile
+ * or read of the anchor, until one lands. A load itself stays read-only, a
+ * preview (`dryRun`) converts without keeping or writing anything, and an
+ * anchor of 0, the start, isn't written, as it converts to the whole window
+ * whenever it is converted. `anchor` stays a sequence in both forms, at or
+ * before the branch head, so a release that reads only it still loads the
+ * slot: the sequence setAnchor was given, or that of the row the window
+ * starts at. A slot naming a `v` other than 2 is another version's, whose
+ * `anchor` this one can't vouch for: it is read as no anchor, so the window
+ * starts at the branch's start, with a warning. One naming a later version
+ * than 2 is never written over, so that version reads back what it wrote,
+ * and the anchor's moves here are kept in memory only; any other is written
+ * over by the next move.
  *
  * **Cache markers.** The strategy holds first claim on message-level cache
  * breakpoints under the same slot contract as the autobiographical
@@ -251,6 +252,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * as `moved`; false while there is no ordinal.
    */
   private anchorMoved = false;
+  /**
+   * Whether the slot may lack the anchor as memory holds it: a write of it
+   * threw (persistAnchor), and the next read of the anchor (presentedAnchor)
+   * writes it again, until one lands.
+   */
+  private anchorUnwritten = false;
   /** The manager's window index (StrategyContext.window); null for a context without one, which reads as legacy mode. */
   private window: WindowIndexView | null = null;
   private store: JsStore | null = null;
@@ -456,8 +463,21 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * An anchor of 0, the start, which a branch with no slot has, is kept in
    * memory only: the row it converts to is the first in the window, so
    * every row presented since is at or after it, whenever it is converted.
+   *
+   * A write of the anchor that threw, this conversion's or a move's, is
+   * made again here, by every read but a preview, until one lands
+   * (anchorUnwritten). A conversion's failure is logged once; a move's
+   * reached its caller.
    */
   private presentedAnchor(preview = false): { ordinals: ReadonlyMap<MessageId, number>; from: number } | null {
+    if (this.anchorUnwritten && !preview) {
+      try {
+        this.persistAnchor();
+      } catch {
+        // Still unwritten: said when it first failed, and tried again at
+        // the next read.
+      }
+    }
     const ordinals = this.window?.ordinals() ?? null;
     if (!ordinals) return null;
     if (this.anchorOrdinal !== null) return { ordinals, from: this.anchorOrdinal };
@@ -468,12 +488,15 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       try {
         this.persistAnchor();
       } catch (err) {
-        // The window is the same either way: a slot not written is
-        // converted again at the next load, as before the conversion was
-        // written.
+        // The window this instance sends is the conversion's either way. A
+        // reload that finds the slot unwritten converts the sequence again,
+        // which gives another ordinal, and so another window, once a row
+        // stored before it has been presented after the row it names: the
+        // next read writes it again (anchorUnwritten), until it lands.
         this.diag.warn(
-          `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written, ` +
-            `so a reload converts its sequence ${this.anchor} again: ${describeThrown(err)}`,
+          `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written; it is written at the ` +
+            `next compile or read of the anchor, and a reload before then converts its sequence ${this.anchor} again: ` +
+            `${describeThrown(err)}`,
         );
       }
     }
@@ -525,6 +548,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.anchor = 0;
     this.anchorOrdinal = null;
     this.anchorMoved = false;
+    this.anchorUnwritten = false;
     this.prevCacheKeys = null;
     this.keptSlotReported = false;
     if (!this.store || !this.stateId) return;
@@ -1006,15 +1030,20 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   /**
    * `{ anchor }` while the window is the record, as before, and
-   * `{ anchor, ordinal, v: 2 }` once the anchor is an ordinal (see the
-   * class doc). A slot a later version wrote (a `v` above 2) is left as it
-   * is, with a warning once per branch load, and the anchor kept in memory:
-   * that version reads its slot back as it wrote it.
+   * `{ anchor, ordinal, v: 2 }` once the anchor is an ordinal, with
+   * `moved: true` after a re-anchor or setAnchorOrdinal (see the class
+   * doc). A slot a later version wrote (a `v` above 2) is left as it is,
+   * with a warning once per branch load, and the anchor kept in memory:
+   * that version reads its slot back as it wrote it. A write that throws
+   * leaves anchorUnwritten set, so the next read writes it again.
    */
   private persistAnchor(): void {
     if (!this.store || !this.stateId) return;
+    // Cleared once the write lands, or once it is clear none is due.
+    this.anchorUnwritten = true;
     const persisted: unknown = this.store.getStateJson(this.stateId);
     if (isNewerSlot(persisted)) {
+      this.anchorUnwritten = false;
       if (!this.keptSlotReported) {
         this.keptSlotReported = true;
         this.diag.warn(
@@ -1031,6 +1060,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         ? { anchor: this.anchor }
         : { anchor: this.anchor, ordinal: this.anchorOrdinal, v: ANCHOR_SLOT_FORMAT, ...(this.anchorMoved ? { moved: true } : {}) },
     );
+    this.anchorUnwritten = false;
   }
 }
 
