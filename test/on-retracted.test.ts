@@ -434,6 +434,51 @@ describe('onRetracted', () => {
     }
   });
 
+  // CM #350 bot review finding 24: retractRows makes two calls when rows the
+  // store no longer holds leave with rows it holds, and the first call's hook
+  // can move the store's branch.
+  it("a call whose hook moves the store's branch: the call by ids alone after it is made only where those rows left the window of the branch the strategy initialized on", async () => {
+    let cm!: ContextManager;
+    let before = '';
+    class Switches extends Records {
+      switchOnRetract = false;
+      switched: Promise<void> | undefined;
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: Info): Promise<void> {
+        if (this.switchOnRetract) {
+          this.switchOnRetract = false;
+          this.switched = cm.switchBranch(before);
+        }
+        return super.onRetracted(rows, ctx, info);
+      }
+    }
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const strategy = new Switches();
+    cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    // A branch made before b was removed: its record and its window hold b.
+    const store = cm.getStore();
+    before = store.createBranchAt('zz-before', cm.currentBranch().name, store.currentSequence()).name;
+    writer.removeMessage(b);
+    strategy.switchOnRetract = true;
+    const lines = await linesDuring(async () => {
+      cm.retractRows([a, b]);
+      await strategy.switched;
+      await settle();
+    });
+    assert.equal(cm.currentBranch().name, before, "setup: the first call's hook moved the store");
+    assert.notEqual(cm.ordinalOf(b), undefined, "setup: the branch's window holds b where it was");
+    assert.deepEqual(
+      strategy.retracted.map((l) => [l.rows, l.info]),
+      [[[a], { undone: false, removed: false, ids: [a] }]],
+      'b, which the branch the strategy initialized on holds, is not told there',
+    );
+    assert.deepEqual(lines, []);
+    cm.close();
+    writer.close();
+  });
+
   // CM #350 bot review finding 22: a delivery whose read fails keeps the call
   // waiting, and the strategy's next notification makes it first.
   it("a call made while the strategy initializes, whose delivery can't read the window, is made at the strategy's next notification, before that one", async () => {

@@ -1636,9 +1636,13 @@ export class ContextManager {
    * its head would follow its own later shards. Naming it by its first
    * shard's id takes those shards out and presents the body whole at the
    * end, in body order, in the one write: they take new ordinals, and the
-   * strategy hears them leave (onRetracted), then the body enter. Such a
-   * first shard reads `'undone'` or `'out'` (windowStatusOf), as its own
-   * tombstone left it.
+   * strategy hears them leave (onRetracted), then the body enter. A hook of
+   * the first call that closes the manager, sets a strategy, starts an
+   * initialization or moves the store's branch sends the second where a
+   * call made then goes: the body is heard once the strategy is
+   * initialized, where the window of the branch it initialized on holds
+   * it. Such a first shard reads `'undone'` or `'out'` (windowStatusOf), as
+   * its own tombstone left it.
    *
    * Until the first presentation on a branch the manager is in legacy
    * mode: the window is the merged record itself, read live, so compiles
@@ -1683,11 +1687,20 @@ export class ContextManager {
     const merged = this.mergedMessageView();
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
-    const hear = (entered: readonly MessageId[]) => this.notifyPresented(entered.map((id) => record[positionOf(id)!]!));
     // The later shards of a body whose first shard was out, which leave so
-    // the body can enter whole (WindowIndex.present).
-    const tell = (left: readonly LeftRow[]) =>
-      this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, row: record[positionOf(id)!]!, ordinal })), { undone: false, removed: false });
+    // the body can enter whole (WindowIndex.present), and the rows that
+    // entered. The rows are found before either hook runs: positionOf reads
+    // the store's branch, which a hook can move. The second call is made
+    // where the first's hook leaves it, as notifyPresented makes a row's
+    // call after another row's hook (deferPresented).
+    const tellAndHear = (left: readonly LeftRow[], entered: readonly MessageId[]) => {
+      const leftRows = left.map(({ id, ordinal }) => ({ id, row: record[positionOf(id)!]!, ordinal }));
+      const enteredRows = entered.map((id) => record[positionOf(id)!]!);
+      const scope = leftRows.length > 0 ? this.hookScope() : null;
+      this.notifyRetracted(leftRows, { undone: false, removed: false });
+      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
+      else this.deferPresented(enteredRows, false);
+    };
     return this.write(() => {
       const { ordinals, entered, left } = this.windowIndex.present(ids, record, positionOf, (enteredBefore, leftBefore) => {
         // The rows a failed write got in stay in the window, and no later
@@ -1695,14 +1708,12 @@ export class ContextManager {
         // them, as of the rows it took out. The write's own error is the
         // one thrown.
         try {
-          tell(leftBefore);
-          hear(enteredBefore);
+          tellAndHear(leftBefore, enteredBefore);
         } catch (error) {
           logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that left or entered before it failed:', error, this.diag);
         }
       });
-      tell(left);
-      hear(entered);
+      tellAndHear(left, entered);
       return ordinals;
     });
   }
@@ -1738,7 +1749,10 @@ export class ContextManager {
    * A row the store no longer holds (one removed through another manager)
    * has no row to give: it is told by its id alone, in a call of its own
    * with `removed`, after the call for the rows the store holds, so a
-   * strategy lets go of what it folded of it too. A call's tombstones are
+   * strategy lets go of what it folded of it too. A hook of the first call
+   * that closes the manager, sets a strategy, starts an initialization or
+   * moves the store's branch sends the second where a call made then goes,
+   * as presentRows sends its second. A call's tombstones are
    * one record, as presentRows's rows are, so a call the store refuses has
    * taken nothing out and told nothing (in legacy mode the write-down is a
    * record of its own, before them). A store handle without the batched
@@ -1751,7 +1765,10 @@ export class ContextManager {
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
     const info: Retraction = { undone: options?.undone === true, removed: false };
     // A row taken out by its id after the store dropped it has no row to
-    // give: it is told by its id, as removed, in a call of its own.
+    // give: it is told by its id, as removed, in a call of its own. Both
+    // calls' rows are found before either hook runs, and the second call is
+    // made where the first's hook leaves it (deferRetracted), as presentRows
+    // makes its second.
     const tell = (left: readonly LeftRow[]) => {
       const held: RetractedRow[] = [];
       const gone: RetractedRow[] = [];
@@ -1760,8 +1777,11 @@ export class ContextManager {
         if (at === undefined) gone.push({ id, ordinal });
         else held.push({ id, row: record[at]!, ordinal });
       }
+      const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
+      const removed: Retraction = { undone: info.undone, removed: true };
       this.notifyRetracted(held, info);
-      this.notifyRetracted(gone, { undone: info.undone, removed: true });
+      if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
+      else this.deferRetracted(gone, removed);
     };
     this.write(() => {
       const left = this.windowIndex.retract(ids, record, positionOf, info.undone, (cutShort) => {
@@ -4007,6 +4027,42 @@ export class ContextManager {
   /** Rows that wait to be heard entering the window (presentedUnheard), with whether they entered a legacy window. */
   private waitToBeHeard(rows: readonly StoredMessage[], legacy: boolean): void {
     for (const row of rows) this.presentedUnheard.set(row.id, legacy || this.presentedUnheard.get(row.id) === true);
+  }
+
+  /**
+   * A call of onRetracted that a hook of an earlier call stopped (the
+   * second call of retractRows): it waits for the initialization the hook
+   * started, as a call made while the strategy initializes does, and is
+   * made at once if that has finished, for the rows that left the window
+   * of the branch it initialized on (deliverRetractedUnheard). Nothing
+   * after close().
+   */
+  private deferRetracted(left: readonly RetractedRow[], info: Retraction): void {
+    if (left.length === 0 || this.closed) return;
+    this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
+    if (this.initializedAttempt === this.initializationAttempt) this.deliverUnheard();
+  }
+
+  /**
+   * What a hook call can change that a call after it is made under: the
+   * strategy, its initialization, and the store's branch. Read before the
+   * first of two calls (presentRows, retractRows), and checked before the
+   * second (inHookScope).
+   */
+  private hookScope(): { strategy: ContextStrategy; attempt: number; branch: StoreBranchGeneration; id: string } {
+    return { strategy: this.strategy, attempt: this.initializationAttempt, branch: observeStoreBranch(this.store), id: this.store.currentBranch().id };
+  }
+
+  /**
+   * Whether a hook call left the manager as `scope` found it: open, with
+   * the same strategy, initialization and branch. Where it didn't, the call
+   * after it waits for the initialization, and is made where the window of
+   * the branch the strategy initialized on holds its rows.
+   */
+  private inHookScope(scope: ReturnType<ContextManager['hookScope']>): boolean {
+    if (this.closed || this.strategy !== scope.strategy || this.initializationAttempt !== scope.attempt) return false;
+    const branch = observeStoreBranch(this.store);
+    return branch.name === scope.branch.name && branch.generation === scope.branch.generation && this.store.currentBranch().id === scope.id;
   }
 
   /**

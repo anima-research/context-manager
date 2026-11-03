@@ -23,8 +23,10 @@ import {
   ContextManager,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
+  windowIndexStateId,
 } from '../src/index.js';
 import type { MessageId, MessageStoreView, StoredMessage, StrategyContext } from '../src/index.js';
+import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-on-presented';
 let storeSeq = 0;
@@ -631,6 +633,71 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
     await settle();
     cm.close();
   });
+});
+
+// CM #350 bot review finding 24: a presentRows that puts a body back whole
+// makes two hook calls, and the first can move the store's branch.
+describe("a body put back whole, whose onRetracted hook moves the store's branch", () => {
+  for (const initializes of [false, true]) {
+    it(`${initializes ? 'a strategy with an initialize' : 'a strategy with no initialize'}: presentRows returns, and the body is heard entering only where the window of the branch it initialized on holds it`, async () => {
+      let cm!: ContextManager;
+      let elsewhere = '';
+      class Switches extends ShardingRecords {
+        switchOnRetract = false;
+        switched: Promise<void> | undefined;
+        async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+          if (this.switchOnRetract) {
+            this.switchOnRetract = false;
+            this.switched = cm.switchBranch(elsewhere);
+          }
+          return super.onRetracted(rows, ctx, info);
+        }
+      }
+      class SwitchesAfterInitialize extends Switches {
+        async initialize(_ctx: StrategyContext): Promise<void> {}
+      }
+      const strategy = initializes ? new SwitchesAfterInitialize() : new Switches();
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      const store = cm.getStore();
+      cm.presentRows([]);
+      // A branch made before the body: neither its record nor its window holds it.
+      elsewhere = store.createBranchAt('zz-elsewhere', cm.currentBranch().name, store.currentSequence()).name;
+      const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+      const shards = cm.getAllMessages().map((m) => m.id);
+      const a = cm.addMessage('alice', [text('a')]);
+      cm.presentRows([doc, a]);
+      // A retract cut short after the first shard's tombstone, in an index
+      // written one record per item: the first shard out, the later ones in.
+      const handle = store as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+      const append = handle.appendToStateJsonWithIdentity;
+      const batched = perItemIndexWrites(store);
+      let appends = 0;
+      handle.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+        if (id === windowIndexStateId('zz-agent') && ++appends === 2) throw new Error('zz-index-append-failed');
+        return append.call(this, id, ...rest);
+      };
+      try {
+        assert.throws(() => cm.retractRows([doc]), /zz-index-append-failed/);
+      } finally {
+        handle.appendToStateJsonWithIdentity = append;
+        batched();
+      }
+      assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['out', 'in', 'in'], 'setup: the first shard out, the later ones in');
+      strategy.heard = [];
+      strategy.retracted = [];
+      strategy.switchOnRetract = true;
+      const errors = await errorsDuring(async () => {
+        cm.presentRows([shards[0]!]);
+        await strategy.switched;
+        await settle();
+      });
+      assert.equal(cm.currentBranch().name, elsewhere, 'setup: the hook moved the store to the branch made before the body');
+      assert.deepEqual(strategy.retracted, [{ rows: [shards[1], shards[2]], undone: false }], 'the later shards were heard leaving, on the branch they left');
+      assert.deepEqual(strategy.heard, [], 'the branch it initialized on holds no shard of the body, so none is heard entering');
+      assert.deepEqual(errors, [], 'nothing failed');
+      cm.close();
+    });
+  }
 });
 
 // House review of #350, code finding 9: once rows are presented,
