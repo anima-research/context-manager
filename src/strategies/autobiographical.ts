@@ -2546,7 +2546,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
     const callerMarkers = this.config.kvUnified?.callerCacheMarkers ?? 0;
     if (!Number.isInteger(callerMarkers) || callerMarkers < 0 || callerMarkers > 3) {
-      const shown = typeof callerMarkers === 'string' ? JSON.stringify(callerMarkers) : String(callerMarkers);
+      const shown =
+        typeof callerMarkers === 'string' || typeof callerMarkers === 'object'
+          ? JSON.stringify(callerMarkers)
+          : String(callerMarkers);
       throw new RangeError(
         `kvUnified.callerCacheMarkers is ${shown}; it must be an integer from 0 to 3, the cache markers the ` +
           `caller's request carries outside the messages. kv-unified places at most 4 minus that many of its own, ` +
@@ -15449,7 +15452,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Slot contract with membrane (the request compiler's side of it):
    * Anthropic allows 4 cache_control blocks per request INCLUDING any on
    * tools/system. The split is: **this strategy holds first claim, up to 3
-   * message-level markers; membrane is residual claimant on whatever
+   * message-level markers (kv-unified up to 4, less those
+   * `kvUnified.callerCacheMarkers` declares); membrane is residual claimant on whatever
    * remains**, spending it end-position-only — a tools+system fallback when
    * zero message markers arrive, and a floating marker on the newest
    * message when the native tool loop rebuilds the request between tool

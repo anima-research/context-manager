@@ -347,10 +347,10 @@ describe("a caller that places its own cache markers outside the messages (kvUni
     kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, callerCacheMarkers },
   });
 
-  it("kv-unified places at most 4 minus the declared count: history markers nearest to evenly spaced fractions of the history's tokens, the last at its last boundary, and the tail end", () => {
-    const expected = [[0, 2, 5, 6], [1, 5, 6], [5, 6], [6]];
-    for (const [declared, marks] of expected.entries()) {
-      const strategy = kvUnified({ headWindowTokens: 0, recentWindowTokens: 100, ...withCallerMarkers(declared) });
+  it("kv-unified places at most 4 minus the declared count: history markers nearest to evenly spaced fractions of the history's tokens, the last at its last boundary, and the tail end; null declares none", () => {
+    const expected: Array<[number | null, number[]]> = [[0, [0, 2, 5, 6]], [1, [1, 5, 6]], [2, [5, 6]], [3, [6]], [null, [0, 2, 5, 6]]];
+    for (const [declared, marks] of expected) {
+      const strategy = kvUnified({ headWindowTokens: 0, recentWindowTokens: 100, ...withCallerMarkers(declared as number) });
       const entries = [1200, 400, 400, 400, 400, 400].map((chars, k) => ({
         participant: 'u', content: [{ type: 'text', text: 'x'.repeat(chars) }],
         sourceMessageId: `m${k}`, sourceRelation: 'copy',
@@ -448,16 +448,18 @@ describe("a caller that places its own cache markers outside the messages (kvUni
     }
   });
 
-  it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built', () => {
-    for (const declared of [4, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1' as unknown as number]) {
-      assert.throws(() => kvUnified({ ...withCallerMarkers(declared) }), (error: unknown) =>
-        error instanceof RangeError && /kvUnified\.callerCacheMarkers is .*; it must be an integer from 0 to 3/.test(error.message),
-      `${declared} is refused`);
+  it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built, naming the value as given', () => {
+    for (const [declared, shown] of [
+      [4, '4'], [-1, '-1'], [1.5, '1.5'], [Number.NaN, 'NaN'], [Number.POSITIVE_INFINITY, 'Infinity'],
+      ['1', '"1"'], [{ toString: null }, '{"toString":null}'], [1n, '1'],
+    ] as Array<[unknown, string]>) {
+      assert.throws(() => kvUnified({ ...withCallerMarkers(declared as number) }), (error: unknown) =>
+        error instanceof RangeError &&
+        error.message.startsWith(`kvUnified.callerCacheMarkers is ${shown}; it must be an integer from 0 to 3`),
+      `${shown} is refused, named as given`);
     }
     for (const declared of [0, 3, null as unknown as number]) {
       assert.doesNotThrow(() => kvUnified({ ...withCallerMarkers(declared) }), `${declared} is taken`);
     }
-    assert.throws(() => kvUnified({ ...withCallerMarkers(Number.NaN) }), /callerCacheMarkers is NaN;/);
-    assert.throws(() => kvUnified({ ...withCallerMarkers('1' as unknown as number) }), /callerCacheMarkers is "1";/);
   });
 });
