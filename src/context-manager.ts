@@ -610,11 +610,19 @@ export class ContextManager {
   private windowIndex: WindowIndex;
   /**
    * Rows that entered the window while the strategy wasn't initialized, for
-   * it to hear once it is (notifyPresented), each with whether it entered
-   * a legacy window, where the add itself entered it.
+   * it to hear once it is (notifyPresented), by id, each with whether it
+   * entered a legacy window, where the add itself entered it. A row that
+   * enters again before then waits once: the delivery reads the window, so
+   * however often a row entered, it is heard once if the window holds it.
    */
-  private presentedUnheard: Array<{ id: MessageId; legacy: boolean }> = [];
-  /** Calls of onRetracted made while the strategy wasn't initialized, in order, for it to hear once it is (notifyRetracted). */
+  private presentedUnheard = new Map<MessageId, boolean>();
+  /**
+   * Calls of onRetracted made while the strategy wasn't initialized, in
+   * order, for it to hear once it is (notifyRetracted). Each keeps its rows'
+   * ids and ordinals, and the row itself only for a row a removal took,
+   * which the store no longer holds: the others are read when the call is
+   * made, so what waits is small however long the initialization fails.
+   */
   private retractedUnheard: Array<{ left: RetractedRow[]; info: Retraction }> = [];
   /**
    * While removeMessage or removeMessages removes rows in presented mode:
@@ -3675,7 +3683,7 @@ export class ContextManager {
     // was presented again is at its old place, and goes before the row is
     // heard at its new one.
     if (this.retractedUnheard.length > 0) this.deliverRetractedUnheard();
-    if (this.presentedUnheard.length > 0) this.deliverPresentedUnheard();
+    if (this.presentedUnheard.size > 0) this.deliverPresentedUnheard();
   }
 
   /** Refuse an operation on a closed manager, naming it. */
@@ -3937,8 +3945,7 @@ export class ContextManager {
     // once it is initialized, so they wait while one without a row hook
     // initializes too: a replacement set meanwhile hears them.
     if (this.initializedAttempt !== this.initializationAttempt) {
-      const legacy = this.windowIndex.mode() === 'legacy';
-      for (const row of rows) this.presentedUnheard.push({ id: row.id, legacy });
+      this.waitToBeHeard(rows, this.windowIndex.mode() === 'legacy');
       return;
     }
     const strategy = this.strategy;
@@ -3986,8 +3993,13 @@ export class ContextManager {
    */
   private deferPresented(rows: readonly StoredMessage[], legacy: boolean): void {
     if (this.closed) return;
-    for (const row of rows) this.presentedUnheard.push({ id: row.id, legacy });
+    this.waitToBeHeard(rows, legacy);
     if (this.initializedAttempt === this.initializationAttempt) this.deliverPresentedUnheard();
+  }
+
+  /** Rows that wait to be heard entering the window (presentedUnheard), with whether they entered a legacy window. */
+  private waitToBeHeard(rows: readonly StoredMessage[], legacy: boolean): void {
+    for (const row of rows) this.presentedUnheard.set(row.id, legacy || this.presentedUnheard.get(row.id) === true);
   }
 
   /**
@@ -4009,7 +4021,9 @@ export class ContextManager {
     // As notifyPresented's rows, the call waits for the manager's strategy,
     // whether or not the one initializing has the hook.
     if (this.initializedAttempt !== this.initializationAttempt) {
-      this.retractedUnheard.push({ left: [...left], info });
+      // A row the store holds is read when the call is made; one a removal
+      // took is kept, since the store no longer has it to give.
+      this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
       return;
     }
     const strategy = this.strategy;
@@ -4036,8 +4050,10 @@ export class ContextManager {
    * its record, so neither is told. A call left with no row isn't made. A
    * call whose hook closes the manager, sets a strategy or starts an
    * initialization sends the calls after it where a call made then goes.
-   * Nothing here fails the initialization that ran it: a failure of the
-   * manager's own work is logged.
+   * A row the call didn't keep is read then, from the record of that
+   * branch, and given where it holds it; one it no longer holds is told by
+   * its id alone. Nothing here fails the initialization that ran it: a
+   * failure of the manager's own work is logged.
    */
   private deliverRetractedUnheard(): void {
     const queued = this.retractedUnheard;
@@ -4051,7 +4067,12 @@ export class ContextManager {
         // be read: it left where the record no longer holds it.
         const leftHere = ({ id, ordinal }: RetractedRow) =>
           (ordinal !== undefined && this.windowIndex.ordinalOf(id) !== ordinal) || !holdsRow(merged!, id);
-        this.notifyRetracted(presented ? left.filter(leftHere) : [], info);
+        const withRow = (l: RetractedRow): RetractedRow => {
+          if (l.row) return l;
+          const row = merged!.get(l.id);
+          return row ? { ...l, row } : l;
+        };
+        this.notifyRetracted(presented ? left.filter(leftHere).map(withRow) : [], info);
       } catch (err) {
         logThrown('[context-manager] telling the strategy of rows that left the window while it initialized failed:', err, this.diag);
       }
@@ -4074,8 +4095,8 @@ export class ContextManager {
    */
   private deliverPresentedUnheard(): void {
     const presented = this.windowIndex.mode() === 'presented';
-    const unheard = new Set(this.presentedUnheard.filter((row) => presented || row.legacy).map((row) => row.id));
-    this.presentedUnheard = [];
+    const unheard = new Set([...this.presentedUnheard].filter(([, legacy]) => presented || legacy).map(([id]) => id));
+    this.presentedUnheard = new Map();
     try {
       // The window's listing: the index's rows once a host presents, the
       // merged record in legacy mode.

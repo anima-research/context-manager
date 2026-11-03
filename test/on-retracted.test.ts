@@ -434,6 +434,42 @@ describe('onRetracted', () => {
     }
   });
 
+  // CM #350 bot review finding 21: while initialization stays failed the
+  // calls wait without bound, so what each keeps is kept small.
+  it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const big = cm.addMessage('alice', [text('x'.repeat(100_000))]);
+    cm.presentRows([big]);
+    class Fails extends Records {
+      async initialize(_ctx: StrategyContext): Promise<void> {
+        throw new Error('zz-init-failed');
+      }
+    }
+    await assert.rejects(cm.setStrategy(new Fails()), /zz-init-failed/);
+    for (let i = 0; i < 20; i++) {
+      cm.retractRows([big]);
+      cm.presentRows([big]);
+    }
+    const waiting = cm as unknown as {
+      presentedUnheard: ReadonlyMap<MessageId, unknown>;
+      retractedUnheard: Array<{ left: Array<{ id: MessageId; row?: unknown }> }>;
+    };
+    assert.equal(waiting.presentedUnheard.size, 1, 'the row waits once to be heard entering');
+    assert.equal(waiting.retractedUnheard.length, 20);
+    assert.ok(waiting.retractedUnheard.every((call) => call.left.every((l) => l.row === undefined)), 'no waiting call keeps the row, which the store holds');
+    const strategy = new Records();
+    await cm.setStrategy(strategy);
+    assert.equal(strategy.retracted.length, 20, 'each call is made once a strategy initializes');
+    assert.ok(
+      strategy.retracted.every((l) => l.rows.length === 1 && l.rows[0] === big && l.texts[0]!.length === 100_000),
+      'with the row, read when the call is made',
+    );
+    assert.deepEqual(strategy.presented, [[big]], 'and the row is heard entering once');
+    await settle();
+    cm.close();
+  });
+
   for (const [name, make] of [
     ['passthrough', () => new PassthroughStrategy()],
     ['windowed passthrough', () => new WindowedPassthroughStrategy()],
