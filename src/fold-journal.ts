@@ -819,6 +819,16 @@ export class FoldJournal {
           `returned it`,
       );
     }
+    // Each sequence bounds a receipt's run where its member does, so each
+    // is a store sequence, and in a layout keyed by sequence it is the
+    // member itself.
+    const misplaced = misplacedSequence(layout);
+    if (misplaced !== null) {
+      throw new Error(
+        `the layout of compile ${provenance.compileId} can't be accepted: ${misplaced}, so accepting it again is ` +
+          `refused the same way. Accept a compile's provenance as compile returned it`,
+      );
+    }
     const prev = branch ? this.loadLatest(index, branch, format) : null;
 
     let draft: Omit<FoldReceipt, 'id'> | null = null;
@@ -1446,6 +1456,36 @@ function unitCount(u: LayoutUnit): number {
 }
 
 /** Members ascend, and the units cover exactly the members. */
+/**
+ * What is wrong with a layout's `memberSequences`, given one per member, or
+ * null: an entry that isn't a store sequence (a non-negative safe integer),
+ * or, in a layout keyed by sequence, one that isn't its member. The first
+ * such entry is named by its index.
+ */
+function misplacedSequence(layout: RenderedLayout): string | null {
+  for (let i = 0; i < layout.memberSequences.length; i++) {
+    const sequence: unknown = layout.memberSequences[i];
+    if (!Number.isSafeInteger(sequence) || (sequence as number) < 0) {
+      return `its memberSequences[${i}] is ${describeValue(sequence)}, not a store sequence (a non-negative safe integer)`;
+    }
+    if (layout.keyedBy === 'sequence' && sequence !== layout.members[i]) {
+      return `it is keyed by sequence, and its memberSequences[${i}] (${sequence as number}) isn't its members[${i}] ` +
+        `(${describeValue(layout.members[i])}), each member's own sequence`;
+    }
+  }
+  return null;
+}
+
+/** A value as an error names it: JSON where it has a form there, else its type. */
+function describeValue(value: unknown): string {
+  if (typeof value === 'number') return String(value);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return typeof value;
+  }
+}
+
 function wellFormed(layout: StoredLayout): boolean {
   let covered = 0;
   for (const u of layout.units) {
