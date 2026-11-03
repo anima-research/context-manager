@@ -3502,8 +3502,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * presentation in flight kept as it is (#166). Called by a compression that
    * waited on another instance's in-flight compression of its family, by the
    * live lookup when the store holds an L1 this instance doesn't
-   * (findExactL1), and by a merge whose sources the store holds as parented
-   * and this instance doesn't (parentedMergeSources). The store's queue of
+   * (findExactL1), by a merge whose sources the store holds as parented and
+   * this instance doesn't, or lacks (parentedMergeSources), and by an L1
+   * whose chunk record the store no longer holds as it began
+   * (chunkRecordChangedInStore). The store's queue of
    * merges replaces this instance's, and may have been written by an
    * instance that hadn't seen this one's later merges, so the threshold pass
    * then queues again whatever the summaries make eligible. The store's merge
@@ -5915,6 +5917,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         'mid-request, and its chunk record is compressed again over the rows it keeps',
     );
     return true;
+  }
+
+  /**
+   * Whether the store no longer holds the chunk record `recordId` as this
+   * instance held it when the compression began (`sources`): uncompressed,
+   * over those sources. Another instance sharing the store changes it when
+   * a row of the span leaves that instance's window (its onRetracted gives
+   * the row up from the record, or removes the record), and this instance
+   * doesn't hear that. Without a record, a store, or a stored list of
+   * records there is nothing to judge, and nothing has changed.
+   */
+  private chunkRecordChangedInStore(recordId: string | undefined, sources: readonly MessageId[] | undefined): boolean {
+    if (recordId === undefined || sources === undefined || !this.chunkPersistenceEnabled || !this.store) return false;
+    const stored = this.store.getStateJson(this.chunksStateId);
+    if (!Array.isArray(stored)) return false;
+    const key = sources.join('\u0000');
+    return !loadedChunkRecords<ChunkRecord>(stored).some(
+      (record) => record.id === recordId && !record.compressed && record.sourceIds.join('\u0000') === key,
+    );
   }
 
   /** A ladder ended with no summary on a family dropped while it ran: it writes no record. */
@@ -8439,24 +8460,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The ids of `sources` a merge may no longer parent: each this instance
    * holds as parented, or the store's summary list does. A parent only the
    * store holds means the store has changed since this instance loaded, as
-   * another instance's merge changes it: this instance then takes up the
-   * store's state, as a compression that waited on another instance's does,
-   * so that afterwards its threshold pass and its count of unmerged
-   * summaries see that merge rather than choosing the run again.
+   * another instance's merge changes it; so does a source the store's list
+   * no longer holds, which another instance sharing the store dropped, as
+   * its onRetracted drops the summaries over a row that left its window,
+   * which this instance doesn't hear (every summary this instance holds was
+   * written to the store, so only another writer takes one out). Either way
+   * this instance then takes up the store's state, as a compression that
+   * waited on another instance's does, so that afterwards it no longer
+   * holds a dropped source, which the caller then finds missing, and its
+   * threshold pass and its count of unmerged summaries see the store's
+   * merges rather than choosing the run again.
    */
   private parentedMergeSources(sources: readonly SummaryEntry[]): string[] {
     const parented = new Set(sources.filter((source) => getSummaryParentId(source)).map((source) => source.id));
     const held = parented.size;
     const stored = this.store?.getStateJson(this.summariesStateId);
+    let dropped = false;
     if (Array.isArray(stored)) {
       const ids = new Set(sources.map((source) => source.id));
+      const listed = new Set<string>();
       for (const item of stored as Array<SummaryEntry | null>) {
         if (!item || typeof item.id !== 'string' || !ids.has(item.id)) continue;
+        listed.add(item.id);
         const parent = getSummaryParentId(item);
         if (typeof parent === 'string' && parent) parented.add(item.id);
       }
+      dropped = listed.size < ids.size;
     }
-    if (parented.size > held) this.takeUpStoreState();
+    if (parented.size > held || dropped) this.takeUpStoreState();
     return [...parented];
   }
 
@@ -9889,6 +9920,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!ctx.membrane) {
       throw new Error('No membrane instance for compression');
     }
+    // The chunk's record as this instance holds it as the compression
+    // begins, which the store's must still match when the L1 is written
+    // (chunkRecordChangedInStore).
+    const recordSources = chunk.recordId === undefined
+      ? undefined
+      : this.chunkRecords.find((record) => record.id === chunk.recordId)?.sourceIds.slice();
 
     // ---- Duplicate-formation guards (layered) ----
     // Merged from two independent fixes for the same disease:
@@ -12159,6 +12196,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // Another instance sharing the store let go of the chunk's record
+      // while the request was in flight: a row of its span left that
+      // instance's window, which gave the row up from the record or removed
+      // it (onRetracted), and this instance didn't hear it, so its own mark
+      // (_spanLeftWindow) isn't set. The summary would cover a row that
+      // window no longer holds. Discard it and take up the store's state;
+      // the rebuild from its records queues the record again over the rows
+      // it keeps. Nothing between this read and the writes below awaits.
+      if (this.chunkRecordChangedInStore(chunk.recordId, recordSources)) {
+        this.diag.warn(
+          `[autobiographical] discarding L1: its chunk record ${chunk.recordId} changed in the store mid-request ` +
+            '(another instance sharing the store let go of a row of its span)',
+        );
+        this.takeUpStoreState();
+        this.rebuildChunks(ctx.messageStore);
+        return;
+      }
+
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
         id: `L1-${this.nextSummaryIdCounter()}`,
@@ -12670,13 +12725,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // item; the remaining orphans will be regrouped by the next threshold
     // pass. Never mutate an already-authored parent edge. The store's
     // summaries are read too, so a merge another instance sharing the store
-    // has written is taken up here, before any call.
+    // has written, or a source it has dropped, is taken up here, before any
+    // call.
     const alreadyParented = this.parentedMergeSources(sources);
     if (alreadyParented.length > 0) {
       this.diag.warn(
         `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
           `(${alreadyParented.join(', ')}); skipping stale queue entry`,
       );
+      return false;
+    }
+    // A source another instance sharing the store dropped (a row under it
+    // left that instance's window), which the read above took up the
+    // store's state without: a merge of it would cover the row again. The
+    // chunks are rebuilt from the store's records, so the record the drop
+    // gave the row up from is queued again over the rows it keeps.
+    const droppedBefore = sources.filter((source) => !this.summaryById(source.id));
+    if (droppedBefore.length > 0) {
+      this.diag.warn(
+        `executeMerge: ${droppedBefore.length}/${sources.length} source(s) dropped from the store by another instance ` +
+          `sharing it (${droppedBefore.map((source) => source.id).join(', ')}); skipping stale queue entry`,
+      );
+      this.rebuildChunks(ctx.messageStore);
       return false;
     }
 
@@ -13289,6 +13359,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // entry for these sources still in it goes when a later tick reaches
       // it and the entry check finds them parented. Nothing below awaits
       // before the writes.
+      const summariesBefore = this.summaries;
       const parentedSince = this.parentedMergeSources(sources);
       if (parentedSince.length > 0) {
         this.diag.warn(
@@ -13297,17 +13368,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         return false;
       }
-      // A row under a source left the window while the call was out
-      // (onRetracted), which dropped the source: a merge of it would cover
-      // that row again. It writes nothing, and its queue entry went with the
-      // source.
+      // A row under a source left the window while the call was out, which
+      // dropped the source: this instance's onRetracted dropped it, or
+      // another instance sharing the store did, and the read above took up
+      // the store's state, which no longer holds it. A merge of it would
+      // cover that row again. It writes nothing, and its queue entry went
+      // with the source. Where the read took up the store's state, the
+      // chunks are rebuilt from its records, as at entry.
+      const tookUpStore = this.summaries !== summariesBefore;
       const droppedSince = sources.filter((source) => !this.summaryById(source.id));
       if (droppedSince.length > 0) {
         this.diag.warn(
           `executeMerge: ${droppedSince.length}/${sources.length} source(s) dropped while the L${targetLevel} ` +
-            `merge's call was out, a row under them having left the window (${droppedSince.map((source) => source.id).join(', ')}); ` +
-            `its summary is not written`,
+            `merge's call was out, a row under them having left the window` +
+            `${tookUpStore ? ' of another instance sharing the store' : ''} ` +
+            `(${droppedSince.map((source) => source.id).join(', ')}); its summary is not written`,
         );
+        if (tookUpStore) this.rebuildChunks(ctx.messageStore);
         return false;
       }
 
