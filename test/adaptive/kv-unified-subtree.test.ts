@@ -5,14 +5,10 @@ import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { CanonicalSummaryForest, SparseLabelCeilingError } from '../../src/adaptive/kv-unified.js';
 import { ParetoKvUnifiedPolicySolver, type ParetoSolveOptions } from '../../src/adaptive/kv-unified-pareto.js';
 import type { KvUnifiedReuse } from '../../src/adaptive/kv-unified-reuse.js';
-import { ExactKvUnifiedPolicySolver, type ExactPolicyCandidate } from '../../src/adaptive/kv-unified-policy.js';
+import { ExactKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-policy.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
-import { buildChronicleWithChain, MockChronicle } from './harness.js';
-
-const metrics = (candidates: readonly ExactPolicyCandidate[]) => candidates
-  .map((c) => [c.renderedTokens, c.fidelityLoss, c.continuityLoss, c.cacheChurn, c.score].map((v) => Math.round(v * 1e6) / 1e6).join('/'))
-  .sort();
+import { buildChronicleWithChain, MockChronicle, candidateMetrics as metrics } from './harness.js';
 
 function inputsOf(chronicle: MockChronicle, extra: Partial<PickerInputs> = {}): PickerInputs {
   return {
@@ -294,7 +290,7 @@ test('an accepted leaf that is a protected hole keeps its summary from counting 
   // owns, so recalling that L1 is a re-rendering, not an extension.
   const chronicle = new MockChronicle({ recallPairTokens: 30 });
   for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 70, pinned: i === 1 });
-  chronicle.produceL1(['c0', 'c1', 'c2', 'c3']);
+  const held = chronicle.produceL1(['c0', 'c1', 'c2', 'c3']);
   chronicle.produceL1(['c4', 'c5', 'c6', 'c7']);
   const inputs = inputsOf(chronicle);
   const forest = new CanonicalSummaryForest(inputs);
@@ -314,6 +310,24 @@ test('an accepted leaf that is a protected hole keeps its summary from counting 
   assert.equal(subtree.selected.score, reference.selected.score);
   assert.deepEqual(subtree.selected.frontier, reference.selected.frontier);
   assert.deepEqual(metrics(subtree.candidates), metrics(reference.candidates));
+
+  const reuse: KvUnifiedReuse = {};
+  assert.ok(solver.solve({ ...options, engine: 'subtree', currentImmutablePrefixHash: 'another prefix', reuse }).feasible);
+  const entry = reuse.subtree?.get(held.id) as unknown as { broken: ReadonlyArray<{ extension: number; trace: unknown }> | null } | undefined;
+  assert.ok(entry?.broken, 'the held L1 has broken-entry deltas');
+  const levels = (trace: unknown): Set<number> => {
+    const seen = new Set<number>();
+    for (const stack = [trace as { parent?: unknown; delta?: unknown; level?: number } | null]; stack.length > 0;) {
+      const node = stack.pop();
+      if (!node) continue;
+      if ('delta' in node) stack.push(node.parent as never, node.delta as never);
+      else { seen.add(node.level!); stack.push(node.parent as never); }
+    }
+    return seen;
+  };
+  const recalls = entry.broken.filter((delta) => levels(delta.trace).has(1));
+  assert.ok(recalls.length > 0, 'a delta recalls the held L1');
+  for (const delta of recalls) assert.equal(delta.extension, 0);
 });
 
 test('without a grid the engine prunes by dominance across values, as the packed engine does', () => {

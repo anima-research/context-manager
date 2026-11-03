@@ -13,8 +13,12 @@
  */
 
 import type { SummaryEntry } from '../../src/types/strategy.js';
-import type { PickerChunk } from '../../src/adaptive/picker.js';
+import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
 import type { ChunkId, SummaryId } from '../../src/adaptive/folding-strategy.js';
+import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
+import type { ExactPolicyCandidate } from '../../src/adaptive/kv-unified-policy.js';
+import { renderLayout } from '../../src/adaptive/render-offsets.js';
+import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 
 /**
  * Default tokens per recall pair, regardless of source level.
@@ -306,3 +310,66 @@ export function buildChronicleWithChain(opts: {
   }
   return chronicle;
 }
+
+export function seededPolicyFixture(seed: number, external = false, large = false) {
+  let state = seed * 2654435761 >>> 0 || 1;
+  const random = () => ((state = (Math.imul(state, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+  const pick = <T>(xs: readonly T[]) => xs[Math.floor(random() * xs.length)];
+  const n = large ? 6 + Math.floor(random() * 7) : 4 + Math.floor(random() * 6);
+  const chronicle = new MockChronicle({ recallPairTokens: 20 + Math.floor(random() * 40) });
+  const ties = random() < 0.25;
+  for (let i = 0; i < n; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: ties ? 60 : 10 + Math.floor(random() * 150) });
+  const ownerless = external ? Math.floor(random() * 4) : 0;
+  const shape = pick(['chain', 'gap', 'holes', 'mixed'] as const);
+  const ids = chronicle.chunks.map((chunk) => chunk.id);
+  const l1s = [];
+  if (shape === 'gap') {
+    l1s.push(chronicle.produceL1(ids.filter((_, i) => i % 2 === 0)));
+    l1s.push(chronicle.produceL1(ids.filter((_, i) => i % 2 === 1)));
+  } else {
+    for (let i = 0; i + 1 < n; i += 2 + Math.floor(random() * 2)) l1s.push(chronicle.produceL1(ids.slice(i, Math.min(n, i + 2 + Math.floor(random() * 2)))));
+  }
+  if (l1s.length >= 2 && random() < 0.5) chronicle.produceUpper(2, [l1s[0].id, l1s[1].id]);
+  for (let i = 0; i < ownerless; i++) chronicle.addChunk({ id: `o${i}`, rawTokens: 10 + Math.floor(random() * 90) });
+  for (const chunk of chronicle.chunks) {
+    if (!ties) chunk.salience = random();
+    if ((shape === 'holes' || shape === 'mixed') && random() < 0.25) chunk.pinned = true;
+  }
+  if (!ties) for (const [id] of chronicle.recallPairTokens) chronicle.recallPairTokens.set(id, 10 + Math.floor(random() * 50));
+  const inputs: PickerInputs = { chunks: chronicle.chunks, summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens, headTokens: Math.floor(random() * 20), tailTokens: Math.floor(random() * 20),
+    headChunkIds: new Set(external && random() < 0.3 ? ['c0'] : []),
+    tailChunkIds: new Set(external && random() < 0.4 ? [chronicle.chunks[chronicle.chunks.length - 1].id, ...(random() < 0.5 ? [`c${n - 1}`] : [])] : []) };
+  const forest = new CanonicalSummaryForest(inputs, { preserveGapBearingSummaries: true });
+  const cuts = forest.enumerateExactCuts().candidates;
+  const prior = pick(cuts);
+  const layout = renderLayout(inputs, new SummaryTree(inputs), prior.frontier);
+  const presented = random();
+  const leaves = new Map(inputs.chunks.filter(() => random() < presented).map((chunk) => {
+    const level = prior.frontier.get(chunk.id) ?? 0;
+    const sid = forest.leaf(chunk.id)!.summaryIds.find((id) => forest.summary(id)!.level === level);
+    const hash = random() < 0.15 ? 'summary:stale' : level === 0 ? `raw:${chunk.id}` : `summary:${sid}`;
+    return [chunk.id, { level, repHash: hash, lastChangedSeq: Math.floor(random() * 4) }];
+  }));
+  const floor = forest.minimumTokens();
+  const everyMarker = random() < 0.5;
+  const grid = large ? pick([[200, 200, 200], [100, 60, 60], [400, 300, 300], [50, 30, 100]])
+    : pick([[0, 0, 0], [50, 30, 100], [1000, 1000, 1000], [20, 5, 5], [7, 3, 11]]);
+  const options = {
+    maxTokens: (floor.floorTokens ?? 0) + Math.floor(random() * 400),
+    adoptEpsilon: pick([0, 0, 5, 20]),
+    presentation: presented > 0.1 ? { currentSeq: 5, leaves } : undefined,
+    cache: { immutablePrefixHash: 'same', layout, markers: everyMarker
+      ? layout.units.map((_, i) => ({ unitIndex: i + 1, offset: layout.units[i + 1]?.offset ?? layout.totalTokens }))
+      : [{ unitIndex: Math.max(1, Math.floor(layout.units.length / 2)), offset: 100 }, { unitIndex: layout.units.length, offset: layout.totalTokens }] },
+    currentImmutablePrefixHash: random() < 0.25 ? 'changed' : 'same',
+    tokenBucketSize: grid[0], continuityBucketSize: grid[1], fidelityBucketSize: grid[2],
+    policy: { continuityLambda: 50 + Math.floor(random() * 500), cacheLambda: 50 + Math.floor(random() * 500), continuityScale: 100, cacheScale: 100 },
+    terminalEvaluation: pick(['full', 'selective'] as const),
+  };
+  return { inputs, forest, options, prior, random };
+}
+
+export const candidateMetrics = (candidates: readonly ExactPolicyCandidate[]) => candidates
+  .map((c) => [c.renderedTokens, c.fidelityLoss, c.continuityLoss, c.cacheChurn, c.score].map((v) => Math.round(v * 1e6) / 1e6).join('/'))
+  .sort();

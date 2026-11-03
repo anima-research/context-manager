@@ -41,6 +41,7 @@ interface Summary { id: string; level: number; content: string; sourceIds: strin
 type Internals = {
   summaries: Summary[];
   config: Record<string, unknown>;
+  _lastCompileEstimate: number;
   estimateTokens(content: unknown[]): number;
   summaryAnswerContent(summary: Summary): unknown[];
   resetHeadWindow(id: string | null): void;
@@ -123,8 +124,11 @@ async function forest(
     built.cm.close();
     return { ids: built.ids, textOf: built.textOf, requests: built.requests, calls: built.calls(), held };
   });
-  const template = await plainForest;
-  cpSync(join(dir, 'plain-forest'), join(dir, name), { recursive: true });
+  return openCopy(await plainForest, 'plain-forest', name);
+}
+
+async function openCopy(template: { ids: string[]; textOf: Map<string, string>; requests: any[]; calls: number }, from: string, name: string) {
+  cpSync(join(dir, from), join(dir, name), { recursive: true });
   const sum = summarizer(defaultRespond, JSON.parse(JSON.stringify(template.requests)), template.calls);
   const strategy = strategyFor({});
   const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane: sum.membrane as never });
@@ -199,6 +203,53 @@ async function captureWarnings<T>(run: () => Promise<T>): Promise<{ result: T; w
   } finally {
     console.warn = original;
   }
+}
+
+const pinsSpeaker = (i: number): string => (i % 2 === 0 || i === 5 ? 'User' : 'Claude');
+let pinsForest: Promise<{ ids: string[]; textOf: Map<string, string>; requests: any[]; calls: number }> | undefined;
+
+async function pinsAtTheLimit(name: string, budget: number, opts: { retried?: boolean; multiplier?: number } = {}) {
+  const tools = [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
+  pinsForest ??= build('pins-forest', {}, undefined, (i, text) => {
+    const image = { type: 'image', source: { type: 'base64', data: 'A'.repeat(64), mediaType: 'image/png' } };
+    return i === 5 ? [image, { type: 'text', text }] : [{ type: 'text', text }];
+  }, pinsSpeaker, defaultRespond).then((built) => {
+    built.cm.close();
+    return { ids: built.ids, textOf: built.textOf, requests: built.requests, calls: built.calls() };
+  });
+  const { cm, strategy, internals, ids, textOf, requests, script } = await openCopy(await pinsForest, 'pins-forest', name);
+  cm.setSystemPrompt('You are the agent whose memory this is.');
+  cm.setToolDefinitions(tools as never);
+  if (opts.multiplier !== undefined) {
+    await cm.compile();
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * opts.multiplier);
+  }
+  internals.config.compressionContextBudgetTokens = budget;
+  cm.pinRange(ids[5], ids[5], { name: 'at-the-limit' });
+  const agentFirst = internals.summaries.find((s) => s.level === 1 && ids.indexOf(s.sourceIds[0]) >= 30 && pinsSpeaker(ids.indexOf(s.sourceIds[0])) === 'Claude');
+  assert.ok(agentFirst, 'setup: an L1 opens on the agent\'s turn');
+  cm.pinRange(agentFirst!.sourceIds[0], agentFirst!.sourceIds[0], { name: 'agent-first' });
+  const root = rootHolding(internals, ids[5]);
+  if (opts.retried) script.push('tool_use', 'thinking-wrapped');
+  const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+  assert.ok(request, 'the compression ran');
+  assert.ok(request.system && request.tools?.length, 'setup: the request carries the system prompt and tools');
+  const view = (cm as unknown as { strategyMessageView(): { estimateTokens(m: unknown): number; getTokenCalibration?(): number } }).strategyMessageView();
+  const priceOf = (content: unknown[]) => view.estimateTokens({ content });
+  const price = (sent: any) => sent.config.maxTokens +
+    priceOf([{ type: 'text', text: sent.system }]) +
+    priceOf([{ type: 'text', text: JSON.stringify(sent.tools) }]) +
+    sent.messages.reduce((sum: number, m: { content: unknown[] }) => sum + priceOf(m.content), 0);
+  const instruction = (sent: any): string => sent.messages.at(-1).content.at(-1).text;
+  const retries = requests.filter((sent) => sent !== request && isL1Request(sent) &&
+    instruction(sent) !== instruction(request) && instruction(sent).startsWith(instruction(request)));
+  const texts = textsOf(request);
+  const raw = texts.includes(textOf.get(ids[5])!);
+  const recalled = texts.includes(`[CM] Recall memory ${root.id}.`);
+  const resumeTurns = texts.filter((text) => text === RECALL_RESUME_TEXT).length;
+  const multiplier = view.getTokenCalibration?.();
+  cm.close();
+  return { price: price(request), retryPrices: retries.map(price), raw, recalled, resumeTurns, warnings, multiplier };
 }
 
 describe('raw pins open only their own branch of the L1 recall frontier', () => {
@@ -807,48 +858,7 @@ describe('the raw pins add is spent from the recall budget', () => {
   });
 
   it('pins are kept up to compressionContextBudgetTokens, priced as the request is sent with the longer retry line', async () => {
-    // The pinned chunk carries an image and two turns of one speaker, which
-    // the request collapses into one with a separator; a second opened chunk
-    // starts on the agent's turn after a recall pair, so the Context Manager
-    // takes a turn between them; and the host serves a system prompt and
-    // tools. So every term of the price is in play. A retry appends a line to
-    // the instruction, so a retry of the admitted request must fit too.
-    const image = { type: 'image', source: { type: 'base64', data: 'A'.repeat(64), mediaType: 'image/png' } };
-    const tools = [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
-    const speaker = (i: number) => (i % 2 === 0 || i === 5 ? 'User' : 'Claude');
-    const run = async (name: string, budget: number, retried = false) => {
-      const { cm, internals, ids, textOf, requests, script } = await forest(name, {}, undefined,
-        (i, text) => (i === 5 ? [image, { type: 'text', text }] : [{ type: 'text', text }]), speaker);
-      cm.setSystemPrompt('You are the agent whose memory this is.');
-      cm.setToolDefinitions(tools as never);
-      internals.config.compressionContextBudgetTokens = budget;
-      cm.pinRange(ids[5], ids[5], { name: 'at-the-limit' });
-      const agentFirst = internals.summaries.find((s) => s.level === 1 && ids.indexOf(s.sourceIds[0]) >= 30 && speaker(ids.indexOf(s.sourceIds[0])) === 'Claude');
-      assert.ok(agentFirst, 'setup: an L1 opens on the agent\'s turn');
-      cm.pinRange(agentFirst!.sourceIds[0], agentFirst!.sourceIds[0], { name: 'agent-first' });
-      const root = rootHolding(internals, ids[5]);
-      // A tool call brings the no-tools retry; its memory, wrapped whole in
-      // <thinking>, brings the plain-prose retry.
-      if (retried) script.push('tool_use', 'thinking-wrapped');
-      const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
-      assert.ok(request, 'the compression ran');
-      assert.ok(request.system && request.tools?.length, 'setup: the request carries the system prompt and tools');
-      const view = (cm as unknown as { strategyMessageView(): { estimateTokens(m: unknown): number } }).strategyMessageView();
-      const priceOf = (content: unknown[]) => view.estimateTokens({ content });
-      const price = (sent: any) => sent.config.maxTokens +
-        priceOf([{ type: 'text', text: sent.system }]) +
-        priceOf([{ type: 'text', text: JSON.stringify(sent.tools) }]) +
-        sent.messages.reduce((sum: number, m: { content: unknown[] }) => sum + priceOf(m.content), 0);
-      const instruction = (sent: any): string => sent.messages.at(-1).content.at(-1).text;
-      const retries = requests.filter((sent) => sent !== request && isL1Request(sent) &&
-        instruction(sent) !== instruction(request) && instruction(sent).startsWith(instruction(request)));
-      const texts = textsOf(request);
-      const raw = texts.includes(textOf.get(ids[5])!);
-      const recalled = texts.includes(`[CM] Recall memory ${root.id}.`);
-      const resumeTurns = texts.filter((text) => text === RECALL_RESUME_TEXT).length;
-      cm.close();
-      return { price: price(request), retryPrices: retries.map(price), raw, recalled, resumeTurns, warnings };
-    };
+    const run = (name: string, budget: number, retried = false) => pinsAtTheLimit(name, budget, { retried });
     const roomy = await run('context-roomy', 10_000_000, true);
     assert.ok(roomy.raw, 'setup: with room, the pinned message is raw');
     assert.equal(roomy.resumeTurns, 1, 'setup: the request carries the Context Manager\'s turn before the agent-first chunk');
@@ -860,6 +870,17 @@ describe('the raw pins add is spent from the recall budget', () => {
     const over = await run('context-over', longest - 1);
     assert.ok(!over.raw && over.recalled, `one token less, the summary the pin overrides is recalled, though the request without a retry line (${roomy.price}) would fit`);
     assert.ok(over.warnings.some((w) => w.includes(`~${longest} tokens, counting the line a retry adds`)), 'the warning gives the price it was held to');
+  });
+
+  it("the request's system prompt and tools are priced at the store's multiplier, as its messages are", async () => {
+    const roomy = await pinsAtTheLimit('context-roomy-calibrated', 10_000_000, { retried: true, multiplier: 1.5 });
+    assert.equal(roomy.multiplier, 1.5, 'setup: the store estimates at 1.5');
+    assert.ok(roomy.raw, 'setup: with room, the pinned message is raw');
+    const longest = Math.max(...roomy.retryPrices);
+    const exact = await pinsAtTheLimit('context-exact-calibrated', longest, { multiplier: 1.5 });
+    assert.ok(exact.raw && exact.price === roomy.price, `a request whose longer retry at the multiplier is exactly the budget (${longest}) keeps the pins`);
+    const over = await pinsAtTheLimit('context-over-calibrated', longest - 1, { multiplier: 1.5 });
+    assert.ok(!over.raw && over.recalled, `one token less, the summary the pin overrides is recalled`);
   });
 
   it('pinned raw is priced as the store prices it, images included, without adaptive selection too', async () => {
