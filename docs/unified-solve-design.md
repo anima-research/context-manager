@@ -800,14 +800,11 @@ itself the main hazard; do not design from those numbers. After rev 6:
   slot moved, an idle expiry kills the tools entry together with the window;
   irrelevant with keepalives on, remember if they are ever off.
 - **That's a compile's own request.** On the native tool loop's later calls in
-  the same turn, a membrane that floats under `cm-owned` marks the newest
-  round: in a free slot, with the message before the round's calling turn too
-  when two or more are free, or in the earliest message marker's slot when all
-  four are in use (context-manager#168). Within one tool loop membrane changes
-  no message content before the turn's opening: in a free slot its marker is
-  added, and when it takes the earliest message marker's slot, that marker's
-  content lies inside the newest marker's prefix, though its block no longer
-  carries `cache_control` on the wire. Once one of the compile's calls is
+  the same turn, membrane may float a marker onto the newest round under
+  `cm-owned`; membrane's `floatingCacheMarker` doc, as antra-tess/membrane#239
+  extends it to `cm-owned`, says when, in which slot, and that within one tool
+  loop membrane changes no message content before the turn's opening
+  (context-manager#168). Once one of the compile's calls is
   accepted, a later call's receipt leaves the cache reference and the
   recorded wire receipt as they stood once that call was accepted (§5).
 - Placement is by **cumulative rendered (priced) tokens**, never by unit

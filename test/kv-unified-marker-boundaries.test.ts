@@ -337,23 +337,25 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
   const ONE = CASES['everything in the recent window: only the last message is marked']!;
   const FOUR = CASES["three messages in the head and three raw in the middle: the head's last and the middle are marked"]!;
 
-  async function withMismatchLines(run: (logged: string[]) => Promise<void>): Promise<void> {
+  async function withMismatchLines(run: (logged: string[], superseded: string[]) => Promise<void>): Promise<void> {
     const logged: string[] = [];
+    const superseded: string[] = [];
     const original = console.error;
     console.error = (...args: unknown[]) => {
       const line = args.map(String).join(' ');
       if (line.startsWith('[kv-unified]') && line.includes('cache markers where')) logged.push(line);
-      else if (!(line.startsWith('[kv-unified]') && line.includes('superseded by'))) original(...args);
+      else if (line.startsWith('[kv-unified]') && line.includes('superseded by')) superseded.push(line);
+      else original(...args);
     };
     try {
-      await run(logged);
+      await run(logged, superseded);
     } finally {
       console.error = original;
     }
   }
 
   it("a floated round leaves the reference, and the recorded wire receipt, as the first call set them", async () => {
-    for (const [c, markers, rounds] of [[ONE, 1, [2, 3, 4]], [FOUR, 4, [4, 4, 4]]] as const) {
+    for (const [c, markers, rounds] of [[ONE, 1, [2, 3, 3]], [FOUR, 4, [4, 4, 4]]] as const) {
       const o = await open(conversation(c), c.config);
       try {
         const compiled = await o.compile();
@@ -432,7 +434,7 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
   it("a first call the receipt chain refuses as a duplicate leaves the count check to the first accepted later call: a reference where its count matches, none where it doesn't", async () => {
     const o = await open(conversation(ONE), ONE.config);
     try {
-      await withMismatchLines(async () => {
+      await withMismatchLines(async (_logged, superseded) => {
         const again = (id: string) =>
           o.strategy.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: `layout-${id}-again` });
         await o.compile();
@@ -445,7 +447,9 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
         again(settled);
         o.accept(settled, 1);
         assert.equal(receipts(o.strategy).cache, earlier, 'premise: the chain refuses the repeated id and keeps the earlier reference');
+        assert.equal(receipts(o.strategy).inFlightSubmissionId, null, 'the refused accept ends the flight it was begun as');
         o.accept(o.begin(), 1);
+        assert.deepEqual(superseded, [], 'so the next begin reports no flight as never settled');
         const set = receipts(o.strategy).cache;
         assert.ok(set && set !== earlier, "the later call takes the count check and sets this compile's reference");
         assert.notDeepEqual(set.markers, earlier.markers, "a reference of this compile's, not the earlier compile's");
@@ -458,6 +462,51 @@ describe("a native tool loop's later calls of one compile (context-manager#168)"
         assert.equal(receipts(o.strategy).cache, null, 'a mismatched first accepted later call sets none');
         o.accept(o.begin(), 1);
         assert.equal(receipts(o.strategy).cache, null, 'and no later call of that compile sets one');
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a failure reported for a first call begun again under a settled id ends that flight too, so the next begin reports none as never settled", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async (_logged, superseded) => {
+        await o.compile();
+        const settled = o.begin();
+        o.accept(settled, 1);
+        o.manager.addMessage('a', [{ type: 'text', text: plain(1) }]);
+        await o.compile();
+        o.strategy.beginKvUnifiedSubmission({ submissionId: settled, requestHash: `wire-${settled}`, layoutHash: 'layout-again' });
+        assert.equal(receipts(o.strategy).inFlightSubmissionId, settled, 'premise: the repeated id is the flight in progress');
+        o.strategy.reportKvUnifiedFailed(settled);
+        assert.equal(receipts(o.strategy).inFlightSubmissionId, null, 'the failure ends the flight it was begun as');
+        o.begin();
+        assert.deepEqual(superseded, [], 'so the next begin reports no flight as never settled');
+      });
+    } finally {
+      await o.close();
+    }
+  });
+
+  it("a first call refused as a duplicate logs no marker mismatch, and leaves the once-per-strategy line for a compile's own mismatched request", async () => {
+    const o = await open(conversation(ONE), ONE.config);
+    try {
+      await withMismatchLines(async (logged) => {
+        await o.compile();
+        const settled = o.begin();
+        o.accept(settled, 1);
+        const earlier = receipts(o.strategy).cache;
+        o.manager.addMessage('a', [{ type: 'text', text: plain(1) }]);
+        await o.compile();
+        o.strategy.beginKvUnifiedSubmission({ submissionId: settled, requestHash: `wire-${settled}`, layoutHash: 'layout-again' });
+        o.accept(settled, 3);
+        assert.equal(receipts(o.strategy).cache, earlier, 'premise: the chain refuses the repeated id and keeps the earlier reference');
+        assert.deepEqual(logged, [], 'the refused call logs no mismatch');
+        o.manager.addMessage('a', [{ type: 'text', text: plain(2) }]);
+        await o.compile();
+        o.accept(o.begin(), 3);
+        assert.equal(logged.length, 1, "a later compile's own mismatched request still logs the line");
       });
     } finally {
       await o.close();

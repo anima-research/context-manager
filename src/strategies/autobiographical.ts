@@ -14841,6 +14841,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const draft = this.kvUnifiedPendingDraft;
     const later = !!draft?.accepted;
     let cache: ProviderCacheReference | null = null;
+    let mismatched = false;
     if (later) {
       // Under `cm-owned`, membrane's tool-loop float changes a later call's
       // markers (context-manager#168).
@@ -14874,15 +14875,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The request carried markers, but not one for each layout boundary its
       // compile reconciled them to, which reconcileKvUnifiedMarkerIndices'
       // contract rules out. A request with none (prompt caching off) has
-      // nothing to match.
-      this.kvUnifiedMarkerMismatchReported = true;
-      const boundaries = this.kvUnifiedPendingMarkerUnitIndices.length;
-      this.diag.error(
-        `[kv-unified] submission ${args.submissionId}: the request carried ${args.wireReceipt.markers.length} ` +
-          `cache markers where its compile marked ${boundaries} layout boundar${boundaries === 1 ? 'y' : 'ies'}, ` +
-          `so this presentation keeps no cache reference and the next compile weighs no cache costs ` +
-          `(logged once per strategy)`,
-      );
+      // nothing to match. Logged once the chain has taken the accept: one it
+      // refuses as a duplicate keeps the chain's reference as it was.
+      mismatched = true;
     }
     const { duplicate } = this.kvUnifiedReceipts.accept(
       args.submissionId,
@@ -14890,6 +14885,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       cache,
       later ? undefined : args.wireReceipt,
     );
+    if (mismatched && !duplicate) {
+      this.kvUnifiedMarkerMismatchReported = true;
+      const boundaries = this.kvUnifiedPendingMarkerUnitIndices.length;
+      this.diag.error(
+        `[kv-unified] submission ${args.submissionId}: the request carried ${args.wireReceipt!.markers.length} ` +
+          `cache markers where its compile marked ${boundaries} layout boundar${boundaries === 1 ? 'y' : 'ies'}, ` +
+          `so this presentation keeps no cache reference and the next compile weighs no cache costs ` +
+          `(logged once per strategy)`,
+      );
+    }
     if (draft && !duplicate) draft.accepted = true;
     this.kvUnifiedPendingDraft = null;
     this.kvUnifiedPendingLayout = null;
@@ -15461,10 +15466,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * kv-unified, which hosts send with membrane's `cacheMarkers: 'cm-owned'`,
    * holds all four slots on a compile's own request. On the native tool
-   * loop's later calls, a membrane that floats under `cm-owned` puts its
-   * marker on the newest round, in the earliest message marker's slot when
-   * all four are in use (context-manager#168): the one case where membrane
-   * takes one of ours.
+   * loop's later calls, membrane may float a marker of its own onto the
+   * newest round, which can take one of these slots; membrane's
+   * `floatingCacheMarker` says when (antra-tess/membrane#239 brings it to
+   * `cm-owned`; context-manager#168).
    *
    * An earlier revision of this comment justified the 3-cap with "membrane
    * marks the system block whenever prompt caching is on" — membrane has
