@@ -17,8 +17,9 @@
   reader, and a manager compiling for no reader is refused a `switchBranch`,
   `fork` or `setStrategy` onto a branch where its namespace records one. A
   `compile`, `previewContext`, `tick`, `editMessage`, `resetHeadWindow`,
-  `renderAsNewest`, `getSummariesInRange`, `getRenderStats` and every read
-  of the manager's messages through the view it hands its strategy,
+  `renderAsNewest`, `getSummariesInRange`, `getRenderStats`,
+  `searchSummaries`, `getSummary` and every read of the manager's messages
+  through the view it hands its strategy,
   compression's included, are refused when the namespace's record on the
   store's current branch names another reader, or any reader for a manager
   compiling for none, as after a claim made once the manager opened or a
@@ -39,8 +40,10 @@
   without the field, so its compiles, summaries, pins, `renderAsNewest`,
   compile provenance (`rawBodies`), thinking binding and its strategy's
   `onNewMessage` hold only what that reader may see, and it leaves out a
-  message whose every block is someone else's; a block it leaves out gives
-  up the raw replay forms it shares with the message's other blocks. An
+  message whose every block is someone else's. Where it leaves out one of a
+  message's blocks, its copy of the message keeps no raw replay form
+  (`rawItem`, `rawXml`) on any block, and leaves out a block whose raw item
+  is its whole content. An
   edited message's copies in the context log are written as the reader sees
   them, and removed where the reader sees nothing of it. Summaries written
   before a reader claims a namespace are kept, and that reader's compiles
