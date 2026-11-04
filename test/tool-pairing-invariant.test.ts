@@ -370,6 +370,24 @@ describe('a run of calls sharing an id in one entry', () => {
     });
   }
 
+  it('a run answered by an entry that then makes its own call with the run\'s id: the gather stops at that call, which keeps its own result', () => {
+    const repaired = [entry('User', [text('look')]), entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1), text('and again'), call(3)]), entry('User', [out(3)]), entry('Claude', [text('done')])];
+    repaired.forEach((e, i) => { e.index = i; });
+    runEnforce(repaired);
+    assertPaired(repaired);
+    const at = repaired.findIndex((e) => e.content.some((b) => b.type === 'tool_use' && (b as unknown as { input: { n: number } }).input.n === 3));
+    assert.deepStrictEqual(repaired[at + 1]!.content.filter((b) => b.type === 'tool_result').map((b) => (b as { content?: unknown }).content), ['OUT OF n=3'], 'the answering entry\'s own call keeps its result');
+    assert.deepStrictEqual(repaired.flatMap((e) => e.content).filter((b) => b.type === 'tool_result').map((b) => (b as { content?: unknown }).content), ['OUT OF n=1', 'OUT OF n=3'], 'the run\'s call has only the result before that call');
+  });
+
+  it('a run\'s further results gathered into an entry with text after its results go after those results and before the text', () => {
+    const repaired = [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1), text('a note')]), entry('User', [out(2)]), entry('Claude', [text('done')])];
+    repaired.forEach((e, i) => { e.index = i; });
+    runEnforce(repaired);
+    assertPaired(repaired);
+    assert.deepStrictEqual(repaired[1]!.content.map((b) => (b.type === 'tool_result' ? (b as { content?: unknown }).content : b.type)), ['OUT OF n=1', 'OUT OF n=2', 'text']);
+  });
+
   it('two assistant turns calling one id, the later answered: the summariser\'s collapsed messages keep the later call, as the repair does', () => {
     const turns = () => [entry('User', [text('look')]), entry('Claude', [text('looking'), call(1)]), entry('Claude', [text('again'), call(2)]), entry('User', [out(2)]), entry('Claude', [text('done')])];
     const repaired = turns();

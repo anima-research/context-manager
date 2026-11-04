@@ -19754,7 +19754,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const results = missing.length > 0 ? this.relocateOrDropMissingResults(entries, i, missing, unitOf, laterCalls) : [];
         // A run id's call takes every further result with its id up to the
         // next call with it, within the look-ahead, after the one it has.
-        const further = this.gatherRunResults(entries, i, [...prevRunIds].filter((id) => prevUseIds.has(id) && !entry.content.some((b) => b.type === 'tool_use' && b.id === id)), unitOf);
+        const further = this.gatherRunResults(entries, i, [...prevRunIds].filter((id) => !entry.content.some((b) => b.type === 'tool_use' && b.id === id)), unitOf);
         if (results.length > 0 || further.length > 0) {
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
