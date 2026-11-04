@@ -15466,10 +15466,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * kv-unified, which hosts send with membrane's `cacheMarkers: 'cm-owned'`,
    * holds all four slots on a compile's own request. On the native tool
-   * loop's later calls, membrane may float a marker of its own onto the
-   * newest round, which can take one of these slots; membrane's
-   * `floatingCacheMarker` says when (antra-tess/membrane#239 brings it to
-   * `cm-owned`; context-manager#168).
+   * loop's later calls, membrane may float markers of its own, which can
+   * take these slots; membrane's `floatingCacheMarker` says when and where
+   * (antra-tess/membrane#239 brings it to `cm-owned`; context-manager#168).
    *
    * An earlier revision of this comment justified the 3-cap with "membrane
    * marks the system block whenever prompt caching is on" — membrane has

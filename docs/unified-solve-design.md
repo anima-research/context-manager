@@ -800,13 +800,24 @@ itself the main hazard; do not design from those numbers. After rev 6:
   slot moved, an idle expiry kills the tools entry together with the window;
   irrelevant with keepalives on, remember if they are ever off.
 - **That's a compile's own request.** On the native tool loop's later calls in
-  the same turn, membrane may float a marker onto the newest round under
-  `cm-owned`; membrane's `floatingCacheMarker` doc, as antra-tess/membrane#239
-  extends it to `cm-owned`, says when, in which slot, and that within one tool
-  loop membrane changes no message content before the turn's opening
-  (context-manager#168). Once one of the compile's calls is
-  accepted, a later call's receipt leaves the cache reference and the
-  recorded wire receipt as they stood once that call was accepted (§5).
+  the same turn, membrane may float markers of its own under `cm-owned`;
+  membrane's `floatingCacheMarker` doc, as antra-tess/membrane#239 extends it
+  to `cm-owned`, says when, where, and that within one tool loop membrane
+  changes no message content before the turn's opening (context-manager#168).
+  Once one of the compile's calls is accepted, a later call's receipt leaves
+  the cache reference and the recorded wire receipt as they stood once that
+  call was accepted (§5). A compile's calls are those begun after it and
+  before the next compile; one still in flight when the next compile runs
+  stays its own compile's. Calls begun after the next compile are that
+  compile's: the first of them accepted before the compile's own request
+  begins is its first accepted call, so it takes the count check, its wire
+  receipt is the one recorded, and the compile's own request then leaves
+  both. A call whose
+  count differs, such as a floated one, then leaves that compile no
+  reference. One still in flight when the compile's own request begins is
+  superseded, so that request, once accepted, is the first accepted call.
+  agent-framework starts a stream only from `idle` (`src/agent.ts:2192` at
+  v0.32.0), so its tool loop's calls end before its next stream compiles.
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
