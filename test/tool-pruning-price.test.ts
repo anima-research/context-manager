@@ -392,7 +392,7 @@ describe('tool pruning, priced as sent', () => {
     cm.addMessage('u', text('next'));
     const compiled = await cm.compile(BUDGET);
     const answers = compiled.messages.flatMap((m) => m.content).flatMap((b) => (b.type === 'tool_result' ? [String(b.content)] : []));
-    assert.deepEqual(answers, [STUB, 'the first answer']);
+    assert.deepEqual(answers, [STUB, 'the first answer', 'the second answer']);
     cm.close();
   });
 

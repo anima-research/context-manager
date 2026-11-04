@@ -343,13 +343,17 @@ describe('a run of calls sharing an id in one entry', () => {
       results: messages.slice(at + 1).flatMap((m) => m.content).filter((b) => b.type === 'tool_result').map((b) => (b as { content?: unknown }).content),
     };
   };
-  const shapes: Array<[string, () => ContextEntry[], number, number[]]> = [
-    ['two calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2, [1, 2]],
-    ['three calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2), call(3)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 3, [1, 2]],
-    ['two calls and one result', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('Claude', [text('done')])], 2, [1]],
+  // Where a run's results lie past the next entry, the repair moves them up beside its call, so its request
+  // carries what the strip keeps in other places.
+  const shapes: Array<[string, () => ContextEntry[], number, number[], 'alike' | 'moved']> = [
+    ['two calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2, [1, 2], 'alike'],
+    ['three calls and two results', () => [entry('Claude', [text('trying'), call(1), call(2), call(3)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 3, [1, 2], 'alike'],
+    ['two calls and one result', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('Claude', [text('done')])], 2, [1], 'alike'],
+    ['two calls with their two results in two entries', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('User', [out(2)]), entry('Claude', [text('done')])], 2, [1, 2], 'moved'],
+    ['two calls with their two results after a recall pair', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('Context Manager', [text('What do you remember?')]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])], 2, [1, 2], 'moved'],
   ];
-  for (const [shape, make, n, outs] of shapes) {
-    it(`${shape}: repair and strip keep the last call, the nearest before each result, with every result after it, and send alike`, () => {
+  for (const [shape, make, n, outs, sends] of shapes) {
+    it(`${shape}: repair and strip keep the last call, the nearest before each result, with every result after it, and ${sends === 'alike' ? 'send alike' : 'membrane sends every result'}`, () => {
       const repaired = make();
       repaired.forEach((e, i) => { e.index = i; });
       runEnforce(repaired);
@@ -358,26 +362,11 @@ describe('a run of calls sharing an id in one entry', () => {
       assert.deepStrictEqual(kept(repaired), expected, 'repair');
       const stripped = stripUnpairedToolBlocks(make());
       assert.deepStrictEqual(kept(stripped), expected, 'strip');
-      assert.deepStrictEqual(format(repaired), format(stripped), 'membrane sends the two paths alike');
-    });
-  }
-
-  // Where a run's results lie beyond the next entry, the repair moves or
-  // keeps the first and drops the rest as orphans, as it does for one call's
-  // displaced duplicate; the strip keeps them all, and membrane sends the
-  // rest as text.
-  const beyond: Array<[string, () => ContextEntry[]]> = [
-    ['two calls with their two results in two entries', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('User', [out(1)]), entry('User', [out(2)]), entry('Claude', [text('done')])]],
-    ['two calls with their two results after a recall pair', () => [entry('Claude', [text('trying'), call(1), call(2)]), entry('Context Manager', [text('What do you remember?')]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])]],
-  ];
-  for (const [shape, make] of beyond) {
-    it(`${shape}: the repair keeps the last call with the first result, and the strip keeps both results`, () => {
-      const repaired = make();
-      repaired.forEach((e, i) => { e.index = i; });
-      runEnforce(repaired);
-      assertPaired(repaired);
-      assert.deepStrictEqual(kept(repaired), { n: [2], results: ['OUT OF n=1'] }, 'repair');
-      assert.deepStrictEqual(kept(stripUnpairedToolBlocks(make())), { n: [2], results: ['OUT OF n=1', 'OUT OF n=2'] }, 'strip');
+      if (sends === 'alike') assert.deepStrictEqual(format(repaired), format(stripped), 'membrane sends the two paths alike');
+      else {
+        const sent = JSON.stringify(format(repaired));
+        assert.ok(outs.every((k) => sent.includes(`OUT OF n=${k}`)), 'membrane sends every result the repair keeps');
+      }
     });
   }
 
@@ -394,25 +383,33 @@ describe('a run of calls sharing an id in one entry', () => {
     assert.deepStrictEqual(kept(stripUnpairedToolBlocks(collapsed)), { n: [2], results: ['OUT OF n=2'] }, 'strip');
   });
 
-  it('two assistant turns calling one id, then both results: the later call keeps both, as the summariser\'s collapsed messages do, and every formatter sends both', () => {
-    const turns = () => [entry('User', [text('look')]), entry('Claude', [text('looking'), call(1)]), entry('Claude', [text('again'), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])];
-    const repaired = turns();
-    repaired.forEach((e, i) => { e.index = i; });
-    runEnforce(repaired);
-    assertPaired(repaired);
-    assert.deepStrictEqual(kept(repaired.slice(0, 3)).results.map((r) => String(r).startsWith('OUT OF')), [false], 'premise: the earlier call goes with a stub');
-    const later = repaired.findIndex((e) => e.content.some((b) => b.type === 'tool_use' && (b as unknown as { input: { n: number } }).input.n === 2));
-    assert.deepStrictEqual(kept(repaired.slice(later)), { n: [2], results: ['OUT OF n=1', 'OUT OF n=2'] }, 'repair');
-    const strategy = new AutobiographicalStrategy({}) as unknown as { collapseConsecutiveMessages: (m: unknown[]) => { participant: string; content: ContentBlock[] }[] };
-    assert.deepStrictEqual(kept(stripUnpairedToolBlocks(strategy.collapseConsecutiveMessages(turns()))), { n: [2], results: ['OUT OF n=1', 'OUT OF n=2'] }, 'strip');
-    for (const formatter of [new NativeFormatter(), new AnthropicXmlFormatter(), new OpenAIResponsesFormatter()]) {
-      const sent = JSON.stringify(formatter.buildMessages(
-        repaired.map(({ participant, content }) => ({ participant, content })),
-        { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
-      ));
-      assert.ok(sent.includes('OUT OF n=1') && sent.includes('OUT OF n=2'), `${formatter.constructor.name} sends both outputs`);
-    }
-  });
+  const late: Array<[string, ContextEntry[], number[]]> = [
+    ['in one message', [entry('User', [out(1), out(2)])], [1, 2]],
+    ['each in a message of its own', [entry('User', [out(1)]), entry('User', [out(2)])], [1, 2]],
+    ['each in a message of its own, the later call\'s first', [entry('User', [out(2)]), entry('User', [out(1)])], [2, 1]],
+  ];
+  for (const [shape, results, order] of late) {
+    it(`two assistant turns calling one id, then both results ${shape}: the later call keeps both, as the summariser's collapsed messages do, and every formatter sends both`, () => {
+      const turns = () => [entry('User', [text('look')]), entry('Claude', [text('looking'), call(1)]), entry('Claude', [text('again'), call(2)]), ...results.map((e) => entry(e.participant, [...e.content])), entry('Claude', [text('done')])];
+      const repaired = turns();
+      repaired.forEach((e, i) => { e.index = i; });
+      runEnforce(repaired);
+      assertPaired(repaired);
+      const later = repaired.findIndex((e) => e.content.some((b) => b.type === 'tool_use' && (b as unknown as { input: { n: number } }).input.n === 2));
+      assert.ok(!kept(repaired.slice(0, later)).results.some((r) => String(r).startsWith('OUT OF')), 'premise: the earlier call goes with a stub');
+      const expected = { n: [2], results: order.map((k) => `OUT OF n=${k}`) };
+      assert.deepStrictEqual(kept(repaired.slice(later)), expected, 'repair');
+      const strategy = new AutobiographicalStrategy({}) as unknown as { collapseConsecutiveMessages: (m: unknown[]) => { participant: string; content: ContentBlock[] }[] };
+      assert.deepStrictEqual(kept(stripUnpairedToolBlocks(strategy.collapseConsecutiveMessages(turns()))), expected, 'strip');
+      for (const formatter of [new NativeFormatter(), new AnthropicXmlFormatter(), new OpenAIResponsesFormatter()]) {
+        const sent = JSON.stringify(formatter.buildMessages(
+          repaired.map(({ participant, content }) => ({ participant, content })),
+          { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
+        ));
+        assert.ok(sent.includes('OUT OF n=1') && sent.includes('OUT OF n=2'), `${formatter.constructor.name} sends both outputs`);
+      }
+    });
+  }
 });
 
 describe('a tool_use id used again by a later call', () => {
