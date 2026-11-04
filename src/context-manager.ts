@@ -1003,8 +1003,10 @@ export class ContextManager {
    *
    * So a change of who reads a block (its `audience`) holds from now on, as
    * any edit does: a reader no longer shown a block, or a message, gets none
-   * of it in a compile or a compression request built after the edit, and
-   * keeps what a summary or a request built before it took in. An edit that
+   * of it raw in a compile or a compression request built after the edit. A
+   * summary or a request built before the edit keeps what it took in, and
+   * later compiles and compression requests carry such a summary as they
+   * carry any. An edit that
    * would show the message to a reader who saw none of it before is refused,
    * naming that reader, since that reader's history would gain a message at a
    * time they couldn't see it: to tell a reader something, add a message. A

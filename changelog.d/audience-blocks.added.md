@@ -50,12 +50,15 @@
   use them as written.
 - An `editMessage` that changes a block's `audience` holds from now on, as
   any edit does: a reader no longer shown a block, or a whole message, gets
-  none of it in a compile or a compression request built after the edit,
-  and keeps what a summary or a request built before it took in. An edit
-  that would show the message to a reader who saw none of it before, by
-  widening an `audience`, rewriting a block for more readers or adding a
-  block with no `audience`, is refused, naming that reader: to tell a reader
-  something, a host adds a message. So a narrowing can't be undone in place.
+  none of it raw in a compile or a compression request built after the
+  edit. A summary or a request built before the edit keeps what it took
+  in, and later compiles and compression requests carry such a summary as
+  they carry any.
+  An edit that would show the message to a reader who saw none of it
+  before, by widening an `audience`, rewriting a block for more readers or
+  adding a block with no `audience`, is refused, naming that reader: to
+  tell a reader something, a host adds a message. So a narrowing that
+  leaves a reader none of a message can't be undone in place.
   Within a message a reader still sees, a block's `audience` may change
   either way.
 - `resetHeadWindow()` without text, under a manager that compiles for a
