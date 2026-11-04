@@ -110,10 +110,23 @@ describe('tool pruning, priced as sent', () => {
       assert.deepEqual(inputs, [1, 2, 3].map((k) => ({
         _truncated: true,
         _originalTokens: Math.ceil(JSON.stringify(inputOf(k)).length / 4),
-        // The store gives an object back with its keys sorted.
-        _keys: ['body', 'group', 'mode', 'owner', 'path'],
+        _keys: ['path', 'body', 'mode', 'owner', 'group'],
       })), 'the input is truncated to its size and its first five keys');
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
+      cm.close();
+    });
+
+    it(`${name}: sends a tool_use block it leaves whole with its keys as written, at every level`, async () => {
+      const { cm } = await open({ ...selector });
+      const written = call('w-1', 'write', { path: 'f', opts: { mode: 'w', all: true }, list: [{ z: 1, a: 2 }] });
+      cm.addMessage('u', text('write it'));
+      cm.addMessage('a', [written]);
+      cm.addMessage('u', [result('w-1', 'written')]);
+      cm.addMessage('a', text('ok'));
+      cm.addMessage('u', text('next'));
+      const compiled = await cm.compile(BUDGET);
+      const sent = compiled.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use');
+      assert.equal(JSON.stringify(sent), JSON.stringify([written]));
       cm.close();
     });
 

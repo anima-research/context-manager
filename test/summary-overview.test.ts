@@ -249,4 +249,19 @@ describe('SummaryOverviewStrategy — listSummariesInRange / getMaxSummaryLevel'
 
     manager.close();
   });
+  it('a strategy that lists summaries refuses, rather than answering [], once the store has left the branch it loaded', async () => {
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy: new AutobiographicalStrategy({}),
+    });
+    try {
+      manager.addMessage('user', textBlock('on main'));
+      const main = manager.currentBranch().name;
+      await manager.fork('other');
+      manager.getStore().switchBranch(main);
+      assert.throws(() => manager.getSummariesInRange({}), /requires reinitialization for the current branch generation/);
+    } finally {
+      manager.close();
+    }
+  });
 });
