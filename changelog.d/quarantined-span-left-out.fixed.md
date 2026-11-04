@@ -12,9 +12,9 @@
   chunks after it could be quarantined in turn and stay raw. Those requests
   now leave the held chunk's messages out, as they already left out what a
   summary covers, including after a host removes one of its messages. A
-  pinned message inside a held chunk is left out too, and
-  `compressionWorkQueued`'s count leaves it out the same way. A store whose
-  quarantine holds no chunk sends the same requests as before. Once the
+  pinned message inside a held chunk is left out too, also where a refused
+  compile decides whether to name `compression` in its `clearedBy`. A store
+  whose quarantine holds no chunk sends the same requests as before. Once the
   quarantine no longer holds the chunk, as after
   `clearCompressionRefusalQuarantine()`, the requests after it no longer
   leave its messages out.
@@ -50,3 +50,8 @@
   is tried again each time it is queued again, after each new message and
   at each reopen, as in 0.24.2, and each try the summarizer refuses costs
   its refused call, plus any fallback calls the ladder makes after it.
+- A merge an earlier release quarantined because its request carried a held
+  chunk stays quarantined after the upgrade: a merge's record holds its group
+  while the group stands and can still merge as it is, whatever request the
+  merge would now send. `clearMergeQuarantine()` of the group's key lets it be
+  tried again, with a request that leaves the held chunk out.

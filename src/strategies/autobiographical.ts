@@ -13711,8 +13711,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * without a model call when the quarantine holds its request family, or the
    * chunk has reached its cap of quarantined shapes under the same request
    * regime; a request of a new shape, or a regime the configuration changed,
-   * gets a fresh attempt. Counting none of them under-names that, the safe
-   * side: naming work tick won't do tells a host to wait for nothing.
+   * gets a fresh attempt. The queued-work count (compressionWorkQueued)
+   * counts none of them, which under-names that work: the safe side for a
+   * count, since naming work tick won't do tells a host to wait for nothing.
+   * The requests that leave held messages out (quarantinedMessageIds) leave
+   * nothing out when this is undefined.
    */
   private quarantinedChunkSources(): Map<string, readonly MessageId[] | undefined> | undefined {
     let projection: Map<string, ActiveCompressionQuarantine>;
@@ -13730,6 +13733,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return sources;
   }
 
+  /**
+   * The messages the compression quarantine holds, which the requests that
+   * compress, merge or summarize leave out: every id a record lists,
+   * wherever that message now sits, and, for a record that lists none (one
+   * written before records kept their ids), the messages of each uncompressed
+   * chunk whose ids, or whose chunk record's ids, hash to the record's
+   * chunkSourceHash. Nothing when the projection can't be read (`sources`
+   * undefined): a merge or a transition summary then leaves nothing out, and
+   * an L1 attempt that would call the model is refused by its later read of
+   * the projection, unless that read succeeds.
+   */
   private quarantinedMessageIds(sources: ReadonlyMap<string, readonly MessageId[] | undefined> | undefined): Set<MessageId> {
     const ids = new Set<MessageId>();
     if (!sources?.size) return ids;
