@@ -22,7 +22,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
-import { NativeFormatter } from '@animalabs/membrane';
+import { NativeFormatter, AnthropicXmlFormatter, OpenAIResponsesFormatter } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 import { stripUnpairedToolBlocks } from '../src/normalize-tool-messages.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -392,6 +392,26 @@ describe('a run of calls sharing an id in one entry', () => {
     const collapsed = strategy.collapseConsecutiveMessages(turns());
     assert.equal(collapsed.filter((m) => m.participant === 'Claude').length, 2, 'premise: the two turns merged into one message');
     assert.deepStrictEqual(kept(stripUnpairedToolBlocks(collapsed)), { n: [2], results: ['OUT OF n=2'] }, 'strip');
+  });
+
+  it('two assistant turns calling one id, then both results: the later call keeps both, as the summariser\'s collapsed messages do, and every formatter sends both', () => {
+    const turns = () => [entry('User', [text('look')]), entry('Claude', [text('looking'), call(1)]), entry('Claude', [text('again'), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])];
+    const repaired = turns();
+    repaired.forEach((e, i) => { e.index = i; });
+    runEnforce(repaired);
+    assertPaired(repaired);
+    assert.deepStrictEqual(kept(repaired.slice(0, 3)).results.map((r) => String(r).startsWith('OUT OF')), [false], 'premise: the earlier call goes with a stub');
+    const later = repaired.findIndex((e) => e.content.some((b) => b.type === 'tool_use' && (b as unknown as { input: { n: number } }).input.n === 2));
+    assert.deepStrictEqual(kept(repaired.slice(later)), { n: [2], results: ['OUT OF n=1', 'OUT OF n=2'] }, 'repair');
+    const strategy = new AutobiographicalStrategy({}) as unknown as { collapseConsecutiveMessages: (m: unknown[]) => { participant: string; content: ContentBlock[] }[] };
+    assert.deepStrictEqual(kept(stripUnpairedToolBlocks(strategy.collapseConsecutiveMessages(turns()))), { n: [2], results: ['OUT OF n=1', 'OUT OF n=2'] }, 'strip');
+    for (const formatter of [new NativeFormatter(), new AnthropicXmlFormatter(), new OpenAIResponsesFormatter()]) {
+      const sent = JSON.stringify(formatter.buildMessages(
+        repaired.map(({ participant, content }) => ({ participant, content })),
+        { participantMode: 'multiuser', assistantParticipant: 'Claude' } as never,
+      ));
+      assert.ok(sent.includes('OUT OF n=1') && sent.includes('OUT OF n=2'), `${formatter.constructor.name} sends both outputs`);
+    }
   });
 });
 

@@ -161,6 +161,7 @@ export function attributeEntries(
   // Pass 1: which members each raw entry carries, and whether it carried
   // them unaltered.
   let inRequest: ReadonlySet<ContentBlock> | undefined;
+  let placedByRepair: ReadonlySet<ContentBlock> | undefined;
   const entryBodies: Array<BodyState[] | null> = [];
   for (const entry of entries) {
     if (!isRawEntry(entry)) {
@@ -177,7 +178,12 @@ export function attributeEntries(
       if (!states.includes(state)) states.push(state);
     }
     const unaltered = entry.relocatedResults?.length
-      ? carriesWithRelocated(entry, sourceMessages, inRequest ??= new Set(entries.flatMap((e) => e.content)))
+      ? carriesWithRelocated(
+        entry,
+        sourceMessages,
+        inRequest ??= new Set(entries.flatMap((e) => e.content)),
+        placedByRepair ??= new Set(entries.flatMap((e) => e.relocatedBlocks ?? [])),
+      )
       : carries(entry.content, sourceMessages);
     if (!unaltered) for (const state of states) state.contentOk = false;
     entryBodies.push(states);
@@ -374,18 +380,20 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
  * when it carries the rest unaltered and each of the body's results with a
  * moved id is carried, unaltered and in any order, by a block of its own:
  * one the repair placed for this entry that is still in the request, or a
- * result with that id still in the entry. Each block carries one result,
- * including one the repair placed within the entry's own message, which
- * folding a cut message's parts back puts in its content too.
- * Another entry's result with its id, even with the same content, doesn't
- * stand in for it. An entry that names no placed blocks
- * (`relocatedBlocks`) is judged by id instead: a result with a moved id is
- * carried by any result with its id in the request that covers it.
+ * result with that id still in the entry that the repair placed for no
+ * entry. Each block carries one result, including one the repair placed
+ * within the entry's own message, which folding a cut message's parts back
+ * puts in its content too. Another entry's result with its id, even with the
+ * same content, doesn't stand in for it, nor does one the repair placed for
+ * another entry inside this entry's message. An entry that names no placed
+ * blocks (`relocatedBlocks`) is judged by id instead: a result with a moved
+ * id is carried by any result with its id in the request that covers it.
  */
 function carriesWithRelocated(
   entry: ContextEntry,
   sourceMessages: readonly StoredMessage[],
   inRequest: ReadonlySet<ContentBlock>,
+  placedByRepair: ReadonlySet<ContentBlock>,
 ): boolean {
   const moved = new Set(entry.relocatedResults);
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
@@ -396,7 +404,7 @@ function carriesWithRelocated(
     return sourceMessages.every((m) => m.content.every((block) => !isMoved(block) || sent.some((result) => covers(result, block))));
   }
   const placed = entry.relocatedBlocks.filter((b) => inRequest.has(b));
-  const carriers = [...placed, ...entry.content.filter((b) => isMoved(b) && !placed.includes(b))];
+  const carriers = [...placed, ...entry.content.filter((b) => isMoved(b) && !placedByRepair.has(b))];
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;

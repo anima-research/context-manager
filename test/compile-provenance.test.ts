@@ -638,6 +638,16 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(bodies.find((x) => x.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
   });
 
+  it('attributes by tool_use id against every result with the moved id in the request, not only the first', () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const earlier: ContextEntry = { index: 0, participant: 'user', sourceRelation: 'derived', content: [result('tu-1', 'another output')] };
+    const answering: ContextEntry = { index: 0, participant: 'user', sourceRelation: 'derived', content: [result('tu-1', 'the real output')] };
+    const moved: ContextEntry = { ...copy(r, [text('and a note')]), relocatedResults: ['tu-1'] };
+    const bodies = attributeEntries([copy(u), earlier, answering, moved], [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
+  });
+
   it('doesn\'t credit a moved result whose stored block another moved result shares, once its own placement was altered', async () => {
     const shared = result('x', 'SAME');
     const a = msg('a', 1, [use('x')]);
@@ -654,6 +664,24 @@ describe('a tool result moved by repair is still carried', () => {
     const bodies = attributeEntries(entries, [a, r1, b, r2]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
     assert.deepEqual(bodies.find((x) => x.messageId === 'r1'), { messageId: 'r1', sequence: 3, complete: false, missing: ['content'] });
     assert.deepEqual(bodies.find((x) => x.messageId === 'r2'), { messageId: 'r2', sequence: 6, complete: true });
+  });
+
+  it('doesn\'t credit a cut message\'s moved result, once its own placement was altered, with a result the repair placed for another entry inside that message', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const m = msg('m', 3, [result('x', 'SAME'), text('note'), use('x'), use('y'), result('y', 'y out')]);
+    const s = msg('s', 4, [result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), recall, copy(m), copy(s)]);
+    const forM = entries.find((e) => e.sourceMessageId === 'm')!;
+    const forS = entries.find((e) => e.sourceMessageId === 's')!;
+    assert.deepEqual([forM.relocatedResults, forS.relocatedResults], [['x'], ['x']], 'premise: repair moved m\'s result up to a, and s\'s into m');
+    assert.ok(forM.content.includes(forS.relocatedBlocks![0]!), 'premise: the result placed for s sits in m\'s folded content');
+    const own = forM.relocatedBlocks![0]!;
+    const holder = entries.find((e) => e.content.includes(own))!;
+    holder.content[holder.content.indexOf(own)] = result('x', 'ALTERED');
+    const bodies = attributeEntries(entries, [a, m, s]).sources.flatMap((x) => (x.kind === 'raw' ? x.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'm'), { messageId: 'm', sequence: 3, complete: false, missing: ['content'] });
+    assert.deepEqual(bodies.find((x) => x.messageId === 's'), { messageId: 's', sequence: 4, complete: true });
   });
 
   it('credits the body with its result where a later call reuses an unanswered call\'s id and repair moves the result to the later call', async () => {

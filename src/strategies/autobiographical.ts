@@ -19709,15 +19709,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
-    // The ids the previous entry held more than one call with: their calls
-    // but the last were dropped, and every result after them answers it.
+    // The ids whose every result in this entry answers the previous entry's
+    // call with the id: those it held more than one call with, all but the
+    // last dropped, and those whose earlier call, in an earlier entry, went
+    // with a stub where the look-ahead met that call (`laterCalls`).
     let prevRunIds = new Set<string>();
+    const laterCalls = new Map<ContextEntry, Set<string>>();
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
 
       // --- Rule A: every tool_result must answer a tool_use in the
-      // immediately-preceding entry (and only once). Drop orphans/dupes. ---
+      // immediately-preceding entry, and only once, but for an id in
+      // prevRunIds, whose every result there answers it. Drop the rest. ---
       if (entry.content.some(b => b.type === 'tool_result')) {
         const seen = new Set<string>();
         const filtered = entry.content.filter(b => {
@@ -19748,7 +19752,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Rule A when we reach it). Move the real block up into position and
           // only stub the ids for which no real result exists — so tool output
           // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
+          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf, laterCalls);
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
@@ -19780,6 +19784,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id);
       prevRunIds = new Set(entry.content.flatMap((b, p) => (b.type === 'tool_use' && later(b, p) ? [b.id] : [])));
       if (prevRunIds.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => !later(b, p)));
+      for (const id of laterCalls.get(entry) ?? []) prevRunIds.add(id);
 
       prevUseIds = new Set();
       for (const b of entry.content) {
@@ -19832,6 +19837,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     afterIndex: number,
     missing: string[],
     unitOf: (entry: ContextEntry) => ContextEntry,
+    laterCalls: Map<ContextEntry, Set<string>>,
   ): ContentBlock[] {
     const LOOKAHEAD = 6;
     let end = afterIndex + 1;
@@ -19848,7 +19854,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
         );
         if (bi === -1) continue;
-        if (src.content[bi]!.type === 'tool_use') break;
+        if (src.content[bi]!.type === 'tool_use') {
+          let ids = laterCalls.get(src);
+          if (!ids) laterCalls.set(src, ids = new Set());
+          ids.add(id);
+          break;
+        }
         const source = src.content;
         const real = source[bi];
         const rest = source.filter((_, k) => k !== bi);

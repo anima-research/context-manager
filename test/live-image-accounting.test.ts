@@ -885,7 +885,7 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
   });
 
-  it("sends a run's images as it would were the ids distinct, where a message calls one id twice and its two results carry images", async () => {
+  it("gives a run's images the verdicts they get with distinct ids, where a message calls one id twice and its two results carry images", async () => {
     const shot = (id: string, q: string): ContentBlock => ({ type: 'tool_use', id, name: 'shot', input: { q } } as ContentBlock);
     const result = (id: string, data: string, text: string) => ({ type: 'tool_result', toolUseId: id, content: [{ type: 'text', text }, image(data, 1000)] });
     const compile = (first: string, second: string) => compileMoved(1, [
