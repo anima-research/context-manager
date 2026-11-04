@@ -1251,13 +1251,16 @@ export class MessageStore {
   /**
    * Whether the slot may hold a block that declares an `audience`: once a
    * write through a MessageStore on this store object stored one, or a read
-   * of the slot found one. The slot is read at the first call, and again
-   * only after a write no MessageStore here counted (a gap, as the caches
-   * test it) or on another branch; between those, every write was counted,
-   * and one that stored such a block marked the slot itself. A block edited
-   * away still counts: a slot a write marked stays marked for its store
-   * object, and one a read found stays found until a write no MessageStore
-   * here counted, or a branch change, has the slot read again.
+   * of the slot found one. The slot is read at a branch's first call, and
+   * again only after a write no MessageStore here counted (a gap, as the
+   * caches test it); between those, every write was counted, and one that
+   * stored such a block marked the slot itself. Each branch keeps its own
+   * read: on the branch last read, it holds through the counted writes made
+   * since; on a branch returned to, only while that branch's slot revision
+   * is the one it read, so a return to a branch nothing wrote meanwhile
+   * reads nothing again. A block edited away still counts: a slot a write
+   * marked stays marked for its store object, and one a read found stays
+   * found until a write no MessageStore here counted has the slot read again.
    * On a chronicle without a slot revision, a write outside MessageStore
    * isn't seen, as by the caches.
    */
@@ -1266,22 +1269,26 @@ export class MessageStore {
     const branchId = this.store.currentBranch().id;
     const revision = slotRevision(this.store, this.stateId);
     const gapCount = currentGapCount(this.store, this.stateId);
-    const read = this.audienceRead;
+    const read = this.audienceReads.get(branchId);
     if (
       read &&
-      read.branchId === branchId &&
       read.gapCount === gapCount &&
-      (read.revision === revision || revisionLeftByLastCountedWrite(this.store, this.stateId) === revision)
+      (read.revision === revision ||
+        (this.audienceReadBranch === branchId && revisionLeftByLastCountedWrite(this.store, this.stateId) === revision))
     ) {
       read.revision = revision;
+      this.audienceReadBranch = branchId;
       return read.found;
     }
     const found = this.getAllInternal().some((internal) => hasAudience(internal.content));
-    this.audienceRead = { branchId, revision, gapCount, found };
+    this.audienceReads.set(branchId, { revision, gapCount, found });
+    this.audienceReadBranch = branchId;
     return found;
   }
 
-  private audienceRead: { branchId: string; revision: number; gapCount: number; found: boolean } | null = null;
+  /** mayHoldAudience's read of each branch, and the branch it last answered for. */
+  private readonly audienceReads = new Map<string, { revision: number; gapCount: number; found: boolean }>();
+  private audienceReadBranch: string | null = null;
 
   /**
    * Get a window of messages by slot index — O(window), not O(all).

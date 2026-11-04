@@ -1821,6 +1821,66 @@ describe('a store whose slots hold no audience block', () => {
     }
   });
 
+  it('reads a branch it returns to, which nothing wrote meanwhile, without scanning its slot again', async () => {
+    const proto = MessageStore.prototype as unknown as { mayHoldAudience(): boolean; getAllInternal(): unknown[] };
+    const check = proto.mayHoldAudience;
+    const scan = proto.getAllInternal;
+    let inCheck = 0;
+    let scans = 0;
+    const checks = mock.method(proto, 'mayHoldAudience', function (this: unknown) {
+      inCheck++;
+      try { return check.call(this); } finally { inCheck--; }
+    });
+    const scanned = mock.method(proto, 'getAllInternal', function (this: unknown) {
+      if (inCheck > 0) scans++;
+      return scan.call(this);
+    });
+    const dir = tmp();
+    const plain = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/plain', strategy: new PassthroughStrategy() });
+    try {
+      for (const text of ['One.', 'Two.', 'Three.']) plain.addMessage('user', [t(text)]);
+      const home = plain.getStore().currentBranch().name;
+      assert.equal(texts((await plain.compile(BUDGET)).messages), 'One.\nTwo.\nThree.');
+      const onHome = scans;
+      await plain.fork('elsewhere');
+      plain.addMessage('user', [t('Four.')]);
+      assert.equal(texts((await plain.compile(BUDGET)).messages), 'One.\nTwo.\nThree.\nFour.');
+      assert.ok(scans > onHome, 'the premise: the other branch was scanned at its first read');
+      const away = scans;
+      await plain.switchBranch(home);
+      assert.equal(texts((await plain.compile(BUDGET)).messages), 'One.\nTwo.\nThree.', 'back home, the compile is as before');
+      assert.equal(scans, away, 'and the slot was not scanned again');
+    } finally {
+      scanned.mock.restore();
+      checks.mock.restore();
+      await plain.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a branch it returns to again when another store handle wrote there meanwhile', async () => {
+    const dir = tmp();
+    const plain = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/plain', strategy: new PassthroughStrategy() });
+    const root = plain.getStore();
+    try {
+      plain.addMessage('user', [t('One.')]);
+      const home = root.currentBranch().name;
+      assert.equal(texts((await plain.compile(BUDGET)).messages), 'One.');
+      await plain.fork('elsewhere');
+      await plain.compile(BUDGET);
+      const other = await ContextManager.open({ store: asRoot(root).view(home), namespace: 'agents/plain', strategy: new PassthroughStrategy() });
+      other.addMessage('user', [forReaders('[for bob]', 'bob'), t('Two.')]);
+      await other.close();
+      await plain.switchBranch(home);
+      const compiled = (await plain.compile(BUDGET)).messages;
+      assert.equal(texts(compiled), 'One.\nTwo.', 'the block for bob, written through the other handle, stays out');
+      assert.ok(!anyAudience(compiled));
+    } finally {
+      await plain.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('takes the reader\'s view once a manager on the same store object stores a block with an audience', async () => {
     const dir = tmp();
     const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
