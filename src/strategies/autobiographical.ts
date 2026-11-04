@@ -3948,10 +3948,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * List summaries whose source message span overlaps `[opts.fromMs, opts.toMs]`,
    * for a "browse my history" table-of-contents (agent-framework consumer) —
-   * read-only, generates nothing. A summary's span runs from the first to the
-   * last of its messages still in the view (a message removed from the
-   * store, or hidden by the view's filter, no longer bounds it), and a
-   * summary with none left isn't listed.
+   * read-only, generates nothing. A summary's span runs from its recorded
+   * first message to its recorded last while both are in the view, and
+   * otherwise from the first to the last of its messages still in the view
+   * (a message removed from the store, or hidden by the view's filter, no
+   * longer bounds it). A summary with none left isn't listed.
    *
    * Deliberately channel-agnostic: `SummaryEntry` has no channel field — a
    * summary is a fold over whatever messages landed in a chunk, which can span
@@ -6739,7 +6740,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected ownershipPositionIndex(): Map<MessageId, number> {
     const { members, chunkMember } = this.ownedMembers();
     const order = this._storeOrder;
-    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    if (this._storeOrderSource === NO_LISTING) return new Map(members.map((id, i) => [id, i] as const));
     const known = members.filter((id) => order.has(id)).sort((a, b) => order.get(a)! - order.get(b)!);
     const index = new Map<MessageId, number>();
     let position = 0;

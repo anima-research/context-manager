@@ -1265,6 +1265,37 @@ describe('removed messages (#321)', () => {
     }
   });
 
+  it('a store whose every message was removed, after a merge across a summary that had lost its messages, reopens', async () => {
+    const { manager, strategy, ids, path } = await fourSummaries();
+    let closed = false;
+    try {
+      for (const i of [4, 5, 6, 7]) manager.removeMessage(ids[i]! as never);
+      strategy.mergeAt(2);
+      await tickUntil(manager, () => strategy.all().some((s) => s.level === 2));
+      const [a, , c] = strategy.all();
+      assert.ok(strategy.all().some((s) => s.level === 2 && s.sourceIds.includes(a!.id) && s.sourceIds.includes(c!.id)),
+        'setup: an L2 holds the first and third summaries, across the second\'s removed messages');
+      for (const message of manager.getAllMessages()) manager.removeMessage(message.id as never);
+      await manager.close();
+      closed = true;
+      let reopened: ContextManager | undefined;
+      await assert.doesNotReject(async () => {
+        reopened = await ContextManager.open({
+          path,
+          strategy: new Probe({
+            compressionModel: 'm', hierarchical: true, headWindowTokens: 1, recentWindowTokens: 0, l1HoldbackChunks: 0,
+            targetChunkTokens: 60, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+          } as never),
+          membrane: { complete: async () => ({ stopReason: 'end_turn', content: text('MEM') }) } as never,
+        } as never);
+      });
+      await reopened?.close();
+    } finally {
+      if (!closed) await manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
   const mergedWith = (strategy: Probe): string[] => strategy.all().filter((s) => s.level === 2).map((s) =>
     s.sourceIds.map((id) => strategy.all().find((x) => x.id === id)!.content).join('+')).sort();
   const unmergedL1s = (strategy: Probe): string[] =>

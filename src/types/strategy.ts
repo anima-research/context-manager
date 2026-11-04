@@ -878,7 +878,8 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 /**
  * A summary, projected to the flat shape a "browse my history" table-of-contents
  * wants: a resolved wall-clock span (`startMs`/`endMs`, derived from the
- * `timestamp` of the first and last of its source messages still in the view)
+ * `timestamp` of its recorded first and last messages while both are in the
+ * view, and otherwise of the first and last of its messages still in the view)
  * instead of `SummaryEntry`'s message-ID
  * `sourceRange`. Produced by `listSummariesInRange`; not persisted anywhere —
  * this is a read-time view, not a new storage shape.
@@ -889,9 +890,9 @@ export interface TimeRangeSummaryEntry {
   level: number;
   content: string;
   tokens: number;
-  /** The `timestamp` of the first of the summary's messages still in the view, in epoch ms. */
+  /** The `timestamp` of the message `firstMessageId` names, in epoch ms. */
   startMs: number;
-  /** The `timestamp` of the last of the summary's messages still in the view, in epoch ms. */
+  /** The `timestamp` of the message `lastMessageId` names, in epoch ms. */
   endMs: number;
   /**
    * Exact identity/order boundaries of the covered span, ALONGSIDE the
@@ -901,9 +902,9 @@ export interface TimeRangeSummaryEntry {
    * not `startMs`/`endMs` alone: two distinct messages can share a
    * timestamp (wall-clock ms resolution, rapid-fire appends), but
    * `sequence` (chronicle's per-record sequence number) is strictly
-   * monotonic and never ties. The `StoredMessage.id`/`.sequence` of the
-   * first and last of the summary's messages still in the view:
-   * `sourceRange.first`/`.last` while those are there.
+   * monotonic and never ties. The `StoredMessage.id`/`.sequence` of
+   * `sourceRange.first`/`.last` while both are in the view, and otherwise
+   * of the first and last of the summary's messages still in the view.
    */
   firstMessageId: string;
   lastMessageId: string;
