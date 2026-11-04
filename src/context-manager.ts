@@ -205,7 +205,8 @@ interface ContextManagerBaseConfig {
    * manager compiling for none is refused a switch to a branch, or a
    * setStrategy, where its namespace records a reader. A compile, a
    * previewContext, a tick, an edit, a resetHeadWindow, a renderAsNewest,
-   * a getSummariesInRange, a getRenderStats and every read of its messages
+   * a getSummariesInRange, a getRenderStats, a searchSummaries, a
+   * getSummary and every read of its messages
    * through the view it hands its strategy, compression's included, are
    * refused when the namespace's record on the store's current branch names
    * another reader, or any reader for a manager compiling for none, as after

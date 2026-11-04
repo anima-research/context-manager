@@ -1,5 +1,6 @@
 - **Host operators:** a write is now refused, saying why, when it puts an
-  `audience` on a tool call or tool result, a system change, inline media
+  `audience` on a tool call or tool result, a `thinking` or
+  `redacted_thinking` block, a system change, inline media
   (which the store keeps as a blob) or a block inside another, or in a
   context entry, or when the `audience` isn't a list of reader names. So is
   a compile given one in an injection or in `messageInjections`, or a

@@ -124,7 +124,7 @@ export function readersGained(
   return { named: [...names].filter(gains), everyoneElse: gains(undefined) };
 }
 
-/** A content block with the readers it's for (`audience`), as a host may write one on a message's own blocks other than tool calls, tool results, system changes and inline media. */
+/** A content block with the readers it's for (`audience`), as a host may write one on a message's own blocks other than tool calls, tool results, thinking, system changes and inline media. */
 export type ContentBlockWithAudience = ContentBlock & { audience?: string[] };
 
 export function hasAudience(content: unknown): boolean {

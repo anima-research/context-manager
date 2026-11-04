@@ -14,8 +14,8 @@
  * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
  * blob, not media inside a `tool_result`, which it keeps as given.
- * A write also refuses an `audience` on a tool call, a tool result, a system
- * change, inline media the store keeps as a blob or a block inside a tool
+ * A write also refuses an `audience` on a tool call, a tool result, thinking,
+ * a system change, inline media the store keeps as a blob or a block inside a tool
  * result, or one that isn't a list of reader names (audiencePlaces).
  * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
  * still refuse a block without, and nothing else of a media source, such as
