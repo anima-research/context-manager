@@ -406,22 +406,25 @@ describe('removed messages (#321)', () => {
   });
 
   it('a raw message between the head and the chunk, removed during the chunk\'s request, is in none of its later requests', async () => {
-    const refusal = { stopReason: 'refusal', content: [{ type: 'text', text: '' }] as ContentBlock[] };
     let removedAt = 0;
-    const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager, request) => {
-      if (summarized(request)[0] === 'M4') return refusal;
-      if (summarized(request)[0] === 'M8' && removedAt === 0) {
+    const { manager, strategy, ids, requests, path } = await chunked(6, (call, ids, manager, request) => {
+      if (summarized(request)[0] === 'M6' && removedAt === 0) {
         removedAt = call;
         manager.removeMessage(ids[5]! as never);
         return '';
       }
     });
     try {
+      // A raw pin on M5, made before M6 arrives, keeps M5 out of every chunk, so it sits raw
+      // between the head and the chunks after it. A refused chunk no longer leaves its messages
+      // there: the compression quarantine holds them out of later requests.
+      manager.pinRange(ids[5]! as never, ids[5]! as never, { name: 'keeps M5 raw' } as never);
+      for (let i = 6; i < 12; i++) ids.push(manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
       await tickUntil(manager, () => strategy.all().some((s) => s.sourceIds.includes(ids[8]!)));
       assert.ok(removedAt > 0, 'premise: the third chunk was asked for');
       const first = requests[removedAt - 1]!;
       assert.ok(carries(first, 'M5') && !summarized(first).includes('M5'),
-        'premise: the third chunk\'s request carried M5 raw, the second chunk being refused');
+        'premise: the third chunk\'s request carried M5 raw, the raw pin keeping it out of every chunk');
       for (const [i, request] of requests.entries()) {
         if (i >= removedAt) assert.ok(!carries(request, 'M5'), `request ${i + 1} carries M5`);
       }
@@ -754,10 +757,8 @@ describe('removed messages (#321)', () => {
   it('a raw message between the head and a merge\'s range, removed while the transport rejects the merge\'s reasoning, is not in the retry without it', async () => {
     const rejected = Object.assign(new Error('400: thinking blocks cannot be modified'),
       { type: 'invalid_request', retryable: false, httpStatus: 400 });
-    const refusal = { stopReason: 'refusal', content: [{ type: 'text', text: '' }] as ContentBlock[] };
     let mergeAt = 0;
-    const { manager, strategy, ids, requests, path } = await chunked(16, (call, ids, manager, request) => {
-      if (summarized(request)[0] === 'M4') return refusal;
+    const { manager, strategy, ids, requests, path } = await chunked(6, (call, ids, manager, request) => {
       if (mergeAt === 0 && carries(request, 'M9') && carries(request, 'M13')) {
         mergeAt = call;
         manager.removeMessage(ids[5]! as never);
@@ -765,24 +766,32 @@ describe('removed messages (#321)', () => {
       }
     }, {}, { hierarchical: true });
     try {
-      await tickUntil(manager, () => strategy.all().filter((s) => s.level === 1).length >= 3);
+      // A raw pin on M5, made before M6 arrives, keeps M5 out of every chunk, so it sits raw
+      // between the head and the merges after it, as the raw-middle test above sets it up.
+      manager.pinRange(ids[5]! as never, ids[5]! as never, { name: 'keeps M5 raw' } as never);
+      for (let i = 6; i < 16; i++) ids.push(manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`M${i}`))));
+      await tickUntil(manager, () => strategy.all().some((s) => s.sourceIds.includes(ids[13]!)));
       assert.deepStrictEqual(strategy.all().filter((s) => s.level === 1).map((s) => named(ids, s.sourceIds).join(',')),
-        ['M0,M1,M2,M3', 'M8,M9,M10,M11', 'M12,M13,M14,M15'], 'premise: the second chunk is refused and stays raw');
-      strategy.all()[0]!.responseContent = [
-        { type: 'thinking', thinking: 'carried reasoning', signature: 'signature' } as never,
-        { type: 'text', text: 'MEM[1]' },
-      ];
+        ['M0,M1,M2,M3', 'M4', 'M6,M7,M8,M9', 'M10,M11,M12,M13'], 'premise: no chunk holds M5');
       strategy.mergeAt(2);
+      for (let i = 0; i < 30 && !strategy.all().some((s) => s.level === 2); i++) await manager.tick();
+      const recalled = strategy.all().find((s) => s.level === 2);
+      assert.ok(recalled, 'premise: the first merge, of the summaries before M5, was written');
+      recalled.responseContent = [
+        { type: 'thinking', thinking: 'carried reasoning', signature: 'signature' } as never,
+        { type: 'text', text: 'MEM[L2]' },
+      ];
       for (let i = 0; i < 30 && mergeAt === 0; i++) await manager.tick();
       assert.ok(mergeAt > 0, 'premise: the merge of the last two summaries was asked for');
       const first = requests[mergeAt - 1]!;
       assert.ok(first.includes('carried reasoning') && carries(first, 'M5'),
         'premise: the merge\'s request recalled reasoning and carried M5 raw');
-      for (let i = 0; i < 30 && !strategy.all().some((s) => s.level === 2); i++) await manager.tick();
+      const merged = () => strategy.all().filter((s) => s.level === 2).length === 2;
+      for (let i = 0; i < 30 && !merged(); i++) await manager.tick();
       for (const [i, request] of requests.entries()) {
         if (i >= mergeAt) assert.ok(!carries(request, 'M5'), `request ${i + 1} carries M5`);
       }
-      assert.ok(strategy.all().some((s) => s.level === 2), 'the merge was written');
+      assert.ok(merged(), 'the merge was written');
     } finally {
       await manager.close();
       rmSync(path, { recursive: true, force: true });
