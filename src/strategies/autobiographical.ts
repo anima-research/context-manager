@@ -6701,10 +6701,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * member that listing did not contain (appended since) after it, in record
    * order. Two summaries are adjacent exactly when no listed message stands
    * between their sources. Without any listing (hosts that drive the
-   * grouping without a store view) this degrades to record order, as
-   * ownershipPositionIndex does. A summary's range ends that the listing
-   * doesn't hold are placed at its first and last messages it does
-   * (placeRangeEnds).
+   * grouping without a store view) this degrades to record order. A summary's
+   * range ends that the listing doesn't hold are placed at its first and last
+   * messages it does (placeRangeEnds).
    */
   protected mergePositionIndex(): Map<MessageId, number> {
     const { members, chunkMember } = this.ownedMembers();
@@ -6736,6 +6735,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * were kept apart at one, still has whole ownership (no owned message
    * between its sources is missing), so the audit leaves it as it stands,
    * though kv-unified's forest finds its live leaves non-contiguous.
+   * Its one caller, auditStoreTopology, sets the listing first.
    */
   protected ownershipPositionIndex(): Map<MessageId, number> {
     const { members, chunkMember } = this.ownedMembers();

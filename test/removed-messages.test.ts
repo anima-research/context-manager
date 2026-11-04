@@ -1090,7 +1090,7 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  it('the range query places a summary above L1 by its children, whatever its own recorded ends say', async () => {
+  it('the range query places a summary above L1 that lost an end message by its children\'s spans, whatever their recorded ends say', async () => {
     const { manager, strategy, ids, path } = await twoParents();
     try {
       strategy.mergeAt(2);
