@@ -25,7 +25,6 @@
 import { createHash } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import { withoutCacheMarker } from './cache-marker.js';
 import { canonicalJson } from './canonical-json.js';
 import { releaseEditedRawForms } from './raw-forms.js';
 import { registerStateIfAbsent } from './state-registration.js';
@@ -193,6 +192,13 @@ export function messageDigest(message: Pick<NormalizedMessage, 'participant' | '
     .update(canonicalJson({ p: message.participant, c: message.content.map(withoutCacheMarker) }))
     .digest('base64url')
     .slice(0, 11);
+}
+
+function withoutCacheMarker(block: ContentBlock): unknown {
+  const marked = block as unknown as Record<string, unknown>;
+  if (!('cache_control' in marked) && !('cacheControl' in marked)) return block;
+  const { cache_control: _snake, cacheControl: _camel, ...rest } = marked;
+  return rest;
 }
 
 export interface BindInput {

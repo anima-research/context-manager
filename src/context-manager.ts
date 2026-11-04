@@ -55,7 +55,7 @@ import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, audienceDeclarations, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
-import { audienceMessageStoreView, audienceNarrowing, contentForReader, filterMessageStoreView, hasAudience, mergeMessageStoreViews, messageForReader, type ContentBlockWithAudience } from './message-view.js';
+import { audienceMessageStoreView, contentForReader, filterMessageStoreView, hasAudience, mergeMessageStoreViews, messageForReader, readersGained, type ContentBlockWithAudience } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -186,9 +186,7 @@ interface ContextManagerBaseConfig {
    * `audience` reads as without it, except that the namespace's record of its
    * reader (below) is a state write, so messages stored after it is first
    * written on a branch (by an open, a switch, a fork, a derive or a
-   * setStrategy) carry sequence numbers one higher, and each record of what
-   * compression has read (`StrategyContext.markCompressionRead`) moves them by
-   * one more. Direct accessors
+   * setStrategy) carry sequence numbers one higher. Direct accessors
    * (getMessage/getAllMessages/query) return messages as stored. Each
    * reader's summaries and context log are kept under its manager's
    * `namespace`, so managers over one message slot compiling for different
@@ -255,29 +253,6 @@ interface ContextManagerBaseConfig {
 
 function viewReaderStateId(namespace: string): string {
   return `${namespace || 'default'}/reader`;
-}
-
-function narrowingFloorStateId(namespace: string): string {
-  return `${namespace || 'default'}/narrowing-floor`;
-}
-
-function refuseUndeclaredStrategy(strategy: ContextStrategy, reader: string | undefined, by: string): void {
-  if (reader === undefined || strategy.marksCompressionReads === true) return;
-  throw new Error(
-    `${by}: refused: the strategy doesn't declare marksCompressionReads, and a manager that compiles for a reader ` +
-      `(${JSON.stringify(reader)}) runs only a strategy that records what compression reads before it reads ` +
-      `(StrategyContext.markCompressionRead), so that editMessage can refuse to narrow a block compression may have ` +
-      `read. A strategy that makes no such read declares it as it is.`,
-  );
-}
-
-function narrowingFloor(store: JsStore, namespace: string): number {
-  const recorded = store.getStateJson(narrowingFloorStateId(namespace)) as unknown;
-  if (recorded === null || recorded === undefined) return -1;
-  if (typeof recorded !== 'number' || !Number.isInteger(recorded)) {
-    throw new Error(`namespace "${namespace}" records ${JSON.stringify(recorded)} as the newest message compression may have read, not a store sequence`);
-  }
-  return recorded;
 }
 
 function isViewReaderRegistered(store: JsStore, namespace: string): boolean {
@@ -1025,95 +1000,38 @@ export class ContextManager {
    * that must reach compressed memory, hold the message (holdCompression /
    * addMessage `holdCompression`) until after the edit.
    *
-   * So an edit that may narrow a block's `audience`, hiding a block from a
-   * reader who saw it, is refused, naming why, wherever compression
-   * may have read the block: away from this manager's reader once a chunk
-   * holding the message or a later one has closed, or a compression request
-   * has read it, as its namespace records whatever strategy or manager did
-   * it (`StrategyContext.markCompressionRead`); and always away from any
-   * other reader, or from its own while another namespace on the branch
-   * records the same reader, since this manager can't see what their
-   * compression has read. Blocks are compared by content, their `audience`
-   * and cache markers (`cache_control`, `cacheControl`) aside, wherever they
-   * sit in the message, so a change to any other field, citations included,
-   * replaces the block's content: an edit narrows when content
-   * the message keeps was seen by a reader before the edit, and that reader
-   * sees none of its blocks after it. A block with no equal before the edit
-   * is new content, and one with no equal after it is removed, as in any
-   * edit. So the refusal holds for content the edit keeps: an edit that
-   * replaces a block's content is a removal and an addition, and a summary
-   * already built from the old content keeps it, as above. Nothing takes a
-   * block out of a summary already written or a request already sent, a
-   * removal included. Like a compile, an edit is refused when the
-   * namespace records a reader this manager doesn't compile for.
+   * So a change of who reads a block (its `audience`) holds from now on, as
+   * any edit does: a reader no longer shown a block, or a message, gets none
+   * of it in a compile or a compression request built after the edit, and
+   * keeps what a summary or a request built before it took in. An edit that
+   * would show the message to a reader who saw none of it before is refused,
+   * naming that reader, since that reader's history would gain a message at a
+   * time they couldn't see it: to tell a reader something, add a message. A
+   * block with no `audience` is every reader's, a manager that compiles for
+   * no reader included. Like a compile, an edit is refused when the namespace
+   * records a reader this manager doesn't compile for.
    */
   editMessage(messageId: MessageId, content: ContentBlockWithAudience[]): void {
     this.requireInitialized('editMessage');
     this.requireRecordedReader('ContextManager.editMessage');
-    this.refuseNarrowing(messageId, content);
+    this.refuseWidening(messageId, content);
     this.write(() => this.messageStore.edit(messageId, content));
     // Propagation handled by event listener
   }
 
-  private refuseNarrowing(messageId: MessageId, content: readonly ContentBlockWithAudience[]): void {
+  private refuseWidening(messageId: MessageId, content: readonly ContentBlockWithAudience[]): void {
     const stored = this.messageStore.get(messageId);
     if (!stored || malformedContentPlaces(content).length > 0) return;
-    const reader = this.readerName;
-    const { own, others } = audienceNarrowing(stored.content, content, reader);
-    if (!own && !others) return;
-    const refused = `ContextManager.editMessage: refused: the edit of message ${messageId} may hide a block from`;
-    const why = 'nothing takes a block out of a summary already written or a request already sent, a removal included';
-    const advice = 'Give a block its audience when its message is added.';
-    if (others) {
-      throw new Error(
-        `${refused} a reader other than ` +
-          `${reader !== undefined ? `${JSON.stringify(reader)}, the one this manager compiles for` : 'this manager, which compiles for no reader'}. ` +
-          `This manager can't see what that reader's compression has read, and ${why}. ${advice}`,
-      );
-    }
-    const ownReader = `${refused} ${JSON.stringify(reader)}, the reader this manager compiles for, and`;
-    if (this.readerSharedWithAnotherNamespace(reader!)) {
-      throw new Error(
-        `${ownReader} another namespace on this branch records the same reader. This manager can't see what that ` +
-          `namespace's compression has read, and ${why}. ${advice}`,
-      );
-    }
-    let floor: number;
-    try {
-      floor = narrowingFloor(this.store, this.strategyNamespace);
-    } catch (error) {
-      throw new Error(
-        `${ownReader} the record of what compression has read can't be read (${error instanceof Error ? error.message : String(error)}), ` +
-          `so compression may have read the message, and ${why}. ${advice}`,
-      );
-    }
-    if (stored.sequence <= floor) {
-      throw new Error(
-        `${ownReader} compression may have read the message: a chunk holding it or a later message has closed, or a ` +
-          `compression request has read it, and ${why}. A block's audience can be narrowed only on a message newer ` +
-          `than anything compression has read, or given when the message is added.`,
-      );
-    }
-  }
-
-  private markCompressionRead(through: Sequence): void {
-    if (this.readerName === undefined) return;
-    const id = narrowingFloorStateId(this.strategyNamespace);
-    registerStateIfAbsent(this.store, { id, strategy: 'snapshot' });
-    if (through > narrowingFloor(this.store, this.strategyNamespace)) this.store.setStateJson(id, through);
-  }
-
-  private readerSharedWithAnotherNamespace(reader: string): boolean {
-    const own = viewReaderStateId(this.strategyNamespace);
-    for (const state of this.store.listStates()) {
-      if (state.id === own || !state.id.endsWith('/reader')) continue;
-      try {
-        if (this.store.getStateJson(state.id) === reader) return true;
-      } catch {
-        return true;
-      }
-    }
-    return false;
+    const { named, everyoneElse } = readersGained(stored.content, content);
+    if (named.length === 0 && !everyoneElse) return;
+    const who = [
+      ...named.map((name) => JSON.stringify(name)),
+      ...(everyoneElse ? ['every reader no block names, a manager that compiles for no reader included'] : []),
+    ].join(', ');
+    throw new Error(
+      `ContextManager.editMessage: refused: the edit of message ${messageId} would show it to ${who}, who saw none of it ` +
+        `before. Their history would gain a message at a time they couldn't see it. To tell a reader something, add a message.`,
+    );
   }
 
   // ==========================================================================
@@ -1599,7 +1517,6 @@ export class ContextManager {
     }
     if (this.readerName !== undefined) refuseOtherViewReader(this.store, this.strategyNamespace, this.readerName, 'ContextManager.derive');
     const reader = this.readerName ?? recordedViewReader(this.store, this.strategyNamespace, 'ContextManager.derive');
-    refuseUndeclaredStrategy(options.strategy, reader, 'ContextManager.derive');
     const source = this.store as unknown as JsStore & DerivableStore;
     const solve = options.solve ?? 'reuse';
     const parentBranch = this.store.currentBranch().name;
@@ -1613,9 +1530,6 @@ export class ContextManager {
       ContextLog.stateIdFor(this.slots.contextNamespace),
       bindingStateId(this.strategyNamespace),
       ...(isViewReaderRegistered(this.store, this.strategyNamespace) ? [viewReaderStateId(this.strategyNamespace)] : []),
-      ...(this.store.listStates().some((state) => state.id === narrowingFloorStateId(this.strategyNamespace))
-        ? [narrowingFloorStateId(this.strategyNamespace)]
-        : []),
       // Authoring-request preimages are keyed by hash in one store-wide
       // tree; inherited so the child can still resolve a memory's origin.
       // Ignored by the store when the tree was never created.
@@ -2398,15 +2312,12 @@ export class ContextManager {
   /**
    * Set the context management strategy and initialize it on the selected branch.
    * The strategy it replaces is detached first (ContextStrategy.detach).
-   * Also recovers a manager after failed initialization. A strategy that
-   * doesn't declare `marksCompressionReads`, given to a manager that compiles
-   * for a reader, is refused before anything changes. Any other failure leaves
+   * Also recovers a manager after failed initialization. A failure leaves
    * the manager's operations fenced until another successful initialization,
    * with the strategy still held; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.requireOpen('setStrategy');
-    refuseUndeclaredStrategy(strategy, this.readerName, 'ContextManager.setStrategy');
     if (strategy !== this.strategy) this.detachStrategy(this.strategy);
     this.strategy = strategy;
     await this.initializeStrategy();
@@ -2931,7 +2842,6 @@ export class ContextManager {
   ): Promise<void> {
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
-    refuseUndeclaredStrategy(this.strategy, this.readerName, by);
     if (this.readerName !== undefined) claimViewReader(this.store, this.strategyNamespace, this.readerName, by);
     else refuseRecordedViewReader(this.store, this.strategyNamespace, by);
     const strategy = this.strategy;
@@ -3070,7 +2980,6 @@ export class ContextManager {
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,
-      markCompressionRead: (through: Sequence) => self.markCompressionRead(through),
       // Live getter, not a snapshot: strategies capture a ctx object once and
       // reuse it across a long-running drain (driveSpeculativeDrain recurses
       // with the same ctx). A snapshot taken before the session's first

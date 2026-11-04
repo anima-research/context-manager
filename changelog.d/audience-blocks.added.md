@@ -45,36 +45,16 @@
   them, and removed where the reader sees nothing of it. Summaries written
   before a reader claims a namespace are kept, and that reader's compiles
   use them as written.
-- An `editMessage` that may narrow a block's `audience`, hiding a block
-  from a reader who saw it, is refused, naming why, wherever compression
-  may have read the block, since nothing takes a block out of a summary
-  already written or a request already sent, a removal included. Away
-  from the manager's own reader it's refused once a chunk holding the
-  message or a later one has closed, or a
-  compression request has read it. The namespace records that on each
-  branch, through the new `StrategyContext.markCompressionRead`, whichever
-  strategy or manager on it did the reading, and a reopen keeps it. So a
-  manager that compiles for a reader refuses to start a strategy that
-  doesn't declare the new `marksCompressionReads`, which says it records
-  what compression reads before it reads; one that makes no such read
-  declares it as it is. Away from any other reader, or from its own while
-  another namespace on the branch records the same reader, it's always refused,
-  since a manager can't see what another namespace's compression has read.
-  Blocks are compared by content, their `audience` and cache markers
-  (`cache_control`, `cacheControl`) aside, wherever they sit in the
-  message, so a change to any other field, citations included, replaces
-  the block's content: an edit narrows when content the message keeps was seen
-  by a reader before the edit, and that reader sees none of its blocks
-  after it. A block with no equal before the edit is new content, and one
-  with no equal after it is removed, as in any edit. So the refusal holds
-  for content the edit keeps: an edit that replaces a block's content is a
-  removal and an addition, and a summary already built from the old
-  content keeps it, as after any edit. So a block takes its audience when its
-  message is added. The record is a
-  state write, made by a manager that compiles for a reader as its
-  strategy's chunks close, so it moves later sequence numbers too. A request
-  never reads a message the record doesn't cover: while it can't be
-  written, the strategy takes no chunk or merge from its queues.
+- An `editMessage` that changes a block's `audience` holds from now on, as
+  any edit does: a reader no longer shown a block, or a whole message, gets
+  none of it in a compile or a compression request built after the edit,
+  and keeps what a summary or a request built before it took in. An edit
+  that would show the message to a reader who saw none of it before, by
+  widening an `audience`, rewriting a block for more readers or adding a
+  block with no `audience`, is refused, naming that reader: to tell a reader
+  something, a host adds a message. So a narrowing can't be undone in place.
+  Within a message a reader still sees, a block's `audience` may change
+  either way.
 - `resetHeadWindow()` without text, under a manager that compiles for a
   reader, stores the transition summary it makes from that reader's view
   for that reader alone, as a block whose `audience` names it; text a host

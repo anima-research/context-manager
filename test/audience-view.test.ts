@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
-import { AutobiographicalStrategy, ContextLog, ContextManager, KnowledgeStrategy, MalformedContentError, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, contentForReader } from '../src/index.js';
+import { AutobiographicalStrategy, ContextLog, ContextManager, MalformedContentError, MessageStore, PassthroughStrategy, contentForReader } from '../src/index.js';
 import { audienceMessageStoreView } from '../src/message-view.js';
-import type { ContextStrategy, MessageStoreView, StoredMessage, StrategyContext } from '../src/index.js';
+import type { ContextStrategy, MessageStoreView, StoredMessage } from '../src/index.js';
 
 const BUDGET = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const t = (text: string): ContentBlock => ({ type: 'text', text });
@@ -251,11 +251,9 @@ describe('a block with an audience', () => {
       assert.ok(!texts((await bob.compile(BUDGET)).messages).includes('ANN-AGAIN'), 'and one made for a null text is kept to ann too');
       await ann.close();
       ann = await ContextManager.open({ store, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-      assert.throws(
-        () => ann.editMessage(opening, [forReaders('ANN-ONLY opening', 'ann'), forReaders('SHARED opening', 'bob')]),
-        /may hide a block from "ann", the reader this manager compiles for, and compression may have read the message/,
-        'reopened, a block the transition request read is not narrowed away from ann',
-      );
+      ann.editMessage(opening, [forReaders('ANN-ONLY opening', 'ann'), forReaders('SHARED opening', 'bob')]);
+      assert.deepEqual(ann.getAllMessages().find((m) => m.id === opening)!.content,
+        [forReaders('ANN-ONLY opening', 'ann'), forReaders('SHARED opening', 'bob')], 'reopened, a block the transition request read may be narrowed away from ann, from now on');
     } finally {
       await ann.close();
       await bob.close();
@@ -265,14 +263,13 @@ describe('a block with an audience', () => {
   });
 });
 
-describe('an edit that narrows a block\'s audience', () => {
+describe('a change of who reads a message', () => {
   const both = (text: string) => forReaders(text, 'ann', 'bob');
   const words = 'word '.repeat(8);
-  const tmp = () => mkdtempSync(join(tmpdir(), 'cm-audience-'));
   const contentOf = (manager: ContextManager, id: string) => manager.getAllMessages().find((m) => m.id === id)!.content;
-  const added = (manager: ContextManager): string[] => {
+  const added = (manager: ContextManager, count = 60, from = 0): string[] => {
     const ids: string[] = [];
-    for (let i = 0; i < 60; i++) {
+    for (let i = from; i < from + count; i++) {
       ids.push(manager.addMessage(i % 2 ? 'agent' : 'user', i === 0 ? [t('Opening.'), both(`SECRET-0 ${words}`)] : [both(`SECRET-${i} ${words}`)]));
     }
     return ids;
@@ -285,180 +282,60 @@ describe('an edit that narrows a block\'s audience', () => {
     assert.ok(payloads.join('\n').includes('SECRET-3 '), 'the premise: a summary was written from message 3');
     return ids;
   };
-  const toBob = (id: string, text: string): [string, ContentBlock[]] => [id, [forReaders(`${text} ${words}`, 'bob')]];
-  const storedToBob = (manager: ContextManager, id: string): [string, ContentBlock[]] =>
-    [id, contentOf(manager, id).map((block) => Object.assign({}, block, { audience: ['bob'] }))];
-  const ownRefusal = /refused: the edit of message \S+ may hide a block from "ann", the reader this manager compiles for, and compression may have read the message: a chunk holding it or a later message has closed, or a compression request has read it/;
+  const widening = (who: string) => new RegExp(`refused: the edit of message \\S+ would show it to ${who}, who saw none of it before`);
 
-  it('is refused away from the reader once compression has read the message, and the message stays as it was', async () => {
-    await withReaders(async ({ ann, annSummaries }) => {
+  it('narrows from now on, wherever compression has read the message, by the same text or a rewrite, from any manager', async () => {
+    await withReaders(async ({ ann, bob, nobody, annSummaries, bobSummaries }) => {
       const ids = await summarized(ann, annSummaries);
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-      assert.deepEqual(contentOf(ann, ids[3]!), [both(`SECRET-3 ${words}`)], 'the message stays as it was');
-      ann.editMessage(ids[3]!, [both(`SECRET-3, edited ${words}`)]);
-      ann.editMessage(ids[3]!, [t(`SECRET-3, for everyone ${words}`)]);
-      assert.deepEqual(contentOf(ann, ids[3]!), [t(`SECRET-3, for everyone ${words}`)], 'an edit that hides nothing, or widens, goes through');
-      ann.editMessage(ids[0]!, [t('Opening.')]);
-      assert.deepEqual(contentOf(ann, ids[0]!), [t('Opening.')], 'and dropping a block is an ordinary edit');
-    });
-  });
-
-  it('is refused once a chunk holding the message has closed, before any request reads it', async () => {
-    await withReaders(async ({ ann, annSummaries }) => {
-      const ids = added(ann);
-      assert.equal(annSummaries.length, 0, 'the premise: no request has been made');
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-      await drain(ann);
-      assert.ok(annSummaries.some((p) => p.includes('SECRET-3 ')), 'and its request then reads the message as it stands');
-    });
-  });
-
-  it('goes through away from the reader on a message newer than anything compression has read', async () => {
-    await withReaders(async ({ ann, annSummaries }) => {
-      await summarized(ann, annSummaries);
-      const late = ann.addMessage('user', [both(`LATE ${words}`), t('Shared.')]);
-      ann.editMessage(late, [forReaders(`LATE ${words}`, 'bob'), t('Shared.')]);
-      assert.deepEqual(contentOf(ann, late), [forReaders(`LATE ${words}`, 'bob'), t('Shared.')]);
-      assert.ok(!texts((await ann.compile(BUDGET)).messages).includes('LATE '), 'ann\'s compile no longer holds it');
-    });
-  });
-
-  it('is refused while a request that may carry the message is out', async () => {
-    let release: (() => void) | undefined;
-    const membrane = {
-      complete: async () => {
-        if (!release) await new Promise<void>((resolve) => { release = resolve; });
-        return { stopReason: 'end_turn', content: [{ type: 'text', text: `[memory] ${'x '.repeat(40)}` }], usage: { input_tokens: 10, output_tokens: 25 } };
-      },
-    } as never;
-    const dir = tmp();
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: memory(), membrane, viewReader: 'ann' });
-    try {
-      const ids = added(ann);
+      assert.ok(texts((await ann.compile(BUDGET)).messages).includes('SECRET-59 '), 'the premise: ann\'s compile holds the newest message raw');
+      ann.editMessage(ids[3]!, [forReaders(`SECRET-3 ${words}`, 'bob')]);
+      ann.editMessage(ids[4]!, [forReaders(`REWRITTEN-4 ${words}`, 'bob')]);
+      ann.editMessage(ids[59]!, [forReaders(`SECRET-59 ${words}`, 'bob')]);
+      ann.editMessage(ids[5]!, [forReaders(`SECRET-5 ${words}`, 'ann')]);
+      nobody.editMessage(ids[6]!, [forReaders(`SECRET-6 ${words}`, 'bob')]);
+      bob.editMessage(ids[7]!, [both(`Seen-7 ${words}`), forReaders(`SECRET-7 ${words}`, 'bob')]);
+      assert.deepEqual(contentOf(ann, ids[3]!), [forReaders(`SECRET-3 ${words}`, 'bob')]);
+      const annBefore = annSummaries.length;
+      added(ann, 40, 60);
       await ann.compile(BUDGET);
-      const ticking = ann.tick();
-      for (let i = 0; i < 400 && !release; i++) await new Promise((r) => setTimeout(r, 5));
-      assert.ok(release, 'the premise: a summariser call is out');
-      assert.equal(JSON.stringify(ann.getStore().getStateJson('agents/ann/autobio:summaries') ?? []), '[]', 'the premise: no summary has been written yet');
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-      release!();
-      await ticking;
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused where another manager on the namespace has read the message for compression', async () => {
-    let release: (() => void) | undefined;
-    const blocking = {
-      complete: async () => {
-        if (!release) await new Promise<void>((resolve) => { release = resolve; });
-        return { stopReason: 'end_turn', content: [{ type: 'text', text: `[memory] ${'x '.repeat(40)}` }], usage: { input_tokens: 10, output_tokens: 25 } };
-      },
-    } as never;
-    const dir = tmp();
-    const first = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: memory(), membrane: summarizer().membrane, viewReader: 'ann' });
-    const second = await ContextManager.open({ store: first.getStore(), namespace: 'agents/ann', strategy: memory(), membrane: blocking, viewReader: 'ann' });
-    try {
-      const ids = added(second);
-      await second.compile(BUDGET);
-      const ticking = second.tick();
-      for (let i = 0; i < 400 && !release; i++) await new Promise((r) => setTimeout(r, 5));
-      assert.ok(release, 'the premise: the second manager\'s request is out');
-      assert.throws(() => first.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-      assert.deepEqual(contentOf(first, ids[3]!), [both(`SECRET-3 ${words}`)]);
-      release!();
-      await ticking;
-    } finally {
-      await second.close();
-      await first.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused after a switch to a strategy that keeps no summaries, where compression read the message before', async () => {
-    await withReaders(async ({ ann, annSummaries }) => {
-      const ids = await summarized(ann, annSummaries);
-      for (const strategy of [new PassthroughStrategy(), new WindowedPassthroughStrategy()]) {
-        await ann.setStrategy(strategy);
-        assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal, strategy.constructor.name);
+      await drain(ann);
+      const annLater = annSummaries.slice(annBefore).join('\n');
+      assert.ok(annLater.includes('SECRET-61 '), 'the premise: ann\'s compression read later messages');
+      for (const gone of ['SECRET-3 ', 'SECRET-4 ', 'REWRITTEN-4', 'SECRET-6 ', 'SECRET-7 ', 'SECRET-59 ']) {
+        assert.ok(!annLater.includes(gone), `no later request of ann's carries ${gone}`);
       }
-      assert.deepEqual(contentOf(ann, ids[3]!), [both(`SECRET-3 ${words}`)]);
+      assert.ok(!texts((await ann.compile(BUDGET)).messages).includes('SECRET-59 '), 'ann\'s compile no longer holds it');
+      await bob.compile(BUDGET);
+      for (let i = 0; i < 300 && bobSummaries.length === 0; i++) await bob.tick();
+      await drain(bob);
+      assert.ok(bobSummaries.join('\n').includes('SECRET-8 '), 'the premise: bob\'s compression read the early messages');
+      assert.ok(!bobSummaries.join('\n').includes('SECRET-5 '), 'a block narrowed away from bob by ann\'s manager reaches none of bob\'s requests');
     });
   });
 
-  it('goes through under a strategy that keeps no summaries while compression has read nothing', async () => {
-    await withReaders(async ({ ann }) => {
-      const shared = ann.addMessage('user', [both('Both.')]);
-      ann.editMessage(shared, [forReaders('Both.', 'bob')]);
-      assert.deepEqual(contentOf(ann, shared), [forReaders('Both.', 'bob')]);
-    }, () => new WindowedPassthroughStrategy());
-  });
-
-  it('is refused away from another reader, and by a manager compiling for no reader, whatever their summaries', async () => {
+  it('refuses an edit that would show a message to a reader who saw none of it, naming them, from any manager, and leaves it as it was', async () => {
     await withReaders(async ({ ann, bob, nobody }) => {
-      const pub = ann.addMessage('user', [t('Public.')]);
-      assert.throws(() => ann.editMessage(pub, [forReaders('Public.', 'ann')]), /refused: the edit of message \S+ may hide a block from a reader other than "ann", the one this manager compiles for\. This manager can't see what that reader's compression has read/);
-      const shared = ann.addMessage('user', [both('Both.')]);
-      assert.throws(() => bob.editMessage(shared, [forReaders('Both.', 'bob')]), /may hide a block from a reader other than "bob"/);
-      assert.throws(() => nobody.editMessage(shared, [forReaders('Both.', 'bob')]), /may hide a block from a reader other than this manager, which compiles for no reader/);
-      assert.deepEqual(contentOf(ann, pub), [t('Public.')]);
-      assert.deepEqual(contentOf(ann, shared), [both('Both.')]);
-      ann.editMessage(shared, [forReaders('Both.', 'bob')]);
-      assert.deepEqual(contentOf(ann, shared), [forReaders('Both.', 'bob')], 'away from its own reader, with nothing read, it goes through');
-      nobody.editMessage(shared, [t('Both, for everyone.')]);
-      assert.deepEqual(contentOf(ann, shared), [t('Both, for everyone.')], 'a manager with no reader may widen');
+      const forBob = ann.addMessage('user', [forReaders('For bob.', 'bob')]);
+      assert.throws(() => ann.editMessage(forBob, [forReaders('For bob.', 'bob', 'ann')]), widening('"ann"'), 'by widening its audience');
+      assert.throws(() => bob.editMessage(forBob, [forReaders('Rewritten.', 'bob', 'ann')]), widening('"ann"'), 'by a rewrite');
+      const everyone = widening('every reader no block names, a manager that compiles for no reader included');
+      assert.throws(() => bob.editMessage(forBob, [forReaders('For bob.', 'bob'), t('For everyone.')]), everyone, 'by adding a block with no audience');
+      assert.throws(() => nobody.editMessage(forBob, [t('For everyone.')]), everyone, 'by a manager that compiles for no reader');
+      assert.deepEqual(contentOf(ann, forBob), [forReaders('For bob.', 'bob')], 'the message stays as it was');
+      const narrowed = ann.addMessage('user', [both('Both.')]);
+      ann.editMessage(narrowed, [forReaders('Both.', 'bob')]);
+      assert.throws(() => bob.editMessage(narrowed, [both('Both.')]), widening('"ann"'), 'a narrowing can\'t be undone in place');
+      assert.deepEqual(contentOf(ann, narrowed), [forReaders('Both.', 'bob')]);
     }, () => new PassthroughStrategy());
   });
 
-  it('compares blocks by content wherever they sit, so a line added for a reader hides nothing', async () => {
+  it('lets a block\'s audience change either way within a message its reader still sees', async () => {
     await withReaders(async ({ ann }) => {
-      const body = ann.addMessage('user', [t('Body.')]);
-      ann.editMessage(body, [forReaders('[ann: #general]', 'ann'), t('Body.')]);
-      assert.deepEqual(contentOf(ann, body), [forReaders('[ann: #general]', 'ann'), t('Body.')], 'a line before the body');
-      const lines = ann.addMessage('user', [forReaders('[for ann]', 'ann'), forReaders('[for bob]', 'bob'), t('Hello.')]);
-      ann.editMessage(lines, [forReaders('[for ann]', 'ann'), forReaders('[for bob]', 'bob'), forReaders('[for carol]', 'carol'), t('Hello.')]);
-      assert.equal(contentOf(ann, lines).length, 4, 'a line for a reader who joined, between the lines and the body');
-    }, () => new PassthroughStrategy());
-  });
-
-  it('is refused where a block a reader saw moves to another place in a narrower audience, and the reader still sees it', async () => {
-    await withReaders(async ({ ann, bob }) => {
-      const secret = ann.addMessage('user', [t('SECRET')]);
-      assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/, 'the premise: bob sees it');
-      assert.throws(() => ann.editMessage(secret, [t('Prefix.'), forReaders('SECRET', 'ann')]), /may hide a block from a reader other than "ann"/);
-      assert.deepEqual(contentOf(ann, secret), [t('SECRET')]);
-      assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/);
-    }, () => new PassthroughStrategy());
-  });
-
-  it('is refused where one of two blocks with the same content goes, hiding it from the reader only that one was for, and lets the two be reordered', async () => {
-    await withReaders(async ({ ann, bob }) => {
-      const twice = ann.addMessage('user', [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
-      assert.throws(() => bob.editMessage(twice, [forReaders('Same.', 'bob')]), /may hide a block from a reader other than "bob"/);
-      assert.deepEqual(contentOf(ann, twice), [forReaders('Same.', 'ann'), forReaders('Same.', 'bob')]);
-      bob.editMessage(twice, [forReaders('Same.', 'bob'), forReaders('Same.', 'ann')]);
-      assert.deepEqual(contentOf(ann, twice), [forReaders('Same.', 'bob'), forReaders('Same.', 'ann')], 'reordered, each reader still sees the content, so it goes through');
-    }, () => new PassthroughStrategy());
-  });
-
-  it('compares content whatever order a block\'s fields were written in', async () => {
-    await withReaders(async ({ ann }) => {
-      const shared = ann.addMessage('user', [{ type: 'text', text: 'Shared.' } as ContentBlock]);
-      assert.throws(() => ann.editMessage(shared, [{ audience: ['ann'], text: 'Shared.', type: 'text' } as unknown as ContentBlock]), /may hide a block from a reader other than "ann"/);
-      assert.deepEqual(contentOf(ann, shared), [t('Shared.')]);
-    }, () => new PassthroughStrategy());
-  });
-
-  it('compares content with a block\'s cache marker aside, so a marker added while narrowing doesn\'t make the block new content', async () => {
-    await withReaders(async ({ ann, bob }) => {
-      for (const marker of [{ cache_control: { type: 'ephemeral' } }, { cacheControl: { type: 'ephemeral' } }]) {
-        const secret = ann.addMessage('user', [t('SECRET')]);
-        assert.throws(() => ann.editMessage(secret, [Object.assign(forReaders('SECRET', 'ann'), marker)]), /may hide a block from a reader other than "ann"/, JSON.stringify(marker));
-        assert.deepEqual(contentOf(ann, secret), [t('SECRET')]);
-      }
-      assert.match(texts((await bob.compile(BUDGET)).messages), /SECRET/);
+      const message = ann.addMessage('user', [t('Seen.'), forReaders('PART for bob.', 'bob')]);
+      ann.editMessage(message, [t('Seen.'), forReaders('PART for bob.', 'bob', 'ann')]);
+      assert.ok(texts((await ann.compile(BUDGET)).messages).includes('PART for bob.'), 'widened to ann');
+      ann.editMessage(message, [t('Seen.'), forReaders('PART for bob.', 'bob')]);
+      assert.ok(!texts((await ann.compile(BUDGET)).messages).includes('PART for bob.'), 'and narrowed back');
     }, () => new PassthroughStrategy());
   });
 
@@ -472,430 +349,43 @@ describe('an edit that narrows a block\'s audience', () => {
     }, () => new PassthroughStrategy());
   });
 
-  it('is refused away from the reader where another namespace on the branch records the same reader', async () => {
-    const dir = tmp();
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-    try {
-      const shared = ann.addMessage('user', [both('Both.')]);
-      const second = await ContextManager.open({ store: ann.getStore(), namespace: 'agents/ann-too', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-      try {
-        assert.equal(second.viewReader, 'ann', 'the premise: a second namespace records the same reader');
-        for (const manager of [ann, second]) {
-          assert.throws(() => manager.editMessage(shared, [forReaders('Both.', 'bob')]), /may hide a block from "ann", the reader this manager compiles for, and another namespace on this branch records the same reader\. This manager can't see what that namespace's compression has read/);
-        }
-        assert.deepEqual(contentOf(ann, shared), [both('Both.')]);
-      } finally {
-        await second.close();
-      }
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  const refusedStart = /refused: the strategy doesn't declare marksCompressionReads, and a manager that compiles for a reader \("ann"\) runs only a strategy that records what compression reads before it reads/;
-
-  it('refuses to start a strategy that doesn\'t say it records what compression reads, for a manager that compiles for a reader, before handing it anything', async () => {
-    const touched: string[] = [];
-    const undeclared = () => {
-      const strategy = memory();
-      const hooks = strategy as unknown as Record<string, unknown>;
-      hooks.marksCompressionReads = undefined;
-      for (const hook of ['initialize', 'onNewMessage', 'prepareFromRenderingFrontier', 'select']) {
-        const own = hooks[hook] as ((...args: unknown[]) => unknown) | undefined;
-        hooks[hook] = (...args: unknown[]) => {
-          touched.push(hook);
-          return own?.apply(strategy, args);
-        };
-      }
-      return strategy;
-    };
-    const dir = tmp();
-    const path = join(dir, 'store');
-    await assert.rejects(ContextManager.open({ path, namespace: 'agents/ann', strategy: undeclared(), viewReader: 'ann' }), refusedStart, 'by open');
-    const ann = await ContextManager.open({ path, namespace: 'agents/ann', strategy: memory(), viewReader: 'ann' });
-    try {
-      ann.addMessage('user', [both('Both.')]);
-      await assert.rejects(ContextManager.open({ store: ann.getStore(), namespace: 'agents/ann', strategy: undeclared() }), refusedStart, 'by open with no viewReader, on a namespace that records one');
-      await assert.rejects(ann.derive({ branch: 'derived', strategy: undeclared() }), refusedStart, 'by derive');
-      const kid = await ann.derive({ branch: 'kid', strategy: memory() });
-      const derivation = kid.getDerivation()!;
-      await kid.close();
-      await assert.rejects(ContextManager.reopenDerived({ store: ann.getStore(), derivation, strategy: undeclared() }), refusedStart, 'by reopenDerived');
-      await assert.rejects(ann.setStrategy(undeclared()), refusedStart, 'by setStrategy');
-      await ann.compile(BUDGET);
-      ann.addMessage('user', [both('After.')]);
-      assert.deepEqual(touched, [], 'no refused strategy was handed anything, and the manager went on with the strategy it had');
-      const home = ann.getStore().currentBranch().name;
-      const held = (ann as unknown as { strategy: { marksCompressionReads?: unknown } }).strategy;
-      held.marksCompressionReads = undefined;
-      await assert.rejects(ann.fork('elsewhere'), refusedStart, 'by fork, once the held strategy withdraws its declaration, a breach only this test makes');
-      held.marksCompressionReads = true;
-      await ann.setStrategy(held as never);
-      held.marksCompressionReads = undefined;
-      await assert.rejects(ann.switchBranch(home), refusedStart, 'by switch, the same way');
-      const nobody = await ContextManager.open({ path: join(dir, 'other'), namespace: 'agents/nobody', strategy: undeclared() });
-      await nobody.close();
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused when the record of what compression has read can\'t be read', async () => {
-    await withReaders(async ({ ann }) => {
-      const store = ann.getStore();
-      store.registerState({ id: 'agents/ann/narrowing-floor', strategy: 'snapshot' });
-      store.setStateJson('agents/ann/narrowing-floor', 'not a sequence');
-      const shared = ann.addMessage('user', [both('Both.')]);
-      assert.throws(() => ann.editMessage(shared, [forReaders('Both.', 'bob')]), /may hide a block from "ann", the reader this manager compiles for, and the record of what compression has read can't be read/);
-      assert.deepEqual(contentOf(ann, shared), [both('Both.')]);
-      ann.editMessage(shared, [both('Both, edited.')]);
-      ann.editMessage(shared, [t('Both, for everyone.')]);
-      assert.deepEqual(contentOf(ann, shared), [t('Both, for everyone.')], 'an edit that hides nothing, or widens, goes through');
-    }, () => new PassthroughStrategy());
-  });
-
-  it('sends no request whose messages the record couldn\'t first cover, and later requests read the messages as they stand', async () => {
-    const dir = tmp();
-    const a = summarizer();
-    const error = mock.method(console, 'error', () => {});
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: memory(), membrane: a.membrane, viewReader: 'ann' });
-    const store = ann.getStore();
-    const real = store.setStateJson.bind(store);
-    let refused = 0;
-    const write = mock.method(store, 'setStateJson', (id: string, value: unknown) => {
-      if (id.endsWith('/narrowing-floor')) {
-        refused++;
-        throw new Error('the disk is full');
-      }
-      return real(id, value);
-    });
-    try {
-      const ids = added(ann);
-      await ann.compile(BUDGET);
-      for (let i = 0; i < 20; i++) await ann.tick();
-      assert.ok(refused > 0, 'the premise: closing its chunks tried to raise the record');
-      assert.equal(a.payloads.length, 0, 'no request is sent while the record can\'t be raised');
-      assert.equal(ann.isReady(), false, 'and its chunks wait, still pending');
-      ann.editMessage(...toBob(ids[3]!, 'SECRET-3'));
-      write.mock.restore();
-      ann.addMessage('user', [both(`AFTER ${words}`)]);
-      await drain(ann);
-      assert.ok(a.payloads.length > 0, 'the premise: once it can be raised, requests are sent');
-      assert.ok(!a.payloads.some((p) => p.includes('SECRET-3 ')), 'and none reads the block narrowed away from ann');
-    } finally {
-      write.mock.restore();
-      error.mock.restore();
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused for a message in a chunk that closed in a rebuild that then failed', async () => {
-    const error = mock.method(console, 'error', () => {});
-    try {
-      await withReaders(async ({ ann }) => {
-        const store = ann.getStore();
-        const real = store.appendToStateJson.bind(store);
-        let appends = 0;
-        const append = mock.method(store, 'appendToStateJson', (id: string, item: unknown) => {
-          if (id === 'agents/ann/autobio:chunks' && ++appends === 2) throw new Error('the disk is full');
-          return real(id, item);
-        });
-        try {
-          const ids = [ann.addMessage('user', [t('Opening.'), both(`SECRET-0 ${words}`)], undefined, undefined, { holdCompression: true })];
-          for (let i = 1; i < 60; i++) ids.push(ann.addMessage(i % 2 ? 'agent' : 'user', [both(`SECRET-${i} ${words}`)]));
-          ann.releaseCompression([ids[0]!]);
-          assert.ok(appends >= 2, 'the premise: the release rebuilt, and its second chunk record failed');
-          assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-        } finally {
-          append.mock.restore();
-        }
-      });
-    } finally {
-      error.mock.restore();
-    }
-  });
-
-  const preRecordMerge = async (run: (m: { ann: ContextManager; ids: string[]; l1: string[]; payloads: string[] }) => Promise<void>) => {
-    const dir = tmp();
-    const path = join(dir, 'store');
-    const knowledge = (recentWindowTokens: number) => new KnowledgeStrategy({
-      compressionModel: 'test-compression-model',
-      targetChunkTokens: 150,
-      headWindowTokens: 0,
-      recentWindowTokens,
-      mergeThreshold: 1000,
-    });
-    const a = summarizer();
-    let ann = await ContextManager.open({ path, namespace: 'agents/ann', strategy: knowledge(0), membrane: a.membrane, viewReader: 'ann' });
-    try {
-      const ids = await summarized(ann, a.payloads);
-      const l1 = (ann as unknown as { strategy: { summaries: Array<{ id: string; level: number }> } }).strategy.summaries.filter((s) => s.level === 1).map((s) => s.id);
-      assert.ok(l1.length >= 2, `the premise: several L1s (${l1.length})`);
-      ann.getStore().setStateJson('agents/ann/narrowing-floor', -1);
-      await ann.close();
-      ann = await ContextManager.open({ path, namespace: 'agents/ann', strategy: knowledge(1_000_000), membrane: a.membrane, viewReader: 'ann' });
-      assert.equal(ann.getStore().getStateJson('agents/ann/narrowing-floor'), -1, 'the premise: reopening closed no chunk over them');
-      await run({ ann, ids, l1, payloads: a.payloads });
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  };
-  const queueMerge = (ann: ContextManager, sourceIds: string[]) =>
-    (ann as unknown as { strategy: { enqueueMerge(merge: { level: number; sourceIds: string[] }): void } }).strategy.enqueueMerge({ level: 2, sourceIds });
-
-  it('is refused for a message a merge has read, where nothing else recorded it', async () => {
-    await preRecordMerge(async ({ ann, ids, l1, payloads }) => {
-      const before = payloads.length;
-      queueMerge(ann, l1.slice(0, 2));
-      for (let i = 0; i < 50 && payloads.length === before; i++) await ann.tick();
-      assert.equal(payloads.length, before + 1, 'the premise: the merge was asked');
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    });
-  });
-
-  it('counts nothing against a merge whose read can\'t first be recorded, and runs it once one can', async () => {
-    const error = mock.method(console, 'error', () => {});
-    try {
-      await preRecordMerge(async ({ ann, ids, l1, payloads }) => {
-        const store = ann.getStore();
-        const real = store.setStateJson.bind(store);
-        let refused = 0;
-        const write = mock.method(store, 'setStateJson', (id: string, value: unknown) => {
-          if (id.endsWith('/narrowing-floor')) {
-            refused++;
-            throw new Error('the disk is full');
-          }
-          return real(id, value);
-        });
-        const lane = (ann as unknown as { strategy: { mergeQueue: Array<{ sourceIds: string[]; attempts?: number }>; mergeFailureRuns: Map<string, unknown>; mergeQuarantine: Map<string, unknown> } }).strategy;
-        const before = payloads.length;
-        const logged = error.mock.calls.length;
-        try {
-          queueMerge(ann, l1.slice(0, 2));
-          for (let i = 0; i < 5; i++) await ann.tick();
-          assert.equal(refused, 1, 'the merge tried once to record what it reads, then waited rather than trying each tick');
-          await ann.compile(BUDGET);
-          for (let i = 0; i < 5; i++) await ann.tick();
-          assert.equal(refused, 2, 'a rebuild tried the record again, and while it still failed the merge kept waiting');
-        } finally {
-          write.mock.restore();
-        }
-        const said = error.mock.calls.slice(logged).map((call) => call.arguments.map(String).join(' '));
-        assert.equal(said.length, 1, `one diagnostic for the whole wait (${said.join(' | ')})`);
-        assert.match(said[0]!, /compression waits: what the L2 merge from \S+ reads can't be recorded as read/, 'and it says the merge waits, not that a merge call failed');
-        assert.equal(payloads.length, before, 'no merge was asked');
-        assert.deepEqual(lane.mergeQueue.map((m) => [m.sourceIds, m.attempts]), [[l1.slice(0, 2), undefined]], 'the merge waits at the head of the queue, unchanged');
-        assert.equal(lane.mergeFailureRuns.size, 0, 'no failure streak');
-        assert.equal(lane.mergeQuarantine.size, 0, 'nothing quarantined');
-        await ann.compile(BUDGET);
-        for (let i = 0; i < 50 && payloads.length === before; i++) await ann.tick();
-        assert.equal(payloads.length, before + 1, 'once a record succeeds, the merge is asked');
-        assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-      });
-    } finally {
-      error.mock.restore();
-    }
-  });
-
-  it('keeps its record of what compression has read when a later mark names an older message', async () => {
-    class Lowering extends PassthroughStrategy {
-      override async onNewMessage(_message: StoredMessage, ctx: StrategyContext): Promise<void> {
-        ctx.markCompressionRead?.(0);
-      }
-    }
-    await withReaders(async ({ ann, annSummaries }) => {
-      const ids = await summarized(ann, annSummaries);
-      const floor = () => ann.getStore().getStateJson('agents/ann/narrowing-floor') as unknown;
-      const before = floor();
-      assert.equal(typeof before, 'number', 'the premise: compression raised the record');
-      await ann.setStrategy(new Lowering());
-      ann.addMessage('user', [t('Later.')]);
-      assert.equal(floor(), before, 'the record stays where it was');
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    });
-  });
-
-  it('is refused once a chunk holding the message has closed as its strategy starts, over messages another manager added', async () => {
-    const dir = tmp();
-    const path = join(dir, 'store');
-    let ids: string[] = [];
-    const writer = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-    try {
-      ids = added(writer);
-    } finally {
-      await writer.close();
-    }
-    const ann = await ContextManager.open({ path, namespace: 'agents/ann', strategy: memory(), membrane: summarizer().membrane, viewReader: 'ann' });
-    try {
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused once a chunk holding the message has closed in a compile, over messages another manager added', async () => {
-    const dir = tmp();
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: memory(), membrane: summarizer().membrane, viewReader: 'ann' });
-    const writer = await ContextManager.open({ store: ann.getStore(), namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-    try {
-      const ids = added(writer);
-      assert.equal(ann.getStore().getStateJson('agents/ann/narrowing-floor'), null, 'the premise: nothing has raised the record yet');
-      await ann.compile(BUDGET);
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    } finally {
-      await writer.close();
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused once a chunk holding the message has closed as a compression hold is released', async () => {
-    await withReaders(async ({ ann }) => {
-      const ids = [ann.addMessage('user', [t('Opening.'), both(`SECRET-0 ${words}`)], undefined, undefined, { holdCompression: true })];
-      for (let i = 1; i < 60; i++) ids.push(ann.addMessage(i % 2 ? 'agent' : 'user', [both(`SECRET-${i} ${words}`)]));
-      assert.equal(ann.getStore().getStateJson('agents/ann/narrowing-floor'), null, 'the premise: while the hold stands, no chunk has closed');
-      ann.releaseCompression([ids[0]!]);
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    });
-  });
-
-  it('is refused for a message in a closed chunk held back from compression, and for a head message older than a closed chunk', async () => {
-    const holding = () => new AutobiographicalStrategy({
-      compressionModel: 'test-compression-model',
-      targetChunkTokens: 300,
-      headWindowTokens: 40,
-      recentWindowTokens: 0,
-      hierarchical: true,
-      l1HoldbackChunks: 1,
-    });
-    await withReaders(async ({ ann }) => {
-      const ids = added(ann);
-      const lane = (ann as unknown as { strategy: { chunks: Array<{ index: number; compressed: boolean; messages: StoredMessage[] }>; compressionQueue: number[] } }).strategy;
-      const heldBack = lane.chunks.filter((chunk) => !chunk.compressed && !lane.compressionQueue.includes(chunk.index));
-      assert.ok(heldBack.length > 0, 'the premise: a closed chunk is held back');
-      assert.ok(!lane.chunks.some((chunk) => chunk.messages.some((m) => m.id === ids[0])), 'the premise: the first message is in the head, in no chunk');
-      assert.throws(() => ann.editMessage(...storedToBob(ann, heldBack.at(-1)!.messages.at(-1)!.id)), ownRefusal, 'a message in the held-back chunk');
-      assert.throws(() => ann.editMessage(ids[0]!, [t('Opening.'), forReaders(`SECRET-0 ${words}`, 'bob')]), ownRefusal, 'a head message');
-    }, holding);
-  });
-
-  it('makes no transition request when what it reads can\'t first be recorded', async () => {
-    let calls = 0;
-    const membrane = {
-      complete: async () => {
-        calls++;
-        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'A transition.' }], usage: { input_tokens: 10, output_tokens: 10 } };
+  it('under kv-unified, refuses at the edit a widening into a reader\'s closed chunk, and her compile holds, as it does for a block widened in a message she sees', async () => {
+    const kvUnified = {
+      policy: {
+        alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+        cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+        continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+        continuityStableHalfLife: 10, continuityStableFloor: 0.25,
       },
-    } as never;
-    const dir = tmp();
-    const error = mock.method(console, 'error', () => {});
-    const headed = new AutobiographicalStrategy({ compressionModel: 'test-compression-model', targetChunkTokens: 300, headWindowTokens: 2000, recentWindowTokens: 0, hierarchical: true });
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: headed, membrane, viewReader: 'ann' });
-    const store = ann.getStore();
-    const real = store.setStateJson.bind(store);
-    let refused = 0;
-    const write = mock.method(store, 'setStateJson', (id: string, value: unknown) => {
-      if (id.endsWith('/narrowing-floor')) {
-        refused++;
-        throw new Error('the disk is full');
+      tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+      treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-audience-'));
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'test-compression-model', adaptiveResolution: true, targetChunkTokens: 300,
+      headWindowTokens: 0, recentWindowTokens: 0, hierarchical: true, foldingStrategy: 'kv-unified', kvUnified,
+    } as never);
+    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy, membrane: summarizer().membrane, viewReader: 'ann' });
+    try {
+      const long = 'words of the conversation '.repeat(18);
+      const ids: string[] = [];
+      for (let i = 0; i < 16; i++) {
+        ids.push(ann.addMessage(i % 2 ? 'agent' : 'user',
+          i === 3 ? [forReaders(`HIDDEN-3 ${long}`, 'bob')]
+            : i === 5 ? [t(`message 5 ${long}`), forReaders(`PART-5 ${long}`, 'bob')]
+              : [t(`message ${i} ${long}`)]));
       }
-      return real(id, value);
-    });
-    try {
-      ann.addMessage('user', [both(`HEAD ${words}`)]);
-      await assert.rejects(ann.resetHeadWindow(), /the disk is full/);
-      assert.ok(refused > 0, 'the premise: the transition tried to record what it reads');
-      assert.equal(calls, 0, 'and asked its model nothing');
-    } finally {
-      write.mock.restore();
-      error.mock.restore();
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused away from the reader where another namespace\'s reader record can\'t be read', async () => {
-    await withReaders(async ({ ann }) => {
-      const store = ann.getStore();
-      store.registerState({ id: 'agents/other/reader', strategy: 'snapshot' });
-      store.setState('agents/other/reader', Buffer.from('{'));
-      const shared = ann.addMessage('user', [both('Both.')]);
-      assert.throws(() => ann.editMessage(shared, [forReaders('Both.', 'bob')]), /another namespace on this branch records the same reader/);
-      assert.deepEqual(contentOf(ann, shared), [both('Both.')]);
-    }, () => new PassthroughStrategy());
-  });
-
-  it('writes no record of what compression has read for a manager that compiles for no reader', async () => {
-    const dir = tmp();
-    const a = summarizer();
-    const nobody = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/nobody', strategy: memory(), membrane: a.membrane });
-    try {
-      for (let i = 0; i < 60; i++) nobody.addMessage(i % 2 ? 'agent' : 'user', [t(`message ${i} ${words}`)]);
-      await nobody.compile(BUDGET);
-      await drain(nobody);
-      assert.ok(a.payloads.length > 0, 'the premise: it compressed');
-      assert.deepEqual(nobody.getStore().listStates().map((state) => state.id).filter((id) => id.endsWith('/narrowing-floor')), []);
-    } finally {
-      await nobody.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused after a request that wrote no summary, after a reopen too', async () => {
-    const dir = tmp();
-    const path = join(dir, 'store');
-    let calls = 0;
-    const failing = { complete: async () => { calls++; throw new Error('the provider is down'); } } as never;
-    let ids: string[] = [];
-    const first = await ContextManager.open({ path, namespace: 'agents/ann', strategy: memory(), membrane: failing, viewReader: 'ann' });
-    try {
-      ids = added(first);
-      await first.compile(BUDGET);
-      for (let i = 0; i < 20 && calls === 0; i++) await first.tick().catch(() => {});
-      assert.ok(calls > 0, 'the premise: the strategy called its provider');
-      assert.equal(JSON.stringify(first.getStore().getStateJson('agents/ann/autobio:summaries') ?? []), '[]', 'the premise: no summary was written');
-      assert.throws(() => first.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal);
-    } finally {
-      await first.close();
-    }
-    const ann = await ContextManager.open({ path, namespace: 'agents/ann', strategy: new PassthroughStrategy(), viewReader: 'ann' });
-    try {
-      assert.throws(() => ann.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal, 'reopened, it is still refused');
-      const late = ann.addMessage('user', [both(`LATE ${words}`)]);
-      ann.editMessage(...toBob(late, 'LATE'));
-      assert.deepEqual(contentOf(ann, late), [forReaders(`LATE ${words}`, 'bob')], 'a message newer than anything compression read may be narrowed');
-    } finally {
-      await ann.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('is refused on a branch forked after compression read the message, and decided on each branch by its own compression', async () => {
-    const dir = tmp();
-    const a = summarizer();
-    const ann = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/ann', strategy: memory(), membrane: a.membrane, viewReader: 'ann' });
-    try {
-      const home = ann.getStore().currentBranch().name;
-      const early = ann.addMessage('user', [both(`EARLY ${words}`)]);
-      await ann.fork('before');
-      await ann.switchBranch(home);
-      const ids = await summarized(ann, a.payloads);
-      await ann.fork('after');
-      for (const id of [early, ids[3]!]) assert.throws(() => ann.editMessage(...storedToBob(ann, id)), ownRefusal, 'on a branch forked after compression read it');
-      const child = await ann.derive({ branch: 'derived', strategy: new PassthroughStrategy() });
-      try {
-        assert.throws(() => child.editMessage(...toBob(ids[3]!, 'SECRET-3')), ownRefusal, 'and on a context derived from it');
-      } finally {
-        await child.close();
-      }
-      await ann.switchBranch('before');
-      ann.editMessage(...toBob(early, 'EARLY'));
-      assert.deepEqual(contentOf(ann, early), [forReaders(`EARLY ${words}`, 'bob')], 'on a branch whose compression read nothing, it goes through');
+      await drain(ann);
+      const budget = { maxTokens: 1_500, reserveForResponse: 0 };
+      const opts = { kvUnifiedImmutablePrefixHash: 'v1' } as never;
+      await ann.compile(budget, undefined, opts);
+      const covering = (ann.getSummariesInRange({}) as unknown as Array<{ sourceIds: string[]; firstMessageId: string; lastMessageId: string }>)
+        .find((s) => ids.indexOf(s.firstMessageId) < 3 && ids.indexOf(s.lastMessageId) > 3);
+      assert.ok(covering && !covering.sourceIds.includes(ids[3]!), 'the premise: a summary of ann\'s spans message 3 without it');
+      assert.throws(() => ann.editMessage(ids[3]!, [forReaders(`HIDDEN-3 ${long}`, 'bob', 'ann')]), widening('"ann"'));
+      ann.editMessage(ids[5]!, [t(`message 5 ${long}`), forReaders(`PART-5 ${long}`, 'bob', 'ann')]);
+      await drain(ann);
+      await ann.compile(budget, undefined, opts);
     } finally {
       await ann.close();
       rmSync(dir, { recursive: true, force: true });

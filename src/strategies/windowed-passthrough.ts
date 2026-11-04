@@ -258,9 +258,6 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     return { ready: true };
   }
 
-  /** It reads no message for a summary or a model request. */
-  readonly marksCompressionReads = true;
-
   async onNewMessage(_message: StoredMessage, _ctx: StrategyContext): Promise<void> {
     // No-op: the window is recomputed on select().
   }

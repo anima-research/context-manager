@@ -18,8 +18,6 @@
 
 import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageStoreView, StoredMessage, MessageId } from './types/index.js';
-import { withoutCacheMarker } from './cache-marker.js';
-import { canonicalJson } from './canonical-json.js';
 import { isOpaqueCarrier, withoutRawForms } from './raw-forms.js';
 
 /**
@@ -110,49 +108,20 @@ export function contentForReader(content: readonly ContentBlock[], reader: strin
   return shown.length > 0 ? shown : null;
 }
 
-export function audienceNarrowing(
+/**
+ * The readers who see some of `after` and saw none of `before`, by the
+ * reader view's own rule (contentForReader): each reader an audience in
+ * either names, and, as `everyoneElse`, every reader no block names, whom the
+ * view that compiles for no reader stands for, since they see the same.
+ */
+export function readersGained(
   before: readonly ContentBlock[],
   after: readonly ContentBlock[],
-  reader: string | undefined,
-): { own: boolean; others: boolean } {
-  const was = readersByContent(before);
-  const now = readersByContent(after);
-  let own = false;
-  let others = false;
-  for (const [content, then] of was) {
-    const next = now.get(content);
-    if (next === undefined || next === 'all') continue;
-    if (then === 'all') {
-      others = true;
-      if (reader !== undefined && !next.has(reader)) own = true;
-      continue;
-    }
-    for (const name of then) {
-      if (next.has(name)) continue;
-      if (name === reader) own = true;
-      else others = true;
-    }
-  }
-  return { own, others };
-}
-
-function readersByContent(blocks: readonly ContentBlock[]): Map<string, 'all' | Set<string>> {
-  const readers = new Map<string, 'all' | Set<string>>();
-  for (const block of blocks) {
-    const { audience: _audience, ...rest } = withoutCacheMarker(block);
-    const content = canonicalJson(rest);
-    const audience = audienceOf(block);
-    const known = readers.get(content);
-    if (known === 'all') continue;
-    if (audience === undefined) {
-      readers.set(content, 'all');
-      continue;
-    }
-    const names = known ?? new Set<string>();
-    for (const name of audience) names.add(name);
-    readers.set(content, names);
-  }
-  return readers;
+): { named: string[]; everyoneElse: boolean } {
+  const names = new Set<string>();
+  for (const block of [...before, ...after]) for (const name of audienceOf(block) ?? []) names.add(name);
+  const gains = (reader: string | undefined) => contentForReader(after, reader) !== null && contentForReader(before, reader) === null;
+  return { named: [...names].filter(gains), everyoneElse: gains(undefined) };
 }
 
 /** A content block with the readers it's for (`audience`), as a host may write one on a message's own blocks other than tool calls, tool results, system changes and inline media. */
