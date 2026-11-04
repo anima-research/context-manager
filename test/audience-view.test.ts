@@ -122,8 +122,8 @@ describe('a block with an audience', () => {
       }
       assert.ok(annSummaries.length > 0, 'ann summarized');
       assert.ok(bobSummaries.length > 0, 'bob summarized');
-      assert.ok(annSummaries.join('\n').includes('ANN-ONLY-'), 'ann\'s summaries hold her blocks');
-      assert.ok(!annSummaries.join('\n').includes('BOB-ONLY-'), 'and never bob\'s');
+      assert.ok(annSummaries.join('\n').includes('ANN-ONLY-'), 'what ann\'s compression read holds her blocks');
+      assert.ok(!annSummaries.join('\n').includes('BOB-ONLY-'), 'and never bob\'s, so no summary of hers can');
       assert.ok(bobSummaries.join('\n').includes('BOB-ONLY-'));
       assert.ok(!bobSummaries.join('\n').includes('ANN-ONLY-'));
       assert.ok(nobodySummaries.length > 0, 'a manager with no reader summarized');
@@ -1048,7 +1048,7 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
     }
   });
 
-  it('refuses a compile, preview, tick, edit, render, summary listing or render stats once the namespace records a reader the manager doesn\'t compile for', async () => {
+  it('refuses a compile, preview, tick, edit, render, summary listing, search or lookup, or render stats once the namespace records a reader the manager doesn\'t compile for', async () => {
     const dir = tmp();
     const host = await ContextManager.open({ path: join(dir, 'store'), namespace: 'host', strategy: new PassthroughStrategy() });
     try {
@@ -1068,6 +1068,8 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       assert.throws(() => nobody.renderAsNewest([hi]), /ContextManager\.renderAsNewest: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
       assert.throws(() => nobody.getSummariesInRange({}), /ContextManager\.getSummariesInRange: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
       assert.throws(() => nobody.getRenderStats(), /ContextManager\.getRenderStats: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
+      assert.throws(() => nobody.searchSummaries({ query: 'Hi' } as never), /ContextManager\.searchSummaries: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
+      assert.throws(() => nobody.getSummary('L1-0'), /ContextManager\.getSummary: namespace "agents\/s" compiles for reader "ann", and this manager compiles for none/);
       await nobody.close();
       store.createBranchAt('bobs', home, store.currentSequence());
       const annT = await ContextManager.open({ store, namespace: 'agents/t', strategy: new PassthroughStrategy(), viewReader: 'ann' });
@@ -1324,7 +1326,7 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
     }
   });
 
-  it('refuses an audience at write wherever a write may not put one: a tool call or result, a system change, a block inside another', async () => {
+  it('refuses an audience at write wherever a write may not put one: a tool call or result, thinking, a system change, a block inside another', async () => {
     const dir = tmp();
     const ann = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), viewReader: 'ann' });
     try {
@@ -1343,6 +1345,14 @@ describe('a reader\'s compile, provenance, binding and namespace', () => {
       assert.throws(
         () => ann.addMessage('user', [{ type: 'system_change', audience: ['ann'], addSystem: ['A line.'] } as unknown as ContentBlock]),
         /content\[0\] is a system_change with an audience; a system change goes to every reader/,
+      );
+      assert.throws(
+        () => ann.addMessage('agent', [{ type: 'thinking', thinking: 'Weighing it.', signature: 'sig', audience: ['ann'] } as unknown as ContentBlock, { type: 'tool_use', id: 'c4', name: 'search', input: {} } as ContentBlock]),
+        /content\[0\] is a thinking block with an audience; a turn's thinking goes with its tool calls to every reader of the message/,
+      );
+      assert.throws(
+        () => ann.addMessage('agent', [{ type: 'redacted_thinking', data: 'opaque', audience: ['ann'] } as unknown as ContentBlock]),
+        /content\[0\] is a redacted_thinking block with an audience/,
       );
       const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
       assert.throws(
@@ -1907,9 +1917,8 @@ describe('a store whose slots hold no audience block', () => {
       release!();
       const readHeadAfter = () => payloads.some((p) => p.startsWith('AFTER ') && p.includes('message 0 ') && /message (1[3-9]|2[0-3]) /.test(p));
       for (let i = 0; i < 1000 && !readHeadAfter(); i++) await new Promise((r) => setTimeout(r, 10));
-      const after = payloads.filter((p) => p.startsWith('AFTER '));
       const shown = payloads.map((p) => `${p.slice(0, 6)}[${[...new Set([...p.matchAll(/message (\d+) /g)].map((m) => m[1]))].join(',')}]${p.includes('SECRET-head') ? ' SECRET' : ''}`).join(' ');
-      assert.ok(after.some((p) => p.includes('message 0 ')), `the premise: the drain read the head after the edit (requests: ${shown})`);
+      assert.ok(readHeadAfter(), `the premise: a request after the release read the head and a message added after the edit (requests: ${shown})`);
       assert.equal(payloads.filter((p) => p.includes('SECRET-head')).length, 0, `no summariser request carries the block for bob (requests: ${shown})`);
     } finally {
       await ann.close();
@@ -2083,5 +2092,16 @@ describe('audienceMessageStoreView', () => {
     const secret = { type: 'text', text: 'secret', rawItem: item, audience: ['bob'] } as unknown as ContentBlock;
     assert.deepEqual(contentForReader([shared, secret], 'ann'), [t('shared')], 'ann\'s copy is rendered from its fields, not the item that holds bob\'s text');
     assert.deepEqual(contentForReader([shared, secret], 'bob'), [shared, { type: 'text', text: 'secret', rawItem: item }], 'bob sees both, item and all');
+  });
+
+  it('keeps no raw replay form in a reader\'s copy of a message holding a block it doesn\'t see, and leaves out an opaque carrier', () => {
+    const item = { type: 'message', id: 'm2', content: [{ type: 'output_text', text: 'public' }, { type: 'output_text', text: 'BOB-TEXT' }] };
+    const visible = { type: 'text', text: 'public', rawItem: item } as unknown as ContentBlock;
+    const hidden = forReaders('BOB-TEXT', 'bob');
+    assert.deepEqual(contentForReader([visible, hidden], 'ann'), [t('public')], 'the item holding bob\'s text goes, though the hidden block carries none');
+    assert.deepEqual(contentForReader([visible, hidden], 'bob'), [visible, t('BOB-TEXT')], 'a reader who sees the whole message keeps the item');
+    const carrier = { type: 'text', text: '', rawItem: { type: 'reasoning', id: 'r1', summary: [] } } as unknown as ContentBlock;
+    assert.deepEqual(contentForReader([carrier, t('public'), hidden], 'ann'), [t('public')], 'an opaque carrier is left out where a block is hidden');
+    assert.deepEqual(contentForReader([carrier, t('public'), hidden], 'bob'), [carrier, t('public'), t('BOB-TEXT')], 'and kept where none is');
   });
 });

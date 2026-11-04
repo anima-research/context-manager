@@ -297,6 +297,8 @@ function audiencePlaces(block: Record<string, unknown>, at: string): string[] {
     places.push(`${at} is inline ${block.type as string} with an audience; the store keeps inline media as a blob, which carries no audience`);
   } else if (block.audience !== undefined && (block.type === 'tool_use' || block.type === 'tool_result')) {
     places.push(`${at} is a ${block.type as string} with an audience; a tool call and its result go to every reader of the message, or a reader's view would hold one without the other`);
+  } else if (block.audience !== undefined && (block.type === 'thinking' || block.type === 'redacted_thinking')) {
+    places.push(`${at} is a ${block.type as string} block with an audience; a turn's thinking goes with its tool calls to every reader of the message, or a reader's view would hold the calls without the thinking a provider wants beside them`);
   } else if (block.audience !== undefined && block.type === 'system_change') {
     places.push(`${at} is a system_change with an audience; a system change goes to every reader`);
   }

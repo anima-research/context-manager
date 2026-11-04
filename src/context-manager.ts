@@ -223,12 +223,15 @@ interface ContextManagerBaseConfig {
    * Summaries written
    * before a reader claims the namespace are kept, and that reader's
    * compiles use them as written. A write may put an `audience` only on a
-   * message's own blocks, other than tool calls, tool results, system
-   * changes and inline media (which the store keeps as a blob), and never in
-   * a context entry; a write that puts one anywhere else, or one that isn't a
-   * list of reader names, is refused, and so is a compile given one in an
-   * injection or in `messageInjections`, or a preview given one in
-   * `messageInjections`. A message holding a block with
+   * message's own blocks, other than tool calls, tool results, thinking,
+   * system changes and inline media (which the store keeps as a blob); a
+   * write that puts one on any of those, on a block inside a tool result, or
+   * in a context entry, or one that isn't a list of reader names, is
+   * refused, and an `audience` key anywhere else, such as inside a tool
+   * call's input or a block's `annotations`, is stored as given and isn't
+   * read as one. A compile given one in an injection or in
+   * `messageInjections`, or a preview given one in `messageInjections`, is
+   * refused too. A message holding a block with
    * an `audience` is stored whole, never split into shards at ingress. The
    * view holds through the manager: a strategy whose `select` or
    * `previewContext` is called directly reads whatever view and options its
@@ -1728,7 +1731,8 @@ export class ContextManager {
 
   /**
    * The reader this manager compiles for: the `viewReader` it was opened
-   * with, or, opened with none, the reader its namespace records; for a
+   * with, or, opened with none, the reader its namespace recorded when it
+   * opened; for a
    * context `derive` or `reopenDerived` made, the reader its branch records.
    * Undefined when it compiles for no reader, and so shows no block that has
    * an `audience`.
@@ -2785,6 +2789,7 @@ export class ContextManager {
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
     this.requireInitialized('searchSummaries');
+    this.requireRecordedReader('ContextManager.searchSummaries');
     if (!isSearchableStrategy(this.strategy)) return [];
     return this.strategy.searchSummaries(query);
   }
@@ -2792,6 +2797,7 @@ export class ContextManager {
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
     this.requireInitialized('getSummary');
+    this.requireRecordedReader('ContextManager.getSummary');
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
   }

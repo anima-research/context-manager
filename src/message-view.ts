@@ -20,7 +20,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageStoreView, StoredMessage, MessageId } from './types/index.js';
 import { withoutCacheMarker } from './cache-marker.js';
 import { canonicalJson } from './canonical-json.js';
-import { releaseEditedRawForms } from './raw-forms.js';
+import { isOpaqueCarrier, withoutRawForms } from './raw-forms.js';
 
 /**
  * Wrap a view so that only messages passing `keep` are visible.
@@ -88,29 +88,26 @@ function audienceOf(block: object): readonly string[] | undefined {
  * The content `reader` sees: every block without an `audience`, and every
  * block whose `audience` names `reader`, without its `audience` field.
  * Undefined `reader` sees no block that has an `audience`. Null when it
- * sees none of the blocks; `content` itself when no block has an
- * `audience`. A block it doesn't see gives up its raw replay forms on
- * every block that shares them (releaseEditedRawForms), so a replay
- * can't carry it.
+ * sees none of the blocks, or none but opaque carriers; `content` itself
+ * when no block has an `audience`. Where it doesn't see a block, no block it sees keeps a raw
+ * replay form, and a block whose raw item is its whole content (an opaque
+ * carrier) is left out, so no replay can carry what it doesn't see.
  */
 export function contentForReader(content: readonly ContentBlock[], reader: string | undefined): ContentBlock[] | null {
   if (!content.some((block) => audienceOf(block) !== undefined)) return content as ContentBlock[];
   const seen: ContentBlock[] = [];
-  const compared: ContentBlock[] = [];
   for (const block of content) {
     const audience = audienceOf(block);
     if (audience === undefined) {
       seen.push(block);
-      compared.push(block);
     } else if (reader !== undefined && audience.includes(reader)) {
       const { audience: _audience, ...rest } = block as ContentBlock & { audience?: unknown };
       seen.push(rest as ContentBlock);
-      compared.push(rest as ContentBlock);
-    } else {
-      compared.push(block);
     }
   }
-  return seen.length > 0 ? releaseEditedRawForms(compared, seen) : null;
+  if (seen.length === content.length) return seen;
+  const shown = seen.filter((block) => !isOpaqueCarrier(block)).map((block) => withoutRawForms(block));
+  return shown.length > 0 ? shown : null;
 }
 
 export function audienceNarrowing(
