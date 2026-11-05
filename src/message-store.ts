@@ -740,9 +740,10 @@ export class MessageStore {
     // messages, event loop starved for hours by ambient traffic + backfill).
     //
     // The cached entry MUST be the chronicle round-trip (serde) form, not a
-    // hand-built object: serde reorders keys and drops undefined fields, and
-    // downstream request hashing stringifies message content — a shape that
-    // differs between a warm cache and a fresh rebuild breaks hash-keyed
+    // hand-built object: the round trip drops undefined fields, gives a lone
+    // surrogate back as U+FFFD and, on chronicle before 0.5.1, sorts keys,
+    // and downstream request hashing stringifies message content — a shape
+    // that differs between a warm cache and a fresh rebuild breaks hash-keyed
     // dedup (compression in-flight registry, quarantine keys). Fetch the
     // just-written record back through the point lookup; on chronicle
     // versions without it, fall back to plain invalidation (old behavior).

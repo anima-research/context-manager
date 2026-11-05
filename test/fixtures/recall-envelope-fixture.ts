@@ -114,6 +114,7 @@ export const HIERARCHICAL_FIXTURE_SUMMARY_IDS = ['L2-100', 'L1-101', 'L1-102'] a
 export const HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE =
   'zz-memory-merged-level covering the first two turns';
 export const HIERARCHICAL_FIXTURE_PLAIN_PROSE = 'zz-memory-plain-prose';
+export const HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT = 'zz-turn-latest ' + 'Z'.repeat(60);
 
 /**
  * Render the default (`selectHierarchical`) path over a fixed set of seeded
@@ -135,7 +136,7 @@ export async function renderHierarchicalFixture(
     const zz2 = manager.addMessage('user', textContent('zz-turn-two'));
     const zz3 = manager.addMessage('user', textContent('zz-turn-three'));
     const zz4 = manager.addMessage('user', textContent('zz-turn-four'));
-    manager.addMessage('user', textContent('zz-turn-latest ' + 'Z'.repeat(60)));
+    manager.addMessage('user', textContent(HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT));
 
     // Two L1s merged away under the L2: anti-redundancy hides a merged L1,
     // so only the L2 renders for the zz-turn-one..zz-turn-two span.
