@@ -179,8 +179,10 @@ export interface CompileResult {
    * slot), whose messages `getMessage` cannot resolve, so callers that need
    * a body's metadata or content read it here. The map is bound to this
    * compile: a later edit doesn't show through it. Its messages are the
-   * store's own objects, which later compiles read too, so treat them as
-   * read-only. It's transient and isn't part of the persisted provenance.
+   * store's own objects where no block declares an `audience`, and this
+   * manager's reader's view of them where one does (ContextManagerBaseConfig
+   * .viewReader); later compiles read them too, so treat them as read-only.
+   * It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
 
@@ -303,9 +305,11 @@ export interface RawBodySource {
   messageId: MessageId;
   sequence: number;
   /**
-   * True only when the whole stored body is in this request unaltered:
-   * every shard present, nothing truncated, no image stripped, no block
-   * removed by a structural repair. A shard the view filter hid is not
+   * True only when the whole stored body, as this manager's reader sees it,
+   * is in this request unaltered: every shard present, nothing truncated, no
+   * image stripped, no block removed by a structural repair. A block whose
+   * `audience` leaves the reader out is no part of its body, and a shard the
+   * reader sees none of is present. A shard the view filter hid is not
    * present. A group that declared its size (StoredMessage.shardCount) must
    * also hold all of its declared shards, so one an interrupted write left
    * short is missing `shards`.

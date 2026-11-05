@@ -258,7 +258,9 @@ export interface ContextStrategy {
    * returns, is logged through the manager's diagnostics, naming the message,
    * and doesn't reach addMessage's caller: the message stays stored, and the
    * strategy isn't offered it again. A hook that returns no promise, as one
-   * written in JavaScript can, isn't a failure, and nothing is logged.
+   * written in JavaScript can, isn't a failure, and nothing is logged. The
+   * message is as the manager's reader sees it (its viewReader), and one the
+   * reader sees none of isn't offered.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
@@ -304,6 +306,8 @@ export interface ContextStrategy {
    * compile time.
    *
    * Return null or undefined to skip chunking (message stored as one record).
+   * The manager doesn't ask for a message holding a block with an `audience`,
+   * which is stored whole.
    *
    * See `docs/adaptive-resolution-design.md` §3.6.
    */
@@ -2306,7 +2310,9 @@ export interface AutobiographicalConfig {
    * Enable picker-driven adaptive resolution. When true, `select()` uses
    * the FoldingStrategy + Picker to choose per-message resolution under
    * token-budget pressure rather than the threshold-driven `checkMergeThreshold`
-   * path. Default: false (existing hierarchical behavior preserved).
+   * path. Default: false (existing hierarchical behavior preserved). A
+   * message holding a block with an `audience` is stored whole, never split
+   * into shards at ingress.
    */
   adaptiveResolution?: boolean;
 

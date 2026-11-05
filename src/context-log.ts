@@ -13,6 +13,24 @@ import { MessageStore } from './message-store.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
 
+function entryForWrite(content: ContentBlock[], what: string): ContentBlock[] {
+  const written = contentForWrite(content, what);
+  const places = audiencePlacesInEntry(written);
+  if (places.length > 0) throw new MalformedContentError(what, places);
+  return written;
+}
+
+function audiencePlacesInEntry(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const places: string[] = [];
+  content.forEach((block, i) => {
+    if (block !== null && typeof block === 'object' && (block as { audience?: unknown }).audience !== undefined) {
+      places.push(`content[${i}] has an audience; a context entry is its namespace's reader's, and no view reads an audience there`);
+    }
+  });
+  return places;
+}
+
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
 /**
@@ -97,7 +115,7 @@ export class ContextLog {
     sourceRelation?: SourceRelation,
     cacheMarker?: boolean
   ): ContextEntry {
-    content = contentForWrite(content, 'Context entry refused');
+    content = entryForWrite(content, 'Context entry refused');
     const storedContent = this.blobManager.extractBlobs(content);
     const index = this.length();
 
@@ -133,7 +151,7 @@ export class ContextLog {
    * Edit an entry's content at a specific index.
    */
   edit(index: number, content: ContentBlock[]): void {
-    content = contentForWrite(content, `Edit of context entry ${index} refused`);
+    content = entryForWrite(content, `Edit of context entry ${index} refused`);
     const internal = this.getInternal(index);
     if (!internal) {
       throw new Error(`Context entry not found at index: ${index}`);
@@ -180,13 +198,13 @@ export class ContextLog {
     sourceRelation?: SourceRelation;
     cacheMarker?: boolean;
   }>): ContextEntry[] {
-    // An entry that doesn't match, or holds inline media the store can't
-    // keep, is refused before the log is cleared, so that refusal leaves the
-    // log as it was rather than half replaced. What a write mends, append
-    // mends. An index loop, as the write loop below meets every index: a
-    // hole is an entry with no content.
+    // An entry that doesn't match, holds inline media the store can't keep,
+    // or holds an audience, is refused before the log is cleared, so that
+    // refusal leaves the log as it was rather than half replaced. What a
+    // write mends, append mends. An index loop, as the write loop below
+    // meets every index: a hole is an entry with no content.
     for (let i = 0; i < entries.length; i++) {
-      const places = malformedContentPlaces(entries[i]?.content);
+      const places = [...malformedContentPlaces(entries[i]?.content), ...audiencePlacesInEntry(entries[i]?.content)];
       if (places.length > 0) throw new MalformedContentError(`Context entry ${i} of the replacement refused`, places);
     }
     // Clear existing entries
