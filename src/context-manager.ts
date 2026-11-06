@@ -4104,8 +4104,9 @@ export class ContextManager {
    * legacy mode, where the window is the record, stored. Where they can't
    * tell (the store is on another branch than the one the transition was
    * added on, or can't say its branch), it says what the call last knew of
-   * that branch, such as stored, or stored and maybe presented, and that it
-   * is what the call last knew.
+   * that branch, such as stored, or stored and maybe presented, and, once a
+   * host presents, that it is what the call last knew (in legacy mode it
+   * says stored, as before).
    * Legacy mode reads no record before the reset itself, as before: a
    * transition a listener removed there is reset at all the same. An add of the
    * transition that fails after storing it rejects with addMessage's
@@ -4125,12 +4126,19 @@ export class ContextManager {
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
     this.requireInitialized('resetHeadWindow', attempt);
 
-    // The branch the add stores the transition on, for whereNow below.
+    // The branch the add stores the transition on, for whereNow below, and
+    // whether its window is the record (legacy mode) then.
     let addedOn: string | null;
     try {
       addedOn = this.store.currentBranch().id;
     } catch {
       addedOn = null;
+    }
+    let legacyAtAdd: boolean;
+    try {
+      legacyAtAdd = this.windowIndex.mode() === 'legacy';
+    } catch {
+      legacyAtAdd = false;
     }
 
     // Inject transition message
@@ -4173,11 +4181,14 @@ export class ContextManager {
     // window, which judges the body whole, each read guarded. `known` is
     // what the call last knew, given where the reads can't tell: the store
     // is on another branch than the one the add stored it on, or can't say
-    // its branch; the words say so. `out` is where the window lacks it and
-    // the store holds it: once a host presents, stored and out of the
-    // window, and in legacy mode, where the window is the record, stored.
+    // its branch; once a host presents, the words say so, and in legacy
+    // mode, where only the refusal after the add can be reached, they are
+    // main's ("stored"). `out` is where the window lacks it and the store
+    // holds it: once a host presents, stored and out of the window, and in
+    // legacy mode, where the window is the record, stored.
     const whereNow = (known: string, out?: string): string => {
-      const lastKnown = (why: string) => `was ${known} on the branch it was added on, as the call last knew, and ${why}`;
+      const lastKnown = (why: string) =>
+        legacyAtAdd ? `is ${known}` : `was ${known} on the branch it was added on, as the call last knew, and ${why}`;
       if (addedOn === null) return lastKnown("the store couldn't say its branch when the call added it");
       try {
         if (this.store.currentBranch().id !== addedOn) return lastKnown('the store is on another branch now');
