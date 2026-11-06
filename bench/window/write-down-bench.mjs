@@ -13,12 +13,20 @@
 // appendManyToStateJsonWithIdentity. Numbers are from one synthetic store on
 // one machine: use them to compare the two ways of writing, not as a
 // guarantee for a resident store, and run it on an idle machine (a busy
-// disk makes the per-row leg many times slower).
+// disk makes the per-row leg many times slower). It prints the Node version
+// and the chronicle it loaded (its package version and the directory it was
+// loaded from, which shows a linked tree) before its results: name both
+// with any figures quoted from it.
 
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ContextManager, PassthroughStrategy, windowIndexStateId } from '../../dist/src/index.js';
+
+const chronicleDir = dirname(realpathSync(createRequire(import.meta.url).resolve('@animalabs/chronicle')));
+const chronicleVersion = JSON.parse(readFileSync(join(chronicleDir, 'package.json'), 'utf8')).version;
+console.log(`node ${process.version}; @animalabs/chronicle ${chronicleVersion}, loaded from ${chronicleDir}`);
 
 const sizes = process.argv.slice(2).map(Number).filter((n) => n > 0);
 if (sizes.length === 0) sizes.push(50_000);
