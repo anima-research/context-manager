@@ -8,6 +8,11 @@
  *   settled at the next write through the index, on the branch it was made
  *   on: the strategy then hears the rows that entered or left, once, before
  *   that call's own work, and hears nothing of a write the store refused.
+ *   Where the store can't say its branch before the write or after it,
+ *   nothing waits, the error and a warning say so, and the strategy reads
+ *   the window at its next select (the nothing-waits case below); a write
+ *   made while the store can't say its branch, where a settlement waits,
+ *   writes nothing.
  * - A window state that holds no index this version reads, a value that
  *   isn't a list of items or one the store can't read back: the window is
  *   the record, with one warning saying what the state holds, and
@@ -365,6 +370,56 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 29: a write can't tell whether an
+  // earlier write waits on its branch while the store can't say which that
+  // is, so it writes nothing, as while the index can't be read.
+  it("a write while the store can't say its branch, and an earlier write's outcome waits, writes nothing, and the earlier write settles first once it can", async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    // The index reads; the store's branch, read where the index settles, doesn't.
+    type Settled = (operation: string) => unknown;
+    const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+    const store = cm.getStore() as unknown as Record<string, unknown>;
+    const currentBranch = store.currentBranch as (this: unknown) => unknown;
+    const settled = index.settled;
+    let settling = false;
+    index.settled = function (this: unknown, operation: string) {
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
+    };
+    store.currentBranch = function (this: unknown) {
+      if (settling) throw new Error('zz-branch-read-failed');
+      return currentBranch.call(this);
+    };
+    try {
+      assert.throws(() => cm.retractRows([x]), (error: Error) => {
+        assert.match(error.message, /^ContextManager\.retractRows: the store can't say its branch/);
+        assert.ok(error.message.endsWith('zz-branch-read-failed'), error.message);
+        return true;
+      });
+    } finally {
+      delete (index as { settled?: unknown }).settled;
+      delete store.currentBranch;
+    }
+    assert.deepEqual(strategy.log, [], 'nothing is told while it waits');
+    assert.equal(cm.windowStatusOf(x), 'in', 'nothing was written');
+    cm.retractRows([x]);
+    assert.deepEqual(strategy.log, [`presented ${x}`, `retracted ${x}`], 'once the store says its branch, x is heard entering, then leaving');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 4, finding 13: where the store can't say its
   // branch before the write or after it, nothing waits, and the error says so.
   it("a write whose outcome is unknown, where the store can't say its branch before the write either, says nothing waits to tell the strategy", async () => {
@@ -374,16 +429,31 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     const x = cm.addMessage('alice', [text('x')]);
     // The index's read of the store's branch before the write fails (the
     // message store's own reads of it before then don't), and so does
-    // every read of it once the write throws.
+    // every read of it once the write throws. The read before is the
+    // store's own, made inside settled (CM #350 bot review, wave 5,
+    // finding 24), so a settled that let it throw would fail the call
+    // before its write.
     type Settled = (operation: string) => { state: unknown; branch: string | null };
     const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
     const settled = index.settled;
+    let settling = false;
     index.settled = function (this: unknown, operation: string) {
-      return { ...settled.call(this, operation), branch: null };
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
     };
     let warned: string[];
     try {
       const restore = failNextWriteUnread(cm, true, 1, true);
+      const store = cm.getStore() as unknown as Record<string, unknown>;
+      const branch = store.currentBranch as (this: unknown) => unknown;
+      store.currentBranch = function (this: unknown) {
+        if (settling) throw new Error('zz-branch-read-failed');
+        return branch.call(this);
+      };
       try {
         ({ warned } = await warnings(async () =>
           throwsUnknown(() => cm.presentRows([x]), {
@@ -468,7 +538,8 @@ describe('a write the store threw on, where the index then can\'t be read', () =
           entering: [],
           leaving: [rows[0]!],
           cause: 'zz-index-kept-then-failed',
-          says: /ordinalOf tells which once the index reads \(undefined for a row taken out\), and calling it again takes out only what is still there/,
+          // "It" would be ordinalOf, a read (CM #350 bot review, wave 5, finding 30).
+          says: new RegExp(`ordinalOf tells which once the index reads \\(undefined for a row taken out\\), and calling ${repair} again takes out only what is still there`),
         });
       } finally {
         restore();
@@ -700,6 +771,38 @@ describe("a hook that hears what an unknown write did, and moves the store's bra
     assert.equal(cm.windowStatusOf(s), 'in', "the branch's own row stays in its window");
     assert.deepEqual(cm.retractAbsentRows(), [], 'a call made again finds nothing to take out');
     assert.deepEqual(strategy.log, [`presented ${x}`]);
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 16: a removal's settlement can run
+  // that hook too, which makes the tombstones' write refuse; the rows read
+  // before it aren't told then, on the branch the store moved to.
+  it("a removal whose settlement's hook moves the store tells no strategy of the removed row, and leaves the other branch's window as it was", async () => {
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([a]);
+    // Made now: its record and its window hold a.
+    const side = store.createBranchAt('zz-side', cm.currentBranch().name, store.currentSequence()).name;
+    const x = cm.addMessage('alice', [text('x')]);
+    presentUnread(cm, x);
+    strategy.log.length = 0;
+    strategy.to = side;
+    const error = console.error;
+    console.error = () => {};
+    let warned: string[];
+    try {
+      ({ warned } = await warnings(async () => cm.removeMessage(a)));
+    } finally {
+      console.error = error;
+    }
+    assert.equal(cm.currentBranch().name, side, 'setup: the settlement\'s hook moved the store');
+    assert.deepEqual(strategy.log, [`presented ${x}`], 'the earlier write is settled, once, and no strategy is told a left');
+    assert.ok(warned.some((line) => line.includes("moved the store's branch") && line.includes(`removed message ${a}`)), warned.join('\n'));
+    assert.equal(cm.windowStatusOf(a), 'in', "the other branch's window still holds a");
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 });

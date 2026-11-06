@@ -45,3 +45,11 @@
   started on, which the store no longer reads. Before, it read the other
   branch, and threw `WriteLandedError` naming the shards that branch holds,
   or the write's own error where it holds none.
+- An `addMessage` of a message stored as one row whose append throws after
+  a listener of its add moved the store's branch, or where the store then
+  can't say its branch, throws `WriteOutcomeUnknownError` with `unnamed` 1:
+  the row landed on the branch the add started on, if it did, which the
+  store no longer reads, or may not. A host listener's throw is caught and
+  logged, so this takes a log that throws too. Before, it read the other
+  branch, and threw `WriteLandedError` naming that branch's row at the
+  place the row would take, or the write's own error where it has none.

@@ -9,7 +9,9 @@
  * it is presented, so the strategy hears it from presentRows instead: while
  * the strategy is initialized, once per call, with the rows that entered,
  * after they are in the window and before presentRows returns, fire and
- * forget; while it isn't, the calls wait, and once it is, one call carries
+ * forget (where the manager's own work around the call fails, such as the
+ * context it builds, that is logged and the call waits for the strategy's
+ * next notification); while it isn't, the calls wait, and once it is, one call carries
  * the rows still in the window, in window order. A hold is still placed at the
  * add. These are the presented-mode siblings of the #288 suite, and the
  * autobiographical strategy's chunk rebuild and background compression,
@@ -383,11 +385,12 @@ describe('onPresented in presented mode', () => {
       const second = cm.setStrategy(replacement);
       const superseded = assert.rejects(first, /supersed/i);
       open();
-      await settle();
+      // The first initialization's completion, where an early delivery
+      // would be made, has run (CM #350 bot review, wave 5, finding 26).
+      await superseded;
       assert.equal(replacement.heard.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;
-      await superseded;
       assert.deepEqual(replacement.heard.map((h) => h.rows), [[a]], `${hooked ? 'control' : 'probe'}: the replacement hears the row once, after its initialize`);
       await settle();
       cm.close();
@@ -552,6 +555,185 @@ describe('onPresented in presented mode', () => {
       await settle();
       cm.close();
     }
+  });
+
+  // CM #350 bot review, wave 5, finding 20: a retried call's hook can take
+  // the notification's own rows out of the window, moving nothing else.
+  it("a notification whose retried call's hook takes its rows out of the window again doesn't tell them entering", async () => {
+    for (const hook of ['onPresented', 'onNewMessage'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      cm.presentRows([]);
+      const x = cm.addMessage('alice', [text('x')]);
+      const y = cm.addMessage('bob', [text('y')]);
+      cm.presentRows([x]);
+      class TakesOut extends GatedRecords {
+        takes = true;
+        async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+          if (this.takes) {
+            this.takes = false;
+            cm.retractRows([y]);
+          }
+          return super.onRetracted(rows, ctx, info);
+        }
+      }
+      const strategy = new TakesOut();
+      if (hook === 'onNewMessage') (strategy as { onPresented?: unknown }).onPresented = undefined;
+      const { gate, open } = gated();
+      strategy.gate = gate;
+      const initialized = cm.setStrategy(strategy);
+      cm.retractRows([x]);
+      // The delivery's read of the record throws, once: the call waits.
+      const reads = cm as unknown as { mergedMessageView: () => unknown };
+      const read = reads.mergedMessageView;
+      let fail = true;
+      reads.mergedMessageView = function (this: unknown) {
+        if (fail) {
+          fail = false;
+          throw new Error('zz-record-read-failed');
+        }
+        return read.call(this);
+      };
+      try {
+        await errorsDuring(async () => {
+          open();
+          await initialized;
+        });
+      } finally {
+        delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+      }
+      assert.equal(strategy.retracted.length, 0, `${hook}, setup: the call waits`);
+      cm.presentRows([y]);
+      assert.equal(cm.windowStatusOf(y), 'out', `${hook}, setup: the retried call's hook took y out`);
+      assert.deepEqual(strategy.retracted[0]?.rows, [x], `${hook}: the call that waited was made`);
+      assert.deepEqual(strategy.heard, [], `${hook}: y isn't heard entering a window that no longer holds it`);
+      assert.deepEqual(strategy.newMessages, [], `${hook}: nor through onNewMessage`);
+      await settle();
+      cm.close();
+    }
+  });
+
+  // CM #350 bot review, wave 5, finding 39: where the store can't say its
+  // branch before the retried calls, a hook of theirs that moves it can't
+  // be seen, so the notification's call goes the way of a moved one.
+  it("a notification that can't read the store's branch before the retried calls is made where the window of the branch the store is on holds its rows", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const y = cm.addMessage('bob', [text('y')]);
+    cm.presentRows([x]);
+    const start = cm.currentBranch().name;
+    // Made now: its window lacks y.
+    const other = store.createBranchAt('zz-other', start, store.currentSequence()).name;
+    class Moves extends GatedRecords {
+      moves = true;
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+        if (this.moves) {
+          this.moves = false;
+          store.switchBranch(other);
+        }
+        return super.onRetracted(rows, ctx, info);
+      }
+    }
+    const strategy = new Moves();
+    const { gate, open } = gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([x]);
+    // The delivery's read of the record throws, once: the call waits.
+    const reads = cm as unknown as { mergedMessageView: () => unknown; hookScope: () => unknown };
+    const read = reads.mergedMessageView;
+    let fail = true;
+    reads.mergedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-record-read-failed');
+      }
+      return read.call(this);
+    };
+    try {
+      await errorsDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(strategy.retracted.length, 0, 'setup: the call waits');
+    // The notification's read of the store's branch, before it tries the
+    // waiting call again, throws once.
+    const scope = reads.hookScope;
+    let unreadable = true;
+    reads.hookScope = function (this: unknown) {
+      if (unreadable) {
+        unreadable = false;
+        throw new Error('zz-branch-unreadable');
+      }
+      return scope.call(this);
+    };
+    try {
+      cm.presentRows([y]);
+    } finally {
+      delete (reads as { hookScope?: unknown }).hookScope;
+    }
+    assert.equal(unreadable, false, 'setup: the branch read failed');
+    assert.equal(cm.currentBranch().name, other, "setup: the retried call's hook moved the store");
+    assert.deepEqual(strategy.retracted.map((r) => r.rows), [[x]], 'the call that waited was made');
+    assert.deepEqual(strategy.heard, [], "y isn't heard entering a window that never held it");
+    await settle();
+    cm.close();
+  });
+
+  // The verifier's C16 at 6a18406: in legacy mode the mode a notification's
+  // rows entered is read before the retried calls, whose hooks can move the
+  // store, so rows a moved notification defers are told where the record of
+  // the branch the store is on holds them.
+  it("in legacy mode a notification whose retried call's hook moves the store to a branch holding its row tells that row there, once", async () => {
+    const store = (await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() })).getStore();
+    const start = store.currentBranch().name;
+    class Moves extends ShardingRecords {
+      moves = true;
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (this.moves && rows.length > 1) {
+          this.moves = false;
+          // A branch of the record as it stands, the new row's add among it.
+          store.createBranchAt('zz-b', start, store.currentSequence());
+          store.switchBranch('zz-b');
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ store, namespace: 'zz-agent', strategy });
+    // A sharded add whose removal fails after telling the strategy of the
+    // body failed twice in the manager's own work: the shards that stayed
+    // wait for the strategy's next notification.
+    const own = cm as unknown as { createStrategyContext: () => unknown; messageStore: { removeBodyGroup: () => void } };
+    const build = own.createStrategyContext.bind(cm);
+    let failures = 0;
+    own.createStrategyContext = () => {
+      if (failures < 2) {
+        failures++;
+        throw new Error('zz-context-failed');
+      }
+      return build();
+    };
+    const removeBodyGroup = own.messageStore.removeBodyGroup;
+    own.messageStore.removeBodyGroup = () => { throw new Error('zz-removal-failed'); };
+    await errorsDuring(async () => {
+      assert.throws(() => cm.addMessage('alice', [text('one'), text('two')]));
+    });
+    own.messageStore.removeBodyGroup = removeBodyGroup;
+    assert.equal(failures, 2, 'setup: both failed');
+    assert.equal(strategy.heard.length, 0, 'setup: the shards wait');
+    const x = cm.addMessage('bob', [text('x')]);
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.equal(store.currentBranch().name, 'zz-b', "setup: the retried call's hook moved the store");
+    assert.equal(strategy.heard[0]?.rows.length, 2, 'setup: the shards were heard');
+    const heard = strategy.heard.flatMap((h) => h.rows);
+    assert.deepEqual(heard.filter((id) => id === x), [x], 'x is heard on the branch whose record holds it, once');
+    await settle();
+    cm.close();
   });
 
   // House review of #350, untested contract 3: a row the view filter leaves
@@ -1254,6 +1436,141 @@ describe('resetHeadWindow once a host presents', () => {
       owner.close();
     }
   });
+
+  // CM #350 bot review, wave 5, finding 36: a listener of a sharded
+  // transition's first shard can present it before the rest is stored, so
+  // a refusal then judges the body whole, as the presentation does.
+  it('a refusal after a listener presented a sharded transition in part says it is presented in part', async () => {
+    class ShardsTransition extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      chunkIngressMessage(participant: string, content: ContentBlock[]) {
+        if (participant !== 'Context Manager') return null;
+        const whole = (content[0] as { text: string }).text;
+        const half = Math.floor(whole.length / 2);
+        return { bodyGroupId: 'zz-transition', shards: [whole.slice(0, half), whole.slice(half)].map((t, shardIndex) => ({ content: [text(t)], shardIndex })) };
+      }
+    }
+    const strategy = new ShardsTransition();
+    // An app-owned store, which stays open after close(), so the window can be asked.
+    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    // A host that presents each row it hears stored, the transition's first
+    // shard before the second is stored, and then closes the manager.
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || event.message.shardIndex !== 0) return;
+      cm.presentRows([event.message.id]);
+      cm.close();
+    });
+    const err = await cm.resetHeadWindow('zz-transition, long enough to split').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const shards = owner.getAllMessages().filter((m) => m.participant === 'Context Manager').map((m) => m.id);
+    assert.equal(shards.length, 2, 'setup: the transition is stored as two shards');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${shards[0]} is stored and presented`), err.message);
+    assert.ok(err.message.includes(`message ${shards[0]} is stored, and presented in part, and the head window wasn't reset`), err.message);
+    await settle();
+    owner.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 17: a removal through another
+  // manager on the slot leaves the transition's ordinal issued here, so the
+  // refusal asks the store before the window.
+  it('a refusal after a hook removed the transition through another manager on the slot says it is no longer stored', async () => {
+    let cm!: ContextManager;
+    let writer!: ContextManager;
+    class Resettable extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        const transition = rows.find((m) => m.participant === 'Context Manager');
+        if (transition) {
+          writer.removeMessage(transition.id);
+          cm.close();
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Resettable();
+    // Another manager on the same store and slot, whose store stays open after cm's close().
+    writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = strategy.heard.flatMap((h) => h.rows).at(-1)!;
+    assert.equal(writer.getMessage(transition), null, 'setup: the other manager removed the transition');
+    assert.notEqual(cm.ordinalOf(transition), undefined, "setup: this manager's ordinal for it stands");
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${transition} is stored`), err.message);
+    assert.ok(err.message.includes(`message ${transition} is no longer stored`), err.message);
+    await settle();
+    writer.close();
+  });
+
+  // The verifier's C10 at 6a18406, and CM #350 bot review, wave 5, finding
+  // 37: where a listener of the add, or the presentation's hook, moved the
+  // store's branch, the refusal says what the call last knew of the branch
+  // the transition was added on, not what the other branch holds, and says
+  // that it is what it last knew.
+  it("a refusal after a listener or a hook moved the store's branch says what the call last knew of the branch the transition was added on", async () => {
+    for (const moves of ['listener', 'hook', 'hook, after removing it'] as const) {
+      let cm!: ContextManager;
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+        onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          const transition = rows.find((m) => m.participant === 'Context Manager');
+          if (transition && moves !== 'listener') {
+            if (moves === 'hook, after removing it') cm.removeMessage(transition.id);
+            cm.getStore().switchBranch('zz-other');
+          }
+          return super.onPresented(rows, ctx);
+        }
+      }
+      const strategy = new Resettable();
+      // An app-owned store, as above.
+      const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const start = cm.currentBranch().name;
+      // A branch made before the reset, which lacks the transition.
+      cm.getStore().createBranchAt('zz-other', start, cm.getStore().currentSequence());
+      let transition: MessageId | undefined;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || event.message.participant !== 'Context Manager') return;
+        transition = event.message.id;
+        if (moves === 'listener') cm.getStore().switchBranch('zz-other');
+      });
+      const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      assert.equal(owner.getStore().currentBranch().name, 'zz-other', `${moves}, setup: the store moved`);
+      assert.deepEqual(strategy.resets, [], `${moves}: the head window wasn't reset`);
+      assert.ok(!err.message.includes('no longer stored'), `${moves}: not what the other branch holds: ${err.message}`);
+      const knew = moves === 'listener' ? 'stored' : 'stored and presented';
+      assert.ok(!err.message.includes(`message ${transition} is ${knew}`), `${moves}: not stated as what holds now: ${err.message}`);
+      assert.ok(
+        err.message.includes(`message ${transition} was ${knew} on the branch it was added on, as the call last knew, and the store is on another branch now`),
+        `${moves}: ${err.message}`,
+      );
+      await settle();
+      cm.close();
+      owner.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {
@@ -1367,9 +1684,19 @@ function mockMembrane() {
 /** The autobiographical strategy, counting its chunk rebuilds. */
 class CountsRebuilds extends AutobiographicalStrategy {
   rebuilds = 0;
+  /** onPresented and onNewMessage calls: the ways a row reaches the strategy. */
+  hooks = 0;
   protected rebuildChunks(store: MessageStoreView): void {
     this.rebuilds++;
     super.rebuildChunks(store);
+  }
+  async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+    this.hooks++;
+    return super.onPresented(rows, ctx);
+  }
+  async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
+    this.hooks++;
+    return super.onNewMessage(message, ctx);
   }
 }
 
@@ -1426,13 +1753,17 @@ describe('the autobiographical strategy follows the window', () => {
     const manager = await ContextManager.open({ path: freshPath(), strategy, membrane });
     manager.presentRows([]);
     const rebuilds = strategy.rebuilds;
+    const hooks = strategy.hooks;
     const { shown, unshown } = addMessages(manager);
+    // CM #350 bot review, wave 5, finding 25: in presented mode an add
+    // reaches the strategy through neither hook, and work the strategy does
+    // for a row has to start from one of them, so none can be scheduled.
+    assert.equal(strategy.hooks, hooks, 'no add reached the strategy (onPresented, onNewMessage)');
     await sleep(200);
+    assert.equal(strategy.hooks, hooks, 'nor after');
     assert.equal(strategy.rebuilds, rebuilds, 'no add rebuilt the chunks');
     assert.equal(calls.length, 0, 'no row is in the window, so nothing is chunked and no compression starts');
-    // CM #350 bot review, wave 4, finding 21: work scheduled from the adds
-    // that reaches the membrane after the sleep would pass the check above;
-    // nothing queued or pending can't.
+    // CM #350 bot review, wave 4, finding 21: nothing is queued or pending.
     assert.ok(manager.isReady(), 'nothing is queued or pending to compress');
 
     manager.presentRows(shown);

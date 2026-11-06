@@ -3,7 +3,9 @@
  * contiguous among chunk-owned messages in the order of the strategy's
  * view, record order in legacy mode and window order once a host presents
  * rows (crossed ownership — issue #122 cross-era merges, restore/branch
- * interleavings, hand surgery).
+ * interleavings, hand surgery), of a manager opened without `isolate`:
+ * the script opens the namespace's shared `messages` slot, so an isolated
+ * manager's slot isn't audited, as before.
  * It runs the same audit as `initialize` (topologyPolicy).
  *
  * Usage:

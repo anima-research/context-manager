@@ -9,7 +9,10 @@
  * first read in presented mode, to the ordinal of the first row in the
  * window stored at that sequence or after, so the window at the conversion
  * is the one the sequence gave; it is written as `{ anchor, ordinal, v: 2 }`
- * when it is made, keeping the sequence for a release that reads it alone,
+ * when it is made (an anchor of 0, the start, isn't written, since it
+ * converts to the whole window whenever it is converted; a write that
+ * fails is made again at the next read: see presentedAnchor), keeping the
+ * sequence for a release that reads it alone,
  * so a reload reads the ordinal back rather than converting again. From
  * then on a row stored before the anchor's sequence and presented later is
  * in the window, which a sequence anchor leaves out. A re-anchor or
@@ -77,6 +80,35 @@ describe('windowed passthrough: the anchor while the window is the record', () =
     assert.ok(result.messages.length < 5, 'the overflow re-anchored');
     assert.deepEqual(slot(cm), { anchor: strategy.getAnchor() });
     assert.equal(cm.windowMode(), 'legacy');
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 35: in legacy mode a move has no
+  // ordinal to look up, so it reads no listing of the record.
+  it('a move reads no listing of the record', async () => {
+    const { cm, strategy } = await open(freshPath());
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    const own = cm as unknown as { mergedMessageView: () => unknown };
+    const merged = own.mergedMessageView;
+    let moving = false;
+    let listings = 0;
+    own.mergedMessageView = function (this: unknown) {
+      if (moving) listings++;
+      return merged.call(this);
+    };
+    try {
+      for (const id of ids) {
+        moving = true;
+        strategy.setAnchor(sequenceOf(cm, id));
+        moving = false;
+        cm.addMessage('u', text('after'));
+      }
+    } finally {
+      delete (own as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[2]!) }, 'setup: the moves were made');
+    assert.equal(listings, 0, 'no move read the merged record');
     cm.close();
   });
 });

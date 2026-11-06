@@ -4,7 +4,9 @@
  *
  * retractRows takes rows out of the window, as an undone turn's rows are
  * taken out, and once a host presents rows a removal through the manager
- * takes a removed row out too. Until this hook the strategy heard neither,
+ * takes a removed row out too (a removeMessages whose range's rows can't be
+ * read before it goes leaves them their ordinals, untold, until
+ * retractAbsentRows takes them out). Until this hook the strategy heard neither,
  * so the autobiographical strategy kept an undone row inside its summaries:
  * the compile went on showing it folded, and a redo, which presents the
  * rows again at the end of the window, rendered them twice, raw there and
@@ -361,6 +363,37 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 44: a retraction a hook makes while
+  // the calls that waited are made waits behind the calls not made yet.
+  it('a call a hook makes while the calls that waited are made comes after them', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    class TakesOut extends Gated {
+      takes = true;
+      onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: Info): Promise<void> {
+        const heard = super.onRetracted(rows, ctx, info);
+        if (this.takes && rows.some((m) => m.id === a)) {
+          this.takes = false;
+          cm.retractRows([c]);
+        }
+        return heard;
+      }
+    }
+    const { gate, open } = gated();
+    const strategy = new TakesOut();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    cm.retractRows([b]);
+    open();
+    await initialized;
+    assert.deepEqual(strategy.log, ['retracted a', 'retracted b', 'retracted c'], "c, taken out by a's hook, after b, which waited");
+    await settle();
+    cm.close();
+  });
+
   it('a row removed elsewhere, taken out while the strategy initializes, is told on a branch whose window holds it still, since its record lacks it too', async () => {
     const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
     const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
@@ -435,11 +468,12 @@ describe('onRetracted', () => {
       const second = cm.setStrategy(replacement);
       const superseded = assert.rejects(first, /supersed/i);
       open();
-      await settle();
+      // The first initialization's completion, where an early delivery
+      // would be made, has run (CM #350 bot review, wave 5, finding 26).
+      await superseded;
       assert.equal(replacement.retracted.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;
-      await superseded;
       assert.deepEqual(
         replacement.retracted.map((l) => [l.rows, l.info]),
         [[[a], { undone: true, removed: false, ids: [a] }]],
@@ -619,6 +653,41 @@ describe('onRetracted', () => {
     assert.ok(cm.ordinalOf(a) !== undefined && cm.ordinalOf(a) !== left, 'setup: the branch holds a, at another ordinal than the one it left on the other');
     assert.deepEqual(strategy.retracted, [], "a never left this branch's window");
     assert.deepEqual(strategy.presented, [[a]], 'it entered it');
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 32: a branch made before the row
+  // was presented can present it on its own at the same ordinal, so the
+  // ordinal and the id alone don't make it the presentation the call left.
+  it('a call waiting on an initialization of a branch that presented the row on its own at the same ordinal, and again since, is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    const a = cm.addMessage('alice', [text('a')]);
+    // Made once a is stored and before it is presented: its record holds a, and its window doesn't.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, at the ordinal it took on the other
+    // branch, then takes it out and presents it again, before the strategy
+    // initializes there.
+    cm.presentRows([a]);
+    assert.equal(cm.ordinalOf(a), left, 'setup: the branch presented a at the same ordinal');
+    cm.retractRows([a]);
+    cm.presentRows([a]);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, diverged);
+    assert.ok(cm.ordinalOf(a) !== undefined && cm.ordinalOf(a) !== left, 'setup: the branch holds a, at a later ordinal');
+    assert.deepEqual(strategy.log, ['retracted a', 'presented a'], "the branch's own retraction of a is told, once, and the other branch's isn't");
     await settle();
     cm.close();
   });

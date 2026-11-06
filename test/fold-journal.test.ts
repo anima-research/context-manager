@@ -2349,9 +2349,14 @@ describe('fold journal over a presented window', () => {
     // are while the window is the record.
     const { cm, strategy } = await open();
     const ids = add(cm, 3);
+    // Built from 0.24.2's RenderedLayout v 2 (origin/main src/types/context.ts)
+    // field by field, so no field this release added or reshaped passes
+    // through for the reader to lean on (CM #350 bot review, wave 5, finding
+    // 48). Its LayoutUnit is unchanged.
     const asV2 = (provenance: CompileProvenance): CompileProvenance => {
-      const { keyedBy: _keyedBy, memberSequences: _memberSequences, ...rest } = provenance.layout!;
-      return { ...provenance, layout: { ...rest, v: 2 } as unknown as RenderedLayout };
+      const { members, memberIds, units, totalTokens, calibration, cause } = provenance.layout!;
+      const v2 = { v: 2, members: [...members], memberIds: [...memberIds], units, totalTokens, calibration, ...(cause !== undefined ? { cause } : {}) };
+      return { ...provenance, layout: v2 as unknown as RenderedLayout };
     };
     const older = asV2((await cm.compile(BUDGET)).provenance!);
     assert.deepEqual(older.layout!.members, ids.map((id) => sequenceOf(cm, id)));

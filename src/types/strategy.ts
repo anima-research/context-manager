@@ -369,7 +369,10 @@ export interface ContextStrategy {
    * Once a host presents rows on the branch, or takes a row out of its
    * window by name (retractRows ends legacy mode too), a stored row isn't
    * heard until it is presented: the call comes from presentRows, once per call, after
-   * the rows are in the window and before presentRows returns. A row
+   * the rows are in the window and before presentRows returns (where the
+   * manager's own work around the call fails, such as the context it
+   * builds, that is logged and the call waits for the strategy's next
+   * notification). A row
    * presented again after retractRows is heard again. A row from an
    * auxiliary slot is heard only when a host presents it; in legacy mode it
    * enters the window unheard, as it always has. The first presentRows on a
@@ -422,9 +425,11 @@ export interface ContextStrategy {
    * repairs (ContextManager.retractRemoved, retractAbsentRows) unfolds it,
    * not only the manager that removed it.
    *
-   * It is called once per call, before the call returns, and a retractRows
-   * that names rows the store no longer holds calls it a second time, for
-   * those, by their ids alone:
+   * It is called once per call, before the call returns (where the
+   * manager's own work around the call fails, such as the context it
+   * builds, that is logged and the call waits for the strategy's next
+   * notification), and a retractRows that names rows the store no longer
+   * holds calls it a second time, for those, by their ids alone:
    *
    * - from ContextManager.retractRows, after the rows are out of the
    *   window, with `undone` as the call gave it and `removed: false`. Rows
@@ -451,7 +456,15 @@ export interface ContextStrategy {
    *   made on a branch whose record no longer holds the row. The shards a
    *   sharded addMessage that fails partway removes, as it removes what it
    *   stored, are given the same way, with `removed: true`, when a host's
-   *   listener of a shard's add presented them.
+   *   listener of a shard's add presented them. Except a removeMessages
+   *   whose range's rows can't be read before it goes (logged): the
+   *   window's rows of it keep their ordinals, untold, until
+   *   retractAbsentRows takes them out and tells the strategy by id. And
+   *   except where a strategy hook the removal runs moves the store's
+   *   branch (its onCompressionHoldsReleased, or a hook that hears what an
+   *   earlier window write did): then no strategy is told, and on the
+   *   removal's branch the rows keep their ordinals until retractAbsentRows
+   *   takes them out there.
    * - from ContextManager.presentRows, for the later shards of a body whose
    *   first shard the window lacked, which leave so that the body enters
    *   whole, with `undone: false` and `removed: false`, before the body is
@@ -485,7 +498,9 @@ export interface ContextStrategy {
    * when the call is made, as for onPresented's) holds at the ordinal it
    * left, in its window and its record (a branch made before it left), is
    * left out, as is a row a branch made before it was presented presented
-   * on its own (that branch's index never gave it the ordinal it left),
+   * on its own (that branch's index never gave it the ordinal it left in
+   * the record that did, even where it gave it the same ordinal in a
+   * record of its own),
    * and every row while that branch is in legacy mode, and a call left
    * with no row isn't made. They wait for the manager's strategy,
    * not for this instance, as onPresented's do.

@@ -19,12 +19,13 @@
     sharded write that fails tells it only of the shards it leaves stored
     (`WriteLandedError`), once it has tried to remove them, in one call: on a
     branch the write's listener moved to, once the strategy is initialized
-    there, where that branch's window holds them. Where the manager can't
+    there, where that branch's window holds them; where the manager's own
+    work telling it fails (the context it builds), they wait for its next
+    notification. Where the manager can't
     tell which shards stayed (`WriteOutcomeUnknownError`), every shard the
     window took in waits, and the strategy hears, in one call, those the
     window's listing holds when they are delivered: at once where the store
-    reads, and at its next notification where it doesn't. Before, it heard
-    none of them, or only those the error names as stayed.
+    reads, and at its next notification where it doesn't.
   - A listener that moves the store's branch between shards stops the write
     before the next shard, and `addMessage` throws `WriteLandedError` naming
     the shards stored, which stay on the branch the write started on, with a
@@ -44,4 +45,9 @@
     such a listener, after it presents a shard) is refused too, with an error
     that says the cut would come before the body's later shards. Before, the
     cut was taken over the shards stored so far, so the new branch's record
-    held part of the body, though `branchAt` promises the whole body.
+    held part of the body, though `branchAt` promises the whole body. So are
+    a `fork` and a `derive` on the same manager made then, before either
+    makes a branch: each cuts at the head, which holds only the shards stored
+    so far. Before, a fork moved the store, so the body's later shards landed
+    on the new branch and the branch the write started on kept only the
+    first, and a derive's child held part of the body.

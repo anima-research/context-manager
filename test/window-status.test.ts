@@ -124,6 +124,8 @@ describe('windowStatusOf', () => {
     assert.deepEqual(statuses(main, [m1, m2]), ['in', 'in']);
     assert.equal(main.windowStatusOf(s1), 'absent', 'the shared slot\'s manager merges no other slot');
     assert.equal(side.windowStatusOf('999999'), 'absent', 'an id no slot holds');
+    // CM #350 bot review, wave 5, finding 41: the first reads, before the removal writes.
+    assert.equal(main.getStore().currentSequence(), head, 'a status read writes nothing');
 
     main.removeMessage(m2);
     assert.equal(main.windowStatusOf(m2), 'absent');
@@ -147,7 +149,10 @@ describe('windowStatusOf', () => {
     cm.presentRows([]);
     const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
     cm.presentRows([a]);
+    const first = cm.getStore().currentSequence();
     assert.deepEqual(statuses(cm, [a, b, c]), ['in', 'out', 'out']);
+    // CM #350 bot review, wave 5, finding 41: the first reads too.
+    assert.equal(cm.getStore().currentSequence(), first, 'a status read writes nothing');
 
     cm.presentRows([b, c]);
     cm.retractRows([b], { undone: true });
@@ -479,8 +484,10 @@ describe('resetHeadWindow with metadata', () => {
     try {
       await assert.rejects(cm.resetHeadWindow('topic'), (error: Error) => {
         transition = cm.getAllMessages().at(-1)?.id;
-        return /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-index-append-failed\. Its transition add finished: message \S+ is stored, and the head window wasn't reset\./.test(error.message)
-          && error.message.includes(`message ${transition} is stored`);
+        // Once a host presents, a transition the window lacks is stored and
+        // out of it (CM #350 bot review, wave 5, finding 38).
+        return /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-index-append-failed\. Its transition add finished: message \S+ is stored and out of the window, and the head window wasn't reset\./.test(error.message)
+          && error.message.includes(`message ${transition} is stored and out of the window`);
       });
     } finally {
       restore();
