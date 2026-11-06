@@ -501,6 +501,47 @@ describe('a retraction through another instance sharing the store', () => {
     }
   });
 
+  // Wave 3 (finding 2, the verifier's pin): a merge's entry check finds a
+  // row under its sources that left and was presented again before it
+  // began, by the order the window now holds them in, and makes no call.
+  it("a merge over a row the other instance took out and presented again before it began, whose own writes then failed, makes no call", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+      const row = l1.sourceIds[0]!;
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      await linesDuring(async () => {
+        refusingWrites(store, [SUMMARIES, CHUNKS], () => {
+          b!.retractRows([row], { undone: true });
+          b!.presentRows([row]);
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
+      assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), "premise: the other instance's summaries write failed");
+      const before = calls.length;
+      const lines = await linesDuring(async () => {
+        await releasingUntil(calls, a.tick());
+      });
+      assert.ok(!calls.slice(before).some((call) => call.merge), `no merge call was made: ${lines.join('\n')}`);
+      assert.ok(lines.some((line) => line.includes('were presented again elsewhere in it') && line.includes('skipping stale queue entry') && line.includes(row)), lines.join('\n'));
+      const after = stored(store, SUMMARIES);
+      assert.ok(after.every((s) => !s.sourceIds.includes(l1.id) && !s.sourceIds.includes(row)), `the instance let go of the row: ${lines.join('\n')}`);
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
   it("a merge over a row the other instance took out before it began, whose own writes then failed, makes no call", async () => {
     const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
     let b: ContextManager | undefined;
@@ -529,6 +570,48 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(after.every((s) => !s.sourceIds.includes(l1.id) && !s.sourceIds.includes(row)), `the instance let go of the row: ${lines.join('\n')}`);
     } finally {
       for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  // Wave 3 (finding 2, the verifier's pin): the exhaustion's check under the
+  // ledger lock asks rowsMovedInWindow too. A KnowledgeStrategy keeps no
+  // chunk record, and the row is in the window again, so only its moved
+  // place says the span is obsolete.
+  it('a ladder ending with no summary in a KnowledgeStrategy over a row the other instance took out and presented again quarantines nothing', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const gate = emptyMembrane();
+    const A = knowledgeFor();
+    const a = await ContextManager.open({ store, strategy: A, membrane: gate.membrane });
+    let b: ContextManager | undefined;
+    try {
+      a.presentRows([]);
+      for (let i = 0; i < 24; i++) {
+        a.presentRows([a.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: `${i} ${'word '.repeat(30)}` }])]);
+      }
+      await a.compile();
+      const ticking = a.tick();
+      await waitFor(() => gate.calls() === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const row = work.chunk.messages[0]!.id;
+
+      b = await ContextManager.open({ store, strategy: knowledgeFor(), membrane: gate.membrane });
+      const lines = await linesDuring(async () => {
+        b!.retractRows([row], { undone: true });
+        b!.presentRows([row]);
+        assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
+        gate.release();
+        await ticking;
+      });
+      assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
+      assert.deepEqual(lines.filter((line) => line.includes('"compression:quarantine-alert"')), [], 'no alert was sent');
+      assert.ok(lines.some((line) => line.includes('quarantines nothing') && line.includes(row)), lines.join('\n'));
+    } finally {
+      gate.release();
       b?.close();
       a.close();
       store.close();
