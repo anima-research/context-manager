@@ -423,6 +423,63 @@ describe('a half-written unfold', () => {
     });
   }
 
+  // Wave 5, finding 53: the read back compared the store's summaries with
+  // what the write was given, but the store keeps a lone UTF-16 surrogate
+  // half in a string as U+FFFD (storedJson). So where a summary the
+  // retraction keeps held one (model text, which memory keeps as written),
+  // a write that landed and then threw read as one that didn't land, and
+  // memory kept the L1 the store had dropped.
+  it('a retraction whose summaries write lands and then throws, where a summary it keeps holds a lone surrogate half, leaves memory as the store holds it', async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+    assert.ok(covering && second, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    // The kept L1's text holds a lone high half, in memory as the model
+    // wrote it; the store holds U+FFFD there.
+    state.summaries = state.summaries.map((s) => (s === second ? { ...s, content: `memory a\uD800b` } : s));
+    store.setStateJson(state.summariesStateId, state.summaries);
+    const ofStore = () => ((store.getStateJson(state.summariesStateId) as SummaryEntry[] | null) ?? []);
+    assert.equal(ofStore().find((s) => s.id === second.id)?.content, 'memory a\uFFFDb', 'premise: the store keeps U+FFFD for the half');
+
+    const realWrite = store.setStateJson;
+    let threw = false;
+    store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+      const result = realWrite.call(this, stateId, ...rest);
+      if (stateId === state.summariesStateId && !threw) {
+        threw = true;
+        throw new Error(`zz the write of ${stateId} landed, then threw`);
+      }
+      return result;
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+    }
+    assert.ok(threw && lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('landed, then threw')), `premise: ${lines.join('\n')}`);
+    assert.ok(ofStore().every((s) => s.id !== covering.id), "premise: the store's summaries dropped the L1");
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), 'memory dropped it too');
+
+    // The next retraction writes from memory: the L1 doesn't come back.
+    await linesDuring(async () => { cm.retractRows([second.sourceIds[0]!], { undone: true }); });
+    assert.ok(ofStore().every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `no summary covers the row again: ${ofStore().map((s) => s.id).join(', ')}`);
+    cm.close();
+  });
+
   it("a retraction whose summaries write throws without landing, and whose read back throws too, takes the let-go's side: the next retraction's write of the summaries drops the L1 from the store", async () => {
     const path = freshPath();
     const strategy = new AutobiographicalStrategy(FOLDING);

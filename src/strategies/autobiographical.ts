@@ -8418,6 +8418,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * which sets it in memory. A write can land in the store and then throw,
    * so where it throws the state is read back: memory takes `value` where
    * the store holds it, and keeps what it held where the store doesn't.
+   * The read is compared with `value` as the store keeps it, a lone
+   * surrogate half in a string as U+FFFD (storedCanonicalJson), so a
+   * summary's text that holds one doesn't read as a write that didn't land.
    * Where the read throws too, memory takes `value`, the side of the
    * let-go: it then holds nothing the unfold dropped, so no later write of
    * that state from memory puts it back (the next unfold's writes the whole
@@ -8431,7 +8434,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       let landed = true;
       try {
-        landed = canonicalJson(this.store?.getStateJson(stateId) ?? null) === canonicalJson(value);
+        landed = canonicalJson(this.store?.getStateJson(stateId) ?? null) === storedCanonicalJson(value);
       } catch {
         // The store can't say: the let-go's side.
       }
@@ -22121,6 +22124,17 @@ function windowOrdered(ids: readonly MessageId[], place: ReadonlyMap<MessageId, 
   }
   placed.sort((a, b) => place.get(a[0]!)! - place.get(b[0]!)!);
   return [...lead, ...placed.flat()];
+}
+
+/**
+ * `value` as canonical JSON of what the store keeps once it is written:
+ * JSON.stringify writes a lone UTF-16 surrogate half in a string as an
+ * escape, and the store keeps U+FFFD there (storedJson). So a value read
+ * back from the store is compared with this, not with `value` as memory
+ * holds it, where model text can keep such a half.
+ */
+function storedCanonicalJson(value: unknown): string {
+  return canonicalJson(JSON.parse(storedJson(value).toString('utf8')));
 }
 
 /**
