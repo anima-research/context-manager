@@ -4,7 +4,8 @@
  * - WriteLandedError: the store holds the rows of the message it names, and
  *   no others, with the write's own error as its cause.
  * - WriteOutcomeUnknownError: the manager can't tell whether the store holds
- *   some row of the message, because the read that would tell threw. It
+ *   some row of the message, because the read that would tell threw, or
+ *   the write's branch moved, so the manager can't read it. It
  *   names the rows the manager knows are stored, and what it can't say
  *   about.
  * - Any other error: the store holds none of the message. A write that fails
@@ -267,6 +268,34 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
       assert.deepEqual(err.landed.map((id) => cm.windowStatusOf(id)), ['in', 'in'], failing);
       cm.close();
     }
+  });
+
+  it("where a host's listener took a shard it presented out again, presenting the first row of landed the window lacks puts the body in whole", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.presentRows([]);
+    // The host presents the first shard as it is stored and takes it out
+    // again, as an undone turn's, before the second is stored; the store
+    // refuses the third.
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || event.message.shardIndex !== 0) return;
+      cm.presentRows([event.message.id]);
+      cm.retractRows([event.message.id], { undone: true });
+    });
+    const messages = internals(cm).messageStore;
+    const append = messages.append.bind(messages);
+    messages.append = (...args: Parameters<MessageStore['append']>) => {
+      if (args[4]?.shardIndex === 2) throw new Error('disk full');
+      return append(...args);
+    };
+    failRemoval(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    assert.deepEqual(err.landed.map((id) => cm.windowStatusOf(id)), ['undone', 'out'], 'setup: the first shard is out as undone');
+    const out = err.landed.filter((id) => cm.windowStatusOf(id) === 'out');
+    assert.throws(() => cm.presentRows(out), /is shard 1 of a body stored as shards/, "the rows that read 'out' alone name a later shard without its first");
+    cm.presentRows([err.landed.find((id) => cm.windowStatusOf(id) !== 'in')!]);
+    assert.deepEqual(err.landed.map((id) => cm.windowStatusOf(id)), ['in', 'in']);
+    cm.close();
   });
 
   it("a shard the store refused isn't named: the error names the shards stored before it", async () => {

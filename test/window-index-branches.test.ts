@@ -22,7 +22,9 @@
  * - A row removed from the manager's slot leaves the window as a
  *   tombstone, so no other row's ordinal moves, also when the context log
  *   throws on the removal. A window that can't be read before a range is
- *   removed doesn't stop the removal.
+ *   removed doesn't stop the removal: where the window can't be read or
+ *   the tombstone written, the removal stands and the row keeps its
+ *   ordinal until a host takes it out.
  */
 
 import { describe, it, after } from 'node:test';

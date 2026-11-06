@@ -5,11 +5,12 @@
   `WriteLandedError` means the store holds the rows of the message its
   `landed` names, in store order, and no others; `WriteOutcomeUnknownError`
   means the manager can't tell whether the store holds some row of the
-  message, because the read of the store that would tell threw; any other
-  error means the store holds none of the message, so a host that stores the
-  message another way when an add throws can do so then, and not store it
-  twice. Both carry the write's own error as their `cause`, and their
-  messages end with the cause's message.
+  message, because the read of the store that would tell threw, or the write's
+  branch moved, so the manager can't read it; any other error means the store
+  holds none of the message, so a host that stores the message another way
+  when an add throws can do so then, and not store it twice. Both carry the
+  write's own error as their `cause`, and their messages end with the cause's
+  message.
   - `WriteLandedError` is thrown when a row stays: a message stored as one
     row, whose append failed after the row landed (the manager's own store
     listener failing inside it; a host's `onMessage` listener can't fail a
@@ -37,11 +38,13 @@
     could be read to tell that it did.
   - The add may have gone unheard: a failure in the manager's own listener
     ends the event before a host's `onMessage` listener hears it. A sharded
-    write's shards before the failing one were heard as each was stored, so
-    a listener that presents rows as they are added may have presented them.
-    Once a host presents rows, present only the rows of `landed` that
-    `windowStatusOf` reads `'out'`: `presentRows` refuses a row already in
-    the window. A `holdCompression` hold the add placed on them stays until
-    `releaseCompression(landed)`. `resetHeadWindow` rejects with either
-    error when its transition's add fails so, without resetting the head
-    window.
+    write's shards before the failing one were heard as each was stored, so a
+    listener that presents rows as they are added may have presented them.
+    Once a host presents rows, present the first row of `landed` that
+    `windowStatusOf` doesn't read `'in'`, if any, which `presentRows` takes as
+    naming the rest of the body: it refuses a row already in the window, and a
+    later shard whose earlier shards aren't all in it (where a listener took a
+    presented shard out again, say). A `holdCompression` hold the add placed
+    on them stays until `releaseCompression(landed)`. `resetHeadWindow`
+    rejects with either error when its transition's add fails so, without
+    resetting the head window.

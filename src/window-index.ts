@@ -94,11 +94,11 @@
  * a body, and a branch or a derive can cut between a body's shards. The
  * header is what switches the mode, and the write-down writes it last, so
  * such a prefix is not in effect: the manager stays in legacy mode, its
- * window still the whole record, and the next presentRows or retractRows
- * finishes the write-down in one record, the rows it hasn't written then
- * the header, before it does its own work. A body such an index holds in
- * part is completed, or put back whole, by present. Such an index is read
- * as one written in batches is; this version writes none.
+ * window still the whole record, and the next presentRows, or a retractRows
+ * that names a row, finishes the write-down in one record, the rows it
+ * hasn't written then the header, before it does its own work. A body such
+ * an index holds in part is completed, or put back whole, by present. Such
+ * an index is read as one written in batches is; this version writes none.
  *
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header

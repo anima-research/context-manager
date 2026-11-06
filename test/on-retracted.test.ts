@@ -10,18 +10,21 @@
  * rows again at the end of the window, rendered them twice, raw there and
  * inside the summary at their old place (the cm-integration TAG2..TAG5
  * probe on #291). The manager calls the hook once per call, after the rows
- * are out and before the call returns, fire and forget as onPresented; while
- * the strategy initializes the calls wait, and are made before the rows
- * presented meanwhile are heard. In legacy mode a removal takes the row out
- * of the record and the window at once, and nothing is called: a strategy
- * that folded the row keeps it, as it always has (#291 question 14).
+ * are out and before the call returns, fire and forget as onPresented (a
+ * retractRows that names rows the store no longer holds calls it a second
+ * time, for those, by their ids alone); while the strategy initializes the
+ * calls wait, and are made before the rows presented meanwhile are heard.
+ * In legacy mode a removal takes the row out of the record and the window
+ * at once, and nothing is called: a strategy that folded the row keeps it,
+ * as it always has (#291 question 14).
  *
  * A row the store no longer holds, removed through another manager, comes
- * by its id alone (`info.ids`, with `removed`), so every reader of a removed
- * row lets go of it (FW-CM-1). A row that left and was presented again
- * before the folding strategy heard it go is let go of at its old place when
- * the strategy hears it, and the open demotes the summary such a row leaves
- * non-contiguous instead of refusing the store.
+ * by its id alone (`info.ids`, with `removed`), so every reader of a
+ * removed row whose window the host repairs with retractRemoved or
+ * retractAbsentRows lets go of it (FW-CM-1). A row that left and was
+ * presented again before the folding strategy heard it go is let go of at
+ * its old place when the strategy hears it, and the open demotes the
+ * summary such a row leaves non-contiguous instead of refusing the store.
  */
 
 import { describe, it, after } from 'node:test';

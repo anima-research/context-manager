@@ -79,8 +79,10 @@ export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
  * order can differ from the record's, and a member's sequence needn't
  * ascend with its place. The two share the envelope and the receipt, so a
  * branch's receipts are listed across both, but a layout of one is never
- * compared with the other's: the first acceptance in the other format
- * writes a baseline, once per namespace and branch. Records of any other
+ * compared with the other's: an acceptance in the format other than that
+ * of the branch's newest record writes a baseline, so one is written at
+ * each switch of format on a branch, in each namespace (once, for a branch
+ * that is presented and stays so). Records of any other
  * format are not read: formats 1 and 2 were never released.
  */
 const SEQUENCE_FORMAT = 3;

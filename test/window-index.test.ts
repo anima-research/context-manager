@@ -3,7 +3,8 @@
  * rows a manager's agent has been shown, in what order, and how every
  * strategy read and compile follows it.
  *
- * - Legacy mode: until a host presents a row, the window is the merged
+ * - Legacy mode: until a host's first presentRows (presentRows([])
+ *   included) or a retractRows that names a row, the window is the merged
  *   record itself, read live, and nothing is written, so compiles are what
  *   they were. A reader that merges another slot keeps seeing it grow.
  * - The write-down: the first presentRows, or a retractRows that names a
@@ -605,7 +606,8 @@ describe('the window in presented mode', () => {
 });
 
 describe('a body partly in the window', () => {
-  // Each row presented is one record, so a presentRows cut short partway
+  // In an index written one record per item (pre-release builds;
+  // failIndexAppend writes one so), a presentRows cut short partway
   // through a sharded body, or a branch cut between its shards'
   // presentations, leaves the body's first shards in the window and the
   // rest out. Naming the body again completes it (FW-CM-3).

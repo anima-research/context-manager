@@ -20,9 +20,10 @@
  *   presented in one call is never split. (A row the write-down entered is
  *   cut at its own sequence, its body's last shard's, and the new branch is
  *   in legacy mode: see window-index-branches.test.ts.)
- * - A batch that throws writes nothing: a write-down leaves legacy mode as
- *   it was, a presentation enters no row and tells the strategy nothing, a
- *   retract takes nothing out, and the next call writes the whole of it.
+ * - A batch the store refuses writes nothing: a write-down leaves legacy
+ *   mode as it was, a presentation enters no row and tells the strategy
+ *   nothing, a retract takes nothing out, and the next call writes the
+ *   whole of it.
  * - A write-down an index written one record per item left cut short is
  *   finished in one record.
  * - A store handle without the batched append is refused at open, before
@@ -440,7 +441,7 @@ describe('a batch is one presentation point', () => {
   });
 });
 
-describe('a batch that throws writes nothing', () => {
+describe('a batch the store refuses writes nothing', () => {
   it('a write-down leaves legacy mode as it was, and the next call writes it whole in one record', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     const rows = ['a', 'b', 'c'].map((t) => cm.addMessage('User', [text(t)]));

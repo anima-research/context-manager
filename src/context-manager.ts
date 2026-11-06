@@ -430,9 +430,11 @@ export class InitializationSupersededError extends Error {
  * the strategy of none of its shards. Once a host presents rows on the
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
- * a host that presents each row as it is stored does: present only the
- * rows of `landed` that windowStatusOf reads `'out'`, since presentRows
- * refuses a row the window holds. Where the add placed a holdCompression
+ * a host that presents each row as it is stored does, or taken one out
+ * again: present the first row of `landed` that windowStatusOf doesn't
+ * read `'in'`, if any, which presentRows takes as naming the rest of the
+ * body, since it refuses a row the window holds and a later shard whose
+ * earlier shards aren't all in it. Where the add placed a holdCompression
  * hold on them, it stays: releaseCompression(landed) releases it.
  */
 export class WriteLandedError extends Error {
@@ -452,7 +454,8 @@ export class WriteLandedError extends Error {
 /**
  * An addMessage that failed where the manager can't tell whether the store
  * holds some row of the message: the read of the store that would tell
- * threw. What the manager does know, and the error the write failed with.
+ * threw, or the write's branch moved, so the manager can't read it. What
+ * the manager does know, and the error the write failed with.
  *
  * - `landed`: the rows of the message the manager knows the store holds, in
  *   store order. Possibly none.
@@ -498,8 +501,9 @@ export class WriteLandedError extends Error {
  * As for WriteLandedError, the add may have gone unheard; once a host
  * presents rows on the branch, a row of `landed` is out of the window until
  * it is presented, unless a listener of the add presented it already, so a
- * host presents only those windowStatusOf reads `'out'`; and a
- * holdCompression hold the add placed stays on any row of it that is
+ * host presents the first row of `landed` that windowStatusOf doesn't read
+ * `'in'`, if any, which presentRows takes as naming the rest of the body;
+ * and a holdCompression hold the add placed stays on any row of it that is
  * stored (getCompressionHolds lists it, and releaseCompression releases
  * it).
  *
@@ -1755,9 +1759,9 @@ export class ContextManager {
    * a write-down a pre-release build cut short, one record per stored row
    * (the call threw partway, or the process died before the store synced),
    * leaves the manager in legacy mode, its window still the whole record,
-   * and the next presentRows or retractRows, the boot call presentRows([])
-   * among them, finishes the write-down, in one record, before it does its
-   * own work.
+   * and the next presentRows, the boot call presentRows([]) among them, or
+   * a retractRows that names a row finishes the write-down, in one record,
+   * before it does its own work.
    *
    * On a branch whose window index another version wrote in a format this
    * one doesn't read, the window is the record (with a warning when the
@@ -1767,8 +1771,9 @@ export class ContextManager {
    * (ContextStrategy.onPresented) once they are in it and before this
    * returns, fire and forget: its failure is logged, and the rows stay
    * presented. The first call, which writes the legacy window down, enters
-   * no new row, so the strategy hears nothing: it heard each row as it was
-   * stored. A call the store refuses tells it nothing; a call that throws
+   * no row the window didn't already hold, which the strategy reads in its
+   * view, so it hears nothing. A call the store refuses tells it nothing;
+   * a call that throws
    * after the store kept part of it tells the strategy the rows that left
    * and entered before it, then throws; a call that completes a body tells
    * it only the shards that entered then. Where the write throws and
@@ -2007,11 +2012,11 @@ export class ContextManager {
   }
 
   /**
-   * `'legacy'` until the first presentRows or retractRows on the store's
-   * branch has written the window down whole, while the window is the
-   * merged record itself; `'presented'` after, even while the window holds
-   * no row. A write-down a pre-release build cut short leaves it
-   * `'legacy'` (see presentRows), as does an index in another version's
+   * `'legacy'` until the first presentRows, or a retractRows that names a
+   * row, on the store's branch has written the window down whole, while the
+   * window is the merged record itself; `'presented'` after, even while the
+   * window holds no row. A write-down a pre-release build cut short leaves
+   * it `'legacy'` (see presentRows), as does an index in another version's
    * format.
    */
   windowMode(): WindowMode {
@@ -2125,8 +2130,10 @@ export class ContextManager {
    *
    * With `afterSequence`, only the rows stored after that sequence: the
    * rows the whole listing gives whose sequence is greater, found by a
-   * binary search over the merged record, so the call walks the rows
-   * stored since and not the whole record. A shard of a body stored across
+   * binary search over the merged record's listing, so the call walks the
+   * rows stored since and not the whole record; the listing itself is
+   * built once per change of the record (with auxiliary slots, merged and
+   * sorted), as a compile's reads are. A shard of a body stored across
    * the cut is listed as the whole listing lists it. Throws a TypeError for
    * an `afterSequence` that isn't a number.
    */
@@ -2147,10 +2154,10 @@ export class ContextManager {
    * presented by a later write than its own, and the window can hold an
    * older row presented after a newer one. The write that presented such a
    * row is where branchAt cuts for it (a row the write-down entered it cuts
-   * at its own sequence); for a place in the record that follows a
-   * presentation, as derive's `atSequence` needs, read currentSequence()
-   * after the presentRows. For where the
-   * window reached, compare ordinals (indexLength, ordinalOf).
+   * at its own sequence, a body stored as shards at its last shard's); for
+   * a place in the record that follows a presentation, as derive's
+   * `atSequence` needs, read currentSequence() after the presentRows. For
+   * where the window reached, compare ordinals (indexLength, ordinalOf).
    */
   newestWindowSequence(): number | undefined {
     let last: number | undefined;
@@ -2230,10 +2237,11 @@ export class ContextManager {
    * named row's own sequence for a row the window doesn't hold and for
    * every row in legacy mode, so a body stored as shards and named by its
    * first shard's id is cut there; its body's last shard's own for a body
-   * the write-down presented; and the latest write that presented a shard
-   * of its body for any other row the window holds, which is the record of
-   * the whole presentRows call (see branchAt). The
-   * row can be in this manager's slot or an auxiliary one.
+   * the write-down presented; and for any other row the window holds, the
+   * latest write that presented a shard of its body, which is the record of
+   * the whole presentRows call (see branchAt), and never before its body's
+   * last shard's own sequence, so the new branch's record holds the whole
+   * body. The row can be in this manager's slot or an auxiliary one.
    * Throws `Message not found: <id>`, as branchAt does, for a row no merged
    * slot holds. It writes nothing.
    */
@@ -2248,7 +2256,10 @@ export class ContextManager {
 
   /**
    * The sequence branchAt cuts at for `message`: its own, unless the window
-   * holds it, and then the latest write that presented a shard of its body.
+   * holds it, and then the latest write that presented a shard of its body,
+   * or its body's last shard's own sequence where that is later (a shard
+   * presented before the rest of its body was stored), so the new branch's
+   * record holds the whole body.
    * That write (WindowIndex.write) is the record of the whole presentRows
    * call that presented it, so the cut keeps every row the call presented:
    * a batch is one presentation point. In an index a pre-release build

@@ -3,15 +3,16 @@
  * message is stored (#288).
  *
  * The manager calls a strategy's onNewMessage from its own store listener,
- * inside the append that stored the message. A host-written strategy whose
- * onNewMessage isn't async can throw there synchronously, or return no
- * promise at all. A throw is now logged as a rejection is, naming the
- * message, and a hook that returns no promise is no failure. Either way the
- * message stays stored: addMessage returns its id, every shard of a sharded
- * body is written, and a host's onMessage listener still hears the add. The
- * hook still runs inside the write, after a holdCompression hold is placed
- * and before addMessage returns, and the manager's own work around the call
- * still fails the write.
+ * inside the append that stored the message; a sharded body's shards it
+ * hears together, once every shard is stored, still before addMessage
+ * returns. A host-written strategy whose onNewMessage isn't async can throw
+ * there synchronously, or return no promise at all. A throw is now logged
+ * as a rejection is, naming the message, and a hook that returns no promise
+ * is no failure. Either way the message stays stored: addMessage returns
+ * its id, every shard of a sharded body is written, and a host's onMessage
+ * listener still hears the add. The hook still runs inside the write, after
+ * a holdCompression hold is placed and before addMessage returns, and the
+ * manager's own work around the call still fails the write.
  *
  * These run in legacy mode, where the manager's window is the record
  * (window-index.ts), so a stored row enters the window at its add and the

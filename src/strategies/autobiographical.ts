@@ -7236,7 +7236,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * non-contiguous (#122's cross-era merges, hand surgery): the demote
    * doesn't ask why, so such a store is demoted, not refused, at its first
    * open once a host presents. An operator who wants it kept for a repair
-   * opens it with `'report'` first.
+   * opens a copy with `topologyPolicy: 'report'` and `auditOnly: true` (a
+   * `'report'` open alone still runs releaseRowsThatLeft).
    *
    * Each summary the audit names is dropped, with every summary above it,
    * as onRetracted drops one (unfold). An L1's chunk record is compressed
@@ -7879,7 +7880,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * The rows are named by `info.ids`, every row that left, `rows` among
    * them: a row removed through another manager comes by its id alone, and
-   * is let go of as any other, so every reader of a removed row unfolds it,
+   * is let go of as any other, so every reader of a removed row whose
+   * window the host repairs (retractRemoved, retractAbsentRows) unfolds it,
    * not only the manager that removed it. So each L1 with one of the rows
    * among its sources is dropped, with every summary above it, as the open
    * drops a summary whose sources are gone: a summary the drop leaves

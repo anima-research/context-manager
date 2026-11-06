@@ -401,10 +401,13 @@ export interface ContextStrategy {
    * doesn't hear) and taken out of this window by its id, has no row to
    * give: it is in `info.ids` alone, with `removed: true`, and `rows` can be
    * empty. A strategy that keeps rows by id lets go of these as of the
-   * others, so that every reader of a removed row unfolds it, not only the
-   * manager that removed it.
+   * others, so that every reader of a removed row whose window the host
+   * repairs (ContextManager.retractRemoved, retractAbsentRows) unfolds it,
+   * not only the manager that removed it.
    *
-   * It is called once per call, before the call returns:
+   * It is called once per call, before the call returns, and a retractRows
+   * that names rows the store no longer holds calls it a second time, for
+   * those, by their ids alone:
    *
    * - from ContextManager.retractRows, after the rows are out of the
    *   window, with `undone` as the call gave it and `removed: false`. Rows
@@ -2186,8 +2189,10 @@ export interface AutobiographicalConfig {
    * rows are chunked again where the window holds them (an uncompressed
    * record whose rows the window holds apart is trimmed the same way). So
    * a store whose crossed ownership predates presentation is demoted, not
-   * refused, at its first open after a host presents; open it with
-   * `'report'` first to keep it for a repair. In legacy mode, and in an
+   * refused, at its first open after a host presents; to keep it for a
+   * repair, open a copy with `topologyPolicy: 'report'` and `auditOnly:
+   * true` (a `'report'` open alone still lets go of what covers a row out
+   * of the window). In legacy mode, and in an
    * audit-only open, nothing is demoted.
    * `'report'` logs the violations at error level and reports them through
    * `getCompressionDebt().topologyViolations` (state `critical`), and
