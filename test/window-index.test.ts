@@ -9,7 +9,8 @@
  *   they were. A reader that merges another slot keeps seeing it grow.
  * - The write-down: the first presentRows, or a retractRows that names a
  *   row, writes the window down, its header last, so one cut short leaves
- *   legacy mode and the next call finishes it. An index in another format
+ *   the manager in legacy mode, and the next presentRows, or a retractRows
+ *   that names a row, finishes it. An index in another format
  *   is read as the record and never written to.
  * - Presented mode: the window is the index. A row stored and not presented
  *   stays out of it; rows presented out of record order are compiled in

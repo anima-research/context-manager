@@ -23,8 +23,9 @@
  * removed row whose window the host repairs with retractRemoved or
  * retractAbsentRows lets go of it (FW-CM-1). A row that left and was
  * presented again before the folding strategy heard it go is let go of at
- * its old place when the strategy hears it, and the open demotes the
- * summary such a row leaves non-contiguous instead of refusing the store.
+ * its old place when the strategy hears it, and the open, under
+ * topologyPolicy 'reject' (the default), demotes the summary such a row
+ * leaves non-contiguous instead of refusing the store.
  */
 
 import { describe, it, after } from 'node:test';
@@ -1128,7 +1129,9 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     plain.presentRows([row]);
     plain.close();
 
-    // 'report' opens the store for inspection: it names the summaries and changes nothing.
+    // 'report' names the summaries and demotes none. (It would still let go
+    // of what covers a row out of the window, and write the load-time
+    // repairs: to inspect a store as it is, open a copy with auditOnly.)
     const inspected = new AutobiographicalStrategy({ ...FOLDING, topologyPolicy: 'report' });
     const inspector = await linesDuring(async () => {
       const open = await ContextManager.open({ path, namespace: 'agent', strategy: inspected, membrane: mockMembrane().membrane });

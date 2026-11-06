@@ -13,8 +13,9 @@
  *   the write-down comes before the write-down: the child is in legacy
  *   mode, its window the record, which holds the row.
  * - branchAt() cuts at the write that presented a row, the last of its
- *   body's shards, once a host presents, so the new branch's window holds
- *   the row; it finds a row of an auxiliary slot too. A row the window
+ *   body's shards, once a host presents, and never before its body's last
+ *   shard's own sequence, so the new branch's window holds the row and its
+ *   record the whole body; it finds a row of an auxiliary slot too. A row the window
  *   doesn't hold is cut at its own sequence, as in legacy mode. A row the
  *   write-down presented is cut at its own sequence too, and the new
  *   branch is in legacy mode; a body the write-down presented is cut at its

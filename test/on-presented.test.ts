@@ -6,9 +6,11 @@
  * manager stores it, and the strategy hears it from inside the add, as
  * onNewMessage did (#288; strategy-new-message-throw.test.ts pins that
  * order). Once a host presents rows, a stored row isn't in the window until
- * it is presented, so the strategy hears it from presentRows instead: once
- * per call, with the rows that entered, after they are in the window and
- * before presentRows returns, fire and forget. A hold is still placed at the
+ * it is presented, so the strategy hears it from presentRows instead: while
+ * the strategy is initialized, once per call, with the rows that entered,
+ * after they are in the window and before presentRows returns, fire and
+ * forget; while it isn't, the calls wait, and once it is, one call carries
+ * the rows still in the window, in window order. A hold is still placed at the
  * add. These are the presented-mode siblings of the #288 suite, and the
  * autobiographical strategy's chunk rebuild and background compression,
  * which follow the window: a stored row nobody presented is never folded.

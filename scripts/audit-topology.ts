@@ -1,7 +1,9 @@
 /**
  * Audit a store's summary topology: every summary whose leaves are not
- * contiguous among chunk-owned messages in store order (crossed ownership —
- * issue #122 cross-era merges, restore/branch interleavings, hand surgery).
+ * contiguous among chunk-owned messages in the order of the strategy's
+ * view, record order in legacy mode and window order once a host presents
+ * rows (crossed ownership — issue #122 cross-era merges, restore/branch
+ * interleavings, hand surgery).
  * It runs the same audit as `initialize` (topologyPolicy).
  *
  * Usage:

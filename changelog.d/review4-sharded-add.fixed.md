@@ -3,9 +3,11 @@
     or not a string, before any shard is stored. Such shards didn't read as
     one body, so a write that failed partway removed only the first of them
     and threw as if none stayed.
-  - An `addMessage` made while a sharded `addMessage` stores its shards (from
-    an `onMessage` listener of a shard's add, or a strategy hook that
-    listener runs by presenting a shard) is refused, with an error that says
+  - An `addMessage` on the same manager made while a sharded `addMessage` of
+    its stores its shards (from an `onMessage` listener of a shard's add, or
+    a strategy hook that listener runs by presenting a shard) is refused (one
+    through another manager sharing the slot isn't: `onMessage`'s contract
+    rules it out, as the listener's to avoid), with an error that says
     its row would land between the shards and split the body. Before, it
     landed there, and the cleanup of a write that then failed left the
     shards after it stored.
@@ -25,9 +27,11 @@
     `unnamed` 1, where a shard's append threw after the move). Before, the
     later shards landed on the other branch, and the cleanup of a write that
     failed looked for the first shard there.
-  - A `removeMessage` or `removeMessages` made while a sharded `addMessage`
-    stores its shards (from an `onMessage` listener of a shard's add) is
-    refused, with an error that says a removal then could split the body or
+  - A `removeMessage` or `removeMessages` on the same manager made while a
+    sharded `addMessage` of its stores its shards (from an `onMessage`
+    listener of a shard's add) is refused (one through another manager
+    sharing the slot isn't: `onMessage`'s contract rules it out), with an
+    error that says a removal then could split the body or
     move the rows the write removes if it fails. Before, it was taken: the
     body's later shards stayed with no first shard, and a write that then
     failed left them stored and threw as if none stayed.

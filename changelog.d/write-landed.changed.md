@@ -8,8 +8,10 @@
   shard, or a later shard where removing the shards before it failed too, or
   the read of which shards a failed removal left threw. The
   write's own error is the `cause` of both, and their messages end with that
-  error's message, so a check of the message still matches; a check of the
-  error's class meets the new classes instead. Every other failure of
+  error's message, so a check that the message contains or ends with it
+  still matches; one that compares the whole message, or is anchored at its
+  start, doesn't, and a check of the error's class meets the new classes
+  instead. Every other failure of
   `addMessage` throws what it threw before.
 - A sharded `addMessage` whose first shard's append threw, where the store
   couldn't be read to tell whether that shard landed, logged that removing
@@ -19,6 +21,8 @@
   add listener reads the window index, to tell whether a host presents rows
   on the branch (in legacy mode the strategy hears the row there). Where
   that read throws, an add that succeeded before fails after its row
-  landed: `addMessage` throws `WriteLandedError` naming the row, the
+  landed: `addMessage` throws `WriteLandedError` naming the row
+  (`WriteOutcomeUnknownError`, with `unnamed` 1, where the read of whether
+  the row landed throws too), the
   strategy isn't told the row entered, and an add listener registered
   after the manager's doesn't hear it.

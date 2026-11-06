@@ -1293,7 +1293,8 @@ export class StoreTopologyError extends Error {
         `; this open has already written its load-time repairs (and, once a host presents, what it demoted and let go of)` +
         `. Repair the store, or open it with topologyPolicy: 'report' and auditOnly: true to inspect it` +
         ` (that open still writes the load-time repairs of what readers can't use, and a 'report' open without auditOnly` +
-        ` writes every repair: to inspect the store as it is, open a copy of it).`,
+        ` also lets go of what covers a row out of the window, though only 'reject' demotes: to inspect the store as it is,` +
+        ` open a copy of it).`,
     );
     this.name = 'StoreTopologyError';
   }
