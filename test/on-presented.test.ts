@@ -9,7 +9,9 @@
  * it is presented, so the strategy hears it from presentRows instead: while
  * the strategy is initialized, once per call, with the rows that entered,
  * after they are in the window and before presentRows returns, fire and
- * forget; while it isn't, the calls wait, and once it is, one call carries
+ * forget (where the manager's own work around the call fails, such as the
+ * context it builds, that is logged and the call waits for the strategy's
+ * next notification); while it isn't, the calls wait, and once it is, one call carries
  * the rows still in the window, in window order. A hold is still placed at the
  * add. These are the presented-mode siblings of the #288 suite, and the
  * autobiographical strategy's chunk rebuild and background compression,

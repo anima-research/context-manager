@@ -2,8 +2,10 @@
  * Taking rows removed from the record out of a window that didn't hear them
  * go (agent-framework #291, CM-8).
  *
- * A removal through a manager takes the row out of that manager's window,
- * but another manager whose window holds the row, on the same slot or
+ * A removal through a manager takes the row out of that manager's window
+ * (except a removeMessages whose range's rows can't be read before it
+ * goes: those keep their ordinals, untold, until retractAbsentRows), but
+ * another manager whose window holds the row, on the same slot or
  * merging it as an auxiliary one, never hears it: the row leaves the
  * record and so its listing, while its ordinal stays issued (CM-T). A host
  * repairs that window with retractRemoved(ids), naming the rows a removal

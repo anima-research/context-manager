@@ -436,8 +436,10 @@ export class InitializationSupersededError extends Error {
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
  * a host that presents each row as it is stored does, or taken one out
- * again: on the branch the write started on (after a branch move, `cause`
- * names it: switch back to it first), present the first row of `landed`
+ * again: on the branch the store was on when addMessage was called (read
+ * currentBranch() before the call; where a listener's move stopped the
+ * write, `cause` names it too: switch back to it first), present the first
+ * row of `landed`
  * that windowStatusOf doesn't read `'in'`, if any, which presentRows takes
  * as naming the rest of the
  * body, since it refuses a row the window holds and a later shard whose
@@ -512,8 +514,10 @@ export class WriteLandedError extends Error {
  * As for WriteLandedError, the add may have gone unheard; once a host
  * presents rows on the branch, a row of `landed` is out of the window until
  * it is presented, unless a listener of the add presented it already, so a
- * host presents, on the branch the write started on (after a branch move,
- * `cause` names it: switch back to it first), the first row of `landed`
+ * host presents, on the branch the store was on when addMessage was
+ * called (read currentBranch() before the call: `cause` is the failing
+ * append's own error, which names no branch; switch back to it first), the
+ * first row of `landed`
  * that windowStatusOf doesn't read `'in'`, if any, which presentRows takes
  * as naming the rest of the body;
  * and a holdCompression hold the add placed stays on any row of it that is
@@ -1605,6 +1609,15 @@ export class ContextManager {
    * manager's strategy is told then, by the row's id, as this one's is told
    * here. A removal made while a sharded addMessage stores its shards (from
    * an onMessage listener of a shard's add) is refused (see onMessage).
+   *
+   * Except where a strategy hook the removal runs moves the store's branch:
+   * onCompressionHoldsReleased, run by the removal's release of holds, or a
+   * hook that hears what an earlier window write whose outcome was unknown
+   * did, which the tombstone's write settles first. Then nothing is taken
+   * out of the window of the branch the store is on, whose record may hold
+   * the row, and no strategy is told (a warning says so); on the removal's
+   * branch the row keeps its ordinal until retractAbsentRows takes it out
+   * there.
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
@@ -1775,9 +1788,14 @@ export class ContextManager {
    * branchSequenceOf, fork and derive on this manager are refused, as the
    * record holds only the shards stored so far), or move the store's
    * branch: the sharded write stops before its next shard and throws
-   * (WriteLandedError). A listener
+   * (WriteLandedError). It may present a shard it hears stored: that
+   * presents only the shards stored by then, the strategy hears that
+   * presentation at that call, and a later presentRows naming the body
+   * puts the rest in (see presentRows). A listener
    * that throws is logged, naming the message it missed, and the write it
-   * heard stands: the throw doesn't reach the caller. A listener that calls
+   * heard stands: the throw doesn't reach the caller, unless the log
+   * throws too (a console.error that throws), when the write fails as
+   * addMessage's errors say. A listener that calls
    * close() lets the write that ran it finish (see close()). Each call
    * registers its own listener and returns its own unsubscribe, so a function
    * registered twice hears each event twice.
@@ -1917,7 +1935,9 @@ export class ContextManager {
    * wrote a call cut short (it threw partway, or the process died before
    * the store synced) can have left a body's first shards in the window and
    * the rest out; so can a branch or a derive cut between its shards'
-   * presentations there. Such a body
+   * presentations there. So, in any index, can a host's onMessage listener
+   * of a shard's add that presents the shard while a sharded addMessage
+   * runs: it presents only the shards stored by then. Such a body
    * is completed, not refused: naming it, by its first shard's id or by the
    * first shard the window lacks, which getUnpresentedMessages lists with
    * the shards after it, presents only the shards it lacks, at the end of
@@ -2492,7 +2512,8 @@ export class ContextManager {
    * With `afterSequence`, only the rows stored after that sequence: the
    * rows the whole listing gives whose sequence is greater, found by a
    * binary search over the merged record's listing, so the call walks the
-   * rows stored since and not the whole record; the listing itself is
+   * rows stored since (and, for a cut inside a body, that body's shards
+   * before the cut) and not the whole record; the listing itself is
    * built once per change of the record (with auxiliary slots, merged and
    * sorted), as a compile's reads are. A shard of a body stored across
    * the cut is listed as the whole listing lists it. Throws a TypeError for
@@ -4633,7 +4654,9 @@ export class ContextManager {
     // and the strategy hears it inside the append: its synchronous part
     // comes before addMessage returns, after a holdCompression hold is
     // placed (#288). A sharded add's shards it hears together, once the
-    // last is stored (appendMessage), so no hook of its runs between them.
+    // last is stored (appendMessage), so no hook of its runs between them
+    // (a listener that presents a shard while the add runs hears that
+    // presentation at its own call: see onMessage).
     // Once a host presents rows on the branch, the row enters the window at
     // its presentRows, and the strategy hears it then.
     if (this.windowIndex.mode() === 'legacy') {

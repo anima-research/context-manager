@@ -4,7 +4,9 @@
  *
  * retractRows takes rows out of the window, as an undone turn's rows are
  * taken out, and once a host presents rows a removal through the manager
- * takes a removed row out too. Until this hook the strategy heard neither,
+ * takes a removed row out too (a removeMessages whose range's rows can't be
+ * read before it goes leaves them their ordinals, untold, until
+ * retractAbsentRows takes them out). Until this hook the strategy heard neither,
  * so the autobiographical strategy kept an undone row inside its summaries:
  * the compile went on showing it folded, and a redo, which presents the
  * rows again at the end of the window, rendered them twice, raw there and
