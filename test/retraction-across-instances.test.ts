@@ -140,6 +140,9 @@ interface Internals {
   summaries: SummaryEntry[];
   chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
   pendingCompressionWork: { chunk: { messages: Array<{ id: MessageId }>; recordId?: string } } | { sourceIds: readonly string[] } | null;
+  chunks: Array<{ messages: Array<{ id: MessageId }>; recordId?: string }>;
+  compressionQueue: number[];
+  pushSummary(entry: SummaryEntry): void;
 }
 const internals = (strategy: AutobiographicalStrategy) => strategy as unknown as Internals;
 
@@ -192,7 +195,7 @@ async function instanceA(make: () => AutobiographicalStrategy = strategyFor) {
 
 /** The list a state of the store holds (none written yet is an empty one). */
 const stored = (store: JsStore, id: string) =>
-  ((store.getStateJson(id) as Array<{ id: string; level?: number; sourceIds: string[]; compressed?: boolean }> | null) ?? []);
+  ((store.getStateJson(id) as Array<{ id: string; level?: number; sourceIds: string[]; compressed?: boolean; summaryId?: string }> | null) ?? []);
 
 describe('a retraction through another instance sharing the store', () => {
   it('a merge in flight over an L1 the other instance dropped writes nothing, and takes up the store', async () => {
@@ -705,6 +708,69 @@ describe('a retraction through another instance sharing the store', () => {
       store.close();
     }
   });
+
+  // Wave 5, finding 4: the paths that write without a model call (adopting
+  // an L1 the instance holds over the chunk's rows, dropping a chunk L1s
+  // already cover, a thin chunk's stub) asked nothing of the store or the
+  // window, so a chunk another instance let go of a row of was still
+  // adopted, dropped as covered, or stubbed over the row.
+  for (const path of ['a thin stub', 'an adoption', 'a covered drop'] as const) {
+    it(`${path} of a chunk the other instance let go of a row of writes nothing, and takes up the store`, async () => {
+      const thin = path === 'a thin stub';
+      const make = () => new AutobiographicalStrategy({
+        compressionModel: 'm',
+        targetChunkTokens: 50,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        autoTickOnNewMessage: false,
+        minChunkCharsForLLM: thin ? 1_000_000 : 0,
+        l1HoldbackChunks: 0,
+        mergeThreshold: 2,
+        maxSpeculativeL1s: 1,
+      });
+      const { store, strategy: A, cm: a, calls, membrane } = await instanceA(make);
+      let b: ContextManager | undefined;
+      try {
+        const chunk = internals(A).chunks[internals(A).compressionQueue[0]!]!;
+        const span = chunk.messages.map((m) => m.id);
+        const recordId = chunk.recordId!;
+        assert.ok(span.length >= 4, `premise: a queued chunk over rows to split: ${span.join()}`);
+        const row = span[1]!;
+        // An L1 the instance holds, written to the store, with the record
+        // not marked: one over the chunk's rows (adopted as it stands), or
+        // two that cover them between them (dropped as covered).
+        const l1 = (id: string, sourceIds: MessageId[]): SummaryEntry => ({
+          id, level: 1, content: `zz ${id}`, tokens: 5, sourceLevel: 0, sourceIds,
+          sourceRange: { first: sourceIds[0]!, last: sourceIds.at(-1)! }, created: 1,
+        } as SummaryEntry);
+        const seeded = path === 'an adoption'
+          ? [l1('L1-zz0', span)]
+          : path === 'a covered drop' ? [l1('L1-zz0', span.slice(0, 2)), l1('L1-zz1', span.slice(2))] : [];
+        for (const summary of seeded) internals(A).pushSummary(summary);
+
+        b = await ContextManager.open({ store, strategy: make(), membrane });
+        await linesDuring(async () => { b!.retractRows([row], { undone: true }); });
+        assert.ok(!stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), 'premise: the other instance gave the row up from the record');
+
+        const before = calls.length;
+        const lines = await linesDuring(async () => { await releasingUntil(calls, a.tick()); });
+        const summaries = stored(store, SUMMARIES);
+        assert.ok(summaries.every((s) => !s.sourceIds.includes(row)), `no summary covers the row: ${JSON.stringify(summaries.map((s) => [s.id, s.sourceIds]))}`);
+        const records = stored(store, CHUNKS);
+        assert.ok(records.every((r) => !r.sourceIds.includes(row)), `no record holds the row: ${JSON.stringify(records)}`);
+        assert.ok(records.every((r) => !r.compressed || summaries.some((s) => s.id === r.summaryId)), `no record is marked with a summary the store lacks: ${JSON.stringify(records)}`);
+        assert.ok(!lines.some((line) => line.includes('dedup guard')), `nothing is dropped as covered: ${lines.join('\n')}`);
+        assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), 'the instance took up the store');
+        assert.equal(calls.length, before, `no call is made: ${lines.join('\n')}`);
+        assert.ok(lines.some((line) => line.includes(`not compressing chunk ${recordId}`)), `the log says why: ${lines.join('\n')}`);
+      } finally {
+        for (const call of calls) call.release();
+        b?.close();
+        a.close();
+        store.close();
+      }
+    });
+  }
 
   it('an L1 in flight over a record no other instance changed is written (control)', async () => {
     const { store, cm: a, calls, membrane, strategy: A } = await instanceA();

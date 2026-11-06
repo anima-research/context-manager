@@ -6121,7 +6121,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * When another instance sharing the store let go of a row of the chunk's
    * span since its compression began (spanLetGoElsewhere), log it, saying
-   * what the compression doesn't write (`discarding`), and take it up. A
+   * what the compression doesn't write (`discarding`) and when the row
+   * went (`when`), and take it up. A
    * record changed in the store: this instance takes up the store's state,
    * and the rebuild from its records queues the record again over the rows
    * it keeps. A row out of the window the record still holds, or with no
@@ -6136,10 +6137,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ctx: StrategyContext,
     ordinals: ReadonlyMap<MessageId, number> | undefined,
     discarding: string,
+    when = 'mid-request',
   ): boolean {
     if (this.chunkRecordChangedInStore(chunk.recordId, sources)) {
       this.diag.warn(
-        `[autobiographical] ${discarding}: its chunk record ${chunk.recordId} changed in the store mid-request ` +
+        `[autobiographical] ${discarding}: its chunk record ${chunk.recordId} changed in the store ${when} ` +
           '(another instance sharing the store let go of a row of its span)',
       );
       this.takeUpStoreState();
@@ -6152,14 +6154,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (outOfWindow.length === 0 && moved.length === 0) return false;
     if (outOfWindow.length > 0) {
       this.diag.warn(
-        `[autobiographical] ${discarding}: row(s) [${outOfWindow.join(', ')}] of its span left the window mid-request ` +
+        `[autobiographical] ${discarding}: row(s) [${outOfWindow.join(', ')}] of its span left the window ${when} ` +
           'through another instance sharing the store, which this one did not hear',
       );
     }
     if (moved.length > 0) {
       this.diag.warn(
         `[autobiographical] ${discarding}: row(s) [${moved.join(', ')}] of its span left the window and were presented ` +
-          'again elsewhere in it mid-request, through another instance sharing the store, which this one did not hear',
+          `again elsewhere in it ${when}, through another instance sharing the store, which this one did not hear`,
       );
     }
     this.letGoOfRowsOutOfWindow([...outOfWindow, ...moved], ctx);
@@ -10614,6 +10616,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The span's ordinals in the window as the compression begins, which a
     // row presented again since no longer has (rowsMovedInWindow).
     const spanOrdinals = this.windowOrdinalsOf(chunk.messages.map((m) => m.id), ctx);
+
+    // Another instance sharing the store let go of a row of the span since
+    // this one chunked it, which this one didn't hear (spanLetGoElsewhere,
+    // as after the call below): the store no longer holds the chunk's
+    // record as this instance does, or a row of the span is out of the
+    // window, or the window holds one past every later row of it. The
+    // paths below that write without a call would then write over it: an
+    // adoption marks the record the store no longer holds as it was with an
+    // L1 the store may no longer hold, the covered drop pays off the span's
+    // quarantine debt, and a thin stub covers the row. So nothing is
+    // written, no call is made, and the instance takes it up
+    // (takeUpSpanLetGoElsewhere).
+    if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, `not compressing chunk ${chunk.recordId ?? `#${chunk.index}`}`, 'before its compression began')) return;
 
     // ---- Duplicate-formation guards (layered) ----
     // Merged from two independent fixes for the same disease:
