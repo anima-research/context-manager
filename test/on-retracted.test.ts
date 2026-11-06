@@ -601,6 +601,44 @@ describe('onRetracted', () => {
     writer.close();
   });
 
+  it("a waiting call's second call whose own work fails waits alone, and the rows told before it aren't told again", async () => {
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a, b]);
+    writer.removeMessage(b);
+    // The context for the second call, b's, can't be built: the manager's own work.
+    const own = cm as unknown as { createStrategyContext: () => unknown };
+    const build = own.createStrategyContext;
+    let builds = 0;
+    own.createStrategyContext = function (this: unknown) {
+      if (++builds === 2) throw new Error('zz the manager failed');
+      return build.call(this);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (own as { createStrategyContext?: unknown }).createStrategyContext;
+    }
+    assert.ok(lines.some((line) => line.includes('zz the manager failed')), lines.join('\n'));
+    assert.deepEqual(strategy.retracted.map((l) => l.info.ids), [[a]], 'setup: the first call was made');
+    cm.retractRows([c]);
+    assert.deepEqual(strategy.retracted.map((l) => [l.info.ids, l.info.removed]), [[[a], false], [[b], true], [[c], false]], 'b waited alone, and a is told once');
+    await settle();
+    cm.close();
+    writer.close();
+  });
+
   // CM #350 bot review finding 21: while initialization stays failed the
   // calls wait without bound, so what each keeps is kept small.
   it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {

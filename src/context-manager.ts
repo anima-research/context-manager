@@ -4594,9 +4594,15 @@ export class ContextManager {
           const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
           this.tellRetracted(held, info);
           if (gone.length > 0) {
-            const removed: Retraction = { undone: info.undone, removed: true };
-            if (scope === null || this.inHookScope(scope)) this.tellRetracted(gone, removed);
-            else queued.splice(i + 1, 0, { left: gone, info: removed });
+            const rest = { left: gone, info: { undone: info.undone, removed: true } };
+            if (scope === null || this.inHookScope(scope)) {
+              // Should the manager's own work around this call throw, it
+              // waits alone: the rows told before it aren't told again.
+              queued[i] = rest;
+              this.tellRetracted(rest.left, rest.info);
+            } else {
+              queued.splice(i + 1, 0, rest);
+            }
           }
         } catch (err) {
           logThrown(
