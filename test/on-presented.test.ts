@@ -848,6 +848,57 @@ describe("a body put back whole, whose onRetracted hook moves the store's branch
       cm.close();
     });
   }
+
+  // CM #350 bot review, wave 4, finding 32: the hook can take the body out
+  // again on the same branch, a nested write the manager allows.
+  it('a hook that takes the body out again, moving nothing else: the body is not heard entering a window that no longer holds it', async () => {
+    let cm!: ContextManager;
+    let body: MessageId | undefined;
+    class TakesItOut extends ShardingRecords {
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+        const name = body;
+        body = undefined;
+        if (name) cm.retractRows([name]);
+        return super.onRetracted(rows, ctx, info);
+      }
+    }
+    const strategy = new TakesItOut();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const doc = cm.addMessage('alice', [text('p0 '), text('p1 '), text('p2 ')]);
+    const shards = cm.getAllMessages().map((m) => m.id);
+    cm.presentRows([doc]);
+    // A retract cut short after the first shard's tombstone, in an index
+    // written one record per item: the first shard out, the later ones in.
+    const handle = store as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+    const append = handle.appendToStateJsonWithIdentity;
+    const batched = perItemIndexWrites(store);
+    let appends = 0;
+    handle.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+      if (id === windowIndexStateId('zz-agent') && ++appends === 2) throw new Error('zz-index-append-failed');
+      return append.call(this, id, ...rest);
+    };
+    try {
+      assert.throws(() => cm.retractRows([doc]), /zz-index-append-failed/);
+    } finally {
+      handle.appendToStateJsonWithIdentity = append;
+      batched();
+    }
+    assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['out', 'in', 'in'], 'setup: the first shard out, the later ones in');
+    strategy.heard = [];
+    strategy.retracted = [];
+    body = shards[0];
+    const errors = await errorsDuring(async () => {
+      cm.presentRows([shards[0]!]);
+      await settle();
+    });
+    assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['out', 'out', 'out'], 'setup: the hook took the body out again');
+    assert.deepEqual(strategy.retracted.map((r) => r.rows).sort((x, y) => x.length - y.length), [[shards[1], shards[2]], shards], 'the later shards leaving, and the body leaving again');
+    assert.deepEqual(strategy.heard, [], 'the window holds no shard of the body, so none is heard entering');
+    assert.deepEqual(errors, [], 'nothing failed');
+    cm.close();
+  });
 });
 
 // House review of #350, code finding 9: once rows are presented,

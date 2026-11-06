@@ -1961,9 +1961,11 @@ export class ContextManager {
    * whose first shard was out, which left so the body could enter whole
    * (WindowIndex.present), and the rows that entered, each read by
    * `rowOf`. The rows are found before either hook runs, since a hook can
-   * move the store's branch. The second call is made where the first's
-   * hook leaves it, as notifyPresented makes a row's call after another
-   * row's hook (deferPresented). Where the manager's own work around a
+   * move the store's branch, or take the rows that entered out of the
+   * window again. The second call is made where the first's hook leaves
+   * it, as notifyPresented makes a row's call after another row's hook
+   * (deferPresented): for the rows the window holds when it is made.
+   * Where the manager's own work around a
    * call throws (the rows' reading, the context it builds), no hook of
    * that call has run: the call's rows wait, as rows a delivery that
    * failed to read left waiting do, to be heard at the strategy's next
@@ -1977,7 +1979,19 @@ export class ContextManager {
       const scope = leftRows.length > 0 ? this.hookScope() : null;
       this.notifyRetracted(leftRows, { undone: false, removed: false });
       leftTold = true;
-      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
+      // The first call's hook may also have taken rows that entered out of
+      // the window again (a retractRows, a nested write the manager allows),
+      // moving nothing else: the second call then waits too, and is made
+      // for the rows the window holds when it is delivered. A read that
+      // throws can't tell, so they wait as well.
+      const stillIn = () => {
+        try {
+          return entered.every((id) => this.windowIndex.ordinalOf(id) !== undefined);
+        } catch {
+          return false;
+        }
+      };
+      if (scope === null || (this.inHookScope(scope) && stillIn())) this.notifyPresented(enteredRows);
       else this.deferPresented(enteredRows, false);
     } catch (error) {
       if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal }) => ({ id, ordinal })), info: { undone: false, removed: false } });
