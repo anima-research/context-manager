@@ -88,16 +88,18 @@ const ORDINAL_FORMAT = 4;
 type RecordFormat = typeof SEQUENCE_FORMAT | typeof ORDINAL_FORMAT;
 
 /**
- * A layout as the journal reads it. One without `keyedBy` is a `v: 2`
- * layout, which a compile returned before the window could be presented
+ * A layout as the journal reads it. A `v: 2` layout, which has no
+ * `keyedBy`, is one a compile returned before the window could be presented
  * (agent-framework #291) and a host can carry across the upgrade to accept:
  * its members were store sequences, so it is read as keyed by sequence,
- * with each member its own sequence. Any other layout is read as it is.
+ * with each member its own sequence. Any other layout is read as it is, so
+ * one of a later version without `keyedBy`, whose members may be ordinals,
+ * says nothing of what they count and is refused (formatFor).
  */
 function keyedLayout(layout: RenderedLayout): RenderedLayout {
-  const read = layout as Omit<RenderedLayout, 'keyedBy' | 'memberSequences'> &
-    Partial<Pick<RenderedLayout, 'keyedBy' | 'memberSequences'>>;
-  if (read.keyedBy !== undefined) return layout;
+  const read = layout as Omit<RenderedLayout, 'v' | 'keyedBy' | 'memberSequences'> &
+    Partial<Pick<RenderedLayout, 'keyedBy' | 'memberSequences'>> & { v: unknown };
+  if (read.v !== 2 || read.keyedBy !== undefined) return layout;
   return { ...layout, keyedBy: 'sequence', memberSequences: read.memberSequences ?? layout.members };
 }
 
