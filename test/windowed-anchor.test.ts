@@ -8,7 +8,9 @@
  * presented after it. A sequence anchor is converted where a branch is
  * first read in presented mode, to the ordinal of the first row in the
  * window stored at that sequence or after, so the window at the conversion
- * is the one the sequence gave; it is written as `{ anchor, ordinal, v: 2 }`
+ * is the one the sequence gave, where no row stored before the sequence has
+ * been presented after the row it names since the write-down; it is written
+ * as `{ anchor, ordinal, v: 2 }`
  * when it is made (an anchor of 0, the start, isn't written, since it
  * converts to the whole window whenever it is converted; a write that
  * fails is made again at the next read: see presentedAnchor), keeping the

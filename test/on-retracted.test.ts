@@ -1620,6 +1620,12 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     const later: MessageId[] = [];
     for (let i = TAGS; i < TAGS + 16; i++) later.push(cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
     const next = autobiographical();
+    const heard: Array<{ ids: readonly MessageId[]; undone: boolean }> = [];
+    const onRetracted = next.onRetracted.bind(next);
+    next.onRetracted = (rows, ctx, info) => {
+      heard.push({ ids: info.ids ?? rows.map((r) => r.id), undone: info.undone });
+      return onRetracted(rows, ctx, info);
+    };
     await linesDuring(async () => {
       const initialized = cm.setStrategy(next);
       cm.presentRows(later.slice(0, 2));
@@ -1628,6 +1634,7 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       cm.presentRows(later.slice(2));
       await initialized;
     });
+    assert.ok(heard.some((h) => h.undone && h.ids.includes(row)), 'the queued retraction reached the strategy, undone');
     // The open chunked the row with the rows around it at its new place;
     // the retraction heard after leaves it there, so that record has no
     // hole where the row stands.
