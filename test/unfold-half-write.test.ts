@@ -338,6 +338,139 @@ describe('a half-written unfold', () => {
     cm.close();
   });
 
+  // Wave 4, finding 7: a state write can land in the store and then throw.
+  // unfold set each mirror only once its write returned, so memory kept
+  // what the store no longer held, and the next unfold wrote it back: the
+  // L1 the retraction dropped, or the record holding the row, over a row
+  // out of the window. The strategy now reads the state back after a throw.
+  for (const [label, failing, unreadable] of [
+    ['the summaries', 'summaries', false],
+    ['the chunk records', 'chunks', false],
+    ['the merge queue', 'queue', false],
+    ['the summaries, where the read back throws too', 'summaries', true],
+  ] as const) {
+    it(`a retraction whose state write lands and then throws (${label}) leaves memory as the store holds it, and the next one writes nothing back`, async () => {
+      const path = freshPath();
+      const strategy = new AutobiographicalStrategy(FOLDING);
+      const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+      cm.presentRows([]);
+      const ids: MessageId[] = [];
+      for (let i = 0; i < 24; i++) {
+        const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+        cm.presentRows([id]);
+        ids.push(id);
+      }
+      await drain(cm);
+      const row = ids[3]!;
+      const state = internals(strategy);
+      const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+      const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+      assert.ok(covering && second, `${label}: premise: an L1 over the row and one beside it`);
+      const later = second.sourceIds[0]!;
+      const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+      // A merge queued over the L1 the retraction drops, so the queue is written too.
+      const queued = [{ level: 2, sourceIds: [covering.id, second.id] }];
+      state.mergeQueue = queued;
+      store.setStateJson(state.mergeQueueStateId, queued);
+
+      const id = { summaries: state.summariesStateId, chunks: state.chunksStateId, queue: state.mergeQueueStateId }[failing];
+      const realWrite = store.setStateJson;
+      const realRead = store.getStateJson;
+      let threw = false;
+      let readFails = false;
+      store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+        const result = realWrite.call(this, stateId, ...rest);
+        if (stateId === id && !threw) {
+          threw = true;
+          readFails = unreadable;
+          throw new Error(`zz the write of ${stateId} landed, then threw`);
+        }
+        return result;
+      };
+      store.getStateJson = function (this: unknown, stateId: string) {
+        if (readFails && stateId === id) {
+          readFails = false;
+          throw new Error(`zz the read of ${stateId} threw`);
+        }
+        return realRead.call(this, stateId);
+      };
+      let lines: string[];
+      try {
+        lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+      } finally {
+        delete (store as { setStateJson?: unknown }).setStateJson;
+        delete (store as { getStateJson?: unknown }).getStateJson;
+      }
+      assert.ok(threw && lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('landed, then threw')), `${label}: premise: ${lines.join('\n')}`);
+      const ofStore = (stateId: string) => ((store.getStateJson(stateId) as Array<{ id?: string }> | null) ?? []);
+      assert.deepEqual(state.summaries.map((s) => s.id), ofStore(state.summariesStateId).map((s) => s.id), `${label}: the summaries in memory are the store's`);
+      assert.deepEqual(state.chunkRecords, ofStore(state.chunksStateId), `${label}: the chunk records in memory are the store's`);
+      assert.deepEqual(state.mergeQueue, ofStore(state.mergeQueueStateId), `${label}: the queue in memory is the store's`);
+      assert.ok(state.chunks.every((chunk) => !chunk.messages.some((m) => m.id === row)), `${label}: the chunks were rebuilt over the window`);
+
+      // The next retraction writes from memory: nothing the first dropped comes back.
+      await linesDuring(async () => { cm.retractRows([later], { undone: true }); });
+      const summaries = ofStore(state.summariesStateId) as SummaryEntry[];
+      assert.ok(summaries.every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `${label}: no summary covers the row again: ${summaries.map((s) => s.id).join(', ')}`);
+      if (failing !== 'summaries') {
+        const records = ofStore(state.chunksStateId) as Array<{ id: string; sourceIds: string[] }>;
+        assert.ok(records.every((r) => !r.sourceIds.includes(row)), `${label}: no record holds the row again: ${JSON.stringify(records)}`);
+      }
+      cm.close();
+    });
+  }
+
+  it("a retraction whose summaries write throws without landing, and whose read back throws too, takes the let-go's side: the next retraction's write of the summaries drops the L1 from the store", async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+    assert.ok(covering && second, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    const realWrite = store.setStateJson;
+    const realRead = store.getStateJson;
+    let readFails = false;
+    store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+      if (stateId === state.summariesStateId) {
+        readFails = true;
+        throw new Error(`zz the store refused the write of ${stateId}`);
+      }
+      return realWrite.call(this, stateId, ...rest);
+    };
+    store.getStateJson = function (this: unknown, stateId: string) {
+      if (readFails && stateId === state.summariesStateId) {
+        readFails = false;
+        throw new Error(`zz the read of ${stateId} threw`);
+      }
+      return realRead.call(this, stateId);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+      delete (store as { getStateJson?: unknown }).getStateJson;
+    }
+    assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `premise: ${lines.join('\n')}`);
+    const ofStore = () => ((store.getStateJson(state.summariesStateId) as SummaryEntry[] | null) ?? []);
+    assert.ok(ofStore().some((s) => s.id === covering.id), "premise: the store's summaries still hold the L1");
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), 'memory holds what the write meant to put');
+    await linesDuring(async () => { cm.retractRows([second.sourceIds[0]!], { undone: true }); });
+    assert.ok(ofStore().every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `the next retraction's write drops it from the store: ${ofStore().map((s) => s.id).join(', ')}`);
+    cm.close();
+  });
+
   it("under 'report' and in an audit-only open, the record is left as it was found", async () => {
     for (const config of [{ topologyPolicy: 'report' as const }, { topologyPolicy: 'report' as const, auditOnly: true }]) {
       const path = freshPath();

@@ -8192,9 +8192,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunk.messages.some((m) => leaving.has(m.id))) this._spanLeftWindow.add(chunk);
     }
     // The chunks are rebuilt over the window whatever the writes do: a write
-    // that throws (unfold) leaves the mirrors as the store holds them, and
-    // the chunks then still held the row. What the writes didn't do, the
-    // next open repairs, as after a stop between them.
+    // that throws (unfold) leaves the mirrors as the store holds them, read
+    // back where it can be, and the chunks then still held the row. What
+    // the writes didn't do, the next open repairs, as after a stop between
+    // them.
     try {
       const unfolded = this.unfoldRowsThatLeft(leaving, ctx);
       if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
@@ -8337,11 +8338,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * The summaries are written first, then the records, then the queue,
    * each a write of its own: the store writes no two states at once. Each
-   * is set in memory once its write returns, so a write that throws leaves
-   * this instance holding what the store holds, and the writes after it
-   * aren't made. Should the records' write not follow, the open makes a record whose L1
-   * it lacks compressible again (releaseUnsummarizedRecords) and, once a
-   * host presents, trims one whose rows the window holds apart to its
+   * is set in memory once its write returns. A write that throws may have
+   * landed first, so its state is read back, and memory takes what the
+   * write put where the store holds it and keeps what it held where the
+   * store doesn't; where the store can't be read to tell, memory takes
+   * what the write put, so this instance writes nothing back that it let
+   * go of (writeUnfolded). The writes after it aren't made. Should the
+   * records' write not follow, the open makes a record whose L1 it lacks
+   * compressible again (releaseUnsummarizedRecords) and, once a host
+   * presents, trims one whose rows the window holds apart to its
    * longest run (demoteSplitSummaries); should the queue's not follow, the
    * load drops a queued merge naming a summary it doesn't keep. The other
    * order is no safer: a record written without its L1 while the L1 stays
@@ -8397,18 +8402,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mergeQueue = dropped.size === 0 ? this.mergeQueue : this.mergeQueue.filter((merge) => !merge.sourceIds.some((id) => dropped.has(id)));
 
     if (dropped.size > 0) {
-      this.store?.setStateJson(this.summariesStateId, summaries);
-      this.summaries = summaries;
+      this.writeUnfolded(this.summariesStateId, summaries, () => { this.summaries = summaries; });
     }
     if (refolded.length > 0 || emptied.length > 0) {
-      this.store?.setStateJson(this.chunksStateId, records);
-      this.chunkRecords = records;
+      this.writeUnfolded(this.chunksStateId, records, () => { this.chunkRecords = records; });
     }
     if (mergeQueue.length !== this.mergeQueue.length) {
-      this.store?.setStateJson(this.mergeQueueStateId, mergeQueue);
-      this.mergeQueue = mergeQueue;
+      this.writeUnfolded(this.mergeQueueStateId, mergeQueue, () => { this.mergeQueue = mergeQueue; });
     }
     return { dropped: [...dropped], orphaned, refolded, emptied };
+  }
+
+  /**
+   * One of unfold's writes: `value` to the state `stateId`, then `take`,
+   * which sets it in memory. A write can land in the store and then throw,
+   * so where it throws the state is read back: memory takes `value` where
+   * the store holds it, and keeps what it held where the store doesn't.
+   * Where the read throws too, memory takes `value`, the side of the
+   * let-go: it then holds nothing the unfold dropped, so no later write of
+   * that state from memory puts it back (the next unfold's writes the whole
+   * state, as it meant to be); what the store may still hold, the next
+   * open repairs, as after a stop between the writes. The write's own
+   * error is thrown on, so the writes after it aren't made.
+   */
+  private writeUnfolded(stateId: string, value: unknown, take: () => void): void {
+    try {
+      this.store?.setStateJson(stateId, value);
+    } catch (error) {
+      let landed = true;
+      try {
+        landed = canonicalJson(this.store?.getStateJson(stateId) ?? null) === canonicalJson(value);
+      } catch {
+        // The store can't say: the let-go's side.
+      }
+      if (landed) take();
+      throw error;
+    }
+    take();
   }
 
   private windowGrew(operation: string, ctx: StrategyContext): void {
