@@ -771,4 +771,51 @@ describe("a removal from the strategy's hook for holds a removal released", () =
       cm.close();
     }
   });
+
+  // CM #350 bot review, wave 4, finding 8: the hook can move the store's
+  // branch before the removal takes its rows out of the window.
+  it("one that moves the store's branch leaves the other branch's window and strategy as they were, and logs that the rows keep their ordinals where they were removed", async () => {
+    /** Records, moving the manager to `target` from onCompressionHoldsReleased. */
+    class SwitchesOnRelease extends Records {
+      cm!: ContextManager;
+      target: string | null = null;
+      switching: Promise<void> | undefined;
+      onCompressionHoldsReleased(): void {
+        const name = this.target;
+        this.target = null;
+        if (name) this.switching = this.cm.switchBranch(name);
+      }
+    }
+    for (const remove of ['removeMessage', 'removeMessages'] as const) {
+      const strategy = new SwitchesOnRelease();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      strategy.cm = cm;
+      cm.presentRows([]);
+      const a = cm.addMessage('alice', [text('a')]);
+      const b = cm.addMessage('alice', [text('b')], undefined, undefined, { holdCompression: true });
+      const c = cm.addMessage('alice', [text('c')]);
+      cm.presentRows([a, b, c]);
+      const start = cm.currentBranch().name;
+      // A branch made before the removal: its record and window hold every row.
+      const other = cm.getStore().createBranch(`zz-before-${remove}`).name;
+      strategy.target = other;
+      const removed = remove === 'removeMessage' ? [b] : [a, b, c];
+      const lines = await linesDuring(() => (remove === 'removeMessage' ? cm.removeMessage(b) : cm.removeMessages(a, c)));
+      await strategy.switching;
+      assert.equal(cm.currentBranch().name, other, `${remove}, setup: the hook moved the store`);
+      assert.deepEqual(cm.getAllMessages().map((m) => m.id), [a, b, c], `${remove}: the other branch's record holds every row`);
+      assert.deepEqual(ordinals(cm, removed).map((o) => o !== undefined), removed.map(() => true), `${remove}: and its window still holds the rows`);
+      assert.deepEqual(strategy.retracted, [], `${remove}: no strategy was told the rows left`);
+      assert.ok(
+        lines.some((line) => line.includes(`moved the store's branch from ${start} to ${other}`) && line.includes('retractAbsentRows')),
+        `${remove}: ${lines.join('\n')}`,
+      );
+      await cm.switchBranch(start);
+      assert.deepEqual(cm.getAllMessages().map((m) => m.id), remove === 'removeMessage' ? [a, c] : [], `${remove}: the removal stands where it was made`);
+      cm.retractAbsentRows();
+      assert.deepEqual(ordinals(cm, removed), removed.map(() => undefined), `${remove}: retractAbsentRows takes the rows out there`);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
+  });
 });

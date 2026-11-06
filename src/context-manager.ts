@@ -4294,17 +4294,20 @@ export class ContextManager {
         // it, so it leaves the window even when that throws. What this
         // removal read of it is taken now: the strategy's hook for the holds
         // it releases can remove a row too, which sets the slot and clears it.
+        // So is the branch it was removed on: that hook can move the store.
         const removing = this.removing;
+        const removedOn = this.removalBranch();
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          this.retractOnRemoval([event.messageId], removing?.rows ?? []);
+          if (this.stillOnRemovalBranch(removedOn, [event.messageId])) this.retractOnRemoval([event.messageId], removing?.rows ?? []);
         }
         break;
       }
       case 'removeRange': {
         // As for 'remove', before any hook runs.
         const removing = this.removing;
+        const removedOn = this.removalBranch();
         // Ids of the removed span aren't in the event; prune holds whose
         // message no longer exists.
         try {
@@ -4331,11 +4334,52 @@ export class ContextManager {
           // merges would read as removed and leave the window for good. The
           // rows leave the window even when the pruning throws, as the
           // 'remove' case's row does.
-          if (removing) this.retractOnRemoval(removing.ids, removing.rows);
+          if (removing && this.stillOnRemovalBranch(removedOn, removing.ids)) this.retractOnRemoval(removing.ids, removing.rows);
         }
         break;
       }
     }
+  }
+
+  /** The store's branch as a removal's event finds it, before any hook runs; null where the store can't say. */
+  private removalBranch(): { id: string; name: string } | null {
+    try {
+      const branch = this.store.currentBranch();
+      return { id: branch.id, name: branch.name };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Whether the store is still on `removedOn`, the branch a removal was
+   * made on, once the hooks its event ran have returned: the strategy's
+   * onCompressionHoldsReleased can move it (switchBranch, before its first
+   * await). Where it moved, the removal's rows aren't taken out of the
+   * window of the branch the store is on now, whose record may hold them,
+   * and no strategy is told, as a window write after a hook moved the
+   * store writes nothing (WindowIndex.settled). The move is logged: on the
+   * removal's branch the rows keep their ordinals until retractAbsentRows
+   * takes them out there and tells the strategy. Where the store can't say
+   * its branch, before the hooks or after, the removal's rows leave the
+   * window as before.
+   */
+  private stillOnRemovalBranch(removedOn: { id: string; name: string } | null, ids: readonly MessageId[]): boolean {
+    if (removedOn === null) return true;
+    let now: { id: string; name: string };
+    try {
+      now = this.store.currentBranch();
+    } catch {
+      return true;
+    }
+    if (now.id === removedOn.id) return true;
+    const rows = ids.length === 1 ? `removed message ${ids[0]}` : `${ids.length} removed messages`;
+    this.diag.warn(
+      `[context-manager] a strategy hook the removal of ${rows} ran moved the store's branch from ${removedOn.name} to ${now.name}, ` +
+        `so nothing is taken out of the window of ${now.name}, whose record may hold them, and no strategy is told; on ` +
+        `${removedOn.name} they keep their ordinals until retractAbsentRows takes them out there`,
+    );
+    return false;
   }
 
   /**
