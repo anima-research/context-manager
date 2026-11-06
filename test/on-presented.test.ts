@@ -678,8 +678,9 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
     const strategy = new Reacts(() => cm.close());
     let ids: MessageId[] = [];
     let ordinals: number[] = [];
+    const path = freshPath();
     const errors = await errorsDuring(async () => {
-      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy });
       cm.presentRows([]);
       ids = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)]));
       ordinals = cm.presentRows(ids);
@@ -690,6 +691,13 @@ describe("a row's onNewMessage hook that closes the manager or sets a strategy",
     assert.equal(ordinals.length, 3, 'presentRows finished the write and returned every ordinal');
     assert.deepEqual(errors, []);
     assert.ok(cm.isClosed());
+    // CM #350 bot review, wave 4, finding 33: the store, which close()
+    // closed, holds the presentation.
+    const reopened = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    assert.equal(reopened.windowMode(), 'presented');
+    assert.deepEqual(reopened.getPresentedMessages().map((m) => m.id), ids, 'the window holds every row presented, in order');
+    assert.deepEqual(ids.map((id) => reopened.ordinalOf(id)), ordinals, 'at the ordinals presentRows returned');
+    reopened.close();
   });
 
   it('a hook that sets a strategy: the one it replaced hears no more, and the rest reach the new one after its initialize', async () => {
@@ -1422,6 +1430,10 @@ describe('the autobiographical strategy follows the window', () => {
     await sleep(200);
     assert.equal(strategy.rebuilds, rebuilds, 'no add rebuilt the chunks');
     assert.equal(calls.length, 0, 'no row is in the window, so nothing is chunked and no compression starts');
+    // CM #350 bot review, wave 4, finding 21: work scheduled from the adds
+    // that reaches the membrane after the sleep would pass the check above;
+    // nothing queued or pending can't.
+    assert.ok(manager.isReady(), 'nothing is queued or pending to compress');
 
     manager.presentRows(shown);
     assert.equal(strategy.rebuilds, rebuilds + 1, 'presentRows rebuilt the chunks over the window, once, before it returned');
