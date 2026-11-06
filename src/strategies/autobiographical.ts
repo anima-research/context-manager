@@ -6172,11 +6172,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * them (rowsOutOfWindow): it takes up the store's state, which holds
    * whatever of that instance's let-go was written, then lets go of the
    * rows as its own onRetracted would have (windowLost), which writes what
-   * that instance's failed writes didn't.
+   * that instance's failed writes didn't, with every other row out of the
+   * window the store still folds (takeUpStoreBeforeLetGo).
    */
   private letGoOfRowsOutOfWindow(rows: readonly MessageId[], ctx: StrategyContext): void {
-    this.takeUpStoreState();
-    this.windowLost(new Set(rows), ctx);
+    const leaving = new Set(rows);
+    this.takeUpStoreBeforeLetGo(leaving, ctx);
+    this.windowLost(leaving, ctx);
   }
 
   /** The rows under `sources`: each L1's sources, and those of the L1s under a higher summary this instance holds. */
@@ -8164,6 +8166,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summary the new place of a row presented again leaves non-contiguous
    * (demoteSplitSummaries).
    *
+   * Another instance sharing the store doesn't hear the rows that leave
+   * this one's window, nor this one its, and each writes the summaries and
+   * chunk records whole. So where the store's are no longer as this
+   * instance holds them, it first takes them up (takeUpStoreState), and
+   * lets go, beside the rows it is told of, of each row out of the window
+   * that what it took up still folds: the other instance's let-go stands,
+   * and this one writes back nothing it dropped.
+   *
    * `undone` and `removed` change none of this: an undone row, a row taken
    * out and a removed row have each left. The manager doesn't call this for a removal
    * in legacy mode, so a row removed there stays in what folded it, as it
@@ -8178,7 +8188,79 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.requireLoadedBranch('onRetracted');
     const leaving = new Set<MessageId>(info?.ids ?? []);
     for (const row of rows) leaving.add(row.id);
+    // Another instance sharing the store may have let go of rows of its own
+    // since this one read the store, which this one didn't hear: its
+    // summaries and chunk records are then the store's, not this
+    // instance's, and the writes below are of the whole states.
+    if (leaving.size > 0 && this.storeWrittenElsewhere()) {
+      const also = this.takeUpStoreBeforeLetGo(leaving, ctx);
+      this.diag.warn(
+        `[autobiographical] the store's summaries or chunk records aren't as this instance holds them (another instance ` +
+          `sharing the store wrote them, or a write of this one's threw and couldn't be read back): took them up before ` +
+          `letting go of ${leaving.size} row(s)${also.length > 0 ? `, among them [${also.join(', ')}], out of the window and still folded there` : ''}`,
+      );
+    }
     this.windowLost(leaving, ctx);
+  }
+
+  /**
+   * Whether the store's summaries or chunk records differ from what this
+   * instance holds, compared as the store keeps them (storedCanonicalJson):
+   * another instance sharing the store wrote them since this one read
+   * them, as its onRetracted writes them whole when a row leaves its
+   * window, which this instance doesn't hear; or a write of this
+   * instance's threw, and memory went ahead of what the store may hold
+   * (writeUnfolded, where the read back threw too; pushSummary). Where the
+   * store can't be read, nothing is known to differ.
+   */
+  private storeWrittenElsewhere(): boolean {
+    const store = this.store;
+    if (!store) return false;
+    try {
+      const differs = (stateId: string, mirror: unknown): boolean =>
+        canonicalJson(store.getStateJson(stateId) ?? []) !== storedCanonicalJson(mirror);
+      return differs(this.summariesStateId, this.summaries) ||
+        (this.chunkPersistenceEnabled && differs(this.chunksStateId, this.chunkRecords));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Take up the store's state (takeUpStoreState) before a let-go of
+   * `leaving`, and add to it each row out of the window that what the
+   * store holds still folds (foldedRowsOutOfWindow), returning those it
+   * added. The store can fold a row this instance let go of in memory
+   * only, where its write threw and couldn't be read back (writeUnfolded),
+   * or one another instance took out whose own writes failed; the let-go
+   * then writes the whole states without it, as the next open would
+   * (releaseRowsThatLeft).
+   */
+  private takeUpStoreBeforeLetGo(leaving: Set<MessageId>, ctx: StrategyContext): MessageId[] {
+    this.takeUpStoreState();
+    const also: MessageId[] = [];
+    for (const id of this.foldedRowsOutOfWindow(ctx)) {
+      if (leaving.has(id)) continue;
+      leaving.add(id);
+      also.push(id);
+    }
+    return also;
+  }
+
+  /**
+   * The rows out of the window (WindowIndexView.left) that this instance
+   * still folds: among an L1's sources or a chunk record's. None in legacy
+   * mode, or where the view can't say.
+   */
+  private foldedRowsOutOfWindow(ctx: StrategyContext): Set<MessageId> {
+    const folded = new Set<MessageId>();
+    const left = ctx.window?.left?.();
+    if (!left || left.size === 0) return folded;
+    for (const summary of this.summaries) {
+      if (summary.level === 1) for (const id of summary.sourceIds) if (left.has(id)) folded.add(id);
+    }
+    for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) folded.add(id);
+    return folded;
   }
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
@@ -8242,13 +8324,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private releaseRowsThatLeft(ctx: StrategyContext): void {
     if (ctx.window?.mode() !== 'presented' || this.config.auditOnly) return;
-    const left = ctx.window.left?.();
-    if (!left || left.size === 0) return;
-    const leaving = new Set<MessageId>();
-    for (const summary of this.summaries) {
-      if (summary.level === 1) for (const id of summary.sourceIds) if (left.has(id)) leaving.add(id);
-    }
-    for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) leaving.add(id);
+    const leaving = this.foldedRowsOutOfWindow(ctx);
     if (leaving.size === 0) return;
     const unfolded = this.unfoldRowsThatLeft(leaving, ctx);
     this.diag.warn(
@@ -8423,9 +8499,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summary's text that holds one doesn't read as a write that didn't land.
    * Where the read throws too, memory takes `value`, the side of the
    * let-go: it then holds nothing the unfold dropped, so no later write of
-   * that state from memory puts it back (the next unfold's writes the whole
-   * state, as it meant to be); what the store may still hold, the next
-   * open repairs, as after a stop between the writes. The write's own
+   * that state from memory puts it back; what the store may still hold,
+   * the next let-go repairs (onRetracted finds the store apart from memory,
+   * takes it up and lets go of each row out of the window it still folds),
+   * or the next open, as after a stop between the writes. The write's own
    * error is thrown on, so the writes after it aren't made.
    */
   private writeUnfolded(stateId: string, value: unknown, take: () => void): void {

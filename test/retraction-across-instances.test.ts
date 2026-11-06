@@ -662,6 +662,50 @@ describe('a retraction through another instance sharing the store', () => {
     }
   });
 
+  // Wave 5, finding 3: a strategy's own let-go (onRetracted) wrote the
+  // summaries and chunk records whole from its memory, which another
+  // instance's let-go had changed in the store unheard: it wrote back the L1
+  // and the record that instance had dropped and given the row up from.
+  it("a retraction through this instance, after the other instance let go of a row of its own, writes back nothing the other dropped", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const [first, second] = internals(A).summaries.filter((s) => s.level === 1);
+      assert.ok(first && second, 'premise: two L1s');
+      const rowA = first.sourceIds[0]!;
+      const rowB = second.sourceIds[0]!;
+      const recordB = internals(A).chunkRecords.find((r) => r.summaryId === second.id)!.id;
+
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      await linesDuring(async () => { b!.retractRows([rowB], { undone: true }); });
+      assert.ok(!stored(store, SUMMARIES).some((s) => s.id === second.id), 'premise: the other instance dropped its L1 in the store');
+      assert.ok(internals(A).summaries.some((s) => s.id === second.id), 'premise: this instance, which did not hear it, still holds it');
+
+      const lines = await linesDuring(async () => { a.retractRows([rowA], { undone: true }); });
+      const summaries = stored(store, SUMMARIES);
+      assert.ok(
+        summaries.every((s) => s.id !== first.id && s.id !== second.id && !s.sourceIds.includes(rowA) && !s.sourceIds.includes(rowB)),
+        `no summary covers either row: ${JSON.stringify(summaries.map((s) => [s.id, s.sourceIds]))}\n${lines.join('\n')}`,
+      );
+      const records = stored(store, CHUNKS);
+      assert.ok(records.every((r) => !r.sourceIds.includes(rowA) && !r.sourceIds.includes(rowB)), `no record holds either row: ${JSON.stringify(records)}`);
+      const refolded = records.find((r) => r.id === recordB);
+      assert.ok(refolded && !refolded.compressed, `the other instance's record stays refolded: ${JSON.stringify(refolded)}`);
+      assert.deepEqual(internals(A).summaries.map((s) => s.id), summaries.map((s) => s.id), "this instance's summaries are the store's");
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
   it('an L1 in flight over a record no other instance changed is written (control)', async () => {
     const { store, cm: a, calls, membrane, strategy: A } = await instanceA();
     let b: ContextManager | undefined;
