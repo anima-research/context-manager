@@ -59,13 +59,14 @@ class SeedableStrategy extends AutobiographicalStrategy {
     sourceRange: { first: string; last: string },
     sourceIds: string[],
     parentId?: string,
+    sourceLevel: SummaryLevel = 0,
   ): SummaryEntry {
     const entry: SummaryEntry = {
       id: `L${level}-${this.nextSummaryIdCounter()}`,
       level,
       content,
       tokens: Math.ceil(content.length / 4),
-      sourceLevel: 0,
+      sourceLevel,
       sourceIds,
       sourceRange,
       created: Date.now(),
@@ -264,6 +265,33 @@ describe('SummaryOverviewStrategy — listSummariesInRange / getMaxSummaryLevel'
     );
     assert.deepEqual([at(three.id).startMs, at(three.id).endMs, at(three.id).firstMessageId, at(three.id).lastMessageId], [100, 300, a, c]);
     assert.deepEqual(manager.getSummariesInRange({ fromMs: 100, toMs: 100 }).map((r) => r.id).sort(), [two.id, three.id].sort(), 'both cover a, at 100');
+
+    manager.close();
+    store.close();
+  });
+
+  // Wave 5, finding 8: the case above seeds only L1s, so the bounds of a
+  // summary over summaries (endsOf's recursion into its children) went
+  // untested: without it an L2's ends were null and the listing left it out.
+  it("a summary over summaries of rows presented out of record order spans from the first of its leaves in the record to the last", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const strategy = new SeedableStrategy({ autoTickOnNewMessage: false });
+    const manager = await ContextManager.open({ store, strategy });
+    manager.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => manager.addMessage('User', textBlock(t))) as [string, string, string];
+    setTimestamp(store, 'messages', 0, 100);
+    setTimestamp(store, 'messages', 1, 200);
+    setTimestamp(store, 'messages', 2, 300);
+    for (const id of [b, a, c]) manager.presentRows([id]);
+    const ba = strategy.seedSummary('b then a', 1, { first: b, last: a }, [b, a]);
+    const lone = strategy.seedSummary('c', 1, { first: c, last: c }, [c]);
+    const l2 = strategy.seedSummary('b, a, then c', 2, { first: b, last: c }, [ba.id, lone.id], undefined, 1);
+
+    const all = manager.getSummariesInRange({});
+    const at = all.find((r) => r.id === l2.id);
+    assert.ok(at, `the L2 is listed: ${JSON.stringify(all.map((r) => r.id))}`);
+    assert.deepEqual([at.startMs, at.endMs, at.firstMessageId, at.lastMessageId], [100, 300, a, c]);
+    assert.deepEqual(manager.getSummariesInRange({ level: 2, fromMs: 100, toMs: 100 }).map((r) => r.id), [l2.id], 'it covers a, at 100');
 
     manager.close();
     store.close();
