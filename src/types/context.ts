@@ -399,8 +399,10 @@ export interface JournalMark {
  * messages' window-index ordinals (ContextManager.ordinalOf), which ascend
  * in the window's. Before this, a layout was `v: 2`, without `keyedBy` or
  * `memberSequences`, and its members were store sequences: acceptRound
- * reads a layout without `keyedBy` that way, so a provenance an earlier
- * release's compile returned is still accepted.
+ * reads a `v: 2` layout that way, so a provenance an earlier release's
+ * compile returned, carried across the upgrade, is still accepted. A
+ * layout of any other version without `keyedBy` says nothing of what its
+ * members count, and acceptRound refuses it, writing nothing.
  */
 export interface RenderedLayout {
   readonly v: 3;
