@@ -313,6 +313,27 @@ describe('writing the window down', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 3, finding 29: the tombstone finishing it
+  // writes, before its header, is no row leaving the window.
+  it("a row it wrote and a legacy removal took isn't among the rows that left the window once it is finished, across a reopen", async () => {
+    const path = freshPath();
+    let cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const left = (manager: ContextManager) => (manager as unknown as { windowIndex: { left(): ReadonlySet<MessageId> | null } }).windowIndex.left();
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cutShortWriteDown(cm, 3);
+    cm.removeMessage(b);
+    cm.presentRows([]);
+    assert.deepEqual(indexItems(cm), [{ id: a }, { id: b }, { retract: b }, { id: c }, { v: 1 }], 'setup: finished with a tombstone before the header');
+    assert.deepEqual([...(left(cm) ?? ['legacy'])], [], 'no row left the window');
+    // A row taken out once the header is written did leave it.
+    cm.retractRows([a]);
+    assert.deepEqual([...(left(cm) ?? [])], [a]);
+    cm.close();
+    cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    assert.deepEqual([...(left(cm) ?? [])], [a], 'after a reopen');
+    cm.close();
+  });
+
   // CM #350 bot review (wave 2), finding 50: the rows a write-down cut
   // short wrote are a prefix of the record only while every row stored
   // since sorts after them. A slot merged since can hold older rows.

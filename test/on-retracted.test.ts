@@ -39,6 +39,7 @@ import {
   WindowedPassthroughStrategy,
 } from '../src/index.js';
 import type { CompileResult, MessageId, StoredMessage, StrategyContext, SummaryEntry } from '../src/index.js';
+import { perItemIndexWrites } from './_harness/index-writes.js';
 
 const BASE = './test-on-retracted';
 let storeSeq = 0;
@@ -925,6 +926,51 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     assert.equal(lm.windowMode(), 'legacy');
     assert.deepEqual(internals(legacy).summaries.map((s) => s.id), summariesBefore, 'a removal in legacy mode keeps what folded the row');
     lm.close();
+  });
+
+  // CM #350 bot review, wave 3, finding 29: finishing a write-down that a
+  // pre-release build cut short takes out a row it wrote that a legacy
+  // removal took since, and that row was never in a presented window.
+  it('a row removed in legacy mode after a cut-short write-down wrote it keeps what folded it once the write-down is finished, across a reopen', async () => {
+    const path = freshPath();
+    const legacy = autobiographical();
+    const lm = await ContextManager.open({ path, namespace: 'agent', strategy: legacy, membrane: mockMembrane().membrane });
+    const lids: MessageId[] = [];
+    for (let i = 0; i < TAGS; i++) lids.push(lm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
+    await drain(lm);
+    const folded = lids[3]!;
+    assert.ok(coveredRows(lm, legacy).has(folded), 'premise: the row is folded');
+    // A pre-release build's write-down, one record per row, cut short after
+    // the first nine rows.
+    const store = lm.getStore() as unknown as { appendToStateJsonWithIdentity: (id: string, ...rest: unknown[]) => unknown };
+    const append = store.appendToStateJsonWithIdentity;
+    const batched = perItemIndexWrites(lm.getStore());
+    let appends = 0;
+    store.appendToStateJsonWithIdentity = function (id: string, ...rest: unknown[]) {
+      if (id === 'agent/window' && ++appends === 10) throw new Error('zz-index-append-failed');
+      return append.call(this, id, ...rest);
+    };
+    try {
+      assert.throws(() => lm.presentRows([]), /zz-index-append-failed/);
+    } finally {
+      store.appendToStateJsonWithIdentity = append;
+      batched();
+    }
+    assert.equal(lm.windowMode(), 'legacy', 'setup: cut short');
+    lm.removeMessage(folded);
+    const covering = internals(legacy).summaries.filter((s) => leavesOf(lm, s.id).includes(folded)).map((s) => s.id);
+    assert.ok(covering.length > 0, 'a removal in legacy mode keeps what folded the row');
+    lm.presentRows([]);
+    assert.equal(lm.windowMode(), 'presented', 'setup: finished');
+    lm.close();
+    const next = autobiographical();
+    let reopened!: ContextManager;
+    const lines = await linesDuring(async () => {
+      reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+    });
+    assert.ok(!lines.some((line) => line.includes('out of the window')), lines.join('\n'));
+    for (const id of covering) assert.notEqual(reopened.getSummary(id), null, `${id}, over the row removed in legacy mode, stays`);
+    reopened.close();
   });
 
   it('an L1 in flight over a row that leaves the window is discarded, and its chunk folds again over the rows it keeps', async () => {

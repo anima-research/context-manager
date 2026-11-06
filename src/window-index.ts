@@ -419,7 +419,11 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
     }
     if (fields.undone === true) state.undone.add(fields.retract);
     else state.undone.delete(fields.retract);
-    state.left.add(fields.retract);
+    // Only a tombstone after the header takes a row out of the window: one
+    // before it is a write-down's, finished over one cut short, for a row it
+    // wrote that a removal in legacy mode, where the window is the record,
+    // had taken already.
+    if (state.header !== null) state.left.add(fields.retract);
     return true;
   }
   if (typeof fields.v === 'number') {
@@ -758,7 +762,9 @@ export class WindowIndex {
    * put back since, undone or not, from one reading of the index: rows a
    * host took out, and rows removed from the record once taken out by
    * their ids. Null in legacy mode. A row removed in legacy mode, before
-   * the write-down, was never in the index, and isn't one; neither is a
+   * the write-down, was never in the window, and isn't one, even where a
+   * write-down cut short wrote it and the one that finished it took it out
+   * (its tombstones come before the header); neither is a
    * row removed through another manager that no retract has taken out
    * yet, which keeps its ordinal (see ordinalOf). Read it at once: a later
    * write changes it.
