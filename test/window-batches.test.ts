@@ -38,7 +38,10 @@
  *   logged, and the rows wait for the strategy's next notification. Where
  *   the index can't be read again, the write throws
  *   WindowWriteOutcomeUnknownError and the strategy hears at the next write
- *   to the window on that branch (window-unreadable.test.ts).
+ *   to the window on that branch, except where the store can't say its
+ *   branch before the write or after it: then nothing waits, the error and
+ *   a warning say so, and the strategy reads the window at its next select
+ *   (the nothing-waits case in window-unreadable.test.ts).
  *
  * test/_harness/index-writes.ts stands in for the batched append on a
  * store handle, one record per item, to write such an index.
