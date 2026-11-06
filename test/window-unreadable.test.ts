@@ -365,6 +365,75 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // CM #350 bot review, wave 4, finding 13: where the store can't say its
+  // branch before the write or after it, nothing waits, and the error says so.
+  it("a write whose outcome is unknown, where the store can't say its branch before the write either, says nothing waits to tell the strategy", async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    // The index's read of the store's branch before the write fails (the
+    // message store's own reads of it before then don't), and so does
+    // every read of it once the write throws.
+    type Settled = (operation: string) => { state: unknown; branch: string | null };
+    const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+    const settled = index.settled;
+    index.settled = function (this: unknown, operation: string) {
+      return { ...settled.call(this, operation), branch: null };
+    };
+    let warned: string[];
+    try {
+      const restore = failNextWriteUnread(cm, true, 1, true);
+      try {
+        ({ warned } = await warnings(async () =>
+          throwsUnknown(() => cm.presentRows([x]), {
+            operation: 'presentRows',
+            entering: [x],
+            leaving: [],
+            cause: 'zz-index-kept-then-failed',
+            says: /nothing waits to tell the strategy what it did, so it reads the window at its next select: zz-index-kept-then-failed$/,
+          }),
+        ));
+      } finally {
+        restore();
+      }
+    } finally {
+      delete (index as { settled?: unknown }).settled;
+    }
+    assert.ok(warned.some((line) => line.includes('nothing waits to tell the strategy what it did')), warned.join('\n'));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 4, finding 5: windowStatusOf reads 'absent' for
+  // a row the store no longer holds, whether or not a repair took it out.
+  it("retractRemoved and retractAbsentRows, the outcome unknown: the error says ordinalOf tells which, and that the call can be made again", async () => {
+    for (const repair of ['retractRemoved', 'retractAbsentRows'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Hearing() });
+      cm.presentRows([]);
+      const rows = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+      cm.presentRows(rows);
+      const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-other', strategy: new PassthroughStrategy() });
+      other.removeMessage(rows[0]!);
+      other.close();
+      const restore = failNextWriteUnread(cm, true);
+      try {
+        throwsUnknown(() => (repair === 'retractRemoved' ? cm.retractRemoved([rows[0]!]) : cm.retractAbsentRows()), {
+          operation: repair,
+          entering: [],
+          leaving: [rows[0]!],
+          cause: 'zz-index-kept-then-failed',
+          says: /ordinalOf tells which once the index reads \(undefined for a row taken out\), and calling it again takes out only what is still there/,
+        });
+      } finally {
+        restore();
+      }
+      assert.equal(cm.windowStatusOf(rows[0]!), 'absent', `${repair}: windowStatusOf can't tell`);
+      assert.equal(cm.ordinalOf(rows[0]!), undefined, `${repair}, setup: the store kept the write, which ordinalOf tells`);
+      assert.deepEqual(repair === 'retractRemoved' ? cm.retractRemoved([rows[0]!]) : cm.retractAbsentRows(), [], `${repair}: a second call takes out nothing more`);
+      cm.close();
+    }
+  });
+
   it('retractRows, the write kept: throws outcome-unknown; the next write tells the strategy the rows left', async () => {
     const strategy = new Hearing();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });

@@ -1907,14 +1907,21 @@ export class ContextManager {
    * view, so it hears nothing. A call the store refuses tells it nothing; a
    * call that throws after the store kept part of it tells the strategy the
    * rows that left and entered before it, then throws; a call that
-   * completes a body tells it only the shards that entered then. Where the
+   * completes a body tells it only the shards that entered then. Either
+   * way, where the index reads again after the write threw, the error
+   * thrown is the write's own, whether the store kept the write or refused
+   * it: ordinalOf or windowStatusOf tells which, and a retry of a write the
+   * store kept is refused, the rows being in the window already. Where the
    * write throws and
    * the index can't be read again to tell whether it landed, the call
    * throws WindowWriteOutcomeUnknownError (its `cause` the write's own
    * error), and the strategy hears what the store kept at the next write
    * to the window on that branch, with the rows as this call found them:
    * a row removed meanwhile is heard entering as it was stored, and then
-   * leaving, as the removal tells it.
+   * leaving, as the removal tells it. Where the store can't say which
+   * branch the write was made on, before it or after it, nothing waits: a
+   * warning and the error's message say so, and the strategy reads the
+   * window at its next select.
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
@@ -2052,9 +2059,13 @@ export class ContextManager {
    * A failure of the manager's own work around the call is logged too, and
    * the call waits, as presentRows' rows do.
    * A call that throws after the store kept its tombstones tells the
-   * strategy the rows that left, then throws; where the index can't be read
-   * again to tell, it throws WindowWriteOutcomeUnknownError and the
-   * strategy hears at the next write to the window.
+   * strategy the rows that left, then throws the write's own error, as one
+   * the store refused does: ordinalOf or windowStatusOf tells which, and a
+   * retry of a write the store kept is refused, the rows being out of the
+   * window already. Where the index can't be read again to tell, it throws
+   * WindowWriteOutcomeUnknownError and the strategy hears at the next write
+   * to the window, unless the store can't say which branch the write was
+   * made on, before it or after it: then nothing waits, as presentRows says.
    * A row the store no longer holds (one removed through another manager)
    * has no row to give: it is told by its id alone, in a call of its own
    * with `removed`, after the call for the rows the store holds, so a
@@ -2168,7 +2179,12 @@ export class ContextManager {
    * retractRows it never writes the window down, nor finishes a write-down
    * cut short, and on an index in another version's format it writes
    * nothing either. Where its write throws and the index can't be read again, it
-   * throws WindowWriteOutcomeUnknownError, as presentRows does.
+   * throws WindowWriteOutcomeUnknownError, as presentRows does; where the
+   * index reads again, it throws the write's own error, whether the store
+   * kept the write or refused it. The rows are ones the store no longer
+   * holds, so windowStatusOf reads 'absent' for them either way: ordinalOf
+   * tells which (undefined once taken out), and calling this again takes
+   * out only what is still there.
    *
    * A row of a slot the manager no longer merges (an auxiliary view
    * dropped from its configuration since the row was presented) reads as
@@ -2205,8 +2221,9 @@ export class ContextManager {
    * (a removal made while the agent wasn't running), and rows whose own
    * removal's tombstone failed. A host runs it at boot. Returns the ids
    * taken out, in window order, and writes nothing when there are none.
-   * Where its write throws and the index can't be read again, it throws
-   * WindowWriteOutcomeUnknownError, as presentRows does.
+   * Where its write throws, it throws as retractRemoved does, and as there
+   * ordinalOf, not windowStatusOf, tells whether the write landed, and
+   * calling it again is safe.
    *
    * A row of a slot the manager no longer merges (an auxiliary view
    * dropped from its configuration since the row was presented) reads as

@@ -156,22 +156,31 @@ export interface LeftRow {
  * `entering` the rows the write would have put in the window, in the order
  * it would have, `leaving` the rows it would have taken out, and
  * `readError` the error of the read that would have told. This error's
- * message ends with the cause's message, so a check of the message that
- * matched the write's own error still matches.
+ * message ends with the cause's message, so a check that the message
+ * contains or ends with the write's own error's message still matches;
+ * one that compares the whole message, or is anchored at its start,
+ * doesn't.
  *
  * windowStatusOf tells which, once the index reads; a row that entered is
  * refused by presentRows as in the window already, and a row that left by
- * retractRows as not in it. A write-down (the first presentRows or
- * retractRows on a branch in legacy mode, which writes the window down
- * before any work of its own) puts no row in the window and takes none
- * out: `entering` and `leaving` are both empty, windowMode tells whether
- * it landed, and the strategy has nothing to hear of it. The strategy hears what the write did
- * (onPresented, onRetracted) at the next write to the window on the branch
- * it was made on, once the index reads there, before that call's own work:
+ * retractRows as not in it. For retractRemoved and retractAbsentRows,
+ * whose rows the store no longer holds, windowStatusOf reads 'absent'
+ * either way: ordinalOf tells (undefined for a row taken out), and calling
+ * either again takes out only what is still there. A write-down (the
+ * first presentRows or retractRows on a branch in legacy mode, which
+ * writes the window down before any work of its own) puts no row in the
+ * window and takes none out: `entering` and `leaving` are both empty,
+ * windowMode tells whether it landed, and the strategy has nothing to
+ * hear of it. The strategy hears what the write did (onPresented,
+ * onRetracted) at the next write to the window on the branch it was made
+ * on, once the index reads there, before that call's own work:
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
  * retractAbsentRows or a removal. Of a write the store didn't keep it
  * hears nothing. A hook of that hearing that moves the store's branch
  * stops the call, which throws, writing nothing (WindowIndex.settled).
+ * Where the store can't say its branch before the write or after it,
+ * nothing waits to tell the strategy, a warning says so, and so does this
+ * error's message: the strategy reads the window at its next select.
  */
 export class WindowWriteOutcomeUnknownError extends Error {
   readonly operation: string;
@@ -180,11 +189,17 @@ export class WindowWriteOutcomeUnknownError extends Error {
   readonly readError: unknown;
   override readonly cause: unknown;
 
+  /**
+   * `waiting` is false where nothing waits to tell the strategy what the
+   * write did (the store can't say which branch it was made on), which the
+   * message then says.
+   */
   constructor(
     operation: string,
     rows: { entering: readonly MessageId[]; leaving: readonly MessageId[] },
     cause: unknown,
     readError: unknown,
+    waiting = true,
   ) {
     const writeDown = rows.entering.length === 0 && rows.leaving.length === 0;
     const whether = writeDown
@@ -193,10 +208,19 @@ export class WindowWriteOutcomeUnknownError extends Error {
           ...(rows.entering.length > 0 ? [`${rowsNamed(rows.entering)} entered`] : []),
           ...(rows.leaving.length > 0 ? [`${rowsNamed(rows.leaving)} left`] : []),
         ].join(' and ') + ' the window';
+    // The rows of the repairs are ones the store no longer holds, which
+    // windowStatusOf reads as absent whether or not the write landed.
+    const repair = operation === 'retractRemoved' || operation === 'retractAbsentRows';
+    const which = repair
+      ? 'ordinalOf tells which once the index reads (undefined for a row taken out), and calling it again takes out only what is still there'
+      : 'windowStatusOf tells which once the index reads';
+    const hears = waiting
+      ? 'the strategy hears what it did at the next write to the window'
+      : 'nothing waits to tell the strategy what it did, so it reads the window at its next select';
     const tells = writeDown
       ? 'windowMode tells which once the index reads, and a write-down puts no row in the window or takes one out, ' +
         'so the strategy has nothing to hear of it'
-      : 'windowStatusOf tells which once the index reads, and the strategy hears what it did at the next write to the window';
+      : `${which}${repair ? ';' : ', and'} ${hears}`;
     super(
       `ContextManager.${operation}: the window index's write threw, and the index can't be read again to tell ` +
         `whether the write landed (${describeThrown(readError)}), so whether ${whether} is unknown; ` +
@@ -696,7 +720,7 @@ export class WindowIndex {
         }
       }
       if (on !== null) this.unsettled.push({ branch: on, settle: tell });
-      return new WindowWriteOutcomeUnknownError(operation, rows, error, readError);
+      return new WindowWriteOutcomeUnknownError(operation, rows, error, readError, on !== null);
     }
     tell(ordinals);
     return error;
