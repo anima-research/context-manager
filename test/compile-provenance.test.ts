@@ -698,6 +698,18 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r', sequence: 5, complete: true });
   });
 
+  it('reports a message whose calls sharing an id repair cut to the last as not complete, since the calls it drops aren\'t sent', async () => {
+    const call = (n: number): ContentBlock => ({ type: 'tool_use', id: 'A', name: 'fn', input: { n } } as ContentBlock);
+    const u = msg('u', 1, [text('look')]);
+    const a = msg('a', 2, [text('trying'), call(1), call(2)], { participant: 'Claude' });
+    const r = msg('r', 3, [result('A', 'out')]);
+    const entries = await repaired([copy(u), copy(a), copy(r)]);
+    const bodies = attributeEntries(entries, [u, a, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((b) => b.messageId === 'a'), { messageId: 'a', sequence: 2, complete: false, missing: ['content'] });
+    assert.deepEqual(bodies.find((b) => b.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
+    assert.equal(entries.flatMap((e) => e.content).filter((b) => b.type === 'tool_use').length, 1, 'repair keeps the last call');
+  });
+
   it('still reports missing content when the moved result was altered afterwards, or is not in the request', async () => {
     const u = msg('u', 1, [use('tu-1')]);
     const r = msg('r', 3, [result('tu-1', 'the real output')]);

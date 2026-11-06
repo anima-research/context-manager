@@ -19660,7 +19660,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
    * subclass overrides like KnowledgeStrategy are covered) and
    * `selectAdaptive` (the path FKM defaults onto). It's a no-op on
-   * already-valid output.
+   * already-valid output in which each call has one result.
    */
   protected enforceToolPairing(entries: ContextEntry[]): void {
     const originOf = new Map<ContextEntry, ContextEntry>();

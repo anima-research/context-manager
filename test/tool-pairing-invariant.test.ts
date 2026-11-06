@@ -433,7 +433,7 @@ describe('a run of calls sharing an id in one entry', () => {
     });
   }
 
-  it('two assistant turns calling one id, the earlier past the later\'s look-ahead, then both results: the later call keeps both, as the summariser\'s collapsed messages do', () => {
+  it('two assistant turns calling one id, the later past the earlier\'s look-ahead, then both results: the later call keeps both, as the summariser\'s collapsed messages do', () => {
     const turns = () => [entry('User', [text('look')]), entry('Claude', [text('looking'), call(1)]), ...Array.from({ length: 8 }, (_, k) => entry(k % 2 ? 'Claude' : 'User', [text(`aside ${k}`)])), entry('Claude', [text('again'), call(2)]), entry('User', [out(1), out(2)]), entry('Claude', [text('done')])];
     const repaired = turns();
     repaired.forEach((e, i) => { e.index = i; });

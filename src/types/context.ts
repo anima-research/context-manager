@@ -66,9 +66,10 @@ export interface ContextEntry {
    * placed them, one block of its own for each move. Where it's set,
    * attribution credits a moved result only through one of these blocks
    * still in the request, unaltered, or through a result with its id still
-   * in this entry that repair placed for no entry, so another result with
-   * the same id and content can't stand in for it, even one repair placed
-   * for another entry inside this entry's message.
+   * in this entry that isn't among the blocks repair recorded as placed for
+   * any entry. A stub repair generated, or a copy that releasing a raw form
+   * made of a block it placed, isn't recorded, so either counts as a carrier
+   * wherever it covers the moved result.
    */
   relocatedBlocks?: ContentBlock[];
 }
