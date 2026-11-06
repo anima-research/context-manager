@@ -934,6 +934,61 @@ describe('resetHeadWindow once a host presents', () => {
       cm.close();
     }
   });
+
+  // CM #350 bot review, wave 2, finding 26: the window reads around the
+  // presentation reject as its failure does, naming the stored transition.
+  it("a read of the window that fails, before or after the transition's presentation, rejects naming the stored transition, and doesn't reset the head window", async () => {
+    for (const failing of ['before', 'after'] as const) {
+      let cm!: ContextManager;
+      let unreadable = false;
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+        onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          if (failing === 'after' && rows.some((m) => m.participant === 'Context Manager')) unreadable = true;
+          return super.onPresented(rows, ctx);
+        }
+      }
+      const strategy = new Resettable();
+      cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      // The window's reads throw once the transition is stored (a host's
+      // listener of its add runs after the manager's own), or once its
+      // presentation's hook has run.
+      if (failing === 'before') cm.onMessage((event) => { if (event.type === 'add') unreadable = true; });
+      const index = (cm as unknown as { windowIndex: Record<'mode' | 'ordinalOf', (...args: unknown[]) => unknown> }).windowIndex;
+      const saved = { mode: index.mode, ordinalOf: index.ordinalOf };
+      for (const name of ['mode', 'ordinalOf'] as const) {
+        const real = saved[name];
+        index[name] = function (this: unknown, ...args: unknown[]) {
+          if (unreadable) throw new Error('zz-index-read-failed');
+          return real.apply(this, args);
+        };
+      }
+      let err: Error;
+      try {
+        err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      } finally {
+        index.mode = saved.mode;
+        index.ordinalOf = saved.ordinalOf;
+      }
+      const transition = cm.getAllMessages().at(-1)!;
+      assert.equal(transition.participant, 'Context Manager', `${failing}, setup: the transition is stored`);
+      assert.deepEqual(strategy.resets, [], `${failing}: the head window wasn't reset`);
+      assert.match(err.message, /^ContextManager\.resetHeadWindow couldn't read the window .*zz-index-read-failed\./, `${failing}: ${err.message}`);
+      assert.ok(
+        err.message.includes(`message ${transition.id} is stored, and may be presented, and the head window wasn't reset`),
+        `${failing}: ${err.message}`,
+      );
+      await settle();
+      cm.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {

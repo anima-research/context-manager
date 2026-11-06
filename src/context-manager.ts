@@ -3717,7 +3717,8 @@ export class ContextManager {
    * rejects, naming the stored message, without resetting the head window.
    * So does a presentation of it that fails, or whose strategy hook closes
    * the manager, sets a strategy, moves the store's branch or takes the
-   * transition out of the window again. An add of the
+   * transition out of the window again, and a read of the window, before
+   * the presentation or after it, that fails. An add of the
    * transition that fails after storing it rejects with addMessage's
    * WriteLandedError, naming it, without resetting the head window, and one
    * where the store can't be read to tell whether it was stored rejects with
@@ -3760,8 +3761,17 @@ export class ContextManager {
 
     // Once rows are presented, the head window can start only at a row the
     // window holds: the transition enters it first, as a host's own row does,
-    // unless a host's listener of the add presented it already.
-    if (this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined) {
+    // unless a host's listener of the add presented it already. Where the
+    // window can't be read to tell, the call refuses as a presentation that
+    // fails does, naming the stored transition, which a listener may have
+    // presented.
+    let presenting: boolean;
+    try {
+      presenting = this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined;
+    } catch (error) {
+      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, 'stored, and may be presented');
+    }
+    if (presenting) {
       try {
         this.presentRows([msgId]);
       } catch (error) {
@@ -3783,7 +3793,13 @@ export class ContextManager {
       }
       // It may also have taken the transition out again, moving nothing
       // else: the head window can't start at a row the window lacks.
-      if (this.windowIndex.ordinalOf(msgId) === undefined) {
+      let out: boolean;
+      try {
+        out = this.windowIndex.ordinalOf(msgId) === undefined;
+      } catch (error) {
+        throw refuse(`ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`, 'stored, and may be presented');
+      }
+      if (out) {
         throw refuse("ContextManager.resetHeadWindow: the strategy's hook for its transition's presentation took the transition out of the window", 'stored and out of the window');
       }
     }
