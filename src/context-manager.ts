@@ -1603,6 +1603,20 @@ export class ContextManager {
     );
   }
 
+  /**
+   * Refuses a branch cut asked for while a sharded addMessage stores its
+   * shards (branchAt, branchSequenceOf): the record holds only the shards
+   * stored so far, so the cut would come before the body's last shard, and
+   * the new branch's record would hold part of the body.
+   */
+  private refuseCutWhileWritingShards(operation: 'branchAt' | 'branchSequenceOf'): void {
+    if (!this.writingShards) return;
+    throw new Error(
+      `ContextManager.${operation} refused: a sharded addMessage is storing its shards, and a cut now would come before ` +
+        "the body's later shards, so the new branch's record wouldn't hold the whole body. Ask for it once that call has returned.",
+    );
+  }
+
   /** The rows of this manager's slot from `fromId` to `toId`, in slot order; empty when either isn't there. */
   private slotRowsBetween(fromId: MessageId, toId: MessageId): StoredMessage[] {
     const view = this.messageStore.createView();
@@ -1665,7 +1679,9 @@ export class ContextManager {
    * microtask or later) instead. Nor may it remove a message then
    * (removeMessage, removeMessages on this manager are refused, as a
    * removal could split the body or move the rows the sharded
-   * write removes if it fails), or move the store's branch: the sharded
+   * write removes if it fails), nor ask for a branch cut (branchAt and
+   * branchSequenceOf on this manager are refused, as the record holds only
+   * the shards stored so far), or move the store's branch: the sharded
    * write stops before its next shard and throws (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
    * heard stands: the throw doesn't reach the caller. A listener that calls
@@ -2432,12 +2448,19 @@ export class ContextManager {
    * write-down's item would keep every row stored before the write-down in
    * the new branch's record, and the strategy state written after the row.
    *
+   * A branchAt made while a sharded addMessage of this manager stores its
+   * shards (from an onMessage listener of a shard's add, or a strategy hook
+   * that listener runs by presenting a shard) is refused, saying why: the
+   * record then holds only the shards stored so far, so no cut could hold
+   * the whole body.
+   *
    * Returns the new branch *name*, which is what `switchBranch` and `forkAt`
    * expect. (Chronicle's branch APIs are name-keyed; the numeric `id` field
    * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
     this.requireInitialized('branchAt');
+    this.refuseCutWhileWritingShards('branchAt');
     const branchPoint = this.branchSequenceOf(messageId);
 
     // Create branch name if not provided
@@ -2468,9 +2491,11 @@ export class ContextManager {
    * last shard's own sequence, so the new branch's record holds the whole
    * body. The row can be in this manager's slot or an auxiliary one.
    * Throws `Message not found: <id>`, as branchAt does, for a row no merged
-   * slot holds. It writes nothing.
+   * slot holds, and is refused, as branchAt is, while a sharded addMessage
+   * of this manager stores its shards (see onMessage). It writes nothing.
    */
   branchSequenceOf(messageId: MessageId): Sequence {
+    this.refuseCutWhileWritingShards('branchSequenceOf');
     const merged = this.mergedMessageView();
     const message = merged.get(messageId);
     if (!message) {
@@ -3902,7 +3927,9 @@ export class ContextManager {
    * presented before the head window is reset to start at it, and the
    * strategy hears it there (ContextStrategy.onPresented), unless a host's
    * listener of its add (onMessage) presented it already, which this then
-   * leaves as it stands; in legacy mode it is in the window from its add,
+   * leaves as it stands (every shard of it, for a transition the strategy
+   * stores as shards: one a listener presented in part is presented, which
+   * puts the rest in); in legacy mode it is in the window from its add,
    * as before, and nothing more is written.
    *
    * Returns the transition summary text used. A close() from a listener of
@@ -3954,13 +3981,25 @@ export class ContextManager {
 
     // Once rows are presented, the head window can start only at a row the
     // window holds: the transition enters it first, as a host's own row does,
-    // unless a host's listener of the add presented it already. Where the
-    // window can't be read to tell, the call refuses as a presentation that
-    // fails does, naming the stored transition, which a listener may have
-    // presented.
+    // unless a host's listener of the add presented it already. A
+    // transition stored as shards is judged by its whole body: a listener
+    // of its first shard's add can present that shard before the rest is
+    // stored, and presentRows puts the rest in. Where the window can't be
+    // read to tell, the call refuses as a presentation that fails does,
+    // naming the stored transition, which a listener may have presented.
+    const outOfWindow = (): boolean => {
+      const merged = this.mergedMessageView();
+      const record = merged.getAll();
+      const at = recordPositionOf(merged, record, msgId);
+      // One a listener removed is out: its presentation refuses its id.
+      if (at === undefined) return this.windowIndex.ordinalOf(msgId) === undefined;
+      const { from, to } = bodyBoundsIn(record, at);
+      for (let k = from; k <= to; k++) if (this.windowIndex.ordinalOf(record[k]!.id) === undefined) return true;
+      return false;
+    };
     let presenting: boolean;
     try {
-      presenting = this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined;
+      presenting = this.windowIndex.mode() === 'presented' && outOfWindow();
     } catch (error) {
       throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, 'stored, and may be presented');
     }
@@ -3993,11 +4032,12 @@ export class ContextManager {
       } catch (error) {
         throw refuse(reasonOf(error), 'stored and presented');
       }
-      // It may also have taken the transition out again, moving nothing
-      // else: the head window can't start at a row the window lacks.
+      // It may also have taken the transition out again, or a shard of it,
+      // moving nothing else: the head window can't start at a row the
+      // window lacks, or at a body it holds in part.
       let out: boolean;
       try {
-        out = this.windowIndex.ordinalOf(msgId) === undefined;
+        out = outOfWindow();
       } catch (error) {
         throw refuse(`ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`, 'stored, and may be presented');
       }

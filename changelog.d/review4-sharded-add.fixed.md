@@ -35,3 +35,8 @@
     move the rows the write removes if it fails. Before, it was taken: the
     body's later shards stayed with no first shard, and a write that then
     failed left them stored and threw as if none stayed.
+  - A `branchAt` or `branchSequenceOf` on the same manager made then (from
+    such a listener, after it presents a shard) is refused too, with an error
+    that says the cut would come before the body's later shards. Before, the
+    cut was taken over the shards stored so far, so the new branch's record
+    held part of the body, though `branchAt` promises the whole body.

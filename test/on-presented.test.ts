@@ -874,6 +874,44 @@ describe('resetHeadWindow once a host presents', () => {
     }
   });
 
+  // CM #350 bot review, wave 4, finding 27: a listener of a sharded
+  // transition's first shard can present it before the rest is stored.
+  it('presents the rest of a sharded transition a listener presented in part, and resets at it whole', async () => {
+    class ShardsTransition extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      chunkIngressMessage(participant: string, content: ContentBlock[]) {
+        if (participant !== 'Context Manager') return null;
+        const whole = (content[0] as { text: string }).text;
+        const half = Math.floor(whole.length / 2);
+        return { bodyGroupId: 'zz-transition', shards: [whole.slice(0, half), whole.slice(half)].map((t, shardIndex) => ({ content: [text(t)], shardIndex })) };
+      }
+    }
+    const strategy = new ShardsTransition();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([a]);
+    // A host that presents each row it hears stored: for the transition,
+    // its first shard, before the second is stored.
+    cm.onMessage((event) => {
+      if (event.type === 'add' && event.message.shardIndex === 0) cm.presentRows([event.message.id]);
+    });
+    await cm.resetHeadWindow('zz-transition, long enough to split');
+    const shards = cm.getAllMessages().filter((m) => m.participant === 'Context Manager').map((m) => m.id);
+    assert.equal(shards.length, 2, 'setup: the transition is stored as two shards');
+    assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['in', 'in'], 'every shard of the transition is in the window');
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, ...shards], 'after a, whole');
+    assert.deepEqual(strategy.resets, [shards[0]], 'the head window was reset at the transition');
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review finding 25: the strategy's hook for the transition's
   // presentation can take it out again, without moving anything else.
   it("refuses when the hook of the transition's presentation takes it out of the window, and doesn't reset the head window", async () => {

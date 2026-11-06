@@ -795,6 +795,43 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     }
   });
 
+  // CM #350 bot review, wave 4, finding 3: a cut taken while the body's
+  // later shards aren't stored yet would hold only the shards stored so far.
+  it('a branchAt or branchSequenceOf while a sharded addMessage stores its shards is refused, saying why, and one once it returns holds the whole body', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.presentRows([]);
+    const refusals: unknown[] = [];
+    let first = true;
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || !first) return;
+      first = false;
+      // A host that presents the shard it heard, then asks for a cut at it.
+      cm.presentRows([event.message.id]);
+      for (const cut of [() => cm.branchAt(event.message.id, 'zz-mid-add'), () => cm.branchSequenceOf(event.message.id)]) {
+        try {
+          cut();
+        } catch (err) {
+          refusals.push(err);
+        }
+      }
+    });
+    const doc = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+    assert.equal(refusals.length, 2, 'both refused');
+    for (const [refusal, operation] of [[refusals[0], 'branchAt'], [refusals[1], 'branchSequenceOf']] as const) {
+      assert.ok(refusal instanceof Error, operation);
+      assert.match(refusal.message, new RegExp(`^ContextManager\\.${operation} refused: a sharded addMessage is storing its shards`), operation);
+      assert.match(refusal.message, /whole body/, operation);
+    }
+    assert.ok(!cm.listBranches().some((b) => b.name === 'zz-mid-add'), 'no branch was made');
+    const shards = cm.getAllMessages().map((m) => m.id);
+    assert.equal(shards.length, 3, 'the body is stored whole');
+    cm.presentRows([doc]);
+    const cut = cm.branchAt(doc, 'zz-after-add');
+    await cm.switchBranch(cut);
+    assert.deepEqual(cm.getAllMessages().map((m) => m.id), shards, "a cut once the call returned holds the whole body in the new branch's record");
+    cm.close();
+  });
+
   it("a listener that moves the store's branch between shards stops the write: the error names the shards stored, on the branch it started on", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
     cm.addMessage('bob', [text('before')]);
