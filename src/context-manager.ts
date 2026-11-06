@@ -1275,8 +1275,18 @@ export class ContextManager {
             );
             // The removal is one store write, of the whole run: the shards
             // stayed, a failing shard's row that landed with them, or none
-            // of them did.
-            const stayed = this.rowsStillStored(wrote);
+            // of them did. They are asked of the branch the write started
+            // on: a hook the removal's event ran (onCompressionHoldsReleased)
+            // can move the store, and another branch's record says nothing
+            // of this one's. Where it moved, or the store can't say, which
+            // stayed is unknown.
+            let here: boolean;
+            try {
+              here = onBranch();
+            } catch {
+              here = false;
+            }
+            const stayed = here ? this.rowsStillStored(wrote) : null;
             if (stayed === null) {
               hearWhatStayed();
               throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);

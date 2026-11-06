@@ -522,6 +522,51 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     cm.close();
   });
 
+  // CM #350 bot review, wave 4, finding 9: a hook the rollback's removal
+  // runs can move the store's branch before the removal fails.
+  it("a rollback whose removal fails after a hold-release hook moved the store's branch says the manager can't tell which shards stayed", async () => {
+    let cm!: ContextManager;
+    let target: string | null = null;
+    let switching: Promise<void> | undefined;
+    class SwitchesOnRelease extends Sharding {
+      onCompressionHoldsReleased(): void {
+        const name = target;
+        target = null;
+        if (name) switching = cm.switchBranch(name);
+      }
+    }
+    cm = await ContextManager.open({ path: freshPath(), strategy: new SwitchesOnRelease() });
+    cm.addMessage('bob', [text('before')]);
+    const start = cm.currentBranch().name;
+    // A host's listener makes a branch once the first shard is stored, so
+    // that branch's record holds it, and the hook moves the store there.
+    cm.onMessage((event) => {
+      if (event.type === 'add' && event.message.shardIndex === 0) target = cm.getStore().createBranch('zz-first-shard').name;
+    });
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    // The removal lands, its event runs the hook, and then it fails.
+    const own = internals(cm);
+    const handle = own.handleMessageStoreEvent.bind(cm);
+    own.handleMessageStoreEvent = (event) => {
+      handle(event);
+      if (event.type === 'remove' || event.type === 'removeRange') throw new Error('failed after removing');
+    };
+    const { result: err } = errorsDuring(() =>
+      thrownBy(() => cm.addMessage('alice', [text('one '), text('two ')], undefined, undefined, { holdCompression: true })),
+    );
+    await switching;
+    assert.equal(cm.currentBranch().name, 'zz-first-shard', 'setup: the hook moved the store');
+    assert.equal(cm.getAllMessages().length, 2, "setup: the other branch's record holds the first shard");
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.deepEqual(err.landed, [], 'none it knows stayed: the other branch says nothing of the one the write was made on');
+    assert.equal(err.unknown.length, 2, 'every shard the write stored');
+    assert.equal(err.cause, failure);
+    await cm.switchBranch(start);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], 'where the write was made, the removal took them out');
+    cm.close();
+  });
+
   it("where the store can't be read to tell whether a row landed, the error says the manager can't tell, and the failed read is logged", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     cm.addMessage('bob', [text('before')]);

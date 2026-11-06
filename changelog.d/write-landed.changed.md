@@ -37,3 +37,11 @@
   that fails once every shard is stored (in legacy mode, the manager's own
   work telling the strategy of the body) and whose removal of them fails
   names every shard, with `WriteLandedError`.
+- A sharded `addMessage` whose removal of the shards it stored fails after
+  the strategy's `onCompressionHoldsReleased` hook, which that removal runs
+  for a held shard, moved the store's branch throws
+  `WriteOutcomeUnknownError`, naming every shard the write stored as
+  `unknown`: which of them stayed is a question for the branch the write
+  started on, which the store no longer reads. Before, it read the other
+  branch, and threw `WriteLandedError` naming the shards that branch holds,
+  or the write's own error where it holds none.
