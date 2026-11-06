@@ -480,8 +480,10 @@ export interface ContextStrategy {
    * row the branch the strategy initialized on (the branch the store is on
    * when the call is made, as for onPresented's) holds at the ordinal it
    * left, in its window and its record (a branch made before it left), is
-   * left out, as is every row while that branch is in legacy mode, and a
-   * call left with no row isn't made. They wait for the manager's strategy,
+   * left out, as is a row a branch made before it was presented presented
+   * on its own (that branch's index never gave it the ordinal it left),
+   * and every row while that branch is in legacy mode, and a call left
+   * with no row isn't made. They wait for the manager's strategy,
    * not for this instance, as onPresented's do.
    *
    * Fire and forget, as onPresented: a rejection, or a throw before it

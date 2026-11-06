@@ -267,6 +267,12 @@ interface IndexState {
   revision: number | null;
   /** Per ordinal, the row presented there while it is still in the window; null for a hole. */
   rows: Array<MessageId | null>;
+  /**
+   * Per ordinal, the row a presentation put there, kept after a tombstone
+   * takes it out; null for an item that presented no row. What this
+   * branch's own index issued (issuedTo).
+   */
+  issued: Array<MessageId | null>;
   /** Per ordinal, the sequence of the record that wrote the item, where it says. */
   at: Array<number | undefined>;
   /** The ordinal of every row in the window. */
@@ -307,6 +313,7 @@ function emptyState(branchId: unknown, revision: number | null): IndexState {
     branchId,
     revision,
     rows: [],
+    issued: [],
     at: [],
     ordinals: new Map(),
     undone: new Set(),
@@ -395,6 +402,7 @@ function inEffect(state: IndexState): boolean {
 function apply(state: IndexState, item: unknown, ordinal: number, at: number | undefined): boolean {
   state.at[ordinal] = at;
   state.rows[ordinal] = null;
+  state.issued[ordinal] = null;
   if (typeof item !== 'object' || item === null) {
     state.unreadable++;
     return false;
@@ -405,6 +413,7 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
     // at the end, and a reload must never move a row a compile has sent.
     if (!state.ordinals.has(fields.id)) {
       state.rows[ordinal] = fields.id;
+      state.issued[ordinal] = fields.id;
       state.ordinals.set(fields.id, ordinal);
     }
     state.undone.delete(fields.id);
@@ -785,6 +794,19 @@ export class WindowIndex {
   ordinals(): ReadonlyMap<MessageId, number> | null {
     const state = this.current();
     return inEffect(state) ? state.ordinals : null;
+  }
+
+  /**
+   * The row this branch's index presented at `ordinal`, whether or not it
+   * is in the window still: a row taken out keeps its ordinal here, as a
+   * hole in the window. Undefined for an ordinal the index never issued to
+   * a row (a header, a tombstone, an item past its end), and in legacy
+   * mode. A branch made from another holds the parent's ordinals up to the
+   * branch point, and its own after.
+   */
+  issuedTo(ordinal: number): MessageId | undefined {
+    const state = this.current();
+    return inEffect(state) ? (state.issued[ordinal] ?? undefined) : undefined;
   }
 
   /** Ordinals issued on this branch: the one the next item takes. 0 in legacy mode. */
@@ -1184,6 +1206,7 @@ export class WindowIndex {
       branchId: null,
       revision: state.revision,
       rows: [...state.rows],
+      issued: [...state.issued],
       at: [...state.at],
       ordinals: new Map(state.ordinals),
       undone: new Set(state.undone),

@@ -590,6 +590,37 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 4, finding 14: a branch made before the row
+  // was presented can present it on its own, at another ordinal.
+  it('a call waiting on an initialization of a branch that presented the row on its own, at another ordinal, is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    const [x, a] = ['x', 'a'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    // Made once a is stored and before it is presented: its record holds a, and its window doesn't.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([x]);
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, before the strategy initializes there.
+    cm.presentRows([a]);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, diverged);
+    assert.ok(cm.ordinalOf(a) !== undefined && cm.ordinalOf(a) !== left, 'setup: the branch holds a, at another ordinal than the one it left on the other');
+    assert.deepEqual(strategy.retracted, [], "a never left this branch's window");
+    assert.deepEqual(strategy.presented, [[a]], 'it entered it');
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
   // store no longer holds is told by its id, removed, as retractRows tells it.
   it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {

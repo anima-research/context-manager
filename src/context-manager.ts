@@ -4801,10 +4801,12 @@ export class ContextManager {
    * The calls of onRetracted made while the strategy wasn't initialized,
    * in the order they came. A row is given when it left the window of the
    * branch the strategy initialized on: that branch's index took it out,
-   * or holds it at another ordinal (presented again since), or the branch's
-   * record no longer holds it (a removal whose tombstone failed). A branch
-   * made before it left holds it there, in its window and its record, a
-   * branch made before it was presented never held it, and a branch in
+   * or holds it at another ordinal and once issued it the call's
+   * (presented again since), or the branch's record no longer holds it (a
+   * removal whose tombstone failed). A branch made before it left holds it
+   * there, in its window and its record, a branch made before it was
+   * presented never held it, or presented it on its own at an ordinal of
+   * its own, and a branch in
    * legacy mode holds every row of its record, so none of them is told. A
    * call left with no row isn't made. A row the call didn't keep is read
    * then, from the record of that branch, and given where it holds it; one
@@ -4830,14 +4832,17 @@ export class ContextManager {
           const tookOut = presented ? this.windowIndex.left() : null;
           // A row out of this window left it where this branch's index took
           // it out; one it never held (a branch made before the row was
-          // presented) didn't. A row the window issues left where it holds it
-          // at another ordinal (presented again since), or where the record
-          // no longer holds it (a removal whose tombstone failed, told with
-          // no ordinal where the index couldn't be read then).
+          // presented) didn't. A row the window holds left where it holds it
+          // at another ordinal than the call's, and this branch's own index
+          // issued the call's ordinal to it (presented again since), or where
+          // the record no longer holds it (a removal whose tombstone failed,
+          // told with no ordinal where the index couldn't be read then). A
+          // branch made before the row was presented, which presented it on
+          // its own, never issued it the call's ordinal, so isn't told.
           const leftHere = ({ id, ordinal }: RetractedRow) => {
             const here = this.windowIndex.ordinalOf(id);
             if (here === undefined) return tookOut?.has(id) === true;
-            return (ordinal !== undefined && here !== ordinal) || !holdsRow(merged!, id);
+            return (ordinal !== undefined && here !== ordinal && this.windowIndex.issuedTo(ordinal) === id) || !holdsRow(merged!, id);
           };
           const withRow = (l: RetractedRow): RetractedRow => {
             if (l.row) return l;
