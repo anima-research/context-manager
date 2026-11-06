@@ -191,10 +191,11 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * reads only the sequence), until one lands. A load itself stays read-only, a
  * preview (`dryRun`) converts without keeping or writing anything, and an
  * anchor of 0, the start, isn't written, as it converts to the whole window
- * whenever it is converted. `anchor` stays a sequence in both forms, at or
- * before the branch head, so a release that reads only it still loads the
- * slot: the sequence setAnchor was given, or that of the row the window
- * starts at. A slot naming a `v` other than 2 is another version's, whose
+ * whenever it is converted. `anchor` stays a sequence in both forms, so a
+ * release that reads only it still loads the slot: the sequence setAnchor
+ * was given, or that of the row the window starts at. That is at or before
+ * the branch head, unless setAnchor was given a sequence past it, which is
+ * stored as given and which a load resets to 0, as before. A slot naming a `v` other than 2 is another version's, whose
  * `anchor` this one can't vouch for: it is read as no anchor, so the window
  * starts at the branch's start, with a warning. One naming a later version
  * than 2 is never written over, so that version reads back what it wrote,
