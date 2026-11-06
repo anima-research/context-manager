@@ -1290,6 +1290,7 @@ export class StoreTopologyError extends Error {
           `L${v.level} ${v.id} (${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
           `${v.holeOwners.length ? ` owned by ${v.holeOwners.join('/')}` : ''})`).join('; ') +
         (violations.length > 8 ? `; +${violations.length - 8} more` : '') +
+        `; this open has already written its load-time repairs (and, once a host presents, what it demoted and let go of)` +
         `. Repair the store, or open it with topologyPolicy: 'report' and auditOnly: true to inspect it` +
         ` (that open still writes the load-time repairs of what readers can't use, and a 'report' open without auditOnly` +
         ` writes every repair: to inspect the store as it is, open a copy of it).`,
