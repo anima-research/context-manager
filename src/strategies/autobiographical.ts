@@ -6070,10 +6070,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * finds it moved. A row the window holds after one later row of the span
    * and before another isn't named: no presentation puts a row there, and
    * a span stands so with nothing moved, as the leaves of two summaries
-   * whose rows cross do (a merge's topology check refuses those). The
-   * ordinals can't tell a row presented again from one a summary was
-   * minted over past a run of rows the next summary holds (one L1 over A
-   * and D, the next over B and C): that row is named. None in legacy mode.
+   * whose rows cross do (a merge's topology check refuses those). A later
+   * row of the span the window doesn't hold (one removed before the
+   * window was written down, which it never held, or one out of it)
+   * stands nowhere, so no row before it is past every later row, and the
+   * rule names none: where that row was one of two summaries' crossed
+   * leaves (one L1 over A and C, the next over B and D, D removed before
+   * the write-down), A, C, B would otherwise read as C moved. Only
+   * `before` finds a row before it moved. The ordinals can't tell a row
+   * presented again from one a summary was minted over past a run of rows
+   * the next summary holds (one L1 over A and D, the next over B and C):
+   * that row is named. None in legacy mode.
    */
   private rowsMovedInWindow(
     ids: readonly MessageId[],
@@ -6083,12 +6090,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ordinals = ctx.window?.ordinals();
     if (!ordinals) return [];
     const moved = new Set<MessageId>();
-    // The highest ordinal among the span's rows after the one read.
+    // The highest ordinal among the span's rows after the one read; past
+    // any ordinal once a later row stands nowhere in the window.
     let latest: number | undefined;
     for (let i = ids.length - 1; i >= 0; i--) {
       const id = ids[i]!;
       const at = ordinals.get(id);
-      if (at === undefined) continue;
+      if (at === undefined) {
+        latest = Infinity;
+        continue;
+      }
       const was = before?.get(id);
       if (was !== undefined && was !== at) moved.add(id);
       if (latest !== undefined && at > latest) moved.add(id);
@@ -13570,8 +13581,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // with a row under them that left and was presented again, which the
     // window holds past every later row under them (rowsMovedInWindow);
     // sources whose rows cross, with nothing moved, are left to the
-    // topology check below. The rows' ordinals now are what the check
-    // after the call compares with.
+    // topology check below, also where a row under one is a row the window
+    // doesn't hold. A queue entry keeps no ordinals, so this check has
+    // none from before to compare with, and two blind spots stay, as
+    // rowsMovedInWindow says: a source over a row that stands past a run
+    // another source holds (an L1 over A and D beside one over B and C)
+    // reads as moved, and is let go of; and a row presented again isn't
+    // found where it is the last row under the sources, or stands before
+    // a row under them the window doesn't hold. The rows' ordinals now are
+    // what the check after the call compares with.
     const leafRows = this.leafRowsOf(sources);
     const outBefore = this.rowsOutOfWindow(leafRows, ctx);
     const movedBefore = this.rowsMovedInWindow(leafRows, ctx).filter((id) => !outBefore.includes(id));

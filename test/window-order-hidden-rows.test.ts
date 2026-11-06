@@ -12,11 +12,13 @@
  * record unfolded the same way again, a model call per tick and nothing
  * written. And under 'report' a merge's entry check named a row of a
  * crossed merge, which no row had left, and unfolded its summary before the
- * merge's topology check refused the group. Now a row is named only where
- * the window holds it past every later row of the span, where a
- * presentation puts a row presented again, and a record that keeps a
- * returned row holds its rows in window order, a hidden row at its own
- * ordinal.
+ * merge's topology check refused the group. Now a row is named where its
+ * ordinal differs from the one read as the work began, or, with or without
+ * that reading, where the window holds it past every later row of the
+ * span, where a presentation puts a row presented again (the snapshot
+ * alone finds the span's last row moved, and, since wave 5's finding 54, a
+ * row before one the window doesn't hold). A record that keeps a returned
+ * row holds its rows in window order, a hidden row at its own ordinal.
  *
  * The open's demote trimmed a record to its longest run of rows the window
  * holds together and released the rest, a hidden row among them, which the
@@ -355,6 +357,53 @@ describe("a merge's entry check over sources that cross", () => {
     const kept = cm.getStore().getStateJson('agent/autobio:summaries') as Array<{ id: string }>;
     assert.deepEqual(kept.map((s) => s.id).sort(), ['L1-ac', 'L1-bd'], "the store's summaries are as found");
     assert.deepEqual(internals(strategy).summaries.map((s) => s.id).sort(), ['L1-ac', 'L1-bd'], "and the strategy's");
+    cm.close();
+  });
+  // Wave 5, finding 54: the check skipped a leaf with no ordinal, so where
+  // a leaf of one source was removed before the window was written down,
+  // the crossed pair read as a row past every later row, and the entry
+  // check let go of it.
+  it("under 'report' leaves crossed sources to the topology check where a leaf of one was removed before the window was written down", async () => {
+    const path = freshPath();
+    const seed = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    const rows: MessageId[] = [];
+    for (let i = 0; i < 4; i++) rows.push(seed.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
+    const [a, b, c, d] = rows as [MessageId, MessageId, MessageId, MessageId];
+    seed.removeMessage(d);
+    seed.presentRows([]);
+    const summary = (id: string, sourceIds: MessageId[]): SummaryEntry => ({
+      id, level: 1, content: `s ${id}`, tokens: 50, sourceLevel: 0, sourceIds,
+      sourceRange: { first: sourceIds[0]!, last: sourceIds.at(-1)! }, created: 1,
+    } as SummaryEntry);
+    // Crossed in the record: A, C under one, B, D under the other.
+    const l1s = [summary('L1-ac', [a, c]), summary('L1-bd', [b, d])];
+    const store = seed.getStore();
+    store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+    store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+    store.setStateJson('agent/autobio:summaries', l1s);
+    store.setStateJson('agent/autobio:chunks', l1s.map((s) => ({ id: `c-${s.id}`, sourceIds: s.sourceIds, compressed: true, summaryId: s.id })));
+    seed.close();
+
+    const mock = mockMembrane();
+    const strategy = new AutobiographicalStrategy({ ...FOLDING, topologyPolicy: 'report' });
+    let cm!: ContextManager;
+    await linesDuring(async () => {
+      cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mock.membrane });
+    });
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b, c], 'premise: the window holds A, B, C, and never held D');
+    assert.equal(cm.ordinalOf(d), undefined, 'premise: D has no ordinal');
+
+    const ctx = (cm as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
+    const merging = strategy as unknown as { executeMerge(level: number, sourceIds: string[], c: StrategyContext): Promise<boolean> };
+    let merged!: boolean;
+    const lines = await linesDuring(async () => {
+      merged = await merging.executeMerge(2, ['L1-ac', 'L1-bd'], ctx);
+    });
+    assert.ok(!lines.some((line) => line.includes('presented again elsewhere')), `no row reads as moved: ${lines.join('\n')}`);
+    assert.equal(merged, false, 'nothing is merged');
+    assert.equal(mock.calls, 0, 'no call is made');
+    assert.ok(lines.some((line) => line.includes('[merge-topology]') && line.includes('refused L2 merge')), `the topology check refuses the group: ${lines.join('\n')}`);
+    assert.deepEqual(internals(strategy).summaries.map((s) => s.id).sort(), ['L1-ac', 'L1-bd'], "the strategy's summaries are as found");
     cm.close();
   });
 });
