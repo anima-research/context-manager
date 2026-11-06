@@ -385,11 +385,12 @@ describe('onPresented in presented mode', () => {
       const second = cm.setStrategy(replacement);
       const superseded = assert.rejects(first, /supersed/i);
       open();
-      await settle();
+      // The first initialization's completion, where an early delivery
+      // would be made, has run (CM #350 bot review, wave 5, finding 26).
+      await superseded;
       assert.equal(replacement.heard.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;
-      await superseded;
       assert.deepEqual(replacement.heard.map((h) => h.rows), [[a]], `${hooked ? 'control' : 'probe'}: the replacement hears the row once, after its initialize`);
       await settle();
       cm.close();
@@ -1683,9 +1684,19 @@ function mockMembrane() {
 /** The autobiographical strategy, counting its chunk rebuilds. */
 class CountsRebuilds extends AutobiographicalStrategy {
   rebuilds = 0;
+  /** onPresented and onNewMessage calls: the ways a row reaches the strategy. */
+  hooks = 0;
   protected rebuildChunks(store: MessageStoreView): void {
     this.rebuilds++;
     super.rebuildChunks(store);
+  }
+  async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+    this.hooks++;
+    return super.onPresented(rows, ctx);
+  }
+  async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
+    this.hooks++;
+    return super.onNewMessage(message, ctx);
   }
 }
 
@@ -1742,13 +1753,17 @@ describe('the autobiographical strategy follows the window', () => {
     const manager = await ContextManager.open({ path: freshPath(), strategy, membrane });
     manager.presentRows([]);
     const rebuilds = strategy.rebuilds;
+    const hooks = strategy.hooks;
     const { shown, unshown } = addMessages(manager);
+    // CM #350 bot review, wave 5, finding 25: in presented mode an add
+    // reaches the strategy through neither hook, and work the strategy does
+    // for a row has to start from one of them, so none can be scheduled.
+    assert.equal(strategy.hooks, hooks, 'no add reached the strategy (onPresented, onNewMessage)');
     await sleep(200);
+    assert.equal(strategy.hooks, hooks, 'nor after');
     assert.equal(strategy.rebuilds, rebuilds, 'no add rebuilt the chunks');
     assert.equal(calls.length, 0, 'no row is in the window, so nothing is chunked and no compression starts');
-    // CM #350 bot review, wave 4, finding 21: work scheduled from the adds
-    // that reaches the membrane after the sleep would pass the check above;
-    // nothing queued or pending can't.
+    // CM #350 bot review, wave 4, finding 21: nothing is queued or pending.
     assert.ok(manager.isReady(), 'nothing is queued or pending to compress');
 
     manager.presentRows(shown);

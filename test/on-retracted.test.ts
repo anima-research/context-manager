@@ -363,6 +363,37 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 44: a retraction a hook makes while
+  // the calls that waited are made waits behind the calls not made yet.
+  it('a call a hook makes while the calls that waited are made comes after them', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    class TakesOut extends Gated {
+      takes = true;
+      onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: Info): Promise<void> {
+        const heard = super.onRetracted(rows, ctx, info);
+        if (this.takes && rows.some((m) => m.id === a)) {
+          this.takes = false;
+          cm.retractRows([c]);
+        }
+        return heard;
+      }
+    }
+    const { gate, open } = gated();
+    const strategy = new TakesOut();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    cm.retractRows([b]);
+    open();
+    await initialized;
+    assert.deepEqual(strategy.log, ['retracted a', 'retracted b', 'retracted c'], "c, taken out by a's hook, after b, which waited");
+    await settle();
+    cm.close();
+  });
+
   it('a row removed elsewhere, taken out while the strategy initializes, is told on a branch whose window holds it still, since its record lacks it too', async () => {
     const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
     const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
@@ -437,11 +468,12 @@ describe('onRetracted', () => {
       const second = cm.setStrategy(replacement);
       const superseded = assert.rejects(first, /supersed/i);
       open();
-      await settle();
+      // The first initialization's completion, where an early delivery
+      // would be made, has run (CM #350 bot review, wave 5, finding 26).
+      await superseded;
       assert.equal(replacement.retracted.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;
-      await superseded;
       assert.deepEqual(
         replacement.retracted.map((l) => [l.rows, l.info]),
         [[[a], { undone: true, removed: false, ids: [a] }]],

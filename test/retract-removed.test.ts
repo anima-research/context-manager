@@ -659,6 +659,38 @@ describe("a removal through the manager where the window can't be read", () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 46: the limit removeMessages' doc
+  // states, a range whose rows can't be read before it goes.
+  it("removeMessages whose range's rows can't be read before it goes: the rows keep their ordinals, untold, until retractAbsentRows takes them out and tells them by id", async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    const own = cm as unknown as { slotRowsBetween: (from: MessageId, to: MessageId) => StoredMessage[] };
+    own.slotRowsBetween = () => { throw new Error('zz-range-unreadable'); };
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      cm.removeMessages(a, b);
+    } finally {
+      console.error = error;
+      delete (own as { slotRowsBetween?: unknown }).slotRowsBetween;
+    }
+    assert.deepEqual(ids(cm.getAllMessages()), [c], 'the removal stands');
+    assert.ok(
+      logged.some((line) => line.includes(`reading the rows before removing messages ${a} to ${b} failed`) && line.includes('keep their ordinals')),
+      logged.join('\n'),
+    );
+    assert.deepEqual(ordinals(cm, [a, b]).map((o) => o !== undefined), [true, true], 'both keep their ordinals');
+    assert.deepEqual(strategy.retracted, [], 'and are untold');
+    assert.deepEqual(cm.retractAbsentRows(), [a, b]);
+    assert.deepEqual(strategy.retracted, [{ rows: [], info: { undone: false, removed: true, ids: [a, b] } }], 'told by id, removed');
+    assert.deepEqual(ordinals(cm, [a, b]), [undefined, undefined]);
+    cm.close();
+  });
+
   it('in legacy mode, where the window is readable, a removal still tells nothing', async () => {
     const strategy = new Records();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });

@@ -429,16 +429,31 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     const x = cm.addMessage('alice', [text('x')]);
     // The index's read of the store's branch before the write fails (the
     // message store's own reads of it before then don't), and so does
-    // every read of it once the write throws.
+    // every read of it once the write throws. The read before is the
+    // store's own, made inside settled (CM #350 bot review, wave 5,
+    // finding 24), so a settled that let it throw would fail the call
+    // before its write.
     type Settled = (operation: string) => { state: unknown; branch: string | null };
     const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
     const settled = index.settled;
+    let settling = false;
     index.settled = function (this: unknown, operation: string) {
-      return { ...settled.call(this, operation), branch: null };
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
     };
     let warned: string[];
     try {
       const restore = failNextWriteUnread(cm, true, 1, true);
+      const store = cm.getStore() as unknown as Record<string, unknown>;
+      const branch = store.currentBranch as (this: unknown) => unknown;
+      store.currentBranch = function (this: unknown) {
+        if (settling) throw new Error('zz-branch-read-failed');
+        return branch.call(this);
+      };
       try {
         ({ warned } = await warnings(async () =>
           throwsUnknown(() => cm.presentRows([x]), {
