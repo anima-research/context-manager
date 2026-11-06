@@ -1,9 +1,9 @@
 /**
  * A half-written unfold is repaired by the next open (CM #350 bot review,
  * finding 2), where that open demotes: under `topologyPolicy` 'reject', the
- * default, in an open that isn't audit-only. 'report' and an audit-only
- * open leave the record as they find it, as the last case shows (wave 4,
- * finding 45).
+ * default, in an open that isn't audit-only. 'report', and an audit-only
+ * open under 'reject', each leave the record as they find it, as the last
+ * case shows (wave 4, finding 45; wave 5, finding 5).
  *
  * The autobiographical strategy writes what it lets go of (unfold) as three
  * states, one after another: the summaries, then the chunk records, then
@@ -531,8 +531,12 @@ describe('a half-written unfold', () => {
     cm.close();
   });
 
+  // Each config turns off the demote by one term of its gate alone (wave 5,
+  // finding 5): 'report' in an open that isn't audit-only, and an
+  // audit-only open under the default 'reject'. With both set, as this case
+  // was, the auditOnly term went untested.
   it("under 'report' and in an audit-only open, the record is left as it was found", async () => {
-    for (const config of [{ topologyPolicy: 'report' as const }, { topologyPolicy: 'report' as const, auditOnly: true }]) {
+    for (const config of [{ topologyPolicy: 'report' as const }, { auditOnly: true }]) {
       const path = freshPath();
       const strategy = new AutobiographicalStrategy(FOLDING);
       const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
