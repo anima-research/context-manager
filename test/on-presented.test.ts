@@ -554,6 +554,185 @@ describe('onPresented in presented mode', () => {
     }
   });
 
+  // CM #350 bot review, wave 5, finding 20: a retried call's hook can take
+  // the notification's own rows out of the window, moving nothing else.
+  it("a notification whose retried call's hook takes its rows out of the window again doesn't tell them entering", async () => {
+    for (const hook of ['onPresented', 'onNewMessage'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      cm.presentRows([]);
+      const x = cm.addMessage('alice', [text('x')]);
+      const y = cm.addMessage('bob', [text('y')]);
+      cm.presentRows([x]);
+      class TakesOut extends GatedRecords {
+        takes = true;
+        async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+          if (this.takes) {
+            this.takes = false;
+            cm.retractRows([y]);
+          }
+          return super.onRetracted(rows, ctx, info);
+        }
+      }
+      const strategy = new TakesOut();
+      if (hook === 'onNewMessage') (strategy as { onPresented?: unknown }).onPresented = undefined;
+      const { gate, open } = gated();
+      strategy.gate = gate;
+      const initialized = cm.setStrategy(strategy);
+      cm.retractRows([x]);
+      // The delivery's read of the record throws, once: the call waits.
+      const reads = cm as unknown as { mergedMessageView: () => unknown };
+      const read = reads.mergedMessageView;
+      let fail = true;
+      reads.mergedMessageView = function (this: unknown) {
+        if (fail) {
+          fail = false;
+          throw new Error('zz-record-read-failed');
+        }
+        return read.call(this);
+      };
+      try {
+        await errorsDuring(async () => {
+          open();
+          await initialized;
+        });
+      } finally {
+        delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+      }
+      assert.equal(strategy.retracted.length, 0, `${hook}, setup: the call waits`);
+      cm.presentRows([y]);
+      assert.equal(cm.windowStatusOf(y), 'out', `${hook}, setup: the retried call's hook took y out`);
+      assert.deepEqual(strategy.retracted[0]?.rows, [x], `${hook}: the call that waited was made`);
+      assert.deepEqual(strategy.heard, [], `${hook}: y isn't heard entering a window that no longer holds it`);
+      assert.deepEqual(strategy.newMessages, [], `${hook}: nor through onNewMessage`);
+      await settle();
+      cm.close();
+    }
+  });
+
+  // CM #350 bot review, wave 5, finding 39: where the store can't say its
+  // branch before the retried calls, a hook of theirs that moves it can't
+  // be seen, so the notification's call goes the way of a moved one.
+  it("a notification that can't read the store's branch before the retried calls is made where the window of the branch the store is on holds its rows", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const y = cm.addMessage('bob', [text('y')]);
+    cm.presentRows([x]);
+    const start = cm.currentBranch().name;
+    // Made now: its window lacks y.
+    const other = store.createBranchAt('zz-other', start, store.currentSequence()).name;
+    class Moves extends GatedRecords {
+      moves = true;
+      async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+        if (this.moves) {
+          this.moves = false;
+          store.switchBranch(other);
+        }
+        return super.onRetracted(rows, ctx, info);
+      }
+    }
+    const strategy = new Moves();
+    const { gate, open } = gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([x]);
+    // The delivery's read of the record throws, once: the call waits.
+    const reads = cm as unknown as { mergedMessageView: () => unknown; hookScope: () => unknown };
+    const read = reads.mergedMessageView;
+    let fail = true;
+    reads.mergedMessageView = function (this: unknown) {
+      if (fail) {
+        fail = false;
+        throw new Error('zz-record-read-failed');
+      }
+      return read.call(this);
+    };
+    try {
+      await errorsDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(strategy.retracted.length, 0, 'setup: the call waits');
+    // The notification's read of the store's branch, before it tries the
+    // waiting call again, throws once.
+    const scope = reads.hookScope;
+    let unreadable = true;
+    reads.hookScope = function (this: unknown) {
+      if (unreadable) {
+        unreadable = false;
+        throw new Error('zz-branch-unreadable');
+      }
+      return scope.call(this);
+    };
+    try {
+      cm.presentRows([y]);
+    } finally {
+      delete (reads as { hookScope?: unknown }).hookScope;
+    }
+    assert.equal(unreadable, false, 'setup: the branch read failed');
+    assert.equal(cm.currentBranch().name, other, "setup: the retried call's hook moved the store");
+    assert.deepEqual(strategy.retracted.map((r) => r.rows), [[x]], 'the call that waited was made');
+    assert.deepEqual(strategy.heard, [], "y isn't heard entering a window that never held it");
+    await settle();
+    cm.close();
+  });
+
+  // The verifier's C16 at 6a18406: in legacy mode the mode a notification's
+  // rows entered is read before the retried calls, whose hooks can move the
+  // store, so rows a moved notification defers are told where the record of
+  // the branch the store is on holds them.
+  it("in legacy mode a notification whose retried call's hook moves the store to a branch holding its row tells that row there, once", async () => {
+    const store = (await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() })).getStore();
+    const start = store.currentBranch().name;
+    class Moves extends ShardingRecords {
+      moves = true;
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (this.moves && rows.length > 1) {
+          this.moves = false;
+          // A branch of the record as it stands, the new row's add among it.
+          store.createBranchAt('zz-b', start, store.currentSequence());
+          store.switchBranch('zz-b');
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ store, namespace: 'zz-agent', strategy });
+    // A sharded add whose removal fails after telling the strategy of the
+    // body failed twice in the manager's own work: the shards that stayed
+    // wait for the strategy's next notification.
+    const own = cm as unknown as { createStrategyContext: () => unknown; messageStore: { removeBodyGroup: () => void } };
+    const build = own.createStrategyContext.bind(cm);
+    let failures = 0;
+    own.createStrategyContext = () => {
+      if (failures < 2) {
+        failures++;
+        throw new Error('zz-context-failed');
+      }
+      return build();
+    };
+    const removeBodyGroup = own.messageStore.removeBodyGroup;
+    own.messageStore.removeBodyGroup = () => { throw new Error('zz-removal-failed'); };
+    await errorsDuring(async () => {
+      assert.throws(() => cm.addMessage('alice', [text('one'), text('two')]));
+    });
+    own.messageStore.removeBodyGroup = removeBodyGroup;
+    assert.equal(failures, 2, 'setup: both failed');
+    assert.equal(strategy.heard.length, 0, 'setup: the shards wait');
+    const x = cm.addMessage('bob', [text('x')]);
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.equal(store.currentBranch().name, 'zz-b', "setup: the retried call's hook moved the store");
+    assert.equal(strategy.heard[0]?.rows.length, 2, 'setup: the shards were heard');
+    const heard = strategy.heard.flatMap((h) => h.rows);
+    assert.deepEqual(heard.filter((id) => id === x), [x], 'x is heard on the branch whose record holds it, once');
+    await settle();
+    cm.close();
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.
