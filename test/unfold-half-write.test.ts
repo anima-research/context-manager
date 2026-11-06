@@ -84,6 +84,8 @@ interface Internals {
   chunks: Array<{ messages: Array<{ id: MessageId }> }>;
   summariesStateId: string;
   chunksStateId: string;
+  mergeQueueStateId: string;
+  mergeQueue: Array<{ level: number; sourceIds: string[] }>;
 }
 const internals = (strategy: AutobiographicalStrategy) => strategy as unknown as Internals;
 
@@ -291,6 +293,49 @@ describe('a half-written unfold', () => {
       assert.ok(internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row)), `${label}: no record holds it`);
       reopened.close();
     }
+  });
+
+  // Wave 3 (finding 14, the verifier's pin): the merge queue, unfold's third
+  // write, is set in memory only once that write returns too.
+  it("a retraction whose merge queue write throws leaves the queue in memory as the store holds it", async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const other = state.summaries.find((s) => s.level === 1 && !s.sourceIds.includes(row));
+    assert.ok(covering && other, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    // A merge queued over the L1 the retraction drops, in memory and stored.
+    const queued = [{ level: 2, sourceIds: [covering.id, other.id] }];
+    state.mergeQueue = queued;
+    store.setStateJson(state.mergeQueueStateId, queued);
+
+    const real = store.setStateJson;
+    store.setStateJson = function (this: unknown, id: string, ...rest: unknown[]) {
+      if (id === state.mergeQueueStateId) throw new Error(`zz the store refused the write of ${id}`);
+      return real.call(this, id, ...rest);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+    }
+    assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `premise: ${lines.join('\n')}`);
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), "premise: the summaries' write landed, dropping the L1");
+    assert.deepEqual(state.mergeQueue, store.getStateJson(state.mergeQueueStateId), 'the queue in memory is the store\'s');
+    assert.deepEqual(state.mergeQueue, queued, 'which still holds the merge the failed write would have dropped');
+    cm.close();
   });
 
   it("under 'report' and in an audit-only open, the record is left as it was found", async () => {
