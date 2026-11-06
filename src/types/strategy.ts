@@ -336,7 +336,11 @@ export interface ContextStrategy {
    * window order, every shard of a body, and a context whose view holds
    * them, unless the manager's view filter leaves them out: a row the filter
    * leaves out is given here all the same, and the view doesn't list it or
-   * give it a position. A presentRows call is one record, so one the store
+   * give it a position. A presentRows whose outcome was unknown
+   * (WindowWriteOutcomeUnknownError) is heard at a later write, with the
+   * rows as that call found them: a row removed meanwhile is given as it
+   * was stored, though the view no longer holds it, and onRetracted with
+   * `removed` follows. A presentRows call is one record, so one the store
    * refuses presents nothing and calls nothing. In an index a pre-release
    * build wrote one record per row (see ContextManager.presentRows), a
    * presentRows cut short can have left a body's first shards in the
@@ -480,8 +484,10 @@ export interface ContextStrategy {
    * row the branch the strategy initialized on (the branch the store is on
    * when the call is made, as for onPresented's) holds at the ordinal it
    * left, in its window and its record (a branch made before it left), is
-   * left out, as is every row while that branch is in legacy mode, and a
-   * call left with no row isn't made. They wait for the manager's strategy,
+   * left out, as is a row a branch made before it was presented presented
+   * on its own (that branch's index never gave it the ordinal it left),
+   * and every row while that branch is in legacy mode, and a call left
+   * with no row isn't made. They wait for the manager's strategy,
    * not for this instance, as onPresented's do.
    *
    * Fire and forget, as onPresented: a rejection, or a throw before it

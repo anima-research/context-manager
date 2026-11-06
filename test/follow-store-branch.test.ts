@@ -81,11 +81,20 @@ function gate() {
   return { promise, resolve, reject };
 }
 
-/** Passthrough whose next initialize() waits on, or fails with, what the test sets; counts its detaches. */
+/**
+ * Passthrough whose next initialize() waits on, or fails with, what the test
+ * sets; counts the initializes entered and its detaches. A test that moves
+ * the store or replaces the strategy while an initialize is in flight
+ * checks `entered` first, so the move is made across one, not before it.
+ */
 class GatedStrategy extends PassthroughStrategy {
   nextInitialization: Promise<void> = Promise.resolve();
+  entered = 0;
   detached = 0;
-  initialize(): Promise<void> { return this.nextInitialization; }
+  initialize(): Promise<void> {
+    this.entered++;
+    return this.nextInitialization;
+  }
   detach(): void { this.detached++; }
 }
 
@@ -241,7 +250,11 @@ describe('setStrategy(getStrategy()) follows a branch move made elsewhere', () =
       store.switchBranch('side');
       const pending = gate();
       strategy.nextInitialization = pending.promise;
+      const entered = strategy.entered;
       const following = follow(a);
+      // CM #350 bot review, wave 4, finding 22: the initialize is in flight
+      // when the strategy is replaced.
+      assert.equal(strategy.entered, entered + 1, "setup: the call's initialize was entered before the replacement");
       const replacement = a.setStrategy(new PassthroughStrategy());
       pending.resolve();
       await assert.rejects(following, (error: unknown) => {
@@ -284,7 +297,9 @@ describe('setStrategy(getStrategy()) follows a branch move made elsewhere', () =
       store.switchBranch('side');
       const pending = gate();
       strategy.nextInitialization = pending.promise;
+      const entered = strategy.entered;
       const following = follow(a);
+      assert.equal(strategy.entered, entered + 1, "setup: the call's initialize was entered before the store moved again");
       store.switchBranch(main);
       pending.resolve();
       await assert.rejects(following, /Branch changed during strategy initialization: requested side/);

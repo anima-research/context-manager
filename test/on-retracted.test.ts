@@ -12,8 +12,10 @@
  * probe on #291). The manager calls the hook once per call, after the rows
  * are out and before the call returns, fire and forget as onPresented (a
  * retractRows that names rows the store no longer holds calls it a second
- * time, for those, by their ids alone); while the strategy initializes the
- * calls wait, and are made before the rows presented meanwhile are heard.
+ * time, for those, by their ids alone; where the manager's own work around
+ * the call fails, it is logged and the call waits for the strategy's next
+ * notification); while the strategy initializes the calls wait, and are
+ * made before the rows presented meanwhile are heard.
  * In legacy mode a removal takes the row out of the record and the window
  * at once, and nothing is called: a strategy that folded the row keeps it,
  * as it always has (#291 question 14).
@@ -586,6 +588,37 @@ describe('onRetracted', () => {
     assert.equal(cm.currentBranch().name, older);
     assert.equal(cm.windowMode(), 'presented', 'setup: the branch is presented');
     assert.deepEqual(strategy.retracted, [], "a never entered this branch's window");
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 4, finding 14: a branch made before the row
+  // was presented can present it on its own, at another ordinal.
+  it('a call waiting on an initialization of a branch that presented the row on its own, at another ordinal, is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    const [x, a] = ['x', 'a'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    // Made once a is stored and before it is presented: its record holds a, and its window doesn't.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([x]);
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, before the strategy initializes there.
+    cm.presentRows([a]);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, diverged);
+    assert.ok(cm.ordinalOf(a) !== undefined && cm.ordinalOf(a) !== left, 'setup: the branch holds a, at another ordinal than the one it left on the other');
+    assert.deepEqual(strategy.retracted, [], "a never left this branch's window");
+    assert.deepEqual(strategy.presented, [[a]], 'it entered it');
     await settle();
     cm.close();
   });

@@ -62,7 +62,11 @@
  * plan is made over its window, the rows presented in the order they were,
  * as the strategy reads them; until then over the record. That is the
  * `--messages-state` slot only: rows a manager merges from auxiliary slots
- * aren't in the plan or the verification, as before.
+ * aren't in the plan, as before. The verification after --apply is a
+ * default open of the namespace (no `isolate`), so it reads the shared
+ * `messages` slot whatever --messages-state names: after a repair of an
+ * isolated manager's slot (`agents/A/messages`, say) it doesn't audit that
+ * slot, as before.
  *
  * After --apply the store is reopened with topologyPolicy 'reject'; the run
  * fails if the audit still finds a crossed summary.
@@ -127,8 +131,10 @@ const resolutions = (storedResolutions != null && typeof storedResolutions === '
 // the verification's audit checks, the namespace's window: the rows
 // presented, in the order they were, which can differ from the record's.
 // The plan is made over it; in legacy mode it is the record. Only the
-// --messages-state slot's rows: the verification's open merges no auxiliary
-// slot either, so a manager that merges one isn't read as it reads it.
+// --messages-state slot's rows, so a manager that merges an auxiliary slot
+// isn't read as it reads it. The verification's open below is a default
+// one, which reads the shared `messages` slot whatever --messages-state
+// names, so it audits the slot planned here only where that is `messages`.
 const messages = new WindowIndex(store, namespace, console).listing(stateArray<StoredMessage>(messagesState)) as Array<{ id: string }>;
 const mergeQueue = stateArray<{ level: number; sourceIds: string[] }>(`${namespace}/autobio:mergeQueue`);
 const mergeQuarantine = stateArray<NonNullable<RepairInputs['mergeQuarantine']>[number]>(`${namespace}/autobio:merge-quarantine`);

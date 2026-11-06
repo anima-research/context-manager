@@ -491,15 +491,23 @@ describe('resetHeadWindow with metadata', () => {
   });
 
   it('the autobiographical head window starts at the transition once rows are presented', async () => {
-    const cm = await ContextManager.open({
-      path: freshPath(), namespace: 'zz-agent', strategy: new AutobiographicalStrategy({ headWindowTokens: 300, recentWindowTokens: 100 }),
-    });
+    const strategy = new AutobiographicalStrategy({ headWindowTokens: 300, recentWindowTokens: 100 });
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
     cm.presentRows([]);
     const old = [cm.addMessage('user', [text('Old context')]), cm.addMessage('assistant', [text('Old response')])];
     cm.presentRows(old);
     await cm.resetHeadWindow('User switched topics.', { metadata: { zz: 'topic' } });
+    const transition = cm.getAllMessages().at(-1)!;
     const next = cm.addMessage('user', [text('New context')]);
     cm.presentRows([next]);
+    // CM #350 bot review, wave 4, finding 20: the compile below fits every
+    // row whatever the head window is, so the head window is read itself.
+    const head = strategy as unknown as {
+      headWindowStartId: string | null;
+      getHeadWindowStartIndex(store: { getAll(): StoredMessage[] }): number;
+    };
+    assert.equal(head.headWindowStartId, transition.id, 'the head window was reset to start at the transition');
+    assert.equal(head.getHeadWindowStartIndex({ getAll: () => cm.getPresentedMessages() }), 2, "which is the window's third row, after the old ones");
     const compiled = texts(await cm.compile(BIG));
     assert.ok(compiled.some((t) => t.startsWith('[Topic Transition]')), compiled.join(' | '));
     assert.ok(compiled.includes('New context'), compiled.join(' | '));

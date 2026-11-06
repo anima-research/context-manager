@@ -464,7 +464,8 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
   });
 
   it("where the store can't be read to tell which shards a failed removal left, the error says the manager can't tell, naming every shard the write stored", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
@@ -483,12 +484,17 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.equal(err.unnamed, 0);
     assert.equal(err.cause, failure);
     assert.ok(err.message.includes(`can't tell whether the store holds 2 rows of the message (${err.unknown.join(', ')}): propagation failed`), err.message);
+    // CM #350 bot review, wave 4, finding 12: the shards whose outcome is
+    // unknown wait, and are heard where the window holds them.
+    assert.deepEqual(strategy.presented, [[stored[0]!.id], err.unknown], 'the strategy hears the shards the legacy window holds, in one call');
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 
   it("a removal that took the shards out and then failed, where the store can't be read to tell, isn't taken to have left them", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
-    cm.addMessage('bob', [text('before')]);
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
     const messages = internals(cm).messageStore;
@@ -509,6 +515,55 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.deepEqual(err.unknown, written);
     assert.equal(err.unnamed, 0);
     assert.equal(err.unknown.length, 2);
+    cm.addMessage('bob', [text('after')]);
+    assert.deepEqual(strategy.presented.slice(0, 1), [[before]]);
+    assert.ok(!strategy.presented.flat().some((id) => written.includes(id)), 'no shard the removal took out is heard');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 4, finding 9: a hook the rollback's removal
+  // runs can move the store's branch before the removal fails.
+  it("a rollback whose removal fails after a hold-release hook moved the store's branch says the manager can't tell which shards stayed", async () => {
+    let cm!: ContextManager;
+    let target: string | null = null;
+    let switching: Promise<void> | undefined;
+    class SwitchesOnRelease extends Sharding {
+      onCompressionHoldsReleased(): void {
+        const name = target;
+        target = null;
+        if (name) switching = cm.switchBranch(name);
+      }
+    }
+    cm = await ContextManager.open({ path: freshPath(), strategy: new SwitchesOnRelease() });
+    cm.addMessage('bob', [text('before')]);
+    const start = cm.currentBranch().name;
+    // A host's listener makes a branch once the first shard is stored, so
+    // that branch's record holds it, and the hook moves the store there.
+    cm.onMessage((event) => {
+      if (event.type === 'add' && event.message.shardIndex === 0) target = cm.getStore().createBranch('zz-first-shard').name;
+    });
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    // The removal lands, its event runs the hook, and then it fails.
+    const own = internals(cm);
+    const handle = own.handleMessageStoreEvent.bind(cm);
+    own.handleMessageStoreEvent = (event) => {
+      handle(event);
+      if (event.type === 'remove' || event.type === 'removeRange') throw new Error('failed after removing');
+    };
+    const { result: err } = errorsDuring(() =>
+      thrownBy(() => cm.addMessage('alice', [text('one '), text('two ')], undefined, undefined, { holdCompression: true })),
+    );
+    await switching;
+    assert.equal(cm.currentBranch().name, 'zz-first-shard', 'setup: the hook moved the store');
+    assert.equal(cm.getAllMessages().length, 2, "setup: the other branch's record holds the first shard");
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.deepEqual(err.landed, [], 'none it knows stayed: the other branch says nothing of the one the write was made on');
+    assert.equal(err.unknown.length, 2, 'every shard the write stored');
+    assert.equal(err.cause, failure);
+    await cm.switchBranch(start);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], 'where the write was made, the removal took them out');
     cm.close();
   });
 
@@ -558,7 +613,8 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
   });
 
   it("where the failing shard's landing can't be read and removing the shards fails too, the error names the shards that stayed and says the manager can't tell about the failing one", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
@@ -574,6 +630,10 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.equal(err.unnamed, 1, 'the second shard, whose append threw');
     assert.equal(err.cause, failure);
     assert.ok(err.message.includes(`a row of the append that threw; it holds message ${stored[1]!.id}: propagation failed`), err.message);
+    // CM #350 bot review, wave 4, finding 12: the failing shard, which the
+    // manager couldn't name, is heard with the shard it knows stayed.
+    assert.deepEqual(strategy.presented.at(-1), stored.slice(1).map((m) => m.id), 'the strategy hears both shards the legacy window holds, in one call');
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 
@@ -793,6 +853,43 @@ describe("a sharded addMessage's shards land together, as one body", () => {
       assert.deepEqual(cm.getAllMessages(), [], `${remove}: a removal once the call returned is taken`);
       cm.close();
     }
+  });
+
+  // CM #350 bot review, wave 4, finding 3: a cut taken while the body's
+  // later shards aren't stored yet would hold only the shards stored so far.
+  it('a branchAt or branchSequenceOf while a sharded addMessage stores its shards is refused, saying why, and one once it returns holds the whole body', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.presentRows([]);
+    const refusals: unknown[] = [];
+    let first = true;
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || !first) return;
+      first = false;
+      // A host that presents the shard it heard, then asks for a cut at it.
+      cm.presentRows([event.message.id]);
+      for (const cut of [() => cm.branchAt(event.message.id, 'zz-mid-add'), () => cm.branchSequenceOf(event.message.id)]) {
+        try {
+          cut();
+        } catch (err) {
+          refusals.push(err);
+        }
+      }
+    });
+    const doc = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+    assert.equal(refusals.length, 2, 'both refused');
+    for (const [refusal, operation] of [[refusals[0], 'branchAt'], [refusals[1], 'branchSequenceOf']] as const) {
+      assert.ok(refusal instanceof Error, operation);
+      assert.match(refusal.message, new RegExp(`^ContextManager\\.${operation} refused: a sharded addMessage is storing its shards`), operation);
+      assert.match(refusal.message, /whole body/, operation);
+    }
+    assert.ok(!cm.listBranches().some((b) => b.name === 'zz-mid-add'), 'no branch was made');
+    const shards = cm.getAllMessages().map((m) => m.id);
+    assert.equal(shards.length, 3, 'the body is stored whole');
+    cm.presentRows([doc]);
+    const cut = cm.branchAt(doc, 'zz-after-add');
+    await cm.switchBranch(cut);
+    assert.deepEqual(cm.getAllMessages().map((m) => m.id), shards, "a cut once the call returned holds the whole body in the new branch's record");
+    cm.close();
   });
 
   it("a listener that moves the store's branch between shards stops the write: the error names the shards stored, on the branch it started on", async () => {

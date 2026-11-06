@@ -700,7 +700,9 @@ export class MessageStore {
     // `branchAt(messageId)` forks in legacy mode and for a row the window
     // doesn't hold. Once a host presents rows, it forks at the write that
     // presented a row the window holds, and at the last shard of a body the
-    // write-down entered (see ContextManager.branchAt).
+    // write-down entered, and never before its body's last shard's own
+    // sequence, so the new branch's record holds the whole body (see
+    // ContextManager.branchAt).
     //
     // Whether this instance's caches reflected every write to the slot
     // BEFORE this append, including writes made through other handles to

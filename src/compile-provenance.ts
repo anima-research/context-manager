@@ -127,7 +127,9 @@ function storedBodyFinder(
  * ContextManager.presentRows) and a later presentRows completed after
  * other rows entered: its
  * shards are then two runs in `stored`, each read as a body of its own and
- * neither complete. `positionOf` resolves an id among those same messages
+ * neither complete (where the body declares `shardCount`; one stored before
+ * sizes were recorded is judged by the shards each run holds, so each run
+ * reads complete). `positionOf` resolves an id among those same messages
  * to its position in `stored` (undefined when none has it).
  */
 export function attributeEntries(

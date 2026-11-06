@@ -86,9 +86,10 @@ function heldMembrane() {
  * Await `work`, releasing every call the membrane holds as it comes, until
  * `work` settles (CM #350 bot review, wave 3, finding 33): a call that
  * reaches the membrane late is released too, where a release after a fixed
- * delay left it held and the test waiting for good. Work that hasn't
- * settled after `ms`, waiting on something other than a held call, fails
- * the test as timed out, as waitFor does (wave 4, finding 35).
+ * delay left it held and the test waiting for good. It gives up after
+ * `ms` (wave 4, finding 35), throwing 'timed out' with the count of calls
+ * it released, so work pending for another reason fails the test instead
+ * of hanging the file.
  */
 async function releasingUntil<T>(calls: ReadonlyArray<{ release: () => void }>, work: Promise<T>, ms = 10_000): Promise<T> {
   let settled = false;
@@ -96,9 +97,7 @@ async function releasingUntil<T>(calls: ReadonlyArray<{ release: () => void }>, 
   done.catch(() => {}); // the caller hears a rejection through the return
   const start = Date.now();
   while (!settled) {
-    if (Date.now() - start > ms) {
-      throw new Error(`timed out: the work hasn't settled after ${ms} ms, with the ${calls.length} call(s) that reached the membrane released`);
-    }
+    if (Date.now() - start > ms) throw new Error(`timed out after ${ms} ms, with ${calls.length} membrane call(s) released and the work still pending`);
     for (const call of calls) call.release();
     await new Promise((resolve) => setTimeout(resolve, 5));
   }

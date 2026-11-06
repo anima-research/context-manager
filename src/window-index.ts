@@ -20,7 +20,8 @@
  * by listing it among the states the manager owns. Rows are stored before
  * they are presented, so the index as of any sequence names only rows the
  * record held by then. Chronicle carries a state's chain, not its
- * registration, so a branch made before the first presentation has no
+ * registration, so a branch made before the window was first written down
+ * (a host's first presentRows, or a retractRows that names a row) has no
  * index, and is in legacy mode, as its parent was then. Its items are:
  *
  * - a header, `{ v: 1 }`, naming the format: the last item of the write-down
@@ -156,22 +157,31 @@ export interface LeftRow {
  * `entering` the rows the write would have put in the window, in the order
  * it would have, `leaving` the rows it would have taken out, and
  * `readError` the error of the read that would have told. This error's
- * message ends with the cause's message, so a check of the message that
- * matched the write's own error still matches.
+ * message ends with the cause's message, so a check that the message
+ * contains or ends with the write's own error's message still matches;
+ * one that compares the whole message, or is anchored at its start,
+ * doesn't.
  *
  * windowStatusOf tells which, once the index reads; a row that entered is
  * refused by presentRows as in the window already, and a row that left by
- * retractRows as not in it. A write-down (the first presentRows or
- * retractRows on a branch in legacy mode, which writes the window down
- * before any work of its own) puts no row in the window and takes none
- * out: `entering` and `leaving` are both empty, windowMode tells whether
- * it landed, and the strategy has nothing to hear of it. The strategy hears what the write did
- * (onPresented, onRetracted) at the next write to the window on the branch
- * it was made on, once the index reads there, before that call's own work:
+ * retractRows as not in it. For retractRemoved and retractAbsentRows,
+ * whose rows the store no longer holds, windowStatusOf reads 'absent'
+ * either way: ordinalOf tells (undefined for a row taken out), and calling
+ * either again takes out only what is still there. A write-down (the
+ * first presentRows or retractRows on a branch in legacy mode, which
+ * writes the window down before any work of its own) puts no row in the
+ * window and takes none out: `entering` and `leaving` are both empty,
+ * windowMode tells whether it landed, and the strategy has nothing to
+ * hear of it. The strategy hears what the write did (onPresented,
+ * onRetracted) at the next write to the window on the branch it was made
+ * on, once the index reads there, before that call's own work:
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
  * retractAbsentRows or a removal. Of a write the store didn't keep it
  * hears nothing. A hook of that hearing that moves the store's branch
  * stops the call, which throws, writing nothing (WindowIndex.settled).
+ * Where the store can't say its branch before the write or after it,
+ * nothing waits to tell the strategy, a warning says so, and so does this
+ * error's message: the strategy reads the window at its next select.
  */
 export class WindowWriteOutcomeUnknownError extends Error {
   readonly operation: string;
@@ -180,11 +190,17 @@ export class WindowWriteOutcomeUnknownError extends Error {
   readonly readError: unknown;
   override readonly cause: unknown;
 
+  /**
+   * `waiting` is false where nothing waits to tell the strategy what the
+   * write did (the store can't say which branch it was made on), which the
+   * message then says.
+   */
   constructor(
     operation: string,
     rows: { entering: readonly MessageId[]; leaving: readonly MessageId[] },
     cause: unknown,
     readError: unknown,
+    waiting = true,
   ) {
     const writeDown = rows.entering.length === 0 && rows.leaving.length === 0;
     const whether = writeDown
@@ -193,10 +209,19 @@ export class WindowWriteOutcomeUnknownError extends Error {
           ...(rows.entering.length > 0 ? [`${rowsNamed(rows.entering)} entered`] : []),
           ...(rows.leaving.length > 0 ? [`${rowsNamed(rows.leaving)} left`] : []),
         ].join(' and ') + ' the window';
+    // The rows of the repairs are ones the store no longer holds, which
+    // windowStatusOf reads as absent whether or not the write landed.
+    const repair = operation === 'retractRemoved' || operation === 'retractAbsentRows';
+    const which = repair
+      ? 'ordinalOf tells which once the index reads (undefined for a row taken out), and calling it again takes out only what is still there'
+      : 'windowStatusOf tells which once the index reads';
+    const hears = waiting
+      ? 'the strategy hears what it did at the next write to the window'
+      : 'nothing waits to tell the strategy what it did, so it reads the window at its next select';
     const tells = writeDown
       ? 'windowMode tells which once the index reads, and a write-down puts no row in the window or takes one out, ' +
         'so the strategy has nothing to hear of it'
-      : 'windowStatusOf tells which once the index reads, and the strategy hears what it did at the next write to the window';
+      : `${which}${repair ? ';' : ', and'} ${hears}`;
     super(
       `ContextManager.${operation}: the window index's write threw, and the index can't be read again to tell ` +
         `whether the write landed (${describeThrown(readError)}), so whether ${whether} is unknown; ` +
@@ -267,6 +292,12 @@ interface IndexState {
   revision: number | null;
   /** Per ordinal, the row presented there while it is still in the window; null for a hole. */
   rows: Array<MessageId | null>;
+  /**
+   * Per ordinal, the row a presentation put there, kept after a tombstone
+   * takes it out; null for an item that presented no row. What this
+   * branch's own index issued (issuedTo).
+   */
+  issued: Array<MessageId | null>;
   /** Per ordinal, the sequence of the record that wrote the item, where it says. */
   at: Array<number | undefined>;
   /** The ordinal of every row in the window. */
@@ -307,6 +338,7 @@ function emptyState(branchId: unknown, revision: number | null): IndexState {
     branchId,
     revision,
     rows: [],
+    issued: [],
     at: [],
     ordinals: new Map(),
     undone: new Set(),
@@ -395,6 +427,7 @@ function inEffect(state: IndexState): boolean {
 function apply(state: IndexState, item: unknown, ordinal: number, at: number | undefined): boolean {
   state.at[ordinal] = at;
   state.rows[ordinal] = null;
+  state.issued[ordinal] = null;
   if (typeof item !== 'object' || item === null) {
     state.unreadable++;
     return false;
@@ -405,6 +438,7 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
     // at the end, and a reload must never move a row a compile has sent.
     if (!state.ordinals.has(fields.id)) {
       state.rows[ordinal] = fields.id;
+      state.issued[ordinal] = fields.id;
       state.ordinals.set(fields.id, ordinal);
     }
     state.undone.delete(fields.id);
@@ -687,7 +721,7 @@ export class WindowIndex {
         }
       }
       if (on !== null) this.unsettled.push({ branch: on, settle: tell });
-      return new WindowWriteOutcomeUnknownError(operation, rows, error, readError);
+      return new WindowWriteOutcomeUnknownError(operation, rows, error, readError, on !== null);
     }
     tell(ordinals);
     return error;
@@ -785,6 +819,19 @@ export class WindowIndex {
   ordinals(): ReadonlyMap<MessageId, number> | null {
     const state = this.current();
     return inEffect(state) ? state.ordinals : null;
+  }
+
+  /**
+   * The row this branch's index presented at `ordinal`, whether or not it
+   * is in the window still: a row taken out keeps its ordinal here, as a
+   * hole in the window. Undefined for an ordinal the index never issued to
+   * a row (a header, a tombstone, an item past its end), and in legacy
+   * mode. A branch made from another holds the parent's ordinals up to the
+   * branch point, and its own after.
+   */
+  issuedTo(ordinal: number): MessageId | undefined {
+    const state = this.current();
+    return inEffect(state) ? (state.issued[ordinal] ?? undefined) : undefined;
   }
 
   /** Ordinals issued on this branch: the one the next item takes. 0 in legacy mode. */
@@ -1184,6 +1231,7 @@ export class WindowIndex {
       branchId: null,
       revision: state.revision,
       rows: [...state.rows],
+      issued: [...state.issued],
       at: [...state.at],
       ordinals: new Map(state.ordinals),
       undone: new Set(state.undone),
