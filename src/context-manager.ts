@@ -4131,11 +4131,13 @@ export class ContextManager {
    * that closes the manager, sets a strategy or starts an initialization
    * (a setStrategy() or switchBranch() called before its first await) stops
    * the calls after it, even when that initialization finished before the
-   * hook returned. The rows it hasn't been given go nowhere after close(),
-   * and otherwise wait for the initialization (deferPresented): once it has
-   * finished they are heard where the window of the branch it initialized
-   * on holds them, at once for a strategy with no initialize. The strategy
-   * it let go hears no more.
+   * hook returned, and so does one that moves the store's branch itself or,
+   * once a host presents, takes the next row out of the window. The rows it
+   * hasn't been given go nowhere after close(), and otherwise wait for the
+   * initialization (deferPresented): once it has finished they are heard
+   * where the window of the branch it initialized on holds them, at once
+   * for a strategy with no initialize or one that is initialized still.
+   * The strategy it let go hears no more.
    *
    * Fire and forget: the write doesn't wait for the strategy, and the
    * strategy's failure isn't the write's (#288). A hook that isn't async can
@@ -4154,8 +4156,8 @@ export class ContextManager {
     // once it is initialized, so they wait while one without a row hook
     // initializes too: a replacement set meanwhile hears them. They wait
     // too behind calls a delivery that failed to read left waiting, once
-    // those are tried again (unheardStillWaiting).
-    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
+    // those are tried again (callWaits).
+    if (this.callWaits()) {
       this.waitToBeHeard(rows, this.windowIndex.mode() === 'legacy');
       return;
     }
@@ -4177,17 +4179,28 @@ export class ContextManager {
       }
       return;
     }
-    // The initialization the calls are made under, and the window the rows
-    // entered, before any hook runs.
-    const attempt = this.initializationAttempt;
+    // The strategy, initialization and branch the calls are made under, and
+    // the window the rows entered, before any hook runs.
+    const scope = this.hookScope();
     const legacy = this.windowIndex.mode() === 'legacy';
+    // Whether a presented row is in the window still: a hook can take it
+    // out. A read that throws can't tell, so the row waits, as below.
+    const inWindow = (id: MessageId) => {
+      try {
+        return this.windowIndex.ordinalOf(id) !== undefined;
+      } catch {
+        return false;
+      }
+    };
     for (let i = 0; i < rows.length; i++) {
-      if (i > 0 && (this.closed || this.strategy !== strategy || this.initializationAttempt !== attempt)) {
-        // The previous row's hook closed the manager, set a strategy or
-        // started an initialization, which may have finished before the hook
-        // returned (a strategy with no initialize): the rest wait for it as
-        // rows presented while it ran do, and are heard once it has, those
-        // the window of the branch it initialized on holds.
+      if (i > 0 && (!this.inHookScope(scope) || (!legacy && !inWindow(rows[i]!.id)))) {
+        // The previous row's hook closed the manager, set a strategy,
+        // started an initialization, which may have finished before the
+        // hook returned (a strategy with no initialize), moved the store's
+        // branch, or took this row out of the window: the rest wait, as rows
+        // presented while an initialization runs do, and are heard once
+        // the strategy is initialized (at once where it is), those the
+        // window of the branch it initialized on holds.
         this.deferPresented(rows.slice(i), legacy);
         return;
       }
@@ -4288,7 +4301,7 @@ export class ContextManager {
     // As notifyPresented's rows, the call waits for the manager's strategy,
     // whether or not the one initializing has the hook, and behind calls a
     // delivery that failed to read left waiting.
-    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
+    if (this.callWaits()) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
       this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
@@ -4317,10 +4330,24 @@ export class ContextManager {
   private deliveringUnheard = false;
   /** While deliverRetractedUnheard makes its calls: a call made meanwhile waits behind those it hasn't made. */
   private drainingRetracted = false;
+  /** While deliverPresentedUnheard makes its calls: rows presented meanwhile wait behind the rows it hasn't given. */
+  private drainingPresented = false;
 
   /** Whether a call waits for the initialized strategy, or a delivery of them is making its calls. */
   private unheardWaiting(): boolean {
-    return this.drainingRetracted || this.retractedUnheard.length > 0 || this.presentedUnheard.size > 0;
+    return this.drainingRetracted || this.drainingPresented || this.retractedUnheard.length > 0 || this.presentedUnheard.size > 0;
+  }
+
+  /**
+   * Whether a notification's own call waits (notifyPresented,
+   * notifyRetracted): while the strategy isn't initialized, while calls
+   * still wait once those a delivery that failed to read left waiting have
+   * been tried again, and where a hook of those retried calls set a
+   * strategy or started an initialization, which the call then waits for.
+   */
+  private callWaits(): boolean {
+    if (this.initializedAttempt !== this.initializationAttempt) return true;
+    return this.unheardStillWaiting() || this.initializedAttempt !== this.initializationAttempt;
   }
 
   /**
@@ -4432,9 +4459,11 @@ export class ContextManager {
    * and the rows given are those an add entered into a legacy window (a
    * sharded add's later shards, after a hook of an earlier one started the
    * initialization) that the record holds; a row presented on a branch
-   * whose index was written down isn't given there. False when the read of
-   * the window failed, or the manager's own work around the call: the rows
-   * wait still.
+   * whose index was written down isn't given there. Rows a hook presents
+   * while it makes its calls wait behind the rows it hasn't given, as a
+   * call made while deliverRetractedUnheard makes its calls does. False
+   * when the read of the window failed, or the manager's own work around
+   * the call: the rows wait still.
    */
   private deliverPresentedUnheard(): boolean {
     const waiting = this.presentedUnheard;
@@ -4452,6 +4481,7 @@ export class ContextManager {
       return false;
     }
     this.presentedUnheard = new Map();
+    this.drainingPresented = true;
     try {
       this.tellPresented(rows);
     } catch (err) {
@@ -4460,6 +4490,8 @@ export class ContextManager {
       for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
       logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
       return false;
+    } finally {
+      this.drainingPresented = false;
     }
     return true;
   }
