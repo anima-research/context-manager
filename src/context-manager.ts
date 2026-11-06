@@ -973,9 +973,10 @@ export class ContextManager {
    *
    * A sharded body's shards land together, as one body: a chunking whose
    * `bodyGroupId` is empty or not a string is refused before any shard is
-   * stored, and an addMessage made while a sharded addMessage stores its
-   * shards (from a listener of a shard's add, or a strategy hook a
-   * listener runs by presenting a shard) is refused, saying why, since its
+   * stored, and an addMessage on this manager made while a sharded
+   * addMessage of its stores its shards (from a listener of a shard's add,
+   * or a strategy hook a listener runs by presenting a shard) is refused,
+   * saying why, since its
    * row would land between the shards and split the body. In legacy mode
    * the strategy hears the shards once every one is stored, in one call,
    * so no hook of its runs between them. A listener that moves the store's
@@ -1094,8 +1095,10 @@ export class ContextManager {
         // reads a body as consecutive messages of one group id whose shard indices
         // rise, so a body's shards must land together: a message appended between
         // them would split the body. Nothing in context-manager appends a message
-        // anywhere but here and below, and an addMessage made while this loop runs
-        // is refused (writingShards): a host's onMessage listener runs inside each
+        // anywhere but here and below, and an addMessage on this manager made while
+        // this loop runs is refused (writingShards, this manager's own: another
+        // manager on the slot doesn't see it, and onMessage's contract rules out an
+        // add from a listener there too): a host's onMessage listener runs inside each
         // append, and the strategy's hooks run there when that listener presents a
         // shard. In legacy mode the strategy hears the body once the loop ends, in
         // one call, as presentRows gives a body, so no hook of its runs between
@@ -1616,10 +1619,12 @@ export class ContextManager {
    * so it can run while a sharded addMessage is still storing that body's
    * remaining shards. It must not add a message synchronously: one added there
    * would land between a body's shards and split the body (body-runs.ts), so
-   * an addMessage made while a sharded addMessage stores its shards is
-   * refused. Add it after the call returns (a microtask or later) instead.
-   * Nor may it remove a message then (removeMessage, removeMessages are
-   * refused, as a removal could split the body or move the rows the sharded
+   * an addMessage on this manager made while a sharded addMessage of its
+   * stores its shards is refused; one on another manager sharing the slot
+   * isn't, and is the listener's to avoid. Add it after the call returns (a
+   * microtask or later) instead. Nor may it remove a message then
+   * (removeMessage, removeMessages on this manager are refused, as a
+   * removal could split the body or move the rows the sharded
    * write removes if it fails), or move the store's branch: the sharded
    * write stops before its next shard and throws (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
