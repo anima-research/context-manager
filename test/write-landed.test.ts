@@ -1032,6 +1032,46 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     cm.close();
   });
 
+  // Weft's plant on 6a18406: what the strategy hears of that write. The
+  // shard whose append threw landed on the branch the write started on, and
+  // the legacy window took it in, so every shard the window took in waits
+  // to be heard (hearWhatStayed), not only those the write could name: the
+  // strategy hears the second shard with the first, once each.
+  it("in legacy mode a shard whose own append failed after its listener moved the store's branch, and that landed, is heard with the shards before it, once", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore();
+    const start = cm.currentBranch().name;
+    const failure = new Error('zz-own-listener-failed');
+    const own = internals(cm);
+    const handle = own.handleMessageStoreEvent.bind(cm);
+    let adds = 0;
+    let switched: Promise<void> | undefined;
+    own.handleMessageStoreEvent = (event) => {
+      handle(event);
+      if (event.type !== 'add' || ++adds !== 2) return;
+      switched = cm.switchBranch(store.createBranchAt('zz-mid-body', start, store.currentSequence()).name);
+      throw failure;
+    };
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    await switched;
+    assert.equal(cm.currentBranch().name, 'zz-mid-body', "setup: the second shard's listener moved the branch");
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.equal(err.unnamed, 1, 'setup: the second shard, whose append threw, has no id');
+    await cm.switchBranch(start);
+    await new Promise((resolve) => setImmediate(resolve));
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two '], 'setup: the second shard landed where the write started');
+    assert.deepEqual(err.landed, [stored[1]!.id], 'setup: only the first shard is named');
+    assert.deepEqual(
+      strategy.presented.flat(),
+      [before, stored[1]!.id, stored[2]!.id],
+      'the strategy heard the shard that landed unnamed, and the one before it, once each',
+    );
+    cm.close();
+  });
+
   // CM #350 bot review, wave 3, finding 21: the rows the strategy is to hear
   // are kept until it has heard them.
   it("in legacy mode the strategy hears the shards that stayed when telling it of the stored body failed in the manager's own work", async () => {
