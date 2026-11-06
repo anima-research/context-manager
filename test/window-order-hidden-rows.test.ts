@@ -1,7 +1,7 @@
 /**
  * The autobiographical strategy's reads of the window's order, where a
  * record holds a row the view filter hides, and where a merge's sources
- * cross (CM #350 bot review, wave 4, finding 6).
+ * cross (CM #350 bot review, wave 4, findings 6 and 24).
  *
  * The check an L1 or a merge makes for a row another instance took out and
  * presented again (rowsMovedInWindow) named a row at any inversion of the
@@ -16,6 +16,11 @@
  * presentation puts a row presented again, and a record that keeps a
  * returned row holds its rows in window order, a hidden row at its own
  * ordinal.
+ *
+ * The open's demote trimmed a record to its longest run of rows the window
+ * holds together and released the rest, a hidden row among them, which the
+ * view never lists, so no chunk took it again. A hidden row now stays in
+ * the record.
  */
 
 import { describe, it, after } from 'node:test';
@@ -204,6 +209,22 @@ describe('a record that holds a row the view filter hides', () => {
     cm.close();
   });
 
+  it("the open's demote keeps the hidden row in the record it trims", async () => {
+    const { cm, hidden, record, rows } = await foldedRecordAtTheEnd();
+    const [back, h] = rows as [MessageId, MessageId, ...MessageId[]];
+    hidden.add(h);
+    // Under 'reject' the open finds the L1 over the record out of window
+    // order and demotes it before the strategy hears the row go.
+    const next = new AutobiographicalStrategy(FOLDING);
+    const lines = await backWhileInitializing(cm, next, back);
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of')), `premise: the open demoted the L1: ${lines.join('\n')}`);
+    const kept = internals(next).chunkRecords.find((r) => r.id === record.id);
+    assert.ok(kept, `the record stays: ${JSON.stringify(internals(next).chunkRecords)}`);
+    assert.ok(kept.sourceIds.includes(h), `the hidden row keeps its chunk ownership: ${JSON.stringify(kept)}`);
+    assert.ok(internals(next).chunkRecords.filter((r) => r.sourceIds.includes(h)).length === 1, 'in one record');
+    assert.deepEqual(kept.sourceIds, [...rows.filter((id) => id !== back), back], 'in window order');
+    cm.close();
+  });
 });
 
 describe("a merge's entry check over sources that cross", () => {

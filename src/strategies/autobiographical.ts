@@ -7459,10 +7459,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * again over its longest run of rows the window holds together (the
    * first, of runs as long), as the topology repair keeps an L1's longest
    * run (src/repair/topology.ts), and its other rows are released, so the
-   * chunker takes them where the window holds them; a summary above L1 is
-   * dropped alone, and the summaries below it render on their own. The
-   * audit runs again over the rebuilt chunks until it names nothing; what
-   * it still names after that is the gate's (assertStoreTopology).
+   * chunker takes them where the window holds them. A row of the record
+   * the view filter hides stays in it, at its place in the window: the
+   * view never lists it, so no chunk would take it again. A summary above
+   * L1 is dropped alone, and the summaries below it render on their own.
+   * The audit runs again over the rebuilt chunks until it names nothing;
+   * what it still names after that is the gate's (assertStoreTopology).
    *
    * An uncompressed chunk record whose rows the window holds apart is
    * trimmed the same way, to its longest run, and its other rows released.
@@ -7529,15 +7531,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const released: MessageId[] = [];
       const trimmed: string[] = [];
       const releasedUncompressed: MessageId[] = [];
+      const place = ctx.window.ordinals() ?? position;
       const unfolded = this.unfold(new Set([...named, ...reordered]), (record) => {
         const demoted = record.summaryId !== undefined && l1s.has(record.summaryId);
         if (!demoted && !split.has(record.id)) return undefined;
         const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
-        const kept = new Set(longest);
+        // A row `position` doesn't place (one the view filter hides) stays:
+        // the view doesn't list it, so released it would never be chunked
+        // again, though it never left the window.
+        const kept = new Set([...longest, ...record.sourceIds.filter((id) => !position.has(id))]);
         const out = demoted ? released : releasedUncompressed;
         for (const id of record.sourceIds) if (!kept.has(id)) out.push(id);
         if (!demoted) trimmed.push(record.id);
-        return longest;
+        return windowOrdered(record.sourceIds.filter((id) => kept.has(id)), place);
       });
       const demoted = violations.length + reordered.length;
       if (demoted > 0) {
